@@ -84,6 +84,6 @@ Killing the queue runner or the `ds-agent.ps1` PowerShell process does **not** s
 | Brief | Goal | Status |
 | --- | --- | --- |
 | `t01-phase2-status-audit.md` | True status of Phase 2 milestones M0-M8 from the code; the conversion command; the acceptance gates likely to fail | done, reviewed by Claude (claims spot-checked: grid preflight, baseline warning, no NiTriStripsData parser) - `docs/research/phase2-status.md` |
-| `t02-worldspace-transition-demo.md` | Alftand -> Blackreach seamless-transition demo: route IDs from the data, converter/DB/engine gaps, recipe, Markarth fallback (requested by the QnA session) | launched 2026-09-21 |
+| `t02-worldspace-transition-demo.md` | Alftand -> Blackreach seamless-transition demo: route IDs from the data, converter/DB/engine gaps, recipe, Markarth fallback (requested by the QnA session) | done, reviewed by Claude (spot-checked: no XTEL in code, exterior-only plan_cells, statics STAT/MSTT/FURN only, fixed worldspace_id) - `docs/research/worldspace-transition-demo.md`; DB queries in its section 7 still to run on the real conversion |
 
 Update the status column when you launch or finish a task.
