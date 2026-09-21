@@ -1,7 +1,8 @@
 {
   "readOnlyDirs": [
     "C:/Users/Brannock/.cargo/registry/src",
-    "C:/Games/Steam/steamapps/common/Skyrim Special Edition"
+    "C:/Games/Steam/steamapps/common/Skyrim Special Edition",
+    "C:/Modding/SkyrimConverted"
   ],
   "denyEdit": [
     "crates/**",
