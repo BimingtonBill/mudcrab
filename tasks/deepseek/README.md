@@ -83,5 +83,6 @@ Killing the queue runner or the `ds-agent.ps1` PowerShell process does **not** s
 
 | Brief | Goal | Status |
 | --- | --- | --- |
+| `t01-phase2-status-audit.md` | True status of Phase 2 milestones M0-M8 from the code; the conversion command; the acceptance gates likely to fail | launched 2026-09-21 |
 
 Update the status column when you launch or finish a task.
