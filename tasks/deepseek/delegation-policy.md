@@ -15,18 +15,23 @@ effort just to save DeepSeek tokens.
 - Delegate research (format layouts, Bevy API questions, prior art in OpenMW and xEdit), evidence
   extraction, analysis of completed profiling and acceptance runs, independent audits, test design,
   and assigned documentation.
-- Implementation starts as a pilot of 6-10 bounded tasks: pure parsers, converters for one record
-  or block type, validators, audit tools and their tests, with fixed interfaces. The lead picks
-  tasks that do not overlap current work. This policy does not launch any task itself.
+- Delegate implementation broadly (delegation level 7, set by the user on 2026-09-21): parsers,
+  converters, validators, audit tools, and multi-file changes within one crate, each run through
+  `tools/ds_impl.ps1` in its own worktree with an owned-file list and acceptance commands. Two
+  tasks never own the same file. The lead picks tasks that do not overlap current work. This
+  policy does not launch any task itself.
 - The lead (Claude) keeps cross-crate architecture, the public contracts in `crates/shared/`,
   render-graph and ECS scheduling changes, dependency changes (`Cargo.toml`), integration, and
   all acceptance-campaign and sign-off runs (`scripts/phase2-*.ps1`).
-- Judge a pilot by acceptance without correction, correction effort, independent tests and, where
-  needed, runtime results. Worker status `ok`, citations that resolve and tests the worker wrote
-  itself do not by themselves show the work is correct.
-- An independent reviewer checks the important claims and patches against the source evidence and
-  the acceptance contract. The lead settles disagreements and accepts the result. Widen the coding
-  scope based on how the pilot goes.
+- Every patch gets an independent review and harness-run acceptance before it is merged. Worker
+  status `ok`, citations that resolve and tests the worker wrote itself do not by themselves show
+  the work is correct.
+- A tuning or calibration task (thresholds, heuristics fitted to sample data) must also pass on
+  held-out examples the worker never saw.
+- Why: DOA's pilot (i01-i12, 2026-09-20/21) ran on the finished harness. 9 of 9 rated tasks needed
+  correction, none rejected on merit; most corrections were small, and the costly one was a check
+  tuned to its own four samples. Record outcomes in `local/agents/pilot.csv`
+  (`python tools/ds_report.py`); the lead settles disagreements and accepts the result.
 
 ## Isolation and permissions
 
