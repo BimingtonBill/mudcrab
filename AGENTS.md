@@ -1,5 +1,16 @@
 # Working agreement for AI assistants
 
+<!-- ds-delegation:begin (managed by DeepSeek Workers/tools/ds_delegation.py; edit with --set) -->
+## DeepSeek delegation level: 7 of 10 (Claude plans and reviews)
+
+Claude plans, writes briefs, reviews and integrates; workers do the exploration and most coding, including multi-file changes in their own worktrees with owned-file lists. Use a DeepSeek lead (-CanSpawn) for jobs that split into independent parts, and -Crosstalk for workers whose work touches.
+
+At every level Claude keeps: talking to the user, design and architecture decisions, integration into the main checkout, security-sensitive changes, and review of every worker result it acts on (spot-check the claims that matter; read the full diff of any edit).
+
+This block is generated. Change the level with `python "C:/Users/Brannock/.claude/skills/deepseek-agents/tools/ds_delegation.py" --set <0-10> --agents-md` from this folder, or ask Claude to. The full scale is in the deepseek-agents skill.
+<!-- ds-delegation:end -->
+
+
 Claude (Claude Code) leads the work on this checkout and delegates bounded tasks to DeepSeek worker agents. The setup is carried over from the user's DOA Xbox360 UI project. This file is how each session, and each assistant, sees what the others did.
 
 ## At the start of every session
