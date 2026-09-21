@@ -7,6 +7,8 @@ Claude plans, writes briefs, reviews and integrates; workers do the exploration 
 
 At every level Claude keeps: talking to the user, design and architecture decisions, integration into the main checkout, security-sensitive changes, and review of every worker result it acts on (spot-check the claims that matter; read the full diff of any edit).
 
+Missing tools: before starting a job, check that the tools it needs are installed. If a compiler, runtime or package the best approach needs is missing, stop and ask the user to install it (say what it is for and give the exact install command) instead of working around it with a weaker approach or a hand-written substitute. Continue without it only if the user chooses to.
+
 This block is generated. Change the level with `python "C:/Users/Brannock/.claude/skills/deepseek-agents/tools/ds_delegation.py" --set <0-10> --agents-md` from this folder, or ask Claude to. The full scale is in the deepseek-agents skill.
 <!-- ds-delegation:end -->
 
