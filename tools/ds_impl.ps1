@@ -38,10 +38,11 @@ $implRoot = Join-Path $root 'local\impl'
 $stateDir = Join-Path $root 'local\agents'
 $pilotLog = Join-Path $stateDir 'pilot.csv'
 
-# Every checkout builds into the lead's target/ so a worker never recompiles Bevy from scratch.
-# Cargo locks the directory, so parallel workers queue their builds instead of corrupting it.
-# The worker, its cargo commands and the acceptance runs below all inherit this.
-$env:CARGO_TARGET_DIR = Join-Path $root 'target'
+# Each checkout builds into its own target/ (git-ignored inside the worktree). A shared target
+# directory is NOT safe: `cargo test -p engine` writes the same test-binary path from every
+# checkout, so parallel workers ran each other's binaries (found by impl-007, 2026-09-22). The
+# price is one cold build per task. Set per task below, once the worktree path is known.
+Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
 $cargoBin = Join-Path $HOME '.cargo\bin'
 if ((Test-Path $cargoBin) -and ($env:Path -notlike "*$cargoBin*")) { $env:Path = "$cargoBin;$env:Path" }
 
@@ -106,6 +107,7 @@ if ($Post) {
     $out = if (Test-Path $resultPath) { Get-Content $resultPath -Raw } else { '' }
     $status = if ($out -match 'status=(\S+)') { $Matches[1] } else { 'unrecorded' }
     "[ds-impl] post-run checks for $Name on $($baseCommit.Substring(0,7))"
+    $env:CARGO_TARGET_DIR = Join-Path $work 'target'
 }
 else {
 
@@ -166,6 +168,7 @@ $scoped = [ordered]@{
     ([ordered]@{ task = $Name; base = $baseCommit; files = $owned; accept = $checks; brief = $Brief } |
         ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding $false))
 
+$env:CARGO_TARGET_DIR = Join-Path $work 'target'
 $started = Get-Date
 "[ds-impl] $Name on $($baseCommit.Substring(0,7)) in $work"
 $schema = Join-Path $root 'tasks\deepseek\result-schema.json'
