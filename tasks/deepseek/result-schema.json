@@ -1,0 +1,39 @@
+{
+  "type": "object",
+  "properties": {
+    "base_commit": { "type": "string", "description": "the commit the work started from" },
+    "summary": { "type": "string", "description": "300-600 words for the lead: what you did and what it means" },
+    "critical_evidence": {
+      "type": "array",
+      "description": "the few claims the lead would have to check; each with where it comes from",
+      "items": {
+        "type": "object",
+        "properties": {
+          "claim": { "type": "string" },
+          "evidence": { "type": "string", "description": "repo-relative path:line, an address, or a command and its output" }
+        },
+        "required": ["claim", "evidence"],
+        "additionalProperties": false
+      }
+    },
+    "unresolved_assumptions": { "type": "array", "items": { "type": "string" } },
+    "commands": {
+      "type": "array",
+      "description": "what you actually ran, with the real result - not what you intended to run",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string" },
+          "result": { "type": "string" }
+        },
+        "required": ["command", "result"],
+        "additionalProperties": false
+      }
+    },
+    "next_falsifying_test": { "type": "string", "description": "the cheapest check that would prove this wrong" },
+    "changed_files": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["base_commit", "summary", "critical_evidence", "unresolved_assumptions",
+               "commands", "next_falsifying_test", "changed_files"],
+  "additionalProperties": false
+}

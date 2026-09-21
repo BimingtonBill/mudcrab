@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "properties": {
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["search-glob", "search-grep", "reference-read", "vision", "write-refused", "write-allowed"]
+          },
+          "result": { "type": "string", "enum": ["PASS", "FAIL"] },
+          "detail": { "type": "string" }
+        },
+        "required": ["name", "result", "detail"],
+        "additionalProperties": false
+      },
+      "minItems": 6,
+      "maxItems": 6
+    },
+    "verdict": { "type": "string", "enum": ["PASS", "FAIL"] }
+  },
+  "required": ["checks", "verdict"],
+  "additionalProperties": false
+}

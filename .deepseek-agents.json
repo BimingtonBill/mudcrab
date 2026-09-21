@@ -1,0 +1,28 @@
+{
+  "readOnlyDirs": [
+    "C:/Users/Brannock/.cargo/registry/src",
+    "C:/Games/Steam/steamapps/common/Skyrim Special Edition"
+  ],
+  "denyEdit": [
+    "crates/**",
+    "vendor/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".cargo/**",
+    ".github/**",
+    "scripts/**",
+    "tools/ds_*",
+    "tools/run_ds_queue.ps1",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".deepseek-agents.json"
+  ],
+  "allowTools": "Bash(cargo check *),Bash(cargo test *),Bash(cargo clippy *),Bash(cargo fmt --check*),Bash(cargo tree *),Bash(python tools/*),Bash(python -m unittest *),Bash(git add *),Bash(git commit *),Bash(git status),Bash(git diff *),Bash(git log *)",
+  "stateDir": "local/agents",
+  "defaults": {
+    "mode": "edit",
+    "effort": "max",
+    "maxTurns": 400,
+    "timeoutMinutes": 150
+  }
+}
