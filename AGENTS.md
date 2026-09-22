@@ -67,10 +67,20 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
   - review-035.
 - **Disk:** each ds_impl worktree seeds about 11 GB of `target/`. Discard a worktree as soon as it
   is integrated. That alone freed 45 GB tonight.
-- **Reconversion plan** (after impl-032 and impl-038):
-  1. bump `CONVERTER_SCHEMA_VERSION` 15→16 and `WORLD_DATABASE_SCHEMA_VERSION` 5→6 (Claude);
-  2. delete `vfs/` and `.ingestion-cache/` (47 GB, regenerable);
-  3. reconvert in place. Textures are reused.
+- **Reconversion: blocked on a user decision.** The code is ready. Converter schema 16 is in
+  `97eefa4`: door clips, `space_lighting`, `matos`, and a migration that keeps cached textures.
+  `WORLD_DATABASE_SCHEMA_VERSION` stays 5, because the new tables are additive and probed.
+  - Claude's attempts to delete `C:\Modding\SkyrimConverted\vfs` and `.ingestion-cache` (47 GB,
+    regenerable) were refused by the permission classifier as irreversible, and so was
+    inspecting drive D: for a fresh conversion. With 74 GB free, an in-place run does not fit
+    without that deletion.
+  - The user chooses:
+    - **(a)** delete those two folders, then run
+      `target\release\converter.exe "<SkyrimSE>\Data" C:\Modding\SkyrimConverted --cpu-jobs 16 --report-json C:\Modding\SkyrimConverted-conversion-report.json`.
+      This is fast, since textures are reused.
+    - **(b)** approve a fresh conversion to D:, about 5 h.
+  - After it publishes, set the engine's `converter_schema_version()` (`app.rs`) to **16**.
+    Until then the engine stays at 15 on purpose, so the current assets keep working.
 - **Upstream:** `origin/main` has moved 16 commits ahead (`dummy-content`, ADRs, CI). A trial merge
   in `local/upstream-trial` has one test-only conflict in `bsa.rs`, now resolved; its build is
   being checked.
