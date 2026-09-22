@@ -94,7 +94,9 @@ Killing the queue runner or the `ds-agent.ps1` PowerShell process does **not** s
 | `impl-010-terrain-blending.md` | Smooth terrain layer blending; stretched terrain textures | done, accepted (`0ece570`; root cause: ClampToEdge sampler; lead fixed a WGSL type error found at first runtime compile) |
 | `research-011-transparent-and-misplaced-meshes.md` | Why objects render transparent or misplaced | done, reviewed (`bc54a17`; spot-checked `alpha_contract` vertex-alpha -> Blend) |
 | `impl-012-converter-alpha-and-markers.md` | Converter: vertex alpha is not blend, keep blend factors, drop editor markers | done, accepted without correction (`b4ce0d9`; lead bumped CONVERTER_SCHEMA_VERSION to 15) |
-| `impl-013-glow-blending-and-terrain-base.md` | Engine: additive/multiplicative glows, textureless terrain bases, clean door labels | launched 2026-09-22 |
+| `impl-013-glow-blending-and-terrain-base.md` | Engine: additive/multiplicative glows, textureless terrain bases, clean door labels | done, accepted without correction (`8d4160b`) |
+| `impl-014-converter-lights.md` | Converter: lights table from LIGH records, schema v5 | launched 2026-09-22 |
+| `impl-015-engine-lights.md` | Engine: point lights from LIGH references, nearest-64 budget | launched 2026-09-22 |
 | `impl-008-terrain-weld-and-water.md` | Weld vanilla terrain seams instead of dropping cells; no dry water planes | done, accepted without correction (`68c19bb`) |
 
 Update the status column when you launch or finish a task.
