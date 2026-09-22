@@ -287,7 +287,9 @@ def main(argv):
             ),
         )
         shown = 0
+        total = 0
         for row in rows:
+            total += 1
             if model_filter and model_filter not in (row[3] or "").lower():
                 continue
             record = {
@@ -305,7 +307,7 @@ def main(argv):
             show(record)
             shown += 1
         if model_filter:
-            print(f"  ({shown} of {len(rows)} rows matched model={model_filter})")
+            print(f"  ({shown} of {total} rows matched model={model_filter})")
     elif command == "arrival":
         # The XTEL arrival point a door writes, in creation units.
         for row in conn.execute(
