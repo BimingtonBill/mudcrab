@@ -25,10 +25,10 @@ this matters.
   (`crates/engine/src/streaming.rs`).
 - Reproduce: run the command above yourself with `--benchmark-output <file>` if the fixture takes
   one (check `config.rs`), or read the logs. Compare with `--terrain-radius 2`, which is the old
-  engine. Use `local/research-028/` for output. Give each run a timeout and kill it if it hangs.
-  You may run `target/release/engine.exe` and `taskkill /F /IM engine.exe`, but only for
-  processes you started. Check with `tasklist` first, and never kill a process you did not start:
-  the user may have the demo open.
+  engine. Use `local/research-028/` for output.
+  Run the engine from a small Python script under `tools/research/` using
+  `subprocess.run(..., timeout=...)`, so a hung run is killed by the script itself (only its own
+  child). Never kill processes by name: the user may have the demo open.
 - Find the stuck condition: a fixture step waiting for residency that ring cells never reach, the
   held-response queue, a terrain-only cell counted as pending forever, the `is_resident` semantic
   change, or something else. Give `file:line`.
