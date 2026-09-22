@@ -338,6 +338,114 @@ named.
 * `tools/research/aim.py` (new) prints the shots-file yaw and pitch from a camera position to a
   landmark, so candidates can be aimed at a database position instead of guessed.
 
+## research-024: re-fitting the poses after the object-rotation fix
+
+**Status:** research, 2026-09-22 (research-024). Commit `933b95f` made placed objects rotate
+clockwise, as Creation does, so every pose that research-020 had fitted against a *face* of a
+tower, a bridge or a wall was fitted against the wrong face. All 25 poses of
+`tools/reference/uesp_shots_4x3.json` and the one of `uesp_shots_blackreach_04.json` were
+rendered again in the corrected world; the nine Alftand-exterior poses were re-fitted and are
+the ones in the files now. Renders and scratch: `local/poses2/` (final renders
+`local/poses2/final-4x3/`, side-by-side pairs `local/poses2/cmp-final/`, sheet `_sheet.jpg`).
+
+### The clue that did most of the work
+
+A load door's facing is known from its link data, and this is what re-anchored the exteriors:
+the `door_links` row whose `destination_ref_id` is a door carries the point where the player
+stands after coming *through* that door, which the game puts in front of it. So the camera that
+sees the door's front is on that side. `tools/research/uesp_door_facing.py` prints it:
+
+| Door | Position | Arrival | Facing |
+|---|---|---|---|
+| `0005BDF1` (the ruined tower's door, AlftandZCell) | 73550, 78431, -5609 | 73582, 78430, -5609 (32 east) | east (XTEL heading 92) |
+| `0005BDC3` (the second AlftandZCell door) | 75998, 78971, -8106 | 76032, 78976, -8102 (34 east) | east (XTEL heading 90) |
+| `00015D48` (the Alftand entrance, an auto-load marker) | 78049, 76985, -5859 | 77583, 77412, -5817 (632 north-west) | north-west (XTEL heading 325) |
+| `000641E8` (the lift tower's lever) | 80001, 75827, -4169 | 80022, 75910, -4169 (83 north) | north (XTEL heading 16) |
+
+The ruined tower is the case the lead had already re-posed; the other three say which side of
+each of those towers the references can be looking at.
+
+### What the fix changed about the Alftand exterior
+
+The exterior is a ring of tower pieces seen from the ravine, and the old (counter-clockwise)
+rotations had each tower's arch and each bridge pointing somewhere else, so the previous poses
+were matched against a mirrored-feeling site. Two things fell out of re-rendering it:
+
+* **The Alftand-exterior references are shot from the north rim, looking south**, not from the
+  west rim. From the north, west is the right of the frame, which is the only way the reference
+  orders come out: the ShackKit shacks (79349..79577, 78505..78623 and 80441..80789,
+  77460..77684) at the left, the two ribbed-`Roof02` towers to their right, and the ruined tower
+  (73422,78436) at the far right edge. From the west rim the shacks and towers come out in the
+  wrong left-to-right order and a `Roof02` dome lands where the references have the big tower.
+* **The two ribbed-roof towers are T5 (76240,77035,-5294) and T6 (77992,78336,-6202)**, both
+  `DweFacadeTower1x4Snow` + `DweFacadeTowerRoof02Snow` + `DweFacadeTowerBase01` at scale 1.25,
+  with the `StockadeScaffold` walkway (77444,77656 / 77062,78041) between them and the entrance
+  platform (StockadeScaffoldBridge04 at 77969,77096, door `00015D48` at 78049,76985) below them.
+  Everything else in the site — `DweFacadeTowerArch1x4Snow` at 80001,75827 is the lift tower,
+  `DweFacadeTowerArch01Snow` at 73422,78436 the ruined tower, `DweFacadeTower02Snow` at
+  75982,78972, `DweFacadeTower01Snow` at 76101,79918 and 76057,79974 — is off the references'
+  sight lines or beyond them.
+
+### The nine exterior poses, as re-rendered
+
+| Reference | pos | yaw | pitch | Confidence | What the render shows |
+|---|---|---|---|---|---|
+| `SR-place-Alftand` | 76800, 81800, -2400 | 178 | 31 | close | the ruin from the north rim: the tower with its descending walkway at the upper left, the shacks left of centre, the wide ribbed roof of T6 over the entrance at the centre right, the ravine ice below |
+| `SR-place-Alftand_02` | 77700, 81500, -2400 | 172 | 26 | close | T6 at 55% and T5 at 79% of the frame with the walkway between them, the shack below left, the ravine in front - the reference's arrangement |
+| `SR-place-Alftand_03` | 77700, 79400, -2700 | 172 | 19 | close | the same ravine closer in: the tower with its platform and the plank walkway at the left, T5 cut off by the right edge |
+| `SR-place-Alftand_04` | 77000, 77600, -5800 | 5 | -28 | close | the underside of the mid-ravine footbridge across the top of the frame with the ravine ice and stone below |
+| `SR-place-Alftand_05` | 77600, 77200, -5900 | 0 | -20 | close | T6 from below with the entrance walkway and its rope crossing the upper right |
+| `SR-place-Alftand_06` | 77000, 77600, -1200 | 0 | 88 | close | the two ribbed roofs from 5000 above, north up, with the walkway between them |
+| `SR-place-Alftand_07` | 79450, 78700, -4590 | 30 | 65 | area only | inside a ShackKit hut looking down at its plank floor; the hut interior is only 192 units high and 260 wide, so it cannot hold the reference's wide snow floor |
+| `SR-place-Alftand_08` | 79350, 78650, -4580 | 120 | 5 | close | inside the same hut at head height looking out of its open side across the snow |
+| `SR-place-Alftand_Ruined_Tower` | 74750, 78431, -5100 | 270 | 2 | matched | unchanged - the lead's re-pose, which the door-facing data confirms |
+
+**Counts:** 1 `matched`, 15 `close`, 10 `area only` (research-020: 1 / 12 / 13). `_03`, `_04`
+and `_05` were promoted from `area only`: `_03` now has both towers and the walkway in the
+reference's places, `_04` and `_05` are no longer inside the ice.
+
+### What is still open
+
+* **`SR-place-Alftand`.** The reference's camera is nearer the towers than this pose: its
+  upper-left tower is a quarter of the frame wide against a tenth here. The world is right, the
+  stand-off is not. The whole site does not fit in one frame from the north rim at the
+  reference's scale, so the reference is a view of part of it, and which part is still a guess.
+* **`SR-place-Alftand_04`, `_05`.** Both are under a bridge in the ravine, and the ravine floor
+  is not flat: at 77000,77600,-5800 there is air where at 77800,76800,-6500 there is ice (that
+  is why research-020's `_04` rendered black). The usable band is about z -5700..-5900 and the
+  camera has to be placed by rendering rather than by the database.
+* **`SR-place-Alftand_07`.** The ShackKit huts are too small (192 units of headroom, 260 wide)
+  for the reference's floor patch, and the engine has no snow layer, so the reference's
+  snow-covered planks cannot be reproduced at all. The entrance scaffold platform at
+  77969,77096 is the other candidate for where that shot was taken.
+* **The 15 interior and Blackreach poses** keep research-020's numbers. They were re-rendered in
+  the corrected world and still show the space and the subject each reference has (see
+  `local/poses2/cmp-r0/`), but rooms whose fittings are strongly asymmetric — `Alftand_02`'s
+  furniture, `Alftand_13`/`_14` in AlftandWorld — would each want the fitting pass that the
+  exteriors got here.
+* **`hfov` 75 is still unverified** on any shot but the ruined tower, and it trades directly
+  against every stand-off distance above.
+
+### Rendering differences seen while re-fitting (beyond research-020's list)
+
+1. **The sky is a flat clear blue.** Every exterior reference is an overcast day with haze and
+   cloud; the engine has no cloud, haze or horizon band, so a third of the frame of `_01`, `_02`
+   and `_03` is a saturated blue the reference does not have. research-020's list has fog for
+   the interiors only.
+2. **The Dwemer roofs and domes render gold-brass.** `DweFacadeTowerRoof01/02` and the tower
+   bodies are the reference's weathered grey stone with a thin snow cap; in the render the roofs
+   are a polished gold and the metal trim is bright, which is what makes the towers read as
+   "wrong" long before their positions do (`_01`, `_02`, `_06`).
+3. **The big load door at the end of the Alftand01 corridor renders open onto black.**
+   `SR-interior-Alftand_03` and `_11` look down the corridor at door `00092809` and see a black
+   hole where the reference has the closed golden door - the door leaf is open (impl-009) and the
+   cell behind it is not streamed. research-020's item 6 covers the same black in Alftand02 and
+   AlftandWorld; this is the door case.
+4. **research-020's item 8 (interiors lit by a camera lantern only) no longer holds.** impl-019
+   removed the lantern and calibrated the ambient and the point lights, and the Alftand01
+   corridor, the shack interior and Blackreach's structures now read as evenly lit rooms rather
+   than a bright pool. The item is left in place above as the state it describes at the time.
+
 ## Files
 
 | File | What |
@@ -353,5 +461,9 @@ named.
 | `tools/research/image_grid.py`, `image_sizes.py` | pixel grids over a reference, and image sizes |
 | `tools/research/shot_grid.py` | one labelled grid of any images, for judging a pose sweep |
 | `tools/research/aim.py` | yaw and pitch from a camera position to a landmark |
+| `tools/research/uesp_make_shots.py` | build a shots file of candidate poses from a one-line-per-pose spec |
+| `tools/research/uesp_ref_list.py` | every placed object of a box or a cell on its own line, with rotation and scale |
+| `tools/research/uesp_door_facing.py` | which way each load door faces, read from the `door_links` arrival |
 | `local/reference/maps/`, `local/reference/fits/` | the maps and pose overlays (not committed) |
-| `local/poses/final/`, `local/poses/cmp-final/` | the final renders and their pairs (not committed) |
+| `local/poses/final/`, `local/poses/cmp-final/` | research-020's renders and pairs (not committed) |
+| `local/poses2/final-4x3/`, `local/poses2/cmp-final/` | research-024's renders and pairs (not committed) |
