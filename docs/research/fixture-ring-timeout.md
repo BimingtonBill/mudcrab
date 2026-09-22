@@ -68,7 +68,8 @@ logs and reports in `local/research-028/`.
 
 | shape | command | result |
 | --- | --- | --- |
-| lead | `--streaming-fixture --terrain-radius 8`, no benchmark window | ran 23712 frames / ~395 s and never exited (the lead's log); in this session still running when a 60 s timeout fired, killed by the probe script |
+| lead | `--streaming-fixture --terrain-radius 8`, no benchmark window | ran 23712 frames / ~379 s and never exited (the lead's log); in this session still running when a 60 s timeout fired, killed by the probe script |
+| same, ring off | `--streaming-fixture --terrain-radius 2`, no benchmark window | ran 14132 frames / 194 s, no `ERROR`, no exit - still running when a 300 s timeout fired, killed by the probe script |
 | ring 8 + duration | `--streaming-fixture --terrain-radius 8 --benchmark-duration 20` | exit 0, `streaming_fixture_validated = true`, `passed = true` |
 | ring 2 + duration (old engine) | `--streaming-fixture --terrain-radius 2 --benchmark-duration 20` | exit 0, `streaming_fixture_validated = true`, `passed = true` |
 | campaign shape | `--streaming-fixture --max-commit-ms 16.67 --benchmark-duration 20` plus the campaign's profiling flags | exit 0 after 145.6 s, scenario `streaming`, 9033 frames, 452 FPS, `streaming_fixture_validated = true`, `passed = true` |
@@ -92,6 +93,16 @@ active throughout, so FPS and wall clock are rough and should not be read as a r
 
 The ring adds 616 fixture requests (783 against 167) and nothing else that this fixture can see:
 `ring_cells_empty` 264 is exactly the ring, and it is 0 with the ring off.
+
+The hang is the same with the ring off: `--streaming-fixture --terrain-radius 2` and no benchmark
+window rendered 14132 frames over 194 s in this session, logged no `ERROR` and never exited
+(`local/research-028/nobench-r2.err`). Since the failure branch would have fired at frame 300, that
+run had also validated. With the ring on and the ring off, the only thing missing is an exit.
+
+The real assets agree. The lead's own ring-on runs with the converted data -
+`local/demo/ring.err`, `local/demo/ring2.err`, `local/demo/rotfix.err` - contain no `ERROR`, no
+`streaming lifecycle invariant failed` and no panic; the lifecycle validator only logs when it finds
+a violation, so the ring is not leaving stray or missing cell roots in an interactive run either.
 
 One deadline in the fixture is measured in frames, not seconds: the failure branch fires at frame
 300 (`crates/engine/src/app.rs:444`), which is 5 s in the lead's vsync'd 60 FPS run but under a
