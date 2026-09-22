@@ -34,6 +34,18 @@ the light sources themselves. Tune against the reference screenshots.
 
 ## Method
 
+0. **Setup.** Your checkout has no `local/reference/`. The references are in the lead's checkout at
+   `C:/Modding/OpenSkyrimProject/local/reference/uesp/`, which you can read. Copy them into your
+   checkout's `local/reference/uesp/` with a small script under `tools/research/` (the folder is
+   git-ignored; never commit the images). The smoke-interior pose is in
+   `C:/Modding/OpenSkyrimProject/local/reference/smoke_shots.json`.
+   **The poses are rough:** another worker (research-020) is refining them now, and many current
+   renders face a wall or the wrong way. So compare **per space**, not per shot. Pool the
+   luminance statistics of all references of one space (Alftand01, Alftand02, AlftandWorld,
+   Blackreach) and compare them with the pooled renders of that space. Also add a few poses of
+   your own, at eye height looking along corridors and across caverns in each space (add them
+   to a shots file of your own under `local/`), so the renders show typical views rather than
+   walls.
 1. Render the reference poses:
    ```
    target/release/engine.exe --assets C:/Modding/SkyrimConverted --shots tools/reference/uesp_shots_4x3.json --shots-out local/calib/<run>
@@ -61,14 +73,16 @@ the light sources themselves. Tune against the reference screenshots.
   one exterior reference render before and after.
 - The pose file and the references are inputs; do not edit them. If a pose is clearly wrong, say
   so in the report and leave it out of your numbers.
-- Only you run the engine while this task runs. Close it after each run: `--shots` exits by
+- research-020 also runs the engine while you do. That is fine: only the images matter here,
+  not timings. Run one engine at a time yourself, and do not measure FPS. `--shots` exits by
   itself.
+- Run the engine from your checkout: `target/release/engine.exe`, rebuilt from your changes.
 
 ## Done when
 
 - The Alftand01 arrival frame (the smoke-interior pose) is no longer washed out.
-- On the tuning set, the render's median luminance is within about a factor of 1.5 of the
-  reference's, and clipped pixels stay under 2% except where the reference clips too.
+- On the tuning set, pooled per space, the render's median luminance is within about a factor of
+  1.5 of the reference's, and clipped pixels stay under 2% except where the reference clips too.
 - The acceptance commands pass, and any test that pinned an old constant is updated with its
   reason.
 
