@@ -18,6 +18,20 @@ Read these first:
 - The snow statics share the plain NIF with their non-snow twins. The snow is only the projected
   material, which is why the roofs render bare bronze.
 
+## Status of the data (read first)
+
+The published assets at `C:/Modding/SkyrimConverted` do **not** have the new tables yet. The
+reconversion is waiting on a user decision about disk space, so the real `skyrim_world.db` has
+no `space_lighting`, `matos` or `statics.material_*`. So:
+- Implement, and prove correctness with unit tests on **fixture databases** that you build in
+  the tests. Use impl-038's exact DDL, from `crates/converter/src/esm/exporter.rs`, and the real
+  values listed in this brief.
+- The engine must behave exactly as today when the tables are absent (probe for them). Check
+  this at runtime: build release and run `--demo-tour`, which must pass 4/4 unchanged.
+- **Skip the calibration against renders.** It needs the new data. Instead, leave in your report
+  a ready-to-run calibration plan: the shots, the commands, the tuning/holdout split and the
+  metric. The lead resumes you after the reconversion.
+
 ## What to build
 
 - Read the two `statics` columns and the `matos` table through the database, with probes, as the
