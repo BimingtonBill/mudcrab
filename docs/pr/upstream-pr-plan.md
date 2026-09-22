@@ -2,6 +2,8 @@
 
 **Status:** research note, 2026-09-22. Audit of everything this fork has done since it was cloned,
 and a design for presenting it to `realfakenerd/OpenSkyrim` without publishing anything yet.
+**Revision audited:** `8919096..3ae5541` (83 commits). Other workers were committing to this branch
+while this was written, so a later count will be higher — every number below is from that range.
 **Method:** `git log`/`git diff 8919096..HEAD` and `8919096..origin/main`, `git grep` over the
 tracked tree, `cargo check --workspace`, `cargo test -p shared`, `cargo test -p converter --lib`,
 `cargo test -p engine --lib`, `cargo clippy --workspace --all-targets -- -D warnings`. Windows,
