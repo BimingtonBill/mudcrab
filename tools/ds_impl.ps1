@@ -30,7 +30,8 @@ param(
     [string]$Discard,
     [string]$Post,                        # re-run the checks for a finished checkout, no worker
     [switch]$DryRun,
-    [switch]$NoSeed                       # Rust: start the task's target/ empty instead of copying the lead's
+    [switch]$NoSeed,                      # Rust: start the task's target/ empty instead of copying the lead's
+    [string]$WebDomains                   # comma-separated domains the worker may fetch; its edits stay in the worktree for review
 )
 $ErrorActionPreference = 'Stop'
 # Where this runs. From the DeepSeek Workers harness (launcher\ds-agent.ps1 beside tools\): the project is
@@ -177,6 +178,36 @@ if (-not $Accept -and $briefText -match '(?m)^\s*Acceptance:\s*`?([^`\r\n]+)`?\s
 $owned = Split-List $Files
 $checks = Split-List $Accept
 if (-not $owned) { Fail 'the task owns no files: add "Owned files: a,b" to the brief or pass -Files' }
+# -Integrate copies owned files into the project, so they must stay inside it.
+$badPath = @($owned | Where-Object { [IO.Path]::IsPathRooted($_) -or ($_ -replace '\\', '/') -match '(^|/)\.\.(/|$)' -or ($_ -replace '\\', '/') -match '^\.git(/|$)' })
+if ($badPath) { Fail "owned files must be paths inside the project: $($badPath -join ', ')" }
+
+# Started by a DeepSeek lead (DS_RUN_ID is set) rather than by Claude: the brief was written by DeepSeek.
+# Its acceptance commands run here, outside the workers' permission system, so they must be plain test
+# commands; and it may not claim files the project protects, which would lift that protection in the worktree.
+$fromLead = [bool]$env:DS_RUN_ID
+if ($fromLead) {
+    $leadConfigPath = Join-Path $root '.deepseek-agents.json'
+    $leadConfig = if (Test-Path $leadConfigPath) { Get-Content $leadConfigPath -Raw | ConvertFrom-Json } else { $null }
+    $prefixes = if ($leadConfig -and $leadConfig.leadAcceptance) { @($leadConfig.leadAcceptance) }
+                else { @('cargo test', 'cargo check', 'cargo clippy', 'cargo build', 'cargo fmt --check', 'python -m unittest',
+                         'python -m pytest', 'py -m unittest', 'py -m pytest', 'npm test', 'npm run test', 'pnpm test',
+                         'yarn test', 'go test', 'go vet', 'dotnet test', 'dotnet build') }
+    foreach ($check in $checks) {
+        $okPrefix = $prefixes | Where-Object { $check -eq $_ -or $check.StartsWith("$_ ") }
+        if (-not $okPrefix -or $check -match '[;&|<>`$\r\n]') {
+            Fail "a lead's acceptance command must be a plain test command starting with one of: $($prefixes -join ', ') (no command separators, pipes, redirects or variables). Refused: $check"
+        }
+    }
+    foreach ($file in $owned) {
+        $f = $file -replace '\\', '/'
+        foreach ($rule in @($leadConfig.denyEdit) + @('.deepseek-agents.json', 'AGENTS.md', 'CLAUDE.md')) {
+            if (-not $rule) { continue }
+            $pattern = '^' + [regex]::Escape(($rule -replace '\\', '/')).Replace('\*\*', '.*').Replace('\*', '[^/]*') + '$'
+            if ($f -match $pattern) { Fail "a lead may not give a coder a protected file ($file matches $rule); ask Claude" }
+        }
+    }
+}
 
 $baseCommit = (& git -C $root rev-parse $Base).Trim()
 $work = Join-Path $implRoot $Name
@@ -239,11 +270,12 @@ if (-not (Test-Path $schema)) { $schema = Join-Path $harness 'templates\result-s
 # The worker writes a harmless notice to stderr. Merging that into the pipeline under
 # ErrorActionPreference Stop turns it into a terminating error and kills this runner while
 # the worker carries on, so let stderr flow to ours and keep the preference relaxed here.
+$webArgs = @(if ($WebDomains) { '-WebDomains', $WebDomains })
 $previousPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 try {
     $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $agent -TaskFile $briefPath -Dir $work `
-        -Label $Name -Schema $schema -MaxTurns $MaxTurns -TimeoutMinutes $TimeoutMinutes -Effort $Effort | Out-String
+        -Label $Name -Schema $schema -MaxTurns $MaxTurns -TimeoutMinutes $TimeoutMinutes -Effort $Effort @webArgs | Out-String
 } finally { $ErrorActionPreference = $previousPreference }
 $out.TrimEnd()
 [IO.File]::WriteAllText((Join-Path $work '.ds-result.json'), $out, (New-Object System.Text.UTF8Encoding $false))
@@ -277,7 +309,7 @@ if (-not $footer) {
 $touched = @(& git -C $work status --porcelain --untracked-files=all | ForEach-Object { ($_ -replace '^..\s+', '').Trim() } |
     Where-Object { $_ -and $_ -notmatch '^\.(deepseek-agents|ds-impl|ds-result|ds-review)\.json$' -and $_ -notmatch '(^|/)target/' })
 $outside = @($touched | Where-Object { $owned -notcontains $_ })
-if ($outside) { "[ds-impl] OUT OF SCOPE: $($outside -join ', ')" } else { "[ds-impl] scope ok ($($touched.Count) file(s))" }
+if ($outside) { "[ds-impl] OUT OF SCOPE: $($outside -join ', ')" } else { "[ds-impl] scope ok ($($touched.Count) file(s): $($touched -join ', '))" }
 
 # Acceptance: the brief's own commands, run in the worktree.
 $results = @()
