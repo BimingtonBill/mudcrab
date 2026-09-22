@@ -40,50 +40,25 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
-### 2026-09-23 (overnight, in progress) - Claude (visual gaps, animated doors and seamless crossing, demo for contributors, upstream PR plan)
+### 2026-09-23 (overnight) - Claude (visual gaps, animated doors and seamless crossing, demo for contributors, upstream PR)
 
-- **User's goals for the night:**
-  1. all the fixes and visual gaps;
-  2. animated doors, with seamless cell-to-cell walking through portals;
-  3. prepare the demo for other contributors, without publishing it;
-  4. general project work;
-  5. an audit and the design of a reasonable upstream PR.
-- **Landed so far:**
-  - `23a95a2` impl-023: the door front comes from the return link's `XTEL` (review-035 running).
-  - `cc53baf` docs-030: `docs/demo/README.md` and `tools/demo/*.ps1`. Claude ran both dry runs.
-  - `6998431` research-028: the fixture "hang" is by design; it needs a benchmark window.
-  - `4ce6f1f` research-027: `docs/design/animated-doors-and-seamless-crossing.md`.
-  - research-029: `docs/pr/upstream-pr-plan.md`, a series of 9 PRs, with the cleanup and
-    exclusion lists.
-  - research-031: `docs/research/reconversion-disk-budget.md`.
-  - `79ce3be`: the visual-gaps spec from lead-026, in `docs/research/visual-gaps-spec.md`.
-- **Running:**
-  - impl-032: converter NIF Open/Close → glTF clips;
-  - impl-033: door state machine; no DB column, clips found by name through `Gltf::named_animations`;
-  - impl-034: seamless crossing;
-  - impl-036: emissive exposure, HDR + bloom, light reach cap;
-  - impl-037: empty marker models;
-  - impl-038: converter `space_lighting`, `matos`, the `statics` DNAM columns;
-  - review-035.
-- **Disk:** each ds_impl worktree seeds about 11 GB of `target/`. Discard a worktree as soon as it
-  is integrated. That alone freed 45 GB tonight.
-- **Reconversion: blocked on a user decision.** The code is ready. Converter schema 16 is in
-  `97eefa4`: door clips, `space_lighting`, `matos`, and a migration that keeps cached textures.
-  `WORLD_DATABASE_SCHEMA_VERSION` stays 5, because the new tables are additive and probed.
-  - Claude's attempts to delete `C:\Modding\SkyrimConverted\vfs` and `.ingestion-cache` (47 GB,
-    regenerable) were refused by the permission classifier as irreversible, and so was
-    inspecting drive D: for a fresh conversion. With 74 GB free, an in-place run does not fit
-    without that deletion.
-  - The user chooses:
-    - **(a)** delete those two folders, then run
-      `target\release\converter.exe "<SkyrimSE>\Data" C:\Modding\SkyrimConverted --cpu-jobs 16 --report-json C:\Modding\SkyrimConverted-conversion-report.json`.
-      This is fast, since textures are reused.
-    - **(b)** approve a fresh conversion to D:, about 5 h.
-  - After it publishes, set the engine's `converter_schema_version()` (`app.rs`) to **16**.
-    Until then the engine stays at 15 on purpose, so the current assets keep working.
-- **Upstream:** `origin/main` has moved 16 commits ahead (`dummy-content`, ADRs, CI). A trial merge
-  in `local/upstream-trial` has one test-only conflict in `bsa.rs`, now resolved; its build is
-  being checked.
+**The user's five goals, and where each stands.**
+
+1. **Visual gaps.** lead-026 (4 research + 3 websearch workers) produced `docs/research/visual-gaps-spec.md`. Landed:
+   - `23adbb4` glow: HDR + bloom, `EMISSIVE_EXPOSURE = 100` applied only to materials the converter marked with an emissive strength (mushrooms, the Blackreach sun, flames), so Own_Emit surfaces (ice, snowy trees) keep Tamriel's daylight within 0.8%; `intensity_for_radius` capped at a 256-unit reference, which is bit-identical below radius 512 and removes Blackreach's orange ceiling. Claude's holdout: AlftandWorld 1.14x, Blackreach 1.26x, clip 0.66%.
+   - `2b69616` empty marker models (Blackreach's two) no longer fail the bounds gate.
+   - `26324d5` converter `space_lighting` + `matos` + `statics` DNAM columns, layouts settled from the real bytes (LGTM payload is DATA; inherit bit set = from template; WTHR FNAM interleaves day/night; MATO's last field is an integer flag).
+   - `66ee786` engine per-space lighting: backdrop, fog, ambient hue and sun tint per space, destination atmosphere on the portal camera. Record colours are applied as **hue** with the calibrated brightness kept.
+   - `cfe4893` directional snow (DNAM/MATO projected material), inert until the data exists.
+   - Ice (environment maps) is still open, and so is the calibration of the last two, which needs the reconversion.
+2. **Animated doors and seamless crossing.** `f6749e2` converter exports Open/Close clips (all 768 door NIFs decode; 171 animated). `50bc0f1` the door state machine (clips found by name; a leaf whose swing is under 45 degrees hides when open). `49f2df5` the seamless crossing: the player's pose is carried through the door instead of snapping. `b535a30` the two wired together, plus the review corrections. Claude's check on the integrated build: **walk tour 4/4 by walking, 0 errors, 0 dark frames in 811 captured frames**; the frames either side of a swap are the same view (`local/demo/walk-swap-fixed.jpg`). The route's Dwemer doors only twitch 5-9 degrees in the real data; their non-load twins swing 86-88. **Open question for the user:** keep the faithful twitch or borrow the twin's swing?
+3. **Demo for contributors.** `cc53baf`: `docs/demo/README.md`, `tools/demo/setup-demo.ps1` (prereqs, build, Skyrim detection, conversion with resume, launcher) and `tools/demo/play-demo.ps1`. Claude ran both dry runs. Nothing published.
+4. **The project as a whole.** Upstream `origin/main` (16 commits: `dummy-content`, ADRs, CI) merged locally (`8c21447`, one test-only conflict). `40e0eb5` extends `dummy-content` with an interior cell and a linked load-door pair, so upstream can test doors and portals without Skyrim. research-028: the streaming fixture never exits without a benchmark window - not a ring bug.
+5. **Audit and PR design.** `docs/pr/upstream-pr-plan.md` (research-029): 9 PRs, fixes first, with exclusion and cleanup lists. Cleanups done: `410ce31` converter (ADR-0002 `OPENSKYRIM_SKYRIM_DATA` / `OPENSKYRIM_CONVERTED_DIR`, no machine paths, no private names), `62c0f7b` + `944250e` engine parts 1-2, part 3 running. Not done: re-cutting the commits into the PR series (the plan's step), which needs the user.
+
+**Blocked on the user:** the reconversion (see the entry below). Until it runs, door clips, per-space lighting and snow have no data, and each is inert by design.
+
+**Process notes.** Every worker patch got an independent DeepSeek review (review-035/040/041/042/045/049) or a full read by Claude; four rounds of corrections were sent back. Discard each ds_impl worktree right after integrating: they seed ~11 GB of `target/` each.
 
 ### 2026-09-22 (night) - Claude (rotation fix, distant terrain, closed doors)
 
