@@ -105,6 +105,10 @@ if ($Integrate) {
         $to = Join-Path $root $file
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $to) | Out-Null
         Copy-Item -LiteralPath $from -Destination $to -Force
+        # Copy-Item keeps the worker's modification time. If that is older than the lead's last build,
+        # cargo treats the integrated source as unchanged and a release build silently reuses the old
+        # binary (seen with impl-013, 2026-09-22). Stamp it as changed now.
+        (Get-Item -LiteralPath $to).LastWriteTime = Get-Date
         $copied += $file
     }
     "[ds-impl] copied into master: $($copied -join ', ')"
