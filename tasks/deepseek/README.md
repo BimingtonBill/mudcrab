@@ -90,10 +90,11 @@ Killing the queue runner or the `ds-agent.ps1` PowerShell process does **not** s
 | `impl-005-converter-door-links.md` | Converter: XTEL door links, six more base types, schema v4 | done, accepted without correction (`df91524`) |
 | `impl-006-engine-door-streaming.md` | Engine: active cell, interiors, seamless door crossings | done, accepted without correction (`7a155fa`) |
 | `impl-007-player-controller.md` | Engine: first-person player controller (--walk) | done, accepted without correction (`be8c2dc`); found the shared target-dir flaw |
-| `impl-009-door-portals.md` | Hide load doors, isolate pre-streamed cells, portal view into the destination | launched 2026-09-22 |
-| `impl-010-terrain-blending.md` | Smooth terrain layer blending; stretched terrain textures | launched 2026-09-22 |
+| `impl-009-door-portals.md` | Hide load doors, isolate pre-streamed cells, portal view into the destination | done, accepted (`f219a05`; lead fixed a startup-order panic the worker could not run) |
+| `impl-010-terrain-blending.md` | Smooth terrain layer blending; stretched terrain textures | done, accepted (`0ece570`; root cause: ClampToEdge sampler; lead fixed a WGSL type error found at first runtime compile) |
 | `research-011-transparent-and-misplaced-meshes.md` | Why objects render transparent or misplaced | done, reviewed (`bc54a17`; spot-checked `alpha_contract` vertex-alpha -> Blend) |
-| `impl-012-converter-alpha-and-markers.md` | Converter: vertex alpha is not blend, keep blend factors, drop editor markers | launched 2026-09-22 |
+| `impl-012-converter-alpha-and-markers.md` | Converter: vertex alpha is not blend, keep blend factors, drop editor markers | done, accepted without correction (`b4ce0d9`; lead bumped CONVERTER_SCHEMA_VERSION to 15) |
+| `impl-013-glow-blending-and-terrain-base.md` | Engine: additive/multiplicative glows, textureless terrain bases, clean door labels | launched 2026-09-22 |
 | `impl-008-terrain-weld-and-water.md` | Weld vanilla terrain seams instead of dropping cells; no dry water planes | done, accepted without correction (`68c19bb`) |
 
 Update the status column when you launch or finish a task.
