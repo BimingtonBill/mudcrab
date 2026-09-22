@@ -38,6 +38,16 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-22 (late) - Claude (reference screenshots and matched renders)
+
+- **User ask:** collect Skyrim screenshots of the demo's locations, then render the same compositions in OpenSkyrim for comparison.
+- **References:** 26 UESP screenshots (CC BY-SA; download approved by the user) in `local/reference/uesp/` (git-ignored, `SOURCES.txt`).
+- **Built:** design `docs/design/reference-shots.md` (the shots-file contract). impl-017 `--shots <file> [--shots-out <dir>]` renders exact poses once streaming settles (`5e53712`, DeepSeek, verified at runtime by Claude). research-018 wrote the first poses, `tools/compare_shots.py` and the mapping/fitting scripts (`adbea02`, `4050696`).
+- **First renders:** `local/reference/cmp1/`. The Ruined Tower matches; most other poses are rough (walls, and some pitch signs flipped).
+- **Found:** the Alftand01 arrival is washed out to white at eye height. The suspect is the stopgap camera lantern (3e9) in `update_atmosphere`. It showed once crossings landed at eye height (`4b1dd7a`).
+- **Running:** research-020, which refines the poses by rendering (main checkout, edits `tools/reference/*.json`). impl-019, which calibrates interior and underground lighting per space (worktree `local/impl/impl-019-light-calibration`). `.deepseek-agents.json` now has `implAllowTools` with `cargo build` and the release engine.
+- **Next:** review both. Check impl-019 on the holdout references (odd digits) once research-020's poses land. Render the final comparison set for the user.
+
 ### 2026-09-22 (day) - Claude (terrain textures, see-through meshes, open doors with portals)
 
 - **User asks:** work on terrain and terrain textures; doors not rendered (or open) so you can see into the next interior; fix objects that render transparent or misplaced.
