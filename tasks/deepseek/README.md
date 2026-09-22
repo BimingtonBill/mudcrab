@@ -97,7 +97,7 @@ Killing the queue runner or the `ds-agent.ps1` PowerShell process does **not** s
 | `impl-013-glow-blending-and-terrain-base.md` | Engine: additive/multiplicative glows, textureless terrain bases, clean door labels | done, accepted without correction (`8d4160b`) |
 | `impl-014-converter-lights.md` | Converter: lights table from LIGH records, schema v5 | done, accepted without correction (`5cd1bf4`) |
 | `impl-015-engine-lights.md` | Engine: point lights from LIGH references, nearest-64 budget | done, accepted without correction (`2acd409`) |
-| `impl-016-auto-load-doors.md` | Auto-load doors cross on contact; E stays for other doors | launched 2026-09-22 |
+| `impl-016-auto-load-doors.md` | Auto-load doors cross on contact; E stays for other doors | done, accepted without correction (`83ec4cd`) |
 | `impl-008-terrain-weld-and-water.md` | Weld vanilla terrain seams instead of dropping cells; no dry water planes | done, accepted without correction (`68c19bb`) |
 
 Update the status column when you launch or finish a task.
