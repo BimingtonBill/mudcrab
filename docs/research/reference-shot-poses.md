@@ -390,7 +390,7 @@ were matched against a mirrored-feeling site. Two things fell out of re-renderin
 
 | Reference | pos | yaw | pitch | Confidence | What the render shows |
 |---|---|---|---|---|---|
-| `SR-place-Alftand` | 76800, 81800, -2400 | 178 | 31 | close | the ruin from the north rim: the tower with its descending walkway at the upper left, the shacks left of centre, the wide ribbed roof of T6 over the entrance at the centre right, the ravine ice below |
+| `SR-place-Alftand` | 81000, 82800, -2400 | 205 | 36 | close | the ruin from the north-east: the tower with its descending walkway at the upper left, a shack at the left, the wide ribbed roofs of T6 and T5 over the entrance right of centre, the ruined tower at the right edge, the ravine ice across the foreground |
 | `SR-place-Alftand_02` | 77700, 81500, -2400 | 172 | 26 | close | T6 at 55% and T5 at 79% of the frame with the walkway between them, the shack below left, the ravine in front - the reference's arrangement |
 | `SR-place-Alftand_03` | 77700, 79400, -2700 | 172 | 19 | close | the same ravine closer in: the tower with its platform and the plank walkway at the left, T5 cut off by the right edge |
 | `SR-place-Alftand_04` | 77000, 77600, -5800 | 5 | -28 | close | the underside of the mid-ravine footbridge across the top of the frame with the ravine ice and stone below |
@@ -406,10 +406,12 @@ reference's places, `_04` and `_05` are no longer inside the ice.
 
 ### What is still open
 
-* **`SR-place-Alftand`.** The reference's camera is nearer the towers than this pose: its
-  upper-left tower is a quarter of the frame wide against a tenth here. The world is right, the
-  stand-off is not. The whole site does not fit in one frame from the north rim at the
-  reference's scale, so the reference is a view of part of it, and which part is still a guess.
+* **`SR-place-Alftand`.** Two bearings put the shacks at the left and the towers to their right
+  — the north rim (76800,81800, the first candidate tried) and the north-east (81000,82800, the
+  pose kept). The north rim leaves a quarter of the frame as the engine's clear blue sky where
+  the reference is all terrain, so the north-east pose is the one written down; but the
+  reference's camera is still nearer the ruin than either, and the whole site does not fit at
+  its scale, so which part of the site the reference actually frames is still open.
 * **`SR-place-Alftand_04`, `_05`.** Both are under a bridge in the ravine, and the ravine floor
   is not flat: at 77000,77600,-5800 there is air where at 77800,76800,-6500 there is ice (that
   is why research-020's `_04` rendered black). The usable band is about z -5700..-5900 and the

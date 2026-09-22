@@ -34,17 +34,22 @@ reference's space and subject. Final renders: `local/poses2/final-4x3/` and
   north-west, the lift lever `000641E8` faces north. Read from `door_links`, and consistent with
   the renders that were kept.
 * `python -m unittest discover -s tests`: 158 tests, OK.
-* The exterior references are shot from the **north** rim of the ravine looking south, not the
-  west rim: from the north the frame holds the shacks at the left, the two ribbed-roof towers
+* The exterior references are shot from the **north side** of the ravine looking south, not the
+  west rim: from there the frame holds the shacks at the left, the two ribbed-roof towers
   (T5 76240,77035 and T6 77992,78336, both `DweFacadeTower1x4Snow` + `Roof02Snow` at scale 1.25)
   to their right and the ruined tower at the right edge, which is the reference's order; from
   the west rim research-020's poses put a ribbed roof where the references have the big tower.
+  `_02` to `_05` are from the north (77700,81500 and 77700,79400); `_01` and `_06` fit better
+  from the north-east, where the same order holds and the sky is out of the frame.
 
 ## Not verified, and where the risk is
 
-* **`SR-place-Alftand` (the wide view).** The world and the order of the objects are right; the
-  stand-off is not - the reference's camera is roughly twice as close to its left-hand tower.
-  Its pose is a view of part of the site, and which part is a guess.
+* **`SR-place-Alftand` (the wide view).** Two bearings give the reference's left-to-right order
+  (the north rim and the north-east); the north rim leaves a quarter of the frame as the
+  engine's clear blue sky, which the reference does not have, so the north-east pose
+  (81000,82800,-2400, yaw 205, pitch 36) is the one written down. The reference's camera is
+  still nearer the ruin than either, and the whole site does not fit at that scale, so which
+  part of the site it frames is a guess.
 * **`_04` and `_05`** are inside the ravine, where the floor is not flat: 77000,77600,-5800 is
   air and 77800,76800,-6500 is ice (that is why research-020's `_04` came back black). Both are
   now above the ice and show the reference's bridge and tower, but the exact stand-off was found
