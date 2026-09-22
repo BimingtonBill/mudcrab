@@ -87,7 +87,7 @@ above. "Fit" is the residual of the least-squares fit where one was run.
 | `SR-interior-Alftand_10` | looking down at a round rimmed platform with a body on it | `DweFacadeLiftUp01` (6479,-185,-7176), the lift into the Animonculory | cell 355355, 6479, -185, -6600 | 90 | 45 | 75 | low |
 | `SR-interior-Alftand_11` | on a stair below a golden Dwemer door, frost on the floor, cobwebs | door `0x92809` (4057,8792,-516), `FXSteamCrack` (3613/3223,8929/8948), `FXcobwebWall01` (3855,8574) | cell 86723, 3760, 8792, -1100 | 90 | -20 | 75 | medium |
 | `SR-interior-Alftand_12` | standing inside a Dwemer arch at the top of a stair, looking out into a teal cavern | the Blackreach exit structure: `DweFacadeTowerArch01` + `DweFacadeHallSmExBg01` + the large door `0x4E504` at (21150,18531,2432), `DwePlatBgMid01` (20981,18714,2431) | world 126562, 21150, 19000, 2900 | 180 | 10 | 75 | medium |
-| `SR-interior-Alftand_13` | looking down into a circular plaza ringed by domed towers, pipes overhead | AlftandWorld's towers (-3864,1543), (-3658,1161), (-4132,842) and the round platform cluster at (-2397..-3045, 1713..2534, 1255) | world 432215, -3200, 2200, 3400 | 0 | 55 | 75 | medium |
+| `SR-interior-Alftand_13` | looking down into a circular plaza ringed by domed towers, pipes overhead | AlftandWorld's towers (-3864,1543), (-3658,1161), (-4132,842) and the round platform cluster at (-2397..-3045, 1713..2534, 1255) | world 432215, -2200, 800, 3600 | 15 | 52 | 75 | medium, checked by projection: `DweFacadeTower02` lands on the big dome at the lower left |
 | `SR-interior-Alftand_14` | a stair up to a glowing orb on a stand between two domed towers | `FXGlowFillRndLitMid` (4x around -1091,2681,2167), `DweFloorLantern` (-1561,2550) | world 432215, -1000, 2400, 1500 | 342 | -20 | 75 | low |
 
 ### Blackreach
@@ -137,6 +137,24 @@ level the brief asks for. `medium` covers the shots where the landmark is unique
 identity is not in doubt (the Blackreach sun, the Alftand entrance platform, the doors). `low`
 covers the exteriors whose towers could not be told apart and the interiors placed on the right
 machinery but from the wrong distance.
+
+## What was checked by projection, and what was not
+
+`uesp_pose_check.py` draws the database's objects through a candidate pose onto the reference;
+these are the overlays that were looked at (they are git-ignored, under
+`local/reference/fits/`):
+
+| Overlay | Reference | Result |
+|---|---|---|
+| `check02w.jpg` | exterior `_02` | the arch tower, tower A and the ruined tower all land on visible towers: this is the pose written down |
+| `check03a.jpg`, `check03c.jpg` | exterior `_03` | the arch tower can be made to land with two different cameras, but no assignment puts all three towers on towers; left at low confidence |
+| `check_i07c.jpg` | interior `_07` | the `DwePipeCap01`/`DwePipe1way01`/`DwePipe2way01` projections land on the pipe work the frame shows |
+| `check_i12.jpg` | interior `_12` | the `DweFacadePartitionRoof01`/`DwePlatWall01`/`DwePlatCorOut01` projections land on the stair and floor in the frame's lower half |
+| `check_i13b.jpg` | interior `_13` | `DweFacadeTower02` lands on the big dome at the lower left and the platform pieces on the plaza rim |
+
+The other 21 shots were placed from the database without a projection check (there is no
+distinctive object in the frame to check them against, or the space itself is the evidence), so
+their positions are only as good as the reasoning in the table above.
 
 ## What the renders should be checked for
 
