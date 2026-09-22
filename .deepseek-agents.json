@@ -26,5 +26,5 @@
     "maxTurns": 400,
     "timeoutMinutes": 150
   },
-  "delegation": 7
+  "delegationLevel": 4
 }
