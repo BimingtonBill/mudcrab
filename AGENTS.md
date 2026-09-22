@@ -40,6 +40,41 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-23 (overnight, in progress) - Claude (visual gaps, animated doors and seamless crossing, demo for contributors, upstream PR plan)
+
+- **User's goals for the night:**
+  1. all the fixes and visual gaps;
+  2. animated doors, with seamless cell-to-cell walking through portals;
+  3. prepare the demo for other contributors, without publishing it;
+  4. general project work;
+  5. an audit and the design of a reasonable upstream PR.
+- **Landed so far:**
+  - `23a95a2` impl-023: the door front comes from the return link's `XTEL` (review-035 running).
+  - `cc53baf` docs-030: `docs/demo/README.md` and `tools/demo/*.ps1`. Claude ran both dry runs.
+  - `6998431` research-028: the fixture "hang" is by design; it needs a benchmark window.
+  - `4ce6f1f` research-027: `docs/design/animated-doors-and-seamless-crossing.md`.
+  - research-029: `docs/pr/upstream-pr-plan.md`, a series of 9 PRs, with the cleanup and
+    exclusion lists.
+  - research-031: `docs/research/reconversion-disk-budget.md`.
+  - `79ce3be`: the visual-gaps spec from lead-026, in `docs/research/visual-gaps-spec.md`.
+- **Running:**
+  - impl-032: converter NIF Open/Close → glTF clips;
+  - impl-033: door state machine; no DB column, clips found by name through `Gltf::named_animations`;
+  - impl-034: seamless crossing;
+  - impl-036: emissive exposure, HDR + bloom, light reach cap;
+  - impl-037: empty marker models;
+  - impl-038: converter `space_lighting`, `matos`, the `statics` DNAM columns;
+  - review-035.
+- **Disk:** each ds_impl worktree seeds about 11 GB of `target/`. Discard a worktree as soon as it
+  is integrated. That alone freed 45 GB tonight.
+- **Reconversion plan** (after impl-032 and impl-038):
+  1. bump `CONVERTER_SCHEMA_VERSION` 15→16 and `WORLD_DATABASE_SCHEMA_VERSION` 5→6 (Claude);
+  2. delete `vfs/` and `.ingestion-cache/` (47 GB, regenerable);
+  3. reconvert in place. Textures are reused.
+- **Upstream:** `origin/main` has moved 16 commits ahead (`dummy-content`, ADRs, CI). A trial merge
+  in `local/upstream-trial` has one test-only conflict in `bsa.rs`, now resolved; its build is
+  being checked.
+
 ### 2026-09-22 (night) - Claude (rotation fix, distant terrain, closed doors)
 
 - **User asks:** the Ruined Tower was rotated wrongly in the side-by-side comparison, so check rotation and placement. Also increase the render distance so distant terrain shows.
