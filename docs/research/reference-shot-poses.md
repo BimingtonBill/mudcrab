@@ -181,6 +181,163 @@ their positions are only as good as the reasoning in the table above.
   (`SR-place-Alftand_Ruined_Tower`), the Blackreach sun and the giant mushrooms (`_02`, `_04`),
   and in Alftand02 the lift platform and the two pipe columns.
 
+## research-020: the poses after rendering and comparing
+
+**Status:** research, 2026-09-22 (research-020). Every pose above was rendered with
+`engine.exe --shots` and compared with its reference; the poses in
+`tools/reference/uesp_shots_4x3.json` and `tools/reference/uesp_shots_blackreach_04.json` are now
+the refined ones, and this section is what the renders changed and what is left open. The renders
+and the candidate sweeps are git-ignored: the final ones are in `local/poses/final/` and their
+side-by-side pairs in `local/poses/cmp-final/` (`_sheet.jpg` holds all 25).
+
+### Method
+
+Rendering is cheap (about 1 s per shot in `--shots` mode), so a pose is now found by sweeping:
+a survey of 8-16 wide-angle views to find the right part of a space, then a round of 4-6
+candidate poses per reference at the shots file's own `hfov` 75, then `tools/compare_shots.py`
+or `tools/research/shot_grid.py` to put the reference and the candidates side by side. The
+database probes from research-018 (`uesp_probe.py box|base-near|bounds`, `uesp_space_map.py`)
+were used to pick the candidates. `tools/research/aim.py` prints the yaw and pitch from a
+camera position to a landmark, which is how most candidates were aimed.
+
+**The conventions are confirmed on screen, not assumed.** `pitch` positive is down: the round-1
+pose of `SR-place-Alftand_06` (pitch 88.5) renders the two round roofs from directly above,
+which is the reference's view, and `SR-interior-Alftand_04` (pitch -45) renders a floor above
+the camera. research-018 wrote the pitch sign correctly; what looked flipped in
+`SR-interior-Alftand_03` was the *pose*, not the convention - the reference looks along a
+corridor whose floor is 6 units under the camera's feet, and at pitch -25 the round-1 camera
+looked at the ceiling instead.
+
+### The 26 poses, as rendered
+
+`pos` is the camera's eye in Creation units, then yaw, pitch, hfov. "What matched" is what the
+render puts in the frame at this pose.
+
+### Tamriel, Alftand exterior (worldspace 60, 1400x1050)
+
+| Reference | pos | yaw | pitch | Confidence | What matched |
+|---|---|---|---|---|---|
+| `SR-place-Alftand` | 76000, 75000, -3000 | 40 | 30 | close | the ruin from a high south-west view: the pointed Roof01 tower, the shacks on the shelf, the lift tower, all in frame as the reference has them |
+| `SR-place-Alftand_02` | 71872, 80768, -4295 | 122 | 27.3 | close | the ravine with towers, kept from the database fit (rms 95 px) |
+| `SR-place-Alftand_03` | 71500, 80500, -3900 | 124 | 22 | area only | the ravine and shelf; the tower assignments do not line up |
+| `SR-place-Alftand_04` | 77800, 76800, -6500 | 45 | -25 | area only | the underside of the entrance walkway with the ravine floor below |
+| `SR-place-Alftand_05` | 77700, 77600, -6500 | 340 | -30 | area only | the ravine wall and bridge structures |
+| `SR-place-Alftand_06` | 77900, 78400, -1500 | 100 | 88 | close | both ribbed Roof02 domes and the wooden structures between them, from above |
+| `SR-place-Alftand_07` | 79460, 78620, -4300 | 300 | 70 | area only | inside a shack looking down at snow on the planks |
+| `SR-place-Alftand_08` | 79460, 78620, -4400 | 320 | 0 | close | inside the shack frame with the timber braces and the snow outside |
+| `SR-place-Alftand_Ruined_Tower` | 73550, 77030, -5050 | 0 | 2 | matched | the tower, its arch frame and door centred in open snow - the stand-off is 1400 (round-1's 1900 made the tower 0.34 of the frame against the reference's 0.46) |
+
+### Interiors
+
+| Reference | Space | pos | yaw | pitch | Confidence | What matched |
+|---|---|---|---|---|---|---|
+| `SR-interior-Alftand_02` | 432216 | 900, 8700, -6100 | 200 | 8 | area only | the AlftandZCell room's carved wall and alcove; the reference's tables and bench are not in this room |
+| `SR-interior-Alftand_03` | 86723 | 2900, 8792, -420 | 90 | 14 | close | the corridor east along y=8792 with its runner, carved walls and the large door 0x92809 at the end |
+| `SR-interior-Alftand_04` | 355355 | 6618, -4449, -6700 | 250 | -60 | close | the deck underside, the ribbed pipe ends and the pipe runs over the cavern floor |
+| `SR-interior-Alftand_05` | 355355 | 6618, -4449, -6900 | 90 | -62 | close | the round deck with its central machine drum, seen from about 1000 below |
+| `SR-interior-Alftand_06` | 355355 | 6618, -4449, -6900 | 135 | -60 | close | the pipe bends and the fan with the ribbed pipe end behind |
+| `SR-interior-Alftand_07` | 355355 | 6800, -4300, -6000 | 30 | -40 | close | the ribbed pipe end low left, a pipe crossing to the upper right, the lit hub and the ice |
+| `SR-interior-Alftand_08` | 355355 | 6300, -4100, -6900 | 30 | -50 | area only | the carved deck underside across the bottom with pipe runs above and the ice behind |
+| `SR-interior-Alftand_09` | 355355 | 6618, -4449, -6900 | 315 | -60 | area only | the pipe cluster and the ice; the reference's column with its bell caps is not framed |
+| `SR-interior-Alftand_10` | 355355 | 8350, -4450, -5200 | 270 | 45 | close | a round DwePlatBgMid02 deck with its metal rim ring and cracked slabs, seen from 900 above |
+| `SR-interior-Alftand_11` | 86723 | 2600, 8792, -400 | 90 | 6 | close | the corridor to the large door with the runner, the frost patch (FXSteamCrack) and the door at the end |
+| `SR-interior-Alftand_12` | 126562 | 21150, 19900, 2900 | 180 | 18 | close | the platform and its steps with the arch and the teal cavern beyond |
+| `SR-interior-Alftand_13` | 432215 | -3000, 1400, 4200 | 20 | 55 | area only | the cathedral's domed superstructure from above; the reference is higher and further west |
+| `SR-interior-Alftand_14` | 432215 | -1091, 2900, 1400 | 0 | -22 | area only | dark; the orb's stand and the two towers were not reproduced |
+
+### Blackreach (worldspace 126562)
+
+| Reference | pos | yaw | pitch | Confidence | What matched |
+|---|---|---|---|---|---|
+| `SR-place-Blackreach` | 8500, 6000, 1700 | 30 | -3 | close | the mushroom field filling the middle and lower frame with the big caps at the centre |
+| `SR-place-Blackreach_02` | 4500, 12500, 2500 | 260 | -15 | area only | dark structures and the cavern; closer poses put a giant mushroom's own cap across the whole frame |
+| `SR-place-Blackreach_03` | 10000, 8000, 1200 | 310 | 0 | area only | the tower bases and cavern on the BlackreachTowers side; the reference's lit doorway tower was not identified |
+| `SR-place-Blackreach_04` (1718x1080) | 4012, 13238, 2100 | 205 | -18 | area only | the Dwemer structures north-east of the sun; the orb's stand-off is right (about 5000) but the plaza with the gratings is not in front of it |
+
+**Counts:** 1 matched, 12 close, 13 area only. Nothing is graded high: the "matched" bar in the
+brief (the main landmarks within 10% of the frame width) was reached for the ruined tower, and
+for the rest the render shows the right place and the right class of objects but not yet the
+same arrangement to the pixel.
+
+### What is still open, and what would close it
+
+* **Alftand exterior towers (9 shots, 7 of them weak).** The tower assignments still cannot be
+  told apart from the references: seven tower pieces stand within 8000 units and the roofs are
+  the only discriminator. `local/scratch/assign_shots.json` (research-018) holds 120 candidate
+  assignments; the next pass should render those 120 rather than reason about them - at one
+  second each this is two minutes of GPU and settles the exteriors by eye.
+* **The two shacks (`_07`, `_08`).** `_08` is inside the shack frame now; `_07` is not, and the
+  other reading (the entrance scaffold platform rather than a shack) is untested. The shacks have
+  no interior cell, so either reading is a camera inside a shell.
+* **`SR-interior-Alftand_02`.** The AlftandZCell room has one dresser, a bench, a counter and a
+  bust; the reference shows two stone tables and a bench in a round vaulted room. The same
+  furniture also exists in Alftand01's crew rooms, which were not swept.
+* **The Alftand02 "up the machinery" frames (04-10).** All seven are now over the machinery (the
+  pipe hub cluster at 6618,-4449 and the DwePlatBg decks), which is the right machinery, but the
+  exact camera for each was chosen by resemblance, not fitted. A projection overlay
+  (`uesp_pose_check.py`) with the pipe cluster and the deck rings as the landmarks would fix
+  them the way `_02` and `_13` were fixed before.
+* **Blackreach `_02` and `_04`.** Both are dominated by a giant mushroom or a Dwemer wall that
+  the reference sees at a distance. The sun's visible orb sits about 1400 below
+  `BlackreachSun01`'s origin (2112,9088,6336) - that estimate comes from where the orb appears
+  in renders, not from the model bounds - so poses for both can now be computed rather than
+  guessed: put the camera 5000 away for `_04` and 2500-3000 for `_02`.
+* **`SR-interior-Alftand_13` / `_14`.** AlftandWorld's plaza and the orb's stair are 3000-5000
+  above the camera positions tried; the reference cameras are higher still, among the tower
+  roofs.
+
+### Rendering differences seen in the 26 renders (for the next engine tasks)
+
+These are differences to *fix in the engine*, not pose errors. Each is visible in the shots
+named.
+
+1. **Two Blackreach models fail conversion validation** and never spawn:
+   `meshes/Furniture/CreatureExit/WispAmbush.glb` (REFR `000F9907`, base `000EF957`) and
+   `meshes/Furniture/CreatureExit/FrostSpiderAmbush01.glb` (REFR `0007C068`, base `00042D31`),
+   both in cell `0002D4E0`: "converted model has no validated aggregate bounds; reconvert the
+   asset". Logged on every Blackreach shot (`SR-place-Blackreach*`,
+   `SR-interior-Alftand_12`). The converter needs a bounds fallback for models whose parts carry
+   no bounds.
+2. **No emissive or glow.** Blackreach's mushrooms, the water columns, the lit doorways and the
+   golden lattice orb are dark in the render; in the reference they are the light sources. A
+   giant mushroom's cap seen from below fills the frame as a flat orange-brown ceiling
+   (`SR-place-Blackreach_02`, and the sweep renders `local/poses/r3/y-br02a-c`).
+3. **No fog or ambient in interiors.** The reference Alftand02 frames are lit blue-teal with
+   visible depth; the render is dark brown within a few hundred units of the camera lantern and
+   black beyond (`SR-interior-Alftand_04` to `_09`). Blackreach reads black where the reference
+   is teal with fog (`SR-place-Blackreach`, `_03`, `_04`).
+4. **Ice reads as dark rock.** The Alftand02 ice shaft and ice walls, which are the bright
+   blue-white surfaces in the reference, render as dark grey-brown rock
+   (`SR-interior-Alftand_04`, `_05`, `_08`).
+5. **No snow, weather or particles on the exteriors.** Every exterior reference is deep snow
+   with drifts (`SnowDriftM01/M02`, `IcePile*`) and blowing snow; the renders are bare ice and
+   rock with a few drifts. `SR-place-Alftand`, `_02`, `_05`, `_06`, `Ruined_Tower`.
+6. **Black voids where the reference has walls.** Looking up or down out of the intended space
+   renders near-black with a few floating objects: the corridor under Alftand01's bridge
+   (`local/poses/r4/z-03a-d`, camera at 3400, 8792, -1000 - the frame is empty black),
+   Alftand02 above the decks (`local/poses/r1/*`), and AlftandWorld (`z-13c/d`, `w-14a/b`).
+   `BlackPlane01` (111 refs in Alftand01, 74 in Alftand02) is the likely culprit or the likely
+   missing piece: either those planes are drawn where the real game hides them, or the cell's
+   shell is not drawn behind them.
+7. **Terrain material.** Exterior terrain renders as smooth grey-blue ice where the reference
+   is white snow with a matt surface (`SR-place-Alftand_02`, `_06`); the terrain's snow layer
+   may be missing or mis-shaded.
+8. **Interior lighting is a camera lantern only**, so the reference's evenly lit corridors read
+   as a bright pool around the camera and darkness beyond (`SR-interior-Alftand_03`, `_11`).
+   Alftand01 does have `DweChandelier02On` and wall sconces placed (the corridor at
+   (3582,8793,-204) is lit in the reference); the engine's `lights` table may not cover them.
+
+### Tool notes
+
+* `tools/compare_shots.py`'s contact sheet was capped at `--sheet-height` and silently dropped
+  pairs after the tenth (`all 25 pairs` while the sheet held 10). Fixed: the sheet now grows to
+  fit every pair and `--sheet-height` is a minimum, with a test in `tests/test_compare_shots.py`
+  that builds 25 synthetic pairs and checks the last cell is drawn.
+* `tools/research/shot_grid.py` (new) assembles any list of images or directories into one
+  labelled grid - the fastest way to judge a sweep of candidate poses.
+* `tools/research/aim.py` (new) prints the shots-file yaw and pitch from a camera position to a
+  landmark, so candidates can be aimed at a database position instead of guessed.
+
 ## Files
 
 | File | What |
@@ -194,4 +351,7 @@ their positions are only as good as the reasoning in the table above.
 | `tools/research/uesp_pose_fit.py` | least-squares and multi-start pose fitting |
 | `tools/research/uesp_tower_assign.py` | tower-assignment candidates for the exterior shots |
 | `tools/research/image_grid.py`, `image_sizes.py` | pixel grids over a reference, and image sizes |
+| `tools/research/shot_grid.py` | one labelled grid of any images, for judging a pose sweep |
+| `tools/research/aim.py` | yaw and pitch from a camera position to a landmark |
 | `local/reference/maps/`, `local/reference/fits/` | the maps and pose overlays (not committed) |
+| `local/poses/final/`, `local/poses/cmp-final/` | the final renders and their pairs (not committed) |
