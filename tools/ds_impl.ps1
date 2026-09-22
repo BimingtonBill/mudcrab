@@ -29,7 +29,8 @@ param(
     [string]$Integrate,
     [string]$Discard,
     [string]$Post,                        # re-run the checks for a finished checkout, no worker
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$NoSeed                       # start the task's target/ empty instead of copying the lead's
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -40,11 +41,27 @@ $pilotLog = Join-Path $stateDir 'pilot.csv'
 
 # Each checkout builds into its own target/ (git-ignored inside the worktree). A shared target
 # directory is NOT safe: `cargo test -p engine` writes the same test-binary path from every
-# checkout, so parallel workers ran each other's binaries (found by impl-007, 2026-09-22). The
-# price is one cold build per task. Set per task below, once the worktree path is known.
+# checkout, so parallel workers ran each other's binaries (found by impl-007, 2026-09-22). To avoid
+# a cold build per task, the new target/ is seeded with a copy of the lead's target/debug (without
+# incremental/, which is only valid for the checkout that wrote it); measured by the DeepSeek Workers
+# harness on this project: 6.6 GB in ~6 s, after which a test build recompiles only the workspace
+# crates. Ported from that harness's ds_impl.ps1 (2026-09-22).
 Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
 $cargoBin = Join-Path $HOME '.cargo\bin'
 if ((Test-Path $cargoBin) -and ($env:Path -notlike "*$cargoBin*")) { $env:Path = "$cargoBin;$env:Path" }
+function Set-TaskTarget([string]$Worktree, [switch]$Seed) {
+    $target = Join-Path $Worktree 'target'
+    $env:CARGO_TARGET_DIR = $target
+    $leadDebug = Join-Path $root 'target\debug'
+    if ($Seed -and -not $NoSeed -and (Test-Path $leadDebug) -and -not (Test-Path (Join-Path $target 'debug'))) {
+        $t0 = Get-Date
+        & robocopy.exe $leadDebug (Join-Path $target 'debug') /E /MT:16 /XD incremental /NFL /NDL /NJH /NJS /NP | Out-Null
+        # robocopy exits 0-7 on success, 8+ on failure.
+        if ($LASTEXITCODE -ge 8) { "[ds-impl] seeding target/ failed (robocopy $LASTEXITCODE); the first build will be cold" }
+        else { "[ds-impl] seeded target/debug from the lead's build in $([int]((Get-Date) - $t0).TotalSeconds) s" }
+        $global:LASTEXITCODE = 0
+    }
+}
 
 function Fail([string]$m) { [Console]::Error.WriteLine("[ds-impl] $m"); exit 2 }
 function Split-List([string]$v) {
@@ -107,7 +124,7 @@ if ($Post) {
     $out = if (Test-Path $resultPath) { Get-Content $resultPath -Raw } else { '' }
     $status = if ($out -match 'status=(\S+)') { $Matches[1] } else { 'unrecorded' }
     "[ds-impl] post-run checks for $Name on $($baseCommit.Substring(0,7))"
-    $env:CARGO_TARGET_DIR = Join-Path $work 'target'
+    Set-TaskTarget $work
 }
 else {
 
@@ -142,7 +159,8 @@ New-Item -ItemType Directory -Force -Path $implRoot | Out-Null
 if (-not (Test-Path $work)) { Fail 'git worktree add failed' }
 
 # Task-scoped permissions: the shared protections, minus the paths this task owns.
-$config = Get-Content (Join-Path $root '.deepseek-agents.json') -Raw | ConvertFrom-Json
+$configPath = Join-Path $root '.deepseek-agents.json'
+$config = if (Test-Path $configPath) { Get-Content $configPath -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
 $keptDenies = @()
 foreach ($rule in $config.denyEdit) {
     $pattern = '^' + [regex]::Escape($rule).Replace('\*\*', '.*').Replace('\*', '[^/]*') + '$'
@@ -168,7 +186,7 @@ $scoped = [ordered]@{
     ([ordered]@{ task = $Name; base = $baseCommit; files = $owned; accept = $checks; brief = $Brief } |
         ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding $false))
 
-$env:CARGO_TARGET_DIR = Join-Path $work 'target'
+Set-TaskTarget $work -Seed
 $started = Get-Date
 "[ds-impl] $Name on $($baseCommit.Substring(0,7)) in $work"
 $schema = Join-Path $root 'tasks\deepseek\result-schema.json'
@@ -188,6 +206,14 @@ $status = if ($footer -match 'status=(\S+)') { $Matches[1] } else { 'unknown' }
 if ($status -eq 'unknown') {
     # The launcher failed before a worker ran (no footer): there is nothing to check, and running the
     # acceptance builds would only spend minutes compiling the base commit and lock the checkout.
+    New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+    if (-not (Test-Path $pilotLog)) {
+        [IO.File]::WriteAllText($pilotLog, "started,task,type,base,status,scope_ok,checks_passed,checks_total,seconds,outcome,reviewer,lead_minutes,notes`r`n",
+            (New-Object System.Text.UTF8Encoding $false))
+    }
+    $row = '{0},{1},implementation,{2},no-worker,,0,{3},{4},launch-failed,,,the launcher returned no worker result; acceptance skipped' -f `
+        $started.ToString('s'), $Name, $baseCommit.Substring(0, 7), $checks.Count, [int]((Get-Date) - $started).TotalSeconds
+    [IO.File]::AppendAllText($pilotLog, $row + "`r`n", (New-Object System.Text.UTF8Encoding $false))
     "[ds-impl] ${Name}: the worker never ran - see the launcher output above. Discard with -Discard $Name."
     exit 1
 }
@@ -200,7 +226,7 @@ if ($status -eq 'unknown') {
 # false-positives every task whose owned files live in a new subdirectory. This worktree is one
 # task's small checkout, not the full repo, so listing all files here is cheap.
 $touched = @(& git -C $work status --porcelain --untracked-files=all | ForEach-Object { ($_ -replace '^..\s+', '').Trim() } |
-    Where-Object { $_ -and $_ -notmatch '^\.(deepseek-agents|ds-impl|ds-result|ds-review)\.json$' })
+    Where-Object { $_ -and $_ -notmatch '^\.(deepseek-agents|ds-impl|ds-result|ds-review)\.json$' -and $_ -notmatch '^target/' })
 $outside = @($touched | Where-Object { $owned -notcontains $_ })
 if ($outside) { "[ds-impl] OUT OF SCOPE: $($outside -join ', ')" } else { "[ds-impl] scope ok ($($touched.Count) file(s))" }
 
