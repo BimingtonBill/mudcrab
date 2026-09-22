@@ -185,6 +185,12 @@ $out.TrimEnd()
 [IO.File]::WriteAllText((Join-Path $work '.ds-result.json'), $out, (New-Object System.Text.UTF8Encoding $false))
 $footer = ($out -split "`n" | Where-Object { $_ -match 'session=\S+ status=' } | Select-Object -Last 1)
 $status = if ($footer -match 'status=(\S+)') { $Matches[1] } else { 'unknown' }
+if ($status -eq 'unknown') {
+    # The launcher failed before a worker ran (no footer): there is nothing to check, and running the
+    # acceptance builds would only spend minutes compiling the base commit and lock the checkout.
+    "[ds-impl] ${Name}: the worker never ran - see the launcher output above. Discard with -Discard $Name."
+    exit 1
+}
 
 }   # end of the launch path
 
