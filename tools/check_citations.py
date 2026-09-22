@@ -22,13 +22,15 @@ import sys
 from pathlib import Path
 
 def _project_root():
-    """The project these tools act on. Run from the DeepSeek Workers harness (launcher/ds-agent.ps1 sits
-    beside tools/), that is DS_PROJECT or the current folder. Copied into a project's tools/, it is
-    DS_PROJECT or the folder above tools/, wherever it is run from."""
+    """The project these tools act on. Run from the DeepSeek Workers harness or the installed skill,
+    that is DS_PROJECT or the current folder. Copied into a project's tools/, it is DS_PROJECT or the
+    folder above tools/, wherever it is run from."""
     if os.environ.get('DS_PROJECT'):
         return Path(os.environ['DS_PROJECT']).resolve()
     here = Path(__file__).resolve().parents[1]
-    if (here / 'launcher' / 'ds-agent.ps1').exists():
+    # The harness (launcher/ds-agent.ps1) or the installed skill (ds-agent.ps1 beside tools/): act on
+    # the folder it is run from. Anywhere else, the tools sit in a project's tools/: act on that project.
+    if (here / 'launcher' / 'ds-agent.ps1').exists() or (here / 'ds-agent.ps1').exists():
         return Path(os.getcwd()).resolve()
     return here
 

@@ -24,20 +24,38 @@ import sys
 from pathlib import Path
 
 def _project_root():
-    """The project these tools act on. Run from the DeepSeek Workers harness (launcher/ds-agent.ps1 sits
-    beside tools/), that is DS_PROJECT or the current folder. Copied into a project's tools/, it is
-    DS_PROJECT or the folder above tools/, wherever it is run from."""
+    """The project these tools act on. Run from the DeepSeek Workers harness or the installed skill,
+    that is DS_PROJECT or the current folder. Copied into a project's tools/, it is DS_PROJECT or the
+    folder above tools/, wherever it is run from."""
     if os.environ.get('DS_PROJECT'):
         return Path(os.environ['DS_PROJECT']).resolve()
     here = Path(__file__).resolve().parents[1]
-    if (here / 'launcher' / 'ds-agent.ps1').exists():
+    # The harness (launcher/ds-agent.ps1) or the installed skill (ds-agent.ps1 beside tools/): act on
+    # the folder it is run from. Anywhere else, the tools sit in a project's tools/: act on that project.
+    if (here / 'launcher' / 'ds-agent.ps1').exists() or (here / 'ds-agent.ps1').exists():
         return Path(os.getcwd()).resolve()
     return here
 
 
 ROOT = _project_root()
-DEFAULT_RUNS = ROOT / 'local' / 'agents' / 'runs.csv'
-DEFAULT_PILOT = ROOT / 'local' / 'agents' / 'pilot.csv'
+
+
+def _state_dir(root=ROOT, env=os.environ):
+    """Where the launcher keeps runs.csv for this project: DS_STATE_DIR, the project's stateDir, local/agents
+    when the project has local/, else ~/.claude-deepseek/agents."""
+    if env.get('DS_STATE_DIR'):
+        return Path(env['DS_STATE_DIR'])
+    try:
+        state = json.loads((root / '.deepseek-agents.json').read_text(encoding='utf-8')).get('stateDir')
+    except (OSError, ValueError):
+        state = None
+    if state:
+        return Path(state) if Path(state).is_absolute() else root / state
+    return root / 'local' / 'agents' if (root / 'local').is_dir() else Path.home() / '.claude-deepseek' / 'agents'
+
+
+DEFAULT_RUNS = _state_dir() / 'runs.csv'
+DEFAULT_PILOT = _state_dir() / 'pilot.csv'
 
 UNTYPED = '(untyped)'
 

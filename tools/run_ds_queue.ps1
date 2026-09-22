@@ -20,9 +20,11 @@ $WaitFor = @($WaitFor -split ',' | ForEach-Object { $_.Trim() } | Where-Object {
 $here = Split-Path -Parent $PSScriptRoot
 $skillDir = Join-Path $HOME '.claude\skills\deepseek-agents'
 $inHarness = Test-Path (Join-Path $here 'launcher\ds-agent.ps1')
-$root = if ($env:DS_PROJECT) { $env:DS_PROJECT } elseif ($inHarness) { (Get-Location).Path } else { $here }
-$agent = if ($inHarness) { Join-Path $here 'launcher\ds-agent.ps1' } else { Join-Path $skillDir 'ds-agent.ps1' }
-$harness = if ($inHarness) { $here } else { $skillDir }
+# Installed as part of the skill, the launcher sits beside tools\ instead: act on the current folder too.
+$inSkill = -not $inHarness -and (Test-Path (Join-Path $here 'ds-agent.ps1'))
+$root = if ($env:DS_PROJECT) { $env:DS_PROJECT } elseif ($inHarness -or $inSkill) { (Get-Location).Path } else { $here }
+$agent = if ($inHarness) { Join-Path $here 'launcher\ds-agent.ps1' } elseif ($inSkill) { Join-Path $here 'ds-agent.ps1' } else { Join-Path $skillDir 'ds-agent.ps1' }
+$harness = if ($inHarness -or $inSkill) { $here } else { $skillDir }
 $readme = Join-Path $root 'tasks\deepseek\README.md'
 
 function Set-Status([string]$brief, [string]$status) {

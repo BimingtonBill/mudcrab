@@ -18,10 +18,19 @@ $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $PSScriptRoot
 $skillDir = Join-Path $HOME '.claude\skills\deepseek-agents'
 $inHarness = Test-Path (Join-Path $here 'launcher\ds-agent.ps1')
-$root = if ($env:DS_PROJECT) { $env:DS_PROJECT } elseif ($inHarness) { (Get-Location).Path } else { $here }
-$agent = if ($inHarness) { Join-Path $here 'launcher\ds-agent.ps1' } else { Join-Path $skillDir 'ds-agent.ps1' }
-$harness = if ($inHarness) { $here } else { $skillDir }
-$stateDir = Join-Path $root 'local\agents'
+# Installed as part of the skill, the launcher sits beside tools\ instead: act on the current folder too.
+$inSkill = -not $inHarness -and (Test-Path (Join-Path $here 'ds-agent.ps1'))
+$root = if ($env:DS_PROJECT) { $env:DS_PROJECT } elseif ($inHarness -or $inSkill) { (Get-Location).Path } else { $here }
+$agent = if ($inHarness) { Join-Path $here 'launcher\ds-agent.ps1' } elseif ($inSkill) { Join-Path $here 'ds-agent.ps1' } else { Join-Path $skillDir 'ds-agent.ps1' }
+$harness = if ($inHarness -or $inSkill) { $here } else { $skillDir }
+# The launcher's state folder: DS_STATE_DIR, the project's stateDir, local\agents when the project has
+# local\, else the shared ~\.claude-deepseek\agents.
+$stateDir = $null
+if ($env:DS_STATE_DIR) { $stateDir = $env:DS_STATE_DIR }
+if (-not $stateDir -and (Test-Path (Join-Path $root '.deepseek-agents.json'))) {
+    try { $cfg = Get-Content (Join-Path $root '.deepseek-agents.json') -Raw | ConvertFrom-Json; if ($cfg.stateDir) { $stateDir = if ([IO.Path]::IsPathRooted($cfg.stateDir)) { $cfg.stateDir } else { Join-Path $root $cfg.stateDir } } } catch { }
+}
+if (-not $stateDir) { $stateDir = if (Test-Path (Join-Path $root 'local')) { Join-Path $root 'local\agents' } else { Join-Path $HOME '.claude-deepseek\agents' } }
 if (-not (Test-Path -LiteralPath $stateDir)) { Write-Output "no worker state yet ($stateDir)"; exit 0 }
 
 function Get-States {
