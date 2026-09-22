@@ -21,7 +21,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+def _project_root():
+    """The project these tools act on. Run from the DeepSeek Workers harness (launcher/ds-agent.ps1 sits
+    beside tools/), that is DS_PROJECT or the current folder. Copied into a project's tools/, it is
+    DS_PROJECT or the folder above tools/, wherever it is run from."""
+    if os.environ.get('DS_PROJECT'):
+        return Path(os.environ['DS_PROJECT']).resolve()
+    here = Path(__file__).resolve().parents[1]
+    if (here / 'launcher' / 'ds-agent.ps1').exists():
+        return Path(os.getcwd()).resolve()
+    return here
+
+
+ROOT = _project_root()
 
 # "src/foo.cpp:120" or "docs/a.md:10-20". Paths are repo-relative, with / or \.
 CITATION = re.compile(r'(?<![\w/\\.:])([\w][\w./\\-]*\.[A-Za-z][\w]{0,7}):(\d+)(?:-(\d+))?\b')

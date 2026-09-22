@@ -14,8 +14,15 @@ $ErrorActionPreference = 'Continue'
 # powershell -File passes "a,b" as one string.
 $Briefs = @($Briefs -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $WaitFor = @($WaitFor -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-$root = Split-Path -Parent $PSScriptRoot
-$agent = Join-Path $HOME '.claude\skills\deepseek-agents\ds-agent.ps1'
+# Where this runs. From the DeepSeek Workers harness (launcher\ds-agent.ps1 beside tools\): the project is
+# DS_PROJECT or the current folder, and the launcher is the harness's. Copied into a project's tools\: the
+# project is DS_PROJECT or the folder above tools\, and the launcher is the installed skill's.
+$here = Split-Path -Parent $PSScriptRoot
+$skillDir = Join-Path $HOME '.claude\skills\deepseek-agents'
+$inHarness = Test-Path (Join-Path $here 'launcher\ds-agent.ps1')
+$root = if ($env:DS_PROJECT) { $env:DS_PROJECT } elseif ($inHarness) { (Get-Location).Path } else { $here }
+$agent = if ($inHarness) { Join-Path $here 'launcher\ds-agent.ps1' } else { Join-Path $skillDir 'ds-agent.ps1' }
+$harness = if ($inHarness) { $here } else { $skillDir }
 $readme = Join-Path $root 'tasks\deepseek\README.md'
 
 function Set-Status([string]$brief, [string]$status) {
@@ -57,7 +64,7 @@ foreach ($brief in $Briefs) {
     # Check the citations in whatever the worker committed before anyone builds on them.
     $notes = & git -C $root diff --name-only $before HEAD 2>$null | Where-Object { $_ -like '*.md' }
     if ($notes) {
-        $report = & python (Join-Path $root 'tools\check_citations.py') --quiet @notes 2>&1 | Out-String
+        $report = & python (Join-Path $PSScriptRoot 'check_citations.py') --quiet @notes 2>&1 | Out-String
         if ($report.Trim()) { Write-Output "[queue] $brief citations:`r`n$($report.TrimEnd())" }
         else { Write-Output "[queue] $brief citations: all resolve" }
     }

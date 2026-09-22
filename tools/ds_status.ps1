@@ -12,7 +12,15 @@ param(
     [int]$StallMinutes = 5
 )
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
+# Where this runs. From the DeepSeek Workers harness (launcher\ds-agent.ps1 beside tools\): the project is
+# DS_PROJECT or the current folder, and the launcher is the harness's. Copied into a project's tools\: the
+# project is DS_PROJECT or the folder above tools\, and the launcher is the installed skill's.
+$here = Split-Path -Parent $PSScriptRoot
+$skillDir = Join-Path $HOME '.claude\skills\deepseek-agents'
+$inHarness = Test-Path (Join-Path $here 'launcher\ds-agent.ps1')
+$root = if ($env:DS_PROJECT) { $env:DS_PROJECT } elseif ($inHarness) { (Get-Location).Path } else { $here }
+$agent = if ($inHarness) { Join-Path $here 'launcher\ds-agent.ps1' } else { Join-Path $skillDir 'ds-agent.ps1' }
+$harness = if ($inHarness) { $here } else { $skillDir }
 $stateDir = Join-Path $root 'local\agents'
 if (-not (Test-Path -LiteralPath $stateDir)) { Write-Output "no worker state yet ($stateDir)"; exit 0 }
 

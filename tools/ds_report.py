@@ -15,6 +15,7 @@ recorded is unknown, and the report says so instead of counting it as zero - a t
 quietly assumed zero would make delegation look free. A value projected from a partial record
 is marked with a leading '~'.
 """
+import os
 import argparse
 import csv
 import json
@@ -22,7 +23,19 @@ import math
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+def _project_root():
+    """The project these tools act on. Run from the DeepSeek Workers harness (launcher/ds-agent.ps1 sits
+    beside tools/), that is DS_PROJECT or the current folder. Copied into a project's tools/, it is
+    DS_PROJECT or the folder above tools/, wherever it is run from."""
+    if os.environ.get('DS_PROJECT'):
+        return Path(os.environ['DS_PROJECT']).resolve()
+    here = Path(__file__).resolve().parents[1]
+    if (here / 'launcher' / 'ds-agent.ps1').exists():
+        return Path(os.getcwd()).resolve()
+    return here
+
+
+ROOT = _project_root()
 DEFAULT_RUNS = ROOT / 'local' / 'agents' / 'runs.csv'
 DEFAULT_PILOT = ROOT / 'local' / 'agents' / 'pilot.csv'
 
@@ -232,7 +245,8 @@ def _group(name, entries, extra_runs=()):
     run_minutes = 0.0
     run_turns = 0
     denied = 0.0
-    denied_unrecorded = 0
+    denied_runs = 0
+    denied_tools = {}
     statuses = {}
     for run in runs:
         in_tokens = _number(run, 'tokens_in')
@@ -248,11 +262,19 @@ def _group(name, entries, extra_runs=()):
         turns = _number(run, 'turns')
         if turns is not None:
             run_turns += int(turns)
+        # The launcher writes the names of the tools a run was denied ("Bash Glob"); older logs wrote a
+        # count. Count names as one denied tool each, and tally which tools they were.
         number = _number(run, 'denied')
         if number is not None:
             denied += number
+            if number:
+                denied_runs += 1
         elif _text(run, 'denied'):
-            denied_unrecorded += 1
+            names = _text(run, 'denied').replace(',', ' ').split()
+            denied += len(names)
+            denied_runs += 1
+            for tool in names:
+                denied_tools[tool] = denied_tools.get(tool, 0) + 1
         status = _text(run, 'status') or '(unrecorded)'
         statuses[status] = statuses.get(status, 0) + 1
 
@@ -298,7 +320,8 @@ def _group(name, entries, extra_runs=()):
         'run_minutes': run_minutes,
         'run_turns': run_turns,
         'denied': denied,
-        'denied_unrecorded_runs': denied_unrecorded,
+        'denied_runs': denied_runs,
+        'denied_tools': denied_tools,
         'statuses': statuses,
     }
 
@@ -335,9 +358,6 @@ def summarise(runs, pilot):
     if overall['tokens_unrecorded_runs']:
         notes.append('%d run(s) record no tokens: unknown, not zero'
                      % overall['tokens_unrecorded_runs'])
-    if overall['denied_unrecorded_runs']:
-        notes.append('%d run(s) record denied tools as text, which the denied total omits'
-                     % overall['denied_unrecorded_runs'])
     if overall['scope_unrecorded']:
         notes.append('%d task(s) have no scope check recorded: unknown, not a pass'
                      % overall['scope_unrecorded'])
@@ -424,8 +444,13 @@ def _block(name, group):
     lines.append('  checks    ' + checks)
     lines.append(_worker_line(group))
     lines.append(_lead_line(group))
-    text = '%d run(s), %d turns, %d denied, %s in + %s out tokens' % (
-        group['runs'], group['run_turns'], int(group['denied']),
+    if group['denied_tools']:
+        tally = ', '.join('%s %d' % kv for kv in sorted(group['denied_tools'].items(), key=lambda kv: (-kv[1], kv[0])))
+        denied = '%d with denied tools (%s)' % (group['denied_runs'], tally)
+    else:
+        denied = '%d denied' % int(group['denied'])
+    text = '%d run(s), %d turns, %s, %s in + %s out tokens' % (
+        group['runs'], group['run_turns'], denied,
         _tokens(group['tokens_in']), _tokens(group['tokens_out']))
     if group['tasks_without_runs']:
         text += ' (%d task(s) with no run record)' % group['tasks_without_runs']

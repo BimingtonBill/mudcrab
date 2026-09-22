@@ -1,4 +1,4 @@
-"""Check a worker's result against the contract in tasks/deepseek/result-schema.json.
+"""Check a worker's result against the contract in templates/result-schema.json.
 
 A worker answers with one JSON object - base commit, a 300-600 word summary, critical
 evidence, unresolved assumptions, the commands it ran, a next falsifying test and the

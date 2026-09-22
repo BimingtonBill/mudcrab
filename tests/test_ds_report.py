@@ -292,13 +292,18 @@ class RunsAndTokens(Fixture):
         self.assertEqual(summary['types']['implementation']['tokens_unrecorded_runs'], 1)
         self.assertIn('record no tokens: unknown, not zero', ' '.join(summary['notes']))
 
-    def test_denied_tools_are_summed_and_text_is_flagged(self):
+    def test_denied_tool_names_are_counted_and_tallied(self):
+        # The launcher writes tool names ("Bash Glob"); older logs wrote a count. Both add up.
         summary = self.records([pilot_row('i01')], [run_row('i01', denied=2),
-                                                    run_row('i01', denied='Bash')])
+                                                    run_row('i01', denied='Bash Glob'),
+                                                    run_row('i01', denied='Bash'),
+                                                    run_row('i01', denied=0)])
         impl = summary['types']['implementation']
-        self.assertEqual(impl['denied'], 2)
-        self.assertEqual(impl['denied_unrecorded_runs'], 1)
-        self.assertIn('denied tools as text', ' '.join(summary['notes']))
+        self.assertEqual(impl['denied'], 5)
+        self.assertEqual(impl['denied_runs'], 3)
+        self.assertEqual(impl['denied_tools'], {'Bash': 2, 'Glob': 1})
+        self.assertNotIn('denied_unrecorded_runs', impl)   # names are counted now, so nothing is 'unrecorded'
+        self.assertNotIn('denied tools as text', ' '.join(summary['notes']))
 
     def test_one_run_is_never_counted_for_two_rows_of_the_same_task(self):
         summary = self.records([pilot_row('i01'), pilot_row('i01')], [run_row('i01')])
