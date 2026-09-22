@@ -45,8 +45,21 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 - **Built:** design `docs/design/reference-shots.md` (the shots-file contract). impl-017 `--shots <file> [--shots-out <dir>]` renders exact poses once streaming settles (`5e53712`, DeepSeek, verified at runtime by Claude). research-018 wrote the first poses, `tools/compare_shots.py` and the mapping/fitting scripts (`adbea02`, `4050696`).
 - **First renders:** `local/reference/cmp1/`. The Ruined Tower matches; most other poses are rough (walls, and some pitch signs flipped).
 - **Found:** the Alftand01 arrival is washed out to white at eye height. The suspect is the stopgap camera lantern (3e9) in `update_atmosphere`. It showed once crossings landed at eye height (`4b1dd7a`).
-- **Running:** research-020, which refines the poses by rendering (main checkout, edits `tools/reference/*.json`). impl-019, which calibrates interior and underground lighting per space (worktree `local/impl/impl-019-light-calibration`). `.deepseek-agents.json` now has `implAllowTools` with `cargo build` and the release engine.
-- **Next:** review both. Check impl-019 on the holdout references (odd digits) once research-020's poses land. Render the final comparison set for the user.
+- **Done:** research-020 refined all 26 poses by rendering: 1 matched, 12 close, 13 area only (`036efbe`; compare-sheet fix `64129bb`). impl-019 calibrated the lighting (`efa5351`):
+  - the lantern is removed;
+  - Bevy's 4π on point lights was missing from `lights.rs`;
+  - the ambient levels and colours were re-measured.
+  Claude's holdout check on the refined poses: Alftand02 is 1.8x too dark (it was 8x), AlftandWorld 1.2x, Blackreach 1.5x too bright; Tamriel is unchanged. `.deepseek-agents.json` now has `implAllowTools` with `cargo build` and the release engine.
+- **Renders:** refined poses with the new lighting are in `local/reference/cmp-lit/` (with `_sheet.jpg`). Measure with `python tools/research/exposure_stats.py --shots <file> --render <dir>`.
+- **Rendering gaps the comparison found** (in `docs/research/reference-shot-poses.md`):
+  - no emissive/glow (Blackreach);
+  - no per-cell lighting templates (`XCLL`/`LTMP`) or fog, so the lighting is flat;
+  - ice reads as rock;
+  - no snow shader or weather;
+  - black voids (`BlackPlane01`?);
+  - two Blackreach models fail validation (`WispAmbush`, `FrostSpiderAmbush01`);
+  - one 4334-radius `FalmerCityLight02NS` floods the Blackreach ceiling orange.
+- **Next:** the user picks the order. Glow first is recommended.
 
 ### 2026-09-22 (day) - Claude (terrain textures, see-through meshes, open doors with portals)
 
