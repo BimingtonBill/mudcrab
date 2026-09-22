@@ -27,12 +27,16 @@ A `--streaming-fixture` run replaces the configured assets with a generated SQLi
   frames 4, 5, 6, 14, 22 and 30, then returns it to the origin on the last one, and stops.
 - `validate_streaming_fixture` (`crates/engine/src/app.rs:409`) runs from frame 90 on. It passes when
   the world has settled, the request/response/stale/unload/rebase counters are all non-zero, the
-  25-cell grid is resident and no ring cell is resident beyond the widest band the plan keeps
-  (`crates/engine/src/app.rs:418`, `crates/engine/src/app.rs:427`). On success it sets
-  `metrics.streaming_fixture_validated` and `state.finished`
-  (`crates/engine/src/app.rs:440`); if it is still failing at frame 300 - about 5 s at 60 Hz - it
-  logs `streaming fixture did not settle or violated its lifecycle contract` and sets the same flag
-  (`crates/engine/src/app.rs:444`).
+  inner grid is fully resident and nothing is resident outside the widest band the plan keeps:
+  `expected_resident` is `(2 × stream_radius + 1)²`, 25 at the default radius 2, and
+  `maximum_resident` is `(2 × max(terrain_radius + 1, unload_radius) + 1)²` - 361 with the ring at 8,
+  49 with it off (`crates/engine/src/app.rs:418`, `crates/engine/src/app.rs:422`). Resident cells
+  above the inner grid are the ones the plan no longer wants but has not unloaded yet, because the
+  unload band is wider than the inner grid - which is why the ring-off run reports 32 of them
+  (section 3). On success it sets `metrics.streaming_fixture_validated` and
+  `state.finished` (`crates/engine/src/app.rs:440`); if it is still failing at frame 300 - about 5 s
+  at 60 Hz - it logs `streaming fixture did not settle or violated its lifecycle contract` and sets
+  the same flag (`crates/engine/src/app.rs:444`).
 
 Neither branch writes `AppExit`. The only `AppExit` on this path is `collect_and_finish`
 (`crates/engine/src/metrics.rs:316`), and that system returns before doing anything when no
