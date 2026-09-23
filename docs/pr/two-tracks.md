@@ -145,13 +145,8 @@ From upstream's CONTRIBUTING.md and README, plus what the fork has learnt:
 
 ## Draft issue: lighting in the Phase 2 visual review
 
-> **Title:** Phase 2 visual review: should static lighting (LIGH point lights, emissive, per-cell
-> lighting templates) be in scope?
+> **Title:** Is static lighting in scope for the Phase 2 visual review?
 >
-> The Phase 2 completion plan asks for a signed visual review of the rural, dense, water and stress
-> scenarios. Interiors and dusk scenes currently render with ambient light only: `LIGH` references
-> are not lights, emissive materials do not glow, and `XCLL`/`LTMP` lighting templates are not
-> read. We have a working implementation (converter: a `lights` table and per-space lighting;
-> engine: clustered point lights with a nearest-N budget, HDR + bloom for emissive, per-space fog and
-> ambient) and can send it as a small series. Is this wanted inside Phase 2, or should it wait for a
-> later phase?
+> Right now, lamps, torches and glowing materials don't light anything, and per-cell lighting
+> settings aren't read. That makes interiors and dusk scenes look flat. We have a working
+> implementation. Should it be part of Phase 2, or wait for a later phase?
