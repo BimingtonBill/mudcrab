@@ -8,6 +8,11 @@ track, and how the two tracks are kept apart.
 **Hold (2026-09-23):** nothing more is sent to GitHub until maintainers respond to #23, #24 and #25.
 Branches and PR bodies are prepared locally in the meantime.
 
+**Maintainer reply (2026-09-23 21:02, realfakenerd on #24):** "Please be have patience, i am
+reworking the roadmap, a lot of management changes are coming, and discord server is one of them",
+with an invite to a new Discord server. No answer on lighting yet; the roadmap itself may change,
+so re-read upstream's roadmap before sending anything more.
+
 **Priority:** the Phase 2 track comes first. Portal work fills the time Phase 2 PRs spend waiting on
 upstream review.
 
