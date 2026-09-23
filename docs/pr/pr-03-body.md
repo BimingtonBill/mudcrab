@@ -22,6 +22,9 @@ separately:
 
 Failed archives and meshes still skip, warn and make the run incomplete.
 
+**On a real install:** with this change, a full Skyrim SE conversion ends `skipped 0 ... (complete:
+true)`; the same install gave `skipped 511 ... (complete: false)` without it.
+
 **Tests** (no game data): the completeness predicate; an older manifest still loads; a pipeline run
 over `dummy-content` NIFs with a missing base colour and a missing normal map ends `complete` with
 both references recorded; a broken archive still makes the run incomplete.
