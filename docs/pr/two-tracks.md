@@ -70,6 +70,16 @@ freeing 40+ GB (2026-09-23). Order: the portal session finishes its post-impl-06
 first and reports its peak staging space; only then does the Phase 2 session build a `target/` in
 `wkj-phase2` and convert `SkyrimConverted-upstream`.
 
+## Tonight's upstream conversion (planned 2026-09-23)
+
+Converter: `C:\Modding\wkj-tools\converter-upstream14-pruned.exe`, built from
+`phase2/pruned-texture-complete` (upstream `main` plus PR 3, schema 14 unchanged), so the set ends
+`complete` and doubles as PR 3's real-install evidence. Command:
+`converter-upstream14-pruned.exe "<Skyrim SE>\Data" C:\Modding\SkyrimConverted-upstream --cpu-jobs 6 --io-jobs 4`.
+A fresh run re-encodes every texture (hours). Announce "converting" to Portal Dev first; no new
+builds on either track until "past conversion"; nothing reads the output or staging folders;
+budget about 75 GB.
+
 ## Which work goes where
 
 Numbers are the PRs of `upstream-pr-plan.md` §3. Order is the proposed submission order.
