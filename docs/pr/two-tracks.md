@@ -150,6 +150,10 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
   `docs/design/portal-performance.md`): Skyrim's own distant models (the converter's `lod` table),
   tree impostors and a real distant-terrain system belong to this track. Upstream's Phase 2 goal
   names "massive render distances". The existing terrain ring is a testing aid, not the design.
+  Design: [`docs/design/distant-lod.md`](../design/distant-lod.md) (research-513): convert Skyrim's
+  shipped LOD as-is first (the LOD textures are already converted; `.btr`/`.bto` are ordinary SSE
+  NIFs missing only `BSMultiBoundNode`), then regenerate only mod-changed blocks. Six PRs; the
+  first is converter-only. Needs an upstream issue before any code, under the send hold.
 
 ### Portal track
 
