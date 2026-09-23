@@ -1,4 +1,4 @@
-# Reply to the review of #23 (draft, not posted)
+# Reply to the review of #23 (posted 2026-09-23 with fix 94d295f)
 
 Thanks for the careful review. All five items are addressed in 94d295f:
 
