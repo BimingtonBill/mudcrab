@@ -74,6 +74,33 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-23 (night) - Claude [portal] (doorway alignment landed; PortalPlugin steps 1-5)
+
+**Doorway alignment (the user's Sven's House report) is merged and confirmed by the user** on "a
+bunch of random transitions" (`2b2687b`). impl-103 anchors the map on the two doorways; the lead's
+review corrections are in (gate to the placed doorway centre, height cap = step height, destination
+door hidden only outside the active space). Found only on the real assets, both fixed: an exterior
+doorway's grid came from its *cell* (Riverwood's doors are in the persistent cell, grid 0,0, so
+the wrong part of Skyrim streamed), and a crossing landed inside the closed far door (impl-152
+opens it at the swap). Non-obvious transitions (ladders, trapdoors, cave mouths) keep the `XTEL`
+landing and are **parked by the user** until they get their own design.
+
+**PortalPlugin refactor steps 1-5 merged** (impl-153, `cdefe05`): one `add_plugins(PortalPlugin)`
+in `run()`, `PortalOptions` in `config.rs`, `main.rs` byte-identical to `main`. The worker could not
+run cargo (harness denied it); the lead fixed three tests and fmt. Both tours pass on the final
+tree: Riverwood 8/8, Alftand 4/4, 0 panics. **Step 6** (atmosphere and terrain ring out of `app.rs`)
+is next; it needs builds, so it waits for the end of Phase 2 Dev's conversion.
+
+**Also:** `docs/roadmap/backlog-engine-and-portal.md` (every idea and note, split main engine /
+portal; main-engine half sent to Phase 2 Dev); research-151 incremental conversion (handed to
+Phase 2); reference sheets `local/reference/cmp-103/` and doorway shots
+`local/reference/doorway-152/`. `target/release/engine.exe` in this checkout predates the refactor
+merge: rebuild before the next play session.
+
+**No workers running.** Phase 2 Dev's upstream conversion runs overnight: no builds, links or new
+worktrees from this checkout until they announce the end. **Next:** step 6; then the backlog
+(water white sheet first, once Phase 2 Dev says whether it is fork-only).
+
 ### 2026-09-23 (evening) - Claude [phase2] (Phase 2 track running; upstream sends on hold)
 
 **Upstream:** issue #24 (lighting scope) and PR #25 (REFR rotation) opened; #23 still open. The user
