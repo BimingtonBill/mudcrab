@@ -125,7 +125,10 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
    `phase2/sun-shadow-cascades` (impl-507). **Needs a GPU run and a benchmark before sending:** the
    shadow pass now draws the streamed world (and most of the 250k-instance benchmark field), and the
    acceptance camera at 20,000 units sits beyond the last cascade, so its screenshots can't show it.
-10. Optional, last: fallible commands on streamed entities (`782f8dd`, 13 upstream sites). No crash
+10. `fix(scripts)`: `phase2-visual-baseline.ps1:46` requires manifest schema 12 and throws on
+    current assets (found by research-510, [`phase2-acceptance-runbook.md`](phase2-acceptance-runbook.md)).
+    Not yet written.
+10b. Optional, last: fallible commands on streamed entities (`782f8dd`, 13 upstream sites). No crash
    is reachable on upstream today; send only as hardening, if at all. On `portal` it held in real
    play: 12 load-door crossings, 0 panics (2026-09-23).
 11. **Lighting**, only if upstream says yes on issue #24 (see below).
