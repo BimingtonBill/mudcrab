@@ -77,8 +77,8 @@ Order revised after research-079 ([`phase2-fix-audit.md`](phase2-fix-audit.md)),
 fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go first.
 
 1. **PR 1** `test(dummy-content)` interior + door pair - open upstream as #23, waiting for review.
-2. **PR 2** `fix(shared): Creation reference angles turn clockwise` - branch `phase2/refr-rotation`,
-   body in [`pr-02-body.md`](pr-02-body.md); needs a `cargo test --workspace` run before sending.
+2. **PR 2** `fix(shared): Creation reference angles turn clockwise` - opened as #25 (branch
+   `phase2/refr-rotation`, body in [`pr-02-body.md`](pr-02-body.md)); CI-equivalent checks passed locally.
 3. `fix(converter)`: a pruned dangling texture does not make a conversion incomplete (`23f68f6`).
    Upstream's own `8b5bf80` records each pruned URI as a skip, so a stock install never converts
    `complete` and the acceptance preflight can never pass. No schema bump.
