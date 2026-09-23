@@ -20,7 +20,7 @@ Status keys: ✅ done · 🔄 in progress · ⏸ waiting · ⬜ not started
 
 | | Task | Status |
 |---|---|---|
-| 🔄 | Convert the game into upstream's format (`SkyrimConverted-upstream`), started 20:20 on 2026-09-23 | running |
+| ✅ | Convert the game into upstream's format (`SkyrimConverted-upstream`): complete, 0 skipped, finished 07:14 on 2026-09-24 | done |
 
 ## 3. Tomorrow (needs tonight's conversion)
 
@@ -55,7 +55,7 @@ Status keys: ✅ done · 🔄 in progress · ⏸ waiting · ⬜ not started
 | ✅ | Independent audit of all 12 branches ([`phase2-branch-audit.md`](../pr/phase2-branch-audit.md)) | done: 1 ready, 10 fix first, 1 needs discussion |
 | ✅ | One fix worker per branch: all 11 fixed and committed on their branches (the rotation fix is local only; pushing it to #25 needs the user) | done |
 | ✅ | Local `--shots` tool for the integration build (`phase2/local-shots`) | done, not run yet |
-| ⬜ | Reference sheets: integration build vs UESP screenshots | after the conversion |
+| ✅ | Reference sheets vs UESP ([`upstream-reference-sheet-2026-09-24.md`](../research/upstream-reference-sheet-2026-09-24.md)), engine-side fixes only | done; schema-15 fixes need a schema-15 conversion |
 | ✅ | Tree LOD files decoded and validated ([`tree-lod-layout.md`](../research/tree-lod-layout.md)) | done |
 | ✅ | Dragonborn "missing" references: an ID-space mismatch in tree LOD, not a converter bug; the 278 "lost" records are deletions by later plugins | done |
 | ✅ | Distant land step 2: branch `phase2/lod-database` (world DB schema 4) | done, not yet reviewed by an independent worker |
@@ -68,7 +68,7 @@ Design: [`docs/design/distant-lod.md`](../design/distant-lod.md).
 |---|---|---|
 | ✅ | 1. Converter reads the distant land and object files | branch `phase2/lod-mesh-containers` |
 | ✅ | 2. Database tables for distant blocks; tree billboards | branch `phase2/lod-database` |
-| ⬜ | 3. Engine draws distant terrain | implementation brief: [`distant-lod-step3-brief.md`](../design/distant-lod-step3-brief.md) |
+| 🔄 | 3. Engine draws distant terrain | branch `phase2/lod-engine-terrain`, tests pass, never run on a GPU |
 | ⬜ | 4. Engine draws distant objects and trees | |
 | ⬜ | 5. Add it to upstream's acceptance tests | |
 | ⬜ | 6. Regenerate distant land for mod-changed areas | later |

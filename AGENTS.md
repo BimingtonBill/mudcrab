@@ -74,6 +74,38 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-24 (overnight) - Claude [phase2] (conversion, audit, fixes, reference sheet, distant LOD)
+
+**Upstream:** realfakenerd replied on #24 (2026-09-23 21:02): be patient, the roadmap is being
+reworked, management changes and a Discord server are coming. Sends stay on hold. PR #23 got the
+review fixes and a reply (sent with the user's OK); #25 has a local follow-up commit (roadmap doc,
+comment, test) that is NOT pushed.
+
+**Conversion:** `C:/Modding/SkyrimConverted-upstream` (schema 14, fresh, 20:20-07:14):
+complete, 242,969 converted, 0 skipped, 511 textures pruned, integration report passed. Converter
+built from `phase2/pruned-texture-complete`, so this is PR 3's real-install evidence.
+
+**Audit and fixes:** lead-515 (12 reviewers) audited every branch
+(`docs/pr/phase2-branch-audit.md`); impl-520..530 fixed every branch (I read each diff, fixed
+several test/clippy slips myself). Integration branch `phase2/integration` passes all tests.
+
+**Distant LOD:** step 1 `phase2/lod-mesh-containers`, step 2 `phase2/lod-database` (world DB
+schema 4; review-535 found ~2,000 offset-grid blocks dropped, fixed), step 3
+`phase2/lod-engine-terrain` (engine, `--lod`, origin-relative lookup; never run on a GPU and needs
+a schema-4 database). Tree LOD decoded (`docs/research/tree-lod-layout.md`).
+
+**Reference sheet:** `docs/research/upstream-reference-sheet-2026-09-24.md`, rendered with
+`phase2/render-check` (engine-side fixes + local `--shots`). Biggest gaps: no trees/plants/Guardian
+Stones and see-through Alftand ice (both fixed by the schema-15 branches, which need a schema-15
+conversion: ~70 GB staging, disk is short), no sky/fog, dim light, no Blackreach glow.
+
+**Other findings:** Dragonborn "missing" refs are a tree-LOD FormID-slot mismatch, not a bug;
+the 278 "lost" records are deletions by later plugins (not a bug); `plugins.priority` is not the
+FormID slot for plugins after the first light plugin (small upstream candidate).
+
+**No workers running.** **Next:** decide with the user on disk for a schema-15 conversion (to see
+trees and materials), whether to push the #25 follow-up, and what to do about the Discord.
+
 ### 2026-09-23 (night) - Claude [portal] (doorway alignment landed; PortalPlugin steps 1-5)
 
 **Doorway alignment (the user's Sven's House report) is merged and confirmed by the user** on "a
