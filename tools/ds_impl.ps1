@@ -46,7 +46,10 @@ $root = if ($env:DS_PROJECT) { $env:DS_PROJECT } elseif ($inHarness -or $inSkill
 $agent = if ($inHarness) { Join-Path $here 'launcher\ds-agent.ps1' } elseif ($inSkill) { Join-Path $here 'ds-agent.ps1' } else { Join-Path $skillDir 'ds-agent.ps1' }
 $harness = if ($inHarness -or $inSkill) { $here } else { $skillDir }
 $implRoot = Join-Path $root 'local\impl'
-$stateDir = if ($env:DS_STATE_DIR) { $env:DS_STATE_DIR } else { Join-Path $root 'local\agents' }
+# The launcher's state folder, for the pilot log: the rule lives in launcher/ds-state.ps1, found the way
+# $agent above is (harness, installed skill, or the skill's own folder).
+$stateScript = if ($inHarness) { Join-Path $here 'launcher\ds-state.ps1' } elseif ($inSkill) { Join-Path $here 'ds-state.ps1' } else { Join-Path $skillDir 'ds-state.ps1' }
+$stateDir = & $stateScript -Dir $root
 $pilotLog = Join-Path $stateDir 'pilot.csv'
 
 # The acceptance commands run in this process, which inherited its PATH from whatever started it. Add the
