@@ -143,6 +143,13 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
     assets. Ask the Phase 2 maintainer (MacLove13) on an issue first whether our hardware counts as
     target hardware.
 
+### Phase 2 candidates, not started
+
+- **Level of detail and distant terrain** (user decision 2026-09-23, recorded by Portal Dev in
+  `docs/design/portal-performance.md`): Skyrim's own distant models (the converter's `lod` table),
+  tree impostors and a real distant-terrain system belong to this track. Upstream's Phase 2 goal
+  names "massive render distances". The existing terrain ring is a testing aid, not the design.
+
 ### Portal track
 
 - Door links from `XTEL` (PR 3's other half), interiors and the active cell (PR 6), seamless
@@ -169,7 +176,8 @@ Refactor on `portal` (worker task `portal-` prefix) so that:
   `PortalOptions` block plus two lines in `from_args` (design: `docs/design/portal-plugin.md`);
 - Phase 2-shaped code on `portal` moves into the modules it will go upstream as, so a new file
   carries it instead of `app.rs`: `atmosphere.rs` (sky, fog, ambient, per-space lighting; the
-  lighting proposal of issue #24) and `terrain_ring.rs` (the distant terrain ring). The sun shadow
+  lighting proposal of issue #24) and `terrain_ring.rs` (the distant terrain ring, which the user
+  calls a testing aid, not the design). The sun shadow
   cascades stay in `app.rs`, because their upstream PR is a small edit there;
 - streaming, rendering and material code carry no portal branches; where the portal needs a hook,
   the hook is a small, general Phase 2-shaped seam (an event, a resource) that could go upstream on
