@@ -1,0 +1,155 @@
+# Two tracks: Phase 2 contributions and the portal feature
+
+**Status:** agreed with the user 2026-09-23. Supersedes the "one branch for everything" layout of
+`deepseek-setup` (now `portal`). The PR series itself is still designed in
+[`upstream-pr-plan.md`](upstream-pr-plan.md); this document decides which of its PRs belong to which
+track, and how the two tracks are kept apart.
+
+**Priority:** the Phase 2 track comes first. Portal work fills the time Phase 2 PRs spend waiting on
+upstream review.
+
+## Why
+
+Upstream (`realfakenerd/OpenSkyrim`, now **Wah Krah Jol**) counts Phase 2 as implemented and waiting
+on one thing, the single completion criterion of
+[`02-completion-plan.md`](../roadmap/02-completion-plan.md): a recent, reproducible real-asset
+bundle whose `acceptance-report.json` says exactly `accepted`, with a baseline and a signed visual
+review of the rural, dense, water and stress scenarios. Our visual-fidelity fixes feed that review;
+the acceptance campaign closes it.
+
+Upstream also draws a phase boundary (`02-core-engine.md`, "Explicit phase boundary"): animation,
+particles and physics are Phase 4. Door clips, model `Idle` clips and the walking player fall on the
+Phase 4 side, so most of the portal feature is not Phase 2 work and must not be presented as such.
+
+## The two tracks
+
+| | Phase 2 track | Portal track |
+|---|---|---|
+| Purpose | contribute to upstream Phase 2, as its README, CONTRIBUTING.md and roadmap describe | the user's seamless-door / portal feature and demos; offered upstream later as a Phase 4 proposal |
+| Branches | `main` (mirror of `origin/main`, never committed to) and `phase2/<topic>`, one per upstream PR, cut from `main` | `portal` (formerly `deepseek-setup`) |
+| Worktree | `C:\Modding\wkj-phase2` | `C:\Modding\OpenSkyrimProject` |
+| Converted assets | `C:\Modding\SkyrimConverted-upstream`, converted by the `phase2` worktree's converter | `C:\Modding\SkyrimConverted` |
+| Push target | `myfork` (`BimingtonBill/wah-krah-jol`), PR to `realfakenerd/OpenSkyrim` `main` | never pushed |
+| Commit style | upstream's: conventional commits (`fix(converter): ...`), no `[claude]`/`[deepseek]` prefix, no citations of fork-only files | this repo's: `[claude]` / `[deepseek]` prefixes |
+| Worker task prefix | `p2-` | `portal-` |
+
+### The flow is one-way
+
+```
+origin/main ──► main ──► phase2/<topic> ──► upstream PR ──► origin/main
+                  │             │
+                  └─────────────┴──────────► portal   (merge only; nothing flows back)
+```
+
+- `portal` merges `main` after every upstream merge, and merges a `phase2/*` branch early when the
+  portal work needs the fix before upstream takes it.
+- Nothing is merged from `portal` into `main` or `phase2/*`. Code that exists only on `portal` reaches
+  upstream through a new `phase2/*` branch built by cherry-pick or rewrite and cleaned per
+  `upstream-pr-plan.md` §4-§5.
+- **Upstream first:** a Phase 2 bug found while working on the portal (the glossiness exponent, the
+  foliage vertex alpha, the shadow cascades) is fixed on a `phase2/*` branch against upstream code
+  and assets, then merged into `portal`. It is not fixed on `portal` first.
+
+### Assets are per track
+
+The engine refuses assets from another schema. Upstream's Phase 2 expects database schema 3,
+converter manifest 14 and cell cache 3 (`02-core-engine.md`, "Compatibility"); `portal` is at DB 5 /
+converter 18. Each track converts with its own converter into its own directory. A `phase2/*` PR
+that bumps a schema also updates that Compatibility section.
+
+**Disk is the blocker.** On 2026-09-23 `C:\Modding\SkyrimConverted` was 73.8 GB, the portal `target/`
+19.4 GB, and C: had 43 GB free. A second full conversion does not fit beside the first. The upstream
+conversion waits until the user frees space or names another drive.
+
+## Which work goes where
+
+Numbers are the PRs of `upstream-pr-plan.md` §3. Order is the proposed submission order.
+
+### Phase 2 track
+
+1. **PR 1** `test(dummy-content): an interior cell and a linked load-door pair` - already open
+   upstream as #23. Keep it moving.
+2. **PR 2** REFR rotation convention (clockwise angles) - Marco 1 names the `REFR` rotation fix.
+3. **PR 10 + later material fixes** (Marco 2): vertex alpha is not blend, blend factors, glossiness
+   exponent mapped as `(2/(n+2))^0.25`, foliage `COLOR_0` alpha excluded from alpha test, the specular
+   mask from the normal map's alpha (impl-064).
+4. **PR 11** terrain layer samplers and welded seams (Marco 4). The distant terrain ring only if
+   upstream wants it; ask on the PR.
+5. **Robustness fixes** (Marcos 3 and 5), each only if it reproduces on upstream code: shadow cascades
+   sized for Skyrim units (impl-068), fallible commands on streamed entities (`0475412`, `782f8dd`),
+   empty marker models passing the bounds gate (from PR 12).
+6. **The renderable base types half of PR 3** (DOOR/ACTI/FLOR/CONT/TREE/LIGH models): trees matter to
+   the visual review. Door links stay on `portal`.
+7. **Lighting, as its own proposal** (the user agreed it goes upstream): LIGH point lights (PR 4 +
+   PR 9), glow/HDR, per-space lighting and directional snow (the non-door half of PR 5, and PR 13).
+   Upstream's Phase 2 scope does not name lighting, so open an issue asking whether the visual
+   review wants it inside Phase 2 before sending code. Draft below.
+8. **The acceptance campaign** (Marco 7), once the fixes above are merged: three release
+   repetitions of each scenario from a clean upstream commit with upstream-schema assets, a
+   baseline, and the user's signed `visual-review.json`. Only hashes and reports are posted, never
+   assets. Ask the Phase 2 maintainer (MacLove13) on an issue first whether our hardware counts as
+   target hardware.
+
+### Portal track
+
+- Door links from `XTEL` (PR 3's other half), interiors and the active cell (PR 6), seamless
+  crossing with the carried pose, doorway portal rendering (PR 7).
+- Door open/close clips (PR 5's door half, PR 8) and model `Idle` clips - Phase 4 animation.
+- First-person player, walking, auto-load doors (PR 12's other half) - Phase 4 gameplay.
+- Demos (Alftand/Blackreach, Riverwood), `--demo-tour`, reference shots, launchers, `docs/demo/`.
+- Everything on the exclusion list of `upstream-pr-plan.md` §4: `AGENTS.md`, `tasks/`, `local/`,
+  the DeepSeek harness, research notes and research scripts.
+
+Later, the portal work is offered upstream as a **Phase 4 proposal** (the user agreed): an issue with
+the design and a short demo capture, then PRs cut from `portal` the same way as Phase 2 ones. PR 1
+(#23) already gives upstream a way to test doors without game data.
+
+## Keeping the code apart on `portal`
+
+Merging `main` into `portal` stays cheap only if the portal feature touches few upstream files.
+Refactor on `portal` (worker task `portal-` prefix) so that:
+
+- all portal-only systems register through one `PortalPlugin` (doorway rendering, crossing,
+  door animation, model animation, player, demos, demo tour, reference shots);
+- `main.rs` differs from upstream by one `add_plugins` call, and `config.rs` by one grouped block of
+  portal CLI flags;
+- streaming, rendering and material code carry no portal branches; where the portal needs a hook,
+  the hook is a small, general Phase 2-shaped seam (an event, a resource) that could go upstream on
+  its own.
+
+Acceptance: `git diff main portal -- crates/engine/src/main.rs crates/engine/src/config.rs` shows only
+those blocks; the Riverwood and Alftand demo tours still pass (8/8 and 4/4 crossings, 0 dark frames).
+
+## Rules for every Phase 2 PR
+
+From upstream's CONTRIBUTING.md and README, plus what the fork has learnt:
+
+- an issue first (search, then open), then a `phase2/<topic>` branch;
+- `///` doc comments on new functions;
+- `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`, and the
+  tests of the touched crates;
+- a test that needs no game data (dummy-content fixtures), since upstream CI has no Skyrim install;
+- the description references the planning doc it serves (`02-completion-plan.md` Marco N, or a
+  `docs/specs/` file), uses the Wah Krah Jol name, and ends with the attribution line;
+- no machine paths, no private names, no citations of `docs/research/` or `tools/research/`;
+- no Bethesda data in the diff or the description.
+
+## Process
+
+- The handoff log tags each entry `[phase2]` or `[portal]`.
+- Worker briefs state the track, the worktree, the assets directory and the branch.
+- Profiling and acceptance runs (`scripts/phase2-*.ps1`) stay one at a time across both tracks.
+- Opening issues and PRs upstream is publishing: the user confirms each one.
+
+## Draft issue: lighting in the Phase 2 visual review
+
+> **Title:** Phase 2 visual review: should static lighting (LIGH point lights, emissive, per-cell
+> lighting templates) be in scope?
+>
+> The Phase 2 completion plan asks for a signed visual review of the rural, dense, water and stress
+> scenarios. Interiors and dusk scenes currently render with ambient light only: `LIGH` references
+> are not lights, emissive materials do not glow, and `XCLL`/`LTMP` lighting templates are not
+> read. We have a working implementation (converter: a `lights` table and per-space lighting;
+> engine: clustered point lights with a nearest-N budget, HDR + bloom for emissive, per-space fog and
+> ambient) and can send it as a small series. Is this wanted inside Phase 2, or should it wait for a
+> later phase?

@@ -23,6 +23,22 @@ Claude (Claude Code) leads the work on this checkout and delegates bounded tasks
 2. Read the **Handoff log** below, newest entry first.
 3. If `git status` shows uncommitted changes you did not make, stop and ask the user before touching them. Another session or a worker may be mid-task. `tools/ds_status.ps1` shows whether a worker is running.
 
+## Two tracks: Phase 2 first, portal second
+
+Every task belongs to one track; name it in the brief, the commit and the handoff entry.
+
+- **Phase 2** (the priority): contributions to upstream Phase 2 as its README, CONTRIBUTING.md and
+  `docs/roadmap/02-completion-plan.md` describe. Worktree `C:\Modding\wkj-phase2`, branches
+  `phase2/<topic>` cut from `main` (a mirror of `origin/main`), assets
+  `C:\Modding\SkyrimConverted-upstream`, upstream's commit style, worker tasks `p2-`.
+- **Portal**: the user's seamless-door feature and demos. This checkout, branch `portal`, assets
+  `C:\Modding\SkyrimConverted`, `[claude]`/`[deepseek]` prefixes, worker tasks `portal-`.
+- Changes flow one way: `main` and `phase2/*` merge into `portal`, never the reverse. A Phase 2 bug
+  found on the portal is fixed on a `phase2/*` branch first.
+
+Which work belongs to which track, the PR rules and the reasons: `docs/pr/two-tracks.md`. Read it
+before starting any `phase2/*` branch or moving work between tracks.
+
 ## While working
 
 - Do not rewrite history (no amend, rebase or force-push on commits already made).
@@ -39,6 +55,27 @@ Claude (Claude Code) leads the work on this checkout and delegates bounded tasks
 Commit your work, then add a dated entry at the top of the handoff log: what changed, what was tested, whether a worker is still running, and the next step.
 
 ## Handoff log
+
+### 2026-09-23 (afternoon) - Claude [phase2] [portal] (the work split into two tracks)
+
+**The user's ask:** keep Phase 2 contributions and the portal feature clearly separate, with
+Phase 2 first and done as upstream's README describes. The user agreed to all of the plan's
+decisions, including lighting going upstream (issue first) and offering the portal work later as a
+Phase 4 proposal. The plan is `docs/pr/two-tracks.md`; the rules are the "Two tracks" section above.
+
+**Done:** `deepseek-setup` renamed to `portal`; `main` fast-forwarded to `origin/main` (`2105bfd`)
+and tracking it; worktree `C:\Modding\wkj-phase2` on `main`.
+
+**Blocked on the user:** disk. `SkyrimConverted` is 73.8 GB, C: has 43 GB free, so the
+upstream-schema conversion (`SkyrimConverted-upstream`) does not fit yet.
+
+**Seen in passing, not mine:** `local/conversion-s18.out.log` ends `complete: false` with 511 skipped
+inputs; `s18b` is later and small. The untracked `tasks/deepseek/*` briefs and `scratch-069/` belong
+to another session. The eight "modified" engine files are line-ending noise (`git diff` is empty).
+
+**Next:** Phase 2 - rebase PR 2 (rotation) onto `main` as `phase2/refr-rotation`; open the lighting
+issue after the user confirms the draft in `two-tracks.md`. Portal - the `PortalPlugin` refactor
+(`portal-` worker task).
 
 ### 2026-09-23 (day) - Claude (the Riverwood demo, and two rendering bugs it exposed)
 
