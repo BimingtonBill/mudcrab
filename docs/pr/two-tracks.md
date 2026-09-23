@@ -125,6 +125,11 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
    `phase2/sun-shadow-cascades` (impl-507). **Needs a GPU run and a benchmark before sending:** the
    shadow pass now draws the streamed world (and most of the 250k-instance benchmark field), and the
    acceptance camera at 20,000 units sits beyond the last cascade, so its screenshots can't show it.
+9b. `feat(converter)`: catalogue six more renderable base types (DOOR/ACTI/FLOR/CONT/TREE/LIGH
+    models into `statics`; the half of fork `df91524` without the XTEL door links). Branch
+    `phase2/renderable-base-types` (impl-511): 125,874 TREE references gain a model, which the
+    visual review needs; the PR #23 reviewer asked for it for DOOR. It bumps the converter schema
+    14 -> 15, as `phase2/material-publication` does: whichever is sent second bumps to 16.
 10. `fix(scripts)`: `phase2-visual-baseline.ps1:46` requires manifest schema 12 and throws on
     current assets (found by research-510, [`phase2-acceptance-runbook.md`](phase2-acceptance-runbook.md)).
     Not yet written.
