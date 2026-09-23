@@ -43,6 +43,10 @@ origin/main ──► main ──► phase2/<topic> ──► upstream PR ──
 
 - `portal` merges `main` after every upstream merge, and merges a `phase2/*` branch early when the
   portal work needs the fix before upstream takes it.
+- A `phase2/*` branch that **ports a fix `portal` already has** (most of the list below) is not
+  merged into `portal` early: the two versions would only conflict twice. It reaches `portal` once,
+  through `main`, and the merge keeps whichever version upstream accepted. Only new Phase 2 work
+  (the shared schema constant, for example) is merged early.
 - Nothing is merged from `portal` into `main` or `phase2/*`. Code that exists only on `portal` reaches
   upstream through a new `phase2/*` branch built by cherry-pick or rewrite and cleaned per
   `upstream-pr-plan.md` §4-§5.
