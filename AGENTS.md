@@ -53,10 +53,15 @@ before starting any `phase2/*` branch or moving work between tracks.
   slower. Two exceptions, each announced to the other session first:
   - **Timing runs run alone:** profiling, acceptance and benchmarks (`scripts/phase2-*.ps1`,
     `--benchmark-only`). A second instance on the GPU spoils their numbers.
-  - **A conversion's publish needs its output folder closed:** publishing renames staging over the
-    output folder, and on Windows that fails ("Access is denied") while any process holds a file in
-    it open, `skyrim_world.db` especially. No engine reads a folder while a conversion into that
-    folder reaches Publishing. Recover with `converter.exe ... --resume-staging <staging dir>`.
+  - **A conversion's publish needs its output and staging folders closed:** publishing renames
+    staging over the output folder, and on Windows that fails ("Access is denied") while any
+    process holds a handle inside either: an engine reading `skyrim_world.db`, but also a size
+    check (`du`), an indexer, an Explorer window or antivirus. Nothing reads either folder while a
+    conversion reaches Publishing; measure staging only while the converter is stopped. Recover
+    with `converter.exe ... --resume-staging <staging dir>`, which re-walks every stage.
+  - **Disk for a conversion:** staging grows to about the size of the finished output (67 GB for
+    a full Skyrim SE conversion, 2026-09-23), so a reconversion needs about that much free beside
+    the existing output folder.
   - **A conversion needs memory:** while one is extracting or converting (~20 min), neither session
     starts a new Rust build or link (`cargo test`/`clippy`/`build`, a fresh worker worktree);
     what is already running may finish. Windows fails allocations at the commit limit, and a
