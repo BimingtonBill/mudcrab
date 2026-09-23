@@ -20,7 +20,7 @@ Status keys: ✅ done · 🔄 in progress · ⏸ waiting · ⬜ not started
 
 | | Task | Status |
 |---|---|---|
-| ⬜ | Convert the game into upstream's format (`SkyrimConverted-upstream`). Starts when the user is done for the day; announce to Portal Dev first | ⏸ waiting for the user |
+| 🔄 | Convert the game into upstream's format (`SkyrimConverted-upstream`), started 20:20 on 2026-09-23 | running |
 
 ## 3. Tomorrow (needs tonight's conversion)
 
@@ -47,6 +47,19 @@ Status keys: ✅ done · 🔄 in progress · ⏸ waiting · ⬜ not started
 | ✅ | Terrain seams | `phase2/terrain-seam-weld` | on-screen check |
 | ✅ | Sun shadows | `phase2/sun-shadow-cascades` | on-screen check and frame-rate check |
 
+## 4b. Overnight 2026-09-23
+
+| | Task | Status |
+|---|---|---|
+| ✅ | Local branch `phase2/integration`: every Phase 2 branch merged (schema 15 once, in `crates/shared`); all tests pass; release engine and converter in `C:/Modding/wkj-tools/` | done |
+| ✅ | Independent audit of all 12 branches ([`phase2-branch-audit.md`](../pr/phase2-branch-audit.md)) | done: 1 ready, 10 fix first, 1 needs discussion |
+| ⬜ | One fix worker per branch (briefs written) | after the conversion |
+| ✅ | Local `--shots` tool for the integration build (`phase2/local-shots`) | done, not run yet |
+| ⬜ | Reference sheets: integration build vs UESP screenshots | after the conversion |
+| ✅ | Tree LOD files decoded and validated ([`tree-lod-layout.md`](../research/tree-lod-layout.md)) | done |
+| 🔄 | Why Dragonborn references are missing from the database | research running |
+| ⬜ | Distant land step 2 (brief written) | after the conversion |
+
 ## 5. Distant land (level of detail)
 
 Design: [`docs/design/distant-lod.md`](../design/distant-lod.md).
@@ -54,7 +67,7 @@ Design: [`docs/design/distant-lod.md`](../design/distant-lod.md).
 | | Step | Status |
 |---|---|---|
 | ✅ | 1. Converter reads the distant land and object files | branch `phase2/lod-mesh-containers` |
-| ⬜ | 2. Database tables for distant blocks; tree billboards | next to build |
+| ⬜ | 2. Database tables for distant blocks; tree billboards | brief written; the tree file layout is decoded |
 | ⬜ | 3. Engine draws distant terrain | |
 | ⬜ | 4. Engine draws distant objects and trees | |
 | ⬜ | 5. Add it to upstream's acceptance tests | |
