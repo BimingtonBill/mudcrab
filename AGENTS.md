@@ -57,6 +57,11 @@ before starting any `phase2/*` branch or moving work between tracks.
     output folder, and on Windows that fails ("Access is denied") while any process holds a file in
     it open, `skyrim_world.db` especially. No engine reads a folder while a conversion into that
     folder reaches Publishing. Recover with `converter.exe ... --resume-staging <staging dir>`.
+  - **A conversion needs memory:** while one is extracting or converting (~20 min), neither session
+    starts a new Rust build or link (`cargo test`/`clippy`/`build`, a fresh worker worktree);
+    what is already running may finish. Windows fails allocations at the commit limit, and a
+    Bevy link plus a parallel archive extraction crossed it on 2026-09-23 ("memory allocation of
+    1048576 bytes failed" at 26% extraction). The converting session announces start and end.
 
 ## At the end of every session
 
