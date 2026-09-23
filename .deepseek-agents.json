@@ -21,7 +21,7 @@
   "allowTools": "Bash(cargo check *),Bash(cargo test *),Bash(cargo clippy *),Bash(cargo fmt --check*),Bash(cargo tree *),Bash(python tools/*),Bash(python -m unittest *),Bash(git add *),Bash(git commit *),Bash(git status),Bash(git diff *),Bash(git log *)",
   "stateDir": "local/agents",
   "defaults": {
-    "mode": "edit",
+    "mode": "read",
     "effort": "max",
     "maxTurns": 400,
     "timeoutMinutes": 150
