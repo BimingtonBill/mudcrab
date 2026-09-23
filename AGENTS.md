@@ -74,6 +74,28 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-23 (evening) - Claude [phase2] (Phase 2 track running; upstream sends on hold)
+
+**Upstream:** issue #24 (lighting scope) and PR #25 (REFR rotation) opened; #23 still open. The user
+put a **hold** on sending anything more until maintainers respond (memory + `docs/pr/two-tracks.md`).
+
+**Ready and held** (all from `main`, CI-equivalent checks run where noted), in send order:
+`phase2/pruned-texture-complete` (checks pass, body `pr-03`), `phase2/empty-model-bounds` (checks
+pass, body `pr-04`), `phase2/shared-converter-schema` (checks pass), `phase2/material-publication`
+(schema 15; after empty-model), `phase2/vertex-alpha-not-opacity` (after material),
+`phase2/terrain-samplers-weights` and `phase2/terrain-seam-weld` (need a GPU run),
+`phase2/sun-shadow-cascades` (needs a GPU run and a benchmark). Workers impl-083, 501, 502,
+504-508 (DeepSeek) wrote them; Claude reviewed every diff. Audit: `docs/pr/phase2-fix-audit.md`.
+
+**Coordination with Portal Dev:** rules in "Two tracks" and "While working" (parallel engines;
+timing runs alone; no reader in a folder being published; no new builds during a conversion).
+Portal reconverted `SkyrimConverted` to schema 19 (complete, 0 skipped).
+
+**No workers running.** **Next:** the upstream-schema conversion into
+`C:\Modding\SkyrimConverted-upstream` (about 70 GB; 117 GB free now) so the GPU-dependent branches
+can be checked, announced to Portal Dev first; then GPU runs of the terrain, shadow and material
+branches. Check #23/#24/#25 for feedback before proposing any send.
+
 ### 2026-09-23 (afternoon) - Claude [phase2] [portal] (the work split into two tracks)
 
 **The user's ask:** keep Phase 2 contributions and the portal feature clearly separate, with
