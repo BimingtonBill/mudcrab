@@ -22,7 +22,6 @@
   "stateDir": "local/agents",
   "defaults": {
     "mode": "read",
-    "effort": "max",
     "maxTurns": 400,
     "timeoutMinutes": 150
   },
