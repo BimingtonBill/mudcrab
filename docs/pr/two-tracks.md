@@ -90,7 +90,11 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
    one-line conflict when `portal` merges (Portal Dev's proposal A, accepted).
 6. `fix(converter)`: material publication - glossiness exponent, vertex alpha is not blend, blend
    factors, editor markers (`59f1f20`, `b4ce0d9`). One schema bump (14 -> 15), one reconversion.
-7. `fix(engine)`: vertex-colour alpha is not opacity (`abaa14f`), engine-side, no bump.
+7. `fix(engine)`: vertex-colour alpha is not opacity (`abaa14f`), engine-side, no bump. Branch
+   `phase2/vertex-alpha-not-opacity` (impl-504). **Send only after item 6 lands:** the rewrite is
+   global, which is right only once `SLSF1_VERTEX_ALPHA` no longer makes a material Blend
+   (`b4ce0d9`). On upstream today, those Blend materials use vertex alpha as opacity, and forcing
+   it to 1.0 would change them.
 8. `fix(engine)`: terrain blending - repeating samplers, bilinear weights (`0ece570`); then the seam
    weld as its own PR. No bump.
 9. `fix(engine)`: sun shadow cascades sized for Creation units (`8bd7a01`); needs a benchmark.
