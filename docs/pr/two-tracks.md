@@ -79,16 +79,22 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
    Upstream's own `8b5bf80` records each pruned URI as a skip, so a stock install never converts
    `complete` and the acceptance preflight can never pass. No schema bump.
 4. `fix(engine)`: an empty converted model is not a bounds failure (`2b69616`). No bump.
-5. `fix(converter)`: material publication - glossiness exponent, vertex alpha is not blend, blend
+5. `refactor(shared)`: one converter manifest schema version. Upstream defines it twice
+   (`converter/src/cache.rs` `CONVERTER_SCHEMA_VERSION` and a hand-synced copy in
+   `engine/src/app.rs` `converter_schema_version()`); move it to `crates/shared` beside
+   `WORLD_DATABASE_SCHEMA_VERSION`. Goes before the first schema bump, and makes each bump a
+   one-line conflict when `portal` merges (Portal Dev's proposal A, accepted).
+6. `fix(converter)`: material publication - glossiness exponent, vertex alpha is not blend, blend
    factors, editor markers (`59f1f20`, `b4ce0d9`). One schema bump (14 -> 15), one reconversion.
-6. `fix(engine)`: vertex-colour alpha is not opacity (`abaa14f`), engine-side, no bump.
-7. `fix(engine)`: terrain blending - repeating samplers, bilinear weights (`0ece570`); then the seam
+7. `fix(engine)`: vertex-colour alpha is not opacity (`abaa14f`), engine-side, no bump.
+8. `fix(engine)`: terrain blending - repeating samplers, bilinear weights (`0ece570`); then the seam
    weld as its own PR. No bump.
-8. `fix(engine)`: sun shadow cascades sized for Creation units (`8bd7a01`); needs a benchmark.
-9. Optional, last: fallible commands on streamed entities (`782f8dd`, 13 upstream sites). No crash
-   is reachable on upstream today; send only as hardening, if at all.
-10. **Lighting**, only if upstream says yes on issue #24 (see below).
-11. **The acceptance campaign** (Marco 7), once the fixes above are merged: three release
+9. `fix(engine)`: sun shadow cascades sized for Creation units (`8bd7a01`); needs a benchmark.
+10. Optional, last: fallible commands on streamed entities (`782f8dd`, 13 upstream sites). No crash
+   is reachable on upstream today; send only as hardening, if at all. On `portal` it held in real
+   play: 12 load-door crossings, 0 panics (2026-09-23).
+11. **Lighting**, only if upstream says yes on issue #24 (see below).
+12. **The acceptance campaign** (Marco 7), once the fixes above are merged: three release
     repetitions of each scenario from a clean upstream commit with upstream-schema assets, a
     baseline, and the user's signed `visual-review.json`. Only hashes and reports are posted, never
     assets. Ask the Phase 2 maintainer (MacLove13) on an issue first whether our hardware counts as
@@ -115,14 +121,19 @@ Refactor on `portal` (worker task `portal-` prefix) so that:
 
 - all portal-only systems register through one `PortalPlugin` (doorway rendering, crossing,
   door animation, model animation, player, demos, demo tour, reference shots);
-- `main.rs` differs from upstream by one `add_plugins` call, and `config.rs` by one grouped block of
-  portal CLI flags;
+- `main.rs` stays byte-identical to upstream (it only calls `engine::run`), and `run()` in `app.rs`
+  adds the portal through exactly one `add_plugins(PortalPlugin)`; `config.rs` differs by one
+  `PortalOptions` block plus two lines in `from_args` (design: `docs/design/portal-plugin.md`);
+- Phase 2-shaped code on `portal` moves into the modules it will go upstream as, so a new file
+  carries it instead of `app.rs`: `atmosphere.rs` (sky, fog, ambient, per-space lighting; the
+  lighting proposal of issue #24) and `terrain_ring.rs` (the distant terrain ring). The sun shadow
+  cascades stay in `app.rs`, because their upstream PR is a small edit there;
 - streaming, rendering and material code carry no portal branches; where the portal needs a hook,
   the hook is a small, general Phase 2-shaped seam (an event, a resource) that could go upstream on
   its own.
 
-Acceptance: `git diff main portal -- crates/engine/src/main.rs crates/engine/src/config.rs` shows only
-those blocks; the Riverwood and Alftand demo tours still pass (8/8 and 4/4 crossings, 0 dark frames).
+Acceptance: `git diff main portal -- crates/engine/src/main.rs` is empty and `config.rs` shows only the
+`PortalOptions` block; the Riverwood and Alftand demo tours still pass (8/8 and 4/4 crossings, 0 dark frames).
 
 ## Rules for every Phase 2 PR
 
