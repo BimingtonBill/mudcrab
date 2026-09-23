@@ -48,7 +48,15 @@ before starting any `phase2/*` branch or moving work between tracks.
 - Before committing Rust changes, run what CI runs: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and the tests of the crates you touched.
 - Keep `docs/` current. Findings go in the docs (`docs/research/`, `docs/roadmap/`), not only in chat.
 - `local/` (worker state, checkouts, advisor notes) and `target/` are Git-ignored. Never commit them, and never commit Bethesda game data.
-- Only one session runs the profiling or acceptance scripts (`scripts/phase2-*.ps1`) at a time. They need the GPU and a release build, and parallel runs spoil each other's timings.
+- **Engine instances run in parallel.** Converted assets are read-only, so any number of engines
+  (both sessions, workers, the user playing) can run tours, `--shots` and tests side by side, just
+  slower. Two exceptions, each announced to the other session first:
+  - **Timing runs run alone:** profiling, acceptance and benchmarks (`scripts/phase2-*.ps1`,
+    `--benchmark-only`). A second instance on the GPU spoils their numbers.
+  - **A conversion's publish needs its output folder closed:** publishing renames staging over the
+    output folder, and on Windows that fails ("Access is denied") while any process holds a file in
+    it open, `skyrim_world.db` especially. No engine reads a folder while a conversion into that
+    folder reaches Publishing. Recover with `converter.exe ... --resume-staging <staging dir>`.
 
 ## At the end of every session
 

@@ -142,10 +142,8 @@ From upstream's CONTRIBUTING.md and README, plus what the fork has learnt:
 
 - The handoff log tags each entry `[phase2]` or `[portal]`.
 - Worker briefs state the track, the worktree, the assets directory and the branch.
-- Several engine instances can run at once (both tracks, or a tour beside the user playing); the
-  assets are read-only. What must run alone is anything whose **timings** are the result:
-  profiling, acceptance and benchmark runs (`scripts/phase2-*.ps1`, `--benchmark-only`). Announce
-  those to the other session first; tours and shots running in parallel are fine but slower.
+- Engine instances run in parallel; the two exceptions (timing runs, and a conversion publishing
+  into a folder an engine is reading) are in AGENTS.md, "While working".
 - Opening issues and PRs upstream is publishing: the user confirms each one.
 
 ## Issue: lighting in the Phase 2 visual review (posted as realfakenerd/wah-krah-jol#24, 2026-09-23)

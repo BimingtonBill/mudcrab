@@ -44,8 +44,9 @@ effort just to save DeepSeek tokens.
   tool denial with a Python or shell workaround. A worker reports a missing permission to the lead
   once, and the lead fixes the setup if it is within the task's scope.
 - All builds share `target/`. Cargo locks the directory itself, so parallel builds queue instead
-  of breaking. Serialize anything that needs the GPU or a long release build: profiling runs and
-  acceptance campaigns belong to the lead.
+  of breaking. Engine instances may run in parallel (tours, `--shots`, tests);
+  what stays serial is listed in AGENTS.md, "While working": timing runs (profiling, acceptance,
+  benchmarks, which belong to the lead) and a conversion publishing into a folder an engine reads.
 
 ## Handoffs and parallelism
 
