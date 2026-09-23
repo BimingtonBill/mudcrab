@@ -96,6 +96,10 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
    `phase2/shared-converter-schema` (impl-502); CI-equivalent checks pass (2026-09-23), held.
 6. `fix(converter)`: material publication - glossiness exponent, vertex alpha is not blend, blend
    factors, editor markers (`59f1f20`, `b4ce0d9`). One schema bump (14 -> 15), one reconversion.
+   Branch `phase2/material-publication` (impl-506, `5ea5f79`), also updating the acceptance
+   preflight and spec/roadmap schema lines. **Send after item 4:** marker-only models become empty
+   scenes, which upstream's bounds gate fails until item 4 lands. The published blend factors are
+   not read by any runtime yet.
 7. `fix(engine)`: vertex-colour alpha is not opacity (`abaa14f`), engine-side, no bump. Branch
    `phase2/vertex-alpha-not-opacity` (impl-504). **Send only after item 6 lands:** the rewrite is
    global, which is right only once `SLSF1_VERTEX_ALPHA` no longer makes a material Blend
@@ -104,7 +108,10 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
 8. `fix(engine)`: terrain blending - repeating samplers, bilinear weights (`0ece570`); then the seam
    weld as its own PR. No bump. Branch `phase2/terrain-samplers-weights` (impl-505). **Needs a GPU
    run before sending:** no test compiles the WGSL, so it waits for upstream-schema assets.
-9. `fix(engine)`: sun shadow cascades sized for Creation units (`8bd7a01`); needs a benchmark.
+9. `fix(engine)`: sun shadow cascades sized for Creation units (`8bd7a01`). Branch
+   `phase2/sun-shadow-cascades` (impl-507). **Needs a GPU run and a benchmark before sending:** the
+   shadow pass now draws the streamed world (and most of the 250k-instance benchmark field), and the
+   acceptance camera at 20,000 units sits beyond the last cascade, so its screenshots can't show it.
 10. Optional, last: fallible commands on streamed entities (`782f8dd`, 13 upstream sites). No crash
    is reachable on upstream today; send only as hardening, if at all. On `portal` it held in real
    play: 12 load-door crossings, 0 panics (2026-09-23).
