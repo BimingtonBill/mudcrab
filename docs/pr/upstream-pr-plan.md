@@ -347,6 +347,14 @@ disappear. Our own `git apply` of PR 3–5 diffs must not include that file (the
 
 ### 3.1 PR 1 — `test(dummy-content): an interior cell and a linked load-door pair`
 
+> **Built and verified, 2026-09-23.** Branch `pr/01-dummy-content-interior-door` off `origin/main`
+> (`2105bfd`), 3 files, +705 −9; `cargo fmt`, the CI clippy command and `cargo test --workspace`
+> all pass on it. Body in `docs/pr/pr-01-body.md`. **One correction to the scope below:**
+> `fixture_doors.rs`'s `generated_interior_plugin_exports_a_reciprocal_door_pair` asserts
+> `door_links` rows and `DOOR` records in `statics`, which upstream's converter does not produce;
+> that test fails on `origin/main` and has moved to PR 3. The branch carries the other two tests
+> (195 lines of the 358).
+
 * **Contains:** `crates/dummy-content/src/esm.rs` (+387), `src/main.rs` (+116),
   `crates/converter/tests/fixture_doors.rs` (new, 358).
 * **Source commit:** `40e0eb5`. Additive API (`esm::Interior`, `esm::Door`,
