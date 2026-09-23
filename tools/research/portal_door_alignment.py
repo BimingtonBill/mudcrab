@@ -29,6 +29,7 @@ and `M_geom` is the same shape with the **destination doorway's own frame** in p
 so it is computed three ways and reported side by side (see `Frame` and `DESTINATION_FRAME`).
 
 Usage:
+    python tools/research/portal_door_alignment.py check       # the report's numbers, asserted
     python tools/research/portal_door_alignment.py selftest
     python tools/research/portal_door_alignment.py probe
     python tools/research/portal_door_alignment.py summary
@@ -47,6 +48,7 @@ number here (the report's section on `--shots` says what a pose still has to add
 from __future__ import annotations
 
 import math
+import os
 import sqlite3
 import sys
 from collections import defaultdict
@@ -58,6 +60,16 @@ OUTWARD_POINT_DISTANCE = 16.0
 OUTWARD_POINT_MAX_DISTANCE = 512.0
 
 EYE_HEIGHT = 120.0
+
+# `check`'s tolerances: a twentieth of a degree, two units, and one per cent of a count. A share
+# ("5.9% of them over 45 deg") is asserted as the count behind it, with the same one per cent.
+CHECK_DEGREES = 0.05
+CHECK_UNITS = 2.0
+CHECK_COUNT_SHARE = 0.01
+
+# Sven's House: the pair the report's section 5 works through by hand, and the pair the user saw.
+SVEN_EXTERIOR = 0x0001CBB0
+SVEN_INTERIOR = 0x0001CBAF
 
 # ---------------------------------------------------------------------------------------------
 # Quaternions, in the runtime ([x, y, z, w], Y-up) convention shared::coordinates uses
@@ -345,8 +357,13 @@ def door_row(row):
                  bool(row[18]), row[19] if row[19] else 1.0))
 
 
+def open_database(path=DATABASE):
+    """A read-only connection: the tool never writes, and the engine may have the file open."""
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
 def load_doors(connection):
-    """Every reference with a `door_links` row, plus its return link (lowest `ref_id` wins)."""
+    """Every reference with a `door_links` row, plus its link, its return link and its outward."""
     doors = {}
     for row in connection.execute(DOOR_SELECT):
         doors[row[0]] = door_row(row)
@@ -360,6 +377,16 @@ def load_doors(connection):
             "position": (row[4], row[5], row[6]),
             "rotation": (row[7], row[8], row[9]),
         }
+    wire_doors(doors, links)
+    return doors, links
+
+
+def wire_doors(doors, links):
+    """Attach to each door its own link, its return link, its outward direction and its facing.
+
+    `links` is keyed by the id of the reference the link leaves from. Split out of `load_doors`
+    so that a test can wire a door built from pasted rows exactly as the database wires it.
+    """
     by_destination = defaultdict(list)
     for link in links.values():
         by_destination[link["destination"]].append(link)
@@ -375,7 +402,16 @@ def load_doors(connection):
                 door.position, door.return_link["position"], door.return_link["rotation"]
             )
         door.facing = creation_heading(door.outward) if door.outward else None
-    return doors, links
+    return doors
+
+
+def load_world(connection):
+    """Everything the commands measure: the doors, their links, space names, conventions, spreads."""
+    interiors, worldspaces = space_names(connection)
+    doors, links = load_doors(connection)
+    conventions, spreads = model_conventions(doors)
+    annotate_doors(doors, conventions)
+    return doors, links, interiors, worldspaces, conventions, spreads
 
 
 def annotate_doors(doors, conventions):
@@ -669,6 +705,39 @@ def measure(doors, conventions, reliable=None):
             for source, destination in reciprocal_pairs(doors)]
 
 
+# The four tiers of report section 9.2, in order of preference.
+TIER_NAMES = ("same model (no convention needed)", "both conventions known",
+              "centre only (a facing is unknown)", "arrival anchor (unchanged)")
+
+
+def anchor_tiers(measurements, reliable, near, height):
+    """The per-door choice of anchor: which directions could use a doorway anchor, and which keep
+    today's arrival anchor.
+
+    `near` and `height` are the arrival gate in units: the game's arrival point must stand within
+    `near` of the destination doorway's centre in plan, and the anchored landing within `height`
+    of the destination floor. Tiers 1 and 3 need a per-model facing convention, tier 2 does not
+    (the convention cancels), tier 4 keeps the map the engine builds today.
+    """
+    tiers = {name: [] for name in TIER_NAMES}
+    for m in measurements:
+        door, other = m.source, m.destination
+        boxes = door.bounds_centre is not None and other.bounds_centre is not None
+        lands_at_the_door = (math.hypot(m.gap_lateral, m.gap_depth) <= near
+                            and abs(m.vertical_error if m.vertical_error is not None else 1e9) <= height)
+        if not (boxes and lands_at_the_door):
+            tiers["arrival anchor (unchanged)"].append(m)
+        elif door.model == other.model:
+            # The model's axis convention cancels out of the doorway-to-doorway map, whatever it
+            # is, so no convention has to be established for these at all.
+            tiers["same model (no convention needed)"].append(m)
+        elif door.model in reliable and other.model in reliable:
+            tiers["both conventions known"].append(m)
+        else:
+            tiers["centre only (a facing is unknown)"].append(m)
+    return tiers
+
+
 def histogram(values, buckets=(1.0, 5.0, 15.0, 45.0)):
     counts = [0] * (len(buckets) + 1)
     for value in values:
@@ -747,6 +816,191 @@ def command_selftest():
     check("a reference yaw is a Creation heading", abs(q_to_yaw_degrees(model) - math.degrees(1.0)) < 1e-3,
           f"{q_to_yaw_degrees(model)}")
     return 1 if failures else 0
+
+
+# ---------------------------------------------------------------------------------------------
+# The gate: the report's numbers, asserted against the converted data
+# ---------------------------------------------------------------------------------------------
+
+
+def format_quantity(value, unit):
+    """Counts print as integers, angles and distances to two decimals."""
+    return f"{value:.2f}" if unit else f"{value:g}"
+
+
+def count_tolerance(expected):
+    """A count is checked to one per cent of itself (`CHECK_COUNT_SHARE`)."""
+    return CHECK_COUNT_SHARE * abs(expected)
+
+
+def per_cent(count, total):
+    """A count as a share of its total - the form the report's tables quote it in."""
+    return 100.0 * count / max(1, total)
+
+
+class Gate:
+    """One line per assertion: `ok` or `FAIL`, the expected value and the measured one."""
+
+    def __init__(self):
+        self.lines = []
+        self.failures = []
+
+    def check(self, name, measured, expected, tolerance, unit=""):
+        ok = abs(measured - expected) <= tolerance
+        self._record(name, ok, f"{format_quantity(measured, unit)}{unit}",
+                     f"expected {format_quantity(expected, unit)} +- "
+                     f"{format_quantity(tolerance, unit)}{unit}")
+        return ok
+
+    def fail(self, name, detail):
+        self._record(name, False, detail, None)
+
+    def _record(self, name, ok, measured, expected):
+        line = f"  {'ok  ' if ok else 'FAIL'} {name}: {measured}"
+        if expected is not None:
+            line += f" ({expected})"
+        self.lines.append(line)
+        if not ok:
+            self.failures.append(line)
+
+
+def find_measurement(measurements, source_ref, destination_ref):
+    """The direction from `source_ref` to `destination_ref`, or None when it is not measured."""
+    for measurement in measurements:
+        if measurement.source.ref_id == source_ref and measurement.destination.ref_id == destination_ref:
+            return measurement
+    return None
+
+
+def check_world(connection, doors, links, interiors, worldspaces, conventions, spreads):
+    """The characterisation in `docs/research/portal-door-alignment.md`, as `(lines, failures)`.
+
+    Every number here is quoted in that report, which produced it with this tool: the counts and
+    rules of section 4, the distributions of sections 4.1-4.3, the anchor split of section 9.2 at
+    the 256/64 gate, and the Sven's House arithmetic of section 5. The report's readers re-run
+    the commands in its section 11 to see these numbers; this is the form that fails loudly when
+    an edit to the port, or a reconversion, moves one of them.
+
+    A share ("5.9% of them over 45 deg") is asserted as the count behind it, so that every
+    tolerance is one of the three the task names: 0.05 degrees, 2 units, 1% of a count.
+    """
+    gate = Gate()
+    reliable = reliable_models(spreads)
+    measurements = measure(doors, conventions, reliable)
+    pairs = reciprocal_pairs(doors)
+    known = [m for m in measurements if m.reliable]
+
+    # --- the counts and the rules (section 4) ---
+    rules = defaultdict(int)
+    for door in doors.values():
+        rules[door.outward_rule] += 1
+    scales = connection.execute(
+        "SELECT count(*) FROM \"references\" r JOIN door_links d ON d.ref_id = r.id "
+        "WHERE r.scale IS NOT NULL AND abs(r.scale - 1.0) > 1.0e-4"
+    ).fetchone()[0]
+    gate.check("doors with a door_links row", len(doors), 2204, count_tolerance(2204))
+    gate.check("door_links rows", len(links), 2204, count_tolerance(2204))
+    gate.check("directions (each door as the source of its own link)", len(measurements), 2204,
+               count_tolerance(2204))
+    gate.check("reciprocal pairs (the lower-ref_id half of the directions)",
+               sum(1 for source, destination in pairs if source.ref_id < destination.ref_id), 1102,
+               count_tolerance(1102))
+    gate.check("doors whose base carries usable bounds",
+               sum(1 for door in doors.values() if door.bounds_centre is not None), 1863,
+               count_tolerance(1863))
+    gate.check("doors with no return link (every door has an outward)",
+               sum(1 for door in doors.values() if door.return_link is None), 0, 0)
+    gate.check("doors the outward point rule applies to", rules["point"], 1848, count_tolerance(1848))
+    gate.check("doors that fall back to the arrival heading", rules["heading"], 356, count_tolerance(356))
+    gate.check("doors with a reference scale other than 1", scales, 259, count_tolerance(259))
+
+    # --- what is known about the doorways (sections 3 and 4) ---
+    gate.check("models with a trustworthy axis convention (>= 4 placements, >= 80% within 15 deg)",
+               len(reliable), 41, count_tolerance(41))
+    gate.check("models a link-derived facing can be measured for", len(spreads), 104, count_tolerance(104))
+    gate.check("directions whose two doorways are both known", len(known), 1468, count_tolerance(1468))
+
+    # --- the map's yaw error (section 4.1) ---
+    known_yaw = [abs(m.yaw_error) for m in known]
+    every_yaw = [abs(m.yaw_error) for m in measurements]
+    gate.check("the map's yaw error, median over the known doorways", percentile(known_yaw, 0.5),
+               2.65, CHECK_DEGREES, " deg")
+    gate.check("the map's yaw error over 45 deg, known doorways (5.9% of 1468)",
+               per_cent(histogram(known_yaw, (1.0, 5.0, 15.0, 45.0))[-1], len(known)), 5.9,
+               count_tolerance(5.9), " %")
+    gate.check("the map's yaw error, median over every direction", percentile(every_yaw, 0.5),
+               4.56, CHECK_DEGREES, " deg")
+    gate.check("the map's yaw error over 45 deg, every direction (20.0% of 2204)",
+               per_cent(histogram(every_yaw, (1.0, 5.0, 15.0, 45.0))[-1], len(every_yaw)), 20.0,
+               count_tolerance(20.0), " %")
+
+    # --- the offset (section 4.2) ---
+    apparent = [m.apparent_distance for m in known]
+    gate.check("the as-drawn offset, median over the known doorways", percentile(apparent, 0.5),
+               75.5, CHECK_UNITS, " u")
+    gate.check("the as-drawn offset in 32..128 units (83.9% of 1468)",
+               per_cent(histogram(apparent, (8.0, 32.0, 128.0, 512.0))[2], len(apparent)), 83.9,
+               count_tolerance(83.9), " %")
+
+    # --- the vertical (section 4.3) ---
+    vertical = [abs(m.vertical_error) for m in measurements if m.vertical_error is not None]
+    gate.check("the anchored landing's height error, median over every direction",
+               percentile(vertical, 0.5), 8.3, CHECK_UNITS, " u")
+
+    # --- the anchor split (section 9.2, at the 256/64 gate) ---
+    tiers = anchor_tiers(measurements, reliable, 256.0, 64.0)
+    gate.check("tier 1, same model (no convention needed)", len(tiers["same model (no convention needed)"]),
+               1356, count_tolerance(1356))
+    gate.check("tier 2, both conventions known", len(tiers["both conventions known"]), 185,
+               count_tolerance(185))
+    gate.check("tier 3, centre only (a facing is unknown)", len(tiers["centre only (a facing is unknown)"]),
+               55, count_tolerance(55))
+    gate.check("tier 4, arrival anchor (unchanged)", len(tiers["arrival anchor (unchanged)"]), 608,
+               count_tolerance(608))
+
+    # --- Sven's House (section 5) ---
+    looking_in = find_measurement(measurements, SVEN_EXTERIOR, SVEN_INTERIOR)
+    looking_out = find_measurement(measurements, SVEN_INTERIOR, SVEN_EXTERIOR)
+    if looking_in is None or looking_out is None:
+        gate.fail("Sven's House 0001CBB0 / 0001CBAF", "the direction is not in the data")
+    else:
+        gate.check("Sven's House 0001CBB0 -> 0001CBAF, the map's yaw error", looking_in.yaw_error,
+                   12.27, CHECK_DEGREES, " deg")
+        gate.check("Sven's House 0001CBB0 -> 0001CBAF, the destination doorway as drawn",
+                   looking_in.apparent_distance, 82.8, CHECK_UNITS, " u")
+        gate.check("Sven's House 0001CBB0 -> 0001CBAF, drawn towards the viewer (depth)",
+                   looking_in.apparent_depth, -80.8, CHECK_UNITS, " u")
+        gate.check("Sven's House 0001CBB0 -> 0001CBAF, the sideways part",
+                   looking_in.apparent_lateral, 17.9, CHECK_UNITS, " u")
+        gate.check("Sven's House 0001CBAF -> 0001CBB0, the map's yaw error", looking_out.yaw_error,
+                   0.19, CHECK_DEGREES, " deg")
+        gate.check("Sven's House 0001CBAF -> 0001CBB0, the destination doorway as drawn",
+                   looking_out.apparent_distance, 106.9, CHECK_UNITS, " u")
+    return gate.lines, gate.failures
+
+
+def command_check(connection, doors, links, interiors, worldspaces, conventions, spreads):
+    lines, failures = check_world(connection, doors, links, interiors, worldspaces, conventions, spreads)
+    print("== the converted data against the numbers in docs/research/portal-door-alignment.md")
+    for line in lines:
+        print(line)
+    print(f"\n{len(lines) - len(failures)} of {len(lines)} assertions passed")
+    return 1 if failures else 0
+
+
+def command_check_database(path=DATABASE):
+    """Assert the report's numbers against the converted data, or skip when it is not installed."""
+    if not os.path.exists(path):
+        print(f"== database not present: {path}")
+        print("   the gate asserts this data's own numbers, so there is nothing to check here;")
+        print("   a developer machine without the converted data is not a failure (exit 0)")
+        return 0
+    connection = open_database(path)
+    try:
+        doors, links, interiors, worldspaces, conventions, spreads = load_world(connection)
+        return command_check(connection, doors, links, interiors, worldspaces, conventions, spreads)
+    finally:
+        connection.close()
 
 
 def command_probe(connection, doors, links, interiors, worldspaces):
@@ -941,7 +1195,7 @@ def command_models(doors, conventions, spreads, substrings):
         printed += 1
         if printed > 40:
             break
-        placements, median, p90 = spreads[model]
+        _, median, p90, _ = spreads[model]
         print(f"  {counts[model]:10d}  {conventions[model]:8.2f}  {median:12.1f}  {p90:10.1f}   {model}")
     if not substrings:
         print(f"  ({len(conventions)} models have at least one link-derived facing)")
@@ -1203,23 +1457,7 @@ def command_modes(doors, interiors, worldspaces, conventions, spreads, args):
     min_share = float(args[3]) if len(args) > 3 else 0.8
     reliable = reliable_models(spreads, min_placements, min_share)
     measurements = measure(doors, conventions, reliable)
-    tiers = {"same model (no convention needed)": [], "both conventions known": [],
-             "centre only (a facing is unknown)": [], "arrival anchor (unchanged)": []}
-    for m in measurements:
-        door, other = m.source, m.destination
-        boxes = door.bounds_centre is not None and other.bounds_centre is not None
-        lands_at_the_door = (math.hypot(m.gap_lateral, m.gap_depth) <= near
-                            and abs(m.vertical_error if m.vertical_error is not None else 1e9) <= height)
-        if not (boxes and lands_at_the_door):
-            tiers["arrival anchor (unchanged)"].append(m)
-        elif door.model == other.model:
-            # The model's axis convention cancels out of the doorway-to-doorway map, whatever it
-            # is, so no convention has to be established for these at all.
-            tiers["same model (no convention needed)"].append(m)
-        elif door.model in reliable and other.model in reliable:
-            tiers["both conventions known"].append(m)
-        else:
-            tiers["centre only (a facing is unknown)"].append(m)
+    tiers = anchor_tiers(measurements, reliable, near, height)
     total = max(1, len(measurements))
     same_model, directions = same_model_share(doors)
     print("== a per-door choice of anchor, from the data (section 9.2 of the report)")
@@ -1329,11 +1567,10 @@ def main(argv):
     command = argv[1]
     if command == "selftest":
         return command_selftest()
-    connection = sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True)
-    interiors, worldspaces = space_names(connection)
-    doors, links = load_doors(connection)
-    conventions, spreads = model_conventions(doors)
-    annotate_doors(doors, conventions)
+    if command == "check":
+        return command_check_database()
+    connection = open_database()
+    doors, links, interiors, worldspaces, conventions, spreads = load_world(connection)
     if command == "probe":
         command_probe(connection, doors, links, interiors, worldspaces)
     elif command == "summary":
