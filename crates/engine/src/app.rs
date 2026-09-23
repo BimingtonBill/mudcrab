@@ -6,7 +6,7 @@ use crate::{
         RendererMetrics, TerrainExtension, TerrainMaterial, VercidiumRendererPlugin,
         WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
-    shots::{ShotsFile, ShotsPlugin, ShotsRun},
+    shots::{ShotsFile, ShotsRun},
     streaming::{
         ActiveCell, AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin,
         build_terrain_quadrant_mesh, validate_standard_material,
@@ -94,13 +94,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     };
     // --shots: the file is read before the window exists, because it sets the window's size, and a
     // shots file the engine cannot use is fatal before anything is rendered or written.
-    let shots = if let Some(path) = config.shots.clone() {
+    let shots = if let Some(path) = config.portal.shots.clone() {
         color_eyre::eyre::ensure!(
             !config.headless,
             "--shots renders a window-sized image; it cannot run with --headless"
         );
         color_eyre::eyre::ensure!(
-            config.demo_tour.is_none() && !config.streaming_fixture,
+            config.portal.demo_tour.is_none() && !config.streaming_fixture,
             "--shots poses the camera itself; the demo tour and the streaming fixture move it"
         );
         color_eyre::eyre::ensure!(
@@ -111,6 +111,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         let file = ShotsFile::load(&path)
             .wrap_err_with(|| format!("cannot use the shots file {}", path.display()))?;
         let output_dir = config
+            .portal
             .shots_output_dir()
             .expect("--shots names a file, so it has an output folder");
         fs::create_dir_all(&output_dir)
@@ -147,7 +148,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // the camera itself, so nothing else may move it.
     let shots_mode = shots.is_some();
     // Interactive walking only; acceptance and benchmark runs keep the scripted fly camera.
-    let walk = config.walk && !benchmark_active && config.auto_fly_speed <= 0.0 && !shots_mode;
+    let walk = config.walks();
     let mut app = App::new();
     if benchmark_active {
         // Acceptance runs are commonly left unfocused while the campaign driver
@@ -179,37 +180,36 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
         .add_plugins(VercidiumRendererPlugin)
         .add_systems(Update, capture_acceptance_screenshot);
-    let demo_tour = app.world().resource::<EngineConfig>().demo_tour.clone();
+    let demo_tour = app
+        .world()
+        .resource::<EngineConfig>()
+        .portal
+        .demo_tour
+        .clone();
     // The runs that are looked at rather than measured: sky and underground lighting, portals and
-    // lights, and no acceptance capture.
-    let interactive = walk || demo_tour.is_some() || shots_mode;
-    if let Some(output_dir) = demo_tour.clone() {
-        std::fs::create_dir_all(&output_dir)
+    // lights, and no acceptance capture. A pure function of the configuration (H7), so this gate
+    // and the portal's own wiring cannot disagree about the sort of run this is.
+    let interactive = app.world().resource::<EngineConfig>().interactive();
+    // A demo tour's output folder, made before anything renders: a folder the engine cannot write
+    // is fatal, and this is where the run can still report it as an error - a plugin build cannot.
+    if let Some(output_dir) = demo_tour.as_ref() {
+        std::fs::create_dir_all(output_dir)
             .wrap_err_with(|| format!("failed to create {}", output_dir.display()))?;
-        app.add_plugins(crate::demo_tour::DemoTourPlugin { output_dir });
     }
     if let Some(run) = shots {
-        app.add_plugins(ShotsPlugin { run });
+        // `--shots` hands its run over as a resource: the file was loaded above, before the window
+        // existed, and the plugin that runs it is the portal (H3).
+        app.insert_resource(run);
     }
-    if walk {
-        // The player drives the StreamingCamera itself; fly_camera would fight it.
-        app.add_plugins(crate::player::PlayerPlugin);
-    } else if !shots_mode {
-        // A shots run poses the camera itself, at an exact Creation position, and takes no input.
+    if !walk && !shots_mode {
+        // The scripted fly camera: a walked run hands the camera to the player's own controller
+        // (`PlayerPlugin`, added by the portal plugin), and a shots run poses the camera itself, at
+        // an exact Creation position, and takes no input.
         app.add_systems(Update, fly_camera);
     }
-    if walk
-        && crate::demo_tour::route_for_demo(app.world().resource::<EngineConfig>().demo.as_deref())
-            .is_some()
-    {
-        app.add_systems(Startup, spawn_demo_objective)
-            .add_systems(Update, update_demo_objective);
-    }
     if atmosphere_applies(interactive, app.world().resource::<EngineConfig>()) {
-        app.insert_resource(ClearColor(SKY_COLOR)).add_systems(
-            Update,
-            update_atmosphere.run_if(resource_exists::<ActiveCell>),
-        );
+        app.insert_resource(ClearColor(SKY_COLOR))
+            .add_systems(Update, update_atmosphere);
     }
     if let Some((database, catalog, space_lighting, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
@@ -218,17 +218,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(cache)
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
+        // The portal, in one call: the crossing for every run that opened the world, and everything
+        // else the demo is - the doorway image, the door and model animation, the player, the demo
+        // tour, the shots run - for the runs that are looked at rather than measured. Which of them
+        // this run gets is the plugin's own decision (docs/design/portal-plugin.md).
+        app.add_plugins(crate::portal::PortalPlugin);
         if interactive {
-            // Open doorways, portal views into the next space, and pre-streamed cells kept out of
-            // the space the player stands in. Interactive runs only: it adds a camera.
-            app.add_plugins(crate::portal::PortalPlugin);
-            // The state of every load door - opened by `E`, swung by the model's own `Open` clip,
-            // and read back by the portal and the crossing.
-            app.add_plugins(crate::door_animation::DoorAnimationPlugin);
-            // A model's own looping `Idle` clip on every reference that is not a door: the mill
-            // wheel the Riverwood finale looks across the river at, and the dust on a log pile.
-            app.add_plugins(crate::model_animation::ModelAnimationPlugin);
-            // Skyrim's LIGH references as point lights, nearest 64 enabled.
+            // Skyrim's LIGH references as point lights, nearest 64 enabled. Lighting is not the
+            // portal's to add, and this gate is the one it has always had.
             app.add_plugins(crate::lights::LightsPlugin);
         }
         app.add_systems(Startup, setup_world);
@@ -1885,7 +1882,10 @@ pub(crate) fn atmosphere_fog(
 fn update_atmosphere(
     mut commands: Commands,
     config: Res<EngineConfig>,
-    active: Res<ActiveCell>,
+    // The cell the camera is in. It is a resource the streaming plan owns, so a run whose world
+    // does not stream cells has none, and the lighting has nothing to apply: the check that used to
+    // be a `run_if(resource_exists::<ActiveCell>)` at the registration is this one.
+    active: Option<Res<ActiveCell>>,
     catalog: Option<Res<SpaceLightingCatalog>>,
     mut clear: ResMut<ClearColor>,
     ambient: Option<ResMut<GlobalAmbientLight>>,
@@ -1893,6 +1893,9 @@ fn update_atmosphere(
     mut cameras: Query<(Entity, &mut Camera), With<StreamingCamera>>,
     mut applied: Local<bool>,
 ) {
+    let Some(active) = active else {
+        return;
+    };
     if cameras.is_empty() {
         return;
     }
@@ -1924,69 +1927,6 @@ fn update_atmosphere(
         sun.illuminance = atmosphere.sun.illuminance;
     }
 }
-
-/// The one-line goal shown in the top-left corner of a demo, and how far through its route the run
-/// is.
-#[derive(Component)]
-struct DemoObjective {
-    doors_crossed: usize,
-    /// The route the run is walking: what the countdown counts down from, what it counts toward,
-    /// and the line shown when it reaches zero.
-    route: &'static crate::demo_tour::DemoRoute,
-}
-
-fn spawn_demo_objective(mut commands: Commands, config: Res<EngineConfig>) {
-    // Both the line and the count are the route of the demo the run started in; a run with no
-    // scripted route of its own keeps the Alftand line and its four doors, which is what the
-    // objective has always shown (`crate::demo_tour::route_for_run`).
-    let route = crate::demo_tour::route_for_run(config.demo.as_deref());
-    commands.spawn((
-        DemoObjective {
-            doors_crossed: 0,
-            route,
-        },
-        Text::new(route.objective),
-        TextFont {
-            font_size: bevy::text::FontSize::Px(18.0),
-            ..default()
-        },
-        TextColor(Color::srgb(0.95, 0.9, 0.75)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(12.0),
-            left: Val::Px(14.0),
-            ..default()
-        },
-    ));
-}
-
-fn update_demo_objective(
-    mut crossed: MessageReader<crate::doors::DoorCrossed>,
-    mut objective: Query<(&mut DemoObjective, &mut Text)>,
-) {
-    let Ok((mut state, mut text)) = objective.single_mut() else {
-        return;
-    };
-    for event in crossed.read() {
-        state.doors_crossed += 1;
-        let place = event.label.trim();
-        let route = state.route;
-        let left = route.doors.len().saturating_sub(state.doors_crossed);
-        // The route is done when its last door has been crossed. Riverwood's route ends back in
-        // Tamriel, where it began, so there is no arrival place to recognise by name.
-        text.0 = if left == 0 {
-            route.finale.to_owned()
-        } else {
-            let destination = route.destination;
-            format!(
-                "Now in {place}. Find the next load door (E) - {left} more to {destination}. F flies if you get stuck."
-            )
-        };
-    }
-}
-
-/// Eye height above a start position, matching the player controller's standing eye height.
-const START_EYE_HEIGHT: f32 = 120.0;
 
 /// How far the camera draws: the far corner of the terrain ring and a margin, so the whole ring is
 /// inside it. With the ring off (a `terrain_radius` at or below `stream_radius`) this is what it
@@ -2141,8 +2081,8 @@ fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
 fn setup_world(
     mut commands: Commands,
     config: Res<EngineConfig>,
-    origin: Res<RenderOrigin>,
     ground_height: Option<Res<InitialCameraGroundHeight>>,
+    start_pose: Option<Res<crate::portal::StartPose>>,
 ) {
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
     let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
@@ -2152,20 +2092,14 @@ fn setup_world(
         Vec3::new(0.0, 1200.0, 2500.0)
     };
     let camera_position = target + camera_offset;
-    // An explicit start (--demo / --start-position) is a Creation-engine foot position: place the
-    // eye above it, facing the requested heading, in the render space of the start grid.
-    let camera_transform = match config.start_position {
-        Some(position) => Transform::from_translation(
-            crate::streaming::render_position(Vec3::from_array(position), origin.0)
-                + Vec3::Y * START_EYE_HEIGHT,
-        )
-        .with_rotation(crate::transition::arrival_camera_rotation([
-            0.0,
-            0.0,
-            config.start_yaw,
-        ])),
-        None => Transform::from_translation(camera_position).looking_at(target, Vec3::Y),
-    };
+    // A run that named a start (--demo / --start-position) leaves the pose it wants as a resource,
+    // in the render space of the start grid: an explicit start is a Creation-engine foot position
+    // with the eye above it, facing the requested heading. Without one, the camera looks at the
+    // middle of the start cell from above.
+    let camera_transform = start_pose.as_deref().map_or_else(
+        || Transform::from_translation(camera_position).looking_at(target, Vec3::Y),
+        |pose| pose.0,
+    );
     let far = camera_far_plane(&config);
     commands.spawn((
         Camera3d::default(),

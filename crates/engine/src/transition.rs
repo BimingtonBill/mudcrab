@@ -86,8 +86,10 @@ pub struct DoorTransition;
 
 /// Registers the load-door messages and the systems that use them.
 ///
-/// [`StreamingPlugin`](crate::streaming::StreamingPlugin) adds this plugin; it can also be added
-/// on its own, by a test or a tool that drives crossings without a world database.
+/// [`PortalPlugin`](crate::portal::PortalPlugin) adds this plugin - for every run that opened the
+/// world, which is what [`StreamingPlugin`](crate::streaming::StreamingPlugin) adding it used to
+/// mean. It can also be added on its own, by a test or a tool that drives crossings without a
+/// world database.
 pub struct TransitionPlugin;
 
 impl Plugin for TransitionPlugin {
@@ -2401,7 +2403,9 @@ mod tests {
             .init_resource::<ProfilingState>()
             .init_resource::<CapturedCrossings>()
             .init_resource::<DoorWatch>()
-            .add_plugins(StreamingPlugin)
+            // The crossing is `PortalPlugin`'s now, not the streamer's: a fixture that crosses
+            // doors adds it beside the streamer, as `PortalPlugin` does.
+            .add_plugins((StreamingPlugin, TransitionPlugin))
             .add_systems(Update, (capture_crossings, watch_doors));
         let camera = spawn_camera(&mut app, eye);
         (app, camera)

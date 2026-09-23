@@ -105,10 +105,24 @@
 //!
 //! # Wiring
 //!
-//! `app.run` adds `PortalPlugin` for interactive runs, after `StreamingPlugin` (it needs
-//! `ActiveCell`, `EngineConfig`, `RenderOrigin` and `StreamingWorld`). Nothing else changes: the
-//! destination cells are moved off the main camera's layers rather than the camera being granted a
-//! new one, and the portal camera, its render target and the quad are all spawned here.
+//! `app.run` adds `PortalPlugin` once, for every run that opened the world, right after
+//! `StreamingPlugin` (it needs `ActiveCell`, `EngineConfig`, `RenderOrigin` and `StreamingWorld`).
+//! Everything the portal feature is comes through that one call:
+//!
+//! * the crossing ([`crate::transition::TransitionPlugin`]) in every such run - crossing a load door
+//!   is not a run mode, and a benchmark run's schedule depends on it;
+//! * the player ([`crate::player::PlayerPlugin`]) in a walked run, the demo tour
+//!   ([`crate::demo_tour::DemoTourPlugin`]) and the shots run ([`crate::shots::ShotsPlugin`]) in the
+//!   runs that asked for them;
+//! * the doorway image, the door and model animation ([`crate::door_animation`],
+//!   [`crate::model_animation`]) and the cell isolation in the runs that are looked at rather than
+//!   measured.
+//!
+//! Which of those a run gets is decided here, from `EngineConfig` alone
+//! ([`EngineConfig::interactive`](crate::config::EngineConfig::interactive)), so the portal block in
+//! `app.rs` is one line and this plugin holds the rest. Nothing else about the rendering changes:
+//! the destination cells are moved off the main camera's layers rather than the camera being granted
+//! a new one, and the portal camera, its render target and the quad are all spawned here.
 //!
 //! `streaming::spawn_cell` inserts [`StreamedCellKey`] on the root it returns:
 //!
@@ -254,11 +268,29 @@ const PORTAL_QUAD_OFFSET: f32 = 0.0;
 /// the window nor the destination (a black frame in the doorway).
 pub(crate) const MIN_PORTAL_DOOR_DISTANCE: f32 = 1.0;
 
-/// Registers the portal shader and the systems that isolate cells, close load doors and render the
-/// destination through the nearest doorway.
+/// Registers the crossing, the portal shader, and the systems that isolate cells, close load doors
+/// and render the destination through the nearest doorway.
 ///
-/// Add it for interactive runs, after [`StreamingPlugin`](crate::streaming::StreamingPlugin).
+/// Add it for every run that opened the world, after
+/// [`StreamingPlugin`](crate::streaming::StreamingPlugin): the crossing is not a run mode - every
+/// run that streams cells crosses load doors - and the rest of it is registered from here by asking
+/// the engine's own configuration what sort of run this is
+/// ([`EngineConfig::interactive`](crate::config::EngineConfig::interactive)). It belongs to one
+/// `add_plugins` call, so that a merge from `main` has one portal line to keep.
 pub struct PortalPlugin;
+
+/// Where a run wants the camera to start: `--start-position` / `--start-yaw`, or the position a
+/// `--demo <name>` starts at, as a transform in the run's own render space.
+///
+/// [`app::setup_world`](crate::app) reads this instead of the configuration, so the world's startup
+/// carries no portal branch: the seam is a general one - "start the camera here, for whatever
+/// reason a run has" - and a run with no start of its own simply leaves it unset and gets the
+/// default placement.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct StartPose(pub Transform);
+
+/// Eye height above a start position, matching the player controller's standing eye height.
+const START_EYE_HEIGHT: f32 = 120.0;
 
 /// The portal's own frame, in order: the door it renders through, the doorway's mirror, the
 /// destination's sun and atmosphere, the leaves of the doors it draws, and the isolation of the
@@ -273,6 +305,60 @@ pub struct PortalFrame;
 
 impl Plugin for PortalPlugin {
     fn build(&self, app: &mut App) {
+        // The crossing and the pre-stream plan: every run that opened the world, which is what
+        // `StreamingPlugin` adding this used to mean. A benchmark run keeps that part of its
+        // schedule, and a fixture run does not gain it.
+        app.add_plugins(crate::transition::TransitionPlugin);
+        // The sort of run this is, read from the configuration: a pure function of it, so this
+        // plugin and `app::run` cannot disagree (H7). The shots run is a value rather than a flag -
+        // `app::run` built it before the window existed, because it sizes that window (H3) - and it
+        // is handed over as a resource. The start pose is built here for the same reason: it is a
+        // portal idea (H5) that `app::setup_world` reads as a plain resource.
+        let (interactive, walking, demo_tour, shots, start_pose) = {
+            let config = app.world().resource::<EngineConfig>();
+            let start_pose = config.start_position.map(|position| {
+                let origin = app.world().resource::<RenderOrigin>().0;
+                StartPose(
+                    Transform::from_translation(
+                        crate::streaming::render_position(Vec3::from_array(position), origin)
+                            + Vec3::Y * START_EYE_HEIGHT,
+                    )
+                    .with_rotation(crate::transition::arrival_camera_rotation(
+                        [0.0, 0.0, config.start_yaw],
+                    )),
+                )
+            });
+            (
+                config.interactive(),
+                config.walks(),
+                config.portal.demo_tour.clone(),
+                app.world()
+                    .get_resource::<crate::shots::ShotsRun>()
+                    .cloned(),
+                start_pose,
+            )
+        };
+        if let Some(pose) = start_pose {
+            app.insert_resource(pose);
+        }
+        if walking {
+            // The player drives the `StreamingCamera` itself. Every other run keeps the scripted
+            // `fly_camera`, which `app::run` registers (H4).
+            app.add_plugins(crate::player::PlayerPlugin);
+        }
+        if interactive {
+            // The demo's scripted tour and the objective line a walked demo shows: the plugin adds
+            // whichever of the two this run has.
+            app.add_plugins(crate::demo_tour::DemoTourPlugin {
+                output_dir: demo_tour,
+            });
+        }
+        if let Some(run) = shots {
+            app.add_plugins(crate::shots::ShotsPlugin { run });
+        }
+        if !interactive {
+            return;
+        }
         embedded_asset!(app, "shaders/portal.wgsl");
         app.add_plugins(MaterialPlugin::<PortalMaterial>::default())
             .init_resource::<PortalState>()
@@ -322,6 +408,13 @@ impl Plugin for PortalPlugin {
                     .after(AnimationSystems)
                     .before(TransformSystems::Propagate),
             );
+        // The state of every load door - opened by `E`, swung by the model's own `Open` clip, and
+        // read back by the portal and the crossing - and a model's own looping `Idle` clip on every
+        // reference that is not a door: the mill wheel the Riverwood finale looks across the river
+        // at, and the dust on a log pile. Both interactive runs only, and each needs nothing but
+        // the asset server.
+        app.add_plugins(crate::door_animation::DoorAnimationPlugin);
+        app.add_plugins(crate::model_animation::ModelAnimationPlugin);
     }
 }
 
