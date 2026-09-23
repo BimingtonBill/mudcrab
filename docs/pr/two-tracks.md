@@ -83,17 +83,17 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
 2. **PR 2** `fix(shared): Creation reference angles turn clockwise` - opened as #25 (branch
    `phase2/refr-rotation`, body in [`pr-02-body.md`](pr-02-body.md)); CI-equivalent checks passed locally.
 3. `fix(converter)`: a pruned dangling texture does not make a conversion incomplete (`23f68f6`).
-   Branch `phase2/pruned-texture-complete` (impl-083), body [`pr-03-body.md`](pr-03-body.md).
+   Branch `phase2/pruned-texture-complete` (impl-083), body [`pr-03-body.md`](pr-03-body.md); CI-equivalent checks pass (2026-09-23), held.
    Upstream's own `8b5bf80` records each pruned URI as a skip, so a stock install never converts
    `complete` and the acceptance preflight can never pass. No schema bump.
 4. `fix(engine)`: an empty converted model is not a bounds failure (`2b69616`). No bump. Branch
-   `phase2/empty-model-bounds` (impl-501), body [`pr-04-body.md`](pr-04-body.md).
+   `phase2/empty-model-bounds` (impl-501), body [`pr-04-body.md`](pr-04-body.md); CI-equivalent checks pass (2026-09-23), held.
 5. `refactor(shared)`: one converter manifest schema version. Upstream defines it twice
    (`converter/src/cache.rs` `CONVERTER_SCHEMA_VERSION` and a hand-synced copy in
    `engine/src/app.rs` `converter_schema_version()`); move it to `crates/shared` beside
    `WORLD_DATABASE_SCHEMA_VERSION`. Goes before the first schema bump, and makes each bump a
    one-line conflict when `portal` merges (Portal Dev's proposal A, accepted). Branch
-   `phase2/shared-converter-schema` (impl-502).
+   `phase2/shared-converter-schema` (impl-502); CI-equivalent checks pass (2026-09-23), held.
 6. `fix(converter)`: material publication - glossiness exponent, vertex alpha is not blend, blend
    factors, editor markers (`59f1f20`, `b4ce0d9`). One schema bump (14 -> 15), one reconversion.
 7. `fix(engine)`: vertex-colour alpha is not opacity (`abaa14f`), engine-side, no bump. Branch
