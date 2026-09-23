@@ -2,7 +2,7 @@
 
 **Branch:** `pr/01-dummy-content-interior-door` (local only, not pushed)
 **Base:** `origin/main` at `2105bfd`
-**Diff:** 3 files, +705 −9 (`crates/dummy-content/src/esm.rs`, `src/main.rs`,
+**Diff:** 3 files, +705 −9, one commit (`crates/dummy-content/src/esm.rs`, `src/main.rs`,
 `crates/converter/tests/fixture_doors.rs`)
 
 ## Title
@@ -32,6 +32,10 @@ cell has no grid and no worldspace, both `DOOR` records carry their flags, the t
 reciprocal and carry each other's arrival frames, and a truncation/mutation sweep never panics.
 
 No game data is involved: every byte is synthesized from the seed, as ADR-0001 requires.
+
+The new preset's author string is plain `"dummy-content"`. The crate's existing one still reads
+`"OpenSkyrim dummy-content"`; renaming it after the move to Wah Krah Jol felt like churn for this
+change, but say the word and it goes in.
 
 ## Checks run locally on the branch
 
