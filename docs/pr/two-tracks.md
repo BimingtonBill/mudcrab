@@ -31,7 +31,7 @@ Phase 4 side, so most of the portal feature is not Phase 2 work and must not be 
 | Converted assets | `C:\Modding\SkyrimConverted-upstream`, converted by the `phase2` worktree's converter | `C:\Modding\SkyrimConverted` |
 | Push target | `myfork` (`BimingtonBill/wah-krah-jol`), PR to `realfakenerd/OpenSkyrim` `main` | never pushed |
 | Commit style | upstream's: conventional commits (`fix(converter): ...`), no `[claude]`/`[deepseek]` prefix, no citations of fork-only files | this repo's: `[claude]` / `[deepseek]` prefixes |
-| Worker task names | `<kind>-<nnn>-p2-<slug>` | `<kind>-<nnn>-portal-<slug>` |
+| Worker task names | `<kind>-<nnn>-p2-<slug>`, numbers 500-599 | `<kind>-<nnn>-portal-<slug>`, numbers 100-199, then 600+ |
 
 ### The flow is one-way
 

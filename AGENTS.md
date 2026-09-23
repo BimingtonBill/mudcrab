@@ -30,9 +30,9 @@ Every task belongs to one track; name it in the brief, the commit and the handof
 - **Phase 2** (the priority): contributions to upstream Phase 2 as its README, CONTRIBUTING.md and
   `docs/roadmap/02-completion-plan.md` describe. Worktree `C:\Modding\wkj-phase2`, branches
   `phase2/<topic>` cut from `main` (a mirror of `origin/main`), assets
-  `C:\Modding\SkyrimConverted-upstream`, upstream's commit style, worker tasks `<kind>-<nnn>-p2-<slug>`.
+  `C:\Modding\SkyrimConverted-upstream`, upstream's commit style, worker tasks `<kind>-<nnn>-p2-<slug>` numbered 500-599.
 - **Portal**: the user's seamless-door feature and demos. This checkout, branch `portal`, assets
-  `C:\Modding\SkyrimConverted`, `[claude]`/`[deepseek]` prefixes, worker tasks `<kind>-<nnn>-portal-<slug>`.
+  `C:\Modding\SkyrimConverted`, `[claude]`/`[deepseek]` prefixes, worker tasks `<kind>-<nnn>-portal-<slug>` numbered 100-199 (then 600+).
 - Changes flow one way: `main` and `phase2/*` merge into `portal`, never the reverse. A Phase 2 bug
   found on the portal is fixed on a `phase2/*` branch first.
 
