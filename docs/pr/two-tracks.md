@@ -108,6 +108,9 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
 8. `fix(engine)`: terrain blending - repeating samplers, bilinear weights (`0ece570`); then the seam
    weld as its own PR. No bump. Branch `phase2/terrain-samplers-weights` (impl-505). **Needs a GPU
    run before sending:** no test compiles the WGSL, so it waits for upstream-schema assets.
+   The seam weld is branch `phase2/terrain-seam-weld` (impl-508): tolerance 512 units (four sample
+   steps), normals of moved points recomputed. The fork's dry-cell water change was left out:
+   upstream already skips cells with no water height.
 9. `fix(engine)`: sun shadow cascades sized for Creation units (`8bd7a01`). Branch
    `phase2/sun-shadow-cascades` (impl-507). **Needs a GPU run and a benchmark before sending:** the
    shadow pass now draws the streamed world (and most of the 250k-instance benchmark field), and the
