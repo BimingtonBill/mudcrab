@@ -143,7 +143,7 @@ From upstream's CONTRIBUTING.md and README, plus what the fork has learnt:
 - Profiling and acceptance runs (`scripts/phase2-*.ps1`) stay one at a time across both tracks.
 - Opening issues and PRs upstream is publishing: the user confirms each one.
 
-## Draft issue: lighting in the Phase 2 visual review
+## Issue: lighting in the Phase 2 visual review (posted as realfakenerd/wah-krah-jol#24, 2026-09-23)
 
 > **Title:** Is static lighting in scope for the Phase 2 visual review?
 >
