@@ -154,6 +154,11 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
   shipped LOD as-is first (the LOD textures are already converted; `.btr`/`.bto` are ordinary SSE
   NIFs missing only `BSMultiBoundNode`), then regenerate only mod-changed blocks. Six PRs; the
   first is converter-only. Needs an upstream issue before any code, under the send hold.
+  Step 1 is built: branch `phase2/lod-mesh-containers` (impl-514). All 9,584 `.btr` and 1,078 `.bto`
+  shipped files parse; the vendored `BSSubIndexTriShape` layout was wrong and is replaced by the
+  measured one. No schema bump (new outputs only), but about 233 Creation Club meshes that use
+  `BSMultiBoundNode` change hierarchy (2 change transform): a reviewer may ask for a bump. The
+  design's "level-4 terrain LOD has vertex colours" is false for vanilla (0 of 11,217 shapes).
 
 ### Portal track
 
