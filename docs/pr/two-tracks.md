@@ -170,8 +170,9 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
 - **`plugins.priority` is not the FormID slot** for plugins after the first light plugin
   (research-531, [`dragonborn-formid-slots.md`](../research/dragonborn-formid-slots.md)): anything that
   decodes a FormID through `plugins.priority` is off by one. Small upstream fix candidate.
-- **274 Skyrim.esm and 4 Update.esm records are lost in conversion** (same note, section 5): REFR,
-  NAVM, ACHR and others, not delete-flagged. Needs its own investigation.
+- ~~274 Skyrim.esm and 4 Update.esm records are lost in conversion~~ **Not a bug** (research-533):
+  every one is deleted by a later official plugin (record flag 0x20) and the merge correctly drops
+  it. Optional hardening only: record deletions visibly (a `deleted` column) instead of silently.
 
 ### Portal track
 

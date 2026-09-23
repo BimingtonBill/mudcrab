@@ -1,6 +1,6 @@
 # Dragonborn "missing references": an ID-space mismatch, plus two real converter gaps
 
-**Status:** DeepSeek research-531, 2026-09-23 (Python over the game files and the converted database, read-only). The worker could not run git, so "upstream is affected" rests on reading the code it had. Claude's summary: nothing is missing for Dragonborn; `.btt` tree LOD stores FormIDs with the authoring master index, which must be remapped to the load-order slot (Dragonborn 0x02 -> 0x04). Two real defects found on the way: `plugins.priority` disagrees with the FormID slot for every plugin after the first light plugin, and 274 Skyrim.esm + 4 Update.esm records are lost in conversion for no visible reason.
+**Status:** DeepSeek research-531, 2026-09-23 (Python over the game files and the converted database, read-only). The worker could not run git, so "upstream is affected" rests on reading the code it had. Claude's summary: nothing is missing for Dragonborn; `.btt` tree LOD stores FormIDs with the authoring master index, which must be remapped to the load-order slot (Dragonborn 0x02 -> 0x04). Two real defects found on the way: `plugins.priority` disagrees with the FormID slot for every plugin after the first light plugin, and 274 Skyrim.esm + 4 Update.esm records looked lost; a follow-up (research-533) showed they are all deleted by later official plugins (flag 0x20), so section 5 below is superseded: the merge is correct.
 
 # Report: Dragonborn references and the converted world database
 
