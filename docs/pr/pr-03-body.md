@@ -22,7 +22,8 @@ separately:
 
 Failed archives and meshes still skip, warn and make the run incomplete.
 
-**On a real install:** with this change, a full Skyrim SE conversion ends `skipped 0 ... (complete:
+**On a real install** (measured with the same fix in our fork's converter, not yet with this
+branch): a full Skyrim SE conversion ends `skipped 0 ... (complete:
 true)`; the same install gave `skipped 511 ... (complete: false)` without it.
 
 **Tests** (no game data): the completeness predicate; an older manifest still loads; a pipeline run
