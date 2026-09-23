@@ -160,6 +160,13 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
   `BSMultiBoundNode` change hierarchy (2 change transform): a reviewer may ask for a bump. The
   design's "level-4 terrain LOD has vertex colours" is false for vanilla (0 of 11,217 shapes).
 
+- **The main-engine backlog** the user and Portal Dev drew up (2026-09-23):
+  [`docs/roadmap/backlog-engine-and-portal.md`](../roadmap/backlog-engine-and-portal.md). Water as a
+  white sheet, dark firelit interiors, glowing rune stones, snow, ice (environment maps), weather,
+  eye adaptation, fade-in instead of popping, faster conversions. Unscheduled. Before any of it
+  becomes Phase 2 work, check whether the defect exists on upstream `main` or only in the fork's
+  lighting (several may come from fork-only code such as the sky-fill ambient).
+
 ### Portal track
 
 - Door links from `XTEL` (PR 3's other half), interiors and the active cell (PR 6), seamless
