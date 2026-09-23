@@ -69,28 +69,30 @@ Numbers are the PRs of `upstream-pr-plan.md` §3. Order is the proposed submissi
 
 ### Phase 2 track
 
-1. **PR 1** `test(dummy-content): an interior cell and a linked load-door pair` - already open
-   upstream as #23. Keep it moving.
-2. **PR 2** REFR rotation convention (clockwise angles) - Marco 1 names the `REFR` rotation fix.
-3. **PR 10 + later material fixes** (Marco 2): vertex alpha is not blend, blend factors, glossiness
-   exponent mapped as `(2/(n+2))^0.25`, foliage `COLOR_0` alpha excluded from alpha test, the specular
-   mask from the normal map's alpha (impl-064).
-4. **PR 11** terrain layer samplers and welded seams (Marco 4). The distant terrain ring only if
-   upstream wants it; ask on the PR.
-5. **Robustness fixes** (Marcos 3 and 5), each only if it reproduces on upstream code: shadow cascades
-   sized for Skyrim units (impl-068), fallible commands on streamed entities (`0475412`, `782f8dd`),
-   empty marker models passing the bounds gate (from PR 12).
-6. **The renderable base types half of PR 3** (DOOR/ACTI/FLOR/CONT/TREE/LIGH models): trees matter to
-   the visual review. Door links stay on `portal`.
-7. **Lighting, as its own proposal** (the user agreed it goes upstream): LIGH point lights (PR 4 +
-   PR 9), glow/HDR, per-space lighting and directional snow (the non-door half of PR 5, and PR 13).
-   Upstream's Phase 2 scope does not name lighting, so open an issue asking whether the visual
-   review wants it inside Phase 2 before sending code. Draft below.
-8. **The acceptance campaign** (Marco 7), once the fixes above are merged: three release
-   repetitions of each scenario from a clean upstream commit with upstream-schema assets, a
-   baseline, and the user's signed `visual-review.json`. Only hashes and reports are posted, never
-   assets. Ask the Phase 2 maintainer (MacLove13) on an issue first whether our hardware counts as
-   target hardware.
+Order revised after research-079 ([`phase2-fix-audit.md`](phase2-fix-audit.md)), which checked each
+fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go first.
+
+1. **PR 1** `test(dummy-content)` interior + door pair - open upstream as #23, waiting for review.
+2. **PR 2** `fix(shared): Creation reference angles turn clockwise` - branch `phase2/refr-rotation`,
+   body in [`pr-02-body.md`](pr-02-body.md); needs a `cargo test --workspace` run before sending.
+3. `fix(converter)`: a pruned dangling texture does not make a conversion incomplete (`23f68f6`).
+   Upstream's own `8b5bf80` records each pruned URI as a skip, so a stock install never converts
+   `complete` and the acceptance preflight can never pass. No schema bump.
+4. `fix(engine)`: an empty converted model is not a bounds failure (`2b69616`). No bump.
+5. `fix(converter)`: material publication - glossiness exponent, vertex alpha is not blend, blend
+   factors, editor markers (`59f1f20`, `b4ce0d9`). One schema bump (14 -> 15), one reconversion.
+6. `fix(engine)`: vertex-colour alpha is not opacity (`abaa14f`), engine-side, no bump.
+7. `fix(engine)`: terrain blending - repeating samplers, bilinear weights (`0ece570`); then the seam
+   weld as its own PR. No bump.
+8. `fix(engine)`: sun shadow cascades sized for Creation units (`8bd7a01`); needs a benchmark.
+9. Optional, last: fallible commands on streamed entities (`782f8dd`, 13 upstream sites). No crash
+   is reachable on upstream today; send only as hardening, if at all.
+10. **Lighting**, only if upstream says yes on issue #24 (see below).
+11. **The acceptance campaign** (Marco 7), once the fixes above are merged: three release
+    repetitions of each scenario from a clean upstream commit with upstream-schema assets, a
+    baseline, and the user's signed `visual-review.json`. Only hashes and reports are posted, never
+    assets. Ask the Phase 2 maintainer (MacLove13) on an issue first whether our hardware counts as
+    target hardware.
 
 ### Portal track
 
