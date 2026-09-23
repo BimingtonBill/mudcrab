@@ -31,7 +31,7 @@ Phase 4 side, so most of the portal feature is not Phase 2 work and must not be 
 | Converted assets | `C:\Modding\SkyrimConverted-upstream`, converted by the `phase2` worktree's converter | `C:\Modding\SkyrimConverted` |
 | Push target | `myfork` (`BimingtonBill/wah-krah-jol`), PR to `realfakenerd/OpenSkyrim` `main` | never pushed |
 | Commit style | upstream's: conventional commits (`fix(converter): ...`), no `[claude]`/`[deepseek]` prefix, no citations of fork-only files | this repo's: `[claude]` / `[deepseek]` prefixes |
-| Worker task prefix | `p2-` | `portal-` |
+| Worker task names | `<kind>-<nnn>-p2-<slug>` | `<kind>-<nnn>-portal-<slug>` |
 
 ### The flow is one-way
 
@@ -58,8 +58,10 @@ converter 18. Each track converts with its own converter into its own directory.
 that bumps a schema also updates that Compatibility section.
 
 **Disk is the blocker.** On 2026-09-23 `C:\Modding\SkyrimConverted` was 73.8 GB, the portal `target/`
-19.4 GB, and C: had 43 GB free. A second full conversion does not fit beside the first. The upstream
-conversion waits until the user frees space or names another drive.
+19.4 GB, and C: had 43 GB free. A second full conversion does not fit beside the first. The user is
+freeing 40+ GB (2026-09-23). Order: the portal session finishes its post-impl-064 reconversion
+first and reports its peak staging space; only then does the Phase 2 session build a `target/` in
+`wkj-phase2` and convert `SkyrimConverted-upstream`.
 
 ## Which work goes where
 
