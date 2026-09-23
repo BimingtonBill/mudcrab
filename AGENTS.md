@@ -40,6 +40,64 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-23 (day) - Claude (the Riverwood demo, and two rendering bugs it exposed)
+
+**The user's ask:** "start on the riverwood demo", off research-055's data
+(`docs/design/riverwood-demo.md`). Section 8 of that document is the part written after the demo
+was built and run, and is the part to trust about behaviour.
+
+**The demo works.** `--demo riverwood --walk` starts on the Helgen road south-west of the village;
+`play-riverwood-demo.cmd` is beside the Blackreach launchers. `--demo-tour` is no longer
+Alftand-only (impl-056): a route is keyed off the `--demo` name, and Riverwood's is eight doors -
+four houses, each entered and left again. The passing run is `local/demo/riverwood2/tour.txt`:
+**8 crossings of 8, all by walking, 0 dark frames in 2,056 captured frames.** The seamless
+crossing now holds in daylight and in both directions, which the Alftand route could not show.
+One tour bug fixed on the way: the walk-through's standoffs were 60 and 320 units, and inside
+Alvor's House the far wall is nearer than 320; a third, 160, is tried last.
+
+**Two rendering bugs, both dataset-wide, both found by looking at Riverwood:**
+
+1. **The forest was invisible** (research-059, impl-063, `abaa14f`). Pines rendered as a spray of
+   dots. My hypothesis - alpha-tested foliage falling through `render.rs`'s `AlphaMode::Blend`
+   fallback - was **wrong**, and the worker falsified it properly: the trees convert to `MASK`
+   with the NIF's own threshold. Bevy tests `vertex_color.a * texture.a` against the cutoff, and
+   Skyrim's tree NIFs carry a `COLOR_0` whose alpha is a shader parameter, not opacity. Fixed
+   engine-side at mesh load, no reconversion. Proof: `local/reference/_tree-before-after.png` -
+   the canopies fill in and the house, thatch and wall in the same frame do not move. This also
+   un-breaks `snow.wgsl`, which multiplies coverage by `in.color.a` under a comment claiming no
+   converted mesh has vertex colours; 1,337 of them do.
+2. **Everything read wet** (research-058, websearch-060, impl-062 `59f1f20`, impl-064 running).
+   `material.rs` mapped Skyrim's Blinn-Phong glossiness *exponent* as a linear percentage. All
+   59,268 published materials were wrong; 14,825 were clamped to Bevy's roughness floor. Now
+   `(2/(n+2))^0.25`. The other half - the specular mask in the normal map's alpha, which the
+   converter drops - is impl-064; websearch-060 settled that the mask scales intensity, not the
+   exponent, so it can be a `specularTexture` pointing at the normal map with no derived textures.
+
+**Converter schema 17 -> 18.** impl-064 rides the same bump, so one reconversion covers both. The
+first reconversion was running when this was written (`local/conversion-s18.out.log`); a second is
+needed after impl-064 lands. **Until a reconversion completes, the engine refuses the assets on
+disk** - that is its schema check working, not a fault.
+
+**Also landed:** impl-057, `crates/engine/src/model_animation.rs` - a model's own looping `Idle`
+clip on every non-door reference. The mill wheel the Riverwood finale looks at now turns (16.67 s
+a revolution, confirmed in the log). The snow catalogue read `material_object IS NOT NULL`, but
+the exporter writes a plain 0 for a static with no `MATO`: 9,924 markers, fences and road chunks
+against 2,506 real snow statics. Now `> 0`, with a test that fails on the old query (`ad7f138`).
+
+**Reference shots.** `tools/reference/riverwood_shots.json`, twelve poses, ten against a UESP
+reference in `local/reference/riverwood/`. All twelve render. research-055 computed the eight
+exteriors at ground + 120 (eye height), but UESP's "place" screenshots are free-camera shots from
+above the rooftops, so four of them could not frame their reference at any yaw. A sweep of
+elevated candidates is `local/reference/rw_sweep4/`; the mill finale has been re-fitted from it.
+The inn and the whole-village aerial still need one more pass - `local/reference/rw_sweep2.json`
+is written and unrendered.
+
+**Running when this was written:** impl-064 (the specular mask), doc-065 (the demo guide covering
+both demos). **Next:** finish the reconversion, re-render and check the wet look is gone, land
+impl-064, reconvert again, re-fit the inn and village poses, then a regression run of the Alftand
+tour.
+
+
 ### 2026-09-23 (overnight) - Claude (visual gaps, animated doors and seamless crossing, demo for contributors, upstream PR)
 
 **The user's five goals, and where each stands.**
