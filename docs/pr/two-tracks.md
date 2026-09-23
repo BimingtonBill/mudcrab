@@ -5,6 +5,9 @@
 [`upstream-pr-plan.md`](upstream-pr-plan.md); this document decides which of its PRs belong to which
 track, and how the two tracks are kept apart.
 
+**Hold (2026-09-23):** nothing more is sent to GitHub until maintainers respond to #23, #24 and #25.
+Branches and PR bodies are prepared locally in the meantime.
+
 **Priority:** the Phase 2 track comes first. Portal work fills the time Phase 2 PRs spend waiting on
 upstream review.
 
