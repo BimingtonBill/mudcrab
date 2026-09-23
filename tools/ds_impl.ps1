@@ -145,7 +145,9 @@ if ($Integrate) {
         # The worker started from $info.base. If the lead has changed this file since, copying the whole
         # file over silently throws those changes away (OpenSkyrim, 2026-09-23: a DemoStart entry and a
         # plugin registration, both found afterwards by grep). Leave such a file alone and say so; the
-        # worker's own change can be applied as a patch instead.
+        # worker's own change can be applied as a patch instead. This covers every file in the task's
+        # list, not only the ones its brief calls owned: both losses above were one-line changes to
+        # files the worker did not own, which is why nobody was watching them.
         if (-not $Force -and (Test-Path -LiteralPath $to)) {
             $sinceBase = @(& git -C $root diff --name-only "$($info.base)" -- $file 2>$null)
             if ($sinceBase) { $moved += $file; continue }
@@ -218,9 +220,13 @@ if ($fromLead) {
             Fail "a lead's acceptance command must be a plain test command starting with one of: $($prefixes -join ', ') (no command separators, pipes, redirects or variables). Refused: $check"
         }
     }
+    # The project's denyEdit protects the main checkout from direct edits, which a worktree coder never
+    # makes; its work reaches the checkout only through Claude's -Integrate. So a lead may give a coder
+    # protected source (OpenSkyrim's crates/**: four leads landed no code on 2026-09-23 because this rule
+    # used to cover denyEdit too). The files that govern workers themselves stay Claude's.
     foreach ($file in $owned) {
         $f = $file -replace '\\', '/'
-        foreach ($rule in @($leadConfig.denyEdit) + @('.deepseek-agents.json', 'AGENTS.md', 'CLAUDE.md')) {
+        foreach ($rule in @('.deepseek-agents.json', 'AGENTS.md', 'CLAUDE.md', '.claude/**', 'tools/ds_*', 'tools/run_ds_queue.ps1')) {
             if (-not $rule) { continue }
             $pattern = '^' + [regex]::Escape(($rule -replace '\\', '/')).Replace('\*\*', '.*').Replace('\*', '[^/]*') + '$'
             if ($f -match $pattern) { Fail "a lead may not give a coder a protected file ($file matches $rule); ask Claude" }
