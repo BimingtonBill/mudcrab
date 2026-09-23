@@ -167,6 +167,12 @@ fork fix against upstream code. Items 1-2 unblock acceptance itself, so they go 
   becomes Phase 2 work, check whether the defect exists on upstream `main` or only in the fork's
   lighting (several may come from fork-only code such as the sky-fill ambient).
 
+- **`plugins.priority` is not the FormID slot** for plugins after the first light plugin
+  (research-531, [`dragonborn-formid-slots.md`](../research/dragonborn-formid-slots.md)): anything that
+  decodes a FormID through `plugins.priority` is off by one. Small upstream fix candidate.
+- **274 Skyrim.esm and 4 Update.esm records are lost in conversion** (same note, section 5): REFR,
+  NAVM, ACHR and others, not delete-flagged. Needs its own investigation.
+
 ### Portal track
 
 - Door links from `XTEL` (PR 3's other half), interiors and the active cell (PR 6), seamless
