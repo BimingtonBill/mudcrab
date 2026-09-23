@@ -53,12 +53,12 @@ Status keys: ✅ done · 🔄 in progress · ⏸ waiting · ⬜ not started
 |---|---|---|
 | ✅ | Local branch `phase2/integration`: every Phase 2 branch merged (schema 15 once, in `crates/shared`); all tests pass; release engine and converter in `C:/Modding/wkj-tools/` | done |
 | ✅ | Independent audit of all 12 branches ([`phase2-branch-audit.md`](../pr/phase2-branch-audit.md)) | done: 1 ready, 10 fix first, 1 needs discussion |
-| ⬜ | One fix worker per branch (briefs written) | after the conversion |
+| ✅ | One fix worker per branch: all 11 fixed and committed on their branches (the rotation fix is local only; pushing it to #25 needs the user) | done |
 | ✅ | Local `--shots` tool for the integration build (`phase2/local-shots`) | done, not run yet |
 | ⬜ | Reference sheets: integration build vs UESP screenshots | after the conversion |
 | ✅ | Tree LOD files decoded and validated ([`tree-lod-layout.md`](../research/tree-lod-layout.md)) | done |
-| 🔄 | Why Dragonborn references are missing from the database | research running |
-| ⬜ | Distant land step 2 (brief written) | after the conversion |
+| ✅ | Dragonborn "missing" references: an ID-space mismatch in tree LOD, not a converter bug; the 278 "lost" records are deletions by later plugins | done |
+| ✅ | Distant land step 2: branch `phase2/lod-database` (world DB schema 4) | done, not yet reviewed by an independent worker |
 
 ## 5. Distant land (level of detail)
 
@@ -67,8 +67,8 @@ Design: [`docs/design/distant-lod.md`](../design/distant-lod.md).
 | | Step | Status |
 |---|---|---|
 | ✅ | 1. Converter reads the distant land and object files | branch `phase2/lod-mesh-containers` |
-| ⬜ | 2. Database tables for distant blocks; tree billboards | brief written; the tree file layout is decoded |
-| ⬜ | 3. Engine draws distant terrain | |
+| ✅ | 2. Database tables for distant blocks; tree billboards | branch `phase2/lod-database` |
+| ⬜ | 3. Engine draws distant terrain | implementation brief: [`distant-lod-step3-brief.md`](../design/distant-lod-step3-brief.md) |
 | ⬜ | 4. Engine draws distant objects and trees | |
 | ⬜ | 5. Add it to upstream's acceptance tests | |
 | ⬜ | 6. Regenerate distant land for mod-changed areas | later |
