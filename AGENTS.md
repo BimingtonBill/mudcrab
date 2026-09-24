@@ -1,9 +1,9 @@
 # Working agreement for AI assistants
 
 <!-- ds-delegation:begin (managed by DeepSeek Workers/tools/ds_delegation.py; edit with --set) -->
-## DeepSeek delegation level: 3 of 5 (Balanced (default))
+## DeepSeek delegation level: 4 of 5 (Claude manages)
 
-As 2, plus bounded, self-contained implementation (a new parser, validator, tool or test file with a fixed interface) through tools/ds_impl.ps1, and any task that can be written as a standalone brief with a clear check. Run independent tasks in parallel, with an independent reviewer on implementation. Claude keeps anything touching shared interfaces or more than a few files.
+Claude plans, writes briefs, reviews and integrates; workers do the exploration and most coding, including multi-file changes in their own worktrees with owned-file lists. Claude avoids reading source beyond what review needs: ask a worker to locate, summarize or trace code instead. Keep several workers busy, and use a DeepSeek lead (-CanSpawn) for jobs that split into independent parts.
 
 Web lookups: when a task needs information from outside the project (library or tool versions, changelogs, API documentation, an error message, how others solved something), send a DeepSeek websearch worker (-Kind websearch) instead of searching yourself; only a single quick search you need this minute is yours. Start it as soon as the question comes up and keep working while it runs. Give it everything it needs in the brief, nothing private, and check the claims you act on.
 
