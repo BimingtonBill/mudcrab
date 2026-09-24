@@ -466,6 +466,34 @@ def shot_place(world, shot):
     return None
 
 
+HISTORY = os.path.join(LOCAL, "history")
+
+
+def rotate(before):
+    """Move saves and skips older than `before` (UTC ISO) to local/reference/history/.
+
+    The fit tool counts every shot with a line in manual-poses.jsonl or not-found.jsonl as done,
+    so once a round has used them up they must leave those files, or the next pass would skip
+    straight past every shot the user saved or skipped before. The lines are kept in history.
+    """
+    os.makedirs(HISTORY, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    for path, key in ((MANUAL, "saved_at"), (NOT_FOUND, "flagged_at")):
+        if not os.path.exists(path):
+            continue
+        lines = [line for line in open(path, encoding="utf-8") if line.strip()]
+        old = [line for line in lines if str(json.loads(line).get(key, "")) < before]
+        new = [line for line in lines if line not in old]
+        if not old:
+            continue
+        name = os.path.splitext(os.path.basename(path))[0]
+        with open(os.path.join(HISTORY, f"{stamp}-{name}.jsonl"), "w", encoding="utf-8") as handle:
+            handle.writelines(old)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.writelines(new)
+        print(f"moved {len(old)} used line(s) of {os.path.basename(path)} to history")
+
+
 def cycle():
     """One automatic round. Its result pictures are the last check's grading pages (Skyrim beside
     the engine, one row per shot), which cost nothing extra to show the user."""
@@ -475,6 +503,9 @@ def cycle():
     if refine():
         batches.append(check(True))
     build()
+    # Everything the user saved or skipped before this round has been used; the next pass starts
+    # clean (see rotate).
+    rotate(utc_now())
     minutes = (datetime.datetime.now() - started).total_seconds() / 60
     print(f"round took {minutes:.1f} min")
     for batch in (b for b in batches if b):
@@ -529,6 +560,8 @@ def main(argv):
         import_grades(argv[2], by)
     elif command == "grade" and len(argv) >= 4:
         grade(argv[2], argv[3], by)
+    elif command == "rotate" and len(argv) >= 3:
+        rotate(argv[2])
     elif command == "status":
         status()
     else:
