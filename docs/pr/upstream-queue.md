@@ -103,9 +103,9 @@ From upstream's CONTRIBUTING.md and `two-tracks.md` "Rules for every Phase 2 PR"
 - `local/pr-drafts/`: bodies of #29-#31, the reference-shots notes, the point-lights plan.
 - `local/overnight/tick.py`: read-only scan (pushable, held, history paths, GitHub activity).
 
-## Out of date elsewhere (owner told)
+## Roadmap page
 
-- `docs/roadmap/phase2-track-tasks.md` still says "nothing new goes to GitHub" and lists #23/#25 as
-  waiting (both merged).
-- `local/roadmap/phase2.json` (updated 2026-09-24 19:00, Phase 2 Dev's file) still lists #23/#25 as
-  waiting and has no entries for #29-#31.
+Phase 2 Dev brought `phase2.json` and `docs/roadmap/phase2-track-tasks.md` (861ca29) up to date on
+2026-09-25. Proposed to the user: an "Upstream" track on the roadmap page from
+`local/roadmap/upstream.json` (Upstream Dev's file). If the user agrees, Phase 2 Dev drops the PR-status
+items from phase2.json and keeps only build status there.
