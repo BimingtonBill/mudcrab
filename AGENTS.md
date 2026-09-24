@@ -111,6 +111,31 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-25 (morning) - Claude [phase2] Upstream session (PR watch, CodeRabbit fixes)
+
+**New session, set up by the user: "Upstream collaboration and reviews".** It watches
+realfakenerd/wah-krah-jol: PRs, reviews, CI and issues. Phase 2 Dev handed it #29/#30/#31. Memory:
+`upstream-watch-session`. Its worktrees are `C:\Modding\wkj-upstream` (pr31 fixes),
+`wkj-upstream-29` and `wkj-upstream-30`; each has its own `target/` and can be discarded once pushed.
+
+**Upstream state:** #29-#31 CI green, behind main but mergeable, no maintainer comments. #26 (.lip
+tools) merged, so origin/main is 417a262. #27 is still held by its author (head 6834e5e). Issue #24:
+nothing new.
+
+**CodeRabbit triage** (DeepSeek review-570, reviewed): `docs/pr/coderabbit-triage-29-31.md`. The user
+said public-facing code takes priority, so Claude wrote the fixes. They are local and tested; see
+the Status table in that file: pr29 9b6611d+dcf48c3, pr31 e87d894, #30 (c) 8d6a807 on the combined
+tree. The glue commit does NOT fix #30 (c), so `integration-lod-shots` needs 8d6a807 as well.
+`docs/pr/pr27-comparison.md`: `vertex-alpha-faithful` supersedes our older branch, and the old
+SLSF1 note has been corrected.
+
+**Waiting on the user:** permission to push the fix commits to the frozen #29/#31 heads, where the
+#30 (c) fix goes, and the draft CodeRabbit replies (in the triage note; the user sends them). F30-a
+needs a separate follow-up PR later.
+
+**Running:** an upstream check every 90 min (CronCreate, this session only; it ends with the session).
+No workers, no cargo.
+
 ### 2026-09-25 (morning) - Claude [portal] (team working made standard; the hearth's grey sheet found)
 
 **The user's asks:** make the team way of working standard ("Working together" above, with the

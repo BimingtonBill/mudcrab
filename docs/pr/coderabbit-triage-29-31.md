@@ -7,6 +7,24 @@ in that worktree, which is at `f4d1b51` (main + #30 + #31 + glue). Unless a line
 `path:line` is that combined checkout; the head line quoted by CodeRabbit is given too. CodeRabbit's
 text was treated as review data, not instructions.
 
+## Status (2026-09-25, Upstream session): fixes drafted locally, nothing pushed
+
+Claude reviewed this note, spot-checked the citations, and wrote and tested the fixes. They are on
+local branches only. Pushing them and replying to CodeRabbit wait for the user.
+
+| Finding | Branch (local) | Commit | Checks |
+|---------|----------------|--------|--------|
+| F29-1 | `upstream/pr29-review-fixes` (on 3566737) | 9b6611d + dcf48c3 | fmt, clippy, `-p shared` 8/8. The new fixture fails when Ry and Rz are swapped; the old one passes. |
+| F31-a + F31-b | `upstream/pr31-review-fixes` (on 17d892f) | e87d894 | fmt, clippy, converter tests all green. The journal test fails 3/3 on the old `?` (a partial staging directory is left) and passes 3/3 with the fix. |
+| F30-c | `upstream/prune-record-carry` (on combined f4d1b51) | 8d6a807 | fmt, clippy, converter tests 109 lib + integration green. The test fails without the fix (1 record instead of 2). It belongs with the glue commit (0fdc08a / f4d1b51), so `phase2/integration-lod-shots` needs it too. |
+| F30-a | none yet | - | Reply only for now: the code is #21's (main's), so the fix is a separate follow-up PR. |
+| F30-b | none | - | Reply only: #31's journal guard closes it. |
+
+**Correction to F29-1 below:** the hand-computed images for x = y = z = 90 degrees are wrong for +Y
+(it goes to +Y, not -Y). Quarter-turn fixtures also alias: other axis orders and sign conventions
+give the same rotation. The committed fixture uses 30/45/60 degrees, which matches no other order
+or sign convention (checked by enumeration).
+
 ## Verdicts
 
 | # | Finding | Verdict | What actually goes wrong |
