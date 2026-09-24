@@ -1,6 +1,97 @@
 # impl-560 — distant LOD, step 4a: object blocks, per-cell hiding, the exclusion filter
 
-Branch `impl/560-lod-object-blocks`, cut from `phase2/lod-engine-terrain`.
+Branch `impl/560-lod-object-blocks`, cut from `phase2/lod-engine-terrain`. Landed as `aece008`;
+everything below the "Real-data churn bug" section is that commit as reviewed. Everything in that
+section is a further, still-uncommitted fix on top of it.
+
+## Real-data churn bug (found on `--assets .../SkyrimConverted-upstream15 --lod`, static camera)
+
+**Symptom.** A 20 s benchmark at the test cell (worldspace `0x3c`, grid `0,0`) with a static camera
+showed `lod_commits` 3630 and `lod_unloaded_blocks` 3562 (~180/s) while `lod_object_blocks_resident`
+sat at a stable 40 — object blocks were being unloaded and re-requested continuously with nothing
+moving. A terrain-only run of the same place had 28 commits and 0 unloads.
+
+**Cause.** `plan_object_blocks`'s split-completion check (`group_complete`, before this fix) and its
+split/merge hysteresis (`currently_split`) both tested a child's own key for `resident`/`ready`
+directly. That is correct for a single split level, but wrong the moment a child itself hands over
+to its own grandchildren: the child key stops being `resident` **by design** — it graduated — but
+its grandparent read the child's disappearance as "my split fell apart" and re-requested *both*
+itself and the child. The child, once reloaded, immediately handed over to the (already-ready)
+grandchildren again, which made the grandparent's key disappear again, ad infinitum. Traced with a
+diagnostic dump of a synthetic multi-level tree (camera at the shared corner of four level-16
+quadtrees, so every level's distance is 0 and nothing about the cycle is boundary-dependent): the
+steady state repeats a 5-frame cycle — level-16 unloads as its level-8 children complete → those
+level-8 blocks immediately hand over to level-4 → the level-4 group completes and the level-8
+blocks unload → **the level-16 parent, now seeing its level-8 children not-resident, re-requests
+both level-16 and level-8 from scratch** → repeat. Of the four candidates named in the review
+request, this is "the split/merge handover" and "roots seeded from resident" together: the flaw is
+one level of "resident" checking, one level too shallow, at every point that decision was made
+(root inclusion, split/merge hysteresis, and the completion check itself). `ready` lagging a frame
+behind `resident` and the whole-block coverage skip were both considered and ruled out: the former
+is deliberate and frame-stable, not oscillating on its own, and the default `stream_radius` (2)
+can never fully cover a grid-aligned level-4 block (width 4) or coarser (the argument is in the
+`quadrant_settled` doc comment's neighbourhood, not repeated here) — the churn reproduced at
+distance 0 regardless.
+
+**Fix.** Two new recursive helpers replace every direct `resident.contains(key)` /
+`ready.contains(key)` test used for a *child's* state (a leaf's own key is still tested directly —
+only a parent asking "is my child's area accounted for" needed to change):
+
+- `quadrant_has_activity(key, level_index, levels, resident)` — `key` itself is `resident`, **or**
+  (recursively) any of its children's areas has activity. Used for the split/merge hysteresis
+  threshold and to detect an in-progress merge.
+- `quadrant_settled(key, level_index, levels, ready, failed, available)` — `key` itself is `ready`,
+  **or** every one of its table-listed children's areas is (recursively); an unlisted child
+  contributes nothing but never blocks; a `Failed` key returns `false` immediately, so it and every
+  ancestor whose completion depends on it can never settle (this is F4's fix, unchanged in effect,
+  just re-expressed recursively).
+
+The algorithm around them changed too, not just the predicates: **the previous version only
+recursed into children once their group was already complete** (a deliberate simplification at the
+time, to dodge a different, imagined deadlock — see the "known limitation" this replaces, below).
+That was the other half of the bug: a child that had itself progressed to grandchildren was never
+revisited by its own parent to confirm it was still fine, so nothing corrected the parent's stale
+view between frames. The fix **always recurses into every child once distance says to split**,
+regardless of `group_complete`; `group_complete` (now via `quadrant_settled`) only decides whether
+the *parent* is **also** kept as a fallback and whether the group is releasable, not whether to look
+at the children at all. This resolves the "known limitation" section from the previous handoff
+entirely — a cascading multi-level settle now converges through normal recursion in the same pass
+its distance conditions allow, rather than needing repeated frames to graduate one level at a time
+— so that section is removed below rather than updated.
+
+One more adjustment fell out of always recursing: `hold_hidden` (forcing an already-`ready` child
+hidden until its siblings catch up) is now only applied to a child with **no finer level of its
+own** — a child that can itself split further might already need to be visible as *its own*
+incomplete split's fallback, and hiding it from above would fight that. `release_hidden` is
+unaffected (releasing an already-visible key is harmless).
+
+**Required test.** `object_quadtree_settles_and_stops_churning_with_a_static_camera` drives
+`plan_object_blocks` for up to 500 simulated frames (a `settle` helper: `wanted` → `Loading`,
+`Loading` → `Ready` after two frames, `unloaded` removed) against nine complete level-16 quadtrees
+(medium bands, real levels 4/8/16) tiled around a static camera sitting on the shared corner of
+four of them, with a few level-4 rows removed from one quadtree to mirror a converter gap. Asserts
+the plan produces neither a `wanted` nor an `unloaded` key for 20 consecutive frames, and that the
+final resident set's block rectangles pairwise never overlap (each area drawn exactly once, at any
+levels). This settles in a handful of frames. I did not re-run this exact harness against the pre-fix
+code (the `settle` helper and its two tests did not exist yet when I was diagnosing this), but an
+earlier ad hoc version of it — an unassertive dump, not kept — drove the same multi-quadtree table
+for 200 simulated frames against the pre-fix planner and printed a `wanted`/`unloaded` pair on
+101 of the last 168 frames, in the exact repeating 5-frame cycle described above; it never once
+went quiet. That dump is what the "Cause" trace above is built from.
+`object_quadtree_settles_against_the_real_tamriel_object_table` (`#[ignore]`d — needs
+`C:/Modding/SkyrimConverted-upstream15/skyrim_world.db` on disk) reads every `kind='objects'` row
+for worldspace `0x3c` directly from the real converted database and runs the same `settle` harness
+at the exact camera cell (`0,0`) the benchmark that found the bug used. Run manually (not part of
+`cargo test -p engine`'s default set): `cargo test -p engine --lib
+object_quadtree_settles_against_the_real_tamriel_object_table -- --ignored` — passes, settles well
+inside the 2000-frame budget.
+
+**Not re-run:** the engine binary / the real benchmark — the GPU was in use by another session
+tonight, and the request said not to run it; the lead is re-running
+`--lod --benchmark-duration 20` to confirm `lod_unloaded_blocks` stays flat. The ignored real-table
+test above is the closest thing to that confirmation available from this worktree without a GPU:
+same worldspace, same camera cell, same real `available` table, same planner — only the renderer
+and the real (not simulated) two-frame-ish GLB load latency are missing.
 
 ## What changed and the approach
 
@@ -92,16 +183,18 @@ at each split decision:
   the chain): a child that finishes loading this exact frame is planned as "not yet ready" and
   picked up on the next pass, so the two writers never touch the same entity the same frame.
 
-**A known limitation, not fixed.** The "don't recurse into an incomplete group's children" rule
-means a *cascading* multi-level settle (say level 16 into level 8 into level 4, all at once) takes
-more than one frame to fully resolve even when every block involved loads instantly — a level-8
-child must itself become `ready` as a level-8 block before its own level-4 split gets a turn. I
-judged this an acceptable, self-correcting trade against the alternative (recursing into
-not-yet-graduated children risks a level-8 key that is *never* individually requested if it always
-prefers to split further, which would leave the level-16 parent's group permanently incomplete —
-a subtler version of the same hole this fix exists to close). `object_quadtree_drops_the_parent_and_releases_children_once_the_group_completes`
-and its sibling tests below all exercise one split boundary at a time for this reason; nothing here
-exercises the two-boundary cascade end to end.
+**A known limitation, not fixed at the time — since fixed by the churn-bug section above.** As
+committed, the "don't recurse into an incomplete group's children" rule meant a *cascading*
+multi-level settle took more than one frame to fully resolve, and — this is the part that turned
+out to matter — nothing ever revisited a child that had already progressed past this level to
+confirm it was still fine. That silence is exactly what the real-data run caught: the level-16
+parent's *next* evaluation re-derived "is my level-8 child okay" from the child's own key alone,
+saw it gone (because it had graduated to level-4, not because anything was wrong), and reopened a
+split that had already finished. See "Real-data churn bug" at the top of this document for the fix;
+`object_quadtree_drops_the_parent_and_releases_children_once_the_group_completes` and its sibling
+tests below still only exercise one split boundary directly, but
+`object_quadtree_settles_and_stops_churning_with_a_static_camera` (also at the top) now exercises
+the two-boundary cascade end to end, repeatedly, across simulated frames.
 
 ### 2. F2 — a coarsest band with no object rows no longer disables the tier
 
@@ -226,10 +319,6 @@ terrain calls `plan_blocks`, which never reads `ready`/`failed` or populates `ho
   (`lod_blocks_covered_skipped % 4 == 0`, the settle/unload timing) are a needless risk to disturb
   for no test that needs it. The real-data run against `C:/Modding/SkyrimConverted-upstream15/` is
   what exercises GLB loading, segment extras and the handover's actual frame timing end to end.
-- **The cascading two-level settle is not covered end to end** (see the handover section above) —
-  only that it converges over multiple frames, not that any single frame of it looks correct. A
-  real-data run with `--lod-fixture`-style logging of `lod_object_blocks_resident` across a few
-  hundred frames while flying toward a level-16 block would be the cheapest way to see it settle.
 - **A pre-existing gap, not touched:** `track_lod_readiness`'s bounds-mismatch path
   (`commands.entity(entity).remove::<PendingLodBlock>()` without also flipping `world.blocks[key]`
   to `Failed`) leaves that key `Resident` with `Visibility::Hidden` forever, but — unlike a true
@@ -244,23 +333,33 @@ terrain calls `plan_blocks`, which never reads `ready`/`failed` or populates `ho
 
 ## Checks run
 
-All three from the worktree root (`D:/wkj-impl/impl-560`):
+All three from the worktree root (`D:/wkj-impl/impl-560`), after the churn-bug fix (most recent
+state):
 
-- `cargo fmt --all -- --check` — clean (after one `cargo fmt --all` pass to settle line-wrapping;
-  re-checked clean afterward, twice — once per round of fixes).
+- `cargo fmt --all -- --check` — clean.
 - `cargo clippy -p engine --all-targets -- -D warnings` — `Finished \`dev\` profile [optimized +
-  debuginfo] target(s) in 3.32s`, no diagnostics. Two lints were caught and fixed along the way:
-  `unnecessary_sort_by` (first round, `levels.sort_by_key(|band| std::cmp::Reverse(band.level))`)
-  and `manual_is_multiple_of` (this round, `coarser.level.is_multiple_of(band.level)`).
-- `cargo test -p engine` — lib: `test result: ok. 94 passed; 0 failed; 0 ignored; 0 measured; 0
-  filtered out; finished in 0.81s`, plus `world-inspect` bin `3 passed`, `main` bin `0 passed`,
-  doc-tests `0 passed`. 94 is 16 more than the branch point (`d42df56`) had (78): the first round's
-  nine plus this round's net seven (eleven object-planner tests now stand where two,
-  `object_quadtree_draws_each_area_exactly_once` and
-  `object_quadtree_split_survives_small_camera_moves_hysteresis`, stood before, both rewritten
-  against the handover semantics rather than kept as-is). Every terrain and segment/extras test
-  stayed green throughout both rounds.
+  debuginfo] target(s) in 4.60s`, no diagnostics.
+- `cargo test -p engine` — lib: `test result: ok. 95 passed; 0 failed; 1 ignored; 0 measured; 0
+  filtered out; finished in 0.87s`, plus `world-inspect` bin `3 passed`, `main` bin `0 passed`,
+  doc-tests `0 passed`. The 1 ignored is
+  `object_quadtree_settles_against_the_real_tamriel_object_table` (needs the converted database on
+  disk); run explicitly: `cargo test -p engine --lib
+  object_quadtree_settles_against_the_real_tamriel_object_table -- --ignored` →
+  `test result: ok. 1 passed`. 95 is one more than the previous round's 94:
+  `object_quadtree_settles_and_stops_churning_with_a_static_camera` is new and counted;
+  `object_quadtree_settles_against_the_real_tamriel_object_table` is `#[ignore]`d so it does not
+  add to the default-run count, and no test was removed this round. Every terrain, segment/extras
+  and previously-existing object-planner test stayed green throughout.
 
-Not run here (no GPU in this worktree): the engine binary, `--lod --lod-objects` on real assets,
-and the visual double-render/overhang/pop-in checks this handover and
-`docs/research/lod-hiding-under-loaded-cells.md` both predict.
+Earlier rounds' checks (before the churn fix; superseded by the above, kept for the record):
+`cargo fmt --all -- --check` clean; `cargo clippy` `Finished ... in 3.32s`, no diagnostics
+(`unnecessary_sort_by` and `manual_is_multiple_of` were caught and fixed along the way, across the
+two earlier rounds); `cargo test -p engine --lib` `94 passed; 0 failed`.
+
+Not run here (no GPU in this worktree, and the GPU was in use by another session tonight): the
+engine binary, `--lod --lod-objects` on real assets, and the visual double-render/overhang/pop-in
+checks this handover and `docs/research/lod-hiding-under-loaded-cells.md` both predict. The lead is
+re-running `--lod --benchmark-duration 20` at the same test cell to confirm `lod_unloaded_blocks`
+now stays flat; `object_quadtree_settles_against_the_real_tamriel_object_table` above is the closest
+available confirmation from this worktree (same worldspace, same camera cell, same real object
+table, same planner, simulated load latency instead of the real one).
