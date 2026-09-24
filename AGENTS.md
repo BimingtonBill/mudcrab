@@ -120,6 +120,12 @@ exported DOOR models); every `phase2/*` branch merges cleanly with origin/main, 
 **06:30:** PR #25 merged too (1f0a40e; main e003f67). main merged into `integration-lod-shots`
 (upstream's accepted rotation code kept; 447 tests green). The #25 follow-up is re-cut as
 `phase2/refr-rotation-followup` (3566737) for the user to send or not.
+**Morning:** with the user's approval QnA opened upstream #29 (`refr-rotation-followup` 3566737), #30
+(`pruned-texture-complete` 3cd8858) and #31 (`resume-staging-validation` 17d892f). These branches are
+live PR heads: frozen unless the user OKs a change. #30 and #31 conflict with each other (`cache.rs`,
+two tests at one spot; keep both), and the second to merge also needs the glue commit 0fdc08a. Local
+`phase2/pr30-31-combined` (main + #30 + #31 + glue) holds the resolution and passes fmt, clippy and
+the converter tests.
 
 **No workers running.**
 
