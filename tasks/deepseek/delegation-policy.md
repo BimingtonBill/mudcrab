@@ -15,7 +15,7 @@ effort just to save DeepSeek tokens.
 - Delegate research (format layouts, Bevy API questions, prior art in OpenMW and xEdit), evidence
   extraction, analysis of completed profiling and acceptance runs, independent audits, test design,
   and assigned documentation.
-- Delegate implementation broadly (delegation level 3 of 5 since 2026-09-24, lowered from 4 by the user to cut DeepSeek spend; where this text delegates more, the generated delegation block governs): parsers,
+- Delegate implementation broadly (delegation level 4 of 5, set back to 4 by the user on 2026-09-24 after a morning at 3; spend is now capped by a $20 weekly DeepSeek limit, and the generated delegation block governs): parsers,
   converters, validators, audit tools, and multi-file changes within one crate, each run through
   `tools/ds_impl.ps1` in its own worktree with an owned-file list and acceptance commands. Two
   tasks never own the same file. The lead picks tasks that do not overlap current work. This
