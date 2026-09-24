@@ -105,10 +105,24 @@ def ballpark_candidates(shot, world, place_key, exclude=(), interior=False):
             camera = (target[0] - math.sin(h) * 600, target[1] - math.cos(h) * 600, target[2])
             out.append(variant(base, f"room{index}", camera, *aim(camera, target)))
         return out, place
+    # A city or small realm is its own worldspace with only a few cells; a camera placed outside
+    # them never gets land to stand on, and the engine waits its full 30 s settle for each such
+    # view. Keep every camera inside the space's placed objects, 300 units in from their edge.
+    bounds = None
+    if base["worldspace_id"] not in (None, 60):
+        row = world.db.execute(
+            'SELECT MIN(pos_x), MAX(pos_x), MIN(pos_y), MAX(pos_y) FROM "references" WHERE worldspace_id = ?',
+            (base["worldspace_id"],),
+        ).fetchone()
+        if row and row[0] is not None:
+            bounds = (row[0] + 300, row[1] - 300, row[2] + 300, row[3] - 300)
     for distance, rise in ((3500.0, 1300.0),):
         for heading in range(0, 360, 45):
             h = math.radians(heading)
-            camera = (target[0] - math.sin(h) * distance, target[1] - math.cos(h) * distance, target[2] + rise)
+            x, y = target[0] - math.sin(h) * distance, target[1] - math.cos(h) * distance
+            if bounds and bounds[0] < bounds[1] and bounds[2] < bounds[3]:
+                x, y = min(max(x, bounds[0]), bounds[1]), min(max(y, bounds[2]), bounds[3])
+            camera = (x, y, target[2] + rise)
             out.append(variant(base, f"d{int(distance)}h{heading}", camera, *aim(camera, target)))
     return out, place
 
