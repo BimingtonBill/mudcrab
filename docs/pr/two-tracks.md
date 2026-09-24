@@ -85,6 +85,18 @@ A fresh run re-encodes every texture (hours). Announce "converting" to Portal De
 builds on either track until "past conversion"; nothing reads the output or staging folders;
 budget about 75 GB.
 
+Result: complete 2026-09-24 07:14, 242,969 converted, 0 skipped, integration passed.
+
+## The schema-15 conversion (2026-09-24)
+
+With 116 GB free, a second set goes into a **new** folder, `C:\Modding\SkyrimConverted-upstream15`,
+so the schema-14 set stays as PR 3's evidence. Converter `C:\Modding\wkj-tools\converter-integration-lod.exe`,
+built from `phase2/integration-lod` (the integration branch plus distant LOD steps 1-3): converter
+schema 15, world DB schema 4. One run lets the reference sheet show trees, plants and the material
+fixes, and gives LOD step 3 its first database. It carries the vertex-alpha branch that is still
+waiting on discussion, so the set is for looking and testing, not PR evidence. Same command shape
+and the same rules as above; Portal Dev agreed.
+
 ## Which work goes where
 
 Numbers are the PRs of `upstream-pr-plan.md` §3. Order is the proposed submission order.
