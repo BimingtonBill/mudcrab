@@ -1,5 +1,7 @@
 # impl-170 - Effect shaders colour their greyscale texture through their palette
 
+**Done by Claude instead (`b54dced`, 2026-09-24): do not launch.** The spend pace allowed only low-effort workers that night.
+
 Owned files: crates/engine/src/effect_palette.rs,crates/engine/src/shaders/effect_palette.wgsl,crates/engine/src/render.rs,crates/engine/src/streaming.rs,crates/engine/src/lib.rs
 
 Acceptance: cargo test -p engine --lib,cargo clippy --workspace --all-targets -- -D warnings,cargo fmt --all -- --check
