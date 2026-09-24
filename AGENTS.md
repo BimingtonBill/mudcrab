@@ -47,6 +47,12 @@ before starting any `phase2/*` branch or moving work between tracks.
 - Task queue for DeepSeek workers and how to run it: `tasks/deepseek/README.md`. Review `[deepseek]` commits and their handoff notes before building on them.
 - Before committing Rust changes, run what CI runs: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and the tests of the crates you touched.
 - Keep `docs/` current. Findings go in the docs (`docs/research/`, `docs/roadmap/`), not only in chat.
+- **Non-measured engine builds use `cargo build --profile quick --bin engine`** (`target/quick/`):
+  release without link-time optimisation, incremental. Defined in the untracked
+  `C:\Modding\.cargo\config.toml`, so it never reaches upstream. Measured 2026-09-24: a one-file
+  edit rebuilds in 39 s against 4 min 20 s for `--release`. Acceptance, profiling and benchmarks
+  keep `--release`. `--bin engine` also skips `world-inspect`'s own 2.5 min link.
+  C:\Modding and `%USERPROFILE%\.cargo` are excluded from Defender scanning.
 - `local/` (worker state, checkouts, advisor notes) and `target/` are Git-ignored. Never commit them, and never commit Bethesda game data.
 - **Engine instances run in parallel.** Converted assets are read-only, so any number of engines
   (both sessions, workers, the user playing) can run tours, `--shots` and tests side by side, just
