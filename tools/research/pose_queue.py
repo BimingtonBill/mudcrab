@@ -535,7 +535,8 @@ def status():
             if not shot.get("reference"):
                 verdict = "no reference"
             elif grades.get(shot["name"], {}).get("parked"):
-                verdict = "parked (no luck after automatic rounds)"
+                reason = grades[shot["name"]].get("parked_reason", "no luck after automatic rounds")
+                verdict = f"parked ({reason})"
             elif shot["name"] in skip:
                 verdict = "can't find (user)"
             elif shot.get("confidence") == "unplaced":
