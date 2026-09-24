@@ -116,6 +116,14 @@ because alone it did not improve interiors, whose fog fills them. Next for inter
 tonemap, per weather and cell); distant land (Phase 2's LOD branches, not merged); a portal is not
 drawn past ~600 units; a shots-run door once rendered closed (flaky).
 
+**After midnight:** interiors draw their fog in the record's far colour (`7d89ae6`, Candlehearth's
+cream haze gone); merged Phase 2's `water-colours` (`eea4448`, per-water colours; the DB was
+re-exported at schema 21, integration passed, tours pass) and `audit-converter` (`ba3e5d9`, resolved
+per Phase 2's notes: panicking assets become failures, the schema stamp comes from the shared
+constant); the engine half of animated shader values (`1bc0be1`: flame atlases scroll from
+`OPEN_SKYRIM_material_animation`, inert until Phase 2's converter export lands, which needs a
+schema bump and a reconversion).
+
 **Morning gallery:** https://claude.ai/artifact/1QMmmU5jKwDhdnhKUynJpZ (private; JPEGs in
 `local/gallery/final/`). **No workers running from this session.** Phase 2 Dev still has coders
 and an audit-converter merge in flight; take their pre-resolved merge, not the branch.
