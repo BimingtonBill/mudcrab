@@ -18,7 +18,7 @@
     "CLAUDE.md",
     ".deepseek-agents.json"
   ],
-  "allowTools": "Bash(cargo check *),Bash(cargo test *),Bash(cargo clippy *),Bash(cargo fmt --check*),Bash(cargo tree *),Bash(python tools/*),Bash(python -m unittest *),Bash(git add *),Bash(git commit *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(target/release/engine.exe *),Bash(./target/release/engine.exe *)",
+  "allowTools": "Bash(cargo check *),Bash(cargo test *),Bash(cargo clippy *),Bash(cargo fmt --check*),Bash(cargo tree *),Bash(python tools/*),Bash(python -m unittest *),Bash(git add *),Bash(git commit *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(target/release/engine.exe *),Bash(./target/release/engine.exe *),Bash(target/quick/engine.exe *),Bash(./target/quick/engine.exe *)",
   "stateDir": "local/agents",
   "defaults": {
     "mode": "read",
@@ -26,6 +26,6 @@
     "timeoutMinutes": 150
   },
   "delegationLevel": 4,
-  "implAllowTools": "Bash(cargo check *),Bash(cargo test *),Bash(cargo clippy *),Bash(cargo fmt *),Bash(cargo tree *),Bash(cargo build *),Bash(python *),Bash(python -m unittest *),Bash(target/release/engine.exe *),Bash(./target/release/engine.exe *)",
+  "implAllowTools": "Bash(cargo check *),Bash(cargo test *),Bash(cargo clippy *),Bash(cargo fmt *),Bash(cargo tree *),Bash(cargo build *),Bash(python *),Bash(python -m unittest *),Bash(target/release/engine.exe *),Bash(./target/release/engine.exe *),Bash(target/quick/engine.exe *),Bash(./target/quick/engine.exe *)",
   "_implAllowToolsNote": "implAllowTools replaces ds_impl's cargo+python default; cargo build and the release engine were added 2026-09-22 for --shots render tasks (impl-019)."
 }
