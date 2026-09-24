@@ -4,17 +4,25 @@ Owner: the Phase 2 Dev session. Goal: help upstream (Wah Krah Jol) finish Phase 
 README and `docs/roadmap/02-completion-plan.md` describe. Details and rules live in
 [`docs/pr/two-tracks.md`](../pr/two-tracks.md); this file is the short list.
 
-**Rule in force:** nothing new goes to GitHub until upstream answers what is already there.
+**Rule in force (2026-09-25):** each send needs the user's OK. Upstream Dev turns ready branches into
+PRs and handles reviews; its queue is [`docs/pr/upstream-queue.md`](../pr/upstream-queue.md). Phase 2
+Dev builds and finishes the branches.
 
 Status keys: ✅ done · 🔄 in progress · ⏸ waiting · ⬜ not started
 
-## 1. On GitHub now
+## 1. On GitHub now (2026-09-25)
 
 | | Item | Status |
 |---|---|---|
-| ✅ | PR #23: door test fixture. Review fixes pushed, reply posted | ⏸ waiting for the reviewer |
-| ✅ | PR #25: rotation fix | ⏸ waiting for a review |
+| ✅ | PR #23: door test fixture | ✅ merged 2026-09-24 (0c4592b) |
+| ✅ | PR #25: rotation fix | ✅ merged 2026-09-24 (1f0a40e) |
+| ✅ | PR #29: rotation follow-up (roadmap note, test) | ⏸ open, review fix pushed (dcf48c3) |
+| ✅ | PR #30: a conversion that prunes broken texture links can still complete | ⏸ open (3cd8858); glue + review fix ready locally |
+| ✅ | PR #31: a resumed conversion doesn't keep outdated files | ⏸ open, review fixes pushed (e87d894) |
 | ✅ | Issue #24: is lighting in scope? | ⏸ waiting for an answer |
+
+Next candidates: the reference-shot tool (`phase2/reference-shots`, ready); point lights
+(planned, `local/pr-drafts/point-lights-plan.md`).
 
 ## 2. Tonight
 
