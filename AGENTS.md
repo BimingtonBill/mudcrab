@@ -80,6 +80,41 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-24/25 (night) - Claude [phase2] (look fixes, distant LOD extended, audits, timing)
+
+**Joint night with Portal Dev** (shared log `local/overnight-2026-09-24.md`; QnA researched water,
+sky, LOD hiding, refraction and terrain-LOD normals in `local/research/`). Everything is on local
+`phase2/*` branches; nothing pushed, and the send hold stands. `phase2/integration-lod-shots`
+(`6aa71fa`) holds all of it: converter, engine, dummy-content and vendored-parser tests green.
+Morning report for the user: `local/morning-report-2026-09-25.md`.
+
+**Landed (branch, key commit):**
+- Distant LOD, terrain (`lod-engine-terrain`): clipped under loaded full-detail terrain and shaded
+  from its model-space normals (e75704b); the clip is a pipeline variant used only on blocks that
+  touch a loaded cell (0d71cd7).
+- Distant LOD, objects (`lod-mesh-containers` 9959944: per-cell segments kept; `lod-engine-objects`:
+  exclusive quadtree, seamless handover, loaded-cell segment hiding, churn fix) and trees
+  (`lod-engine-trees`: billboards batched per type, hidden per loaded cell, lit evenly).
+- Water (`water-look`, `water-colours`), terrain normal maps fixed (`terrain-normal-maps` ba85290),
+  heat-haze/refraction exclusion and material animation export with static UV transform
+  (`material-publication`; Portal Dev plays it: flames scroll), reconversion hard links for vfs
+  and the ingestion cache (`staging-hard-links`), strict-bounds precision (`bounds-precision`),
+  audit fixes (`audit-converter`, `audit-engine`), archive/plugin precedence (`asset-precedence`).
+
+**Timing:** the clean re-time (03:30, alone) passes all scenarios: rural 161 fps, with all LOD kinds
+134 fps; the stress fly-through with LOD is p95 15.8 ms (19.3 and failing before). Results in
+`C:/Modding/wkj-tools/retime2-2026-09-25`. An earlier re-time was spoiled by four runaway
+`find /` scans left by subagents (memory `subagent-midtask-messages`).
+
+**Upstream:** PR #27 (TaylorTurnerIT) overlaps renderable-base-types, vertex-alpha-not-opacity and
+the schema-15 bump: comparison and recommendation in `docs/pr/pr27-comparison.md`, for the user.
+
+**Open:** a one-frame LOD invariant warning after a camera teleport; tree billboard brightness;
+the GUI launcher lacks Skyrim.ini/Plugins.txt discovery; the sky (QnA's `sky.md`). DeepSeek coders
+are held by budget pacing until Fri 22:39; Claude subagents took the coding.
+
+**No workers running.**
+
 ### 2026-09-24 (night) - Claude [portal] (the look gaps, worked with Phase 2 Dev; morning gallery)
 
 **The user's asks:** a ranked list of how the demo's look differs from Skyrim
