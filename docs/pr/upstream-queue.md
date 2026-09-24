@@ -40,7 +40,9 @@ The #30 reply promised it. Not written yet.
 4. **History paths:** lod-engine-trees and material-publication commits contain `C:/Modding/...`
    paths (no names). Accept them, or rewrite before pushing to the fork.
 5. **public/portal** is 14+ commits behind portal and needs a re-export
-   (memory `public-fork-export`) before it is pushed again.
+   (memory `public-fork-export`) before it is pushed again. Portal Dev recommends waiting for the
+   s23 bundle reconversion and tours, when the fire fix actually shows, and will say when. HEAD is
+   safe to publish now if the user wants it sooner.
 
 ## Staged branches, in send order
 
