@@ -117,6 +117,9 @@ are held by budget pacing until Fri 22:39; Claude subagents took the coding.
 LOD chain (one spec-doc conflict) and `renderable-base-types` (#23's interior test updated for
 exported DOOR models); every `phase2/*` branch merges cleanly with origin/main, integration green
 (440 tests). Whether the send hold lifts is the user's call.
+**06:30:** PR #25 merged too (1f0a40e; main e003f67). main merged into `integration-lod-shots`
+(upstream's accepted rotation code kept; 447 tests green). The #25 follow-up is re-cut as
+`phase2/refr-rotation-followup` (3566737) for the user to send or not.
 
 **No workers running.**
 
