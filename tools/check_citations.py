@@ -144,6 +144,12 @@ def check_path(path, first, last, root=ROOT, index=None):
     clean = path.replace('\\', '/')
     if '/' in clean:
         target = root / clean
+        # A worker-written note must not make this read files outside the project ("../../x", or an absolute
+        # path, which pathlib's / would take as the whole path): OpenSkyrim audit finding HT-20260924-05.
+        try:
+            target.resolve().relative_to(root.resolve())
+        except ValueError:
+            return 'outside the project', None
         if not target.exists():
             return 'no such file', None
         if target.is_dir():

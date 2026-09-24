@@ -192,6 +192,11 @@ if ($Integrate) {
     if ($acceptanceFailed -and -not $Force) {
         Fail "$Integrate's last recorded acceptance did not pass (outcome=$($lastRow.outcome)); refusing to integrate broken work. Fix it and re-run -Post $Integrate, or pass -Force to copy it anyway: -Integrate $Integrate -Force"
     }
+    # Every coder ds_impl runs leaves a row, so none means its acceptance was never checked here. Don't let
+    # that pass as clean (OpenSkyrim audit finding HT-20260924-04): check it first, or say so with -Force.
+    if (-not $lastRow -and -not $Force) {
+        Fail "no acceptance is recorded for $Integrate, so nothing says it works. Run its checks first (-Post $Integrate), or pass -Force to copy it anyway: -Integrate $Integrate -Force"
+    }
 
     $reviewName = $Integrate -replace '^impl-', ''
     $reviewRoot = Join-Path $stateDir 'runs'
