@@ -225,13 +225,16 @@ def merge(dry_run):
             for space in ("worldspace_id", "interior_cell_id"):
                 if space in record:
                     pose[space] = record[space]
-            if all(shot.get(key) == value for key, value in pose.items()):
+            if all(shot.get(key) == value for key, value in pose.items()) and not record.get("note"):
                 continue
             shot.update(pose)
             shot["confidence"] = "hand-fit"
             stamp = f" Pose set by hand in the engine ({str(record.get('saved_at', ''))[:10]})."
             if "Pose set by hand" not in shot.get("note", ""):
                 shot["note"] = shot.get("note", "") + stamp
+            user_note = str(record.get("note", "")).strip()
+            if user_note and user_note not in shot.get("note", ""):
+                shot["note"] = shot.get("note", "") + f" User's note: {user_note}"
             set_grade(grades, shot["name"], "unchecked", "user")
             grades[shot["name"]]["hand"] = True
             print(f"{shot['name']}: {pose}")
