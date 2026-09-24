@@ -99,7 +99,7 @@ planes excluded (the fire heat haze), the water look (white sheet gone), staging
 reconversions, scripts reading the schema from source. Audit findings CC-01/02, RM-02, HT-01/02/04/05
 closed.
 
-**Data:** `C:\Modding\SkyrimConverted` is converter **schema 21** (complete, integration passed;
+**Data (at 23:00):** `C:\Modding\SkyrimConverted` was converter **schema 21** (complete, integration passed;
 space_lighting also carries fog far colour, fog max and light fade). `engine-portal-fit.exe` is
 schema 21. Tours on it: Riverwood 8/8, Alftand 4/4, 0 FAIL. Fallback copy `SkyrimConverted-s19`
 (hard links; its vfs and ingestion cache removed after they filled C: at 20:40 - see memory
@@ -123,6 +123,14 @@ per Phase 2's notes: panicking assets become failures, the schema stamp comes fr
 constant); the engine half of animated shader values (`1bc0be1`: flame atlases scroll from
 `OPEN_SKYRIM_material_animation`, inert until Phase 2's converter export lands, which needs a
 schema bump and a reconversion).
+
+**Later still (01:00-02:30):** schema **22** published: Phase 2's material-animation export
+(cherry-picked 43bda16, 00743f8, bd6e439, 9ef3104: `OPEN_SKYRIM_material_animation`, static
+uvOffset/uvScale, tangents [outgoing, incoming] per NifSkope) plus the engine half (`1bc0be1`):
+**the hearth flames scroll** (GIF `local/gallery/sleeping-giant-fire.gif`). Effect cards are unlit
+and drawn at 8x (`d7f4e5c`); a grey translucent sheet over the flames is still open (suspects: fog
+on the blended cards, or the additive Glow card). Audit ES-02 closed (`try_despawn`). Tours on
+schema 22: Riverwood 8/8, Alftand 4/4; `engine-portal-fit.exe` is schema 22.
 
 **Morning gallery:** https://claude.ai/artifact/1QMmmU5jKwDhdnhKUynJpZ (private; JPEGs in
 `local/gallery/final/`). **No workers running from this session.** Phase 2 Dev still has coders
