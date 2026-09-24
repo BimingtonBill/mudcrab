@@ -111,6 +111,40 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-25 (morning) - Claude [phase2] (hearth-flame converter fixes; portal reconversion bundle started)
+
+Worked with Portal Dev on the grey sheet over hearth flames (team log `local/team/2026-09-25.md`).
+The upstream PRs #29-#31 moved to the "Upstream collaboration and reviews" session (heads frozen;
+its CodeRabbit triage `docs/pr/coderabbit-triage-29-31.md` finds the glue 0fdc08a makes #30 (c) - a
+lost prune record, output still correct - reachable; integration-lod-shots carries that too).
+
+**Landed on local `phase2/*` branches (fmt, clippy, tests green; nothing pushed):**
+- `vertex-alpha-faithful` 39c3497 (from main): the vendored exporter dropped vertex colours on every
+  static BSTriShape (the flame cards' fade and palette row: the grey sheet; baked shading on SSE
+  meshes). Now kept and published per the shaders' rule: no SLSF2_Vertex_Colors → dropped;
+  Tree_Anim → alpha 1 (wind); else alpha is opacity. Supersedes `vertex-alpha-not-opacity`.
+  Reviewed and approved by Portal Dev.
+- `nif-billboard-nodes` 11b2e2b, e3d30a6 (from main): NiBillboardNode parsed and kept (the flame
+  cards lay flat without its transform), marked with node extras `openSkyrim.billboard`.
+- `material-publication` 4546e6e (effect falloff + soft depth in OPEN_SKYRIM_material, as stored:
+  cosines) and 227da41 (colour controllers → `emissiveColor`/`specularColor` channels with
+  `components: 3`; the chain walk no longer stops at a colour controller). Checked on the real
+  fireplace NIF against Portal Dev's key dump.
+- Portal Dev's engine half of all of this is on portal (19e5fc7, 302516e), inert until the data.
+
+**In progress: `bundle/portal-s23`** (in `C:\Modding\wkj-phase2`, from portal 19e5fc7): the one
+reconversion for portal. Done: LOD converter half merged (60e9fff, world DB schema 6; converter,
+shared, dummy-content tests green). **Left:** merge `vertex-alpha-faithful`, `nif-billboard-nodes`,
+cherry-pick 4546e6e + 227da41 (dummy-content nif.rs will conflict: add the colour writer to the
+union), bump CONVERTER_SCHEMA_VERSION 22 → 23, full workspace tests, hand to Portal Dev (they delete
+`force_opaque_vertex_alpha` in the same commit and announce the reconversion). The LOD engine half
+merges later without a reconversion (portal lacks upstream main since #23: expect big conflicts).
+
+**Also open:** distant tree billboards 2-4x too bright and grey; the vanilla DistantTree lighting
+research is websearch-703 (QnA started it; report at
+`C:\Users\Brannock\AppData\Local\Temp\claude\C--Modding-OpenSkyrimProject\d9ee62b9-a4a7-4ec8-af9c-bdc53350c97e\scratchpad\treelod\websearch-703.out`),
+unread. QnA is no longer the research desk. **No workers running from this session.**
+
 ### 2026-09-24/25 (night) - Claude [phase2] (look fixes, distant LOD extended, audits, timing)
 
 **Joint night with Portal Dev** (shared log `local/overnight-2026-09-24.md`; QnA researched water,
