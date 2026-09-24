@@ -164,23 +164,35 @@ def check(run_grader):
 
 
 def import_grades(path, by):
+    """Read the grader's JSON: shot -> grade, or shot -> {"grade", "why"} (the reason is kept)."""
     text = open(path, encoding="utf-8", errors="replace").read()
     found = None
-    for match in re.finditer(r"\{[^{}]*\}", text, re.S):
+    decoder = json.JSONDecoder()
+    for start in (m.start() for m in re.finditer(r"\{", text)):
         try:
-            candidate = json.loads(match.group(0))
+            candidate, _ = decoder.raw_decode(text, start)
         except ValueError:
             continue
-        if isinstance(candidate, dict) and candidate and all(isinstance(v, str) for v in candidate.values()):
+        # The answer is the biggest such object: each shot's own {"grade", "why"} parses too.
+        if (
+            isinstance(candidate, dict)
+            and candidate
+            and "grade" not in candidate
+            and all(isinstance(v, str) or (isinstance(v, dict) and "grade" in v) for v in candidate.values())
+            and len(candidate) >= len(found or {})
+        ):
             found = candidate
     if not found:
         sys.exit(f"no JSON object of grades found in {path}")
     grades = load_json(GRADES, {})
     known = {shot["name"] for _, data in shots_files() for shot in data["shots"]}
-    for name, verdict in found.items():
-        verdict = verdict.strip().lower()
+    for name, value in found.items():
+        why = value.get("why", "") if isinstance(value, dict) else ""
+        verdict = (value.get("grade", "") if isinstance(value, dict) else value).strip().lower()
         if name in known and verdict in GRADES_KNOWN:
             set_grade(grades, name, verdict, by)
+            if why:
+                grades[name]["why"] = why.strip()
         else:
             print(f"ignored {name!r}: {verdict!r}")
     save_json(GRADES, grades)

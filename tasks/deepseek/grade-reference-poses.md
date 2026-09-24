@@ -29,5 +29,7 @@ Read the pages and the index file only. Change nothing. No renders, no database.
 take a few minutes: one look per row.
 
 # Report
-Only a JSON object mapping shot name to grade, e.g.
-`{"SR-place-Whiterun": "area only", "SR-interior-Honeyside": "close"}`, covering every row.
+Only a JSON object mapping each shot name to its grade and a one-line reason, in plain words a
+non-developer understands (what matches, what is off), covering every row, e.g.
+`{"SR-place-Whiterun": {"grade": "area only", "why": "Right city, but seen from the north; the
+screenshot looks up at Dragonsreach from the plains."}}`. Keep each reason under 20 words.
