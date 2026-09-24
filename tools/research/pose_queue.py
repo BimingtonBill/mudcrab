@@ -51,7 +51,7 @@ ASSETS = r"C:\Modding\SkyrimConverted"
 GRADER_BRIEF = "tasks/deepseek/grade-reference-poses.md"
 NOTES_BRIEF = "tasks/deepseek/resolve-pose-notes.md"
 ACCEPTED = {"matched", "close"}
-MAX_ROUNDS = 3
+MAX_ROUNDS = 2
 GRADES_KNOWN = ACCEPTED | {"area only", "wrong"}
 
 
