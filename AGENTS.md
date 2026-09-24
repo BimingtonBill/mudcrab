@@ -111,6 +111,33 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-25 (morning) - Claude [portal] (team working made standard; the hearth's grey sheet found)
+
+**The user's asks:** make the team way of working standard ("Working together" above, with the
+user's later changes: resource claims by message and log, the Claude plan shared, QnA the user's own
+session); distant LOD in the portal demo (yes).
+
+**Grey sheet over the hearth flames:** a hide test (`local/gallery/glow-check-compare.jpg`) showed
+it is the `Flames:0` card, not Glow. research-701 (QnA's NIF decode) plus the GLB: the converter
+dropped every BSTriShape's vertex colours (the flames' alpha is the palette's alpha row) and the
+`Flames` NiBillboardNode, and did not export falloff. Phase 2 Dev fixed all three plus the colour
+controller (see their entry). Engine half on portal, all inert until the data arrives:
+`302516e` (emissiveColor channel playback, vertex alpha in the alpha row, additive cards fade to
+black in fog) and `19e5fc7` (billboard nodes, `billboard.rs`; Use_Falloff). softFalloffDepth is not
+played (needs the depth prepass). Reviewed and approved Phase 2's `39c3497` (vertex-alpha-faithful).
+
+**The bundle** (`bundle/portal-s23` in `C:\Modding\wkj-phase2`, Phase 2 Dev's) is **not ready**: it
+still needs vertex-alpha-faithful, nif-billboard-nodes, 4546e6e, 227da41 and the schema bump 22->23.
+When Phase 2 Dev hands it over: merge it, delete `render.rs`'s `force_opaque_vertex_alpha` **in the
+same commit** (before the reconversion it would bring back see-through trees), announce the
+reconversion by message and log, reconvert, then check the Sleeping Giant hearth
+(`local/gallery/glow-check.json`) and the Whiterun houses' new vertex shading. The LOD engine half
+merges after that (big conflicts: portal lacks upstream main since #23).
+
+**Open (portal):** interior lighting (`local/reference/look-gaps/interior-lighting-design.md`),
+imagespace colour grading (`local/research/imagespace-colour-grading.md`). The Claude week is at 84%:
+subagents for short lookups only. **No workers running.**
+
 ### 2026-09-25 (morning) - Claude [phase2] (hearth-flame converter fixes; portal reconversion bundle started)
 
 Worked with Portal Dev on the grey sheet over hearth flames (team log `local/team/2026-09-25.md`).
