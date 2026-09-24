@@ -113,6 +113,11 @@ the schema-15 bump: comparison and recommendation in `docs/pr/pr27-comparison.md
 the GUI launcher lacks Skyrim.ini/Plugins.txt discovery; the sky (QnA's `sky.md`). DeepSeek coders
 are held by budget pacing until Fri 22:39; Claude subagents took the coding.
 
+**04:40 upstream:** PR #23 merged (0c4592b). Local `main` fast-forwarded; `main` merged into the
+LOD chain (one spec-doc conflict) and `renderable-base-types` (#23's interior test updated for
+exported DOOR models); every `phase2/*` branch merges cleanly with origin/main, integration green
+(440 tests). Whether the send hold lifts is the user's call.
+
 **No workers running.**
 
 ### 2026-09-24 (night) - Claude [portal] (the look gaps, worked with Phase 2 Dev; morning gallery)
