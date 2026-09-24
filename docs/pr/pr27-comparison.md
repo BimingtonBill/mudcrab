@@ -105,7 +105,8 @@ even though it doesn't invalidate the fix.
 
 Checked against our earlier research (research-059/impl-063): on tree NIFs the `COLOR_0` alpha is a
 shader parameter (tree animation), not opacity. Skyrim only uses vertex alpha as opacity when the
-shader's `SLSF1_VERTEX_ALPHA` flag is set. So "half the canopy vertices below 0.5 alpha" is data
+shader's `SLSF1_VERTEX_ALPHA` flag is set *(corrected 2026-09-25: wrong; see the update below — it is
+SLSF2_Vertex_Colors, minus Tree_Anim)*. So "half the canopy vertices below 0.5 alpha" is data
 the game does not draw as transparency, and neither fix loses anything visible today. #27 still
 throws that data away for the wind animation a later phase will want.
 
@@ -130,13 +131,17 @@ forces alpha to 1 on Cutout shapes. Ours decides by shader flag, so it keeps tre
 effect-card alpha, which #27 would lose or never have. This is the faithful fix that option (c)
 above asked for. The two PRs still conflict in `mesh.rs` and in the schema number.
 
-Open points before offering it upstream:
-- The lead's note above says vertex alpha is opacity only where **SLSF1_VERTEX_ALPHA** is set. The
-  branch uses **SLSF2_Vertex_Colors** plus Tree_Anim instead, citing Community Shaders'
-  Lighting.hlsl/Effect.hlsl. The two rules disagree on shapes that have vertex colours but not
-  SLSF1_VERTEX_ALPHA. Phase 2 Dev has been asked which rule is right.
-- It adds `project-wormhole-shared` as a converter dependency (Cargo.toml and Cargo.lock). That is
-  a dependency change for upstream review. It is natural if `phase2/shared-converter-schema` goes
-  first, since that branch adds the same dependency.
+Settled points (Phase 2 Dev, 2026-09-25):
+- **The lead's note above is wrong on SLSF1_VERTEX_ALPHA; the branch's rule is right.** In Community
+  Shaders' Lighting.hlsl the vertex colour reaches the pixel shader only under `VC` (otherwise
+  `1.0.xxxx`), and the fragment multiplies alpha by `input.Color.w` except under TREE_ANIM /
+  LODOBJECTS / LODOBJECTSHD. Effect.hlsl multiplies by `input.Color.w` under `VC`. Neither shader
+  reads SLSF1_Vertex_Alpha. That `VC` is the technique bit SLSF2_Vertex_Colors selects is
+  *inferred* from the flag names and CS's technique descriptors, not read from the executable. On
+  real data the two rules never diverge: in a schema-22 scan of every GLB with alpha below 1 (trees
+  and plants plus a 4,000-file sample) every shape had both SLSF1 bit 3 and SLSF2 bit 5, and the
+  123 tree shapes also had Tree_Anim.
+- The added `project-wormhole-shared` is a **dev-dependency** (one test, glam/BSVec4), not a
+  runtime one; #27 adds the same line.
 - #27's author is still holding it to build a test scene with every foliage and tree type (comment
   2026-09-24 18:34Z). Its head is unchanged since 6834e5e (2026-09-24 17:34Z).
