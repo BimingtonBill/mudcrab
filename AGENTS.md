@@ -39,12 +39,15 @@ Every task belongs to one track; name it in the brief, the commit and the handof
 Which work belongs to which track, the PR rules and the reasons: `docs/pr/two-tracks.md`. Read it
 before starting any `phase2/*` branch or moving work between tracks.
 
-## Working together: Phase 2 Dev and Portal Dev
+## Working together: Phase 2 Dev, Portal Dev and Upstream Dev
 
 The user's standing rule since 2026-09-25: the dev sessions work as one team by default, the way
-they did on the night of 2026-09-24. The tracks stay separate; the people don't. The session
-"Upstream collaboration and reviews" watches upstream PRs, reviews and CI and posts in the team log;
-ask it for a review of upstream-bound changes. **QnA is the user's own questions-and-answers
+they did on the night of 2026-09-24. The tracks stay separate; the people don't.
+**Upstream Dev** (the user's decision, 2026-09-25) owns the upstream side: it watches upstream PRs,
+reviews, CI and issues, answers review findings, and prepares and organises what goes upstream
+(the send queue `docs/pr/upstream-queue.md`, PR branches and bodies, fork state). Phase 2 Dev
+builds the `phase2/*` work; Upstream Dev turns ready branches into PRs, with the user's OK for each
+send. Ask Upstream Dev to review upstream-bound changes, and send it upstream questions. **QnA is the user's own questions-and-answers
 session** (the user's decision, 2026-09-25): keep it free for them and send it no work.
 
 - **One shared log a day**, `local/team/<YYYY-MM-DD>.md`. Each session adds a timestamped line when
