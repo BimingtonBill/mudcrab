@@ -47,24 +47,65 @@ The #30 reply promised it. Not written yet.
 ## Staged branches, in send order
 
 Branch scan of 2026-09-25 against origin/main 417a262 ("fork" means the same commit is on
-BimingtonBill/wah-krah-jol):
+BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's roadmap page
+(`local/roadmap/phase2.json`).
 
-| Order | Branch(es) | Ahead | Merge | Fork | Status |
-|-------|-----------|-------|-------|------|--------|
-| 1 | empty-model-bounds + bounds-precision (one PR) | 2+1 | clean | same | ready; body `pr-04` exists; acceptance reliability |
-| 2 | default-water-height | 1 | clean | same | ready |
-| 3 | terrain-seam-weld | 3 | clean | same | needs a GPU check |
-| 4 | terrain-samplers-weights | 2 | clean | same | needs a GPU check |
-| 5 | sun-shadow-cascades | 2 | clean | same | needs a GPU check and a benchmark (timing runs go alone) |
-| 6 | water-look + water-colours | 2+3 | clean | none | needs a GPU check |
-| 7 | terrain-normal-maps | 4 | clean | same | needs a GPU check |
-| 8 | reference-shots (a96d50e) | 1 | clean | none | **READY** (Phase 2 Dev: fmt/clippy/engine tests green, one real pose rendered; engine-only, off unless `--shots`, no schema bump). Waits on decision 2 |
-| 9 | scripts-schema-from-source | 2 | clean | same | tooling; low risk |
-| after #27 | shared-converter-schema, renderable-base-types, vertex-alpha-faithful, material-publication, nif-billboard-nodes | | clean | mixed | **each changes converter output and needs a schema bump** (Phase 2 Dev holds vertex-alpha-faithful 39c3497, nif-billboard-nodes 11b2e2b+e3d30a6 and material-publication's new 4546e6e/227da41 until then; vertex-alpha-faithful is also the user's call because it overlaps #27): send one at a time, or bundle, so the schema numbers don't collide with #27's 15 |
-| discuss first | lod-mesh-containers, lod-database, lod-engine-terrain/objects/trees | 3-31 | 4 of 5 CONFLICT with main | mixed | too big to just send; needs a roadmap talk, and the conflicts resolved |
-| low | staging-hard-links, audit-converter, audit-engine, asset-precedence | 1-4 | clean | mixed | small; bundle later |
-| drop | vertex-alpha-not-opacity (superseded by vertex-alpha-faithful), refr-rotation (merged as #25) | | | | do not send |
+| Order | Branch(es) | Plain | Ahead | Merge | Fork | Status |
+|-------|-----------|-------|-------|-------|------|--------|
+| 1 | empty-model-bounds + bounds-precision (one PR) | Invisible marker models don't fail the size check; long test runs no longer fail at random on correct models | 2+1 | clean | same | ready; body `pr-04` covers empty-model only, so extend it |
+| 2 | default-water-height | Morthal's lake and the open sea come back (10,630 of 11,187 cells had no water) | 1 | clean | same | ready; a before/after shot would help |
+| 3 | terrain-seam-weld | No hairline gaps between land squares; city worldspaces no longer fail the seam check | 3 | clean | same | needs a GPU check |
+| 4 | terrain-samplers-weights | Ground textures tile and blend properly | 2 | clean | same | needs a GPU check |
+| 5 | sun-shadow-cascades | Sun shadows reach across the whole view | 2 | clean | same | needs a GPU check and a benchmark (timing runs go alone) |
+| 6 | water-look + water-colours | Lakes and rivers no longer draw as a white sheet | 2+3 | clean | none | needs a GPU check; lakes read grey until there is a sky |
+| 7 | terrain-normal-maps | Ground detail maps (pebbles, relief) | 4 | clean | same | needs a GPU check |
+| 8 | reference-shots (a96d50e) | The reference-shot tool | 1 | clean | none | **READY** (Phase 2 Dev: fmt, clippy and engine tests green, one real pose rendered; engine-only, off unless `--shots`, no schema bump). Waits on decision 2 |
+| 9 | scripts-schema-from-source | Test scripts read the version from the code | 2 | clean | same | tooling; low risk |
+| after #27 | shared-converter-schema, renderable-base-types, material-publication, vertex-alpha-faithful, nif-billboard-nodes | one version number; trees/doors/objects get models; surface shine and see-through, heat haze, fire and effects, flame animation; flame cards | | clean | mixed | **each changes converter output and needs a schema bump**. Phase 2 Dev holds vertex-alpha-faithful 39c3497, nif-billboard-nodes 11b2e2b+e3d30a6 and material-publication's 4546e6e/227da41 until then. vertex-alpha-faithful is also the user's call because it overlaps #27. Send one at a time, or bundle, so the schema numbers don't collide with #27's 15. material-publication also has a history-path hold (decision 4) |
+| discuss first | lod-mesh-containers, lod-database, lod-engine-terrain/objects/trees | Distant land, steps 1-4 | 3-31 | 4 of 5 CONFLICT with main | mixed | two-tracks says **an upstream issue before any code**. Too big to just send; needs a roadmap talk, and the conflicts resolved. lod-engine-trees has a history-path hold |
+| low | staging-hard-links, audit-converter, audit-engine, asset-precedence | reconversions reuse files without copying; audit fixes; mod file and archive order | 1-4 | clean | mixed | small; bundle later. staging-hard-links needs the #30/#31 combination first |
+| drop | vertex-alpha-not-opacity (superseded by vertex-alpha-faithful), refr-rotation (merged as #25) | | | | | do not send |
 
-Rules for each send: check the track (`two-tracks.md`), merge origin/main in and rerun CI's checks
-(fmt, clippy, tests), write the body in plain words for the user with an AI label on kept text,
-get the user's OK, then open the PR. After opening, watch CodeRabbit and CI and answer both.
+## Candidates with no branch yet
+
+- **#30 (a) follow-up** (owed; see above).
+- **Plugin FormID slot:** `plugins.priority` is off by one for plugins after the first light plugin
+  (research-531, `docs/research/dragonborn-formid-slots.md`). A small fix.
+- **Visible record deletions:** an optional `deleted` column instead of dropping silently (research-533).
+- **Point lights** (decision 3) and the **engine backlog** (`docs/roadmap/backlog-engine-and-portal.md`):
+  check each against upstream `main` first, since some defects exist only in the fork.
+
+## Rules for each send
+
+From upstream's CONTRIBUTING.md and `two-tracks.md` "Rules for every Phase 2 PR":
+
+1. **Issue first.** CONTRIBUTING says "Find or Create an Issue" before the branch. #29-#31 were
+   review follow-ups; each new topic gets an issue (the user writes or approves it) unless the
+   maintainers say otherwise.
+2. Merge origin/main in; run `cargo fmt --all -- --check`, `cargo clippy --all-targets
+   --all-features -- -D warnings`, and the touched crates' tests.
+3. The test needs no game data (dummy-content fixtures); no Bethesda data in the diff or body; no
+   machine paths or private names (the history too: `tick.py` scans for them); no citations of
+   `docs/research/` or `tools/research/`.
+4. `///` doc comments on new functions; commits in upstream's style (`fix(converter): ...`).
+5. The body references the planning doc it serves (`02-completion-plan.md` milestone or a
+   `docs/specs/` file), uses the Wah Krah Jol name, and ends with the attribution line. It is
+   written in plain words for the user, with an AI label on kept text.
+6. The user OKs the send. After opening, watch CI and CodeRabbit and answer both.
+
+## Reference documents
+
+- `two-tracks.md`: which work is Phase 2, the PR rules, and the send-order notes (the #30/#31 glue,
+  staging-hard-links, effect emissive riding material-publication).
+- `upstream-pr-plan.md` (2026-09-23): the older 13-PR plan for the whole fork, with the exclusion
+  list (§4, never in a PR) and the cleanup list (§5). Superseded as a plan, still valid for §4 and §2.
+- `phase2-branch-audit.md`, `phase2-fix-audit.md`: audits of each branch.
+- `local/pr-drafts/`: bodies of #29-#31, the reference-shots notes, the point-lights plan.
+- `local/overnight/tick.py`: read-only scan (pushable, held, history paths, GitHub activity).
+
+## Out of date elsewhere (owner told)
+
+- `docs/roadmap/phase2-track-tasks.md` still says "nothing new goes to GitHub" and lists #23/#25 as
+  waiting (both merged).
+- `local/roadmap/phase2.json` (updated 2026-09-24 19:00, Phase 2 Dev's file) still lists #23/#25 as
+  waiting and has no entries for #29-#31.
