@@ -35,7 +35,8 @@ The #30 reply promised it. Not written yet.
 2. **reference-shots** (`--shots`, engine only, merges cleanly): ask first (issue or Discord) or
    send directly? Include an example shots file? Notes in `local/pr-drafts/reference-shots.md`.
 3. **Point lights**, a 3-PR plan (`local/pr-drafts/point-lights-plan.md`): ask in #24 first
-   (recommended) or go. Also: a neutral documented brightness default (recommended) or a re-fit.
+   (recommended) or go. The branches are not built yet: impl-572/573 are queued for when the
+   DeepSeek coders are released (~22:39). Also: a neutral documented brightness default (recommended) or a re-fit.
 4. **History paths:** lod-engine-trees and material-publication commits contain `C:/Modding/...`
    paths (no names). Accept them, or rewrite before pushing to the fork.
 5. **public/portal** is 14+ commits behind portal and needs a re-export
@@ -55,9 +56,9 @@ BimingtonBill/wah-krah-jol):
 | 5 | sun-shadow-cascades | 2 | clean | same | needs a GPU check and a benchmark (timing runs go alone) |
 | 6 | water-look + water-colours | 2+3 | clean | none | needs a GPU check |
 | 7 | terrain-normal-maps | 4 | clean | same | needs a GPU check |
-| 8 | reference-shots | 1 | clean | none | waits on decision 2 |
+| 8 | reference-shots (a96d50e) | 1 | clean | none | **READY** (Phase 2 Dev: fmt/clippy/engine tests green, one real pose rendered; engine-only, off unless `--shots`, no schema bump). Waits on decision 2 |
 | 9 | scripts-schema-from-source | 2 | clean | same | tooling; low risk |
-| after #27 | shared-converter-schema, renderable-base-types, vertex-alpha-faithful, material-publication, nif-billboard-nodes | | clean | mixed | **each changes converter output and needs a schema bump**: send one at a time, or bundle, so the schema numbers don't collide with #27's 15 |
+| after #27 | shared-converter-schema, renderable-base-types, vertex-alpha-faithful, material-publication, nif-billboard-nodes | | clean | mixed | **each changes converter output and needs a schema bump** (Phase 2 Dev holds vertex-alpha-faithful 39c3497, nif-billboard-nodes 11b2e2b+e3d30a6 and material-publication's new 4546e6e/227da41 until then; vertex-alpha-faithful is also the user's call because it overlaps #27): send one at a time, or bundle, so the schema numbers don't collide with #27's 15 |
 | discuss first | lod-mesh-containers, lod-database, lod-engine-terrain/objects/trees | 3-31 | 4 of 5 CONFLICT with main | mixed | too big to just send; needs a roadmap talk, and the conflicts resolved |
 | low | staging-hard-links, audit-converter, audit-engine, asset-precedence | 1-4 | clean | mixed | small; bundle later |
 | drop | vertex-alpha-not-opacity (superseded by vertex-alpha-faithful), refr-rotation (merged as #25) | | | | do not send |
