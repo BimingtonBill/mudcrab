@@ -142,12 +142,12 @@ def check(run_grader):
         subsets.append(f"{subset}:{renders}")
     if not subsets:
         print("nothing to check")
-        return
+        return None
     pages = os.path.join(GRADING, batch + ".jpg")
     subprocess.run([sys.executable, os.path.join(ROOT, "tools/research/grade_sheet.py"), pages, *subsets], check=True)
     if not run_grader:
         print(f"pages ready: {GRADING}\\{batch}-*.jpg; grade them, then `import`")
-        return
+        return batch
     report = os.path.join(GRADING, batch + ".grades.txt")
     agent = os.path.expanduser("~/.claude/skills/deepseek-agents/ds-agent.ps1")
     with open(report, "w", encoding="utf-8") as out:
@@ -160,6 +160,7 @@ def check(run_grader):
             cwd=ROOT, stdout=out, stderr=subprocess.STDOUT, check=False,
         )
     import_grades(report, "grader")
+    return batch
 
 
 def import_grades(path, by):
@@ -466,11 +467,18 @@ def shot_place(world, shot):
 
 
 def cycle():
+    """One automatic round. Its result pictures are the last check's grading pages (Skyrim beside
+    the engine, one row per shot), which cost nothing extra to show the user."""
+    started = datetime.datetime.now()
     merge(False)
-    check(True)
+    batches = [check(True)]
     if refine():
-        check(True)
+        batches.append(check(True))
     build()
+    minutes = (datetime.datetime.now() - started).total_seconds() / 60
+    print(f"round took {minutes:.1f} min")
+    for batch in (b for b in batches if b):
+        print("results pictures: " + os.path.join(GRADING, batch + "-*.jpg"))
 
 
 def grade(name, verdict, by):
