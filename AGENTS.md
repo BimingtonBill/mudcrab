@@ -48,6 +48,9 @@ they did on the night of 2026-09-24. The tracks stay separate; the people don't.
   it starts or finishes something, claims a shared resource (a timing window, a conversion, a GPU
   run, disk) or finds something another session needs. Read the others' newest lines at session
   start and before any shared-resource step.
+- **A shared-resource claim goes by message AND in the log.** The log is read at session start, so
+  a line alone can miss a session that is mid-task; the messages are what kept the 2026-09-24
+  timing runs clean.
 - **One joint plan.** At the start of a work block the two devs agree by message who takes what,
   and write it at the top of that day's log. No two sessions chase the same bug. Work found for the
   other track is handed over with its evidence (shot, screenshot, data path, repro), not done twice.
@@ -61,8 +64,10 @@ they did on the night of 2026-09-24. The tracks stay separate; the people don't.
 - **Shared findings go in shared places:** reference shots and grades (`local/reference/`), the
   look-gaps list (`docs/research/look-gaps-*.md`), research (`local/research/`), so any session can
   pick them up without asking.
-- **Budget is shared:** the $20/week DeepSeek limit covers all three; say in the log when a session
-  holds coders, and QnA prefers Claude agents when the budget runs ahead of pace.
+- **Budgets are shared:** the $20/week DeepSeek limit covers all three; say in the log when a
+  session holds coders, and QnA prefers Claude agents when the budget runs ahead of pace. The Claude
+  plan is shared too (one account): when its week runs ahead of pace, every session keeps Claude
+  subagents to short lookups.
 
 ## While working
 
