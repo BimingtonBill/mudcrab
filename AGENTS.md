@@ -80,6 +80,46 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-24 (night) - Claude [portal] (the look gaps, worked with Phase 2 Dev; morning gallery)
+
+**The user's asks:** a ranked list of how the demo's look differs from Skyrim
+(`docs/research/look-gaps-2026-09-24.md`, 61 graded reference shots), then an overnight plan with
+Phase 2 Dev working as one team, progress pictures, and pretty screenshots for the morning. Shared
+log of the night: `local/overnight-2026-09-24.md`.
+
+**Fixed on portal (each measured on the reference shots, tuning fitted on half and checked on the
+other half):** dark city worldspaces take their parent's lighting (`7585b7d`); the sky fill is a
+tenth of the sun, not half (`880a3f4`); shadows take 18 % of the sky's hue, no longer green
+(`fe7d24e`); multi-pass snow materials are not drawn as a black layer - the Alftand ice blotches
+(`aac5989`); effect shaders draw their greyscale texture through their palette (`b54dced`); glows
+are capped under the tonemapper's white - Blackreach (`f4c40d7`); the city LAND edges past the weld
+bound are drawn as authored (`80bf6de`, mirroring Phase 2's `4fe8f6e`). From Phase 2, cherry-picked
+or merged: effect-shader emissive (`b8f152a`), default water height (Morthal's lake), refraction
+planes excluded (the fire heat haze), the water look (white sheet gone), staging hard links for
+reconversions, scripts reading the schema from source. Audit findings CC-01/02, RM-02, HT-01/02/04/05
+closed.
+
+**Data:** `C:\Modding\SkyrimConverted` is converter **schema 21** (complete, integration passed;
+space_lighting also carries fog far colour, fog max and light fade). `engine-portal-fit.exe` is
+schema 21. Tours on it: Riverwood 8/8, Alftand 4/4, 0 FAIL. Fallback copy `SkyrimConverted-s19`
+(hard links; its vfs and ingestion cache removed after they filled C: at 20:40 - see memory
+`reconversion-disk`). `target/debug` and `target/release` live on `D:\Modding-overflow` behind
+junctions (the user allowed D:).
+
+**Built, not switched on:** Skyrim's `1 - (d/r)^2` point-light falloff (`light_falloff.rs`, a
+load-time patch of Bevy's attenuation line, QnA's research); `lights::SKYRIM_FALLOFF` is false
+because alone it did not improve interiors, whose fog fills them. Next for interiors:
+`local/reference/look-gaps/interior-lighting-design.md`.
+
+**Open:** the fire cards still read as pale sheets (atlas animation, palette orientation); sky
+(Phase 2); colour grading (QnA's `local/research/imagespace-colour-grading.md`: grade after the
+tonemap, per weather and cell); distant land (Phase 2's LOD branches, not merged); a portal is not
+drawn past ~600 units; a shots-run door once rendered closed (flaky).
+
+**Morning gallery:** https://claude.ai/artifact/1QMmmU5jKwDhdnhKUynJpZ (private; JPEGs in
+`local/gallery/final/`). **No workers running from this session.** Phase 2 Dev still has coders
+and an audit-converter merge in flight; take their pre-resolved merge, not the branch.
+
 ### 2026-09-24 (overnight) - Claude [phase2] (conversion, audit, fixes, reference sheet, distant LOD)
 
 **Upstream:** realfakenerd replied on #24 (2026-09-23 21:02): be patient, the roadmap is being
