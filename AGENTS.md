@@ -39,6 +39,31 @@ Every task belongs to one track; name it in the brief, the commit and the handof
 Which work belongs to which track, the PR rules and the reasons: `docs/pr/two-tracks.md`. Read it
 before starting any `phase2/*` branch or moving work between tracks.
 
+## Working together: Phase 2 Dev, Portal Dev and QnA
+
+The user's standing rule since 2026-09-25: the three sessions work as one team by default, the way
+they did on the night of 2026-09-24. The tracks stay separate; the people don't.
+
+- **One shared log a day**, `local/team/<YYYY-MM-DD>.md`. Each session adds a timestamped line when
+  it starts or finishes something, claims a shared resource (a timing window, a conversion, a GPU
+  run, disk) or finds something another session needs. Read the others' newest lines at session
+  start and before any shared-resource step.
+- **One joint plan.** At the start of a work block the two devs agree by message who takes what,
+  and write it at the top of that day's log. No two sessions chase the same bug. Work found for the
+  other track is handed over with its evidence (shot, screenshot, data path, repro), not done twice.
+- **QnA is the research desk.** A question that needs more than one quick lookup (several sources,
+  prior art, how Skyrim or another engine does it, a reference comparison) goes to QnA by message,
+  saying what is needed and what it decides. QnA answers in `local/research/`, cited and
+  spot-checked, and names the file to the asker. A single fact can still go to a websearch worker.
+- **Hand over finished work, not only news.** Phase 2 Dev sends Portal Dev merges it has already
+  resolved (portal takes `phase2/*`, never the reverse); Portal Dev reports Phase 2 bugs with
+  evidence. Ask the other dev to review a change that touches their area before merging it.
+- **Shared findings go in shared places:** reference shots and grades (`local/reference/`), the
+  look-gaps list (`docs/research/look-gaps-*.md`), research (`local/research/`), so any session can
+  pick them up without asking.
+- **Budget is shared:** the $20/week DeepSeek limit covers all three; say in the log when a session
+  holds coders, and QnA prefers Claude agents when the budget runs ahead of pace.
+
 ## While working
 
 - Do not rewrite history (no amend, rebase or force-push on commits already made).
