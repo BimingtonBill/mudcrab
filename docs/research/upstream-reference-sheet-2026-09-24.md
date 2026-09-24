@@ -33,3 +33,27 @@ The two schema-15 branches (base types, materials) are the biggest visual wins a
 schema-15 asset set. Migrating in place writes a full staging copy (about 70 GB), and C: had
 about 31 GB free on the morning of 2026-09-24, so that needs disk space first. The vertex-alpha
 question (are trees dots on upstream?) can only be answered once trees are catalogued.
+
+## Second pass: schema 15 and distant LOD (2026-09-24, late morning)
+
+**What was rendered:** `phase2/integration-lod-shots` (every Phase 2 branch including
+vertex-alpha, distant LOD steps 1-3, and the local `--shots` tool) on
+`C:\Modding\SkyrimConverted-upstream15` (converter schema 15, world DB schema 4, complete,
+integration passed; made in ~45 min by converting over a hard-linked mirror of the schema-14 set,
+so its textures were reused rather than re-encoded). Same poses as above, once without and once
+with `--lod`. Sheets (not in git): `C:\Modding\wkj-tools\shots15\riverwood-before-after.jpg` and
+`uesp-before-after.jpg`, columns Skyrim | schema 14 | schema 15 | schema 15 + LOD.
+
+- **Fixed by the schema-15 branches:** trees, ferns, bushes and the Guardian Stones now render
+  (renderable-base-types); the Alftand Ruined Tower door is no longer see-through and the Alftand
+  ice reads as solid blue ice instead of grey glass (material-publication / vertex-alpha).
+- **Distant LOD works on a GPU for the first time:** far mountains and ridges appear behind
+  Riverwood, the trader and the Ruined Tower where schema 15 alone shows empty background. No
+  errors or panics in either run.
+- **LOD's new gap:** the distant land renders near-black with a blue tint. Its fog colour falls
+  back to black because the engine draws no sky (`ClearColor` absent), so the horizon fades into
+  black instead of haze. This is the existing "no sky / no fog" gap, now more visible; fixing it
+  belongs with the lighting question in issue #24.
+- **Unchanged:** dim overall light, no sky, no Blackreach glow, pale water.
+- **Pose note:** RW-04 (inn front) now lands inside a pine tree that schema 14 did not draw; the
+  pose needs re-fitting, not the engine.
