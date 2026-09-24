@@ -113,3 +113,30 @@ The faithful fix is neither PR's: the converter already records `shaderFlags1`, 
 should honour vertex alpha as opacity exactly where `SLSF1_VERTEX_ALPHA` is set, and ignore it
 elsewhere. That is the concrete improvement to offer under option (c), whichever side the
 maintainer picks. The call on sending is the user's, and the send hold still stands.
+
+## Update 2026-09-25 (Upstream session): `phase2/vertex-alpha-faithful` supersedes ours
+
+`phase2/vertex-alpha-faithful` (39c3497, local only, reviewed and approved by Portal Dev) replaces
+`phase2/vertex-alpha-not-opacity`. It fixes the vertex-alpha question in the converter:
+
+- The vendored exporter dropped vertex colours on every static BSTriShape, so every SSE-native
+  shape lost them. It now keeps them.
+- They are published per the shader's own rule. Without SLSF2_Vertex_Colors the colours are dropped.
+  On a lighting shape with Tree_Anim the RGB is kept and the alpha is forced to 1 (it is wind
+  amplitude). Everywhere else the alpha is kept as opacity.
+
+Against #27: both are converter-side and both change the output, so both need a schema bump. #27
+forces alpha to 1 on Cutout shapes. Ours decides by shader flag, so it keeps tree RGB shading and
+effect-card alpha, which #27 would lose or never have. This is the faithful fix that option (c)
+above asked for. The two PRs still conflict in `mesh.rs` and in the schema number.
+
+Open points before offering it upstream:
+- The lead's note above says vertex alpha is opacity only where **SLSF1_VERTEX_ALPHA** is set. The
+  branch uses **SLSF2_Vertex_Colors** plus Tree_Anim instead, citing Community Shaders'
+  Lighting.hlsl/Effect.hlsl. The two rules disagree on shapes that have vertex colours but not
+  SLSF1_VERTEX_ALPHA. Phase 2 Dev has been asked which rule is right.
+- It adds `project-wormhole-shared` as a converter dependency (Cargo.toml and Cargo.lock). That is
+  a dependency change for upstream review. It is natural if `phase2/shared-converter-schema` goes
+  first, since that branch adds the same dependency.
+- #27's author is still holding it to build a test scene with every foliage and tree type (comment
+  2026-09-24 18:34Z). Its head is unchanged since 6834e5e (2026-09-24 17:34Z).
