@@ -256,3 +256,13 @@ From upstream's CONTRIBUTING.md and README, plus what the fork has learnt:
 > Right now, lamps, torches and glowing materials don't light anything, and per-cell lighting
 > settings aren't read. That makes interiors and dusk scenes look flat. We have a working
 > implementation. Should it be part of Phase 2, or wait for a later phase?
+
+## Send-order notes found by integration (2026-09-24 night)
+
+- `phase2/resume-staging-validation` and `phase2/pruned-texture-complete` need a small glue commit
+  when both are in (integration branch, "record a pruned mesh's new bytes"): pruning rewrites a
+  mesh after its hash was recorded, and the resume check then distrusts it. Whichever lands second
+  carries that commit.
+- `phase2/staging-hard-links` relies on no staged output being written in place; it adds the
+  unlink before conversion that makes script output safe.
+- The effect-shader emissive fix rides `phase2/material-publication`'s unreleased schema 15.
