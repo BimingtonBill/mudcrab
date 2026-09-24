@@ -1,79 +1,71 @@
 # Goal
-Track: Phase 2 (for upstream). Distant LOD step 4a: the engine streams Skyrim's far-away object
-blocks (buildings, rocks, bridges baked into `.bto` LOD meshes) beside the terrain blocks it
-already draws with `--lod`, and drops the non-rendering primitives LOD scenes carry.
+Track: Phase 2 (for upstream). Distant LOD step 4a, converter half: keep the per-cell segments of
+Skyrim's level-4 object LOD blocks (`.bto`) in the converted GLB, so the engine can hide the part
+of a block that belongs to a loaded cell, as Skyrim does.
 
 # Context
-- Your checkout is cut from `phase2/lod-engine-terrain` (step 3). Use upstream's commit style
-  (`feat(engine): ...`, `fix(engine): ...`), with no `[deepseek]` prefix.
-- The design is `C:/Modding/OpenSkyrimProject/local/research-557/DESIGN.md`. Read sections 0, 1,
-  2, 4, 5, 6 and 8 ("4a"), and 9. It was written before two changes that landed tonight, which
-  override it where they differ:
-  1. **Blocks are clipped under full-detail cells.** `crates/engine/src/lod.rs` now draws every
-     terrain block with `LodTerrainMaterial` (`ExtendedMaterial<StandardMaterial,
-     LodTerrainExtension>`, shader `crates/engine/src/shaders/lod_terrain.wgsl`). Fragments over
-     any cell whose full-detail terrain is showing are discarded, in the main pass and in the
-     depth prepass (`ClipMask`, `update_lod_clip`). Object blocks use the same clip. This
-     replaces the design's "leave the overlap to the depth offset": a simplified LOD building
-     that is bigger than the real one would poke through it.
-  2. **Terrain blocks shade from a model-space normal map.** The extension takes the block's
-     `_n` texture off the base material (`model_space_normal`; `settings.window.z` = 1). Object
-     blocks are different: their GLBs carry `NORMAL` and a tangent-space `normalTexture`
-     (checked on `meshes/terrain/tamriel/objects/tamriel.4.4.-12.glb`). An object block keeps
-     its base material's normal map, and the extension is built with `model_space_normal: None`,
-     so the shader's `window.z == 0` path keeps `pbr_input_from_standard_material`'s normal.
-- Per-kind material policy, which settles design §2 "Material":
-  - Terrain: exactly what `track_lod_readiness` does today.
-  - Objects: clone the GLB material into a `LodTerrainMaterial` with the clip extension and
-    `model_space_normal: None`. Keep the GLB's `cull_mode`, `double_sided`, roughness and normal
-    map. Set `alpha_mode: Mask(0.5)`, which the clip needs so the prepass runs it (see the
-    comment in `track_lod_readiness`).
-  - A primitive whose GLB material is not opaque is left alone, as today.
-- The exclusion filter (design §9.1). Terrain LOD GLBs carry non-rendering primitives: a `WATER`
-  node mesh whose material is `"OpenSkyrim non-rendering excluded geometry"` (MASK, alpha 0) and
-  whose primitive extras carry `openSkyrim.materialExclusion`. The cell path filters these
-  through `GltfExtras` (`has_explicit_material_exclusion` in `crates/engine/src/streaming.rs`).
-  LOD readiness must hide them (`Visibility::Hidden`) the same way, for both kinds, and count
-  them. Reuse the streaming helper; make it `pub(crate)` if needed.
-- Selection (design §2 "Selection"): object blocks use the same planner, rules and bands as
-  terrain. `plan_lod_blocks` plans `LodBlockKind::Terrain` only today; it must plan each enabled
-  kind. `LodBlockKind::Objects` already exists in `world/database.rs`, and `lod_block` rows of
-  kind `objects` are already in the table. Objects are on whenever `--lod` is. `--lod-objects off`
-  turns them off. No per-kind distance flags yet: objects use `lod_bands`.
-- Depth offset, block translation, hysteresis, the commit budget, rebase, the lifecycle
-  validator and the metrics all already work per `LodBlockKey` (which includes the kind). Check
-  each one handles `Objects`, and extend the counters where the design lists object metrics.
-- Converted data for a real-data look: `C:/Modding/SkyrimConverted-upstream15/` (DB schema 4,
-  717 Tamriel object blocks under `meshes/terrain/tamriel/objects/`). The lead runs the real-data
-  render; you need no GPU.
+- Your checkout is cut from `phase2/lod-mesh-containers` (distant LOD step 1: the converter reads
+  the LOD mesh containers and converts `.btr`/`.bto` to GLB). Use upstream's commit style
+  (`feat(converter): ...`), with no `[deepseek]` prefix.
+- How Skyrim hides object LOD (research: `C:/Modding/OpenSkyrimProject/local/research/lod-hiding-under-loaded-cells.md`,
+  read its first 80 lines):
+  - Every shape of a level-4 `.bto` block is a `BSSubIndexTriShape` whose triangles are split into
+    up to 16 segments, one per cell of the 4x4 block. Segment index `i` = `4 * dx + dy`, where
+    `dx`, `dy` (0..3) are the owner cell's offset from the block's south-west cell (x is the major
+    axis). When a cell's full models load, Skyrim hides that cell's segment of every shape.
+  - A segment entry is `u8 flag, u32 start index, u32 primitive count`. The start index points
+    into the index buffer (start = previous start + 3 x previous count), and the count is in
+    triangles. A table shorter than 16 means the trailing cells are empty. The flag is 0 in every
+    shipped entry.
+  - Shapes named `*-LargeRef` (e.g. `obj-LargeRef`, `objHD-LargeRef`) are a separate group with
+    their own 16 segments. Keep the name; the engine treats them like the others for now.
+  - Level-8 and level-16 blocks have one segment per shape, and nothing to split.
+- The NIF parser already reads the table: `vendor/project-wormhole-nif/src/bs/sub_index_tri_shape.rs`
+  (`BSGeometrySegmentData`, `segments`). The GLB export drops it today. Find where `.bto` shapes
+  become glTF meshes (`crates/converter/src/lod.rs`, `mesh.rs`, and the material publication in
+  `material.rs`, which currently asserts one primitive per mesh).
+- The contract the engine half (a separate task, written against this contract) relies on:
+  - For a `.bto` shape with 2 or more non-empty segments: one glTF **primitive** per non-empty
+    segment, in the shape's glTF mesh. Each primitive has its own indices (that segment's
+    triangles), may share the shape's vertex accessors, uses the shape's material, and carries
+    **primitive extras** `{"openSkyrim": {"lodSegment": i}}` with `i` the segment's index in the
+    table (0..15).
+  - A shape with 0 or 1 segments, and every non-`.bto` model, is exported exactly as today (one
+    primitive, no `lodSegment`).
+  - Any mesh-count, bounds or material bookkeeping that assumed one primitive per shape must keep
+    working: the block's recorded bounds (`lod_block.bounds_*`) must not change.
+  - If you find you cannot put several primitives in one mesh without a large refactor, stop and
+    report why, and propose the alternative (one glTF mesh and node per segment, each with the same
+    extras) before implementing it.
+- Converted data to check against (read-only): `C:/Modding/SkyrimConverted-upstream15/` (source NIFs
+  extracted under `vfs/meshes/terrain/<worldspace>/objects/`). Write a small Python check of one
+  real block's converted GLB in a temporary output folder if you can convert a single file;
+  otherwise rely on tests.
 
 # Scope
 Owned files:
-- `crates/engine/src/lod.rs`
-- `crates/engine/src/shaders/lod_terrain.wgsl` (only if the object path needs it; say why)
-- `crates/engine/src/config.rs` (the `--lod-objects` switch and its test)
-- `crates/engine/src/world/database.rs` (only if the object rows need a query change)
-- `crates/engine/src/streaming.rs` (only to share `has_explicit_material_exclusion` and add
-  object counters to `StreamingMetrics`)
-- `crates/engine/src/metrics.rs` (only for new counters)
-- `crates/engine/src/app.rs` (only for `--lod-fixture` object rows, if the fixture needs them)
+- `crates/converter/src/lod.rs`, `crates/converter/src/mesh.rs`, `crates/converter/src/material.rs`
+  (only where the one-primitive assumption lives)
+- `crates/converter/tests/fixture_lod.rs`
+- `crates/dummy-content/src/nif.rs` (only if the fixture needs a segmented shape; it already writes
+  a segment table)
+- `docs/specs/converters/` (the LOD section: document the `lodSegment` extras)
 - `docs/handoff/impl-558-p2-lod-objects.md`
 
-No converter changes, no schema bump, no new dependencies, no trees (that is step 4b).
+No engine changes, no new dependencies. Do not bump the converter schema: the LOD series is
+unreleased and the lead decides the bump.
 
 # Done when
 - Tests that fail on the old code and pass on yours:
-  1. The plan for a camera cell includes object blocks from the table, with the same band,
-     coverage and hysteresis rules as terrain, and none when objects are turned off.
-  2. `--lod-objects off` parses, and `--lod` alone leaves objects on.
-  3. The exclusion check recognises the primitive extras the converter writes
-     (`{"openSkyrim":{"materialExclusion":"..."}}`) and rejects others.
-- With `--lod` off nothing changes: no new systems run, and the existing LOD-off tests still pass
-  unchanged.
-- `cargo fmt --all -- --check`, `cargo clippy -p engine --all-targets -- -D warnings` and
-  `cargo test -p engine` pass.
+  1. A level-4 `.bto` fixture shape with three non-empty segments converts to three primitives with
+     `lodSegment` 0, 5 and 15 (or whatever indices the fixture uses), whose index counts are 3x each
+     segment's triangle count, and together cover every triangle once.
+  2. A shape with one segment, and an ordinary static model, convert exactly as before.
+  3. The block's bounds are unchanged by the split.
+- `cargo fmt --all -- --check`, `cargo clippy -p converter --all-targets -- -D warnings` and
+  `cargo test -p converter` pass.
 
 # Report
 - Files changed and the approach in 5 lines.
+- Where the one-primitive assumption lived and how you changed it.
 - Each test's name and what it proves.
-- Anything in the design you found wrong, or left out and why.
