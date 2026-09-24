@@ -77,11 +77,19 @@ def ballpark_candidates(shot, world, place_key, exclude=(), interior=False):
     """
     from pose_ballpark import squash
 
-    world.exclude = frozenset(squash(name) for name in exclude)
+    world.exclude = frozenset(squash(name.split(":")[-1]) if name.startswith("Outside:") else squash(name) for name in exclude)
+    if place_key.startswith("outside:"):
+        # Only the outside view of this city is excluded when it has failed, not the city itself.
+        world.exclude = frozenset(squash(name.split(":")[-1]) for name in exclude if name.startswith("Outside:"))
     found = None
     # An interior screenshot is only ever looked for indoors: otherwise `Alftand` in an interior
     # shot's name finds Alftand's outdoor entrance.
-    lookups = (world.interior,) if interior else (world.city, world.entrance, world.interior, world.worldspace)
+    if place_key.startswith("outside:"):
+        lookups, place_key = (world.outside,), place_key[len("outside:"):]
+    elif interior:
+        lookups = (world.interior,)
+    else:
+        lookups = (world.city, world.entrance, world.interior, world.worldspace)
     for lookup in lookups:
         found = lookup(place_key)
         if found:

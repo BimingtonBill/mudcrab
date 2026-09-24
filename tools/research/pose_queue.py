@@ -400,7 +400,12 @@ def refine():
                 place = match.group(2).replace("_", " ") if match else name
                 key = pose_ballpark.HINTS.get(pose_ballpark.squash(place), pose_ballpark.squash(place))
                 if name in resolved:
-                    key = pose_ballpark.squash(resolved[name])
+                    chosen = resolved[name]
+                    key = (
+                        "outside:" + pose_ballpark.squash(chosen.split(":", 1)[1])
+                        if chosen.startswith("Outside:")
+                        else pose_ballpark.squash(chosen)
+                    )
                 tried = entry.get("places_tried", [])
                 # The place the shot stands in now failed too, unless the note sends it back.
                 current = shot_place(world, shot)

@@ -20,6 +20,8 @@ instead of where it looked before. Be quick: one decision per shot.
 - If the note names a place and a candidate clearly matches it, choose that candidate.
 - If the note only says what is wrong ("not this room"), choose the candidate that best fits the
   screenshot, for example a hall with long tables, a basement, or a courtyard.
+- `Outside:<CityWorld>` means the open world just outside that city's gate. Choose it when the
+  note or the screenshot says the view is from outside the walls, looking at the city.
 - If nothing fits, answer null. The shot then stays with the user.
 
 # Scope

@@ -100,6 +100,15 @@ class World:
         """Interior cell and worldspace editor ids sharing a word (4+ letters) with `words`."""
         tokens = {w for w in (squash(word) for word in words) if len(w) >= 4}
         names = [editor for _, editor, squashed in self.cells + self.worlds if any(t in squashed for t in tokens)]
+        # A city seen from outside its walls is in Tamriel, not in the city's worldspace: offer
+        # `Outside:<CityWorld>` for every worldspace a Tamriel door leads into.
+        cities = {wid: editor for wid, editor, squashed in self.worlds if any(t in squashed for t in tokens)}
+        for world_id, editor in cities.items():
+            if self.db.execute(
+                "SELECT 1 FROM door_links d JOIN \"references\" r ON r.id = d.ref_id "
+                "WHERE d.destination_worldspace_id = ? AND r.worldspace_id = 60 LIMIT 1", (world_id,)
+            ).fetchone():
+                names.append(f"Outside:{editor}")
         return sorted(set(names), key=len)[:limit]
 
     def interior(self, key):
@@ -149,6 +158,28 @@ class World:
         for world_id, editor, squashed in self.worlds:
             if squashed in (key, key + "world") and squashed not in self.exclude:
                 return self.worldspace(squashed)
+        return None
+
+    def outside(self, key):
+        """The open world just outside a city: a door in Tamriel whose destination is the city's
+        own worldspace (a city gate), seen from out on the approach. For screenshots of a city
+        taken from outside its walls, which the city's worldspace itself cannot show."""
+        for world_id, editor, squashed in self.worlds:
+            if squashed in (key, key + "world") and squashed not in self.exclude:
+                door = self.db.execute(
+                    "SELECT r.pos_x, r.pos_y, r.pos_z, r.rot_z FROM door_links d "
+                    "JOIN \"references\" r ON r.id = d.ref_id "
+                    "WHERE d.destination_worldspace_id = ? AND r.worldspace_id = 60 LIMIT 1",
+                    (world_id,),
+                ).fetchone()
+                if not door:
+                    return None
+                x, y, z, rot_z = door
+                forward = (math.sin(rot_z), math.cos(rot_z))
+                camera = (x + forward[0] * 4000, y + forward[1] * 4000, z + 1500)
+                yaw, pitch = aim(camera, (x, y, z + 600))
+                pose = {"worldspace_id": 60, "interior_cell_id": None, "position": camera, "yaw": yaw, "pitch": pitch}
+                return pose, f"outside Outside:{editor}"
         return None
 
     def worldspace(self, key):
