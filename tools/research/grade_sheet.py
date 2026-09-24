@@ -6,7 +6,8 @@ Usage:
 
 Pages `<out stem>-1.jpg`, `-2`, ... of eight rows each. Each row is `#n  <shot name>`, the Skyrim screenshot on the left and the engine's render of the
 shot's pose on the right. Shots without a render (or a reference) are listed on the console and
-left out. Also writes `<out>.json`, the row number -> shot name index a grader answers against.
+left out. Also writes `<out>.json`, the row number -> shot name index a grader answers against
+(an object with the user's note instead of the bare name when the user typed one in the fit tool).
 """
 
 import json
@@ -37,7 +38,9 @@ def main(argv):
                 skipped.append(shot["name"])
                 continue
             number = len(rows) + 1
-            index[number] = shot["name"]
+            note = shot.get("note", "")
+            user_note = note.split("User's note:", 1)[1].strip() if "User's note:" in note else ""
+            index[number] = {"shot": shot["name"], "user_note": user_note} if user_note else shot["name"]
             row = Image.new("RGB", (W * 2, H + 20), (20, 20, 20))
             row.paste(Image.open(reference).convert("RGB").resize((W, H)), (0, 20))
             row.paste(Image.open(render).convert("RGB").resize((W, H)), (W, 20))

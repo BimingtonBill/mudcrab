@@ -74,10 +74,19 @@ class World:
             )
         ]
         self.worlds = [(wid, editor, squash(editor)) for wid, editor in self.db.execute("SELECT id, editor_id FROM worldspaces")]
+        # Developer test and demo spaces ship in the game data too (`E3demoBleakFallsBarrow`,
+        # `QASmoke`, `CWTestHold`); a screenshot never shows one.
+        dev = re.compile(r"e3demo|qasmoke|^qa|test|debug|dummy|zzz|delete", re.IGNORECASE)
+        self.cells = [row for row in self.cells if not dev.search(row[1])]
+        self.worlds = [row for row in self.worlds if not dev.search(row[1])]
+
+    # Editor ids (squashed) a lookup must not return: places already tried and found wrong.
+    exclude = frozenset()
 
     def best(self, rows, key):
         # Prefer an exact match, then the shortest editor id containing the name (the main
         # room rather than `...Basement`), then any id the name contains.
+        rows = [row for row in rows if row[2] not in self.exclude]
         exact = [row for row in rows if row[2] == key]
         if exact:
             return exact[0]
@@ -86,6 +95,12 @@ class World:
             key=lambda row: (not row[2].endswith(key), len(row[2])),
         )
         return containing[0] if containing else None
+
+    def names_like(self, words, limit=60):
+        """Interior cell and worldspace editor ids sharing a word (4+ letters) with `words`."""
+        tokens = {w for w in (squash(word) for word in words) if len(w) >= 4}
+        names = [editor for _, editor, squashed in self.cells + self.worlds if any(t in squashed for t in tokens)]
+        return sorted(set(names), key=len)[:limit]
 
     def interior(self, key):
         cell = self.best(self.cells, key)
@@ -132,7 +147,7 @@ class World:
         # A city is its own worldspace (`WhiterunWorld`); only an exact `<name>world` match
         # counts, so `Riften Fishery` still finds the fishery's own door.
         for world_id, editor, squashed in self.worlds:
-            if squashed in (key, key + "world"):
+            if squashed in (key, key + "world") and squashed not in self.exclude:
                 return self.worldspace(squashed)
         return None
 
