@@ -87,6 +87,8 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 
 - **io-pool-stack** 1af3b95 (from main ddb6d70; port of portal impl-222): bevy_gltf loads textures in `IoTaskPool::scope`, whose `block_on` runs other queued glTF loads on the same thread (~85 KiB each); streaming Markarth reached 8,074 KiB and overflowed the 8 MiB IO stack. Fix: 128 MiB reservation + a nesting test (300 scoped loads on a one-thread pool). A real crash on main, small: a good first send when the hold lifts (issue + PR, the user's call; a Bevy issue too, the user's call).
 
+- **water-reflection-gating** 6dc630f (from main ddb6d70, one commit, render.rs): the water reflection renders only while water can be seen. Evidence is the fork's (Riverwood, shadowed build): frame 10.9 -> 9.6 ms, GPU 1.45 -> 1.26 ms with the river out of view; upstream main shows no difference (no sun shadows, frame cap), so the PR must say the gain appears once shadows land. Open before sending: a worst-case 16-18 ms CPU time of the gate system in one run (Phase 2 Dev checking). Fact sheet E.
+
 ## Candidates with no branch yet
 
 - **#30 (a) follow-up** (owed; see above).
