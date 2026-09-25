@@ -153,3 +153,15 @@ reconversion (the first with that branch), Whiterun's walls, rocks and road edge
 patches, and the suspect is vertex alpha being published as opacity where the shader doesn't read
 it (team log 13:05; `local/gallery/s23-check/`). The rule and its "never diverge on real data" scan
 need rechecking by Phase 2 Dev first.
+
+## Correction 2026-09-25 (Phase 2 Dev, confirmed on real data)
+
+The schema-23 data disproved the vertex-alpha-faithful rule (39c3497, held, unsent): Whiterun's
+alpha-tested (MASK) walls got holes because their vertex alpha (down to 0.5, even 0.08) went into
+the alpha test, while Skyrim draws them solid. The corrected rule: vertex alpha is opacity only on
+BLEND materials; MASK and opaque shapes get alpha 1; no SLSF2_Vertex_Colors drops the colours;
+Tree_Anim still gives alpha 1. So **#27's "force alpha 1 on Cutout" is right** for alpha-tested
+shapes, and our comparison above overstated the gap there. What our branch still adds over #27:
+the BSTriShape vertex-colour export, and the fade on blended cards (the hearth flames).
+Phase 2 Dev is fixing the bundle and the branch; the new commit replaces 39c3497 in this note.
+Until then the caution above stands.
