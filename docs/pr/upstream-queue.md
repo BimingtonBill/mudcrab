@@ -23,7 +23,7 @@ Sources: QnA's handover `local/handover-upstream-2026-09-25.md`, the branch scan
 | #38 (issue #37) | phase2/terrain-seam-weld | 3e28bdd | opened 2026-09-25; the issue asks weld vs reject | as above; conflicts with #34 in **profiling.rs** (report template). Resolution ready: `phase2/pr34-38-combined` 073c20b (Phase 2 Dev; includes 0ebe63b and 3e28bdd; fmt, clippy clean, 56 engine tests). The second to merge takes 073c20b's profiling.rs: #38's lines plus `- Empty model references: {}` after `- Assets ready: {}` |
 
 Owed: a follow-up PR for CodeRabbit #30 (a) (check the source under `staging/vfs` before pruning).
-The #30 reply promised it. Not written yet.
+The #30 reply promised it. **Written 2026-09-25 night:** `phase2/prune-keeps-failed-sources` 6bfee13 (on #30's head 3cd8858; merges cleanly with main and pr30-31-combined): a missing KTX2 whose source DDS is under `staging/vfs` is not pruned. Test `a_texture_that_failed_to_convert_is_not_pruned_as_absent` (fails without the fix: 2 pruned vs 1). fmt, clippy, converter + dummy-content tests green. Held by the send rule; no draft text yet.
 
 ## Others' PRs we track
 
