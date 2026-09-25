@@ -171,3 +171,10 @@ send, and the caution above stands until a reconversion with it shows Whiterun s
 **Recheck 2026-09-25 (Portal Dev, schema 25 with ee0e6d7): NOT passed.** Whiterun's walls and rocks
 still show the same see-through patches (`local/gallery/s25-check/`), so the vertex-alpha rule may
 not be the (only) cause; Phase 2 Dev is testing a depth-prepass hypothesis. The caution stands.
+
+**Why schema 25 failed (Phase 2 Dev, later 2026-09-25): a merge, not the rule.** Portal merged the
+bundle and then reverted it (22731d7); the later re-merge (72d9eb8 / b2b1395) silently dropped the
+rule, so the s25 data was converted with schema 23's rule (rockpilem01.glb: MASK/opaque shapes with
+vertex alpha 0..0.55, where d479310's converter gives 1.00). `vertex-alpha-faithful` ee0e6d7 is
+unchanged and correct. Portal's fix is `bundle/portal-s26-fix` 319832f (schema 26; Upstream Dev
+checked it has the BLEND-only line). Caution stands until the schema-26 recheck; then re-judge.
