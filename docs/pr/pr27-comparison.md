@@ -185,3 +185,13 @@ is ee0e6d7's: vertex alpha is opacity only on BLEND; MASK/opaque and Tree_Anim g
 drops the colours. It agrees with #27 on cutout shapes; what we would add is the BSTriShape
 vertex-colour export and the blended cards' fade. Any comment on #27 is to a human, so it goes
 to the user as a previewed draft first.
+
+**Refinement in progress (Phase 2 Dev, later 2026-09-25): don't offer ee0e6d7's rule as final.**
+websearch-578: Community Shaders' Lighting.hlsl multiplies `input.Color.w` into alpha *before* the
+`DO_ALPHA_TEST` discard, so vertex alpha does reach the alpha test on some lighting shapes.
+research-578: `SLSF1_Vertex_Alpha` (bit 3) separates them (gravel skirts set, 6/6; Whiterun wall caps,
+fence bases, rugs clear, 6/6). Candidate rule (`phase2/vertex-alpha-flag`, not ready): lighting
+shapes use vertex alpha as opacity iff `SLSF1_Vertex_Alpha && !Tree_Anim`; effect rule unchanged.
+Plus an engine fix (`phase2/prepass-vertex-alpha`): Bevy 0.19's prepass alpha discard ignores
+COLOR_0. That makes #27's blanket "alpha 1 on Cutout" too strict for SLSF1_Vertex_Alpha shapes;
+re-judge when both branches pass their GPU check.
