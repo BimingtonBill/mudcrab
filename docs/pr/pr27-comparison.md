@@ -178,3 +178,10 @@ rule, so the s25 data was converted with schema 23's rule (rockpilem01.glb: MASK
 vertex alpha 0..0.55, where d479310's converter gives 1.00). `vertex-alpha-faithful` ee0e6d7 is
 unchanged and correct. Portal's fix is `bundle/portal-s26-fix` 319832f (schema 26; Upstream Dev
 checked it has the BLEND-only line). Caution stands until the schema-26 recheck; then re-judge.
+
+**Caution lifted 2026-09-25 (Portal Dev's schema-26 recheck passed).** Whiterun's walls and rocks
+are solid (`local/gallery/s26-check/`; Upstream Dev looked at SR-place-Whiterun). The rule to offer
+is ee0e6d7's: vertex alpha is opacity only on BLEND; MASK/opaque and Tree_Anim get 1; no VC flag
+drops the colours. It agrees with #27 on cutout shapes; what we would add is the BSTriShape
+vertex-colour export and the blended cards' fade. Any comment on #27 is to a human, so it goes
+to the user as a previewed draft first.
