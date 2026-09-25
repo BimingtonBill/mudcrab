@@ -145,3 +145,11 @@ Settled points (Phase 2 Dev, 2026-09-25):
   runtime one; #27 adds the same line.
 - #27's author is still holding it to build a test scene with every foliage and tree type (comment
   2026-09-24 18:34Z). Its head is unchanged since 6834e5e (2026-09-24 17:34Z).
+
+## Caution 2026-09-25 13:05 (Upstream Dev)
+
+Don't offer the vertex-alpha-faithful rule to #27 or upstream yet. On Portal Dev's schema-23
+reconversion (the first with that branch), Whiterun's walls, rocks and road edges show see-through
+patches, and the suspect is vertex alpha being published as opacity where the shader doesn't read
+it (team log 13:05; `local/gallery/s23-check/`). The rule and its "never diverge on real data" scan
+need rechecking by Phase 2 Dev first.
