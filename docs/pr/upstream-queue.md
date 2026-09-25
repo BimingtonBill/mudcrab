@@ -15,7 +15,7 @@ Sources: QnA's handover `local/handover-upstream-2026-09-25.md`, the branch scan
 
 | PR | Branch | Head | State | Next |
 |----|--------|------|-------|------|
-| #29 | phase2/refr-rotation-followup | 5aaf023 (realfakenerd merged main in) | CI green; CodeRabbit confirmed the fix (checked 48 order/sign combinations itself) | wait for a maintainer |
+| #29 | phase2/refr-rotation-followup | 4dcfb69 (realfakenerd merged main in twice) | CI green; CodeRabbit confirmed the fix (checked 48 order/sign combinations itself) | wait for a maintainer |
 | #30 | phase2/pruned-texture-complete | 3cd8858 | CodeRabbit answered; the (c) fix waits on the combination | the second of #30/#31 to merge takes `phase2/pr30-31-combined` (43cd1eb: resolution, glue, the (c) fix and 136d05a; converter 140 tests green) |
 | #31 | phase2/resume-staging-validation | 136d05a | CodeRabbit second-pass Minor fixed and answered (9cbeee7 pushed with the user's OK) | as above |
 | #34 (issue #33) | phase2/model-bounds | 0ebe63b | **MERGED** 2026-09-25 18:07Z by realfakenerd (squash, main 7151669) | done |
