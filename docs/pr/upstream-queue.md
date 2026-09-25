@@ -11,9 +11,9 @@ Sources: QnA's handover `local/handover-upstream-2026-09-25.md`, the branch scan
 
 | PR | Branch | Head | State | Next |
 |----|--------|------|-------|------|
-| #29 | phase2/refr-rotation-followup | dcf48c3 | CI green; CodeRabbit findings answered and fixed | wait for a maintainer |
+| #29 | phase2/refr-rotation-followup | dcf48c3 | CI green; CodeRabbit confirmed the fix (checked 48 order/sign combinations itself) | wait for a maintainer |
 | #30 | phase2/pruned-texture-complete | 3cd8858 | CodeRabbit answered; the (c) fix waits on the combination | the second of #30/#31 to merge takes `phase2/pr30-31-combined` (eeb65b0: resolution, glue and the (c) fix) |
-| #31 | phase2/resume-staging-validation | e87d894 | CI green; CodeRabbit fixed | as above |
+| #31 | phase2/resume-staging-validation | e87d894 | CodeRabbit's second pass: 1 new Minor (a partial journal line swallows the next record); fix 9cbeee7 is local, tested, waiting for the user's push OK | as above |
 
 Owed: a follow-up PR for CodeRabbit #30 (a) (check the source under `staging/vfs` before pruning).
 The #30 reply promised it. Not written yet.
@@ -60,6 +60,7 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 | 6 | water-look + water-colours | Lakes and rivers no longer draw as a white sheet | 2+3 | clean | none | needs a GPU check; lakes read grey until there is a sky |
 | 7 | terrain-normal-maps | Ground detail maps (pebbles, relief) | 4 | clean | same | needs a GPU check |
 | 8 | reference-shots (a96d50e) | The reference-shot tool | 1 | clean | none | **READY** (Phase 2 Dev: fmt, clippy and engine tests green, one real pose rendered; engine-only, off unless `--shots`, no schema bump). Waits on decision 2 |
+| 8b | lights-fixture (dbb1cf6), then lights-converter (e4a2c18, on top) | Test data with a lamp; the converter records lights and their radius | 1+1 | clean | none | **READY** (Phase 2 Dev, reviewed; 194 tests; the real Skyrim.esm test finds 435 LIGH records). lights-converter bumps the **world DB schema 3 → 4** (breaking). Engine PR 3 waits on the brightness decision. Issue #24 is unanswered: decision 3 |
 | 9 | scripts-schema-from-source | Test scripts read the version from the code | 2 | clean | same | tooling; low risk |
 | after #27 | shared-converter-schema, renderable-base-types, material-publication, vertex-alpha-faithful, nif-billboard-nodes | one version number; trees/doors/objects get models; surface shine and see-through, heat haze, fire and effects, flame animation; flame cards | | clean | mixed | **each changes converter output and needs a schema bump**. Phase 2 Dev holds vertex-alpha-faithful 39c3497, nif-billboard-nodes 11b2e2b+e3d30a6 and material-publication's 4546e6e/227da41 until then. vertex-alpha-faithful is also the user's call because it overlaps #27. Send one at a time, or bundle, so the schema numbers don't collide with #27's 15. material-publication also has a history-path hold (decision 4) |
 | discuss first | lod-mesh-containers, lod-database, lod-engine-terrain/objects/trees | Distant land, steps 1-4 | 3-31 | 4 of 5 CONFLICT with main | mixed | two-tracks says **an upstream issue before any code**. Too big to just send; needs a roadmap talk, and the conflicts resolved. lod-engine-trees has a history-path hold |
@@ -71,6 +72,8 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 - **#30 (a) follow-up** (owed; see above).
 - **Plugin FormID slot:** `plugins.priority` is off by one for plugins after the first light plugin
   (research-531, `docs/research/dragonborn-formid-slots.md`). A small fix.
+- **Schema stamp housekeeping** (for the next schema bump): the stamp is still a literal in exporter.rs
+  create_tables, the engine app.rs fixture and the world/database.rs test.
 - **Visible record deletions:** an optional `deleted` column instead of dropping silently (research-533).
 - **Point lights** (decision 3) and the **engine backlog** (`docs/roadmap/backlog-engine-and-portal.md`):
   check each against upstream `main` first, since some defects exist only in the fork.
