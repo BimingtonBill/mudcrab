@@ -167,3 +167,7 @@ The branch is fixed: `phase2/vertex-alpha-faithful` head **ee0e6d7** (on 39c3497
 reviewed the diff: `alpha_mode != Blend` joins Tree_Anim in `ColourOnly`, and the model test adds
 an alpha-tested VC shape that must get alpha 1). It still needs a converter schema bump before any
 send, and the caution above stands until a reconversion with it shows Whiterun solid again.
+
+**Recheck 2026-09-25 (Portal Dev, schema 25 with ee0e6d7): NOT passed.** Whiterun's walls and rocks
+still show the same see-through patches (`local/gallery/s25-check/`), so the vertex-alpha rule may
+not be the (only) cause; Phase 2 Dev is testing a depth-prepass hypothesis. The caution stands.
