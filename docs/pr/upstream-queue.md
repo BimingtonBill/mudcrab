@@ -87,9 +87,10 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 
 From upstream's CONTRIBUTING.md and `two-tracks.md` "Rules for every Phase 2 PR":
 
-1. **Issue first.** CONTRIBUTING says "Find or Create an Issue" before the branch. #29-#31 were
-   review follow-ups; each new topic gets an issue (the user writes or approves it) unless the
-   maintainers say otherwise.
+1. **Issue: optional, the user's call per send.** CONTRIBUTING's workflow step 1 is "Find or Create
+   an Issue" ("check the issue tracker to ensure no one else is working on the same feature"): a
+   suggestion, not a rule. #29-#31 went up without one. Every send request lists each post
+   separately (issues, comments, PRs) with a count (the user, 2026-09-25).
 2. Merge origin/main in; run `cargo fmt --all -- --check`, `cargo clippy --all-targets
    --all-features -- -D warnings`, and the touched crates' tests.
 3. The test needs no game data (dummy-content fixtures); no Bethesda data in the diff or body; no
