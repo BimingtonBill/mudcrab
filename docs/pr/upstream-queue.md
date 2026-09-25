@@ -16,11 +16,11 @@ Sources: QnA's handover `local/handover-upstream-2026-09-25.md`, the branch scan
 | PR | Branch | Head | State | Next |
 |----|--------|------|-------|------|
 | #29 | phase2/refr-rotation-followup | 5b5f380 | CI green; CodeRabbit confirmed the fix (checked 48 order/sign combinations itself) | wait for a maintainer |
-| #30 | phase2/pruned-texture-complete | 3cd8858 | CodeRabbit answered; the (c) fix waits on the combination | the second of #30/#31 to merge takes `phase2/pr30-31-combined` (eeb65b0: resolution, glue and the (c) fix) |
+| #30 | phase2/pruned-texture-complete | 3cd8858 | CodeRabbit answered; the (c) fix waits on the combination | the second of #30/#31 to merge takes `phase2/pr30-31-combined` (43cd1eb: resolution, glue, the (c) fix and 136d05a; converter 140 tests green) |
 | #31 | phase2/resume-staging-validation | 136d05a | CodeRabbit second-pass Minor fixed and answered (9cbeee7 pushed with the user's OK) | as above |
 | #34 (issue #33) | phase2/model-bounds | 0ebe63b | opened 2026-09-25 | wait for CI, CodeRabbit, a maintainer |
 | #36 (issue #35) | phase2/default-water-height | b5fc81f | opened 2026-09-25 | as above |
-| #38 (issue #37) | phase2/terrain-seam-weld | 3e28bdd | opened 2026-09-25; the issue asks weld vs reject | as above; conflicts with #34 in **profiling.rs** (report template). Resolution ready: `phase2/pr34-38-combined` b3e9291 (Phase 2 Dev; includes 5c50031; fmt, engine clippy --all-features clean, 55 engine tests). The second to merge takes b3e9291's profiling.rs: #38's lines plus `- Empty model references: {}` after `- Assets ready: {}` |
+| #38 (issue #37) | phase2/terrain-seam-weld | 3e28bdd | opened 2026-09-25; the issue asks weld vs reject | as above; conflicts with #34 in **profiling.rs** (report template). Resolution ready: `phase2/pr34-38-combined` 073c20b (Phase 2 Dev; includes 0ebe63b and 3e28bdd; fmt, clippy clean, 56 engine tests). The second to merge takes 073c20b's profiling.rs: #38's lines plus `- Empty model references: {}` after `- Assets ready: {}` |
 
 Owed: a follow-up PR for CodeRabbit #30 (a) (check the source under `staging/vfs` before pruning).
 The #30 reply promised it. Not written yet.
@@ -74,6 +74,10 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 | discuss first | lod-mesh-containers, lod-database, lod-engine-terrain/objects/trees, tree-billboard-lighting (fd292df, on lod-engine-trees: distant trees shaded like vanilla DistantTree, pale band -> green; `local/gallery/phase2/distant-trees-before-after.jpg`) | Distant land, steps 1-4 | 3-31 | 4 of 5 CONFLICT with main | mixed | two-tracks says **an upstream issue before any code**. Too big to just send; needs a roadmap talk, and the conflicts resolved. lod-engine-trees has a history-path hold |
 | low | staging-hard-links, audit-converter, audit-engine, asset-precedence | reconversions reuse files without copying; audit fixes; mod file and archive order | 1-4 | clean | mixed | small; bundle later. staging-hard-links needs the #30/#31 combination first |
 | drop | vertex-alpha-not-opacity (superseded by vertex-alpha-faithful), refr-rotation (merged as #25) | | | | | do not send |
+
+## Unsent branches with a known dependency
+
+- **resume-publish-only** ea757a9 (publish-only resume, not sent): once #30 is in, pruned GLBs are rewritten after their size is recorded, so its per-asset size check must skip them (portal's f19bbf2 has that guard). Add the guard before sending.
 
 ## Candidates with no branch yet
 
