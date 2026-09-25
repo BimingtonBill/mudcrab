@@ -1,6 +1,6 @@
 # Upstream send queue
 
-**HOLD (the user, 2026-09-25): no new public PRs until at least 3 of the standing PRs (#29, #30, #31, #34, #36, #38) are merged.** Merged so far: #34 (1 of 3). Review fixes to open PRs (user OK each) and labelled bot replies continue.
+**HOLD (the user, 2026-09-25): no new public PRs until at least 3 of the standing PRs (#29, #30, #31, #34, #36, #38) are merged.** Merged so far: #34, #36 (2 of 3). Review fixes to open PRs (user OK each) and labelled bot replies continue.
 
 Owner: **Upstream Dev**. Upstream is realfakenerd/wah-krah-jol, whose main is 417a262 as of
 2026-09-25. Every new PR or issue, and any text meant for humans, needs the user's OK. Replies to
@@ -19,8 +19,8 @@ Sources: QnA's handover `local/handover-upstream-2026-09-25.md`, the branch scan
 | #30 | phase2/pruned-texture-complete | 3cd8858 | CodeRabbit answered; the (c) fix waits on the combination | the second of #30/#31 to merge takes `phase2/pr30-31-combined` (43cd1eb: resolution, glue, the (c) fix and 136d05a; converter 140 tests green) |
 | #31 | phase2/resume-staging-validation | 136d05a | CodeRabbit second-pass Minor fixed and answered (9cbeee7 pushed with the user's OK) | as above |
 | #34 (issue #33) | phase2/model-bounds | 0ebe63b | **MERGED** 2026-09-25 18:07Z by realfakenerd (squash, main 7151669) | done |
-| #36 (issue #35) | phase2/default-water-height | b5fc81f | opened 2026-09-25 | as above |
-| #38 (issue #37) | phase2/terrain-seam-weld | 3e28bdd; **conflicts with main since #34**: merge ready as `upstream/pr38-main-merge` 0f24d80 (awaiting push OK) | opened 2026-09-25; the issue asks weld vs reject | as above; conflicts with #34 in **profiling.rs** (report template). Resolution ready: `phase2/pr34-38-combined` 073c20b (Phase 2 Dev; includes 0ebe63b and 3e28bdd; fmt, clippy clean, 56 engine tests). The second to merge takes 073c20b's profiling.rs: #38's lines plus `- Empty model references: {}` after `- Assets ready: {}` |
+| #36 (issue #35) | phase2/default-water-height | b5fc81f | **MERGED** 2026-09-25 18:37Z by realfakenerd (main ddb6d70) | done |
+| #38 (issue #37) | phase2/terrain-seam-weld | e60d6ba (realfakenerd merged main in, but dropped two summary lines: clippy fails). Fix `upstream/pr38-fix-merge` d21f357 + comment, awaiting the user's OK | opened 2026-09-25; the issue asks weld vs reject | as above; conflicts with #34 in **profiling.rs** (report template). Resolution ready: `phase2/pr34-38-combined` 073c20b (Phase 2 Dev; includes 0ebe63b and 3e28bdd; fmt, clippy clean, 56 engine tests). The second to merge takes 073c20b's profiling.rs: #38's lines plus `- Empty model references: {}` after `- Assets ready: {}` |
 
 Owed: a follow-up PR for CodeRabbit #30 (a) (check the source under `staging/vfs` before pruning).
 The #30 reply promised it. **Written 2026-09-25 night:** `phase2/prune-keeps-failed-sources` 6bfee13 (on #30's head 3cd8858; merges cleanly with main and pr30-31-combined): a missing KTX2 whose source DDS is under `staging/vfs` is not pruned. Test `a_texture_that_failed_to_convert_is_not_pruned_as_absent` (fails without the fix: 2 pruned vs 1). fmt, clippy, converter + dummy-content tests green. Held by the send rule; no draft text yet.
