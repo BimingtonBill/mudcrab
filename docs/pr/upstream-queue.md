@@ -14,6 +14,9 @@ Sources: QnA's handover `local/handover-upstream-2026-09-25.md`, the branch scan
 | #29 | phase2/refr-rotation-followup | dcf48c3 | CI green; CodeRabbit confirmed the fix (checked 48 order/sign combinations itself) | wait for a maintainer |
 | #30 | phase2/pruned-texture-complete | 3cd8858 | CodeRabbit answered; the (c) fix waits on the combination | the second of #30/#31 to merge takes `phase2/pr30-31-combined` (eeb65b0: resolution, glue and the (c) fix) |
 | #31 | phase2/resume-staging-validation | 9cbeee7 | CodeRabbit second-pass Minor fixed and answered (9cbeee7 pushed with the user's OK) | as above |
+| #34 (issue #33) | phase2/model-bounds | 157d0f8 | opened 2026-09-25 | wait for CI, CodeRabbit, a maintainer |
+| #36 (issue #35) | phase2/default-water-height | 9d6508a | opened 2026-09-25 | as above |
+| #38 (issue #37) | phase2/terrain-seam-weld | 4fe8f6e | opened 2026-09-25; the issue asks weld vs reject | as above; conflicts with #34 in streaming.rs |
 
 Owed: a follow-up PR for CodeRabbit #30 (a) (check the source under `staging/vfs` before pruning).
 The #30 reply promised it. Not written yet.
@@ -52,9 +55,9 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 
 | Order | Branch(es) | Plain | Ahead | Merge | Fork | Status |
 |-------|-----------|-------|-------|-------|------|--------|
-| 1 | empty-model-bounds + bounds-precision (one PR) | Invisible marker models don't fail the size check; long test runs no longer fail at random on correct models | 2+1 | clean | same | **PREPARED** 2026-09-25: branch `upstream/model-bounds-pr` (157d0f8, one commit), checks green; issue + PR text in `local/pr-drafts/4-model-bounds.md` |
-| 2 | default-water-height | Morthal's lake and the open sea come back (10,630 of 11,187 cells had no water) | 1 | clean | same | **PREPARED**: head `phase2/default-water-height` (9d6508a); converter checks green; issue + PR text in `local/pr-drafts/5-default-water-height.md`. A Morthal before/after shot would help |
-| 3 | terrain-seam-weld | No hairline gaps between land squares; city worldspaces no longer fail the seam check | 3 | clean | 4fe8f6e not on fork | **PREPARED**: head `phase2/terrain-seam-weld`; engine checks green; issue + PR text in `local/pr-drafts/6-terrain-seam-weld.md`. The issue asks the maintainers about weld-vs-reject (Marco 4 says reject). Conflicts with #1 in streaming.rs: whichever lands second merges main |
+| 1 | empty-model-bounds + bounds-precision (one PR) | Invisible marker models don't fail the size check; long test runs no longer fail at random on correct models | 2+1 | clean | same | **SENT** as #33/#34 |
+| 2 | default-water-height | Morthal's lake and the open sea come back (10,630 of 11,187 cells had no water) | 1 | clean | same | **SENT** as #35/#36 |
+| 3 | terrain-seam-weld | No hairline gaps between land squares; city worldspaces no longer fail the seam check | 3 | clean | 4fe8f6e not on fork | **SENT** as #37/#38 |
 | 4 | terrain-samplers-weights | Ground textures tile and blend properly | 2 | clean | same | needs a GPU check |
 | 5 | sun-shadow-cascades | Sun shadows reach across the whole view | 2 | clean | same | needs a GPU check and a benchmark (timing runs go alone) |
 | 6 | water-look + water-colours | Lakes and rivers no longer draw as a white sheet | 2+3 | clean | none | needs a GPU check; lakes read grey until there is a sky |
