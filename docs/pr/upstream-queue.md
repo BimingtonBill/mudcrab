@@ -13,7 +13,7 @@ Sources: QnA's handover `local/handover-upstream-2026-09-25.md`, the branch scan
 |----|--------|------|-------|------|
 | #29 | phase2/refr-rotation-followup | dcf48c3 | CI green; CodeRabbit confirmed the fix (checked 48 order/sign combinations itself) | wait for a maintainer |
 | #30 | phase2/pruned-texture-complete | 3cd8858 | CodeRabbit answered; the (c) fix waits on the combination | the second of #30/#31 to merge takes `phase2/pr30-31-combined` (eeb65b0: resolution, glue and the (c) fix) |
-| #31 | phase2/resume-staging-validation | e87d894 | CodeRabbit's second pass: 1 new Minor (a partial journal line swallows the next record); fix 9cbeee7 is local, tested, waiting for the user's push OK | as above |
+| #31 | phase2/resume-staging-validation | 9cbeee7 | CodeRabbit second-pass Minor fixed and answered (9cbeee7 pushed with the user's OK) | as above |
 
 Owed: a follow-up PR for CodeRabbit #30 (a) (check the source under `staging/vfs` before pruning).
 The #30 reply promised it. Not written yet.
