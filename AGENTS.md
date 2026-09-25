@@ -114,6 +114,35 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-25 (midday) - Claude [phase2] Upstream Dev (sends, reviews, preview tool)
+
+**Role:** the user renamed this session **Upstream Dev**. It watches upstream and prepares and
+organises sends. The state lives in `docs/pr/upstream-queue.md` (open PRs, decisions, send order),
+`local/pr-drafts/` (texts) and the team log.
+
+**Upstream now:** our open PRs are #29 (dcf48c3), #30 (3cd8858), #31 (9cbeee7), #34 (issue #33,
+phase2/model-bounds 157d0f8), #36 (issue #35, default-water-height 9d6508a) and #38 (issue #37,
+terrain-seam-weld e91db89). Every CodeRabbit finding is answered, and all are fixed except #30 (a),
+which becomes a later follow-up PR. The combined branches for whichever PR merges second are
+`phase2/pr30-31-combined` and `phase2/pr34-38-combined` (fc9e834, which lacks the doc-only e91db89).
+No maintainer activity since #25.
+
+**The user's rules for public text** (memory `feedback_public_posts`): an AI label at the top of
+every post; the user sees a rendered preview before anything is sent
+(`python local/pr-drafts/preview.py <draft.md>...` writes the exact text to post to
+`local/pr-drafts/out/` and renders `preview.html`; post from those files). Replies to bots may be
+posted directly, labelled as AI. Python `markdown` is installed.
+
+**Waiting on the user:** the preview of drafts 7-9 (reference-shots: issue + PR; lights: a comment on
+#24 + a fixture PR + a converter PR, world DB 3 → 4; suggested: the comment and fixture now, the
+converter held). Before sending, re-run the checks on those branches **after Portal Dev's s23
+reconversion is done** (no builds until Portal Dev says "done"). Also waiting: the roadmap-page
+Upstream track (yes/no), the Chef Discord reply, the fork history holds, and public/portal (after
+Portal Dev's hearth check).
+
+**Running:** the 90-minute upstream check (session cron; it can be skipped while the session is
+busy, so run it by hand when that happens). No workers, no cargo.
+
 ### 2026-09-25 (morning) - Claude [phase2] Upstream session (PR watch, CodeRabbit fixes)
 
 **New session, set up by the user: "Upstream collaboration and reviews".** It watches
