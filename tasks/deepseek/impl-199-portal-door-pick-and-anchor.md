@@ -16,3 +16,6 @@ Track: portal. Starts after impl-188/189 merge (same file). Read research-193's 
 
 ## Report
 Changes, test names, anchor tiers per door before/after, tours' last lines.
+
+## Note from the lead (2026-09-25)
+Phase 2 found 528 models whose NIF root block carries a yaw the engine wrongly applies on top of the reference yaw (research-577; converter fix pending, schema bump). Before changing anchor rules, check whether the Chillfurrow / Cracked Tusk door models carry a root rotation (their GLB root node transform); if so, report it instead of tuning around it.
