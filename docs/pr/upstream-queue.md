@@ -85,6 +85,8 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
   Needs a schema bump and Portal Dev's s27 GPU check; overlaps #27.
 - **sky-fog** f32eccf (on sky-dome): distance fog fitted to SkyrimClear's fog. Sky PR 2, after the dome.
 
+- **io-pool-stack** 1af3b95 (from main ddb6d70; port of portal impl-222): bevy_gltf loads textures in `IoTaskPool::scope`, whose `block_on` runs other queued glTF loads on the same thread (~85 KiB each); streaming Markarth reached 8,074 KiB and overflowed the 8 MiB IO stack. Fix: 128 MiB reservation + a nesting test (300 scoped loads on a one-thread pool). A real crash on main, small: a good first send when the hold lifts (issue + PR, the user's call; a Bevy issue too, the user's call).
+
 ## Candidates with no branch yet
 
 - **#30 (a) follow-up** (owed; see above).
