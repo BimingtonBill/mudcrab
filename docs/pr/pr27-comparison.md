@@ -163,5 +163,7 @@ BLEND materials; MASK and opaque shapes get alpha 1; no SLSF2_Vertex_Colors drop
 Tree_Anim still gives alpha 1. So **#27's "force alpha 1 on Cutout" is right** for alpha-tested
 shapes, and our comparison above overstated the gap there. What our branch still adds over #27:
 the BSTriShape vertex-colour export, and the fade on blended cards (the hearth flames).
-Phase 2 Dev is fixing the bundle and the branch; the new commit replaces 39c3497 in this note.
-Until then the caution above stands.
+The branch is fixed: `phase2/vertex-alpha-faithful` head **ee0e6d7** (on 39c3497; Upstream Dev
+reviewed the diff: `alpha_mode != Blend` joins Tree_Anim in `ColourOnly`, and the model test adds
+an alpha-tested VC shape that must get alpha 1). It still needs a converter schema bump before any
+send, and the caution above stands until a reconversion with it shows Whiterun solid again.
