@@ -11,14 +11,16 @@ Sources: QnA's handover `local/handover-upstream-2026-09-25.md`, the branch scan
 
 ## Open upstream (ours)
 
+**2026-09-25 afternoon:** HazielMagallanes (a contributor, not a maintainer) reviewed all six, each "Approve (in my opinion)". His non-blocking notes were fixed and pushed with the user's OK (heads below) and answered on each PR (`local/pr-drafts/10-haziel-replies.md`). Combined branches need the new heads merged (Phase 2 Dev).
+
 | PR | Branch | Head | State | Next |
 |----|--------|------|-------|------|
-| #29 | phase2/refr-rotation-followup | dcf48c3 | CI green; CodeRabbit confirmed the fix (checked 48 order/sign combinations itself) | wait for a maintainer |
+| #29 | phase2/refr-rotation-followup | 5b5f380 | CI green; CodeRabbit confirmed the fix (checked 48 order/sign combinations itself) | wait for a maintainer |
 | #30 | phase2/pruned-texture-complete | 3cd8858 | CodeRabbit answered; the (c) fix waits on the combination | the second of #30/#31 to merge takes `phase2/pr30-31-combined` (eeb65b0: resolution, glue and the (c) fix) |
-| #31 | phase2/resume-staging-validation | 9cbeee7 | CodeRabbit second-pass Minor fixed and answered (9cbeee7 pushed with the user's OK) | as above |
-| #34 (issue #33) | phase2/model-bounds | 157d0f8 | opened 2026-09-25 | wait for CI, CodeRabbit, a maintainer |
-| #36 (issue #35) | phase2/default-water-height | 9d6508a | opened 2026-09-25 | as above |
-| #38 (issue #37) | phase2/terrain-seam-weld | 5c50031 | opened 2026-09-25; the issue asks weld vs reject | as above; conflicts with #34 in **profiling.rs** (report template). Resolution ready: `phase2/pr34-38-combined` b3e9291 (Phase 2 Dev; includes 5c50031; fmt, engine clippy --all-features clean, 55 engine tests). The second to merge takes b3e9291's profiling.rs: #38's lines plus `- Empty model references: {}` after `- Assets ready: {}` |
+| #31 | phase2/resume-staging-validation | 136d05a | CodeRabbit second-pass Minor fixed and answered (9cbeee7 pushed with the user's OK) | as above |
+| #34 (issue #33) | phase2/model-bounds | 0ebe63b | opened 2026-09-25 | wait for CI, CodeRabbit, a maintainer |
+| #36 (issue #35) | phase2/default-water-height | b5fc81f | opened 2026-09-25 | as above |
+| #38 (issue #37) | phase2/terrain-seam-weld | 3e28bdd | opened 2026-09-25; the issue asks weld vs reject | as above; conflicts with #34 in **profiling.rs** (report template). Resolution ready: `phase2/pr34-38-combined` b3e9291 (Phase 2 Dev; includes 5c50031; fmt, engine clippy --all-features clean, 55 engine tests). The second to merge takes b3e9291's profiling.rs: #38's lines plus `- Empty model references: {}` after `- Assets ready: {}` |
 
 Owed: a follow-up PR for CodeRabbit #30 (a) (check the source under `staging/vfs` before pruning).
 The #30 reply promised it. Not written yet.
