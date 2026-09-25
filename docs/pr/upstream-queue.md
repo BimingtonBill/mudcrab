@@ -79,6 +79,12 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 
 - **resume-publish-only** ea757a9 (publish-only resume, not sent): once #30 is in, pruned GLBs are rewritten after their size is recorded, so its per-asset size check must skip them (portal's f19bbf2 has that guard). Add the guard before sending.
 
+- **vertex-alpha series** (held; replaces vertex-alpha-faithful's rule): `vertex-alpha-flag` f05c1d1 (on
+  vertex-alpha-faithful: lighting shapes use vertex alpha as opacity iff SLSF1_Vertex_Alpha && !Tree_Anim)
+  + `prepass-vertex-alpha` 1b7226b (from main: the depth prepass tests vertex alpha like the main pass).
+  Needs a schema bump and Portal Dev's s27 GPU check; overlaps #27.
+- **sky-fog** f32eccf (on sky-dome): distance fog fitted to SkyrimClear's fog. Sky PR 2, after the dome.
+
 ## Candidates with no branch yet
 
 - **#30 (a) follow-up** (owed; see above).
