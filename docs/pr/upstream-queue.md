@@ -1,5 +1,7 @@
 # Upstream send queue
 
+**HOLD (the user, 2026-09-25): no new public PRs until at least 3 of the standing PRs (#29, #30, #31, #34, #36, #38) are merged.** Review fixes to open PRs (user OK each) and labelled bot replies continue.
+
 Owner: **Upstream Dev**. Upstream is realfakenerd/wah-krah-jol, whose main is 417a262 as of
 2026-09-25. Every new PR or issue, and any text meant for humans, needs the user's OK. Replies to
 bots (CodeRabbit) may be posted by agents, labelled as AI.
@@ -16,7 +18,7 @@ Sources: QnA's handover `local/handover-upstream-2026-09-25.md`, the branch scan
 | #31 | phase2/resume-staging-validation | 9cbeee7 | CodeRabbit second-pass Minor fixed and answered (9cbeee7 pushed with the user's OK) | as above |
 | #34 (issue #33) | phase2/model-bounds | 157d0f8 | opened 2026-09-25 | wait for CI, CodeRabbit, a maintainer |
 | #36 (issue #35) | phase2/default-water-height | 9d6508a | opened 2026-09-25 | as above |
-| #38 (issue #37) | phase2/terrain-seam-weld | e91db89 | opened 2026-09-25; the issue asks weld vs reject | as above; conflicts with #34 in **profiling.rs** (report template). Resolution ready: `phase2/pr34-38-combined` fc9e834 (Phase 2 Dev; engine checks green, 54 tests). The second to merge takes fc9e834's profiling.rs: #38's lines plus `- Empty model references: {}` after `- Assets ready: {}` |
+| #38 (issue #37) | phase2/terrain-seam-weld | 5c50031 | opened 2026-09-25; the issue asks weld vs reject | as above; conflicts with #34 in **profiling.rs** (report template). Resolution ready: `phase2/pr34-38-combined` fc9e834 (Phase 2 Dev; engine checks green, 54 tests). The second to merge takes fc9e834's profiling.rs: #38's lines plus `- Empty model references: {}` after `- Assets ready: {}` |
 
 Owed: a follow-up PR for CodeRabbit #30 (a) (check the source under `staging/vfs` before pruning).
 The #30 reply promised it. Not written yet.
