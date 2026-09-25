@@ -195,3 +195,9 @@ shapes use vertex alpha as opacity iff `SLSF1_Vertex_Alpha && !Tree_Anim`; effec
 Plus an engine fix (`phase2/prepass-vertex-alpha`): Bevy 0.19's prepass alpha discard ignores
 COLOR_0. That makes #27's blanket "alpha 1 on Cutout" too strict for SLSF1_Vertex_Alpha shapes;
 re-judge when both branches pass their GPU check.
+
+**2026-09-25 13:20Z: HazielMagallanes reviewed #27** (approve in his opinion). His design note 2:
+forcing vertex alpha to 1 on every Cutout shape touches 244 GLBs (wolf fur cards and similar), not
+just pine needles; he suggests an ADR/issue and scoping the normalization by material semantics. That
+is what our candidate rule does (`SLSF1_Vertex_Alpha`, `vertex-alpha-flag`), so a comment on #27 has
+a natural opening once the s27 check passes. Any such comment is to humans: the user decides.
