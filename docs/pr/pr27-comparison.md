@@ -201,3 +201,11 @@ forcing vertex alpha to 1 on every Cutout shape touches 244 GLBs (wolf fur cards
 just pine needles; he suggests an ADR/issue and scoping the normalization by material semantics. That
 is what our candidate rule does (`SLSF1_Vertex_Alpha`, `vertex-alpha-flag`), so a comment on #27 has
 a natural opening once the s27 check passes. Any such comment is to humans: the user decides.
+
+**2026-09-26: schema-27 recheck passed (Portal Dev; `local/gallery/s27-check/`).** With
+`vertex-alpha-flag` + `prepass-vertex-alpha`: Whiterun's walls solid, gravel skirts without sky rings,
+prepass patch active (Upstream Dev looked at SR-place-Whiterun and cap-07). **The rule to offer is
+the flag rule** (vertex alpha is opacity on lighting shapes iff SLSF1_Vertex_Alpha && !Tree_Anim;
+effect shapes when blended), sent as two PRs: prepass first, then the converter rule with its schema
+bump. Against #27: #27's blanket Cutout -> alpha 1 is right for the 68 solid shapes and wrong for
+the 262 that fade (fact sheet D), which answers Haziel's design note 2. A #27 comment is the user's call.
