@@ -100,8 +100,7 @@ impl Plugin for VercidiumRendererPlugin {
                 .add_systems(
                     PostUpdate,
                     limit_water_reflection_cascades
-                        .after(SimulationLightSystems::UpdateDirectionalLightCascades)
-                        .before(SimulationLightSystems::UpdateLightFrusta),
+                        .after(SimulationLightSystems::UpdateLightFrusta),
                 );
         }
 
@@ -660,13 +659,19 @@ struct WaterReflectionCascadeLimit(usize);
 /// casts their shadows reaches the reflection view too (`bevy_pbr-0.19.0/src/render/light.rs:1782`
 /// filters a view's lights by layer). What can differ per view is the list of cascades: Bevy builds
 /// it for every active camera (`bevy_light-0.19.0/src/cascade.rs:195-253`), and everything after
-/// takes that list's length:
-/// - `update_directional_light_frusta` builds one frustum per listed cascade
-///   (`bevy_light-0.19.0/src/directional_light.rs:239`), and `check_dir_light_mesh_visibility`
-///   culls the world once per frustum (`bevy_light-0.19.0/src/lib.rs:383-388`, `:402`);
-/// - `prepare_lights` zips the view's cascades with its frusta and the light's bounds and spawns
-///   one shadow view per pair (`bevy_pbr-0.19.0/src/render/light.rs:1795-1818`), so a cascade
-///   dropped here is a shadow view never specialized, queued, batched or drawn.
+/// zips it: `prepare_lights` pairs the view's cascades with its frusta and the light's bounds and
+/// spawns one shadow view per pair (`bevy_pbr-0.19.0/src/render/light.rs:1795-1818`), so a cascade
+/// dropped here is a shadow view never specialized, queued, batched or drawn on the render thread.
+///
+/// Only the cascades are shortened, after `update_directional_light_frusta` has built the frusta
+/// from them (`bevy_light-0.19.0/src/directional_light.rs:239`). Shortening the frusta as well
+/// would also save the main world's per-cascade culling, but it panics:
+/// `check_dir_light_mesh_visibility` sizes its thread-local queues to one view's frustum count only
+/// on the threads that ran a batch for that view (`bevy_light-0.19.0/src/lib.rs:403-407`), and then
+/// indexes every thread's queue by the next view's cascade index (`:466-476`) - a view with fewer
+/// frusta than the one before it leaves a short queue behind ("index out of bounds: the len is 0
+/// but the index is 0", `lib.rs:477`, seen on a `--shots` run). With every view's frusta the same
+/// length, as Bevy always has them, the queues always fit.
 ///
 /// The light's shader record still says the light has its full count (`light.rs:1672-1706` takes it
 /// from the config), and the dropped cascades are left at `GpuDirectionalCascade::default`:
@@ -678,11 +683,12 @@ struct WaterReflectionCascadeLimit(usize);
 /// reflection is unshadowed.
 ///
 /// A light whose layers miss the reflection camera's (the doorway's sun, on the portal's layer)
-/// still had cascades built and culled for the reflection view that `prepare_lights` never uses:
-/// those are dropped whole.
+/// has cascades listed for the reflection view too, which `prepare_lights` never turns into shadow
+/// views (it skips a light whose layers miss the view's): they are emptied as well, which changes
+/// nothing drawn.
 ///
-/// Runs between `build_directional_light_cascades` and `update_directional_light_frusta`, so the
-/// frusta and the culling follow the shortened list.
+/// Runs after `update_directional_light_frusta` (`SimulationLightSystems::UpdateLightFrusta`), for
+/// the reason above; the lists reach the render world at extraction, after `PostUpdate`.
 fn limit_water_reflection_cascades(
     limit: Res<WaterReflectionCascadeLimit>,
     reflection: Query<(Entity, Option<&RenderLayers>), With<WaterReflectionCamera>>,
