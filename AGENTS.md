@@ -107,7 +107,9 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
   (both sessions, workers, the user playing) can run tours, `--shots` and tests side by side, just
   slower. Two exceptions, each announced to the other session first:
   - **Timing runs run alone:** profiling, acceptance and benchmarks (`scripts/phase2-*.ps1`,
-    `--benchmark-only`). A second instance on the GPU spoils their numbers.
+    `--benchmark-only`). A second instance on the GPU spoils their numbers, and so does a cargo
+    build or test on the CPU (2026-09-26: a stress p95 of 18.4 ms with builds running beside it,
+    11.4-12.1 ms on a quiet machine). A booking holds engines **and** cargo in every session.
   - **A conversion's publish needs its output and staging folders closed:** publishing renames
     staging over the output folder, and on Windows that fails ("Access is denied") while any
     process holds a handle inside either: an engine reading `skyrim_world.db`, but also a size
