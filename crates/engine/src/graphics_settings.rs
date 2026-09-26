@@ -307,9 +307,8 @@ pub struct GraphicsSettings {
     pub contact_shadows: bool,
     /// The portal's render target, as a fraction of the doorway's rectangle on screen.
     ///
-    /// Recorded but **not applied yet**: the target is sized in `crate::portal`'s
-    /// `resize_portal_target`, which impl-218 owned while this was written. The hook is
-    /// [`scaled_portal_size`] around its `portal_target_size(rect.size(), ...)` argument.
+    /// Applied by `crate::portal`'s `resize_portal_target` through [`scaled_portal_size`], every
+    /// frame, so a change from the graphics panel takes effect on the next frame; held to 0.1..=1.
     pub portal_scale: f32,
 }
 

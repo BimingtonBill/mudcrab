@@ -104,7 +104,10 @@ use crate::{
 };
 use bevy::{
     prelude::*,
-    render::view::screenshot::{Screenshot, save_to_disk},
+    render::{
+        render_resource::{Extent3d, TextureDimension, TextureFormat},
+        view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk},
+    },
 };
 use std::{fmt::Write as _, path::PathBuf};
 
@@ -648,6 +651,64 @@ fn shoot_path(commands: &mut Commands, tour: &mut DemoTour, path: PathBuf) {
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(path));
+}
+
+/// A 0..1 display value for one linear HDR channel: clamped, so the portal target's colours below
+/// white - everything the main tonemapper would also leave nearly as it is - are kept, and a
+/// highlight past white saturates rather than wrapping.
+fn hdr_channel_to_display(linear: f32) -> f32 {
+    if linear.is_finite() {
+        linear.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// An 8-bit sRGB copy of a captured image in any format `Image::get_color_at` reads - the portal
+/// target's `Rgba16Float` included, which Bevy's own `save_to_disk` refuses ("Cannot save
+/// screenshot", its `try_into_dynamic` has no half-float case). Each channel is clamped
+/// ([`hdr_channel_to_display`]) and encoded as sRGB, alpha opaque.
+fn hdr_to_srgb8(image: &Image) -> Image {
+    let size = image.size();
+    let mut data = Vec::with_capacity((size.x * size.y * 4) as usize);
+    for y in 0..size.y {
+        for x in 0..size.x {
+            let linear = image
+                .get_color_at(x, y)
+                .map(|color| color.to_linear())
+                .unwrap_or(LinearRgba::BLACK);
+            let display = LinearRgba::rgb(
+                hdr_channel_to_display(linear.red),
+                hdr_channel_to_display(linear.green),
+                hdr_channel_to_display(linear.blue),
+            );
+            let srgb = Srgba::from(display).to_u8_array();
+            data.extend_from_slice(&[srgb[0], srgb[1], srgb[2], 255]);
+        }
+    }
+    Image::new(
+        Extent3d {
+            width: size.x,
+            height: size.y,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        default(),
+    )
+}
+
+/// Bevy's `save_to_disk` for an HDR render target: the capture is converted to 8-bit sRGB first
+/// ([`hdr_to_srgb8`]) and then written as the path's format.
+fn save_hdr_to_disk(path: PathBuf) -> impl FnMut(On<ScreenshotCaptured>) {
+    move |captured| match hdr_to_srgb8(&captured.image).try_into_dynamic() {
+        Ok(image) => match image.to_rgb8().save(&path) {
+            Ok(()) => info!("Screenshot saved to {}", path.display()),
+            Err(error) => error!("Cannot save screenshot {}: {error}", path.display()),
+        },
+        Err(error) => error!("Cannot save screenshot {}: {error}", path.display()),
+    }
 }
 
 fn shoot(commands: &mut Commands, tour: &mut DemoTour, name: &str) {
@@ -1369,7 +1430,7 @@ fn run_demo_tour(
                     tour.note(format!("portal render target {}", path.display()));
                     commands
                         .spawn(Screenshot::image(portal.0.clone()))
-                        .observe(save_to_disk(path));
+                        .observe(save_hdr_to_disk(path));
                 }
                 // A screenshot is taken on a later frame; crossing now would photograph the far side.
                 //
@@ -2290,6 +2351,39 @@ mod tests {
             None,
             "with no render origin there is no grid to name, which the settle reads as not resident"
         );
+    }
+
+    /// The portal target's HDR capture becomes an 8-bit sRGB image Bevy can write: values under
+    /// white are encoded as sRGB, a highlight past white is clamped, and a NaN is black.
+    #[test]
+    fn an_hdr_capture_is_converted_to_srgb8_for_saving() {
+        let mut hdr = Image::new_fill(
+            Extent3d {
+                width: 3,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0; 8],
+            TextureFormat::Rgba16Float,
+            default(),
+        );
+        hdr.set_color_at(0, 0, Color::linear_rgba(0.214, 0.0, 1.0, 1.0))
+            .unwrap();
+        hdr.set_color_at(1, 0, Color::linear_rgba(8.0, 40.0, 0.5, 1.0))
+            .unwrap();
+        hdr.set_color_at(2, 0, Color::linear_rgba(f32::NAN, -1.0, 0.0, 1.0))
+            .unwrap();
+        let out = hdr_to_srgb8(&hdr);
+        assert_eq!(out.texture_descriptor.format, TextureFormat::Rgba8UnormSrgb);
+        assert_eq!(out.size(), UVec2::new(3, 1));
+        let data = out.data.as_ref().unwrap();
+        // Linear 0.214 is sRGB ~0.5 (127 or 128).
+        assert!((127..=128).contains(&data[0]), "{}", data[0]);
+        assert_eq!(&data[1..4], &[0, 255, 255]);
+        assert_eq!(&data[4..6], &[255, 255], "past white clamps");
+        assert_eq!(&data[8..12], &[0, 0, 0, 255], "NaN and negatives are black");
+        assert!(out.try_into_dynamic().is_ok(), "a format Bevy can save");
     }
 
     #[test]
