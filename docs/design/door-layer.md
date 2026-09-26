@@ -76,3 +76,30 @@ Two parts:
   Sven's House, the Trader.
 - At portal scale 0.1, the door in front of the player is sharp (note 04).
 - Frames either side of a crossing are the same view (the tour's walk frames).
+
+## As built (2026-09-26, `crates/engine/src/door_layer.rs`)
+
+- **Which doors.** Every non-auto-load door of the player's space within 800 units whose model
+  swings (`DoorAnimation::swings`) gets a door-layer door ("copy") spawned from its model; that
+  door is the pair's *driver*, its link's other end the *follower*. Static doors keep their native
+  drawing. The copy is drawn on layers 0 and `DOOR_LAYER` (3): the main camera, the water
+  reflection and the engine sun's shadows read layer 0, the portal camera does not.
+- **Hiding the natives.** Once the copy has drawn, `isolate_cells` puts every node of both natives
+  on no layer at all (they keep their visibility, so the walk probe and the doorway floor probes
+  still hit them). The walk probe skips the copy (`DoorCopyPart`).
+- **Behind the plane.** The quad's depth composite hides source geometry more than a wall's depth
+  behind the doorway plane, so a leaf that swings away from the player would vanish there. While
+  the portal draws through the pair, a leaf-only copy on the portal camera's layer draws it in the
+  doorway image. At a low portal scale that part of the leaf is drawn at the portal's resolution,
+  like the room it stands in; the part in front of the plane is always full resolution.
+- **Filler.** The model's plug (a static mesh behind the driver's doorway plane) is hidden in the
+  copy while the door is not shut and whenever the copy stands in the other space.
+- **Crossing.** The copy is re-expressed through the driver's own `door_map`, scaled about the
+  destination doorway by the follower's scale over the driver's. Hand-back (the copy goes, the next
+  one is spawned from the player's side) when both doors are shut and the player is 250 units away
+  or the doorway is out of view.
+- **State.** The far-door drive swings the follower with its driver for as long as the pair is on
+  the layer; `E` at a follower works its driver; auto-close measures both ends of a doorway.
+- **Found on the way.** A scaled door (a load door whose own `Open` clip is too narrow) now closes by
+  retracing its scaled swing: its own `Close` clip, scaled about its open first pose, left
+  Dragonsreach's doors standing open after a close (the black doorway of note 02).
