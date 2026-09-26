@@ -344,7 +344,7 @@ pub enum DoorwayFacings {
 /// geometry, in place of the link's `XTEL` arrival target.
 ///
 /// Attached by `crate::streaming` when [`doorway_anchor`] accepts the door's data; read by
-/// `crate::transition`'s map, which the portal camera, the crossing and the doorway mirror are all
+/// `crate::transition`'s map, which the portal camera, the crossing and the door-layer door are all
 /// placed by, and by the player's doorway plane, which has to stand in the same plane as the
 /// portal's window. **Absent** on a door the data does not support - tier 4 of the report - and on
 /// every door of a run without a world database, where the map is exactly what it has always been.

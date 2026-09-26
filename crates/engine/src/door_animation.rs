@@ -1424,11 +1424,9 @@ fn swing_scale(swing_degrees: f32) -> f32 {
 /// leaf - keeps its own rotation, and nothing else in the clip is touched: a door that slides
 /// something while it swings keeps sliding it exactly as far.
 ///
-/// `Close` is the scaled `Open` **run backwards** when the door's own `Close` is its `Open`
-/// backwards ([`close_mirrors_open`]) - the two sequences of one model, which is how every load door
-/// in the install that has both is built - because closing is the door retracing the swing it just
-/// made, and a `Close` scaled about its own first pose would instead carry the leaf *past* closed.
-/// A `Close` that is a motion of its own is scaled the way `Open` is, about its own first pose.
+/// `Close` is always the scaled `Open` **run backwards**: closing is the door retracing the swing it
+/// just made. A `Close` of the door's own cannot be scaled into a close (see the body), so a node
+/// only the `Close` moves - a latch, if a model has one - keeps the pose the `Open` left it in.
 ///
 /// `None` when there is no clip to scale or a curve cannot be rebuilt (times that are not a curve,
 /// keys that are not finite), which leaves the door with the clip it has.
@@ -1451,7 +1449,9 @@ fn swung_open_clips(
     let close = match close {
         Some(close) => {
             if !close_mirrors_open(open, close, moved) {
-                debug!("a scaled door's own close is a motion of its own; it retraces its swing");
+                debug!(
+                    "a scaled door's own close is a motion of its own; it retraces its scaled open instead"
+                );
             }
             Some(rebuilt_clip(&swung, Resample::Reversed)?)
         }

@@ -161,9 +161,14 @@ pub(crate) struct DoorLayer {
 }
 
 impl DoorLayer {
-    /// The pair `door` is a native of (driver or follower), if it is on the door layer.
+    /// The pair `door` is a native of (driver or follower), if it is on the door layer. The pair it
+    /// drives comes first, so a door that is also claimed as another pair's follower still answers
+    /// with its own.
     pub(crate) fn pair_of(&self, door: Entity) -> Option<&LayerPair> {
-        self.pairs.iter().find(|pair| pair.has(door))
+        self.pairs
+            .iter()
+            .find(|pair| pair.driver == door)
+            .or_else(|| self.pairs.iter().find(|pair| pair.has(door)))
     }
 
     /// The door whose state is the door-layer door's, for a native of a pair: the driver. `None`
@@ -365,6 +370,8 @@ pub(crate) fn manage_door_layer(
 
     // The pairs standing: kept, updated, or dropped.
     let mut kept: Vec<LayerPair> = Vec::with_capacity(layer.pairs.len());
+    // Every door that drives a pair this frame: never re-claimed as another pair's follower.
+    let drivers: Vec<Entity> = layer.pairs.iter().map(|pair| pair.driver).collect();
     for mut pair in std::mem::take(&mut layer.pairs) {
         let drop = |commands: &mut Commands, pair: &LayerPair| {
             commands.entity(pair.copy).try_despawn();
@@ -380,7 +387,9 @@ pub(crate) fn manage_door_layer(
             .follower
             .is_none_or(|follower| !doors.contains(follower))
         {
-            pair.follower = twin_of(pair.driver);
+            // Never a twin that drives a pair of its own (the spawn path's rule too): two pairs
+            // would own one doorway.
+            pair.follower = twin_of(pair.driver).filter(|twin| !drivers.contains(twin));
         }
         let driver_active = active(pair.driver);
         let follower_active = pair.follower.is_some_and(active);
