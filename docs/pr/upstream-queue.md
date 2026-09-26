@@ -95,6 +95,8 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 - **lights-xrds-cap** f79cf46 (one commit on #41's 7410b6d): XRDS above 8,192 units ignored (data gap between 6,919 and the nine outliers 15,967..3,736,737; a ratio rule drops ordinary lamps). Test `an_override_above_the_cap_is_ignored`. **Pushed onto #41 with the user's OK (head f79cf46); #41's body updated.**
 - **reflection-land-only** 925205f (from main, held): the water reflection camera draws terrain only; objects on their own layer (sun keeps both, so objects still cast). Rural p50 3.96 -> 3.71 ms (+6.5% fps). Citations in `local/pr-drafts/factsheet-reflection-land-only.md` (high confidence on LOD + sky, medium on the exclusion list; the REFR flag 0x10000000 Reflected By Auto Water and XPWR are a candidate follow-up). Honest look change to state: shore objects leave the reflection until LOD/SSR exist. Best sent after the sky PR, so the reflection has a sky. **Before quoting: the citations are a worker's, not re-fetched (Phase 2 Dev's correction); open STEP [Water] and DynDOLOD How-LOD-Works (a websearch worker), and verify or drop the bUseWaterReflectionsStatics/Actors = Oblivion/FO3 line (recollection, not research).**
 
+- **initially-disabled-refs** a47bde9 (held): references Skyrim starts disabled (flag 0x800) are recorded and not loaded; adds `references.flags`, which also enables the reflection follow-up (honour 0x10000000 Reflected By Auto Water: flagged references join the reflection's world layer; Phase 2 Dev will give the flagged count). Changes the world DB: check whether it needs a schema bump next to #40's 3 -> 4.
+
 ## Candidates with no branch yet
 
 - **#30 (a) follow-up** (owed; see above).
