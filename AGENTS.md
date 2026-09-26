@@ -162,6 +162,31 @@ Worktrees to discard when done: `wkj-p2-proptest`, `wkj-p2-brp` (+ `wkj-p2-brp-t
 unloads), the 8 standing audits on one day's DeepSeek budget, `--shots` animation freeze, bevy_brp_mcp
 (needs the user's install and MCP config).
 
+### 2026-09-26 - Claude [phase2] Upstream Dev (merges, lighting sent, upstream posts paused)
+
+**Upstream:** #34 and #36 MERGED (main ddb6d70): 2 of 3 for the send hold. Open ours: #29 (4dcfb69,
+realfakenerd merged main in; likely next), #30, #31, #38 (d21f357: fixed realfakenerd's broken main
+merge), lighting #39 (fixture), #40 (converter, world DB 3->4, head 5a89364) and #41 (engine
+`--lights`, head 358450a: XRDS cap + CodeRabbit fix). HazielMagallanes (contributor) reviewed
+everything; his notes were fixed and answered. #27 (TaylorTurnerIT) is a stalled draft: the user
+chose to WAIT on it for base types (Whiterun's water); ours (renderable-base-types) stays unsent.
+
+**The user's rules now (memory `upstream-send-hold`, `feedback_public_posts`,
+`feedback-self-contained-asks`, `feedback-path-only-commits`):** **posts to realfakenerd's
+upstream are PAUSED** (comments, issues, PRs, bot replies; pushing to an open PR head counts).
+The user's own fork may be updated freely. Every ask to the user is self-contained and labelled
+🤖 AI / 👤 human / 🚫 no message. Commit named paths only in the shared checkout.
+
+**Prepared, held:** texts 11 prepass, 12 sky-dome, 13 sky-fog, 18 LOD issue (the user said yes to
+the issue before pausing); first sends when allowed: cell-name-nul, io-pool-stack, parser-never-panic,
+sky-dome, sky-fog, reflection-land-only (its citations need a websearch worker, DeepSeek pacing
+permitting). #30 (a) follow-up written (6bfee13). History paths: send as a fresh squashed commit.
+public/portal re-exported by Portal Dev (ff96ac2). Full list: `docs/pr/upstream-queue.md`.
+
+**Tools:** `local/pr-drafts/preview.py` (lists every post and a count at the top); shared warm
+target `C:\Modding	arget-upstream`; `cargo nextest` for CI-matching tests. **Running:** the
+90-minute upstream check (session crons). No workers, no worktrees.
+
 ### 2026-09-26 - Claude [portal] Portal Dev (portal cost, door leaf, flames, benches)
 
 **State:** portal HEAD c5cdad9. 637 engine lib tests pass; the full Riverwood tour passes 8/8. No workers running. The details are in `local/handover-2026-09-26-portal.md` and `local/team/2026-09-26.md`.
