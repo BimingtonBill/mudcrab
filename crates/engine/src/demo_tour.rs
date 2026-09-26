@@ -249,6 +249,10 @@ const WALK_THROUGH_SECONDS: f32 = 25.0;
 /// any door needs, and it fits inside [`WALK_THROUGH_SECONDS`], which the wait runs inside, so a
 /// door that never opens is named rather than walked at.
 const WALK_OPEN_SECONDS: f32 = 10.0;
+
+/// How long a door stands fully open before the tour photographs the portal's target: a few
+/// frames for the portal camera to be picked, activated and to draw the destination.
+const PORTAL_SHOT_SECONDS: f32 = 0.5;
 // The wait is the failure a door that never opens is named by, so it has to come before the
 // walk-through's own ceiling; a wait longer than that would never be reached.
 const _: () = assert!(WALK_OPEN_SECONDS < WALK_THROUGH_SECONDS);
@@ -334,6 +338,12 @@ enum Phase {
     /// `--tour-bench`: the closed state is timed and the door has been asked to open; wait for it
     /// to be fully open before timing it open.
     BenchOpen,
+    /// Scripted crossing with a portal: the door has been asked to open so the portal camera
+    /// renders through it; wait until it is fully open.
+    PortalOpen,
+    /// The door is open: after [`PORTAL_SHOT_SECONDS`], photograph the portal's target and the
+    /// open doorway, then cross.
+    PortalShot,
     /// Door photographed; activate it once the screenshot has been taken.
     Activate,
     /// Door activated; waiting for `DoorCrossed`.
@@ -709,6 +719,22 @@ fn save_hdr_to_disk(path: PathBuf) -> impl FnMut(On<ScreenshotCaptured>) {
         },
         Err(error) => error!("Cannot save screenshot {}: {error}", path.display()),
     }
+}
+
+/// Photographs what the portal camera itself renders - the room beyond the open door - into
+/// `NN-portal-view.png`, from its HDR target ([`save_hdr_to_disk`]).
+fn shoot_portal_view(
+    commands: &mut Commands,
+    tour: &mut DemoTour,
+    portal: &crate::portal::PortalTexture,
+) {
+    let path = tour
+        .output_dir
+        .join(format!("{:02}-portal-view.png", tour.stage));
+    tour.note(format!("portal render target {}", path.display()));
+    commands
+        .spawn(Screenshot::image(portal.0.clone()))
+        .observe(save_hdr_to_disk(path));
 }
 
 fn shoot(commands: &mut Commands, tour: &mut DemoTour, name: &str) {
@@ -1421,17 +1447,6 @@ fn run_demo_tour(
             if tour.timer >= PRESTREAM_SECONDS {
                 let name = format!("{:02}-door", tour.stage);
                 shoot(&mut commands, &mut tour, &name);
-                // What the portal camera itself renders, independent of where the main camera
-                // stands: the room beyond this door, if the portal is showing it.
-                if let Some(portal) = &portal_texture {
-                    let path = tour
-                        .output_dir
-                        .join(format!("{:02}-portal-view.png", tour.stage));
-                    tour.note(format!("portal render target {}", path.display()));
-                    commands
-                        .spawn(Screenshot::image(portal.0.clone()))
-                        .observe(save_hdr_to_disk(path));
-                }
                 // A screenshot is taken on a later frame; crossing now would photograph the far side.
                 //
                 // `--tour-bench`: at an outside `E` door, time the doorway first - the bench's
@@ -1463,8 +1478,51 @@ fn run_demo_tour(
                         tour.note(line);
                         start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
                     }
+                    // What the portal camera itself renders: it renders only through a door that
+                    // is open ([`crate::portal`]), and a scripted crossing snaps through a closed
+                    // one, so the door is opened first and photographed open
+                    // ([`Phase::PortalOpen`]). A walk-through opens the door itself and takes the
+                    // same photograph once it is open (`WalkAction::Walk`).
+                    Some((_, _)) if portal_texture.is_some() && player.is_none() => {
+                        if let Some(entity) = tour.door {
+                            open_door.write(OpenDoor { door: entity });
+                        }
+                        tour.enter(Phase::PortalOpen);
+                    }
                     _ => start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors),
                 }
+            }
+        }
+        Phase::PortalOpen => {
+            let state = tour
+                .door
+                .and_then(|door| doors.get(door).ok())
+                .map(|(_, _, _, state, ..)| state.copied());
+            match state {
+                // Fully open, and the portal has had frames to draw the destination into its
+                // target: photograph it, and the doorway as the main camera shows it.
+                Some(Some(DoorState::Open { .. })) => tour.enter(Phase::PortalShot),
+                Some(_) if tour.timer < WALK_OPEN_SECONDS => {}
+                _ => {
+                    let line = format!(
+                        "stage {}: the door did not open within {WALK_OPEN_SECONDS:.0} s, so the portal view is not photographed",
+                        tour.stage
+                    );
+                    tour.note(line);
+                    start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
+                }
+            }
+        }
+        Phase::PortalShot => {
+            if tour.timer >= PORTAL_SHOT_SECONDS {
+                if let Some(portal) = &portal_texture {
+                    shoot_portal_view(&mut commands, &mut tour, portal);
+                }
+                let name = format!("{:02}-door-open", tour.stage);
+                shoot(&mut commands, &mut tour, &name);
+                // The crossing waits a second before it activates the door (`Phase::Activate`),
+                // so both photographs are of this side.
+                start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
             }
         }
         Phase::Bench(state) => {
@@ -1749,6 +1807,11 @@ fn run_demo_tour(
                             tour.stage, door.ref_id, tour.timer, WALK_STANDOFFS[tour.walk_standoff]
                         );
                         tour.note(line);
+                        // The door is fully open and the player has not moved yet: the portal
+                        // camera is drawing the destination, so photograph its target.
+                        if let Some(portal) = &portal_texture {
+                            shoot_portal_view(&mut commands, &mut tour, portal);
+                        }
                     }
                     keys.press(KeyCode::KeyW);
                 }
