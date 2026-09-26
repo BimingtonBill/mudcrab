@@ -8,6 +8,7 @@ pub mod door_animation;
 pub mod door_layer;
 pub mod doors;
 pub mod effect_palette;
+pub mod eye_adjust;
 pub mod field_notes;
 pub mod graphics_panel;
 pub mod graphics_settings;

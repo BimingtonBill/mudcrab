@@ -552,6 +552,18 @@ impl Plugin for PortalPlugin {
         // camera renders one frame in `N` while a doorway stays in view ([`cadence`]). Always
         // added, so the panel can change it live; at the default of every frame it never skips.
         app.add_plugins(cadence::PortalCadencePlugin);
+        // The eye adjusts on crossing (`crate::eye_adjust`, docs/design/door-layer.md note 05): the
+        // target rises toward full resolution as the player nears the doorway - measured after
+        // this frame's doorway is placed and before the target is sized - and the new space comes
+        // into focus after a crossing.
+        app.add_plugins(crate::eye_adjust::EyeAdjustPlugin)
+            .add_systems(
+                Update,
+                crate::eye_adjust::track_portal_approach
+                    .in_set(PortalFrame)
+                    .after(update_portal)
+                    .before(resize_portal_target),
+            );
         // One log line per doorway opened: the frame times and the pipelines created over the
         // frames after it ([`measure_portal_opens`]). The counts are read in the render world.
         let counts = PipelineCounts::default();
@@ -2163,10 +2175,15 @@ fn resize_portal_target(
     mut targets: Query<&mut RenderTarget, With<PortalCamera>>,
     quad: Query<&MeshMaterial3d<PortalMaterial>, With<PortalQuad>>,
     settings: Option<Res<crate::graphics_settings::GraphicsSettings>>,
+    approach: Option<Res<crate::eye_adjust::PortalApproach>>,
 ) {
     // `--portal-scale` / the graphics panel's knob, read every frame so a live change resizes the
-    // target on the next one.
-    let scale = settings.map_or(1.0, |settings| settings.portal_scale);
+    // target on the next one; raised toward full resolution as the player nears the doorway
+    // (`crate::eye_adjust`), which writes the effective scale from the setting each frame.
+    let scale = approach.map_or_else(
+        || settings.map_or(1.0, |settings| settings.portal_scale),
+        |approach| approach.scale,
+    );
     // The doorway's own rectangle when [`update_portal`] has measured one this run, and the main
     // camera's whole view until it has.
     let rect = state.and_then(|state| state.render_rect);
