@@ -21,6 +21,7 @@ use crate::{
     },
 };
 use bevy::{
+    animation::AnimationTargetId,
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::primitives::MeshAabb,
     ecs::system::SystemParam,
@@ -1415,7 +1416,9 @@ type RenderPrimitiveQuery<'world, 'state> = Query<
 >;
 
 /// A spawned model's hierarchy nodes as the strict bounds check reads them. `Billboard` marks the
-/// camera-facing nodes, whose authored rotation stands in for their camera-dependent one.
+/// camera-facing nodes, whose authored rotation stands in for their camera-dependent one;
+/// [`AuthoredPose`] marks the nodes a clip can move, whose spawn-time transform stands in for
+/// wherever the clip has put them.
 type SpawnedNodeQuery<'world, 'state> = Query<
     'world,
     'state,
@@ -1423,8 +1426,39 @@ type SpawnedNodeQuery<'world, 'state> = Query<
         &'static Transform,
         &'static GlobalTransform,
         Option<&'static crate::billboard::Billboard>,
+        Option<&'static AuthoredPose>,
     ),
 >;
+
+/// A node's local transform as its model authored it, recorded when the model's scene spawns, on
+/// the nodes an animation clip can move.
+///
+/// The strict bounds check compares a spawned model with the bounds the converter computed from the
+/// authored NIF, at rest. A model's clips move its nodes - the mill wheel turns
+/// (`model_animation.rs`, started at a per-reference phase), a door swings (`door_animation.rs`) -
+/// and the check runs a frame or more after the scene spawns, by which time a clip may already have
+/// posed them: the Riverwood wheel then measured 92 units lower than converted, and a Whiterun
+/// shack door a few degrees open, and both were rejected and never drawn. The glTF loader tags
+/// every node under an animation root with an [`AnimationTargetId`], and nothing can animate a node
+/// before the scene is ready, so the transform read at [`WorldInstanceReady`] is the authored one.
+/// A model with no clips carries no target ids, gets no `AuthoredPose`, and is measured exactly as
+/// it spawned: the check on static models is unchanged.
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct AuthoredPose(pub Transform);
+
+/// Records an [`AuthoredPose`] on every node under `root` that an animation clip can target.
+fn record_authored_poses(
+    commands: &mut Commands,
+    root: Entity,
+    children: &Query<&Children>,
+    animated: &Query<&Transform, With<AnimationTargetId>>,
+) {
+    for node in children.iter_descendants(root) {
+        if let Ok(transform) = animated.get(node) {
+            commands.entity(node).try_insert(AuthoredPose(*transform));
+        }
+    }
+}
 
 /// Every streamed cell root, in either tier: a full cell ([`StreamedCellRoot`]) or one of the
 /// ring's terrain-only cells ([`DistantTerrainRoot`]). Both carry the cell they draw, so the
@@ -1452,10 +1486,15 @@ type PendingAssetQuery<'world, 'state> = Query<
 
 fn mark_world_instance_ready(
     ready: On<WorldInstanceReady>,
+    mut commands: Commands,
     mut pending: Query<&mut PendingAssetProfile>,
+    children: Query<&Children>,
+    animated: Query<&Transform, With<AnimationTargetId>>,
 ) {
     if let Ok(mut pending) = pending.get_mut(ready.entity) {
         pending.scene_spawned = true;
+        // Before any clip has run: the strict check measures animated nodes here.
+        record_authored_poses(&mut commands, ready.entity, &children, &animated);
     }
 }
 
@@ -2009,13 +2048,18 @@ fn spawned_relative_bounds(
         stack.extend(root_children.iter().map(|child| (child, Mat4::IDENTITY)));
     }
     while let Some((descendant, relative)) = stack.pop() {
-        let (local, global, billboard) = transforms
+        let (local, global, billboard, authored) = transforms
             .get(descendant)
             .map_err(|_| format!("hierarchy node {descendant:?} has no local/global transform"))?;
         validate_transform(&format!("hierarchy node {descendant:?}"), local, global)?;
-        // A billboard node (a hearth's flame cards) turns toward the camera; the converter's
-        // bounds hold it at its authored rotation, so measure it there (`billboard.rs`).
-        let local = &crate::billboard::authored_transform(local, billboard);
+        // The converter's bounds hold the model at rest. A node a clip moves (the mill wheel, a
+        // door leaf) is measured at the pose recorded when its scene spawned ([`AuthoredPose`]);
+        // a billboard node (a hearth's flame cards) turns toward the camera, so it is measured at
+        // its authored rotation (`billboard.rs`).
+        let local = &match authored {
+            Some(AuthoredPose(pose)) => *pose,
+            None => crate::billboard::authored_transform(local, billboard),
+        };
         nodes += 1;
         let relative = relative * local.to_matrix();
         if let Ok(grandchildren) = children.get(descendant) {
@@ -5905,6 +5949,88 @@ mod tests {
         assert!(
             reason.contains("spawned hierarchy bounds diverge from conversion"),
             "{reason}"
+        );
+    }
+
+    /// The bounds check on a model whose mesh node a clip has moved after its scene spawned, as
+    /// `model_animation.rs` turns the mill wheel. `animated` tags the node as a clip target
+    /// ([`AnimationTargetId`], as the glTF loader does under an animation root); `authored_shift`
+    /// displaces the node before its pose is recorded, which is a model whose authored hierarchy
+    /// genuinely disagrees with the converted bounds.
+    fn animated_node_case(
+        animated: bool,
+        authored_shift: Vec3,
+    ) -> Result<TransformValidationSummary, String> {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut app = App::new();
+        let mut meshes = Assets::<Mesh>::default();
+        let mesh = meshes.add(Cuboid::new(2.0, 4.0, 6.0));
+        app.insert_resource(meshes);
+        let (root, _) = spawn_bounds_fixture(
+            app.world_mut(),
+            Transform::default(),
+            scene_node(),
+            rotated_mesh_node(),
+            authored_shift,
+            mesh,
+        );
+        let world = app.world_mut();
+        let node = world
+            .query_filtered::<Entity, With<Mesh3d>>()
+            .single(world)
+            .expect("the fixture has one mesh node");
+        if animated {
+            world
+                .entity_mut(node)
+                .insert(AnimationTargetId::from_name(&Name::new(
+                    "L1_SawWaterWheelHub",
+                )));
+        }
+        // What the scene-ready observer does, before any clip has run.
+        world
+            .run_system_once(
+                move |mut commands: Commands,
+                      children: Query<&Children>,
+                      animated: Query<&Transform, With<AnimationTargetId>>| {
+                    record_authored_poses(&mut commands, root, &children, &animated);
+                },
+            )
+            .expect("recording the authored poses runs");
+        // The clip turns the node about its hub, as the wheel's Idle clip does.
+        let mut transform = world.get_mut::<Transform>(node).unwrap();
+        transform.rotation = Quat::from_rotation_x(1.9) * transform.rotation;
+        app.init_resource::<BoundsOutcome>()
+            .add_systems(Update, run_bounds_check);
+        app.update();
+        app.world_mut()
+            .remove_resource::<BoundsOutcome>()
+            .expect("the bounds check system ran")
+            .check
+            .expect("the bounds check ran")
+    }
+
+    #[test]
+    fn bounds_check_measures_an_animated_node_at_its_authored_pose() {
+        let turned_by_its_clip = animated_node_case(true, Vec3::ZERO);
+        assert!(
+            turned_by_its_clip.is_ok(),
+            "a clip target turned after spawn must pass: {turned_by_its_clip:?}"
+        );
+    }
+
+    #[test]
+    fn bounds_check_still_rejects_a_moved_static_node_and_a_wrong_authored_pose() {
+        let static_turned = animated_node_case(false, Vec3::ZERO)
+            .expect_err("the same turn on a node no clip targets is a real divergence");
+        assert!(
+            static_turned.contains("spawned hierarchy bounds diverge from conversion"),
+            "{static_turned}"
+        );
+        let wrong_at_rest = animated_node_case(true, Vec3::new(0.0, 0.5, 0.0))
+            .expect_err("an animated model whose authored pose disagrees with conversion fails");
+        assert!(
+            wrong_at_rest.contains("spawned hierarchy bounds diverge from conversion"),
+            "{wrong_at_rest}"
         );
     }
 
