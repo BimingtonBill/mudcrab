@@ -561,6 +561,12 @@ impl Plugin for PortalPlugin {
         {
             app.add_plugins(depth_composite::DepthCompositePlugin);
         }
+        // `--portal-every N`: the portal camera renders one frame in `N` while a doorway stays in
+        // view ([`cadence`]). Opt-in, for timing; not added at the default of every frame.
+        let every = app.world().resource::<EngineConfig>().portal.portal_every;
+        if every > 1 {
+            app.add_plugins(cadence::PortalCadencePlugin { every });
+        }
         // One log line per doorway opened: the frame times and the pipelines created over the
         // frames after it ([`measure_portal_opens`]). The counts are read in the render world.
         let counts = PipelineCounts::default();
@@ -4391,6 +4397,310 @@ fn skip_occluded_doorway(
                 "back in view"
             }
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The portal's cadence (`--portal-every N`)
+// ---------------------------------------------------------------------------------------------
+
+/// `--portal-every N`: the portal camera renders one frame in `N` while a doorway stays in view,
+/// and the doorway shows the last image it rendered on the frames between. Opt-in, for timing what
+/// the portal's own render-thread work costs; `N = 1` (the default) does not add this plugin at all.
+///
+/// # Why not `Camera::is_active`
+///
+/// The obvious skip - `is_active = false` on the frames between - tears the view down in the render
+/// world every time, and the next rendered frame rebuilds it from nothing, which costs more than a
+/// skipped frame saves:
+///
+/// * `bevy_render-0.19.0/src/camera.rs` `extract_cameras` removes `ExtractedCamera`,
+///   `ExtractedView` and `RenderVisibleEntities` from an inactive camera's render entity, so the
+///   next active frame starts from an empty visible set and every visible mesh is "added";
+/// * `bevy_core_pipeline-0.19.0/src/core_3d/mod.rs` `extract_core_3d_camera_phases` skips an
+///   inactive camera and then `retain`s only live views, dropping the view's retained
+///   opaque/alpha-mask/transparent bins;
+/// * `bevy_pbr-0.19.0/src/material.rs` `specialize_material_meshes` (and `prepass/mod.rs`'s twin)
+///   `retain` their per-view `SpecializedMaterialPipelineCache` to the live views, so every mesh of
+///   the destination is specialized and queued again the frame the camera comes back.
+///
+/// That teardown is what the off-screen and occluded-doorway skips already pay, once per
+/// transition; paid every other frame it would be the cost of a newly opened doorway on every
+/// frame the portal does render.
+///
+/// # The skip: the camera's render schedule, not its extraction
+///
+/// The camera stays active, so extraction, specialization, queuing and the per-view prepare keep
+/// their retained state and do only their usual incremental work. What is skipped is the camera's
+/// render schedule: `bevy_core_pipeline-0.19.0/src/schedule.rs` `camera_driver` runs one `Core3d`
+/// schedule per entry of `SortedCameras`, so the portal camera's entry is taken out of that list
+/// on a skipped frame ([`drop_skipped_portal_view`], after `sort_cameras` and `prepare_lights` -
+/// `bevy_pbr-0.19.0/src/render/light.rs` iterates `SortedCameras` - and before `render_system`).
+/// Everything the portal camera's `Core3d` schedule encodes goes with it: the GPU mesh
+/// preprocessing and indirect-parameter dispatches for its view, the shadow passes of its cascades
+/// (`per_view_shadow_pass`, in `Core3d` in `bevy_pbr-0.19.0/src/lib.rs`), its depth prepass, main
+/// passes, the post-processing into the portal target and the depth composite's copy. The target
+/// image and the composite's depth image are persistent assets, so they keep the last frame's
+/// contents; the view's cached textures are still requested by the prepare systems every frame,
+/// so the texture cache does not drop them.
+///
+/// Not saved: extraction, specialization, queuing, sorting, batching and the per-view prepare of
+/// the portal view still run each frame.
+///
+/// # The rule ([`PortalCadence::step`])
+///
+/// A frame renders when the portal camera is showing a doorway it did not show last frame (the
+/// camera was off, or it is another door), when the target was replaced (a resized target is a
+/// new, never-drawn image), or when `N - 1` frames have been skipped in a row. So the first frame
+/// of a doorway is never a stale or black image.
+///
+/// # What the skip looks like
+///
+/// On a skipped frame the doorway quad, the doorway rectangle and the composite's clip matrix are
+/// this frame's, and the image is last frame's: the destination is drawn as seen from last frame's
+/// eye, mapped onto this frame's doorway. A player standing still sees nothing; a moving one sees
+/// the destination lag the doorway by one frame (a parallax error of the eye's movement over one
+/// frame), and the destination's own animation (flames, a turning wheel) runs at 1/N the rate.
+/// That lag is what a measured saving is weighed against.
+pub(crate) mod cadence {
+    use super::{
+        PortalCamera, PortalState, PortalTexture, resize_portal_target, skip_occluded_doorway,
+    };
+    use crate::config::EngineConfig;
+    use bevy::{
+        prelude::*,
+        render::{
+            Extract, ExtractSchedule, Render, RenderApp, RenderSystems, camera::SortedCameras,
+            renderer::render_system, sync_world::RenderEntity,
+        },
+    };
+
+    /// What the portal camera showed on a frame: the door it looked through and the target image
+    /// it rendered into. `None` while the camera is off.
+    pub(crate) type Shown = Option<(Entity, AssetId<Image>)>;
+
+    /// The portal camera's frame-by-frame cadence under `--portal-every`: whether it renders this
+    /// frame, and what it showed last frame. Main world; the render world reads
+    /// [`skips_this_frame`](Self::skips_this_frame) at extraction.
+    #[derive(Resource, Debug, Default)]
+    pub(crate) struct PortalCadence {
+        /// Render one frame in this many while a doorway stays in view; `0` and `1` both mean every
+        /// frame.
+        pub(crate) every: u32,
+        /// What the camera showed last frame.
+        last: Shown,
+        /// Frames skipped in a row since the camera last rendered.
+        since_render: u32,
+        /// Whether the camera is showing a doorway this frame and does not render it.
+        skip: bool,
+        /// Frames rendered and skipped since the doorway came into view, for the log line when it
+        /// goes out.
+        rendered: u64,
+        skipped: u64,
+    }
+
+    impl PortalCadence {
+        pub(crate) fn new(every: u32) -> Self {
+            Self {
+                every,
+                ..Self::default()
+            }
+        }
+
+        /// Decides this frame from what the camera shows (`None` while it is off) and returns
+        /// whether the camera renders. A doorway the camera did not show last frame - the camera
+        /// was off, it is another door, or the target image was replaced - always renders; one it
+        /// keeps showing renders once every [`every`](Self::every) frames.
+        pub(crate) fn step(&mut self, shown: Shown) -> bool {
+            let every = self.every.max(1);
+            let continuing = shown.is_some() && shown == self.last;
+            self.last = shown;
+            if shown.is_none() {
+                self.since_render = 0;
+                self.skip = false;
+                return false;
+            }
+            let render = !continuing || self.since_render + 1 >= every;
+            if render {
+                self.since_render = 0;
+                self.rendered += 1;
+            } else {
+                self.since_render += 1;
+                self.skipped += 1;
+            }
+            self.skip = !render;
+            render
+        }
+
+        /// Whether the portal camera is active this frame and its render schedule is skipped.
+        pub(crate) fn skips_this_frame(&self) -> bool {
+            self.skip
+        }
+    }
+
+    /// Adds the cadence when `--portal-every` asks for more than every frame.
+    pub(crate) struct PortalCadencePlugin {
+        pub(crate) every: u32,
+    }
+
+    impl Plugin for PortalCadencePlugin {
+        fn build(&self, app: &mut App) {
+            info!(
+                every = self.every,
+                "portal: the portal camera renders one frame in {} while a doorway stays in view",
+                self.every
+            );
+            app.insert_resource(PortalCadence::new(self.every))
+                // After both systems that switch the camera off and after the target is resized,
+                // so this frame's `is_active` and target are final.
+                .add_systems(
+                    Update,
+                    pace_portal_camera
+                        .after(skip_occluded_doorway)
+                        .after(resize_portal_target),
+                );
+            if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+                render_app
+                    .init_resource::<SkippedPortalView>()
+                    .add_systems(ExtractSchedule, extract_portal_skip)
+                    .add_systems(
+                        Render,
+                        drop_skipped_portal_view
+                            .in_set(RenderSystems::Render)
+                            .before(render_system),
+                    );
+            }
+        }
+    }
+
+    /// Steps the cadence for this frame.
+    fn pace_portal_camera(
+        mut cadence: ResMut<PortalCadence>,
+        state: Option<Res<PortalState>>,
+        texture: Option<Res<PortalTexture>>,
+        camera: Query<&Camera, With<PortalCamera>>,
+        config: Option<Res<EngineConfig>>,
+    ) {
+        if let Some(config) = config {
+            cadence.every = config.portal.portal_every;
+        }
+        let shown = match (camera.single(), state, texture) {
+            (Ok(camera), Some(state), Some(texture)) if camera.is_active => {
+                state.open_door.map(|door| (door, texture.0.id()))
+            }
+            _ => None,
+        };
+        let was_shown = cadence.last.is_some();
+        cadence.step(shown);
+        if was_shown && shown.is_none() {
+            info!(
+                rendered = cadence.rendered,
+                skipped = cadence.skipped,
+                every = cadence.every,
+                "portal: doorway out of view; frames the portal camera rendered and skipped"
+            );
+            cadence.rendered = 0;
+            cadence.skipped = 0;
+        }
+    }
+
+    /// The render entity of the portal camera when its render schedule is skipped this frame.
+    #[derive(Resource, Default)]
+    struct SkippedPortalView(Option<Entity>);
+
+    fn extract_portal_skip(
+        mut skipped: ResMut<SkippedPortalView>,
+        cadence: Extract<Option<Res<PortalCadence>>>,
+        camera: Extract<Query<RenderEntity, With<PortalCamera>>>,
+    ) {
+        skipped.0 = cadence
+            .as_ref()
+            .is_some_and(|cadence| cadence.skips_this_frame())
+            .then(|| camera.single().ok())
+            .flatten();
+    }
+
+    /// Takes the skipped portal camera out of the list `camera_driver` runs render schedules for.
+    fn drop_skipped_portal_view(
+        skipped: Res<SkippedPortalView>,
+        mut sorted: ResMut<SortedCameras>,
+    ) {
+        if let Some(entity) = skipped.0 {
+            sorted.0.retain(|camera| camera.entity != entity);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn door(index: u32) -> Entity {
+            Entity::from_raw_u32(index).unwrap()
+        }
+
+        fn target(index: u128) -> AssetId<Image> {
+            AssetId::Uuid {
+                uuid: bevy::asset::uuid::Uuid::from_u128(index),
+            }
+        }
+
+        #[test]
+        fn a_newly_shown_doorway_renders_its_first_frame() {
+            for every in [1, 2, 3, 8] {
+                let mut cadence = PortalCadence::new(every);
+                assert!(!cadence.step(None));
+                assert!(
+                    cadence.step(Some((door(1), target(1)))),
+                    "first frame of a doorway at every={every}"
+                );
+                assert!(!cadence.skips_this_frame());
+                // Out of view and back: the first frame back renders too.
+                cadence.step(None);
+                assert!(!cadence.skips_this_frame(), "nothing to skip while off");
+                assert!(cadence.step(Some((door(1), target(1)))));
+            }
+        }
+
+        #[test]
+        fn every_one_never_skips() {
+            for every in [0, 1] {
+                let mut cadence = PortalCadence::new(every);
+                for _ in 0..10 {
+                    assert!(cadence.step(Some((door(1), target(1)))));
+                    assert!(!cadence.skips_this_frame());
+                }
+            }
+        }
+
+        #[test]
+        fn every_two_alternates_while_the_doorway_stays_in_view() {
+            let mut cadence = PortalCadence::new(2);
+            let shown = Some((door(1), target(1)));
+            let frames: Vec<bool> = (0..6).map(|_| cadence.step(shown)).collect();
+            assert_eq!(frames, [true, false, true, false, true, false]);
+            assert!(cadence.skips_this_frame());
+        }
+
+        #[test]
+        fn every_three_renders_one_frame_in_three() {
+            let mut cadence = PortalCadence::new(3);
+            let shown = Some((door(1), target(1)));
+            let frames: Vec<bool> = (0..7).map(|_| cadence.step(shown)).collect();
+            assert_eq!(frames, [true, false, false, true, false, false, true]);
+        }
+
+        #[test]
+        fn another_door_or_a_new_target_renders_at_once() {
+            let mut cadence = PortalCadence::new(4);
+            assert!(cadence.step(Some((door(1), target(1)))));
+            assert!(!cadence.step(Some((door(1), target(1)))));
+            // Another door: its destination is not in the image.
+            assert!(cadence.step(Some((door(2), target(1)))));
+            assert!(!cadence.step(Some((door(2), target(1)))));
+            // A resized target is a new image nothing has been drawn into.
+            assert!(cadence.step(Some((door(2), target(2)))));
+            assert!(!cadence.skips_this_frame());
+        }
     }
 }
 
