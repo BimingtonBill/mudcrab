@@ -81,6 +81,21 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
 - Task queue for DeepSeek workers and how to run it: `tasks/deepseek/README.md`. Review `[deepseek]` commits and their handoff notes before building on them.
 - Before committing Rust changes, run what CI runs: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and the tests of the crates you touched.
 - Keep `docs/` current. Findings go in the docs (`docs/research/`, `docs/roadmap/`), not only in chat.
+- **Installed dev tools (2026-09-26):** `cargo nextest run` matches CI's test runner, so prefer it
+  locally; it still compiles, so the build rules above apply. For render bugs, capture a frame
+  before guessing from screenshots: RenderDoc (`C:\Program Files\RenderDoc\qrenderdoc.exe`, run the
+  engine with `WGPU_BACKEND=vulkan`, `--release`) or PIX (`C:\Program Files\Microsoft PIX\`, the
+  default DX12 backend). A capture is GPU work, so never during a claimed timing run. `rg` is
+  installed. Not installed on purpose: Tracy (the viewer must match Bevy 0.19's tracy-client
+  0.18.3), bevy_brp_mcp (needs RemotePlugin), cargo-insta, sccache/kache (the user's 09-23
+  decision). Background: `local/research/fun/dev-tools.md`.
+- **Every automated tool is as quick as possible while still useful** (the user, 2026-09-26,
+  project-wide: "we're looking for quick iteration"). No fixed cap: estimate a job's wall time from
+  its parts before running it (windows x states x places x variants x repeats, load, build), cut
+  what adds no information (short windows and repeats rather than long windows, variants already
+  measured, a build when the binary is current), and say the expected duration when starting it.
+  Benchmarks open their window on screen and centred; every automated run's window title says what
+  it is (`--run-label`).
 - **Non-measured engine builds use `cargo build --profile quick --bin engine`** (`target/quick/`):
   release without link-time optimisation, incremental. Defined in the untracked
   `C:\Modding\.cargo\config.toml`, so it never reaches upstream. Measured 2026-09-24: a one-file
