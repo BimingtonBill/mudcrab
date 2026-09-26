@@ -40,12 +40,10 @@ The #30 reply promised it. **Written 2026-09-25 night:** `phase2/prune-keeps-fai
 2. **reference-shots** (`--shots`, engine only, merges cleanly): ask first (issue or Discord) or
    send directly? Include an example shots file? Notes in `local/pr-drafts/reference-shots.md`.
 3. ~~Point lights~~ settled: sent as #39/#40/#41 (hold exception).
-4. **History paths:** lod-engine-trees and material-publication commits contain `C:/Modding/...`
-   paths (no names). Accept them, or rewrite before pushing to the fork.
-5. **public/portal** is 14+ commits behind portal and needs a re-export
-   (memory `public-fork-export`) before it is pushed again. Portal Dev recommends waiting for the
-   s23 bundle reconversion and tours, when the fire fix actually shows, and will say when. HEAD is
-   safe to publish now if the user wants it sooner.
+4. ~~History paths~~ decided 2026-09-26 (the user, 3a): when lod-engine-trees or material-publication is sent, send it as one fresh squashed commit (same tree, clean history); nothing existing is rewritten.
+5. ~~public/portal~~ decided 2026-09-26: the user said yes; Portal Dev re-exports it.
+
+**PUBLIC POSTS PAUSED (the user, 2026-09-26): "hold off on public github posts for now".** No comments, issues, PRs or bot replies on GitHub until the user lifts it. Held: the LOD issue (18), the reference-shots route decision. Pushing review fixes also waits unless the user OKs it.
 
 ## Staged branches, in send order
 
