@@ -97,7 +97,7 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 
 - **initially-disabled-refs** a47bde9 (held): references Skyrim starts disabled (flag 0x800) are recorded and not loaded; adds `references.flags`, which also enables the reflection follow-up (honour 0x10000000 Reflected By Auto Water: flagged references join the reflection's world layer; Phase 2 Dev will give the flagged count). Bumps the world DB 3 -> 4 too, so it goes **after #40**: when #40 merges, Phase 2 Dev merges main in and resolves to 5 everywhere (shared, db-schema.md, Compatibility line, test literals). The engine's exact version check refuses a database without the column.
 
-- **renderable-base-types** 41333e1: priority (Whiterun's water and 56% of WhiterunWorld's references have no mesh on main). NOT sent while the maintainer waits on #27 (a superset). A comment asking TaylorTurnerIT to split base types out is drafted (`local/pr-drafts/17-pr27-base-types.md`, the user's OK). Its LIGH arm overlaps #40 (one writer after a merge).
+- **renderable-base-types** 41333e1: priority (Whiterun's water and 56% of WhiterunWorld's references have no mesh on main). NOT sent while the maintainer waits on #27 (a superset). The user chose to **wait** (2026-09-26): no comment on #27, ours not sent; let #27 finish. Draft kept (`local/pr-drafts/17-pr27-base-types.md`) in case the user changes their mind. Its LIGH arm overlaps #40 (one writer after a merge).
 - **terrain-vclr-srgb** e4b6586: HOLD, no visible effect in renders; not sendable without evidence.
 
 ## Candidates with no branch yet
