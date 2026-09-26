@@ -1807,11 +1807,13 @@ fn restore_lost_swings(
 /// empties while the leaf is on its way home, and the cell is dropped once the state reaches
 /// [`DoorState::Closed`] - which is this system having closed the door and no longer holding it
 /// open.
+#[allow(clippy::too_many_arguments)]
 fn auto_close_doors(
     camera: Query<&Transform, With<StreamingCamera>>,
     doors: DoorAutoCloseQuery,
     streaming: Option<Res<StreamingWorld>>,
     drive: Res<FarDoorDrive>,
+    door_layer: Option<Res<crate::door_layer::DoorLayer>>,
     mut open: MessageWriter<OpenDoor>,
 ) {
     let Ok(camera) = camera.single() else {
@@ -1820,6 +1822,7 @@ fn auto_close_doors(
     let eye = camera.translation;
     let feet = feet_from_eye(eye);
     let streaming = streaming.as_deref();
+    let door_layer = door_layer.as_deref();
     for (entity, global, local, door, state, anchor, animation, instance_bounds, expected_bounds) in
         &doors
     {
@@ -1838,10 +1841,37 @@ fn auto_close_doors(
         // The far door of a doorway the player opened from the other side: it is open because its
         // near door is ([`drive_far_doors`]), and it closes with that door rather than on its own.
         // Its distance from the eye is a distance across two spaces, which says nothing.
-        if drive.holds_open(entity) {
+        if drive.holds_open(entity) || door_layer.is_some_and(|layer| layer.is_follower(entity)) {
             continue;
         }
-        if global.translation().distance_squared(eye) <= AUTO_CLOSE_DISTANCE.powi(2) {
+        // The two ends of a doorway are one door to the player: a door-layer pair
+        // (`crate::door_layer`), or a pair the far-door drive swings together. The door is near,
+        // and the player may be in its doorway, if either end is: after a crossing the player
+        // stands at the other end - and in the frame of the crossing itself the camera has already
+        // moved there while this door is still read at its old place - so measuring this end alone
+        // closed the doorway the player had just walked through (the tours' "far door not open
+        // after the player arrived", state `Closing`).
+        let partner = door_layer
+            .and_then(|layer| layer.pair_of(entity))
+            .and_then(|pair| {
+                if pair.driver == entity {
+                    pair.follower
+                } else {
+                    Some(pair.driver)
+                }
+            })
+            .or_else(|| drive.partner_of(entity));
+        let ends = std::iter::once((global, local, instance_bounds, expected_bounds)).chain(
+            partner.and_then(|partner| doors.get(partner).ok()).map(
+                |(_, global, local, _, _, _, _, instance_bounds, expected_bounds)| {
+                    (global, local, instance_bounds, expected_bounds)
+                },
+            ),
+        );
+        let ends: Vec<_> = ends.collect();
+        if ends.iter().any(|(global, ..)| {
+            global.translation().distance_squared(eye) <= AUTO_CLOSE_DISTANCE.powi(2)
+        }) {
             continue;
         }
         // The refusal `E` makes at a model with an `Open` clip and no `Close` one: `run_activation`
@@ -1859,10 +1889,15 @@ fn auto_close_doors(
         // And nobody may be standing in the doorway. The leaf turns solid again the moment the
         // state leaves `Open` (`mesh_is_out_of_the_way`, which the walk probe reads the same way),
         // so pulling it through the player would shut them into it - the same refusal `E` makes.
-        if in_the_doorway(global, local, instance_bounds, expected_bounds, feet) {
+        if ends
+            .iter()
+            .any(|(global, local, instance_bounds, expected_bounds)| {
+                in_the_doorway(global, local, *instance_bounds, *expected_bounds, feet)
+            })
+        {
             continue;
         }
-        debug!(
+        info!(
             door = format_args!("{:08X}", door.ref_id),
             distance = global.translation().distance(eye),
             destination = %door.label,
@@ -1946,11 +1981,19 @@ pub(crate) fn activate_doors(
     mut doors: DoorActivationQuery,
     mut pending: ResMut<PendingDoorOpens>,
     streaming: Option<Res<StreamingWorld>>,
+    door_layer: Option<Res<crate::door_layer::DoorLayer>>,
     mut players: Query<(&mut AnimationPlayer, Option<&mut AnimationTransitions>)>,
 ) {
     let streaming = streaming.as_deref();
     for request in requests.read() {
-        let Ok((entity, door, mut state, animation, anchor)) = doors.get_mut(request.door) else {
+        // A door on the door layer is the door-layer door, and its state is its driver's: `E` at
+        // the follower - the native on the player's side after a crossing - works the driver, and
+        // the far-door drive swings the follower with it (`crate::door_layer`).
+        let target = door_layer
+            .as_deref()
+            .and_then(|layer| layer.driver_of(request.door))
+            .unwrap_or(request.door);
+        let Ok((entity, door, mut state, animation, anchor)) = doors.get_mut(target) else {
             continue;
         };
         // An invisible `AutoLoadDoor01` marker has no leaf to open: `player_auto_doors` crosses it
@@ -2317,6 +2360,19 @@ impl FarDoorDrive {
             .iter()
             .any(|pair| pair.far == door && pair.near_open == Some(true))
     }
+
+    /// The other door of the pair `door` is in, if it is driven with one.
+    fn partner_of(&self, door: Entity) -> Option<Entity> {
+        self.pairs.iter().find_map(|pair| {
+            if pair.near == door {
+                Some(pair.far)
+            } else if pair.far == door {
+                Some(pair.near)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 /// One doorway's two doors, and what the drive last saw of the near one.
@@ -2329,6 +2385,9 @@ struct DrivenPair {
     /// nothing else, so a far door the player works with their own hands after a crossing is not
     /// fought over.
     near_open: Option<bool>,
+    /// Whether the pair is a door-layer pair (`crate::door_layer`): kept for as long as the layer
+    /// holds it rather than dropped when both doors are shut or the player crosses.
+    layered: bool,
 }
 
 /// What the far door of a pair is asked to do this frame.
@@ -2405,15 +2464,6 @@ fn close_far_door(
     }
 }
 
-/// Marks a load door whose own leaf is not drawn because the doorway's **canonical** leaf stands
-/// in for it (impl-234): the other end's leaf, carried through the door map into this door's room
-/// by `crate::portal`'s mirror. One leaf per doorway, drawn from both sides, so the leaf stands on
-/// the same jamb whichever side the player looks from. [`update_door_leaves`] hides the leaf nodes
-/// of a door carrying it; its frame stays drawn. `crate::portal::place_door_mirror` inserts and
-/// removes it.
-#[derive(Component, Debug, Clone, Copy, Default)]
-pub(crate) struct LeafShownByMirror;
-
 /// A load door as [`drive_far_doors`] reads and moves it: its state, its animation, and what
 /// [`in_the_doorway`] measures its doorway from.
 type DrivenDoorQuery<'world, 'state> = Query<
@@ -2445,7 +2495,7 @@ type DrivenDoorQuery<'world, 'state> = Query<
 /// auto-close make): that is the frame of a crossing, and the pair is dropped the frame after.
 fn drive_far_doors(
     portal: Option<Res<crate::portal::PortalState>>,
-    room_leaves: Option<Res<crate::portal::RoomLeafPairs>>,
+    door_layer: Option<Res<crate::door_layer::DoorLayer>>,
     parents: Query<&ChildOf>,
     camera: Query<&Transform, With<StreamingCamera>>,
     mut drive: ResMut<FarDoorDrive>,
@@ -2453,7 +2503,35 @@ fn drive_far_doors(
     mut players: Query<(&mut AnimationPlayer, Option<&mut AnimationTransitions>)>,
 ) {
     let portal = portal.as_deref();
+    let door_layer = door_layer.as_deref();
+    // A pair on the door layer is driven by its driver for as long as it is on the layer, whatever
+    // the portal draws through: the door-layer door is posed from the driver alone, so the
+    // follower's state - which the crossing, the walk probe and the portal read on the player's side
+    // after a crossing - has to be the driver's too (`crate::door_layer`).
+    let layered: Vec<(Entity, Entity)> = door_layer
+        .map(|layer| layer.driven_pairs().collect())
+        .unwrap_or_default();
+    for &(near, far) in &layered {
+        if !drive
+            .pairs
+            .iter()
+            .any(|pair| pair.near == near && pair.far == far)
+        {
+            drive.pairs.retain(|pair| {
+                pair.near != near && pair.near != far && pair.far != near && pair.far != far
+            });
+            drive.pairs.push(DrivenPair {
+                near,
+                far,
+                near_open: None,
+                layered: true,
+            });
+        }
+    }
+    let on_layer = |door: Entity| door_layer.is_some_and(|layer| layer.pair_of(door).is_some());
     if let Some((near, far)) = portal.and_then(crate::portal::PortalState::drawn_door_pair)
+        && !on_layer(near)
+        && !on_layer(far)
         && !drive
             .pairs
             .iter()
@@ -2468,30 +2546,8 @@ fn drive_far_doors(
             near,
             far,
             near_open: None,
+            layered: false,
         });
-    }
-    // The doorways whose room-side leaf is the canonical door's mirror (impl-237): the room door is
-    // the near door, and the canonical door - whose animation poses the mirror - swings with it, so
-    // the leaf the player sees in the room opens and closes when `E` or the auto-close moves the
-    // room door, whether or not the portal is drawing through it. Taken while the room door is
-    // moving or open and not already in a pair; dropped as every pair is, when both are closed.
-    for &(room, canonical) in room_leaves.iter().flat_map(|pairs| pairs.0.iter()) {
-        if drive.pairs.iter().any(|pair| {
-            [pair.near, pair.far].contains(&room) || [pair.near, pair.far].contains(&canonical)
-        }) {
-            continue;
-        }
-        if doors
-            .get(room)
-            .is_ok_and(|(_, state, ..)| *state != DoorState::Closed)
-            && doors.contains(canonical)
-        {
-            drive.pairs.push(DrivenPair {
-                near: room,
-                far: canonical,
-                near_open: None,
-            });
-        }
     }
 
     let feet = camera
@@ -2511,11 +2567,18 @@ fn drive_far_doors(
         let Ok((_, far_state, ..)) = doors.get(pair.far) else {
             return false;
         };
-        if near_state == DoorState::Closed && *far_state == DoorState::Closed {
-            return false;
-        }
-        if portal.is_some_and(|portal| !portal.is_in_active_space(pair.near, &parents)) {
-            return false;
+        if pair.layered {
+            // Kept while the door layer holds the pair, in every state and across a crossing.
+            if !layered.contains(&(pair.near, pair.far)) {
+                return false;
+            }
+        } else {
+            if near_state == DoorState::Closed && *far_state == DoorState::Closed {
+                return false;
+            }
+            if portal.is_some_and(|portal| !portal.is_in_active_space(pair.near, &parents)) {
+                return false;
+            }
         }
         let Some(follow) = far_door_follow(pair.near_open, near_state, near_fraction) else {
             return true;
@@ -2605,21 +2668,20 @@ fn advance_door_states(
 /// `portal::show_load_door_leaves`). Writing only on a change keeps the visibility hierarchy from
 /// being recomputed for every leaf every frame.
 fn update_door_leaves(
-    doors: Query<(&DoorState, Option<&DoorAnimation>, Has<LeafShownByMirror>)>,
+    doors: Query<(&DoorState, Option<&DoorAnimation>)>,
     held: Query<(), With<CrossingHeld>>,
     mut leaves: Query<(&DoorLeaf, &mut Visibility)>,
 ) {
     for (leaf, mut visibility) in &mut leaves {
-        let Ok((state, animation, shown_elsewhere)) = doors.get(leaf.door) else {
+        let Ok((state, animation)) = doors.get(leaf.door) else {
             // The door is gone (its cell unloaded): its leaves are going with it.
             continue;
         };
-        let wanted =
-            if !shown_elsewhere && leaves_are_drawn(*state, animation, held.contains(leaf.door)) {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
+        let wanted = if leaves_are_drawn(*state, animation, held.contains(leaf.door)) {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
         if *visibility != wanted {
             *visibility = wanted;
         }
@@ -6426,6 +6488,52 @@ mod tests {
         );
     }
 
+    /// A pair on the door layer is one door: `E` at the follower - the door on the player's side
+    /// after a crossing - works the driver, whose clips pose the door-layer door, and the follower
+    /// swings with it; the pair is held through a close, so the next `E` works it again
+    /// (`crate::door_layer`).
+    #[test]
+    fn e_at_a_door_layer_follower_works_its_driver_and_the_follower_follows() {
+        let mut app = door_app();
+        let driver = animated_door(&mut app);
+        let follower = spawn_far_animated_door(&mut app, driver.door);
+        app.insert_resource(crate::door_layer::DoorLayer::holding_for_test(&[(
+            driver.door,
+            follower.door,
+        )]));
+        activate(&mut app, follower.door);
+        step(&mut app, 1);
+        assert_eq!(
+            state(&app, driver.door),
+            DoorState::Opening,
+            "the driver opens"
+        );
+        assert_eq!(
+            state(&app, follower.door),
+            DoorState::Opening,
+            "and the follower with it"
+        );
+        step(&mut app, 12);
+        assert_eq!(state(&app, driver.door), DoorState::Open { animated: true });
+        assert_eq!(
+            state(&app, follower.door),
+            DoorState::Open { animated: true }
+        );
+
+        activate(&mut app, follower.door);
+        step(&mut app, 12);
+        assert_eq!(state(&app, driver.door), DoorState::Closed);
+        assert_eq!(state(&app, follower.door), DoorState::Closed);
+        assert_eq!(
+            app.world().resource::<FarDoorDrive>().pairs.len(),
+            1,
+            "a door-layer pair is held while the layer holds it"
+        );
+        activate(&mut app, follower.door);
+        step(&mut app, 1);
+        assert_eq!(state(&app, follower.door), DoorState::Opening);
+    }
+
     /// A far door the player works with their own hands is theirs: the drive acts on a change of
     /// the near door and on nothing else, so it does not open again a far door closed under an
     /// open near door (the player crossed and shut the door behind them).
@@ -6447,28 +6555,5 @@ mod tests {
             DoorState::Closed,
             "the far door stays shut"
         );
-    }
-
-    /// A door whose leaf the doorway's canonical leaf stands in for ([`LeafShownByMirror`]) draws
-    /// no leaf of its own, swinging or settled, and draws it again the frame the mark goes.
-    #[test]
-    fn a_door_whose_leaf_is_shown_by_the_mirror_draws_none_of_its_own() {
-        let mut app = door_app();
-        let door = animated_door(&mut app);
-        app.world_mut()
-            .entity_mut(door.door)
-            .insert(LeafShownByMirror);
-        activate(&mut app, door.door);
-        step(&mut app, 2);
-        assert_eq!(state(&app, door.door), DoorState::Opening);
-        assert_eq!(leaf_visibility(&app, door.leaf), Visibility::Hidden);
-        step(&mut app, 12);
-        assert_eq!(leaf_visibility(&app, door.leaf), Visibility::Hidden);
-
-        app.world_mut()
-            .entity_mut(door.door)
-            .remove::<LeafShownByMirror>();
-        step(&mut app, 1);
-        assert_eq!(leaf_visibility(&app, door.leaf), Visibility::Inherited);
     }
 }

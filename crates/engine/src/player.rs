@@ -989,6 +989,7 @@ pub(crate) fn player_walk(
     mut ray_cast: MeshRayCast,
     water: Query<(), With<WaterSurface>>,
     quad: Query<(), With<PortalQuad>>,
+    door_copies: Query<(), With<crate::door_layer::DoorCopyPart>>,
     portal: Option<Res<PortalState>>,
     parents: Query<&ChildOf>,
     leaves: Query<&DoorLeaf>,
@@ -1005,6 +1006,9 @@ pub(crate) fn player_walk(
         let skip = |entity: Entity| {
             water.get(entity).is_ok()
                 || quad.get(entity).is_ok()
+                // The door layer's drawing of a door (`crate::door_layer`): the native it stands
+                // in for is still there, hidden from the cameras, and is what the player meets.
+                || door_copies.contains(entity)
                 || mesh_is_out_of_the_way(entity, &parents, &leaves, &states)
                 || !in_active_space(portal.as_deref(), entity, &parents)
         };
