@@ -124,6 +124,12 @@ fn load_directional_snow_catalog(
 pub struct StreamingWorld {
     generation: u64,
     cells: HashMap<CellKey, CellStatus>,
+    /// Exterior cells whose full request failed, while they stay planned. The plan asks for them
+    /// as terrain-only instead, wherever they are: a cell the camera stands in whose references
+    /// failed still has a landscape to draw, and asking for it in full again would fail again (the
+    /// data does not change) and drop that landscape every time. Forgotten when the cell leaves
+    /// the plan, so a cell the camera comes back to is asked for in full once more.
+    full_failed: HashSet<CellKey>,
 }
 
 impl StreamingWorld {
@@ -145,13 +151,17 @@ impl StreamingWorld {
 
     /// Whether the request for `key` in full failed and will not be repeated: the cell is never
     /// going to become resident, so a caller waiting for it (a `--shots` pose) stops waiting.
+    ///
+    /// An exterior cell whose full request failed is drawn as terrain-only afterwards, so it is
+    /// failed by this test whatever its terrain-only status is.
     pub fn has_failed(&self, key: &CellKey) -> bool {
-        matches!(
-            self.cells.get(key),
-            Some(CellStatus::Failed {
-                detail: CellDetail::Full
-            })
-        )
+        self.full_failed.contains(key)
+            || matches!(
+                self.cells.get(key),
+                Some(CellStatus::Failed {
+                    detail: CellDetail::Full
+                })
+            )
     }
 }
 
@@ -488,6 +498,14 @@ fn plan_cells(
         &prestream,
     );
     for (key, detail) in wanted {
+        // A cell whose full request failed is not asked for in full again while it stays planned:
+        // its landscape is asked for instead, so a cell the camera stands in is never a hole in the
+        // ground because its references failed (see `fail_cell`).
+        let detail = if detail == CellDetail::Full && streaming.full_failed.contains(&key) {
+            CellDetail::Terrain
+        } else {
+            detail
+        };
         // What the cell is streamed as now, and the root that draws it.
         let (held, root) = match streaming.cells.get(&key) {
             None => (None, None),
@@ -581,6 +599,10 @@ fn plan_cells(
         }
         keep
     });
+    let StreamingWorld {
+        cells, full_failed, ..
+    } = &mut *streaming;
+    full_failed.retain(|key| cells.contains_key(key));
     metrics.resident_cells = streaming
         .cells
         .values()
@@ -889,6 +911,14 @@ fn collect_cells(
 /// what the cell claims to be - a full cell's references and lights were the reason for the
 /// request, and a cell that has left the ring must not keep them - and a root nothing tracks is
 /// exactly what the lifecycle check reports as orphaned.
+///
+/// A failed full request of an exterior cell is remembered in [`StreamingWorld::full_failed`]:
+/// the plan then asks for the cell's landscape on its own, through the ordinary terrain-only
+/// request and commit, so a cell the camera stands in whose full request failed is drawn again as
+/// terrain a few frames later instead of staying a hole until the camera leaves it. The terrain
+/// root it was upgrading from is not kept instead: its seam edges were unregistered when the
+/// answer arrived, and a fresh terrain-only commit registers and validates them the one way every
+/// other cell does.
 fn fail_cell(
     commands: &mut Commands,
     streaming: &mut StreamingWorld,
@@ -898,6 +928,9 @@ fn fail_cell(
 ) {
     if let Some(replaced) = replaced {
         commands.entity(replaced).try_despawn();
+    }
+    if detail == CellDetail::Full && matches!(key, CellKey::Exterior { .. }) {
+        streaming.full_failed.insert(key);
     }
     streaming.cells.insert(key, CellStatus::Failed { detail });
 }
@@ -4239,6 +4272,93 @@ mod tests {
             "the full request's failure is not counted as ring noise"
         );
         assert_eq!(metrics.asset_failures.len(), 1);
+    }
+
+    /// A cell whose upgrade to full fails while the camera stands in it is drawn as terrain again,
+    /// and is not asked for in full again: the failed request drops the terrain-only root it was
+    /// replacing, and the cell must not stay a hole in the ground until the camera leaves it
+    /// (audit finding ES-20260926-01), nor fail in full over and over.
+    #[test]
+    fn a_failed_full_upgrade_leaves_the_cell_drawn_as_terrain() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        // Without the reference table a full request fails and a terrain-only one does not: the
+        // terrain-only answer never reads it.
+        rusqlite::Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(r#"DROP TABLE "references";"#)
+            .unwrap();
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_terrain_cache(&cache_path, 1);
+        let mut app = terrain_streaming_app(&database_path, &cache_path);
+        let key = exterior_cell(2, -3);
+        let resident_terrain = |app: &App| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Resident {
+                    detail: CellDetail::Terrain,
+                    ..
+                })
+            )
+        };
+
+        // The camera starts one cell east, so the cell is in the ring and drawn as terrain.
+        let camera = app
+            .world_mut()
+            .spawn((Transform::from_xyz(CELL_SIZE, 0.0, 0.0), StreamingCamera))
+            .id();
+        run_until(&mut app, "the ring's terrain-only cell", resident_terrain);
+        assert!(!app.world().resource::<StreamingWorld>().has_failed(&key));
+        // The camera's own first cell is not in the database, and fails in full: counted from here.
+        let failed_before = app.world().resource::<StreamingMetrics>().failed_cells;
+
+        // The camera steps into the cell: it is asked for in full, and that request fails.
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation = Vec3::ZERO;
+        run_until(&mut app, "the full request's failure", |app| {
+            app.world().resource::<StreamingWorld>().has_failed(&key)
+        });
+        assert_eq!(
+            app.world().resource::<StreamingMetrics>().failed_cells,
+            failed_before + 1
+        );
+
+        // The landscape comes back as a terrain-only cell while the camera is still in it.
+        run_until(
+            &mut app,
+            "the cell's landscape drawn again",
+            resident_terrain,
+        );
+        assert_eq!(roots_of(&mut app, 1), 1, "the cell is drawn by one root");
+
+        // And it stays that way: the full request is not repeated.
+        let upgrades = app.world().resource::<StreamingMetrics>().cells_upgraded;
+        for _ in 0..40 {
+            app.update();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(resident_terrain(&app), "the cell is still drawn as terrain");
+        assert_eq!(roots_of(&mut app, 1), 1);
+        let streaming = app.world().resource::<StreamingWorld>();
+        assert!(
+            streaming.has_failed(&key),
+            "a caller waiting for the cell in full still learns it failed"
+        );
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(upgrades, 1, "one upgrade to full was asked for");
+        assert_eq!(
+            metrics.cells_upgraded, upgrades,
+            "the failed upgrade is not asked for again"
+        );
+        assert_eq!(
+            metrics.failed_cells,
+            failed_before + 1,
+            "and so it does not fail again"
+        );
     }
 
     /// The terrain-only request end to end: the planner asks for it, the worker answers it from the
