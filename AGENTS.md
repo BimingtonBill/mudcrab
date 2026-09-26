@@ -87,8 +87,11 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
   engine with `WGPU_BACKEND=vulkan`, `--release`) or PIX (`C:\Program Files\Microsoft PIX\`, the
   default DX12 backend). A capture is GPU work, so never during a claimed timing run. `rg` is
   installed. Not installed on purpose: Tracy (the viewer must match Bevy 0.19's tracy-client
-  0.18.3), bevy_brp_mcp (needs RemotePlugin), cargo-insta, sccache/kache (the user's 09-23
-  decision). Background: `local/research/fun/dev-tools.md`.
+  0.18.3), cargo-insta, sccache/kache (the user's 09-23 decision). Background:
+  `local/research/fun/dev-tools.md`. **bevy_brp_mcp 0.22.7** (Bevy 0.19) is installed and
+  registered as the user-scope MCP server `brp` (2026-09-26): sessions started after that see its
+  tools. It talks to an engine built with `--features remote` and run with `--remote` (127.0.0.1:15702;
+  branch `phase2/remote-dev-flag`, not yet on main or portal).
 - **Every automated tool is as quick as possible while still useful** (the user, 2026-09-26,
   project-wide: "we're looking for quick iteration"). No fixed cap: estimate a job's wall time from
   its parts before running it (windows x states x places x variants x repeats, load, build), cut
