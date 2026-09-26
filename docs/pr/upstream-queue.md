@@ -41,7 +41,7 @@ The #30 reply promised it. **Written 2026-09-25 night:** `phase2/prune-keeps-fai
    send directly? Include an example shots file? Notes in `local/pr-drafts/reference-shots.md`.
 3. ~~Point lights~~ settled: sent as #39/#40/#41 (hold exception).
 4. ~~History paths~~ decided 2026-09-26 (the user, 3a): when lod-engine-trees or material-publication is sent, send it as one fresh squashed commit (same tree, clean history); nothing existing is rewritten.
-5. ~~public/portal~~ decided 2026-09-26: the user said yes; Portal Dev re-exports it.
+5. ~~public/portal~~ done 2026-09-26: re-exported by Portal Dev with the user's direct yes; head ff96ac2 (portal ae25821).
 
 **POSTS TO UPSTREAM PAUSED (the user, 2026-09-26: "hold off on posts to realfakenerd's upstream").** No comments, issues, PRs or bot replies on realfakenerd/wah-krah-jol until the user lifts it. The user's own fork (e.g. public/portal) is not affected. Held: the LOD issue (18), the reference-shots route decision. Pushing review fixes also waits unless the user OKs it.
 
