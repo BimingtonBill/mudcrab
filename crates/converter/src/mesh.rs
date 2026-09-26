@@ -1678,7 +1678,9 @@ fn actor_root(path: &Path) -> Option<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_strategies::{arbitrary_bytes, config, corrupted};
     use project_wormhole_nif::model::all::{Model, StaticMesh, StaticSceneNode};
+    use proptest::prelude::*;
 
     /// A real, minimal `NifFile` with no `BSSubIndexTriShape` blocks: enough
     /// for tests that exercise `rewrite_materials_and_texture_uris` against a
@@ -1699,8 +1701,6 @@ mod tests {
         fs::write(&path, dummy_content::nif::static_shape(&shape).unwrap()).unwrap();
         open_nif_resilient(&path).unwrap().0
     }
-    use crate::test_strategies::{arbitrary_bytes, config, corrupted};
-    use proptest::prelude::*;
 
     #[test]
     fn rejects_invalid_nif_without_panicking() {
@@ -3118,6 +3118,8 @@ mod tests {
             model.static_meshes[0].colors[0].0.truncate(),
             Vec3::new(1.0, 0.5, 0.25)
         );
+    }
+
     fn static_nif() -> Vec<u8> {
         dummy_content::nif::static_shape(&dummy_content::nif::StaticShape {
             name: "PropertyQuad",
