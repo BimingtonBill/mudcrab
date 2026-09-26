@@ -129,6 +129,33 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-26 - Claude [portal] Portal Dev (portal cost, door leaf, flames, benches)
+
+**State:** portal HEAD c5cdad9. 637 engine lib tests pass; the full Riverwood tour passes 8/8. No workers running. The details are in `local/handover-2026-09-26-portal.md` and `local/team/2026-09-26.md`.
+
+**Landed today (the user affirmed the whole queue):**
+- impl-227: the doorway depth composite is the default.
+- 4daa459: suns cast shadows only while they give light. -1.24 ms looking through an open door, measured.
+- impl-231 through impl-239:
+  - the bevy preset's exposure;
+  - the tour's screenshot;
+  - light spill measured at the threshold (still opt-in);
+  - flames: palette clamp and soft fade;
+  - the door leaf: one canonical leaf per pair in every state;
+  - the doorway floor anchor is re-probed until stable;
+  - the door model double load (partial);
+  - billboard bounds validation;
+  - the live AA-switch crash (a Bevy stale motion-vector pipeline; `--graphics-cycle`).
+- Also: an FPS counter.
+
+**Bench:** `tools/bench/portal-bench.ps1`:
+- `-Variants 'a=','b=--flag' -Repeats 2`, interleaved, with spread, about 2.25 min a run;
+- render-thread columns from Phase 2's render_timing (fe5e794);
+- timing runs open centred, with `--run-label` titles;
+- **every automated tool as quick as possible** (the user's project-wide rule, above).
+
+**Next:** animated models rejected by bounds (the Riverwood mill wheel), Whiterun's double gate, frame rate toward 160 (the render thread is the limit), the user's project-plan §3 items.
+
 ### 2026-09-25 (midday) - Claude [phase2] Upstream Dev (sends, reviews, preview tool)
 
 **Role:** the user renamed this session **Upstream Dev**. It watches upstream and prepares and
