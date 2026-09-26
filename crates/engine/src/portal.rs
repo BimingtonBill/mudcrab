@@ -478,6 +478,8 @@ impl Plugin for PortalPlugin {
             // The quad reads PortalTexture, which the camera setup inserts through commands:
             // chaining adds the sync point that applies them in between.
             .add_systems(Startup, (setup_portal_camera, setup_portal_quad).chain())
+            // Each animated door's doorway, from its leaves, before the portal sizes a window by it.
+            .add_systems(Update, measure_leaf_openings.before(PortalFrame))
             .add_systems(
                 Update,
                 (
@@ -1256,6 +1258,7 @@ fn portal_quad_extents(
 ///
 /// One definition for the quad [`update_portal`] draws and the doorway it asks
 /// [`select_portal_door`] about, so the doorway the pick measures on screen is the one drawn.
+#[allow(clippy::too_many_arguments)]
 fn doorway_quad_transform(
     door_position: Vec3,
     door_rotation: Quat,
@@ -1264,6 +1267,7 @@ fn doorway_quad_transform(
     instance_bounds: Option<&InstanceBounds>,
     expected_bounds: Option<&ExpectedModelBounds>,
     anchor: Option<&DoorAnchor>,
+    leaves: Option<&LeafOpening>,
 ) -> Transform {
     let (size, centre) = portal_quad_extents(
         instance_bounds,
@@ -1271,6 +1275,13 @@ fn doorway_quad_transform(
         door_rotation,
         frame,
         scale,
+    );
+    let (size, centre) = narrowed_to_leaves(
+        size,
+        centre,
+        leaves
+            .and_then(|leaves| leaves.0)
+            .map(|(min, max)| doorway_in_frame(min * scale, max * scale, door_rotation, frame)),
     );
     let (size, centre) = anchor
         .and_then(|anchor| anchored_threshold(door_rotation, frame, scale, anchor))
@@ -1764,6 +1775,114 @@ pub(crate) fn measured_portal_extents(
 ) -> Option<(Vec2, Vec3)> {
     let (min, max) = measured_doorway_box(instance_bounds, expected_bounds, door_rotation, scale)?;
     Some((Vec2::new(max.x - min.x, max.y - min.y), (min + max) * 0.5))
+}
+
+/// The box a load door's leaves stand in when the door is closed, in the door's own unscaled model
+/// frame (the frame [`ExpectedModelBounds`] is in) - or `None` for a door whose leaves have no mesh
+/// to measure. Measured once per door by [`measure_leaf_openings`].
+///
+/// This is the doorway itself, where the model's own bounds may be much more: Whiterun's main gate,
+/// `WRDoorMainGate01`, carries its whole `GateHousing` - the posts and the carved panels either side
+/// of the gateway - in the same model as its two leaves, so its bounds are 643 units wide around a
+/// 424-unit opening. A window the width of the model drew the destination over the housing's side
+/// panels (the user's capture of 2026-09-26: the carved panel beside the gate "missing" once the
+/// gate opened, and a sliver of the destination's own gate standing in its place).
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LeafOpening(pub(crate) Option<(Vec3, Vec3)>);
+
+/// How much narrower than the model's doorway box its leaves have to be before the window is
+/// narrowed to them ([`narrowed_to_leaves`]): a share of the box's width. A door whose leaves fill
+/// its model - every house door, whose model is a leaf and a plug the leaf's size - keeps the box's
+/// window exactly as before; a model that carries a frame much wider than its opening does not.
+const LEAF_NARROWING_SHARE: f32 = 0.85;
+
+/// The doorway window's size and centre in the door's frame, narrowed across to the door's leaves
+/// when they are much narrower than the box it was measured from ([`LeafOpening`]). Only the width
+/// changes: the height, the depth and a threshold ([`quad_on_threshold`]) are the box's, so a door
+/// whose leaves are shorter than its arch still shows the whole arch's opening.
+///
+/// `leaves` is the leaves' own size and centre in the same frame ([`doorway_in_frame`]). The window
+/// is the part of the box the leaves span, never wider than the box.
+fn narrowed_to_leaves(size: Vec2, centre: Vec3, leaves: Option<(Vec2, Vec3)>) -> (Vec2, Vec3) {
+    let Some((leaf_size, leaf_centre)) = leaves else {
+        return (size, centre);
+    };
+    if !(leaf_size.x.is_finite() && leaf_centre.x.is_finite())
+        || leaf_size.x >= size.x * LEAF_NARROWING_SHARE
+    {
+        return (size, centre);
+    }
+    let low = (centre.x - size.x * 0.5).max(leaf_centre.x - leaf_size.x * 0.5);
+    let high = (centre.x + size.x * 0.5).min(leaf_centre.x + leaf_size.x * 0.5);
+    if high - low < MIN_PORTAL_SIZE {
+        return (size, centre);
+    }
+    (
+        Vec2::new(high - low, size.y),
+        Vec3::new((low + high) * 0.5, centre.y, centre.z),
+    )
+}
+
+/// The animated load doors [`measure_leaf_openings`] has not measured yet.
+type UnmeasuredDoorQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (Entity, &'static GlobalTransform, Option<&'static DoorState>),
+    (With<LoadDoor>, With<DoorAnimation>, Without<LeafOpening>),
+>;
+
+/// Measures each animated load door's [`LeafOpening`] once: the meshes under the nodes its clips
+/// move ([`DoorLeaf`]), in the door's own frame, while the door is closed and its leaves stand in
+/// the doorway.
+///
+/// Waits - measures nothing, and tries again next frame - while a leaf mesh has no [`Aabb`] yet
+/// (Bevy computes it after the mesh spawns), its leaves are not marked yet, or the door is not
+/// closed. A door whose leaves have no mesh at all is given an empty opening, so it is not walked
+/// again.
+fn measure_leaf_openings(
+    mut commands: Commands,
+    doors: UnmeasuredDoorQuery,
+    children: Query<&Children>,
+    leaves: Query<&DoorLeaf>,
+    meshes: Query<(&GlobalTransform, Option<&Aabb>), With<Mesh3d>>,
+) {
+    for (door, door_global, state) in &doors {
+        if !matches!(state, Some(DoorState::Closed)) {
+            continue;
+        }
+        let to_door = door_global.affine().inverse();
+        let mut low = Vec3::splat(f32::INFINITY);
+        let mut high = Vec3::splat(f32::NEG_INFINITY);
+        let mut waiting = false;
+        let leaf_nodes: Vec<Entity> = children
+            .iter_descendants(door)
+            .filter(|node| leaves.get(*node).is_ok_and(|leaf| leaf.door == door))
+            .collect();
+        // The leaves are marked through commands after the animation is attached: none marked yet
+        // is a door not ready to measure, not a door without leaves.
+        if leaf_nodes.is_empty() {
+            continue;
+        }
+        for node in leaf_nodes {
+            for mesh in std::iter::once(node).chain(children.iter_descendants(node)) {
+                let Ok((mesh_global, aabb)) = meshes.get(mesh) else {
+                    continue;
+                };
+                let Some(aabb) = aabb else {
+                    waiting = true;
+                    continue;
+                };
+                let (min, max) = world_box(aabb, &(to_door * mesh_global.affine()));
+                low = low.min(Vec3::from(min));
+                high = high.max(Vec3::from(max));
+            }
+        }
+        if waiting {
+            continue;
+        }
+        let measured = (low.is_finite() && high.is_finite()).then_some((low, high));
+        commands.entity(door).try_insert(LeafOpening(measured));
+    }
 }
 
 /// Whether the portal draws its window through a door in this state: `Opening`, `Open` and
@@ -3538,6 +3657,7 @@ fn update_portal(
     parents: Query<&ChildOf>,
     mut portal_camera: PortalCameraQuery,
     mut quad: PortalQuadQuery,
+    leaf_openings: Query<&LeafOpening>,
     time: Option<Res<Time>>,
     mut shown: Local<Option<u32>>,
 ) {
@@ -3611,6 +3731,7 @@ fn update_portal(
             instance_bounds,
             expected_bounds,
             anchor,
+            leaf_openings.get(entity).ok(),
         );
         if let Some(window) = window {
             doorway_screen_rect(
@@ -3778,6 +3899,7 @@ fn update_portal(
         instance_bounds,
         expected_bounds,
         anchor,
+        leaf_openings.get(target).ok(),
     );
     // Published for the systems that dress the doorway (`crate::portal_spill`): read only.
     state.doorway = Some(OpenDoorway {
@@ -6965,8 +7087,16 @@ mod tests {
     fn an_anchored_quad_stands_on_the_threshold_the_camera_is_anchored_on() {
         let (position, rotation, scale, bounds, anchor) = threshold_door();
         let frame = rotation;
-        let boxed =
-            doorway_quad_transform(position, rotation, frame, scale, None, Some(&bounds), None);
+        let boxed = doorway_quad_transform(
+            position,
+            rotation,
+            frame,
+            scale,
+            None,
+            Some(&bounds),
+            None,
+            None,
+        );
         let anchored = doorway_quad_transform(
             position,
             rotation,
@@ -6975,6 +7105,7 @@ mod tests {
             None,
             Some(&bounds),
             Some(&anchor),
+            None,
         );
         let pivot = crate::transition::source_doorway_centre(position, rotation, scale, &anchor);
         let (bottom, top) = quad_bottom_and_top(&anchored);
@@ -7042,6 +7173,7 @@ mod tests {
                 None,
                 Some(&bounds),
                 Some(anchor),
+                None,
             );
             quad_bottom_and_top(&quad).0 - position.y
         };
@@ -7075,6 +7207,43 @@ mod tests {
         );
     }
 
+    /// A door model that carries a frame much wider than its leaves has a window the width of its
+    /// leaves ([`narrowed_to_leaves`]); a door whose leaf fills its model keeps the box's window.
+    #[test]
+    fn the_window_of_a_door_whose_model_is_wider_than_its_leaves_is_its_leaves() {
+        // Whiterun's main gate, as `WRDoorMainGate01`'s bounds give it: a 643-unit housing round
+        // two leaves 424 units across, both centred on the model.
+        let size = Vec2::new(643.7, 374.4);
+        let centre = Vec3::new(0.0, 101.0, -10.5);
+        let leaves = (Vec2::new(425.4, 373.0), Vec3::new(-0.2, 101.6, -1.9));
+        let (narrowed, narrowed_centre) = narrowed_to_leaves(size, centre, Some(leaves));
+        assert!(
+            (narrowed.x - 425.4).abs() < 1.0e-3,
+            "the window is the leaves' width: {narrowed}"
+        );
+        assert_eq!(narrowed.y, size.y, "and the box's height");
+        assert!((narrowed_centre.x - leaves.1.x).abs() < 1.0e-3);
+        assert_eq!(
+            (narrowed_centre.y, narrowed_centre.z),
+            (centre.y, centre.z),
+            "the box's height and depth are kept"
+        );
+
+        // A house door, whose leaf fills its model: nothing changes.
+        let size = Vec2::new(100.0, 180.0);
+        let leaf = (Vec2::new(92.0, 176.0), Vec3::new(1.0, 88.0, 0.0));
+        assert_eq!(narrowed_to_leaves(size, centre, Some(leaf)), (size, centre));
+        // No leaves measured, or leaves reaching past the box: the box, or the part of it they
+        // span, and never wider than the box.
+        assert_eq!(narrowed_to_leaves(size, centre, None), (size, centre));
+        let (offset, offset_centre) = narrowed_to_leaves(
+            Vec2::new(600.0, 300.0),
+            Vec3::ZERO,
+            Some((Vec2::new(400.0, 300.0), Vec3::new(200.0, 0.0, 0.0))),
+        );
+        assert!((offset.x - 300.0).abs() < 1.0e-3 && (offset_centre.x - 150.0).abs() < 1.0e-3);
+    }
+
     /// A door with no anchor, and one anchored on its box centre (the centre rule, which has no
     /// threshold to give), keep today's quad exactly: the box's.
     #[test]
@@ -7087,6 +7256,7 @@ mod tests {
             scale,
             None,
             Some(&bounds),
+            None,
             None,
         );
         let (size, centre) = portal_quad_extents(None, Some(&bounds), rotation, rotation, scale);
@@ -7105,6 +7275,7 @@ mod tests {
             None,
             Some(&bounds),
             Some(&anchor),
+            None,
         );
         assert_eq!(centred, boxed);
     }
