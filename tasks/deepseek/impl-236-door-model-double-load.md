@@ -28,15 +28,13 @@ Sometimes a closed door fills Sven's open doorway. It is Sven's own front door `
 - The short tour passes (`--demo riverwood --demo-tour <dir> --tour-doors 2`).
 
 ## Build and run rules
-- Build: `cargo build --profile quick --bin engine` with `CARGO_TARGET_DIR=D:/Modding-overflow/portal-quick-target` and `CARGO_BUILD_JOBS=6`.
-  - The target is shared with other portal coders, so cargo's lock runs one build at a time.
-  - Straight after each build, copy `engine.exe` to `local/t236/engine.exe` and run the copy.
-- Tests and clippy use `--target-dir D:/Modding-overflow/shared-check-target`.
+- Build: `cargo build --profile quick --bin engine` in your own worktree, with its own target (the harness sets it; never another folder's target) and `CARGO_BUILD_JOBS=6`. After each build, check that `quick/engine.d` names your worktree before you run the exe.
+- Tests use your worktree's target; the harness runs the acceptance commands.
 - Assets: `C:\Modding\SkyrimConverted`.
-- No timing or benchmark runs.
+- No timing or benchmark runs. If the lead messages HOLD, finish the command in hand and start no cargo or engine command until told to resume.
 
 ## Commits
-Subjects start `[claude] impl-236:`; trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. No amend, rebase or force-push.
+Do not commit; the lead integrates. Leave a handoff note in `docs/handoff/impl-236.md`.
 
 ## Report
 - Which handle rule you used, with Bevy citations;
