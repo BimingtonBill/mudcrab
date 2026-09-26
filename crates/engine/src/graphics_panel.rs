@@ -85,12 +85,13 @@ pub enum Knob {
     ContactShadows,
     PortalScale,
     PortalEvery,
+    EyeFocus,
 }
 
 impl Knob {
     /// Every knob, in the panel's order: the flags' own ([`graphics_settings::KNOBS`]) with the
     /// fixed EV100 and the tonemapper added where they belong.
-    pub const ALL: [Knob; 22] = [
+    pub const ALL: [Knob; 23] = [
         Knob::Aa,
         Knob::Ssao,
         Knob::SsaoRadius,
@@ -113,6 +114,7 @@ impl Knob {
         Knob::ContactShadows,
         Knob::PortalScale,
         Knob::PortalEvery,
+        Knob::EyeFocus,
     ];
 
     /// The knob's label: its flag's name, so the panel, the flags and the file read alike.
@@ -140,6 +142,7 @@ impl Knob {
             Knob::ContactShadows => "contact-shadows",
             Knob::PortalScale => "portal-scale",
             Knob::PortalEvery => "portal-every",
+            Knob::EyeFocus => "eye-focus",
         }
     }
 
@@ -170,6 +173,7 @@ impl Knob {
             Knob::ContactShadows => on_off(settings.contact_shadows).to_owned(),
             Knob::PortalScale => settings.portal_scale.to_string(),
             Knob::PortalEvery => settings.portal_every.to_string(),
+            Knob::EyeFocus => on_off(settings.eye_focus).to_owned(),
         }
     }
 
@@ -310,6 +314,7 @@ impl Knob {
             Knob::PortalScale => {
                 settings.portal_scale = step_number(settings.portal_scale, 0.05, 0.1, 1.0, up);
             }
+            Knob::EyeFocus => settings.eye_focus = !settings.eye_focus,
             Knob::PortalEvery => {
                 let every = settings.portal_every;
                 settings.portal_every = if up {
@@ -576,6 +581,7 @@ pub fn settings_file_text(settings: &GraphicsSettings) -> String {
         format!("contact_shadows = \"{}\"", on_off(settings.contact_shadows)),
         format!("portal_scale = {}", settings.portal_scale),
         format!("portal_every = {}", settings.portal_every),
+        format!("eye_focus = \"{}\"", on_off(settings.eye_focus)),
     ]);
     let mut text = lines.join("\n");
     text.push('\n');
@@ -784,7 +790,7 @@ mod tests {
         panel.move_selection(-1);
         assert_eq!(
             panel.selected_knob(),
-            Knob::PortalEvery,
+            Knob::EyeFocus,
             "wraps past the first"
         );
     }
