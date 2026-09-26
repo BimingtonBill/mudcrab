@@ -2148,6 +2148,21 @@ fn portal_target_size(main: UVec2, ceiling: UVec2) -> Option<UVec2> {
     Some(scaled.min(ceiling).as_uvec2())
 }
 
+/// The portal target's size for a rectangle `size` pixels big at the graphics settings' portal
+/// `scale` ([`crate::graphics_settings::scaled_portal_size`], which holds the scale to 0.1..=1),
+/// rounded to whole texels and then held to [`PORTAL_TEXTURE_MAX_SIZE`] by [`portal_target_size`].
+/// At scale 1 this is `portal_target_size` itself. `None` for a zero axis, as there.
+///
+/// The quad samples the target by its position in the rectangle (`portal.wgsl`), not by texel,
+/// so a smaller target is the same view at a lower resolution, filtered up.
+fn scaled_portal_target_size(size: UVec2, scale: f32) -> Option<UVec2> {
+    if size.x == 0 || size.y == 0 {
+        return None;
+    }
+    let scaled = crate::graphics_settings::scaled_portal_size(size.as_vec2(), scale).round();
+    portal_target_size(scaled.as_uvec2(), PORTAL_TEXTURE_MAX_SIZE)
+}
+
 /// Grows or shrinks the portal render target to the rectangle of the screen the doorway covers
 /// ([`PortalState::render_rect`]), so the doorway is drawn one texel per window pixel - the
 /// resolution of the room around it - and no larger than the doorway is.
@@ -2167,6 +2182,7 @@ fn portal_target_size(main: UVec2, ceiling: UVec2) -> Option<UVec2> {
 /// camera would otherwise render into the new texture while the doorway still sampled the old one.
 /// The rectangle the quad maps through ([`PortalExtension::doorway_rect`]) is written in that same
 /// frame too, and only when it changed.
+#[allow(clippy::too_many_arguments)]
 fn resize_portal_target(
     state: Option<Res<PortalState>>,
     mut images: ResMut<Assets<Image>>,
@@ -2175,19 +2191,24 @@ fn resize_portal_target(
     main: MainCameraTargetQuery,
     mut targets: Query<&mut RenderTarget, With<PortalCamera>>,
     quad: Query<&MeshMaterial3d<PortalMaterial>, With<PortalQuad>>,
+    settings: Option<Res<crate::graphics_settings::GraphicsSettings>>,
 ) {
+    // `--portal-scale` / the graphics panel's knob, read every frame so a live change resizes the
+    // target on the next one.
+    let scale = settings.map_or(1.0, |settings| settings.portal_scale);
     // The doorway's own rectangle when [`update_portal`] has measured one this run, and the main
     // camera's whole view until it has.
     let rect = state.and_then(|state| state.render_rect);
-    let size =
-        match rect {
-            Some(rect) => portal_target_size(rect.size(), PORTAL_TEXTURE_MAX_SIZE),
-            None => main.single().ok().and_then(|camera| {
-                camera.computed.target_info.as_ref().and_then(|info| {
-                    portal_target_size(info.physical_size, PORTAL_TEXTURE_MAX_SIZE)
-                })
-            }),
-        };
+    let size = match rect {
+        Some(rect) => scaled_portal_target_size(rect.size(), scale),
+        None => main.single().ok().and_then(|camera| {
+            camera
+                .computed
+                .target_info
+                .as_ref()
+                .and_then(|info| scaled_portal_target_size(info.physical_size, scale))
+        }),
+    };
     let resized = size
         .filter(|&size| images.get(&texture.0).map(Image::size) != Some(size))
         .map(|size| {
@@ -2199,6 +2220,7 @@ fn resize_portal_target(
             debug!(
                 width = size.x,
                 height = size.y,
+                scale,
                 "portal: render target resized to the doorway's rectangle"
             );
             image
@@ -7817,6 +7839,69 @@ mod tests {
         );
         assert_eq!(camera_target_of(&app, camera), target_image(&app));
         assert_eq!(quad_texture_of(&app, quad), target_image(&app));
+    }
+
+    /// `--portal-scale` sizes the target at that fraction of the rectangle, and a change of the
+    /// setting while running (the graphics panel's knob) resizes it on the next frame.
+    #[test]
+    fn the_portal_scale_setting_sizes_the_target_and_takes_effect_live() {
+        let (mut app, _, camera, quad, _) = resize_app(UVec2::new(1600, 900));
+        let mut settings = crate::graphics_settings::GraphicsSettings::bevy();
+        settings.portal_scale = 0.5;
+        app.insert_resource(settings);
+        update(&mut app, 1);
+        let half = target_image(&app);
+        assert_eq!(target_size_of(&app, &half), UVec2::new(800, 450));
+        assert_eq!(camera_target_of(&app, camera), half);
+        assert_eq!(quad_texture_of(&app, quad), half);
+
+        app.world_mut()
+            .resource_mut::<crate::graphics_settings::GraphicsSettings>()
+            .portal_scale = 1.0;
+        update(&mut app, 1);
+        let full = target_image(&app);
+        assert_ne!(full, half, "the live change is a new target");
+        assert_eq!(target_size_of(&app, &full), UVec2::new(1600, 900));
+        assert_eq!(quad_texture_of(&app, quad), full);
+    }
+
+    /// The scale math: 1 is the unscaled size, a fraction rounds to whole texels, a scale out of
+    /// range is held to 0.1..=1, the ceiling still applies, and a zero axis is still no size.
+    #[test]
+    fn the_scaled_target_size_rounds_clamps_and_keeps_the_ceiling() {
+        let rect = UVec2::new(301, 200);
+        assert_eq!(
+            scaled_portal_target_size(rect, 1.0),
+            portal_target_size(rect, PORTAL_TEXTURE_MAX_SIZE)
+        );
+        assert_eq!(
+            scaled_portal_target_size(rect, 0.5),
+            Some(UVec2::new(151, 100))
+        );
+        assert_eq!(
+            scaled_portal_target_size(rect, 4.0),
+            Some(rect),
+            "held to 1"
+        );
+        assert_eq!(
+            scaled_portal_target_size(rect, 0.0),
+            Some(UVec2::new(30, 20)),
+            "held to 0.1"
+        );
+        assert_eq!(
+            scaled_portal_target_size(UVec2::new(2, 2), 0.1),
+            Some(UVec2::ONE),
+            "at least a texel a side"
+        );
+        assert_eq!(
+            scaled_portal_target_size(UVec2::new(3840, 2160), 1.0),
+            Some(PORTAL_TEXTURE_MAX_SIZE)
+        );
+        assert_eq!(
+            scaled_portal_target_size(UVec2::new(3840, 2160), 0.5),
+            Some(UVec2::new(1920, 1080))
+        );
+        assert_eq!(scaled_portal_target_size(UVec2::new(0, 900), 0.5), None);
     }
 
     /// A window that is minimized has no size to follow - its target is 0x0 and a 0x0 texture is

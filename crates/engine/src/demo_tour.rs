@@ -104,7 +104,10 @@ use crate::{
 };
 use bevy::{
     prelude::*,
-    render::view::screenshot::{Screenshot, save_to_disk},
+    render::{
+        render_resource::{Extent3d, TextureDimension, TextureFormat},
+        view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk},
+    },
 };
 use std::{fmt::Write as _, path::PathBuf};
 
@@ -246,6 +249,10 @@ const WALK_THROUGH_SECONDS: f32 = 25.0;
 /// any door needs, and it fits inside [`WALK_THROUGH_SECONDS`], which the wait runs inside, so a
 /// door that never opens is named rather than walked at.
 const WALK_OPEN_SECONDS: f32 = 10.0;
+
+/// How long a door stands fully open before the tour photographs the portal's target: a few
+/// frames for the portal camera to be picked, activated and to draw the destination.
+const PORTAL_SHOT_SECONDS: f32 = 0.5;
 // The wait is the failure a door that never opens is named by, so it has to come before the
 // walk-through's own ceiling; a wait longer than that would never be reached.
 const _: () = assert!(WALK_OPEN_SECONDS < WALK_THROUGH_SECONDS);
@@ -331,6 +338,12 @@ enum Phase {
     /// `--tour-bench`: the closed state is timed and the door has been asked to open; wait for it
     /// to be fully open before timing it open.
     BenchOpen,
+    /// Scripted crossing with a portal: the door has been asked to open so the portal camera
+    /// renders through it; wait until it is fully open.
+    PortalOpen,
+    /// The door is open: after [`PORTAL_SHOT_SECONDS`], photograph the portal's target and the
+    /// open doorway, then cross.
+    PortalShot,
     /// Door photographed; activate it once the screenshot has been taken.
     Activate,
     /// Door activated; waiting for `DoorCrossed`.
@@ -648,6 +661,80 @@ fn shoot_path(commands: &mut Commands, tour: &mut DemoTour, path: PathBuf) {
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(path));
+}
+
+/// A 0..1 display value for one linear HDR channel: clamped, so the portal target's colours below
+/// white - everything the main tonemapper would also leave nearly as it is - are kept, and a
+/// highlight past white saturates rather than wrapping.
+fn hdr_channel_to_display(linear: f32) -> f32 {
+    if linear.is_finite() {
+        linear.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// An 8-bit sRGB copy of a captured image in any format `Image::get_color_at` reads - the portal
+/// target's `Rgba16Float` included, which Bevy's own `save_to_disk` refuses ("Cannot save
+/// screenshot", its `try_into_dynamic` has no half-float case). Each channel is clamped
+/// ([`hdr_channel_to_display`]) and encoded as sRGB, alpha opaque.
+fn hdr_to_srgb8(image: &Image) -> Image {
+    let size = image.size();
+    let mut data = Vec::with_capacity((size.x * size.y * 4) as usize);
+    for y in 0..size.y {
+        for x in 0..size.x {
+            let linear = image
+                .get_color_at(x, y)
+                .map(|color| color.to_linear())
+                .unwrap_or(LinearRgba::BLACK);
+            let display = LinearRgba::rgb(
+                hdr_channel_to_display(linear.red),
+                hdr_channel_to_display(linear.green),
+                hdr_channel_to_display(linear.blue),
+            );
+            let srgb = Srgba::from(display).to_u8_array();
+            data.extend_from_slice(&[srgb[0], srgb[1], srgb[2], 255]);
+        }
+    }
+    Image::new(
+        Extent3d {
+            width: size.x,
+            height: size.y,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        default(),
+    )
+}
+
+/// Bevy's `save_to_disk` for an HDR render target: the capture is converted to 8-bit sRGB first
+/// ([`hdr_to_srgb8`]) and then written as the path's format.
+fn save_hdr_to_disk(path: PathBuf) -> impl FnMut(On<ScreenshotCaptured>) {
+    move |captured| match hdr_to_srgb8(&captured.image).try_into_dynamic() {
+        Ok(image) => match image.to_rgb8().save(&path) {
+            Ok(()) => info!("Screenshot saved to {}", path.display()),
+            Err(error) => error!("Cannot save screenshot {}: {error}", path.display()),
+        },
+        Err(error) => error!("Cannot save screenshot {}: {error}", path.display()),
+    }
+}
+
+/// Photographs what the portal camera itself renders - the room beyond the open door - into
+/// `NN-portal-view.png`, from its HDR target ([`save_hdr_to_disk`]).
+fn shoot_portal_view(
+    commands: &mut Commands,
+    tour: &mut DemoTour,
+    portal: &crate::portal::PortalTexture,
+) {
+    let path = tour
+        .output_dir
+        .join(format!("{:02}-portal-view.png", tour.stage));
+    tour.note(format!("portal render target {}", path.display()));
+    commands
+        .spawn(Screenshot::image(portal.0.clone()))
+        .observe(save_hdr_to_disk(path));
 }
 
 fn shoot(commands: &mut Commands, tour: &mut DemoTour, name: &str) {
@@ -1360,17 +1447,6 @@ fn run_demo_tour(
             if tour.timer >= PRESTREAM_SECONDS {
                 let name = format!("{:02}-door", tour.stage);
                 shoot(&mut commands, &mut tour, &name);
-                // What the portal camera itself renders, independent of where the main camera
-                // stands: the room beyond this door, if the portal is showing it.
-                if let Some(portal) = &portal_texture {
-                    let path = tour
-                        .output_dir
-                        .join(format!("{:02}-portal-view.png", tour.stage));
-                    tour.note(format!("portal render target {}", path.display()));
-                    commands
-                        .spawn(Screenshot::image(portal.0.clone()))
-                        .observe(save_to_disk(path));
-                }
                 // A screenshot is taken on a later frame; crossing now would photograph the far side.
                 //
                 // `--tour-bench`: at an outside `E` door, time the doorway first - the bench's
@@ -1402,8 +1478,51 @@ fn run_demo_tour(
                         tour.note(line);
                         start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
                     }
+                    // What the portal camera itself renders: it renders only through a door that
+                    // is open ([`crate::portal`]), and a scripted crossing snaps through a closed
+                    // one, so the door is opened first and photographed open
+                    // ([`Phase::PortalOpen`]). A walk-through opens the door itself and takes the
+                    // same photograph once it is open (`WalkAction::Walk`).
+                    Some((_, _)) if portal_texture.is_some() && player.is_none() => {
+                        if let Some(entity) = tour.door {
+                            open_door.write(OpenDoor { door: entity });
+                        }
+                        tour.enter(Phase::PortalOpen);
+                    }
                     _ => start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors),
                 }
+            }
+        }
+        Phase::PortalOpen => {
+            let state = tour
+                .door
+                .and_then(|door| doors.get(door).ok())
+                .map(|(_, _, _, state, ..)| state.copied());
+            match state {
+                // Fully open, and the portal has had frames to draw the destination into its
+                // target: photograph it, and the doorway as the main camera shows it.
+                Some(Some(DoorState::Open { .. })) => tour.enter(Phase::PortalShot),
+                Some(_) if tour.timer < WALK_OPEN_SECONDS => {}
+                _ => {
+                    let line = format!(
+                        "stage {}: the door did not open within {WALK_OPEN_SECONDS:.0} s, so the portal view is not photographed",
+                        tour.stage
+                    );
+                    tour.note(line);
+                    start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
+                }
+            }
+        }
+        Phase::PortalShot => {
+            if tour.timer >= PORTAL_SHOT_SECONDS {
+                if let Some(portal) = &portal_texture {
+                    shoot_portal_view(&mut commands, &mut tour, portal);
+                }
+                let name = format!("{:02}-door-open", tour.stage);
+                shoot(&mut commands, &mut tour, &name);
+                // The crossing waits a second before it activates the door (`Phase::Activate`),
+                // so both photographs are of this side.
+                start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
             }
         }
         Phase::Bench(state) => {
@@ -1688,6 +1807,11 @@ fn run_demo_tour(
                             tour.stage, door.ref_id, tour.timer, WALK_STANDOFFS[tour.walk_standoff]
                         );
                         tour.note(line);
+                        // The door is fully open and the player has not moved yet: the portal
+                        // camera is drawing the destination, so photograph its target.
+                        if let Some(portal) = &portal_texture {
+                            shoot_portal_view(&mut commands, &mut tour, portal);
+                        }
                     }
                     keys.press(KeyCode::KeyW);
                 }
@@ -2290,6 +2414,39 @@ mod tests {
             None,
             "with no render origin there is no grid to name, which the settle reads as not resident"
         );
+    }
+
+    /// The portal target's HDR capture becomes an 8-bit sRGB image Bevy can write: values under
+    /// white are encoded as sRGB, a highlight past white is clamped, and a NaN is black.
+    #[test]
+    fn an_hdr_capture_is_converted_to_srgb8_for_saving() {
+        let mut hdr = Image::new_fill(
+            Extent3d {
+                width: 3,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0; 8],
+            TextureFormat::Rgba16Float,
+            default(),
+        );
+        hdr.set_color_at(0, 0, Color::linear_rgba(0.214, 0.0, 1.0, 1.0))
+            .unwrap();
+        hdr.set_color_at(1, 0, Color::linear_rgba(8.0, 40.0, 0.5, 1.0))
+            .unwrap();
+        hdr.set_color_at(2, 0, Color::linear_rgba(f32::NAN, -1.0, 0.0, 1.0))
+            .unwrap();
+        let out = hdr_to_srgb8(&hdr);
+        assert_eq!(out.texture_descriptor.format, TextureFormat::Rgba8UnormSrgb);
+        assert_eq!(out.size(), UVec2::new(3, 1));
+        let data = out.data.as_ref().unwrap();
+        // Linear 0.214 is sRGB ~0.5 (127 or 128).
+        assert!((127..=128).contains(&data[0]), "{}", data[0]);
+        assert_eq!(&data[1..4], &[0, 255, 255]);
+        assert_eq!(&data[4..6], &[255, 255], "past white clamps");
+        assert_eq!(&data[8..12], &[0, 0, 0, 255], "NaN and negatives are black");
+        assert!(out.try_into_dynamic().is_ok(), "a format Bevy can save");
     }
 
     #[test]

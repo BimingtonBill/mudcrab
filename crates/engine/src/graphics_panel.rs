@@ -184,7 +184,6 @@ impl Knob {
                 "  (auto only)"
             }
             Knob::BloomIntensity if !settings.bloom => "  (bloom off)",
-            Knob::PortalScale => "  (not applied yet)",
             _ => "",
         }
     }
