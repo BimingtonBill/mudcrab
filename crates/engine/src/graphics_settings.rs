@@ -101,7 +101,7 @@ pub const UNITS_PER_METRE: f32 = 70.0;
 
 /// Every per-knob flag, as `--<name> <value>`, and the file key it shares (dashes or
 /// underscores).
-pub const KNOBS: [&str; 20] = [
+pub const KNOBS: [&str; 21] = [
     "aa",
     "ssao",
     "ssao-radius",
@@ -122,6 +122,7 @@ pub const KNOBS: [&str; 20] = [
     "contact-shadows",
     "portal-scale",
     "portal-every",
+    "eye-focus",
 ];
 
 /// Whether `name` (a flag without its `--`) is one of the [`KNOBS`].
@@ -318,6 +319,11 @@ pub struct GraphicsSettings {
     /// change from the graphics panel takes effect on the next frame; held to
     /// 1..=[`MAX_PORTAL_EVERY`].
     pub portal_every: u32,
+    /// After a crossing through a doorway the portal drew below full resolution, the new space
+    /// comes into focus over about half a second, like an eye adjusting (`crate::eye_adjust`).
+    /// Nil at an effective portal scale of 1. Read when a crossing happens, so a change from the
+    /// graphics panel applies to the next crossing.
+    pub eye_focus: bool,
 }
 
 /// The most frames [`GraphicsSettings::portal_every`] spreads the portal's redraw over.
@@ -363,6 +369,7 @@ impl GraphicsSettings {
             contact_shadows: false,
             portal_scale: 1.0,
             portal_every: 1,
+            eye_focus: true,
         }
     }
 
@@ -506,6 +513,7 @@ impl GraphicsSettings {
                 }
                 self.portal_every = every;
             }
+            "eye-focus" => self.eye_focus = switch(value).map_err(|e| bad(&e))?,
             "tonemapper" => self.tonemapper = crate::tonemapper::parse(value)?,
             _ => {
                 return Err(format!(
@@ -557,7 +565,7 @@ impl GraphicsSettings {
         format!(
             "graphics: preset={} aa={:?} ssao={ssao} exposure={exposure} tonemapper={} \
              bloom={bloom} shadows={}px x{} to {distance} filter={:?} contact_shadows={} \
-             portal_scale={} portal_every={}",
+             portal_scale={} portal_every={} eye_focus={}",
             self.preset.name(),
             self.aa,
             crate::tonemapper::name_of(self.tonemapper),
@@ -567,6 +575,7 @@ impl GraphicsSettings {
             self.contact_shadows,
             self.portal_scale,
             self.portal_every,
+            self.eye_focus,
         )
         .replace("aa=Off", "aa=off")
         .replace("aa=Fxaa", "aa=fxaa")
@@ -1439,7 +1448,7 @@ mod tests {
         assert!(settings.contact_shadows);
         assert_eq!(settings.portal_scale, 0.5);
         assert_eq!(settings.portal_every, 2);
-        assert_eq!(KNOBS.len(), 20);
+        assert_eq!(KNOBS.len(), 21);
 
         for (key, value, says) in [
             ("aa", "msaa", "fxaa"),
