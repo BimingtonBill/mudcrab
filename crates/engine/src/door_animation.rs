@@ -1354,6 +1354,14 @@ type SwingFactors = HashMap<AnimationTargetId, f32>;
 /// "this type of door doesn't open the whole way"). 54 of the 90 door models in the install with
 /// two or more hinged leaves turn them by different amounts.
 ///
+/// **The leaves of one door open together.** [`MAX_SWING_SCALE`] caps how far one leaf's own
+/// twitch is blown up, but a double door's leaves are one door: the leaf the cap lets reach the
+/// furthest says how far this model's door opens ([`double_door_target`]), and every other leaf is
+/// scaled to stand there too, past the cap if it has to. Whiterun's main gate, `WRDoorMainGate01`,
+/// turns its leaves 5.0 and 2.2 degrees: capped leaf by leaf, the second stood at 44 degrees,
+/// square across half the gateway (the user's capture of 2026-09-26, "the door doesn't open all the
+/// way"). A single leaf is still capped: nothing else in the model says how far it opens.
+///
 /// Empty - nothing scaled - when the clip already opens the doorway: its widest leaf clears it, and
 /// a door whose own swing is a doorway is never touched. Nodes mounted on a leaf are not in
 /// `hinged` ([`hinged_leaves`]) and so are never scaled: they turn with their leaf already.
@@ -1361,10 +1369,35 @@ fn swing_factors(clip: &AnimationClip, hinged: &HashSet<AnimationTargetId>) -> S
     if swing_degrees(clip, hinged) >= DOORWAY_CLEAR_DEGREES {
         return SwingFactors::new();
     }
-    hinged
+    let swings: Vec<(AnimationTargetId, f32)> = hinged
         .iter()
-        .filter_map(|target| Some((*target, swing_scale(node_swing_degrees(clip, *target)?))))
+        .filter_map(|target| Some((*target, node_swing_degrees(clip, *target)?)))
+        .collect();
+    let target = double_door_target(swings.iter().map(|(_, degrees)| *degrees));
+    swings
+        .into_iter()
+        .map(|(leaf, degrees)| {
+            let factor = match target {
+                // A leaf that turns at all is scaled to where its door's widest-reaching leaf
+                // stands; `swing_scale` keeps what it says for a leaf with nothing to scale.
+                Some(target) if swing_scale(degrees) > 1.0 => target / degrees,
+                _ => swing_scale(degrees),
+            };
+            (leaf, factor)
+        })
         .collect()
+}
+
+/// Where every leaf of a door with two or more turning leaves is stood by [`swing_factors`]: as far
+/// as the cap lets the widest-turning leaf go, which is [`SWUNG_OPEN_DEGREES`] for any door whose
+/// widest leaf turns at least a twentieth of that. `None` for a door with fewer than two leaves
+/// that turn at all - a single leaf keeps its own capped [`swing_scale`].
+fn double_door_target(swings: impl Iterator<Item = f32>) -> Option<f32> {
+    let reached: Vec<f32> = swings
+        .filter(|degrees| swing_scale(*degrees) > 1.0)
+        .map(|degrees| degrees * swing_scale(degrees))
+        .collect();
+    (reached.len() >= 2).then(|| reached.into_iter().fold(0.0_f32, f32::max))
 }
 
 /// How much a door leaf's own swing is scaled by, given how far its `Open` clip turns it.
@@ -5870,6 +5903,44 @@ mod tests {
             80.0,
         );
         assert!(swing_factors(&open, &HashSet::from([left, right])).is_empty());
+    }
+
+    /// A double door's leaves open together: Whiterun's main gate, `WRDoorMainGate01`, turns its
+    /// leaves 5.0 and 2.2 degrees, and the narrower leaf is scaled past the cap to stand where the
+    /// wider one does rather than stopping at 44 degrees across half the gateway. A single leaf is
+    /// still capped.
+    #[test]
+    fn a_double_door_s_leaves_open_together_past_the_cap() {
+        let wide = target_id(&[BASIS, "WRDoorMainGate01", "FrontGateDoor08"]);
+        let narrow = target_id(&[BASIS, "WRDoorMainGate01", "FrontGateDoor06"]);
+        let open = with_swing(
+            clip_swinging(CLIP_SECONDS, wide, 0.0, -5.0),
+            narrow,
+            0.0,
+            2.2,
+        );
+        let hinged = HashSet::from([wide, narrow]);
+        let factors = swing_factors(&open, &hinged);
+        assert!(
+            factors[&narrow] > MAX_SWING_SCALE,
+            "the narrow leaf goes past the cap: {factors:?}"
+        );
+        let (swung, _) =
+            swung_open_clips(Some(&open), None, &hinged, &factors).expect("two leaves");
+        for (name, leaf) in [("wide", wide), ("narrow", narrow)] {
+            let degrees = swung_from_rest(&swung, leaf, swung.duration());
+            assert!(
+                (degrees - SWUNG_OPEN_DEGREES).abs() < 0.5,
+                "the {name} leaf stands at {degrees} degrees, not {SWUNG_OPEN_DEGREES}"
+            );
+        }
+
+        // The door the leaves are scaled to is the one the cap lets the widest leaf reach: two
+        // leaves that barely move (2.9 and 2.0) both stand at the widest one's 58 degrees.
+        assert_eq!(double_door_target([2.9_f32, 2.0].into_iter()), Some(58.0));
+        // One leaf keeps its own capped scale; a leaf that turns nothing is not a leaf of the pair.
+        assert_eq!(double_door_target([2.9_f32].into_iter()), None);
+        assert_eq!(double_door_target([2.9_f32, 0.0].into_iter()), None);
     }
 
     /// A clip that already clears the doorway is never scaled - not up, and not down either - and
