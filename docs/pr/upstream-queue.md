@@ -36,14 +36,10 @@ The #30 reply promised it. **Written 2026-09-25 night:** `phase2/prune-keeps-fai
 
 ## Waiting on the user's decision
 
-1. **Discord "Chef"** asked whether you are looking into lighting. The user writes the reply; QnA's
-   talking points are in the handover. Fact to keep straight: point lights work on the fork, the
-   Skyrim falloff patch is off, and the look doesn't match Skyrim yet.
+1. ~~Discord "Chef"~~ settled: the user replied; Lucas said "let there be light".
 2. **reference-shots** (`--shots`, engine only, merges cleanly): ask first (issue or Discord) or
    send directly? Include an example shots file? Notes in `local/pr-drafts/reference-shots.md`.
-3. **Point lights**, a 3-PR plan (`local/pr-drafts/point-lights-plan.md`): ask in #24 first
-   (recommended) or go. The branches are not built yet: impl-572/573 are queued for when the
-   DeepSeek coders are released (~22:39). Also: a neutral documented brightness default (recommended) or a re-fit.
+3. ~~Point lights~~ settled: sent as #39/#40/#41 (hold exception).
 4. **History paths:** lod-engine-trees and material-publication commits contain `C:/Modding/...`
    paths (no names). Accept them, or rewrite before pushing to the fork.
 5. **public/portal** is 14+ commits behind portal and needs a re-export
@@ -73,7 +69,7 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 | after #27 | shared-converter-schema, renderable-base-types, material-publication, vertex-alpha-faithful, nif-billboard-nodes | one version number; trees/doors/objects get models; surface shine and see-through, heat haze, fire and effects, flame animation; flame cards | | clean | mixed | **each changes converter output and needs a schema bump**. Phase 2 Dev holds vertex-alpha-faithful ee0e6d7 (39c3497 + the BLEND-only fix), nif-billboard-nodes 11b2e2b+e3d30a6 and material-publication's 4546e6e/227da41 until then. vertex-alpha-faithful is also the user's call because it overlaps #27. Send one at a time, or bundle, so the schema numbers don't collide with #27's 15. material-publication also has a history-path hold (decision 4) |
 | discuss first | lod-mesh-containers, lod-database, lod-engine-terrain/objects/trees, tree-billboard-lighting (fd292df, on lod-engine-trees: distant trees shaded like vanilla DistantTree, pale band -> green; `local/gallery/phase2/distant-trees-before-after.jpg`) | Distant land, steps 1-4 | 3-31 | 4 of 5 CONFLICT with main | mixed | two-tracks says **an upstream issue before any code**. Too big to just send; needs a roadmap talk, and the conflicts resolved. lod-engine-trees has a history-path hold |
 | low | staging-hard-links, audit-converter, audit-engine, asset-precedence | reconversions reuse files without copying; audit fixes; mod file and archive order | 1-4 | clean | mixed | small; bundle later. staging-hard-links needs the #30/#31 combination first |
-| drop | vertex-alpha-not-opacity (superseded by vertex-alpha-faithful), refr-rotation (merged as #25) | | | | | do not send |
+| drop | vertex-alpha-not-opacity (superseded by vertex-alpha-faithful), refr-rotation (merged as #25); both archived as tags `archive/phase2/*` (also integration, integration-lod, integration-lod-shots, integration-shots, local-shots, render-check) | | | | | do not send |
 
 ## Unsent branches with a known dependency
 
