@@ -29,7 +29,7 @@ pub const OUTWARD_POINT_DISTANCE: f32 = 16.0;
 pub const OUTWARD_POINT_MAX_DISTANCE: f32 = 512.0;
 
 /// Where a load door leads, as converted from the source door's `XTEL` subrecord.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Reflect, Debug, Clone, PartialEq)]
 pub struct DoorDestination {
     /// The destination door reference (`XTEL` bytes 0..4, after plugin FormID remapping).
     pub destination_ref_id: u32,
@@ -47,7 +47,8 @@ pub struct DoorDestination {
 
 /// Marks a spawned reference as a load door. Lives on the reference's root entity, whose
 /// `GlobalTransform` is the door's placement in the render world.
-#[derive(Component, Debug, Clone, PartialEq)]
+#[derive(Component, Reflect, Debug, Clone, PartialEq)]
+#[reflect(Component)]
 pub struct LoadDoor {
     /// The door reference's own FormID.
     pub ref_id: u32,
@@ -598,7 +599,8 @@ pub const DOORWAY_CLEAR_DEGREES: f32 = 45.0;
 /// A load door is born [`Closed`](DoorState::Closed). An auto-load door - an invisible marker with
 /// no leaf - is born `Open { animated: false }` and never changes: crossing the player on contact
 /// is the whole of its behaviour.
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[reflect(Component)]
 pub enum DoorState {
     /// Nothing has opened this door: the leaf is drawn and solid. The model's rest pose is the pose
     /// its `Open` clip starts from, so this is also what a door that just streamed in looks like.
@@ -656,7 +658,8 @@ impl DoorState {
 /// [`Open`](DoorState::Open) door's clip did not swing clear. [`mesh_is_out_of_the_way`] is how the
 /// walk probe uses them: a leaf mid-swing is drawn, and it must not block the doorway or trap a
 /// player walking through a door that is still opening ([`crate::player`]'s ray-cast filter).
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
+#[reflect(Component)]
 pub struct DoorLeaf {
     /// The load door reference this leaf belongs to: the entity carrying [`LoadDoor`] and
     /// [`DoorState`].

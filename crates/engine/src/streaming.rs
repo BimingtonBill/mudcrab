@@ -161,7 +161,8 @@ impl StreamingWorld {
 ///
 /// Started from [`EngineConfig::worldspace_id`], so a run that never crosses a load door behaves
 /// exactly as it did before doors existed.
-#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Resource, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
+#[reflect(Resource)]
 pub struct ActiveCell {
     pub worldspace_id: u32,
     pub interior: Option<u32>,
@@ -232,7 +233,8 @@ impl PrestreamCells {
     }
 }
 
-#[derive(Resource, Debug, Clone, Default, Serialize)]
+#[derive(Resource, Reflect, Debug, Clone, Default, Serialize)]
+#[reflect(Resource)]
 pub struct StreamingMetrics {
     pub requests_submitted: u64,
     pub responses_received: u64,
@@ -317,7 +319,7 @@ pub struct StreamingMetrics {
     pub asset_failures: Vec<AssetFailure>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Reflect, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssetFailure {
     pub model_path: String,
     pub reference_form_id: u32,
@@ -453,7 +455,8 @@ enum CellStatus {
     },
 }
 
-#[derive(Resource, Debug, Clone, Copy)]
+#[derive(Resource, Reflect, Debug, Clone, Copy)]
+#[reflect(Resource)]
 pub struct RenderOrigin(pub IVec2);
 
 #[allow(clippy::too_many_arguments)]

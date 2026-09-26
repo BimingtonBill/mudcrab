@@ -24,6 +24,7 @@ pub mod portal_spill;
 pub mod pose_capture;
 pub mod prepass_vertex_alpha;
 pub mod profiling;
+pub mod remote;
 pub mod render;
 pub mod render_timing;
 pub mod shadow_layers;

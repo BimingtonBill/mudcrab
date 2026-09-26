@@ -3,6 +3,11 @@ name = "engine"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Serve the Bevy Remote Protocol on 127.0.0.1 when the engine runs with
+# `--remote`. Local development only: the endpoint has no authentication.
+remote = ["bevy/bevy_remote"]
+
 [dependencies]
 shared = { path = "../shared" }
 bevy.workspace = true

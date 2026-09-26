@@ -7,6 +7,7 @@ use crate::{
     metrics::AcceptanceMetricsPlugin,
     pose_capture::PoseCapturePlugin,
     profiling::{ProfilingPlugin, ProfilingState},
+    remote::{RemoteSettings, add_remote_plugins},
     render::{
         RendererMetrics, TerrainExtension, TerrainMaterial, VercidiumRendererPlugin,
         WaterExtension, WaterMaterial, WaterReflectionTexture,
@@ -55,6 +56,7 @@ use std::{
 struct InitialCameraGroundHeight(f32);
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
+    let remote = RemoteSettings::from_config(&config)?;
     configure_io_task_pool();
     // The graphics settings (--graphics, the knob flags, --tonemapper and the settings file): a
     // value that is not one is fatal first, with the valid ones, before anything is opened or
@@ -214,6 +216,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
         .add_plugins(VercidiumRendererPlugin)
         .add_systems(Update, capture_acceptance_screenshot);
+    add_remote_plugins(&mut app, remote);
     let demo_tour = app
         .world()
         .resource::<EngineConfig>()

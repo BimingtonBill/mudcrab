@@ -592,7 +592,8 @@ impl Plugin for PortalPlugin {
 /// The streaming side inserts this; without it the isolation falls back to matching a root's
 /// `CellRef` (interiors, which have unique cell ids) and its `ExteriorCellGrid` (exteriors, where
 /// the worldspace is not recoverable).
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
+#[reflect(Component)]
 pub struct StreamedCellKey(pub CellKey);
 
 /// The render target the portal camera draws into. Public so a tool can inspect it.
