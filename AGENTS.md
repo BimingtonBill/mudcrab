@@ -131,6 +131,37 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-26 - Claude [phase2] Phase 2 Dev (project audit and plan; acceptance baseline; parser, cache and BRP work)
+
+**The user's asks:** "audit and make project-wide plan for me to see" (the plan page:
+https://claude.ai/artifact/2HSP4u8EVcvXrjCpu9scSm), then "yes to all and go ahead with the plan".
+Done from the decisions: leftovers deleted (C: 66 -> 76 GB free), 8 stale branches kept as tags
+`archive/phase2/*` (integration, -lod, -lod-shots, -shots, local-shots, render-check,
+vertex-alpha-not-opacity, refr-rotation); `integration-night` is the one integration tree. Upstream
+posts to realfakenerd are paused by the user (the fork is free, except the 7 open-PR head branches).
+
+**Acceptance baseline on upstream main ddb6d70** (`C:/Modding/wkj-tools/acceptance-main-60s`,
+`stress-ab`): functionally clean (preflight, asset closure, runtime audit, 15 robustness tests, 11
+scenarios). On a quiet machine every scenario passes at 60 s (stress p95 ~12 ms); an earlier 18.4 ms
+"fail" was cargo builds running beside it, so **a timing booking holds cargo too**. Still missing for
+`accepted`: quality and release gates, 3 full-length reps (~3.4 h), a human visual sign-off. The
+script needs pwsh 7 (fixed below).
+
+**New local branches, reviewed, green, held** (Upstream Dev has the list):
+`parser-never-panic` (591328a VMAD 96 GiB abort fixed, a666ebc proptest never-panic properties, fb7f928
+bounded decompression), `scripts-utf8-bom` 232a286, `cell-cache-validate-once` ac91f54 (cell_commit
+2.86 -> 0.37 ms), `remote-dev-flag` f8a5c03 (BRP behind feature `remote` + `--remote`, 127.0.0.1).
+Tools: `C:/Modding/wkj-tools/flip_shots.py` (FLIP before/after of `--shots`; same-build noise <= 0.0054,
+threshold 0.02; animated models such as the mill wheel need animation frozen in `--shots`),
+`stress_ab.py`. All written by Claude subagents (impl-593..597, analysis-596) and reviewed by Claude.
+
+**Running:** Claude impl-597, shadowless second sun for the reflection view
+(`phase2/reflection-shadowless-sun`, worktree `C:/Modding/wkj-p2-refsun`), then its timing A/B.
+Worktrees to discard when done: `wkj-p2-proptest`, `wkj-p2-brp` (+ `wkj-p2-brp-target`),
+`wkj-p2-refsun` (+ target). **Next:** cheaper crossing frames (spread despawns, rebase without
+unloads), the 8 standing audits on one day's DeepSeek budget, `--shots` animation freeze, bevy_brp_mcp
+(needs the user's install and MCP config).
+
 ### 2026-09-26 - Claude [portal] Portal Dev (portal cost, door leaf, flames, benches)
 
 **State:** portal HEAD c5cdad9. 637 engine lib tests pass; the full Riverwood tour passes 8/8. No workers running. The details are in `local/handover-2026-09-26-portal.md` and `local/team/2026-09-26.md`.
