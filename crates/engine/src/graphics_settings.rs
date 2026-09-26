@@ -101,7 +101,7 @@ pub const UNITS_PER_METRE: f32 = 70.0;
 
 /// Every per-knob flag, as `--<name> <value>`, and the file key it shares (dashes or
 /// underscores).
-pub const KNOBS: [&str; 19] = [
+pub const KNOBS: [&str; 20] = [
     "aa",
     "ssao",
     "ssao-radius",
@@ -121,6 +121,7 @@ pub const KNOBS: [&str; 19] = [
     "shadow-filter",
     "contact-shadows",
     "portal-scale",
+    "portal-every",
 ];
 
 /// Whether `name` (a flag without its `--`) is one of the [`KNOBS`].
@@ -310,7 +311,17 @@ pub struct GraphicsSettings {
     /// Applied by `crate::portal`'s `resize_portal_target` through [`scaled_portal_size`], every
     /// frame, so a change from the graphics panel takes effect on the next frame; held to 0.1..=1.
     pub portal_scale: f32,
+    /// The portal camera renders one frame in this many while a doorway stays in view, and the
+    /// doorway shows its last image in between (`crate::portal::cadence`): 1 (the default) every
+    /// frame, 2 every second frame, at the cost of the destination lagging the doorway by a frame
+    /// while the player moves. Read by `crate::portal`'s `pace_portal_camera` every frame, so a
+    /// change from the graphics panel takes effect on the next frame; held to
+    /// 1..=[`MAX_PORTAL_EVERY`].
+    pub portal_every: u32,
 }
+
+/// The most frames [`GraphicsSettings::portal_every`] spreads the portal's redraw over.
+pub const MAX_PORTAL_EVERY: u32 = 3;
 
 fn serialize_tonemapper<S: Serializer>(
     value: &Tonemapping,
@@ -351,6 +362,7 @@ impl GraphicsSettings {
             shadow_filter: ShadowFilter::Gaussian,
             contact_shadows: false,
             portal_scale: 1.0,
+            portal_every: 1,
         }
     }
 
@@ -487,6 +499,13 @@ impl GraphicsSettings {
                 }
                 self.portal_scale = scale;
             }
+            "portal-every" => {
+                let every: u32 = value.parse().map_err(|_| bad("a whole number"))?;
+                if !(1..=MAX_PORTAL_EVERY).contains(&every) {
+                    return Err(bad("1 to 3 (1: every frame)"));
+                }
+                self.portal_every = every;
+            }
             "tonemapper" => self.tonemapper = crate::tonemapper::parse(value)?,
             _ => {
                 return Err(format!(
@@ -538,7 +557,7 @@ impl GraphicsSettings {
         format!(
             "graphics: preset={} aa={:?} ssao={ssao} exposure={exposure} tonemapper={} \
              bloom={bloom} shadows={}px x{} to {distance} filter={:?} contact_shadows={} \
-             portal_scale={}",
+             portal_scale={} portal_every={}",
             self.preset.name(),
             self.aa,
             crate::tonemapper::name_of(self.tonemapper),
@@ -547,6 +566,7 @@ impl GraphicsSettings {
             self.shadow_filter,
             self.contact_shadows,
             self.portal_scale,
+            self.portal_every,
         )
         .replace("aa=Off", "aa=off")
         .replace("aa=Fxaa", "aa=fxaa")
@@ -575,6 +595,13 @@ fn switch(value: &str) -> Result<bool, String> {
         "on" | "true" | "yes" | "1" => Ok(true),
         "off" | "false" | "no" | "0" => Ok(false),
         _ => Err("on or off".to_owned()),
+    }
+}
+
+impl GraphicsSettings {
+    /// [`Self::portal_every`] held to 1..=[`MAX_PORTAL_EVERY`], for the portal's cadence.
+    pub fn portal_redraw_every(&self) -> u32 {
+        self.portal_every.clamp(1, MAX_PORTAL_EVERY)
     }
 }
 
@@ -1304,6 +1331,11 @@ mod tests {
         assert_eq!(current.shadow_filter, ShadowFilter::Gaussian);
         assert!(!current.contact_shadows);
         assert_eq!(current.portal_scale, 1.0);
+        assert_eq!(
+            current.portal_every, 1,
+            "the portal redraws every frame by default"
+        );
+        assert_eq!(GraphicsSettings::bevy().portal_every, 1);
         assert_eq!(GraphicsSettings::default(), current);
 
         let bevy = GraphicsSettings::bevy();
@@ -1385,6 +1417,7 @@ mod tests {
             ("shadow-filter", "temporal"),
             ("contact-shadows", "on"),
             ("portal-scale", "0.5"),
+            ("portal-every", "2"),
         ] {
             assert!(is_knob(key), "{key}");
             settings
@@ -1405,7 +1438,8 @@ mod tests {
         assert_eq!(settings.shadow_filter, ShadowFilter::Temporal);
         assert!(settings.contact_shadows);
         assert_eq!(settings.portal_scale, 0.5);
-        assert_eq!(KNOBS.len(), 19);
+        assert_eq!(settings.portal_every, 2);
+        assert_eq!(KNOBS.len(), 20);
 
         for (key, value, says) in [
             ("aa", "msaa", "fxaa"),
@@ -1414,6 +1448,9 @@ mod tests {
             ("shadow-map-size", "3000", "power of two"),
             ("bloom", "maybe", "on or off"),
             ("portal-scale", "2", "0.1 to 1"),
+            ("portal-every", "0", "1 to 3"),
+            ("portal-every", "4", "1 to 3"),
+            ("portal-every", "1.5", "whole number"),
             ("exposure-max", "-9", "below"),
             ("nope", "1", "unknown graphics setting"),
         ] {
@@ -1951,6 +1988,37 @@ mod tests {
                 .get(&handle)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn portal_every_comes_from_the_flag_or_the_file_and_is_held_to_its_range() {
+        let config = EngineConfig::from_args(["--portal-every", "2"].map(str::to_owned));
+        assert_eq!(
+            config.portal.graphics_knobs,
+            pairs(&[("portal-every", "2")])
+        );
+        let settings = resolve(None, None, &config.portal.graphics_knobs, None).unwrap();
+        assert_eq!(settings.portal_every, 2);
+        assert_eq!(settings.preset, Preset::Custom);
+        assert!(settings.summary().contains("portal_every=2"));
+
+        let file = parse_file(
+            Path::new("g.toml"),
+            "portal_every = 3
+",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(None, Some(&file), &[], None).unwrap().portal_every,
+            3
+        );
+        assert!(resolve(None, None, &pairs(&[("portal-every", "0")]), None).is_err());
+
+        let mut settings = GraphicsSettings::current();
+        for (every, held) in [(0, 1), (1, 1), (2, 2), (3, 3), (7, 3)] {
+            settings.portal_every = every;
+            assert_eq!(settings.portal_redraw_every(), held, "{every}");
+        }
     }
 
     #[test]

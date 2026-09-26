@@ -380,11 +380,6 @@ pub struct PortalOptions {
     /// sun, or a doorway into one), as before research-228. Only for timing the saving
     /// (`atmosphere::sun_casts_shadows`); off by default.
     pub dark_sun_shadows: bool,
-    /// `--portal-every <N>`: the portal camera renders one frame in `N` while a doorway stays in
-    /// view, and the doorway shows its last image in between (`crate::portal::cadence`). Only for
-    /// timing the portal's render-thread cost; `1` (the default) renders every frame. A value that
-    /// is not a whole number of at least 1 is ignored.
-    pub portal_every: u32,
     /// `--tonemapper <name>`: the main camera's tonemapper, any case (`crate::tonemapper`). Kept
     /// as written; a name that is not one is refused before the window exists. `None` is Bevy's
     /// default, TonyMcMapface.
@@ -436,7 +431,6 @@ impl Default for PortalOptions {
             depth_composite: true,
             light_spill: false,
             dark_sun_shadows: false,
-            portal_every: 1,
             tonemapper: None,
             graphics: None,
             graphics_file: None,
@@ -543,15 +537,6 @@ impl PortalOptions {
             "--field-notes-test" => config.portal.field_notes_test = true,
             "--portal-light-spill" => config.portal.light_spill = true,
             "--dark-sun-shadows" => config.portal.dark_sun_shadows = true,
-            "--portal-every" => {
-                if let Some(every) = args
-                    .next()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .filter(|every| *every >= 1)
-                {
-                    config.portal.portal_every = every;
-                }
-            }
             "--tonemapper" => config.portal.tonemapper = args.next(),
             "--graphics" => config.portal.graphics = args.next(),
             "--graphics-file" => config.portal.graphics_file = args.next().map(PathBuf::from),
@@ -714,20 +699,27 @@ impl DemoStart {
 }
 
 /// The water reflection camera's cost options: each drops one piece of the reflection's per-view
-/// work, so the portal bench can measure them one at a time. Every default is the reflection as it
-/// was before these flags (`crate::render`'s `setup_water_reflection` and
-/// `limit_water_reflection_cascades` read them).
+/// work, so the portal bench can measure them one at a time (`crate::render`'s
+/// `setup_water_reflection` and `limit_water_reflection_cascades` read them).
+///
+/// The default is the cheaper reflection (the user's decision, 2026-09-26): no depth prepass (so no
+/// occlusion culling) and no shadow cascades, which cut the render thread 1.0-1.4 ms at Riften's
+/// water door (`local/bench/portal-bench-2026-09-26_16-42-33`). The full reflection as it was
+/// before comes back with `--reflection-prepass=on --reflection-cascades all`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReflectionOptions {
-    /// `--reflection-prepass=off`: no `DepthPrepass` on the reflection camera. Bevy's occlusion
-    /// culling needs the prepass, so this turns [`occlusion`](Self::occlusion) off with it.
+    /// Whether the reflection camera has a `DepthPrepass`: off by default, `--reflection-prepass=on`
+    /// opts back in. Bevy's occlusion culling needs the prepass, so without it
+    /// [`occlusion`](Self::occlusion) has no effect.
     pub prepass: bool,
-    /// `--reflection-occlusion=off`: no `OcclusionCulling` on the reflection camera (its depth
-    /// prepass stays).
+    /// `--reflection-occlusion=off`: no `OcclusionCulling` on the reflection camera even when it
+    /// has its depth prepass (on by default, so `--reflection-prepass=on` brings occlusion culling
+    /// back with it).
     pub occlusion: bool,
-    /// `--reflection-cascades N` (0 to [`MAX_REFLECTION_CASCADES`]): the reflection view keeps only
-    /// the first `N` shadow cascades of the sun; 0 draws the reflection unshadowed. `None` keeps
-    /// every cascade the sun has.
+    /// `--reflection-cascades N` (0 to [`MAX_REFLECTION_CASCADES`], or `all`): the reflection view
+    /// keeps only the first `N` shadow cascades of the sun; 0 (the default) draws the reflection
+    /// unshadowed. `None` (`all`, or `N` = [`MAX_REFLECTION_CASCADES`]) keeps every cascade the sun
+    /// has and installs no limiting system.
     pub cascades: Option<usize>,
     /// `--reflection-scale S` (above 0, at most 1): the reflection target's size as a fraction of
     /// [`REFLECTION_SIZE`] per axis.
@@ -744,9 +736,9 @@ const MIN_REFLECTION_SIDE: u32 = 16;
 impl Default for ReflectionOptions {
     fn default() -> Self {
         Self {
-            prepass: true,
+            prepass: false,
             occlusion: true,
-            cascades: None,
+            cascades: Some(0),
             scale: 1.0,
         }
     }
@@ -765,15 +757,20 @@ impl ReflectionOptions {
             "--reflection-prepass=on" => options.prepass = true,
             "--reflection-occlusion=off" => options.occlusion = false,
             "--reflection-occlusion=on" => options.occlusion = true,
-            "--reflection-cascades" => {
-                if let Some(cascades) = args
-                    .next()
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .filter(|cascades| *cascades <= MAX_REFLECTION_CASCADES)
-                {
-                    options.cascades = Some(cascades);
+            "--reflection-cascades" => match args.next().as_deref() {
+                Some("all") => options.cascades = None,
+                Some(value) => {
+                    if let Some(cascades) = value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|cascades| *cascades <= MAX_REFLECTION_CASCADES)
+                    {
+                        // Every cascade Bevy gives a light is the same as no limit at all.
+                        options.cascades = (cascades < MAX_REFLECTION_CASCADES).then_some(cascades);
+                    }
                 }
-            }
+                None => {}
+            },
             "--reflection-scale" => {
                 if let Some(scale) = args
                     .next()
@@ -1258,21 +1255,6 @@ mod tests {
     }
 
     #[test]
-    fn portal_every_defaults_to_every_frame_and_takes_whole_numbers_of_one_or_more() {
-        let every = |args: &[&str]| {
-            EngineConfig::from_args(args.iter().map(|arg| (*arg).to_owned()))
-                .portal
-                .portal_every
-        };
-        assert_eq!(every(&[]), 1);
-        assert_eq!(every(&["--portal-every", "2"]), 2);
-        assert_eq!(every(&["--portal-every", "1"]), 1);
-        assert_eq!(every(&["--portal-every", "0"]), 1);
-        assert_eq!(every(&["--portal-every", "1.5"]), 1);
-        assert_eq!(every(&["--portal-every", "often"]), 1);
-    }
-
-    #[test]
     fn parses_runtime_options() {
         let config = EngineConfig::from_args(
             [
@@ -1356,13 +1338,27 @@ mod tests {
     }
 
     #[test]
-    fn reflection_options_default_to_the_full_reflection() {
+    fn reflection_options_default_to_no_prepass_and_no_cascades() {
         let options = EngineConfig::from_args(Vec::<String>::new()).reflection;
         assert_eq!(options, ReflectionOptions::default());
-        assert!(options.prepass);
-        assert!(options.occlusion_culling());
-        assert_eq!(options.cascades, None);
+        assert!(!options.prepass);
+        assert!(!options.occlusion_culling());
+        assert_eq!(options.cascades, Some(0));
         assert_eq!(options.target_size(), REFLECTION_SIZE);
+    }
+
+    #[test]
+    fn the_opt_back_in_flags_give_the_full_reflection() {
+        let parse = |args: &[&str]| {
+            EngineConfig::from_args(args.iter().map(|arg| (*arg).to_owned())).reflection
+        };
+        for cascades in ["all", "4"] {
+            let options = parse(&["--reflection-prepass=on", "--reflection-cascades", cascades]);
+            assert!(options.prepass);
+            assert!(options.occlusion_culling());
+            assert_eq!(options.cascades, None, "--reflection-cascades {cascades}");
+            assert_eq!(options.target_size(), REFLECTION_SIZE);
+        }
     }
 
     #[test]
@@ -1377,13 +1373,13 @@ mod tests {
             "--reflection-scale",
             "0.5",
         ]);
-        assert!(options.prepass);
+        assert!(!options.prepass);
         assert!(!options.occlusion_culling());
         assert_eq!(options.cascades, Some(1));
         assert_eq!(options.target_size(), (512, 288));
-        assert_eq!(parse(&["--reflection-cascades", "0"]).cascades, Some(0));
-        assert_eq!(parse(&["--reflection-cascades", "5"]).cascades, None);
-        assert_eq!(parse(&["--reflection-cascades", "two"]).cascades, None);
+        assert_eq!(parse(&["--reflection-cascades", "2"]).cascades, Some(2));
+        assert_eq!(parse(&["--reflection-cascades", "5"]).cascades, Some(0));
+        assert_eq!(parse(&["--reflection-cascades", "two"]).cascades, Some(0));
         assert_eq!(parse(&["--reflection-scale", "0"]).scale, 1.0);
         assert_eq!(parse(&["--reflection-scale", "1.5"]).scale, 1.0);
         assert_eq!(
@@ -1395,8 +1391,10 @@ mod tests {
 
     #[test]
     fn the_reflection_prepass_off_takes_occlusion_culling_with_it() {
-        let options =
-            EngineConfig::from_args(["--reflection-prepass=off"].map(str::to_owned)).reflection;
+        let options = EngineConfig::from_args(
+            ["--reflection-prepass=on", "--reflection-prepass=off"].map(str::to_owned),
+        )
+        .reflection;
         assert!(!options.prepass);
         assert!(options.occlusion, "the flag itself is left as given");
         assert!(!options.occlusion_culling());

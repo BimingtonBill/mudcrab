@@ -89,9 +89,9 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #ifdef DEPTH_PREPASS
     // Soft_Effect (Effect.hlsl's SOFT): fade in over softFalloffDepth units in front of the
     // opaque scene, so a card meeting the logs or the pit floor has no hard cut line. Every 3D
-    // camera here has a depth prepass with MSAA off - except the water reflection under
-    // `--reflection-prepass=off`, whose cards keep their hard edge; the cards blend, so they write
-    // none of it.
+    // camera here has a depth prepass with MSAA off - except the water reflection, which has none
+    // by default (`--reflection-prepass=on` restores it), so its cards keep their hard edge; the
+    // cards blend, so they write none of it.
     if (effect.soft.x > 0.0) {
         let scene_z = depth_ndc_to_view_z(prepass_utils::prepass_depth(in.position, 0u));
         let fragment_z = depth_ndc_to_view_z(in.position.z);

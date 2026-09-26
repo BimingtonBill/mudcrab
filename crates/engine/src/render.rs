@@ -89,8 +89,10 @@ impl Plugin for VercidiumRendererPlugin {
             ),
         );
 
-        // `--reflection-cascades N`: the system runs only when the flag is given, so the default
-        // reflection keeps every cascade of the sun without an extra system in the frame.
+        // `--reflection-cascades N`: the default is 0 (an unshadowed reflection), so the limit is
+        // installed on every run; `--reflection-cascades all` (or 4) keeps every cascade of the sun
+        // and leaves the system out of the frame. Without an `EngineConfig` (unit tests) nothing is
+        // limited.
         if let Some(limit) = app
             .world()
             .get_resource::<crate::config::EngineConfig>()
@@ -632,7 +634,8 @@ fn setup_water_reflection(
         // (`crate::graphics_settings`).
         crate::graphics_settings::GraphicsCamera::WaterReflection,
     ));
-    // Both are on by default. Without the prepass the view has no prepass phase to queue, sort,
+    // The prepass is off by default and `--reflection-prepass=on` brings it back, with occlusion
+    // culling unless `--reflection-occlusion=off` (`ReflectionOptions`). Without the prepass the view has no prepass phase to queue, sort,
     // batch and draw (`bevy_core_pipeline-0.19.0/src/prepass/node.rs`), and a card's soft edge
     // (`effect_palette.wgsl`'s `DEPTH_PREPASS` block) is compiled out for this view. Without
     // occlusion culling the view skips the two-phase early/late prepass split
@@ -1228,17 +1231,26 @@ mod tests {
     }
 
     #[test]
-    fn the_default_reflection_camera_keeps_its_prepass_occlusion_and_full_target() {
+    fn the_default_reflection_camera_has_no_prepass_or_occlusion_and_a_full_target() {
         let (app, camera) = spawned_reflection_camera(&[]);
         let camera = app.world().entity(camera);
-        assert!(camera.contains::<DepthPrepass>());
-        assert!(camera.contains::<OcclusionCulling>());
+        assert!(!camera.contains::<DepthPrepass>());
+        assert!(!camera.contains::<OcclusionCulling>());
         assert_eq!(reflection_target_size(&app), UVec2::new(1024, 576));
     }
 
     #[test]
+    fn the_reflection_prepass_flag_brings_back_the_prepass_and_occlusion() {
+        let (app, camera) = spawned_reflection_camera(&["--reflection-prepass=on"]);
+        let camera = app.world().entity(camera);
+        assert!(camera.contains::<DepthPrepass>());
+        assert!(camera.contains::<OcclusionCulling>());
+    }
+
+    #[test]
     fn reflection_flags_drop_the_occlusion_culling_or_the_whole_prepass() {
-        let (app, camera) = spawned_reflection_camera(&["--reflection-occlusion=off"]);
+        let (app, camera) =
+            spawned_reflection_camera(&["--reflection-prepass=on", "--reflection-occlusion=off"]);
         assert!(app.world().entity(camera).contains::<DepthPrepass>());
         assert!(!app.world().entity(camera).contains::<OcclusionCulling>());
 
