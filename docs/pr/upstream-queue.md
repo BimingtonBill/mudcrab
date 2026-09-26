@@ -93,7 +93,7 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 - **Lighting (hold exception, the user 2026-09-26): SENT** with the user's OK: #24 comment, **#39** fixture (4041832), **#40** converter (5a89364 after the CodeRabbit fix, on #39). Engine **#41** `phase2/lights-engine` 7410b6d SENT with the user's OK (picture hosted on the fork's `pr-assets` branch fe3cbe6). XRDS cap added to #41 (f79cf46).
 
 - **lights-xrds-cap** f79cf46 (one commit on #41's 7410b6d): XRDS above 8,192 units ignored (data gap between 6,919 and the nine outliers 15,967..3,736,737; a ratio rule drops ordinary lamps). Test `an_override_above_the_cap_is_ignored`. **Pushed onto #41 with the user's OK (head f79cf46); #41's body updated.**
-- **reflection-land-only** 925205f (from main, held): the water reflection camera draws terrain only; objects on their own layer (sun keeps both, so objects still cast). Rural p50 3.96 -> 3.71 ms (+6.5% fps). Vanilla reflects LOD and sky, not full-detail objects (cited in code; verify the citation before sending).
+- **reflection-land-only** 925205f (from main, held): the water reflection camera draws terrain only; objects on their own layer (sun keeps both, so objects still cast). Rural p50 3.96 -> 3.71 ms (+6.5% fps). Citations in `local/pr-drafts/factsheet-reflection-land-only.md` (high confidence on LOD + sky, medium on the exclusion list; the REFR flag 0x10000000 Reflected By Auto Water and XPWR are a candidate follow-up). Honest look change to state: shore objects leave the reflection until LOD/SSR exist. Best sent after the sky PR, so the reflection has a sky.
 
 ## Candidates with no branch yet
 
