@@ -84,12 +84,13 @@ pub enum Knob {
     ShadowFilter,
     ContactShadows,
     PortalScale,
+    PortalEvery,
 }
 
 impl Knob {
     /// Every knob, in the panel's order: the flags' own ([`graphics_settings::KNOBS`]) with the
     /// fixed EV100 and the tonemapper added where they belong.
-    pub const ALL: [Knob; 21] = [
+    pub const ALL: [Knob; 22] = [
         Knob::Aa,
         Knob::Ssao,
         Knob::SsaoRadius,
@@ -111,6 +112,7 @@ impl Knob {
         Knob::ShadowFilter,
         Knob::ContactShadows,
         Knob::PortalScale,
+        Knob::PortalEvery,
     ];
 
     /// The knob's label: its flag's name, so the panel, the flags and the file read alike.
@@ -137,6 +139,7 @@ impl Knob {
             Knob::ShadowFilter => "shadow-filter",
             Knob::ContactShadows => "contact-shadows",
             Knob::PortalScale => "portal-scale",
+            Knob::PortalEvery => "portal-every",
         }
     }
 
@@ -166,6 +169,7 @@ impl Knob {
             Knob::ShadowFilter => shadow_filter_name(settings.shadow_filter).to_owned(),
             Knob::ContactShadows => on_off(settings.contact_shadows).to_owned(),
             Knob::PortalScale => settings.portal_scale.to_string(),
+            Knob::PortalEvery => settings.portal_every.to_string(),
         }
     }
 
@@ -184,6 +188,7 @@ impl Knob {
                 "  (auto only)"
             }
             Knob::BloomIntensity if !settings.bloom => "  (bloom off)",
+            Knob::PortalEvery => portal_every_note(settings.portal_every),
             _ => "",
         }
     }
@@ -305,7 +310,24 @@ impl Knob {
             Knob::PortalScale => {
                 settings.portal_scale = step_number(settings.portal_scale, 0.05, 0.1, 1.0, up);
             }
+            Knob::PortalEvery => {
+                let every = settings.portal_every;
+                settings.portal_every = if up {
+                    (every + 1).min(graphics_settings::MAX_PORTAL_EVERY)
+                } else {
+                    every.saturating_sub(1).max(1)
+                };
+            }
         }
+    }
+}
+
+/// What the `portal-every` knob's value means, after it on the panel.
+fn portal_every_note(every: u32) -> &'static str {
+    match every {
+        0 | 1 => "  (portal redraw: every frame)",
+        2 => "  (portal redraw: every 2nd frame; lags one frame when moving)",
+        _ => "  (portal redraw: every 3rd frame; lags when moving)",
     }
 }
 
@@ -553,6 +575,7 @@ pub fn settings_file_text(settings: &GraphicsSettings) -> String {
         ),
         format!("contact_shadows = \"{}\"", on_off(settings.contact_shadows)),
         format!("portal_scale = {}", settings.portal_scale),
+        format!("portal_every = {}", settings.portal_every),
     ]);
     let mut text = lines.join("\n");
     text.push('\n');
@@ -761,7 +784,7 @@ mod tests {
         panel.move_selection(-1);
         assert_eq!(
             panel.selected_knob(),
-            Knob::PortalScale,
+            Knob::PortalEvery,
             "wraps past the first"
         );
     }
@@ -920,6 +943,29 @@ mod tests {
     }
 
     #[test]
+    fn the_portal_every_knob_steps_one_to_three_and_says_what_it_does() {
+        let mut settings = GraphicsSettings::current();
+        assert!(Knob::PortalEvery.note(&settings).contains("every frame"));
+        let mut seen = vec![settings.portal_every];
+        for _ in 0..3 {
+            Knob::PortalEvery.step(&mut settings, 1);
+            seen.push(settings.portal_every);
+        }
+        assert_eq!(seen, [1, 2, 3, 3]);
+        Knob::PortalEvery.step(&mut settings, -1);
+        assert_eq!(settings.portal_every, 2);
+        assert!(
+            Knob::PortalEvery
+                .note(&settings)
+                .contains("every 2nd frame; lags one frame when moving")
+        );
+        for _ in 0..3 {
+            Knob::PortalEvery.step(&mut settings, -1);
+        }
+        assert_eq!(settings.portal_every, 1);
+    }
+
+    #[test]
     fn saved_settings_load_back_the_same() {
         let dir = std::env::temp_dir().join(format!("graphics-panel-{}", std::process::id()));
         let path = dir.join("nested").join("graphics.toml");
@@ -937,6 +983,7 @@ mod tests {
         low_range.tonemapper = Tonemapping::AgX;
         low_range.bloom = false;
         low_range.portal_scale = 0.35;
+        low_range.portal_every = 2;
         low_range.shadow_filter = ShadowFilter::Temporal;
         low_range.relabel();
         let labelled_custom = Preset::Custom.settings();

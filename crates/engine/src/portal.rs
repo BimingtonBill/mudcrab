@@ -561,12 +561,10 @@ impl Plugin for PortalPlugin {
         {
             app.add_plugins(depth_composite::DepthCompositePlugin);
         }
-        // `--portal-every N`: the portal camera renders one frame in `N` while a doorway stays in
-        // view ([`cadence`]). Opt-in, for timing; not added at the default of every frame.
-        let every = app.world().resource::<EngineConfig>().portal.portal_every;
-        if every > 1 {
-            app.add_plugins(cadence::PortalCadencePlugin { every });
-        }
+        // The graphics setting `portal_every` (`--portal-every N`, the graphics panel): the portal
+        // camera renders one frame in `N` while a doorway stays in view ([`cadence`]). Always
+        // added, so the panel can change it live; at the default of every frame it never skips.
+        app.add_plugins(cadence::PortalCadencePlugin);
         // One log line per doorway opened: the frame times and the pipelines created over the
         // frames after it ([`measure_portal_opens`]). The counts are read in the render world.
         let counts = PipelineCounts::default();
@@ -4402,12 +4400,14 @@ fn skip_occluded_doorway(
 }
 
 // ---------------------------------------------------------------------------------------------
-// The portal's cadence (`--portal-every N`)
+// The portal's cadence (the graphics setting `portal_every`, `--portal-every N`)
 // ---------------------------------------------------------------------------------------------
 
-/// `--portal-every N`: the portal camera renders one frame in `N` while a doorway stays in view,
-/// and the doorway shows the last image it rendered on the frames between. Opt-in, for timing what
-/// the portal's own render-thread work costs; `N = 1` (the default) does not add this plugin at all.
+/// The graphics setting `portal_every` (`crate::graphics_settings::GraphicsSettings::portal_every`,
+/// `--portal-every N`, the graphics panel's "Portal redraw"): the portal camera renders one frame in
+/// `N` while a doorway stays in view, and the doorway shows the last image it rendered on the
+/// frames between. A setting, off by default (the user's decision, 2026-09-26): `N = 1` renders
+/// every frame and never skips, and the setting is read every frame, so the panel changes it live.
 ///
 /// # Why not `Camera::is_active`
 ///
@@ -4467,7 +4467,7 @@ pub(crate) mod cadence {
     use super::{
         PortalCamera, PortalState, PortalTexture, resize_portal_target, skip_occluded_doorway,
     };
-    use crate::config::EngineConfig;
+    use crate::graphics_settings::GraphicsSettings;
     use bevy::{
         prelude::*,
         render::{
@@ -4480,7 +4480,7 @@ pub(crate) mod cadence {
     /// it rendered into. `None` while the camera is off.
     pub(crate) type Shown = Option<(Entity, AssetId<Image>)>;
 
-    /// The portal camera's frame-by-frame cadence under `--portal-every`: whether it renders this
+    /// The portal camera's frame-by-frame cadence under `portal_every`: whether it renders this
     /// frame, and what it showed last frame. Main world; the render world reads
     /// [`skips_this_frame`](Self::skips_this_frame) at extraction.
     #[derive(Resource, Debug, Default)]
@@ -4539,19 +4539,13 @@ pub(crate) mod cadence {
         }
     }
 
-    /// Adds the cadence when `--portal-every` asks for more than every frame.
-    pub(crate) struct PortalCadencePlugin {
-        pub(crate) every: u32,
-    }
+    /// Adds the cadence. It starts at every frame and follows [`GraphicsSettings::portal_every`]
+    /// from the first frame on.
+    pub(crate) struct PortalCadencePlugin;
 
     impl Plugin for PortalCadencePlugin {
         fn build(&self, app: &mut App) {
-            info!(
-                every = self.every,
-                "portal: the portal camera renders one frame in {} while a doorway stays in view",
-                self.every
-            );
-            app.insert_resource(PortalCadence::new(self.every))
+            app.insert_resource(PortalCadence::new(1))
                 // After both systems that switch the camera off and after the target is resized,
                 // so this frame's `is_active` and target are final.
                 .add_systems(
@@ -4574,16 +4568,23 @@ pub(crate) mod cadence {
         }
     }
 
-    /// Steps the cadence for this frame.
+    /// Steps the cadence for this frame, at this frame's [`GraphicsSettings::portal_every`].
     fn pace_portal_camera(
         mut cadence: ResMut<PortalCadence>,
         state: Option<Res<PortalState>>,
         texture: Option<Res<PortalTexture>>,
         camera: Query<&Camera, With<PortalCamera>>,
-        config: Option<Res<EngineConfig>>,
+        settings: Option<Res<GraphicsSettings>>,
     ) {
-        if let Some(config) = config {
-            cadence.every = config.portal.portal_every;
+        if let Some(settings) = settings {
+            let every = settings.portal_redraw_every();
+            if cadence.every != every {
+                info!(
+                    every,
+                    "portal: the portal camera renders one frame in {every} while a doorway stays                      in view"
+                );
+                cadence.every = every;
+            }
         }
         let shown = match (camera.single(), state, texture) {
             (Ok(camera), Some(state), Some(texture)) if camera.is_active => {
@@ -4593,7 +4594,8 @@ pub(crate) mod cadence {
         };
         let was_shown = cadence.last.is_some();
         cadence.step(shown);
-        if was_shown && shown.is_none() {
+        // At every frame there is nothing to report.
+        if was_shown && shown.is_none() && (cadence.every > 1 || cadence.skipped > 0) {
             info!(
                 rendered = cadence.rendered,
                 skipped = cadence.skipped,
@@ -4701,6 +4703,45 @@ pub(crate) mod cadence {
             // A resized target is a new image nothing has been drawn into.
             assert!(cadence.step(Some((door(2), target(2)))));
             assert!(!cadence.skips_this_frame());
+        }
+
+        #[test]
+        fn the_cadence_follows_the_graphics_setting_live() {
+            let mut app = App::new();
+            let mut settings = GraphicsSettings::current();
+            assert_eq!(settings.portal_every, 1, "every frame by default");
+            settings.portal_every = 2;
+            app.insert_resource(settings)
+                .insert_resource(PortalCadence::new(1))
+                .add_systems(Update, pace_portal_camera);
+            app.update();
+            assert_eq!(app.world().resource::<PortalCadence>().every, 2);
+            app.world_mut()
+                .resource_mut::<GraphicsSettings>()
+                .portal_every = 1;
+            app.update();
+            assert_eq!(app.world().resource::<PortalCadence>().every, 1);
+            // A value outside the setting's range is held to it.
+            app.world_mut()
+                .resource_mut::<GraphicsSettings>()
+                .portal_every = 9;
+            app.update();
+            assert_eq!(app.world().resource::<PortalCadence>().every, 3);
+            // No camera, so nothing is shown and nothing is skipped.
+            assert!(!app.world().resource::<PortalCadence>().skips_this_frame());
+        }
+
+        #[test]
+        fn switching_back_to_every_frame_mid_doorway_stops_the_skips_at_once() {
+            let mut cadence = PortalCadence::new(2);
+            let shown = Some((door(1), target(1)));
+            assert!(cadence.step(shown));
+            assert!(!cadence.step(shown));
+            cadence.every = 1;
+            for _ in 0..5 {
+                assert!(cadence.step(shown));
+                assert!(!cadence.skips_this_frame());
+            }
         }
     }
 }
