@@ -358,6 +358,11 @@ pub struct PortalOptions {
     /// sun, or a doorway into one), as before research-228. Only for timing the saving
     /// (`atmosphere::sun_casts_shadows`); off by default.
     pub dark_sun_shadows: bool,
+    /// `--portal-every <N>`: the portal camera renders one frame in `N` while a doorway stays in
+    /// view, and the doorway shows its last image in between (`crate::portal::cadence`). Only for
+    /// timing the portal's render-thread cost; `1` (the default) renders every frame. A value that
+    /// is not a whole number of at least 1 is ignored.
+    pub portal_every: u32,
     /// `--tonemapper <name>`: the main camera's tonemapper, any case (`crate::tonemapper`). Kept
     /// as written; a name that is not one is refused before the window exists. `None` is Bevy's
     /// default, TonyMcMapface.
@@ -409,6 +414,7 @@ impl Default for PortalOptions {
             depth_composite: true,
             light_spill: false,
             dark_sun_shadows: false,
+            portal_every: 1,
             tonemapper: None,
             graphics: None,
             graphics_file: None,
@@ -515,6 +521,15 @@ impl PortalOptions {
             "--field-notes-test" => config.portal.field_notes_test = true,
             "--portal-light-spill" => config.portal.light_spill = true,
             "--dark-sun-shadows" => config.portal.dark_sun_shadows = true,
+            "--portal-every" => {
+                if let Some(every) = args
+                    .next()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|every| *every >= 1)
+                {
+                    config.portal.portal_every = every;
+                }
+            }
             "--tonemapper" => config.portal.tonemapper = args.next(),
             "--graphics" => config.portal.graphics = args.next(),
             "--graphics-file" => config.portal.graphics_file = args.next().map(PathBuf::from),
@@ -1129,6 +1144,21 @@ mod tests {
         assert_eq!(period(&["--graphics-cycle", "0"]), None);
         assert_eq!(period(&["--graphics-cycle", "-1"]), None);
         assert_eq!(period(&["--graphics-cycle", "soon"]), None);
+    }
+
+    #[test]
+    fn portal_every_defaults_to_every_frame_and_takes_whole_numbers_of_one_or_more() {
+        let every = |args: &[&str]| {
+            EngineConfig::from_args(args.iter().map(|arg| (*arg).to_owned()))
+                .portal
+                .portal_every
+        };
+        assert_eq!(every(&[]), 1);
+        assert_eq!(every(&["--portal-every", "2"]), 2);
+        assert_eq!(every(&["--portal-every", "1"]), 1);
+        assert_eq!(every(&["--portal-every", "0"]), 1);
+        assert_eq!(every(&["--portal-every", "1.5"]), 1);
+        assert_eq!(every(&["--portal-every", "often"]), 1);
     }
 
     #[test]
