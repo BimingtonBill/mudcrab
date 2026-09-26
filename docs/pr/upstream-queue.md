@@ -94,6 +94,13 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 - **renderable-base-types** 41333e1: priority (Whiterun's water and 56% of WhiterunWorld's references have no mesh on main). NOT sent while the maintainer waits on #27 (a superset). The user chose to **wait** (2026-09-26): no comment on #27, ours not sent; let #27 finish. Draft kept (`local/pr-drafts/17-pr27-base-types.md`) in case the user changes their mind. Its LIGH arm overlaps #40 (one writer after a merge).
 - **terrain-vclr-srgb** e4b6586: HOLD, no visible effect in renders; not sendable without evidence.
 
+- **From Phase 2 Dev 2026-09-26 (all from main, reviewed, green, held):**
+  - `parser-never-panic` fb7f928 (3 commits): VMAD array counts reserved up to 96 GiB on corrupt input and aborted the process; decompression no longer reserves a corrupt header's declared size; proptest never-panic properties for ESM/VMAD/cell cache/BSA/BA2/PEX/LIP/NIF. **Real crash fix: early send.**
+  - `scripts-utf8-bom` 232a286: phase2-acceptance.ps1 fails to parse in Windows PowerShell 5.1 (UTF-8 without BOM + an em-dash); phase2-close.ps1 misreads accented headings. Tiny.
+  - `cell-cache-validate-once` ac91f54: CellCache::terrain re-validated the whole 489 MB rkyv archive per cell commit; stress streaming/cell_commit 2.86 -> 0.37 ms mean (504 commits, interleaved 2x2; frame p95 within noise). Data `C:/Modding/wkj-tools/stress-ab/`.
+  - `remote-dev-flag` f8a5c03: opt-in Bevy Remote Protocol (feature `remote` + `--remote`, 127.0.0.1 only; default deps unchanged). New capability: issue first.
+  - Acceptance baseline on main (for PR bodies): every scenario passes at 60 s on a quiet machine (stress p95 ~12 ms); missing for `accepted`: quality/release gates, 3 full reps, human visual sign-off. `C:/Modding/wkj-tools/acceptance-main-60s/`.
+
 ## Candidates with no branch yet
 
 - **#30 (a) follow-up** (owed; see above).
