@@ -40,6 +40,8 @@ pub struct EngineConfig {
     pub profile_dirty_worktree: bool,
     pub profile_hardware: String,
     pub acceptance_screenshot: Option<PathBuf>,
+    /// The water reflection camera's cost options ([`ReflectionOptions`]).
+    pub reflection: ReflectionOptions,
     pub diagnostic_asset_fallbacks: bool,
     pub material_fixture: bool,
     pub terrain_water_fixture: bool,
@@ -114,6 +116,7 @@ impl Default for EngineConfig {
             profile_dirty_worktree: false,
             profile_hardware: "unspecified".into(),
             acceptance_screenshot: None,
+            reflection: ReflectionOptions::default(),
             diagnostic_asset_fallbacks: false,
             material_fixture: false,
             terrain_water_fixture: false,
@@ -139,6 +142,10 @@ impl EngineConfig {
         let mut terrain_radius_given = false;
         let mut args = args.into_iter();
         while let Some(argument) = args.next() {
+            // The water reflection's cost flags ([`ReflectionOptions`]).
+            if ReflectionOptions::parse_flag(&mut config.reflection, &argument, &mut args) {
+                continue;
+            }
             // The portal's own flags, parsed by one block at the end of this file.
             if PortalOptions::parse_flag(&mut config, &argument, &mut args) {
                 continue;
@@ -706,6 +713,95 @@ impl DemoStart {
     }
 }
 
+/// The water reflection camera's cost options: each drops one piece of the reflection's per-view
+/// work, so the portal bench can measure them one at a time. Every default is the reflection as it
+/// was before these flags (`crate::render`'s `setup_water_reflection` and
+/// `limit_water_reflection_cascades` read them).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReflectionOptions {
+    /// `--reflection-prepass=off`: no `DepthPrepass` on the reflection camera. Bevy's occlusion
+    /// culling needs the prepass, so this turns [`occlusion`](Self::occlusion) off with it.
+    pub prepass: bool,
+    /// `--reflection-occlusion=off`: no `OcclusionCulling` on the reflection camera (its depth
+    /// prepass stays).
+    pub occlusion: bool,
+    /// `--reflection-cascades N` (0 to [`MAX_REFLECTION_CASCADES`]): the reflection view keeps only
+    /// the first `N` shadow cascades of the sun; 0 draws the reflection unshadowed. `None` keeps
+    /// every cascade the sun has.
+    pub cascades: Option<usize>,
+    /// `--reflection-scale S` (above 0, at most 1): the reflection target's size as a fraction of
+    /// [`REFLECTION_SIZE`] per axis.
+    pub scale: f32,
+}
+
+/// The water reflection target's full size, in pixels.
+pub const REFLECTION_SIZE: (u32, u32) = (1024, 576);
+/// The most cascades Bevy gives a directional light (`MAX_CASCADES_PER_LIGHT`).
+pub const MAX_REFLECTION_CASCADES: usize = 4;
+/// The smallest side a scaled reflection target is given, in pixels.
+const MIN_REFLECTION_SIDE: u32 = 16;
+
+impl Default for ReflectionOptions {
+    fn default() -> Self {
+        Self {
+            prepass: true,
+            occlusion: true,
+            cascades: None,
+            scale: 1.0,
+        }
+    }
+}
+
+impl ReflectionOptions {
+    /// Parses one reflection flag, taking the argument it needs from `args`, and says whether
+    /// `argument` was one of them. A value out of range leaves the option as it was.
+    pub fn parse_flag(
+        options: &mut Self,
+        argument: &str,
+        args: &mut impl Iterator<Item = String>,
+    ) -> bool {
+        match argument {
+            "--reflection-prepass=off" => options.prepass = false,
+            "--reflection-prepass=on" => options.prepass = true,
+            "--reflection-occlusion=off" => options.occlusion = false,
+            "--reflection-occlusion=on" => options.occlusion = true,
+            "--reflection-cascades" => {
+                if let Some(cascades) = args
+                    .next()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|cascades| *cascades <= MAX_REFLECTION_CASCADES)
+                {
+                    options.cascades = Some(cascades);
+                }
+            }
+            "--reflection-scale" => {
+                if let Some(scale) = args
+                    .next()
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .filter(|scale| scale.is_finite() && *scale > 0.0 && *scale <= 1.0)
+                {
+                    options.scale = scale;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether the reflection camera carries `OcclusionCulling`: asked for, and with the depth
+    /// prepass Bevy's occlusion culling requires (`bevy_render-0.19.0/src/occlusion_culling/mod.rs`,
+    /// "Occlusion culling currently requires a `DepthPrepass`").
+    pub fn occlusion_culling(&self) -> bool {
+        self.prepass && self.occlusion
+    }
+
+    /// The reflection target's size in pixels.
+    pub fn target_size(&self) -> (u32, u32) {
+        let side = |full: u32| ((full as f32 * self.scale).round() as u32).max(MIN_REFLECTION_SIDE);
+        (side(REFLECTION_SIZE.0), side(REFLECTION_SIZE.1))
+    }
+}
+
 /// The exterior cell grid containing a Creation-engine position (cells are 4096 units).
 pub fn grid_of(x: f32, y: f32) -> (i32, i32) {
     ((x / 4096.0).floor() as i32, (y / 4096.0).floor() as i32)
@@ -1257,5 +1353,52 @@ mod tests {
         let config = EngineConfig::from_args(["--remote-port", "16001"].map(str::to_owned));
         assert!(config.remote);
         assert_eq!(config.remote_port, 16_001);
+    }
+
+    #[test]
+    fn reflection_options_default_to_the_full_reflection() {
+        let options = EngineConfig::from_args(Vec::<String>::new()).reflection;
+        assert_eq!(options, ReflectionOptions::default());
+        assert!(options.prepass);
+        assert!(options.occlusion_culling());
+        assert_eq!(options.cascades, None);
+        assert_eq!(options.target_size(), REFLECTION_SIZE);
+    }
+
+    #[test]
+    fn parses_the_reflection_cost_flags() {
+        let parse = |args: &[&str]| {
+            EngineConfig::from_args(args.iter().map(|arg| (*arg).to_owned())).reflection
+        };
+        let options = parse(&[
+            "--reflection-occlusion=off",
+            "--reflection-cascades",
+            "1",
+            "--reflection-scale",
+            "0.5",
+        ]);
+        assert!(options.prepass);
+        assert!(!options.occlusion_culling());
+        assert_eq!(options.cascades, Some(1));
+        assert_eq!(options.target_size(), (512, 288));
+        assert_eq!(parse(&["--reflection-cascades", "0"]).cascades, Some(0));
+        assert_eq!(parse(&["--reflection-cascades", "5"]).cascades, None);
+        assert_eq!(parse(&["--reflection-cascades", "two"]).cascades, None);
+        assert_eq!(parse(&["--reflection-scale", "0"]).scale, 1.0);
+        assert_eq!(parse(&["--reflection-scale", "1.5"]).scale, 1.0);
+        assert_eq!(
+            parse(&["--reflection-scale", "0.001"]).target_size(),
+            (16, 16),
+            "a tiny scale keeps a usable target"
+        );
+    }
+
+    #[test]
+    fn the_reflection_prepass_off_takes_occlusion_culling_with_it() {
+        let options =
+            EngineConfig::from_args(["--reflection-prepass=off"].map(str::to_owned)).reflection;
+        assert!(!options.prepass);
+        assert!(options.occlusion, "the flag itself is left as given");
+        assert!(!options.occlusion_culling());
     }
 }
