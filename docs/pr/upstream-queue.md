@@ -92,6 +92,9 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 - **From Phase 2 Dev 2026-09-26, all from main, fmt/clippy/tests green (held):** `converter-snapshots` 94a091f (insta snapshot tests of converter output); `cell-name-nul` 44d8720 (on it: `cells.interior_name` lost its trailing NUL, caught by the snapshots; a real bug fix, good early send); `conversion-stage-times` ce66d11 (elapsed time per log line + per-stage times); bench tooling `benchmark-frame-times` a8560b5, `render-world-timing` 49b2d8d.
 - **Lighting (hold exception, the user 2026-09-26): SENT** with the user's OK: #24 comment, **#39** fixture (4041832), **#40** converter (5a89364 after the CodeRabbit fix, on #39). Engine **#41** `phase2/lights-engine` 7410b6d SENT with the user's OK (picture hosted on the fork's `pr-assets` branch fe3cbe6). XRDS sanity cap = a follow-up (the user chose to send first).
 
+- **lights-xrds-cap** f79cf46 (one commit on #41's 7410b6d): XRDS above 8,192 units ignored (data gap between 6,919 and the nine outliers 15,967..3,736,737; a ratio rule drops ordinary lamps). Test `an_override_above_the_cap_is_ignored`. Proposed: push onto #41 + update its body's XRDS bullet (the user's call).
+- **reflection-land-only** 925205f (from main, held): the water reflection camera draws terrain only; objects on their own layer (sun keeps both, so objects still cast). Rural p50 3.96 -> 3.71 ms (+6.5% fps). Vanilla reflects LOD and sky, not full-detail objects (cited in code; verify the citation before sending).
+
 ## Candidates with no branch yet
 
 - **#30 (a) follow-up** (owed; see above).
