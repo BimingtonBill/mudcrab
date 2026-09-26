@@ -184,7 +184,7 @@ permitting). #30 (a) follow-up written (6bfee13). History paths: send as a fresh
 public/portal re-exported by Portal Dev (ff96ac2). Full list: `docs/pr/upstream-queue.md`.
 
 **Tools:** `local/pr-drafts/preview.py` (lists every post and a count at the top); shared warm
-target `C:\Modding	arget-upstream`; `cargo nextest` for CI-matching tests. **Running:** the
+target `C:\Modding\target-upstream`; `cargo nextest` for CI-matching tests. **Running:** the
 90-minute upstream check (session crons). No workers, no worktrees.
 
 ### 2026-09-26 - Claude [portal] Portal Dev (portal cost, door leaf, flames, benches)
