@@ -19,6 +19,7 @@ use bevy::{
         extensions::{ErasedGltfExtensionHandler, GltfExtensionHandler, GltfExtensionHandlers},
     },
     image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor},
+    light::{Cascades, SimulationLightSystems},
     pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
     render::{
@@ -87,6 +88,22 @@ impl Plugin for VercidiumRendererPlugin {
                 sync_renderer_metrics,
             ),
         );
+
+        // `--reflection-cascades N`: the system runs only when the flag is given, so the default
+        // reflection keeps every cascade of the sun without an extra system in the frame.
+        if let Some(limit) = app
+            .world()
+            .get_resource::<crate::config::EngineConfig>()
+            .and_then(|config| config.reflection.cascades)
+        {
+            app.insert_resource(WaterReflectionCascadeLimit(limit))
+                .add_systems(
+                    PostUpdate,
+                    limit_water_reflection_cascades
+                        .after(SimulationLightSystems::UpdateDirectionalLightCascades)
+                        .before(SimulationLightSystems::UpdateLightFrusta),
+                );
+        }
 
         let bridge = RendererProofBridge::default();
         app.insert_resource(bridge.clone());
@@ -582,15 +599,23 @@ struct WaterReflectionCamera;
 /// sliver of the frame, so little of the saving is given back.
 const WATER_REFLECTION_FRUSTUM_MARGIN: f32 = 512.0;
 
-fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+fn setup_water_reflection(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    config: Option<Res<crate::config::EngineConfig>>,
+) {
+    let options = config
+        .map(|config| config.reflection.clone())
+        .unwrap_or_default();
+    let (width, height) = options.target_size();
     let image = images.add(Image::new_target_texture(
-        1024,
-        576,
+        width,
+        height,
         bevy::render::render_resource::TextureFormat::Rgba8Unorm,
         Some(bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb),
     ));
     commands.insert_resource(WaterReflectionTexture(image.clone()));
-    commands.spawn((
+    let mut camera = commands.spawn((
         Camera3d::default(),
         Camera {
             order: -1,
@@ -602,14 +627,85 @@ fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Imag
         },
         RenderTarget::Image(image.into()),
         Transform::default(),
-        DepthPrepass,
-        OcclusionCulling,
         RenderLayers::layer(0),
         WaterReflectionCamera,
         // The exposure and shadow filter of the graphics settings; no AA, no SSAO
         // (`crate::graphics_settings`).
         crate::graphics_settings::GraphicsCamera::WaterReflection,
     ));
+    // Both are on by default. Without the prepass the view has no prepass phase to queue, sort,
+    // batch and draw (`bevy_core_pipeline-0.19.0/src/prepass/node.rs`), and a card's soft edge
+    // (`effect_palette.wgsl`'s `DEPTH_PREPASS` block) is compiled out for this view. Without
+    // occlusion culling the view skips the two-phase early/late prepass split
+    // (`prepass/node.rs:41`), the late GPU preprocessing pass (`bevy_pbr-0.19.0/src/render/
+    // gpu_preprocess.rs:459`, `:610`) and its depth pyramid (`bevy_core_pipeline-0.19.0/src/
+    // mip_generation/experimental/depth.rs:699`).
+    if options.prepass {
+        camera.insert(DepthPrepass);
+    }
+    if options.occlusion_culling() {
+        camera.insert(OcclusionCulling);
+    }
+}
+
+/// `--reflection-cascades N`: how many of a sun's shadow cascades the reflection view keeps.
+#[derive(Resource, Debug, Clone, Copy)]
+struct WaterReflectionCascadeLimit(usize);
+
+/// Keeps only the first [`WaterReflectionCascadeLimit`] shadow cascades of each directional light
+/// for the reflection view, and none of a light the reflection view cannot see.
+///
+/// A light's cascade count is one number for every view, so the reflection cannot be given a sun of
+/// its own: the world's meshes are on layer 0 and the reflection draws layer 0, so any light that
+/// casts their shadows reaches the reflection view too (`bevy_pbr-0.19.0/src/render/light.rs:1782`
+/// filters a view's lights by layer). What can differ per view is the list of cascades: Bevy builds
+/// it for every active camera (`bevy_light-0.19.0/src/cascade.rs:195-253`), and everything after
+/// takes that list's length:
+/// - `update_directional_light_frusta` builds one frustum per listed cascade
+///   (`bevy_light-0.19.0/src/directional_light.rs:239`), and `check_dir_light_mesh_visibility`
+///   culls the world once per frustum (`bevy_light-0.19.0/src/lib.rs:383-388`, `:402`);
+/// - `prepare_lights` zips the view's cascades with its frusta and the light's bounds and spawns
+///   one shadow view per pair (`bevy_pbr-0.19.0/src/render/light.rs:1795-1818`), so a cascade
+///   dropped here is a shadow view never specialized, queued, batched or drawn.
+///
+/// The light's shader record still says the light has its full count (`light.rs:1672-1706` takes it
+/// from the config), and the dropped cascades are left at `GpuDirectionalCascade::default`:
+/// `far_bound` 0, so `get_cascade_index` (`bevy_pbr-0.19.0/src/render/shadows.wgsl:136-145`)
+/// returns "no cascade" past the last kept one and the surface is lit, and the blend into the next
+/// cascade over the last kept cascade's overlap samples an identity matrix, which lands outside
+/// the shadow map (`shadows.wgsl:151-168`) for any point further than one unit from the world
+/// origin. The shadows fade out at the last kept cascade's far bound; 0 keeps none, and the
+/// reflection is unshadowed.
+///
+/// A light whose layers miss the reflection camera's (the doorway's sun, on the portal's layer)
+/// still had cascades built and culled for the reflection view that `prepare_lights` never uses:
+/// those are dropped whole.
+///
+/// Runs between `build_directional_light_cascades` and `update_directional_light_frusta`, so the
+/// frusta and the culling follow the shortened list.
+fn limit_water_reflection_cascades(
+    limit: Res<WaterReflectionCascadeLimit>,
+    reflection: Query<(Entity, Option<&RenderLayers>), With<WaterReflectionCamera>>,
+    mut lights: Query<(&mut Cascades, Option<&RenderLayers>), With<DirectionalLight>>,
+) {
+    let Ok((camera, camera_layers)) = reflection.single() else {
+        return;
+    };
+    let camera_layers = camera_layers.cloned().unwrap_or_default();
+    for (mut cascades, light_layers) in &mut lights {
+        let keep = if light_layers
+            .cloned()
+            .unwrap_or_default()
+            .intersects(&camera_layers)
+        {
+            limit.0
+        } else {
+            0
+        };
+        if let Some(view_cascades) = cascades.cascades.get_mut(&camera) {
+            view_cascades.truncate(keep);
+        }
+    }
 }
 
 /// The streamed world camera, never the reflection camera.
@@ -1097,6 +1193,116 @@ mod tests {
     use bevy::mesh::VertexAttributeValues;
 
     const MAIN_CAMERA_FAR: f32 = 1000.0;
+
+    /// Runs `setup_water_reflection` under the given command line and returns the app and the
+    /// reflection camera it spawned.
+    fn spawned_reflection_camera(args: &[&str]) -> (App, Entity) {
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .insert_resource(crate::config::EngineConfig::from_args(
+                args.iter().map(|arg| (*arg).to_owned()),
+            ))
+            .add_systems(Startup, setup_water_reflection);
+        app.update();
+        let camera = app
+            .world_mut()
+            .query_filtered::<Entity, With<WaterReflectionCamera>>()
+            .single(app.world())
+            .expect("one reflection camera");
+        (app, camera)
+    }
+
+    fn reflection_target_size(app: &App) -> UVec2 {
+        let texture = app.world().resource::<WaterReflectionTexture>();
+        app.world()
+            .resource::<Assets<Image>>()
+            .get(&texture.0)
+            .expect("the reflection target")
+            .size()
+    }
+
+    #[test]
+    fn the_default_reflection_camera_keeps_its_prepass_occlusion_and_full_target() {
+        let (app, camera) = spawned_reflection_camera(&[]);
+        let camera = app.world().entity(camera);
+        assert!(camera.contains::<DepthPrepass>());
+        assert!(camera.contains::<OcclusionCulling>());
+        assert_eq!(reflection_target_size(&app), UVec2::new(1024, 576));
+    }
+
+    #[test]
+    fn reflection_flags_drop_the_occlusion_culling_or_the_whole_prepass() {
+        let (app, camera) = spawned_reflection_camera(&["--reflection-occlusion=off"]);
+        assert!(app.world().entity(camera).contains::<DepthPrepass>());
+        assert!(!app.world().entity(camera).contains::<OcclusionCulling>());
+
+        let (app, camera) = spawned_reflection_camera(&["--reflection-prepass=off"]);
+        assert!(!app.world().entity(camera).contains::<DepthPrepass>());
+        assert!(
+            !app.world().entity(camera).contains::<OcclusionCulling>(),
+            "occlusion culling needs the prepass"
+        );
+    }
+
+    #[test]
+    fn the_reflection_scale_shrinks_the_target() {
+        let (app, _) = spawned_reflection_camera(&["--reflection-scale", "0.5"]);
+        assert_eq!(reflection_target_size(&app), UVec2::new(512, 288));
+    }
+
+    fn four_cascades_for(views: &[Entity]) -> Cascades {
+        Cascades {
+            cascades: views
+                .iter()
+                .map(|view| (*view, vec![bevy::light::cascade::Cascade::default(); 4]))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_reflection_view_keeps_only_the_cascades_asked_for() {
+        let mut app = App::new();
+        app.insert_resource(WaterReflectionCascadeLimit(1))
+            .add_systems(Update, limit_water_reflection_cascades);
+        let main = app.world_mut().spawn_empty().id();
+        let reflection = app
+            .world_mut()
+            .spawn((WaterReflectionCamera, RenderLayers::layer(0)))
+            .id();
+        let sun = app
+            .world_mut()
+            .spawn((
+                DirectionalLight::default(),
+                four_cascades_for(&[main, reflection]),
+            ))
+            .id();
+        let doorway_sun = app
+            .world_mut()
+            .spawn((
+                DirectionalLight::default(),
+                four_cascades_for(&[main, reflection]),
+                RenderLayers::layer(2),
+            ))
+            .id();
+        app.update();
+
+        let count = |light: Entity, view: Entity| {
+            app.world().get::<Cascades>(light).unwrap().cascades[&view].len()
+        };
+        assert_eq!(
+            count(sun, reflection),
+            1,
+            "the sun keeps one cascade for the reflection"
+        );
+        assert_eq!(count(sun, main), 4, "the main camera keeps every cascade");
+        assert_eq!(
+            count(doorway_sun, reflection),
+            0,
+            "a light the reflection cannot see keeps none for it"
+        );
+        assert_eq!(count(doorway_sun, main), 4);
+    }
+
     /// The mesh bounds of the water plane streaming.rs spawns: a `Plane3d` quad a cell wide with no
     /// thickness at all.
     const CELL_WATER_HALF_EXTENTS: Vec3 = Vec3::new(2048.0, 0.0, 2048.0);
