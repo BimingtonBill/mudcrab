@@ -120,3 +120,8 @@ cargo test --release -p dummy-content -- --ignored performance     # release bud
 Security sweeps (truncation and mutation) for generated archives, DDS files and PEX scripts live
 in the converter unit tests; the generated pipeline is covered end to end by
 `crates/converter/tests/fixture_round_trip.rs`.
+
+Property tests (`proptest`, fixed seed, run by the normal test suite) extend those sweeps: the
+ESM, VMAD, LAND, BSA, BA2, PEX and NIF parsers must return an error, never panic or abort,
+on arbitrary bytes and on generated fixtures with overwritten bytes, extreme size and count
+words, and truncation. Shared strategies live in `crates/converter/src/test_strategies.rs`.
