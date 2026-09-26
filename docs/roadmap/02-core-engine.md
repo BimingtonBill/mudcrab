@@ -76,6 +76,36 @@ cargo run -p engine -- --benchmark-only --synthetic-instances 250000 --benchmark
 
 The benchmark uses one mesh/material pair so Bevy's GPU preprocessing can exercise the indirect instancing and visibility path without redistributing Skyrim assets.
 
+### Inspecting a running engine (Bevy Remote Protocol)
+
+The engine can serve the [Bevy Remote Protocol](https://docs.rs/bevy_remote) so developers and
+tools can query entities, components and resources while it runs. It is off by default: build with
+the `remote` feature and start with `--remote`.
+
+```text
+cargo run -p engine --features remote -- --assets modern_assets --remote
+```
+
+`--remote-port <port>` picks another port (and implies `--remote`); the default is Bevy's 15702.
+Bevy also serves the render world on 15703, which cannot be changed, so a second engine running
+with `--remote` at the same time cannot serve its render world, even on another `--remote-port`. An engine built without the feature refuses `--remote` with an
+error saying to rebuild with `--features remote`.
+
+```text
+curl -s -X POST http://127.0.0.1:15702 -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"rpc.discover\"}"
+curl -s -X POST http://127.0.0.1:15702 -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"world.query\",\"params\":{\"data\":{\"components\":[\"engine::world::components::FormId\"]}}}"
+```
+
+Only reflected types are visible through the protocol: Bevy's own (`Transform`, `Name`, ...), the
+engine's world components (`FormId`, `CellRef`, `WorldPosition`, `ExteriorCellGrid`, ...) and the
+`StreamingMetrics` and `RenderOrigin` resources. On the portal branch also the `ActiveCell`
+resource and the `LoadDoor`, `DoorState`, `DoorLeaf`, `StreamedCellKey`, `DistantTerrainRoot`,
+`Player`, `PlayerMode` and `CrossingHeld` components (for example
+`engine::doors::DoorState` in a `world.query`).
+
+The server listens on 127.0.0.1 only and has **no authentication**: anything that can reach the
+port can read and change the world. Use it for local development only.
+
 ## Integration and acceptance
 
 The full asset-integrity, real-world, stress, stability, and performance procedure is documented in

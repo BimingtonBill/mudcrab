@@ -1,6 +1,9 @@
 use bevy::prelude::Resource;
 use std::path::PathBuf;
 
+/// Bevy Remote Protocol's default HTTP port, used by `--remote` unless `--remote-port` is given.
+pub const DEFAULT_REMOTE_PORT: u16 = 15702;
+
 #[derive(Debug, Clone, Resource)]
 pub struct EngineConfig {
     pub assets_dir: PathBuf,
@@ -50,6 +53,9 @@ pub struct EngineConfig {
     /// The portal's own options: the walk, the demo starts, the scripted tour and the shots run.
     /// One struct, parsed by one block at the end of this file ([`PortalOptions`]).
     pub portal: PortalOptions,
+    /// Serve the Bevy Remote Protocol on 127.0.0.1 (`--remote`). Needs the `remote` feature.
+    pub remote: bool,
+    pub remote_port: u16,
 }
 
 /// The default reach of the terrain-only ring, in cells: eight cells is 32,768 units of landscape
@@ -117,6 +123,8 @@ impl Default for EngineConfig {
             start_position: None,
             start_yaw: 0.0,
             portal: PortalOptions::default(),
+            remote: false,
+            remote_port: DEFAULT_REMOTE_PORT,
         }
     }
 }
@@ -255,6 +263,13 @@ impl EngineConfig {
                 "--transform-bounds-fixture" => config.transform_bounds_fixture = true,
                 "--renderer-fixture" => config.renderer_fixture = true,
                 "--streaming-fixture" => config.streaming_fixture = true,
+                "--remote" => config.remote = true,
+                "--remote-port" => {
+                    config.remote = true;
+                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
+                        config.remote_port = value;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1223,5 +1238,24 @@ mod tests {
         assert!(config.transform_bounds_fixture);
         assert!(config.renderer_fixture);
         assert!(config.streaming_fixture);
+        assert!(!config.remote);
+        assert_eq!(config.remote_port, DEFAULT_REMOTE_PORT);
+    }
+
+    #[test]
+    fn parses_remote_options() {
+        let config = EngineConfig::from_args(["--remote"].map(str::to_owned));
+        assert!(config.remote);
+        assert_eq!(config.remote_port, DEFAULT_REMOTE_PORT);
+
+        let config =
+            EngineConfig::from_args(["--remote", "--remote-port", "16000"].map(str::to_owned));
+        assert!(config.remote);
+        assert_eq!(config.remote_port, 16_000);
+
+        // A port on its own asks for the server too rather than being silently ignored.
+        let config = EngineConfig::from_args(["--remote-port", "16001"].map(str::to_owned));
+        assert!(config.remote);
+        assert_eq!(config.remote_port, 16_001);
     }
 }

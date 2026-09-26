@@ -254,7 +254,8 @@ struct PendingCrossing {
 /// [`PendingCrossing`] holds. Put on and taken off by [`apply_door_crossings`], read by the portal
 /// and by the door animation, which both have to leave that door looking shut until the crossing
 /// can be made.
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
+#[reflect(Component)]
 pub struct CrossingHeld;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

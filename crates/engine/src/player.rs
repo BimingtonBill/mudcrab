@@ -211,7 +211,8 @@ fn controls_text(mode: PlayerMode) -> String {
 }
 
 /// How the player moves: on the ground, or free flight.
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[reflect(Component)]
 pub enum PlayerMode {
     /// Gravity, ground following, step-up and walls.
     #[default]
@@ -232,7 +233,8 @@ impl PlayerMode {
 
 /// The first-person player, attached to the [`StreamingCamera`] entity: the transform **is** the
 /// eye, one [`EYE_HEIGHT`] above the player's feet.
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq)]
+#[reflect(Component)]
 pub struct Player {
     /// Rotation about Y, in radians. Zero looks along -Z, as Bevy's `Transform::forward` does.
     pub yaw: f32,

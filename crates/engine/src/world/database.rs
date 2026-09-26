@@ -1,5 +1,5 @@
 use crate::doors::DoorwayPlacement;
-use bevy::prelude::Resource;
+use bevy::prelude::{Reflect, Resource};
 use color_eyre::{Result, eyre::WrapErr};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use rusqlite::{Connection, OpenFlags, params};
@@ -21,7 +21,7 @@ pub(crate) const EXTERIOR_CELL_ID_SQL: &str = "SELECT c.id FROM cells c
      ORDER BY (l.cell_id IS NOT NULL) DESC, c.id DESC
      LIMIT 1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Reflect, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CellKey {
     Exterior {
         worldspace_id: u32,
