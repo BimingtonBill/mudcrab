@@ -1440,11 +1440,21 @@ fn swung_open_clips(
 ) -> Option<(AnimationClip, Option<AnimationClip>)> {
     let open = open?;
     let swung = rebuilt_clip(open, Resample::SwungOpen(factors))?;
+    // A scaled door closes by retracing its scaled swing, whatever its own `Close` clip is. A
+    // `Close` that mirrors the `Open` is that already; one that is a motion of its own - a few
+    // degrees from a pose near the open one to a pose near the rest pose - cannot be scaled into a
+    // close at all: turned about its first pose it ends forty times its few degrees from where it
+    // started, and turned about the rest pose any degree it misses the rest pose by is multiplied
+    // too. Dragonsreach's great doors (`WRCastleDoor01`, scaled 40 times) "closed" to a leaf
+    // standing open across the doorway with no window behind it (the user's capture of
+    // 2026-09-26 17:26, note 02).
     let close = match close {
-        Some(close) if close_mirrors_open(open, close, moved) => {
+        Some(close) => {
+            if !close_mirrors_open(open, close, moved) {
+                debug!("a scaled door's own close is a motion of its own; it retraces its swing");
+            }
             Some(rebuilt_clip(&swung, Resample::Reversed)?)
         }
-        Some(close) => Some(rebuilt_clip(close, Resample::SwungOpen(factors))?),
         None => None,
     };
     Some((swung, close))
@@ -6086,6 +6096,42 @@ mod tests {
     /// A door whose `Close` is its `Open` run backwards - every load door in the install that has
     /// both - closes by retracing the scaled swing, not by running `Close` through the same scaling
     /// and carrying the leaf past closed.
+    /// A `Close` that is a motion of its own - here one that also moves a node the `Open` does not,
+    /// as Dragonsreach's `WRCastleDoor01` does not mirror its `Open` - is scaled about the pose the
+    /// door closes to, so a scaled door that closes stands shut: scaled about its own first pose
+    /// (the open one) it ended the leaf far past the frame, standing open in a "closed" doorway.
+    #[test]
+    fn a_close_of_its_own_ends_on_the_pose_the_door_stands_in() {
+        let leaf = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
+        let latch = target_id(&[BASIS, MODEL_ROOT, "Latch"]);
+        let open = clip_swinging(CLIP_SECONDS, leaf, 0.0, NARROW_SWING_DEGREES);
+        let mut close = clip_swinging(CLIP_SECONDS, leaf, NARROW_SWING_DEGREES, 0.0);
+        let latch_turn = clip_swinging(CLIP_SECONDS, latch, 0.0, 3.0);
+        for (target, curves) in latch_turn.curves() {
+            for curve in curves {
+                close.add_variable_curve_to_target(*target, curve.clone());
+            }
+        }
+        let moved = HashSet::from([leaf]);
+        assert!(!close_mirrors_open(&open, &close, &moved));
+
+        let factors = swing_factors(&open, &moved);
+        let (swung, closed) = swung_open_clips(Some(&open), Some(&close), &moved, &factors)
+            .expect("a swinging door with a close of its own");
+        let closed = closed.expect("the close came back");
+        let from = pose(&closed, leaf, 0.0)
+            .angle_between(pose(&swung, leaf, swung.duration()))
+            .to_degrees();
+        assert!(
+            from < 0.5,
+            "the close starts where the swing ended, not {from} degrees off"
+        );
+        let stopped = pose(&closed, leaf, closed.duration())
+            .angle_between(pose(&open, leaf, 0.0))
+            .to_degrees();
+        assert!(stopped < 0.5, "and stands shut, not {stopped} degrees open");
+    }
+
     #[test]
     fn a_mirrored_close_is_the_scaled_open_run_backwards() {
         let leaf = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
@@ -6143,39 +6189,34 @@ mod tests {
         }
     }
 
-    /// A `Close` that is a motion of its own rather than the `Open` run backwards is scaled the same
-    /// way `Open` is - about its own first pose - because there is no swing of its own to retrace.
+    /// A scaled door whose own `Close` is a motion of its own - starting 5 degrees off where the
+    /// swing ended - closes by retracing its scaled swing: scaling that motion would end it tens of
+    /// degrees from the pose the door stands in.
     #[test]
-    fn a_close_that_is_a_motion_of_its_own_is_scaled_its_own_way() {
+    fn a_scaled_door_with_a_close_of_its_own_retraces_its_swing() {
         let leaf = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
         let open = clip_swinging(CLIP_SECONDS, leaf, 0.0, NARROW_SWING_DEGREES);
-        // Starts 5 degrees off where the swing ended, and ends elsewhere than where it started:
-        // not this door's opening run backwards.
         let close = clip_swinging(CLIP_SECONDS, leaf, 5.0, 0.0);
         let moved = HashSet::from([leaf]);
         assert!(
             !close_mirrors_open(&open, &close, &moved),
             "5 degrees is not where the swing ended at 8"
         );
-
         let factors = swing_factors(&open, &moved);
-        let factor = factors[&leaf];
-        let (_, closed) = swung_open_clips(Some(&open), Some(&close), &moved, &factors)
+        let (swung, closed) = swung_open_clips(Some(&open), Some(&close), &moved, &factors)
             .expect("a swinging door with a close of its own");
         let closed = closed.expect("the close came back");
-
-        let start = swung_from_rest(&closed, leaf, 0.0);
+        let from = pose(&closed, leaf, 0.0)
+            .angle_between(pose(&swung, leaf, swung.duration()))
+            .to_degrees();
         assert!(
-            start < 0.01,
-            "a scaled clip starts where its own clip started: {start} degrees of drift"
+            from < 0.5,
+            "the close starts where the swing ended, not {from} degrees off"
         );
-        // Its own motion - 5 degrees down to 0 - turned the same way and by the same factor.
-        let turned = swung_from_rest(&closed, leaf, closed.duration());
-        let expected = 5.0 * factor;
-        assert!(
-            (turned - expected).abs() < 0.5,
-            "the close's own 5 degrees became {turned}, not {expected}"
-        );
+        let stopped = pose(&closed, leaf, closed.duration())
+            .angle_between(pose(&open, leaf, 0.0))
+            .to_degrees();
+        assert!(stopped < 0.5, "and stands shut, not {stopped} degrees open");
     }
 
     /// A door whose own clip is too narrow to open the doorway is given its own swing, scaled: the
