@@ -1,7 +1,11 @@
 # DDS to KTX2 Texture Conversion
 
 OpenSkyrim converts extracted Skyrim DDS assets ahead of time to Basis Universal UASTC in KTX2
-containers. The runtime can transcode that payload to the best GPU format available through Bevy.
+containers whose levels are Zstandard-supercompressed (`supercompressionScheme = 2`). The runtime
+decompresses the levels and can transcode that payload to the best GPU format available through
+Bevy. Supercompression is lossless over the level data: the decoded UASTC blocks are the bytes the
+uncompressed container held, so a texture's texels do not depend on whether its levels were
+compressed.
 
 ## Semantic encoding contract
 
@@ -38,11 +42,23 @@ output is atomically renamed into place, the converter verifies:
 - encoded byte length and deterministic SHA-256;
 - expanded RGBA byte size, color model and supercompression mode.
 
+The encoder returns raw UASTC levels, so the container is then rewritten level by level: every
+level becomes one Zstandard frame, its index entry records the compressed length plus the
+uncompressed length, and the header declares scheme 2. Nothing else in the container changes — the
+DFD, key/value data, dimensions, transfer function and the sRGB alias handling are copied through —
+and Zstandard carries no supercompression global data.
+
+A published texture is reused only when its levels already carry that supercompression. A container
+of raw levels left by an earlier conversion (or by a resumed staging directory) is recompressed
+from its own levels instead of being copied forward or re-encoded from the DDS; both alternatives
+would produce the same texels, one for the cost of a copy and the other for minutes per thousand
+textures. Its manifest entry is rewritten with the hash of the bytes actually published, so a
+recompression invalidates nothing else and a later run reuses the recompressed file directly.
+
 Temporary files are removed after a failed validation/publication. Batch conversion is staged and
-only becomes a complete schema-12 manifest when every asset and required GLB texture URI validates.
-The standalone texture-closure report uses format version 3, records the converter schema and the
-same metadata per texture, and never reports success for missing required assets or conversion
-failures.
+only becomes a complete manifest when every asset and required GLB texture URI validates. The
+standalone texture-closure report uses format version 3, records the converter schema and the same
+metadata per texture, and never reports success for missing required assets or conversion failures.
 
 ## Round-trip acceptance
 
