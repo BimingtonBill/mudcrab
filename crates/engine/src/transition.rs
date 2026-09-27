@@ -844,23 +844,54 @@ pub(crate) fn door_map(
     origin: IVec2,
 ) -> DoorMap {
     let (arrival_position, arrival_rotation) = arrival_frame(&door.destination, origin);
+    let (pivot, frame) =
+        source_doorway_plane(door_position, door_rotation, door_scale, door, anchor);
     let mut map = DoorMap {
-        pivot: door_position,
-        frame: door_frame(door_rotation, door.outward),
+        pivot,
+        frame,
         arrival_position,
         arrival_rotation,
     };
     let Some(anchor) = anchor else {
         return map;
     };
-    map.pivot = source_doorway_centre(door_position, door_rotation, door_scale, anchor);
     map.arrival_position =
         destination_doorway_centre(anchor, door.destination.interior_cell_id.is_some(), origin);
-    let (frame, arrival_rotation) =
+    // Only the destination's frame is taken here: the source side above already came from
+    // [`source_doorway_plane`], which is the same definition, and `doorway_frames` returns both.
+    let (_, arrival_rotation) =
         doorway_frames(anchor, door_rotation, door.outward, map.arrival_rotation);
-    map.frame = frame;
     map.arrival_rotation = arrival_rotation;
     map
+}
+
+/// The source side of a door's map: the point its doorway plane stands on and the frame it is
+/// measured in, whose `-Z` is the side a player walks in from.
+///
+/// [`door_map`] builds its `pivot` and `frame` from this, and the player's walk-through plane
+/// ([`crate::player::doorway_walk_plane`]) reads its own from here too, so the plane the crossing
+/// fires in is the plane the portal's window carries the destination image in - one definition, and
+/// the two cannot drift apart.
+///
+/// Which way the doorway faces is the doorway's own facing where the data has one
+/// ([`source_doorway_frame`]); without an anchor the door's link-derived [`door_frame`] is all there
+/// is. Where the doorway *stands* is its own centre under an anchor, and the door's reference origin
+/// without one, which is what the map has always pivoted on.
+pub(crate) fn source_doorway_plane(
+    door_position: Vec3,
+    door_rotation: Quat,
+    door_scale: Vec3,
+    door: &LoadDoor,
+    anchor: Option<&DoorAnchor>,
+) -> (Vec3, Quat) {
+    let frame = source_doorway_frame(door_rotation, door.outward, anchor);
+    match anchor {
+        Some(anchor) => (
+            source_doorway_centre(door_position, door_rotation, door_scale, anchor),
+            frame,
+        ),
+        None => (door_position, frame),
+    }
 }
 
 /// The two frames an anchored map is built in: the source doorway's - its `-Z` is the side a player
@@ -882,14 +913,14 @@ pub(crate) fn doorway_frames(
             source,
             destination,
         } => (
-            Quat::from_rotation_y(-source),
-            Quat::from_rotation_y(-destination),
+            heading_to_rotation(source),
+            heading_to_rotation(destination),
         ),
         DoorwayFacings::SameModel { turn } => {
             // The conventions cancel: the destination doorway faces exactly `turn` from the source
             // one, whatever the model's own axis is, so the map's turn is exact either way.
             let frame = door_frame(door_rotation, outward);
-            (frame, frame * Quat::from_rotation_y(-turn))
+            (frame, frame * heading_to_rotation(turn))
         }
         DoorwayFacings::Kept => (door_frame(door_rotation, outward), arrival_rotation),
     }
@@ -930,7 +961,7 @@ pub(crate) fn source_doorway_frame(
 ) -> Quat {
     match anchor {
         Some(anchor) => match anchor.facings {
-            DoorwayFacings::Known { source, .. } => Quat::from_rotation_y(-source),
+            DoorwayFacings::Known { source, .. } => heading_to_rotation(source),
             // The destination's frame is not wanted here, and the arrival rotation belongs to the
             // map: this one is the source doorway's alone.
             DoorwayFacings::SameModel { .. } | DoorwayFacings::Kept => {
@@ -1701,8 +1732,8 @@ mod tests {
     // -----------------------------------------------------------------------------------------
 
     use crate::doors::{
-        ANCHOR_HEIGHT_CAP, ANCHOR_PLAN_CAP, DoorAnchorTier, DoorwayFacings, DoorwayPlacement,
-        doorway_anchor,
+        ANCHOR_HEIGHT_CAP, ANCHOR_PLAN_CAP, DoorAnchorTier, DoorwayFacings, DoorwayGeometry,
+        DoorwayPlacement, doorway_anchor,
     };
 
     /// Sven's House, the door the user reported: the same base model on both sides, so tier 1.
@@ -2334,6 +2365,70 @@ mod tests {
             ),
             "and the destination's is that frame turned by the doorways' own yaw difference"
         );
+    }
+
+    /// The plane the player walks a doorway through is the source side of the door's **own map**
+    /// ([`source_doorway_plane`], which [`door_map`] builds its `pivot` and `frame` from): the
+    /// crossing then fires in the plane the portal's window carries the destination image in.
+    ///
+    /// This is the guard for that one owner. The frames must agree on an anchored door and on one
+    /// without, and an anchored walk plane must stand on the map's own pivot - so a `door_map` that
+    /// starts deriving its source side somewhere else, or a walk plane that keeps a copy of its own,
+    /// fails here instead of showing the wall behind a door for the last step into it.
+    #[test]
+    fn the_walk_through_plane_is_the_maps_source_side() {
+        let (source, destination) = svens_house_doorways();
+        let anchor = doorway_anchor(&source, &destination, SVENS_HOUSE_ARRIVAL, false).unwrap();
+        let door = svens_house_door(&source);
+        let position = creation_to_bevy(Vec3::from_array(source.position));
+        let rotation = creation_rotation_to_bevy(source.rotation);
+        let scale = Vec3::ONE;
+        // The volume the door's own model measures, which is where a walk plane without an anchor has
+        // always stood: a box whose centre is well off the reference, so a plane that quietly took
+        // the map's pivot instead would move by 80 units.
+        let trigger = crate::player::auto_door_trigger(
+            position,
+            rotation,
+            scale,
+            Some(&crate::world::components::InstanceBounds {
+                min: Vec3::new(-20.0, 0.0, -6.0),
+                max: Vec3::new(20.0, 160.0, 6.0),
+            }),
+            None,
+        );
+
+        let anchored = Some(&anchor);
+        let unanchored: Option<&DoorAnchor> = None;
+        for anchor in [anchored, unanchored] {
+            let map = door_map(position, rotation, scale, &door, anchor, IVec2::ZERO);
+            let (centre, frame) = crate::player::doorway_walk_plane(
+                position, rotation, scale, &door, anchor, &trigger,
+            );
+            assert!(
+                frame.abs_diff_eq(map.frame, 1.0e-6),
+                "the walk plane and the map's source side are measured in different frames: \
+                 {frame:?} against {:?}",
+                map.frame
+            );
+            match anchor {
+                Some(_) => assert!(
+                    centre.abs_diff_eq(map.pivot, 1.0e-6),
+                    "an anchored walk plane stands at {centre:?}, the map's pivot at {:?}",
+                    map.pivot
+                ),
+                None => {
+                    assert_eq!(
+                        centre,
+                        trigger.centre(),
+                        "a door without an anchor walks the volume its own model measures"
+                    );
+                    assert!(
+                        (centre - map.pivot).length() > 1.0,
+                        "and that is not the map's pivot, so this comparison can tell the two apart"
+                    );
+                }
+            }
+        }
     }
 
     fn interior_destination(cell_id: u32) -> LoadDoor {
@@ -3264,7 +3359,8 @@ mod tests {
         // Before `heading_to_rotation` was the single entry point, `arrival_camera_rotation` took
         // an XTEL heading directly, `door_frame` recovered a heading from an outward direction
         // vector with `atan2` first, and `shots::shot_camera_rotation` took a heading in degrees.
-        // All three now call `heading_to_rotation`; this checks the actual public functions still
+        // The two doorway frames did the same by hand (`doorway_frames`, `source_doorway_frame`).
+        // All of them now call `heading_to_rotation`; this checks the actual public functions still
         // agree with each other and with it, for headings in every quadrant plus one off-axis.
         // Compared as the direction each rotation faces, not component by component: `q` and `-q`
         // are the same rotation, and at 180 degrees `atan2` hands back -pi where the heading was pi.
@@ -3293,6 +3389,49 @@ mod tests {
                     1.0e-5
                 ),
                 "heading {degrees}: shot_camera_rotation disagrees with heading_to_rotation"
+            );
+
+            // The doorway frames, which took their two headings straight to `Quat::from_rotation_y`
+            // before: a doorway whose own facing is known turns its Creation heading, and the walk
+            // plane's is the source doorway's alone. The destination is a quarter turn off the
+            // source, so the two cannot agree by accident.
+            let destination_heading = heading + PI / 2.0;
+            let anchor = DoorAnchor {
+                tier: DoorAnchorTier::Conventions,
+                source_box_centre: [0.0; 3],
+                source_anchor_height: 0.0,
+                destination: DoorwayGeometry {
+                    position: [0.0; 3],
+                    rotation: [0.0, 0.0, destination_heading],
+                    scale: 1.0,
+                    box_centre: [0.0; 3],
+                    anchor_height: 0.0,
+                },
+                destination_grid: None,
+                facings: DoorwayFacings::Known {
+                    source: heading,
+                    destination: destination_heading,
+                },
+            };
+            let (source_frame, destination_frame) =
+                doorway_frames(&anchor, Quat::IDENTITY, None, Quat::IDENTITY);
+            assert!(
+                shared.abs_diff_eq(facing(source_frame), 1.0e-5),
+                "heading {degrees}: doorway_frames' source frame disagrees with heading_to_rotation"
+            );
+            assert!(
+                facing(heading_to_rotation(destination_heading))
+                    .abs_diff_eq(facing(destination_frame), 1.0e-5),
+                "heading {degrees}: doorway_frames' destination frame disagrees with \
+                 heading_to_rotation"
+            );
+            assert!(
+                shared.abs_diff_eq(
+                    facing(source_doorway_frame(Quat::IDENTITY, None, Some(&anchor))),
+                    1.0e-5
+                ),
+                "heading {degrees}: the walk plane's source doorway frame disagrees with \
+                 heading_to_rotation"
             );
         }
     }

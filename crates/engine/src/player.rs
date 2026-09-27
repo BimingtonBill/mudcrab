@@ -60,7 +60,7 @@ use crate::{
     streaming::{StreamingWorld, creation_to_bevy},
     transition::{
         CrossDoor, OpenDoor, destination_is_loaded, distance_in_front_of_door, door_is_open,
-        source_doorway_centre, source_doorway_frame,
+        source_doorway_plane,
     },
     world::components::{
         CELL_SIZE, ExpectedModelBounds, InstanceBounds, StreamingCamera, WaterSurface,
@@ -1355,6 +1355,37 @@ pub(crate) fn player_auto_doors(
     profiler.record_elapsed("player/auto_doors", started);
 }
 
+/// The plane the player walks a doorway through: a point in it and the frame its `-Z` faces along,
+/// which is the side a player walks in from.
+///
+/// The frame, and the point under a [`DoorAnchor`], are the source side of the door's own map
+/// ([`crate::transition::source_doorway_plane`]) - the same the portal camera, the doorway quad and
+/// the crossing are built from - so the plane this fires on is the plane the portal's window carries
+/// the destination image in, on both sides of the crossing.
+///
+/// A door **without** an anchor has no doorway geometry in the anchor's sense: the map pivots on its
+/// reference origin, while the walk plane has always stood on the centre of the volume the door's own
+/// model measures ([`auto_door_trigger`], measured from the bounds the portal draws the window from),
+/// which is what puts it in the doorway of a model that hangs its leaf off its reference. That
+/// centre is the `trigger`'s and only that: everything else comes from the map.
+pub(crate) fn doorway_walk_plane(
+    door_position: Vec3,
+    door_rotation: Quat,
+    door_scale: Vec3,
+    door: &LoadDoor,
+    anchor: Option<&DoorAnchor>,
+    trigger: &AutoDoorTrigger,
+) -> (Vec3, Quat) {
+    let (centre, frame) =
+        source_doorway_plane(door_position, door_rotation, door_scale, door, anchor);
+    let centre = if anchor.is_some() {
+        centre
+    } else {
+        trigger.centre()
+    };
+    (centre, frame)
+}
+
 /// Walks the player through an open doorway: the frame the feet cross the doorway's own plane from
 /// the side it faces to the side behind it, the crossing fires (design section 4.3).
 ///
@@ -1364,8 +1395,8 @@ pub(crate) fn player_auto_doors(
 ///   volume the door's model measures ([`auto_door_trigger`]) - the same volume the portal draws
 ///   through - and a door model need not centre its doorway on its reference (the demo's dwemer
 ///   doors hang theirs eight units off). A door with a [`DoorAnchor`] puts both in the doorway's own
-///   frame instead ([`source_doorway_frame`], [`source_doorway_centre`]), which is the frame and the
-///   point the portal's quad carries the destination image in: under the anchored map the two are
+///   frame instead (the map's own source side, via [`doorway_walk_plane`]), which is the frame and
+///   the point the portal's quad carries the destination image in: under the anchored map the two are
 ///   the same plane. That plane is also where the portal's window ends and the
 ///   cell swap has to happen - the quad that carries the destination image stands in that plane
 ///   (`crate::portal`), so the window is drawn up to the frame of the swap and no further - which is
@@ -1459,12 +1490,11 @@ pub(crate) fn player_walks_through_doors(
         // doorway's own centre, which is the frame and the point the portal quad is laid out in: the
         // anchored map takes the two doorways onto each other, so the quad and this plane are the
         // same plane on both sides of the crossing. Without an anchor both are what they always
-        // were - the model's doorway volume in the door's link-derived frame.
-        let frame = source_doorway_frame(rotation, door.outward, anchor);
-        let doorway = match anchor {
-            Some(anchor) => source_doorway_centre(position, rotation, local.scale, anchor),
-            None => trigger.centre(),
-        };
+        // were - the model's doorway volume in the door's link-derived frame. That choice is
+        // [`doorway_walk_plane`], which takes the frame - and the anchored centre - from the map's
+        // own source side (`transition::source_doorway_plane`), so nothing here re-derives them.
+        let (doorway, frame) =
+            doorway_walk_plane(position, rotation, local.scale, door, anchor, &trigger);
         let before = distance_in_front_of_door(doorway, frame, previous);
         let now = distance_in_front_of_door(doorway, frame, feet);
         let reference_front = distance_in_front_of_door(position, frame, feet);

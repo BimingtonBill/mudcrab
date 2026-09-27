@@ -142,19 +142,26 @@ impl EngineConfig {
         })
     }
 
-    /// The configuration from the command line. A reflection cost flag with a value that is not one
-    /// stops the run here, before anything is opened, with the message [`try_from_args`] returns.
+    /// The configuration from these flags, panicking on a flag with a value that is not one.
     ///
-    /// [`try_from_args`]: Self::try_from_args
+    /// **Tests only** ([`cfg(test)`]): no production path may panic on what the user typed. The run's
+    /// own entry, [`from_env`](Self::from_env), reports the message [`try_from_args`] returns and
+    /// exits 2 instead, before the window and the world database exist. This stays as the tests'
+    /// shorthand for "a configuration from these flags" - and a test that wants a bad flag to stop
+    /// the run still says so, with `#[should_panic]`.
+    ///
+    /// [`cfg(test)`]: https://doc.rust-lang.org/reference/conditional-compilation.html#the-test-attribute
+    #[cfg(test)]
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Self {
         Self::try_from_args(args).unwrap_or_else(|error| panic!("{error}"))
     }
 
-    /// The same parse as [`from_args`](Self::from_args), with an unusable value returned instead of
-    /// stopping the run. The flags are parsed before `app::run` exists to report an error the way it
-    /// reports a bad graphics setting (`graphics_settings::from_config`), and the parse entry point
-    /// (`from_env`, `main`) hands the configuration straight to `run`, so the panic in `from_args`
-    /// is what turns a message here into an exit before the window and the world database exist.
+    /// The parse every caller goes through, [`from_env`](Self::from_env) and the tests'
+    /// [`from_args`] alike: an unusable value is returned instead of stopping the run. The flags are
+    /// parsed before `app::run` exists to report an error the way it reports a bad graphics setting
+    /// (`graphics_settings::from_config`), and `main` hands the configuration straight to `run`, so
+    /// the message returned here is what becomes the exit code 2 before the window and the world
+    /// database are opened.
     pub fn try_from_args(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut config = Self::default();
         let mut terrain_radius_given = false;
