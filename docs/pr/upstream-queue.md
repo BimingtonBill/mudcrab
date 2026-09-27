@@ -71,6 +71,7 @@ Built locally from main 6f583cd by Upstream Dev (merges of the component branche
  
 **PACING (the user, 2026-09-27 23:36, via Phase 2 Dev's schedule): new PRs wait for the next maintainer merge; fixes to our open PRs still go (each with the user's yes here).** Monday ~23:00-03:00 is the full acceptance campaign on main: watch only, no builds. Wednesday 30 Sep: project-wide audit and clean-up day.
 **Converter send order under the pacing (agreed with Phase 1 Dev, 2026-09-28; the user can change it):** 1 quick-profile, 2 ktx2-zstd (not before its clean timing A/B), 3 cheap-io (merge #31 in + a torn-GLB resume test once #31 is on main), 4 cache-dir (issue first); converter-progress slots in after #45 merges.
+**#44 note (non-blocking):** `is_safe_relative_asset_path` is defined twice (streaming.rs and world/database.rs, from audit-engine 9e40e93). Phase 2 Dev can write a one-module follow-up if a reviewer raises it or #44 needs a push anyway (push = the user's yes).
 
 **SENT 2026-09-27 with the user's OK ("open all 7 prepped PRs"):** #43 converter-hardening a3e132f, #44 engine-hardening fe010d0, #45 tooling 36fd76f, #46 sky 9ddddf9, #47 sun-shadows 5714ec6, #48 water 55439de, #49 terrain-textures ab2f3e7 (credits #42). These branches are now live PR heads.
 
