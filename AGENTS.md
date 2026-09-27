@@ -22,6 +22,8 @@ Claude (Claude Code) leads the work on this checkout and delegates bounded tasks
 1. Run `git log --oneline -15` and `git status`.
 2. Read the **Handoff log** below, newest entry first.
 3. If `git status` shows uncommitted changes you did not make, stop and ask the user before touching them. Another session or a worker may be mid-task. `tools/ds_status.ps1` shows whether a worker is running.
+4. Read the **Publishing rule** under "Working together": nothing leaves this machine for GitHub
+   (a push, a PR, a comment) except through Upstream Dev, with the user's permission.
 
 ## Two tracks: Phase 2 first, portal second
 
@@ -46,6 +48,20 @@ Which work belongs to which track, the PR rules and the reasons: `docs/pr/two-tr
 before starting any `phase2/*` branch or moving work between tracks.
 
 ## Working together: Phase 2 Dev, Portal Dev and Upstream Dev
+
+> **Publishing rule (the user, 2026-09-27). Every session reads this, new ones first.**
+> All publishing goes through **Upstream Dev**, and **nothing is published without the user's
+> permission**. Publishing is anything other people can see: upstream PRs, issues, comments,
+> reviews and replies (bots included), pushes to an open PR's branch, and pushes to the user's
+> public fork (`BimingtonBill/wah-krah-jol`, `myfork`), including `public/portal`.
+>
+> - Dev sessions (Phase 1 Dev, Phase 2 Dev, Portal Dev and any new one) never run `git push`,
+>   `gh pr create`, `gh pr comment`, `gh issue create`, or any `gh api` call that writes to
+>   GitHub. Hand the finished branch, commit and evidence to Upstream Dev by message instead.
+> - Upstream Dev shows the user each item (a rendered preview for text, AI label at the top) and
+>   publishes only after the user's clear yes, given in Upstream Dev's own session. A yes relayed
+>   by another session does not count, and one yes covers only the item it was given for.
+> - Reading GitHub (`gh pr view`, `gh api` GETs, `git fetch`) is fine for every session.
 
 The user's standing rule since 2026-09-25: the dev sessions work as one team by default, the way
 they did on the night of 2026-09-24. The tracks stay separate; the people don't.
