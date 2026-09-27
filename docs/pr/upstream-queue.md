@@ -45,6 +45,27 @@ The #30 reply promised it. **Written 2026-09-25 night:** `phase2/prune-keeps-fai
 
 **POSTS TO UPSTREAM PAUSED (the user, 2026-09-26: "hold off on posts to realfakenerd's upstream").** No comments, issues, PRs or bot replies on realfakenerd/wah-krah-jol until the user lifts it. The user's own fork (e.g. public/portal) is not affected. Held: the LOD issue (18), the reference-shots route decision. Pushing review fixes also waits unless the user OKs it.
 
+## Bundles (the user, 2026-09-27: fewer, bigger PRs, each with photo/video evidence)
+
+Built locally from main 6f583cd by Upstream Dev (merges of the component branches; conflicts noted). These replace sending the components one by one.
+
+| Bundle branch | Components | Evidence needed | Status |
+|---|---|---|---|
+| `phase2/converter-hardening` | converter-snapshots, cell-name-nul, parser-never-panic (Cargo.toml/lock + dummy-content.md: kept both) | test output (never-panic properties, snapshot) | built, checks running |
+| `phase2/engine-loading` | io-pool-stack, cell-cache-validate-once | Markarth crash log before/after; stress A/B table | built |
+| `phase2/tooling` | scripts-utf8-bom, scripts-schema-from-source, conversion-stage-times, benchmark-frame-times, render-world-timing | sample output | built |
+| (onto #30) | prune-keeps-failed-sources 6bfee13 | test output | ready; a push to our own PR |
+| `phase2/sky` | sky-dome, sky-fog | before/after pairs (p2night) | built |
+| `phase2/water` | water-look, water-colours, reflection-land-only (render.rs: kept both) | lake before/after + reflection | built; reflection citations to verify |
+| `phase2/vertex-colours` | prepass-vertex-alpha, vertex-alpha-faithful, vertex-alpha-flag | gravel/Whiterun before/after | built; needs the converter schema bump |
+| `phase2/terrain-textures` | terrain-samplers-weights, terrain-normal-maps | ground close-ups | built; check overlap with #42 |
+| `phase2/sun-shadows` | sun-shadow-cascades, water-reflection-gating | wide shadow view; timing | built; needs a benchmark |
+| `phase2/housekeeping` | audit-converter, audit-engine, asset-precedence | test output | built |
+| (later) faster re-conversions | resume-publish-only, staging-hard-links | timing | after #30/#31 merge |
+| (after #27) fire and effects | material-publication, nif-billboard-nodes, shared-converter-schema | before/after | waits on #27 |
+| (after the owner answers) distant scenery x2 | lod-engine-terrain (incl. containers + database); lod-engine-trees + tree-billboard-lighting | before/after | waits on the LOD issue |
+| unchanged | initially-disabled-refs (after #40), reference-shots, remote-dev-flag, renderable-base-types (#27) | | |
+
 ## Staged branches, in send order
 
 Branch scan of 2026-09-25 against origin/main 417a262 ("fork" means the same commit is on
