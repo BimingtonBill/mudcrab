@@ -66,6 +66,9 @@ Built locally from main 6f583cd by Upstream Dev (merges of the component branche
 | (after the owner answers) distant scenery x2 | lod-engine-terrain (incl. containers + database); lod-engine-trees + tree-billboard-lighting | before/after | waits on the LOD issue |
 | unchanged | initially-disabled-refs (after #40), reference-shots, remote-dev-flag, renderable-base-types (#27) | | |
 
+**PR texts prepared 2026-09-27 (preview `local/pr-drafts/preview-bundles.html`, images on the fork's pr-assets 430eb7e):** 19 converter-hardening a3e132f, 20 engine-hardening fe010d0 (replaces engine-loading; + audit-engine + texture-path-containment; 265 green), 21 tooling 36fd76f, 22 sky 9ddddf9 (replaces 12/13), 23 water 55439de (after sky), 24 terrain-textures ab2f3e7 (credits #42; drop our Repeat part if #42 merges first), 25 sun-shadows 5714ec6 (needs a main-vs-PR timing number first). Held: `asset-precedence-audit` 5a9a88b (audit-converter + asset-precedence, 278 green; send as a fresh squashed commit: history has local paths), vertex-colours (weak evidence on main; rethink the pitch).
+
+ 
 ## Staged branches, in send order
 
 Branch scan of 2026-09-25 against origin/main 417a262 ("fork" means the same commit is on
