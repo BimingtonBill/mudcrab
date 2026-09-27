@@ -125,6 +125,8 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
   - `remote-dev-flag` f8a5c03: opt-in Bevy Remote Protocol (feature `remote` + `--remote`, 127.0.0.1 only; default deps unchanged). New capability: issue first.
   - Acceptance baseline on main (for PR bodies): every scenario passes at 60 s on a quiet machine (stress p95 ~12 ms); missing for `accepted`: quality/release gates, 3 full reps, human visual sign-off. `C:/Modding/wkj-tools/acceptance-main-60s/`.
 
+- **reuse-window-single-source** e59baad (impl-608, held): one converter reuse window, pinned 0..=15; 130 converter tests. Fits the converter-hardening or the next schema-bump PR.
+
 ## Candidates with no branch yet
 
 - **#30 (a) follow-up** (owed; see above).
