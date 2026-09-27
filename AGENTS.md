@@ -169,6 +169,32 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-27/28 (night) - Claude [phase1] Phase 1 Dev (first session: output size, converter speed, contributor tooling)
+
+**Set-up:** the user accepted the Phase 1 rules (worktree `C:/Modding/wkj-phase1`, `phase1/*` from main,
+targets on D:, owns crates/converter + dummy-content). Plan: `local/research/phase1-plan.md` (items 1-12,
+contributor experience C1-C11, upstream plan items U1-U6). Research: `local/research/phase1-*.md`.
+
+**Branches (all green, handed to Upstream Dev; publishing only with the user's OK):**
+| Branch | Head | What |
+|---|---|---|
+| `phase1/vfs-hard-links` = PR #51 | f14c5a9 | vfs + cache one file (-25 GB measured), NTFS 1,024-name spill |
+| `phase1/ktx2-zstd` | e0496e7 | KTX2 zstd (textures 19.3 -> 13.0 GB), schema +1 with recompress-not-re-encode migration, bevy zstd_rust |
+| `phase1/fast-textures` | 2f507dd | `--texture-mode native` (BCn + RGBA8; 200 tex 286.9 s -> 1.1 s; FLIP <= 0.042); issue draft `local/pr-drafts/30-...` |
+| `phase1/cache-dir` | 56b6bdd | ingestion cache beside the output (`<output>.cache`, migration) - issue first |
+| `phase1/cheap-io` | b583f3b | no per-file fsync in staging, extractor hashes reused, one plugin merge, GLB length check |
+| `phase1/decoder-bounds` | 0914347 | on #43: DDS mips, EsmReader header, BA2/zlib ratio bounds |
+| `phase1/converter-progress` | ba83c96 | live status line, ETA, Ctrl+C resume (needs #45) |
+| `phase1/quick-profile` | 67e7af4 | `[profile.quick]` + CONTRIBUTING (the user said yes) |
+| `prep/portal-zstd` | 28c2d18 | for Portal Dev: #51 + zstd on portal, schema 27 -> 28 (workspace 1070 green) |
+
+**Open:** the clean zstd timing A/B at 08:30 (pair ready: D:/Modding-overflow/p1-timing/SkyrimConverted
+vs -raw, same engine; Phase 2 chains a 3-min run after); a timed native reconversion for the issue draft;
+Wednesday: U1-U6 and plan items 8-9. **Running:** DeepSeek impl-824 (ProgressEstimate, window step A),
+MiMo research-825 (first-30-minutes guide). Lessons: never `du` a conversion folder (memory
+`stray-du-blocks-publish`); coders need a private target dir (shared-check-target mixed branches).
+
+
 ### 2026-09-26 - Claude [phase2] Phase 2 Dev (project audit and plan; acceptance baseline; parser, cache and BRP work)
 
 **The user's asks:** "audit and make project-wide plan for me to see" (the plan page:
