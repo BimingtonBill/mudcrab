@@ -3144,12 +3144,7 @@ fn validate_streaming_lifecycle(
         0
     } else {
         camera.single().map_or(0, |camera| {
-            let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
-            let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
-            let center = IVec2::new(
-                (global_x / CELL_SIZE).floor() as i32,
-                (global_y / CELL_SIZE).floor() as i32,
-            );
+            let center = camera_grid(camera.translation, origin.0);
             let limit = config
                 .unload_radius
                 .max(config.terrain_radius.saturating_add(1));
