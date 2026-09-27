@@ -114,6 +114,8 @@ BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's r
 
 ## Rules for each send
 
+**Evidence in every PR (the user, 2026-09-27):** each staged PR carries visual validation in its body: before/after screenshots (or a short video/GIF for motion, e.g. doors, water, streaming) for anything that changes what you see, labelled with how they were made (build, data, any local-only switch). Host them on the fork's `pr-assets` branch (pinned by commit, as in #41) and embed them. A PR with no visible change shows its evidence as test output or a measured table instead. Phase 2 Dev supplies the renders with each fact sheet.
+
 From upstream's CONTRIBUTING.md and `two-tracks.md` "Rules for every Phase 2 PR":
 
 1. **Issue: optional, the user's call per send.** CONTRIBUTING's workflow step 1 is "Find or Create
