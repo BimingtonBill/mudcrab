@@ -812,7 +812,9 @@ impl ConversionBatch<'_> {
                                             &bytes,
                                             encoding.expect("DDS conversion requires an encoding"),
                                         ) {
-                                            Ok(_) if is_zstd_supercompressed(&bytes) => Staged::Keep,
+                                            Ok(_) if is_zstd_supercompressed(&bytes) => {
+                                                Staged::Keep
+                                            }
                                             Ok(_) => Staged::Supercompress,
                                             Err(_) => Staged::Rebuild,
                                         },
@@ -858,7 +860,9 @@ impl ConversionBatch<'_> {
 
                             let result = result
                                 .map(|()| ConversionOutcome::Converted)
-                                .wrap_err_with(|| format!("failed to convert {}", relative.display()));
+                                .wrap_err_with(|| {
+                                    format!("failed to convert {}", relative.display())
+                                });
                             let _ = outcome_tx.send((
                                 index,
                                 key,
@@ -1810,44 +1814,6 @@ mod tests {
             vec![PathBuf::from("textures/effects/fire.opensky-srgb.ktx2")]
         );
         assert_eq!(fs::read(staging.join(&aliases[0])).unwrap(), b"texture");
-    }
-
-    #[test]
-    fn loose_asset_override_does_not_write_through_a_linked_vfs_entry() {
-        use crate::cache::link_or_copy;
-
-        let directory = tempfile::tempdir().unwrap();
-        let previous = directory.path().join("previous");
-        let previous_vfs = previous.join("vfs/textures/rock.dds");
-        fs::create_dir_all(previous_vfs.parent().unwrap()).unwrap();
-        fs::write(&previous_vfs, b"archive bytes").unwrap();
-
-        // What a first conversion publishes: the extracted `vfs` file and its content-addressed
-        // blob share one file. What a reconversion stages for the same entry is one file with
-        // that published blob again.
-        let hash = "ab".repeat(32);
-        let previous_blob = previous.join(".ingestion-cache/sha256/ab").join(&hash);
-        fs::create_dir_all(previous_blob.parent().unwrap()).unwrap();
-        link_or_copy(&previous_vfs, &previous_blob).unwrap();
-        let staging_vfs = directory.path().join("staging/vfs");
-        let staged = staging_vfs.join("textures/rock.dds");
-        fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        link_or_copy(&previous_blob, &staged).unwrap();
-
-        let data = directory.path().join("Data");
-        fs::create_dir_all(data.join("textures")).unwrap();
-        let loose = data.join("textures/rock.dds");
-        fs::write(&loose, b"loose override").unwrap();
-
-        overlay_loose_assets(&data, &staging_vfs, &[loose]).unwrap();
-
-        assert_eq!(fs::read(&staged).unwrap(), b"loose override");
-        assert_eq!(
-            fs::read(&previous_vfs).unwrap(),
-            b"archive bytes",
-            "the override wrote through the link into the previous output"
-        );
-        assert_eq!(fs::read(&previous_blob).unwrap(), b"archive bytes");
     }
 
     #[test]

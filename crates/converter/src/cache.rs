@@ -297,7 +297,7 @@ mod tests {
         fs::write(
             &path,
             r#"{
-                "schema_version": 27,
+                "schema_version": 28,
                 "complete": true,
                 "configuration_hash": "configuration",
                 "inputs_by_kind": {"nif": 4},
