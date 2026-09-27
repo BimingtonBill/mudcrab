@@ -43,7 +43,7 @@ The #30 reply promised it. **Written 2026-09-25 night:** `phase2/prune-keeps-fai
 4. ~~History paths~~ decided 2026-09-26 (the user, 3a): when lod-engine-trees or material-publication is sent, send it as one fresh squashed commit (same tree, clean history); nothing existing is rewritten.
 5. ~~public/portal~~ done 2026-09-26: re-exported by Portal Dev with the user's direct yes; head ff96ac2 (portal ae25821).
 
-**POSTS TO UPSTREAM PAUSED (the user, 2026-09-26: "hold off on posts to realfakenerd's upstream").** No comments, issues, PRs or bot replies on realfakenerd/wah-krah-jol until the user lifts it. The user's own fork (e.g. public/portal) is not affected. Held: the LOD issue (18), the reference-shots route decision. Pushing review fixes also waits unless the user OKs it.
+**POSTS TO UPSTREAM PAUSED (lifted for the 7 bundle PRs by the user's "open all 7", 2026-09-27; everything else still asks first) (the user, 2026-09-26: "hold off on posts to realfakenerd's upstream").** No comments, issues, PRs or bot replies on realfakenerd/wah-krah-jol until the user lifts it. The user's own fork (e.g. public/portal) is not affected. Held: the LOD issue (18), the reference-shots route decision. Pushing review fixes also waits unless the user OKs it.
 
 ## Bundles (the user, 2026-09-27: fewer, bigger PRs, each with photo/video evidence)
 
@@ -69,6 +69,8 @@ Built locally from main 6f583cd by Upstream Dev (merges of the component branche
 **PR texts prepared 2026-09-27 (preview `local/pr-drafts/preview-bundles.html`, images on the fork's pr-assets 430eb7e):** 19 converter-hardening a3e132f, 20 engine-hardening fe010d0 (replaces engine-loading; + audit-engine + texture-path-containment; 265 green), 21 tooling 36fd76f, 22 sky 9ddddf9 (replaces 12/13), 23 water 55439de (after sky), 24 terrain-textures ab2f3e7 (credits #42; drop our Repeat part if #42 merges first), 25 sun-shadows 5714ec6 (timing in: rural +0.5 ms p50, stress +6% fps). Held: `asset-precedence-audit` 5a9a88b (audit-converter + asset-precedence, 278 green; send as a fresh squashed commit: history has local paths), vertex-colours (weak evidence on main; rethink the pitch).
 
  
+**SENT 2026-09-27 with the user's OK ("open all 7 prepped PRs"):** #43 converter-hardening a3e132f, #44 engine-hardening fe010d0, #45 tooling 36fd76f, #46 sky 9ddddf9, #47 sun-shadows 5714ec6, #48 water 55439de, #49 terrain-textures ab2f3e7 (credits #42). These branches are now live PR heads.
+
 ## Staged branches, in send order
 
 Branch scan of 2026-09-25 against origin/main 417a262 ("fork" means the same commit is on
