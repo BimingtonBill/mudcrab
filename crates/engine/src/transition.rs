@@ -66,11 +66,12 @@ use crate::{
     portal_graph::{PortalGraph, Space},
     profiling::ProfilingState,
     streaming::{
-        ActiveCell, PrestreamCells, RenderOrigin, StreamingWorld, creation_rotation_to_bevy,
-        creation_to_bevy, render_position, reposition_cell_roots,
+        ActiveCell, PrestreamCells, RenderOrigin, StreamingWorld, absolute_render_position,
+        camera_grid, creation_rotation_to_bevy, creation_to_bevy, render_position,
+        reposition_cell_roots,
     },
     world::{
-        components::{CELL_SIZE, ExteriorCellGrid, StreamingCamera},
+        components::{ExteriorCellGrid, StreamingCamera},
         database::CellKey,
     },
 };
@@ -997,15 +998,13 @@ pub(crate) fn destination_doorway_centre(
 
 /// A Creation-engine point from a render-space one: the inverse of `streaming::render_position`
 /// for a point of the space `target` names. An interior is at absolute creation coordinates, an
-/// exterior sits relative to the render origin it was streamed with.
+/// exterior sits relative to the render origin it was streamed with, and
+/// `streaming::absolute_render_position` - the one inverse of that offset - takes it back to the
+/// absolute Bevy frame before the axes are swapped.
 fn creation_from_render(position: Vec3, target: SpaceTarget, origin: IVec2) -> Vec3 {
     let absolute = match target {
         SpaceTarget::Interior(_) => position,
-        SpaceTarget::Exterior(_) => Vec3::new(
-            position.x + origin.x as f32 * CELL_SIZE,
-            position.y,
-            position.z - origin.y as f32 * CELL_SIZE,
-        ),
+        SpaceTarget::Exterior(_) => absolute_render_position(position, origin),
     };
     Vec3::from_array(shared::coordinates::runtime_to_creation_vector(
         absolute.to_array(),
@@ -1100,13 +1099,12 @@ pub(crate) fn destination_grid(
     destination.worldspace_id?;
     Some(match anchor.and_then(|anchor| anchor.destination_grid) {
         Some([grid_x, grid_y]) => IVec2::new(grid_x, grid_y),
-        None => {
-            let arrival = creation_to_bevy(Vec3::from_array(destination.arrival_position));
-            IVec2::new(
-                (arrival.x / CELL_SIZE).floor() as i32,
-                (-arrival.z / CELL_SIZE).floor() as i32,
-            )
-        }
+        // The arrival point in the absolute Bevy frame is a render position against the zero
+        // origin, so `camera_grid` reads its cell the way it reads the camera's.
+        None => camera_grid(
+            creation_to_bevy(Vec3::from_array(destination.arrival_position)),
+            IVec2::ZERO,
+        ),
     })
 }
 
@@ -1233,12 +1231,9 @@ pub(crate) fn switch_space(
             active.worldspace_id = worldspace_id;
             active.interior = None;
             // The destination may have been pre-streamed, so its roots were placed for the origin
-            // the camera is leaving. Take the origin to its cell and re-place them.
-            let position_in_world = creation_to_bevy(creation_position);
-            origin.0 = IVec2::new(
-                (position_in_world.x / CELL_SIZE).floor() as i32,
-                (-position_in_world.z / CELL_SIZE).floor() as i32,
-            );
+            // the camera is leaving. Take the origin to its cell (the absolute Bevy frame is the
+            // render frame of the zero origin) and re-place them.
+            origin.0 = camera_grid(creation_to_bevy(creation_position), IVec2::ZERO);
             reposition_cell_roots(origin.0, roots);
             render_position(creation_position, origin.0)
         }
@@ -1424,7 +1419,7 @@ mod tests {
         streaming::{StreamingMetrics, StreamingPlugin, StreamingWorld, creation_rotation_to_bevy},
         world::{
             cache::CellCache,
-            components::StreamedCellRoot,
+            components::{CELL_SIZE, StreamedCellRoot},
             database::{AssetCatalog, CellKey, WorldDatabase},
         },
     };

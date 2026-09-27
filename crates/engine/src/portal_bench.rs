@@ -47,16 +47,17 @@
 //! * **Frame time**: `Time<Real>`'s delta, as before.
 
 use crate::{
-    config::grid_of,
     doors::{DoorState, LoadDoor},
     metrics::percentile,
     portal::PortalTexture,
     render_timing::{RENDER_THREAD, RenderTimings, WAIT_FOR_RENDER_THREAD},
     shots::{HexFormId, SETTLE_QUIET_FRAMES, settle_counts},
-    streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy},
+    streaming::{
+        ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, camera_grid, creation_to_bevy,
+    },
     transition::{OpenDoor, SpaceTarget, switch_space},
     world::{
-        components::{CELL_SIZE, ExteriorCellGrid, StreamingCamera},
+        components::{ExteriorCellGrid, StreamingCamera},
         database::CellKey,
     },
 };
@@ -764,19 +765,18 @@ fn door_pose(
     pose
 }
 
-/// The cell the camera stands in, for the settle's residency test (as the demo tour reads it).
+/// The cell the camera stands in, for the settle's residency test (as the demo tour reads it): the
+/// interior it is in, or the exterior grid `streaming::camera_grid` reads from its render position
+/// and the render origin, which is the cell the streaming plan centres on.
 fn camera_cell(active: &ActiveCell, origin: &RenderOrigin, position: Vec3) -> CellKey {
     if let Some(cell_id) = active.interior {
         return CellKey::Interior(cell_id);
     }
-    let (grid_x, grid_y) = grid_of(
-        position.x + origin.0.x as f32 * CELL_SIZE,
-        -position.z + origin.0.y as f32 * CELL_SIZE,
-    );
+    let grid = camera_grid(position, origin.0);
     CellKey::Exterior {
         worldspace_id: active.worldspace_id,
-        grid_x,
-        grid_y,
+        grid_x: grid.x,
+        grid_y: grid.y,
     }
 }
 
@@ -1390,5 +1390,41 @@ mod tests {
         let text = r#"{"doors": [{"ref_id": "0x00000001", "position": [0, 0, 0]}]}"#;
         assert!(DoorsFile::from_json(text).is_err());
         assert!(DoorsFile::from_json(r#"{"doors": []}"#).is_err());
+    }
+
+    /// The settle's cell is the camera's exterior grid at a render origin that is not zero, worked
+    /// by hand on both sides of a cell corner (a render step north is a step along `-z`), and the
+    /// interior itself when the camera is in one, whatever its position.
+    #[test]
+    fn the_camera_cell_is_read_against_the_render_origin() {
+        let exterior = ActiveCell {
+            worldspace_id: 0x3C,
+            interior: None,
+        };
+        let origin = RenderOrigin(IVec2::new(-4, 11));
+        for (position, (grid_x, grid_y)) in [
+            (Vec3::ZERO, (-4, 11)),
+            (Vec3::new(10.0, 0.0, 10.0), (-4, 10)),
+            (Vec3::new(-10.0, 0.0, -10.0), (-5, 11)),
+            (Vec3::new(2.0 * 4096.0 + 1.0, 0.0, -4096.0 - 1.0), (-2, 12)),
+        ] {
+            assert_eq!(
+                camera_cell(&exterior, &origin, position),
+                CellKey::Exterior {
+                    worldspace_id: 0x3C,
+                    grid_x,
+                    grid_y,
+                },
+                "a camera at render {position:?}"
+            );
+        }
+        let interior = ActiveCell {
+            worldspace_id: 0x3C,
+            interior: Some(0x0001_52C3),
+        };
+        assert_eq!(
+            camera_cell(&interior, &origin, Vec3::new(9000.0, 0.0, -9000.0)),
+            CellKey::Interior(0x0001_52C3)
+        );
     }
 }
