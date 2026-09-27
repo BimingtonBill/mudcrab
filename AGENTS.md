@@ -90,8 +90,12 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
 - **Shared findings go in shared places:** reference shots and grades (`local/reference/`), the
   look-gaps list (`docs/research/look-gaps-*.md`), research (`local/research/`), so any session can
   pick them up without asking.
-- **Budgets are shared:** the $20/week DeepSeek limit covers every session; say in the log when a
-  session holds coders. The Claude
+- **Budgets are shared:** the DeepSeek daily limit (`ds_spend.py status`; a stretch to Sat 3 Oct, about
+  $9.73 a day) covers every session; say in the log when a session holds coders. **The split (the
+  user, 2026-09-27):** Phase 1 Dev about 41% of the day ($4.00 of $9.73), Phase 2 Dev 26% ($2.50),
+  Portal Dev 26% ($2.50), Upstream Dev 7% ($0.73). The launcher cannot enforce a per-session share,
+  so each session keeps to its own; a session that finishes early says so in the log and the others
+  may use the rest. It replaces the older "3 Phase 2 coders and 2 Portal coders a day". The Claude
   plan is shared too (one account): when its week runs ahead of pace, every session keeps Claude
   subagents to short lookups.
 
