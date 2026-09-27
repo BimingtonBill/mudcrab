@@ -12,7 +12,10 @@ use crate::{
     mesh::MeshConverter,
     progress::{ProgressEvent, ProgressStage},
     script::ScriptConverter,
-    texture::{TextureConverter, TextureEncoding, TextureSemantic},
+    texture::{
+        TextureConverter, TextureEncoding, TextureSemantic, file_is_zstd_supercompressed,
+        is_zstd_supercompressed, supercompress_ktx2_file,
+    },
 };
 use color_eyre::{
     Result,
@@ -35,6 +38,28 @@ use tokio::{
     task::spawn_blocking,
 };
 use walkdir::WalkDir;
+
+/// What a worker did for one asset; it decides whether the previous manifest entry can be kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversionOutcome {
+    /// The asset was converted from its source (or a staged output was kept or rewritten in place).
+    Converted,
+    /// The previous output was copied byte for byte.
+    Copied,
+    /// The previous output's levels were recompressed into the published form.
+    Recompressed,
+}
+
+/// Whether the output already staged for an asset can be reused as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staged {
+    /// The staged output is complete, including the supercompression this build publishes.
+    Keep,
+    /// The staged output is a valid texture whose levels still have to be supercompressed.
+    Supercompress,
+    /// The staged output cannot be reused and the asset has to be converted again.
+    Rebuild,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineReport {
@@ -139,7 +164,7 @@ impl AssetPipeline {
         let expected_configuration = configuration_hash(&config)?;
         let configuration_is_compatible = previous_manifest.configuration_hash
             == expected_configuration
-            || (matches!(previous_manifest.schema_version, 12..=26)
+            || (matches!(previous_manifest.schema_version, 12..=27)
                 && previous_manifest.configuration_hash
                     == configuration_hash_for_schema(&config, previous_manifest.schema_version)?);
         let previous_manifest = if configuration_is_compatible {
@@ -744,38 +769,61 @@ impl ConversionBatch<'_> {
                                     if let Some(parent) = target.parent() {
                                         let _ = fs::create_dir_all(parent);
                                     }
-                                    if link_or_copy(&old, &target).is_ok() {
+                                    // A texture is only reused when it already carries the
+                                    // supercompression this build publishes. A container of raw
+                                    // levels (published before the converter wrote them, or left by
+                                    // an earlier schema) is recompressed from its own levels: that
+                                    // costs milliseconds where re-encoding the DDS costs minutes, and
+                                    // it decodes to the same texels either way.
+                                    let reused: Result<ConversionOutcome> = if source_kind == "dds"
+                                        && !file_is_zstd_supercompressed(&old)
+                                    {
+                                        supercompress_ktx2_file(&old, &target)
+                                            .map(|_| ConversionOutcome::Recompressed)
+                                    } else {
+                                        link_or_copy(&old, &target)
+                                            .map(|_| ConversionOutcome::Copied)
+                                            .map_err(Into::into)
+                                    };
+                                    // A reuse that fails falls through to a full conversion below.
+                                    if let Ok(outcome) = reused {
                                         let _ = outcome_tx.send((
                                             index,
                                             key,
                                             hash,
                                             target_rel,
                                             relative.clone(),
-                                            Ok(true), // is_cache_hit = true
+                                            Ok(outcome),
                                             target,
                                         ));
                                         return;
-                                    };
+                                    }
                                 }
                             }
 
-                            let existing_is_valid = target.is_file()
-                                && fs::metadata(&target).is_ok_and(|metadata| metadata.len() > 0)
-                                && match source_kind.as_str() {
-                                    "dds" => fs::read(&target).is_ok_and(|bytes| {
-                                        crate::texture::inspect_ktx2(
+                            let staged = if !target.is_file()
+                                || !fs::metadata(&target).is_ok_and(|metadata| metadata.len() > 0)
+                            {
+                                Staged::Rebuild
+                            } else {
+                                match source_kind.as_str() {
+                                    "dds" => match fs::read(&target) {
+                                        Ok(bytes) => match crate::texture::inspect_ktx2(
                                             &bytes,
                                             encoding.expect("DDS conversion requires an encoding"),
-                                        )
-                                        .is_ok()
-                                    }),
-                                    "nif" | "btr" | "bto" | "pex" => true,
-                                    _ => false,
-                                };
+                                        ) {
+                                            Ok(_) if is_zstd_supercompressed(&bytes) => Staged::Keep,
+                                            Ok(_) => Staged::Supercompress,
+                                            Err(_) => Staged::Rebuild,
+                                        },
+                                        Err(_) => Staged::Rebuild,
+                                    },
+                                    "nif" | "btr" | "bto" | "pex" => Staged::Keep,
+                                    _ => Staged::Rebuild,
+                                }
+                            };
 
-                            let result = if existing_is_valid {
-                                Ok(())
-                            } else {
+                            let convert = || {
                                 // A staged output may be a hard link to the published one
                                 // (`link_or_copy`); a converter that writes its output in place
                                 // would write through the link into the published set, so the old
@@ -797,10 +845,20 @@ impl ConversionBatch<'_> {
                                     _ => unreachable!(),
                                 }
                             };
+                            let result = match staged {
+                                Staged::Keep => Ok(()),
+                                // A staged texture that cannot be rewritten (a damaged container,
+                                // say) is encoded again from its source rather than failing the
+                                // asset, which is what a full reconversion would have done anyway.
+                                Staged::Supercompress => {
+                                    supercompress_ktx2_file(&target, &target).or_else(|_| convert())
+                                }
+                                Staged::Rebuild => convert(),
+                            };
 
-                            let result = result.map(|_| false).wrap_err_with(|| {
-                                format!("failed to convert {}", relative.display())
-                            });
+                            let result = result
+                                .map(|()| ConversionOutcome::Converted)
+                                .wrap_err_with(|| format!("failed to convert {}", relative.display()));
                             let _ = outcome_tx.send((
                                 index,
                                 key,
@@ -847,11 +905,11 @@ impl ConversionBatch<'_> {
             completed += 1;
 
             match conversion {
-                Ok(is_cache_hit) => {
+                Ok(outcome) => {
                     if fail_fast && first_error.is_some() {
                         continue;
                     }
-                    if !is_cache_hit {
+                    if outcome != ConversionOutcome::Copied {
                         let size = match fs::metadata(&target) {
                             Ok(metadata) => metadata.len(),
                             Err(error) => {
@@ -898,7 +956,10 @@ impl ConversionBatch<'_> {
                             completed,
                             total_files,
                             Some(relative.clone()),
-                            "Converted asset",
+                            match outcome {
+                                ConversionOutcome::Recompressed => "Recompressed asset",
+                                _ => "Converted asset",
+                            },
                         )
                         .await;
                         self.manifest.entries.insert(
@@ -913,7 +974,13 @@ impl ConversionBatch<'_> {
                                 output_hash,
                             },
                         );
-                        self.report.converted += 1;
+                        // A recompressed texture rewrote the previous output instead of encoding
+                        // the source again, and its hash above is the hash of the new bytes.
+                        if outcome == ConversionOutcome::Recompressed {
+                            self.report.cache_hits += 1;
+                        } else {
+                            self.report.converted += 1;
+                        }
                     } else {
                         send(
                             &progress_tx,
@@ -1694,6 +1761,7 @@ mod tests {
         assert_eq!(fs::read(&old).unwrap(), b"published");
         assert_eq!(fs::read(&staged).unwrap(), b"reconverted");
     }
+    use crate::cache::hash_bytes;
     use tokio::sync::mpsc;
 
     #[test]
@@ -1843,6 +1911,175 @@ mod tests {
             ConversionManifest::load(&output.join("conversion-manifest.json"))
                 .unwrap()
                 .complete
+        );
+    }
+
+    #[tokio::test]
+    async fn reconversion_supercompresses_a_previously_raw_texture() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("textures")).unwrap();
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 64, 64)
+                .with_mip_levels(3),
+            &mut dummy_content::rng::Rng::new(21),
+        )
+        .unwrap();
+        fs::write(data.join("textures/rock.dds"), &dds).unwrap();
+        let config = PipelineConfig::new(&data, &output);
+
+        let first = run_without_progress(config.clone()).await;
+        assert_eq!(first.converted, 1);
+        assert!(file_is_zstd_supercompressed(
+            &output.join("textures/rock.ktx2")
+        ));
+
+        // What a reconversion used to find: a published container of raw levels, described by the
+        // manifest entry that makes the next run reuse it instead of encoding the DDS again.
+        let raw = TextureConverter::encode_container(
+            &dds,
+            TextureEncoding::DataLinear,
+            config.texture_etc1s_quality,
+            config.texture_uastc_level,
+        )
+        .unwrap();
+        let published_path = output.join("textures/rock.ktx2");
+        fs::write(&published_path, &raw).unwrap();
+        let manifest_path = output.join("conversion-manifest.json");
+        let mut manifest = ConversionManifest::load(&manifest_path).unwrap();
+        let entry = manifest.entries.get_mut("textures/rock.dds").unwrap();
+        entry.output_size = raw.len() as u64;
+        entry.output_hash = hash_bytes(&raw);
+        manifest.save(&manifest_path).unwrap();
+
+        let second = run_without_progress(config).await;
+
+        assert_eq!(second.cache_hits, 1);
+        assert_eq!(second.converted, 0, "the DDS was encoded again");
+        let republished = fs::read(&published_path).unwrap();
+        assert!(
+            is_zstd_supercompressed(&republished),
+            "a raw container was copied into the new output"
+        );
+        assert_eq!(
+            crate::texture::decode_ktx2_levels(&republished),
+            crate::texture::decode_ktx2_levels(&raw)
+        );
+        let manifest = ConversionManifest::load(&manifest_path).unwrap();
+        assert_eq!(
+            manifest.entries["textures/rock.dds"].output_hash,
+            hash_bytes(&republished),
+            "the manifest still describes the raw container"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schema_27_output_recompresses_its_textures_without_encoding_the_dds() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("textures")).unwrap();
+        let spec = dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 64, 64)
+            .with_mip_levels(3);
+        let source_dds =
+            dummy_content::dds::generate(&spec, &mut dummy_content::rng::Rng::new(33)).unwrap();
+        fs::write(data.join("textures/rock.dds"), &source_dds).unwrap();
+        let config = PipelineConfig::new(&data, &output);
+
+        // What the previous schema published: a container of raw levels whose payloads are not the
+        // encoding of the DDS on disk, so the test can tell a recompression from a re-encode.
+        let first = run_without_progress(config.clone()).await;
+        assert_eq!(first.converted, 1);
+        let published_dds =
+            dummy_content::dds::generate(&spec, &mut dummy_content::rng::Rng::new(21)).unwrap();
+        let raw = TextureConverter::encode_container(
+            &published_dds,
+            TextureEncoding::DataLinear,
+            config.texture_etc1s_quality,
+            config.texture_uastc_level,
+        )
+        .unwrap();
+        let published_path = output.join("textures/rock.ktx2");
+        fs::write(&published_path, &raw).unwrap();
+        let manifest_path = output.join("conversion-manifest.json");
+        let mut manifest = ConversionManifest::load(&manifest_path).unwrap();
+        manifest.schema_version = 27;
+        manifest.complete = true;
+        manifest.configuration_hash = configuration_hash_for_schema(&config, 27).unwrap();
+        let entry = manifest.entries.get_mut("textures/rock.dds").unwrap();
+        entry.output_size = raw.len() as u64;
+        entry.output_hash = hash_bytes(&raw);
+        manifest.save(&manifest_path).unwrap();
+
+        let report = run_without_progress(config.clone()).await;
+
+        assert_eq!(report.cache_hits, 1);
+        assert_eq!(report.converted, 0, "the DDS was encoded again");
+        let republished = fs::read(output.join("textures/rock.ktx2")).unwrap();
+        assert!(
+            is_zstd_supercompressed(&republished),
+            "the schema-27 container was copied forward"
+        );
+        assert_eq!(
+            crate::texture::decode_ktx2_levels(&republished),
+            crate::texture::decode_ktx2_levels(&raw),
+            "the published texture is not the recompressed previous output"
+        );
+        assert_ne!(
+            crate::texture::decode_ktx2_levels(&republished),
+            crate::texture::decode_ktx2_levels(
+                &TextureConverter::encode_container(
+                    &source_dds,
+                    TextureEncoding::DataLinear,
+                    config.texture_etc1s_quality,
+                    config.texture_uastc_level,
+                )
+                .unwrap()
+            ),
+            "the published texture was encoded from the DDS"
+        );
+        let manifest = ConversionManifest::load(&manifest_path).unwrap();
+        assert_eq!(
+            manifest.schema_version,
+            crate::cache::CONVERTER_SCHEMA_VERSION
+        );
+        assert!(manifest.complete);
+        assert_eq!(
+            manifest.entries["textures/rock.dds"].output_hash,
+            hash_bytes(&republished)
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_staging_supercompresses_a_raw_texture_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        let staging = temp.path().join("modern.staging-1-2");
+        fs::create_dir_all(data.join("textures")).unwrap();
+        fs::create_dir_all(staging.join("textures")).unwrap();
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 32, 32)
+                .with_mip_levels(2),
+            &mut dummy_content::rng::Rng::new(22),
+        )
+        .unwrap();
+        fs::write(data.join("textures/rock.dds"), &dds).unwrap();
+        let raw =
+            TextureConverter::encode_container(&dds, TextureEncoding::DataLinear, 192, 2).unwrap();
+        fs::write(staging.join("textures/rock.ktx2"), &raw).unwrap();
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let report = run_without_progress(config).await;
+
+        assert_eq!(report.converted, 1);
+        let published = fs::read(output.join("textures/rock.ktx2")).unwrap();
+        assert!(is_zstd_supercompressed(&published));
+        assert_eq!(
+            crate::texture::decode_ktx2_levels(&published),
+            crate::texture::decode_ktx2_levels(&raw)
         );
     }
 

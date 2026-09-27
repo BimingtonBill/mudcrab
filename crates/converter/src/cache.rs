@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 27;
+pub const CONVERTER_SCHEMA_VERSION: u32 = 28;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -64,7 +64,7 @@ impl ConversionManifest {
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
-        if matches!(manifest.schema_version, 12..=26) && CONVERTER_SCHEMA_VERSION == 27 {
+        if matches!(manifest.schema_version, 12..=26) && CONVERTER_SCHEMA_VERSION == 28 {
             // Schemas 13-27 change only NIF publication (15: vertex alpha is not blend, blend
             // factors, editor markers dropped; 16: door Open/Close animation clips; 17: scale
             // channels written as VEC3, which 16 wrote as SCALAR and no conforming glTF reader
@@ -89,6 +89,16 @@ impl ConversionManifest {
             manifest
                 .entries
                 .retain(|_, entry| !entry.output.to_ascii_lowercase().ends_with(".glb"));
+            return Ok(manifest);
+        }
+        if manifest.schema_version == 27 && CONVERTER_SCHEMA_VERSION == 28 {
+            // Schema 28 changes only how texture levels are compressed. Every
+            // recorded output still describes bytes this build can publish:
+            // a texture whose levels are not supercompressed yet is rewritten
+            // from its own levels, and meshes, scripts and archive ingestion
+            // are untouched. Nothing is dropped, so a full reconversion
+            // re-encodes no DDS.
+            manifest.complete = false;
             return Ok(manifest);
         }
         if manifest.schema_version != CONVERTER_SCHEMA_VERSION {
@@ -405,6 +415,42 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read(&blob).unwrap(), b"archive bytes");
         assert_eq!(fs::read(&vfs).unwrap(), b"archive bytes+");
+    }
+
+    #[test]
+    fn a_schema_27_manifest_reuses_every_recorded_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conversion-manifest.json");
+        let mut manifest = ConversionManifest {
+            schema_version: 27,
+            complete: true,
+            configuration_hash: "configuration".to_owned(),
+            ..ConversionManifest::default()
+        };
+        for output in ["meshes/a.glb", "textures/a.ktx2", "scripts/a.luau"] {
+            manifest.entries.insert(
+                output.to_owned(),
+                CacheEntry {
+                    source_hash: "source".to_owned(),
+                    output: output.to_owned(),
+                    output_size: 1,
+                    output_hash: "output".to_owned(),
+                },
+            );
+        }
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let migrated = ConversionManifest::load(&path).unwrap();
+
+        assert_eq!(migrated.schema_version, 27);
+        assert!(!migrated.complete);
+        assert_eq!(migrated.configuration_hash, "configuration");
+        for output in ["meshes/a.glb", "textures/a.ktx2", "scripts/a.luau"] {
+            assert!(
+                migrated.entries.contains_key(output),
+                "{output} lost its reuse entry"
+            );
+        }
     }
 
     #[test]

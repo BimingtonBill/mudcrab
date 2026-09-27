@@ -9,7 +9,7 @@ use std::{
     collections::BTreeSet,
     ffi::c_void,
     fs::{self, File},
-    io::Cursor,
+    io::{Cursor, Read},
     path::Path,
     sync::Once,
 };
@@ -153,47 +153,9 @@ impl TextureConverter {
             .wrap_err_with(|| format!("failed to memory-map {}", input.display()))?;
 
         let ktx2 = Self::convert_with_options(&mmap, encoding, etc1s_quality, uastc_level)?;
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let temporary = output.with_extension(format!("ktx2.{}.partial", std::process::id()));
-        let backup = output.with_extension(format!("ktx2.{}.backup", std::process::id()));
-        ensure!(
-            !temporary.exists() && !backup.exists(),
-            "stale texture publication file exists beside {}",
-            output.display()
-        );
-        fs::write(&temporary, &ktx2)
-            .wrap_err_with(|| format!("failed to write {}", temporary.display()))?;
-        let publish = (|| {
-            let metadata = inspect_ktx2(&ktx2, encoding)?;
-            let had_previous = output.is_file();
-            if had_previous {
-                fs::rename(output, &backup).wrap_err_with(|| {
-                    format!("failed to stage replacement for {}", output.display())
-                })?;
-            }
-            if let Err(error) = fs::rename(&temporary, output) {
-                if had_previous {
-                    let _ = fs::rename(&backup, output);
-                }
-                return Err(error)
-                    .wrap_err_with(|| format!("failed to publish {}", output.display()));
-            }
-            if had_previous {
-                fs::remove_file(&backup).wrap_err_with(|| {
-                    format!("failed to remove publication backup {}", backup.display())
-                })?;
-            }
-            Ok(metadata)
-        })();
-        if publish.is_err() {
-            let _ = fs::remove_file(&temporary);
-            if backup.is_file() && !output.is_file() {
-                let _ = fs::rename(&backup, output);
-            }
-        }
-        publish
+        let metadata = inspect_ktx2(&ktx2, encoding)?;
+        publish_ktx2(output, &ktx2)?;
+        Ok(metadata)
     }
 
     pub fn convert(dds_bytes: &[u8], encoding: TextureEncoding) -> Result<Vec<u8>> {
@@ -206,6 +168,29 @@ impl TextureConverter {
     }
 
     pub fn convert_with_options(
+        dds_bytes: &[u8],
+        encoding: TextureEncoding,
+        etc1s_quality: u8,
+        uastc_level: u8,
+    ) -> Result<Vec<u8>> {
+        let container = Self::encode_container(dds_bytes, encoding, etc1s_quality, uastc_level)?;
+        let published = supercompress_ktx2(&container)?;
+        // `encode_container` validated the container against the DDS; the rewrite only moves level
+        // payloads and the fields that describe them, so the published bytes are re-checked here
+        // for the contract the runtime sees.
+        validate_ktx2(&published, encoding)?;
+        ensure!(
+            is_zstd_supercompressed(&published),
+            "converted KTX2 does not carry Zstandard-supercompressed levels"
+        );
+        Ok(published)
+    }
+
+    /// Encodes every decoded level as raw UASTC in a KTX2 container, without supercompression.
+    ///
+    /// This is the container [`Self::convert_with_options`] rewrites for publication; tests use it
+    /// as the uncompressed reference whose levels the published container must decode to.
+    pub(crate) fn encode_container(
         dds_bytes: &[u8],
         encoding: TextureEncoding,
         etc1s_quality: u8,
@@ -280,6 +265,235 @@ impl TextureConverter {
         validate_ktx2_against_dds(&result, &dds, encoding, false)?;
         Ok(result)
     }
+}
+
+/// Rewrites a KTX2 container so every level is one Zstandard frame.
+///
+/// The Basis encoder emits UASTC levels as raw blocks (`supercompressionScheme = 0`), and the
+/// runtime KTX2 loader decompresses a Zstandard-supercompressed container (scheme 2) before
+/// transcoding it. Supercompression is lossless over the level data: each rewritten level decodes
+/// to exactly the bytes the raw container held. Everything else — the DFD, key/value data,
+/// dimensions, transfer function and sRGB alias handling — is copied through untouched; only the
+/// level payloads, their index entries and the scheme field change. Levels keep their original
+/// order and are laid out back to back: KTX2 asks supercompressed level data for no alignment.
+pub fn supercompress_ktx2(bytes: &[u8]) -> Result<Vec<u8>> {
+    // Only the header and the level table are read here. Parsing the whole container would run the
+    // DFD parser over bytes this function copies through untouched, and a damaged descriptor is
+    // not this step's to interpret.
+    let mut header = bytes
+        .get(..ktx2::Header::LENGTH)
+        .and_then(|header| <&[u8; ktx2::Header::LENGTH]>::try_from(header).ok())
+        .and_then(|header| ktx2::Header::from_bytes(header).ok())
+        .ok_or_else(|| color_eyre::eyre::eyre!("not a KTX2 container"))?;
+    ensure!(
+        header.supercompression_scheme.is_none(),
+        "KTX2 levels are already supercompressed ({:?})",
+        header.supercompression_scheme
+    );
+    ensure!(
+        header.index.sgd_byte_length == 0 && header.index.sgd_byte_offset == 0,
+        "Zstandard supercompression does not use supercompression global data"
+    );
+    let level_count = header.level_count.max(1) as usize;
+    let table_end = ktx2::Header::LENGTH
+        .checked_add(
+            level_count
+                .checked_mul(ktx2::LevelIndex::LENGTH)
+                .ok_or_else(|| color_eyre::eyre::eyre!("KTX2 level table overflow"))?,
+        )
+        .ok_or_else(|| color_eyre::eyre::eyre!("KTX2 level table overflow"))?;
+    // The count comes from the file, so it is only trusted once the table it describes fits in the
+    // container: every allocation and index below is bounded by that.
+    ensure!(
+        table_end <= bytes.len(),
+        "KTX2 level table does not fit in the container"
+    );
+    let mut levels = Vec::with_capacity(level_count);
+    for level in 0..level_count {
+        let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
+        let index = bytes
+            .get(start..start + ktx2::LevelIndex::LENGTH)
+            .and_then(|index| <&[u8; ktx2::LevelIndex::LENGTH]>::try_from(index).ok())
+            .ok_or_else(|| color_eyre::eyre::eyre!("KTX2 level {level} index is truncated"))?;
+        let index = ktx2::LevelIndex::from_bytes(index);
+        let end = (index.byte_offset as usize)
+            .checked_add(index.byte_length as usize)
+            .ok_or_else(|| color_eyre::eyre::eyre!("KTX2 level {level} size overflow"))?;
+        let data = bytes
+            .get(index.byte_offset as usize..end)
+            .ok_or_else(|| color_eyre::eyre::eyre!("KTX2 level {level} is out of bounds"))?;
+        levels.push((level, index.byte_offset as usize, data));
+    }
+    // The level table sits between the header and the DFD/KVD sections, so the smallest level
+    // offset bounds the metadata that has to survive the rewrite unchanged.
+    let metadata_end = (table_end as u64)
+        .max(u64::from(header.index.dfd_byte_offset) + u64::from(header.index.dfd_byte_length))
+        .max(u64::from(header.index.kvd_byte_offset) + u64::from(header.index.kvd_byte_length));
+    let first_data_offset = levels
+        .iter()
+        .map(|(_, offset, _)| *offset)
+        .min()
+        .ok_or_else(|| color_eyre::eyre::eyre!("KTX2 has no levels"))?;
+    ensure!(
+        first_data_offset as u64 >= metadata_end && first_data_offset <= bytes.len(),
+        "invalid KTX2 metadata layout"
+    );
+
+    // Levels keep the order they had in the container. Supercompressed data carries no alignment
+    // requirement in KTX2, so the payloads are laid out back to back and readers go through the
+    // index instead.
+    levels.sort_by_key(|(_, offset, _)| *offset);
+    let mut offsets = vec![0u64; level_count];
+    let mut lengths = vec![0u64; level_count];
+    let mut uncompressed_lengths = vec![0u64; level_count];
+    let mut output = bytes[..first_data_offset].to_vec();
+    for (mip, _, data) in &levels {
+        let compressed = ruzstd::encoding::compress_to_vec(
+            Cursor::new(*data),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        offsets[*mip] = output.len() as u64;
+        lengths[*mip] = compressed.len() as u64;
+        uncompressed_lengths[*mip] = data.len() as u64;
+        output.extend_from_slice(&compressed);
+    }
+    header.supercompression_scheme = Some(ktx2::SupercompressionScheme::Zstandard);
+    output[..ktx2::Header::LENGTH].copy_from_slice(&header.as_bytes());
+    for mip in 0..level_count {
+        let index = ktx2::LevelIndex {
+            byte_offset: offsets[mip],
+            byte_length: lengths[mip],
+            uncompressed_byte_length: uncompressed_lengths[mip],
+        };
+        let start = ktx2::Header::LENGTH + mip * ktx2::LevelIndex::LENGTH;
+        output[start..start + ktx2::LevelIndex::LENGTH].copy_from_slice(&index.as_bytes());
+    }
+    Ok(output)
+}
+
+/// Writes the supercompressed runtime form of the published texture at `source` to `output`.
+///
+/// A texture published before this converter wrote Zstandard levels — or a staging directory left
+/// by such a build — holds raw levels. Re-encoding UASTC from the source DDS takes minutes per
+/// thousand textures; recompressing the levels of the published container takes milliseconds and
+/// yields the bytes an encoding of the same DDS would have produced. `source` and `output` may
+/// name the same file: every byte is read before anything is written.
+///
+/// The container is checked by its header and level table only. A published texture can hold a
+/// damaged data format descriptor — the ktx2 crate's parser panics on one — and that must fail the
+/// asset, not abort a conversion of thousands of them: the caller re-encodes from the source DDS.
+pub fn supercompress_ktx2_file(source: &Path, output: &Path) -> Result<()> {
+    let bytes =
+        fs::read(source).wrap_err_with(|| format!("failed to read {}", source.display()))?;
+    let published = supercompress_ktx2(&bytes)?;
+    ensure!(
+        is_zstd_supercompressed(&published),
+        "rewritten KTX2 does not declare Zstandard"
+    );
+    // The rewrite never interprets the descriptor, so the published container is read here the way
+    // the runtime reads it — including the parser that panics on a damaged descriptor. A bad file
+    // has to fail its asset, not abort a conversion of thousands of them.
+    let inspected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        inspect_runtime_ktx2(&published)
+    }))
+    .map_err(|_| {
+        color_eyre::eyre::eyre!(
+            "KTX2 {} carries a damaged data format descriptor",
+            source.display()
+        )
+    })?;
+    inspected.wrap_err_with(|| format!("invalid runtime KTX2 {}", source.display()))?;
+    publish_ktx2(output, &published)
+}
+
+/// True when `bytes` begins with a KTX2 header whose levels carry Zstandard supercompression.
+///
+/// Only the 80-byte header is read, so this can be asked of a whole file or of the first block of
+/// one, and an unreadable or non-KTX2 file reports `false` instead of an error.
+pub fn is_zstd_supercompressed(bytes: &[u8]) -> bool {
+    bytes
+        .get(..ktx2::Header::LENGTH)
+        .and_then(|header| <&[u8; ktx2::Header::LENGTH]>::try_from(header).ok())
+        .and_then(|header| ktx2::Header::from_bytes(header).ok())
+        .is_some_and(|header| {
+            header.supercompression_scheme == Some(ktx2::SupercompressionScheme::Zstandard)
+        })
+}
+
+/// Reads only the KTX2 header of `path`; see [`is_zstd_supercompressed`].
+pub fn file_is_zstd_supercompressed(path: &Path) -> bool {
+    let mut header = [0u8; ktx2::Header::LENGTH];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok_and(|()| is_zstd_supercompressed(&header))
+}
+
+/// Decodes every level of a container the way the runtime does; test-only.
+#[cfg(test)]
+pub(crate) fn decode_ktx2_levels(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let reader = ktx2::Reader::new(bytes).expect("valid KTX2");
+    reader
+        .levels()
+        .map(|level| match reader.header().supercompression_scheme {
+            Some(ktx2::SupercompressionScheme::Zstandard) => {
+                let mut decoded = Vec::new();
+                ruzstd::decoding::StreamingDecoder::new(Cursor::new(level.data))
+                    .expect("valid Zstandard frame")
+                    .read_to_end(&mut decoded)
+                    .expect("complete Zstandard frame");
+                decoded
+            }
+            None => level.data.to_vec(),
+            other => panic!("unsupported test supercompression {other:?}"),
+        })
+        .collect()
+}
+
+/// Puts `bytes` at `output`, replacing a previous file only once the new bytes are on disk.
+///
+/// The destination's parent directory is created when missing. A leftover publication file beside
+/// `output` is an error rather than something to overwrite: the only writer of those names is a
+/// crashed run of this function.
+fn publish_ktx2(output: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = output.with_extension(format!("ktx2.{}.partial", std::process::id()));
+    let backup = output.with_extension(format!("ktx2.{}.backup", std::process::id()));
+    ensure!(
+        !temporary.exists() && !backup.exists(),
+        "stale texture publication file exists beside {}",
+        output.display()
+    );
+    fs::write(&temporary, bytes)
+        .wrap_err_with(|| format!("failed to write {}", temporary.display()))?;
+    let publish = (|| {
+        let had_previous = output.is_file();
+        if had_previous {
+            fs::rename(output, &backup).wrap_err_with(|| {
+                format!("failed to stage replacement for {}", output.display())
+            })?;
+        }
+        if let Err(error) = fs::rename(&temporary, output) {
+            if had_previous {
+                let _ = fs::rename(&backup, output);
+            }
+            return Err(error).wrap_err_with(|| format!("failed to publish {}", output.display()));
+        }
+        if had_previous {
+            fs::remove_file(&backup).wrap_err_with(|| {
+                format!("failed to remove publication backup {}", backup.display())
+            })?;
+        }
+        Ok(())
+    })();
+    if publish.is_err() {
+        let _ = fs::remove_file(&temporary);
+        if backup.is_file() && !output.is_file() {
+            let _ = fs::rename(&backup, output);
+        }
+    }
+    publish
 }
 
 fn encode_2d_surface(
@@ -1454,6 +1668,337 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn zstd_supercompression_keeps_every_level_byte_identical() {
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 64, 64)
+                .with_mip_levels(4),
+            &mut dummy_content::rng::Rng::new(4),
+        )
+        .unwrap();
+
+        let raw =
+            TextureConverter::encode_container(&dds, TextureEncoding::ColorSrgb, 192, 2).unwrap();
+        let published = supercompress_ktx2(&raw).unwrap();
+
+        let raw_reader = ktx2::Reader::new(&raw).unwrap();
+        let reader = ktx2::Reader::new(&published).unwrap();
+        let header = reader.header();
+        assert_eq!(
+            header.supercompression_scheme,
+            Some(ktx2::SupercompressionScheme::Zstandard)
+        );
+        assert_eq!(header.level_count, raw_reader.header().level_count);
+        assert_eq!(header.pixel_width, raw_reader.header().pixel_width);
+        assert_eq!(header.pixel_height, raw_reader.header().pixel_height);
+        assert_eq!(reader.transfer_function(), raw_reader.transfer_function());
+
+        let raw_levels: Vec<&[u8]> = raw_reader.levels().map(|level| level.data).collect();
+        let decoded = decode_ktx2_levels(&published);
+        assert_eq!(decoded.len(), raw_levels.len());
+        for (mip, (decoded, raw)) in decoded.iter().zip(&raw_levels).enumerate() {
+            assert_eq!(decoded, *raw, "mip {mip} changed under supercompression");
+        }
+        for (mip, (level, raw)) in reader.levels().zip(&raw_levels).enumerate() {
+            assert_eq!(
+                level.uncompressed_byte_length,
+                raw.len() as u64,
+                "mip {mip} does not record its uncompressed length"
+            );
+        }
+
+        // Only the level index and the scheme field may differ: the header around them, the DFD
+        // and the key/value data are copied through byte for byte.
+        let table_end =
+            ktx2::Header::LENGTH + header.level_count as usize * ktx2::LevelIndex::LENGTH;
+        let index = header.index;
+        let metadata_end = (index.dfd_byte_offset + index.dfd_byte_length)
+            .max(index.kvd_byte_offset + index.kvd_byte_length) as usize;
+        assert_eq!(raw[..44], published[..44]);
+        assert_eq!(&published[44..48], 2u32.to_le_bytes());
+        assert_eq!(
+            raw[48..ktx2::Header::LENGTH],
+            published[48..ktx2::Header::LENGTH]
+        );
+        assert_eq!(
+            raw[table_end..metadata_end],
+            published[table_end..metadata_end]
+        );
+        assert!(metadata_end > table_end, "the container carries no DFD/KVD");
+    }
+
+    #[test]
+    fn publishes_zstd_supercompressed_cubemaps_and_volumes() {
+        for spec in [
+            dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 64, 64)
+                .with_mip_levels(4),
+            dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 32, 32)
+                .as_cubemap(),
+            dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8).with_depth(4),
+        ] {
+            let dds =
+                dummy_content::dds::generate(&spec, &mut dummy_content::rng::Rng::new(6)).unwrap();
+            let published =
+                TextureConverter::convert_with_options(&dds, TextureEncoding::DataLinear, 192, 2)
+                    .unwrap();
+
+            inspect_ktx2(&published, TextureEncoding::DataLinear).unwrap();
+            assert!(is_zstd_supercompressed(&published));
+            let reader = ktx2::Reader::new(&published).unwrap();
+            let levels = decode_ktx2_levels(&published);
+            assert_eq!(levels.len(), reader.header().level_count as usize);
+            assert!(
+                levels.iter().all(|level| !level.is_empty()),
+                "a level lost its payload"
+            );
+            assert_eq!(reader.header().face_count, if spec.cubemap { 6 } else { 1 });
+            assert_eq!(reader.header().pixel_depth, spec.depth.unwrap_or(0));
+        }
+    }
+
+    #[test]
+    fn reuses_a_raw_container_by_supercompressing_its_levels() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("legacy.ktx2");
+        let output = directory.path().join("published.ktx2");
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 32, 32)
+                .with_mip_levels(3),
+            &mut dummy_content::rng::Rng::new(5),
+        )
+        .unwrap();
+        let raw =
+            TextureConverter::encode_container(&dds, TextureEncoding::DataLinear, 192, 2).unwrap();
+        fs::write(&source, &raw).unwrap();
+        assert!(!file_is_zstd_supercompressed(&source));
+
+        supercompress_ktx2_file(&source, &output).unwrap();
+
+        let published = fs::read(&output).unwrap();
+        assert!(file_is_zstd_supercompressed(&output));
+        assert_eq!(decode_ktx2_levels(&published), decode_ktx2_levels(&raw));
+        assert_eq!(fs::read(&source).unwrap(), raw, "the source was rewritten");
+    }
+
+    #[test]
+    fn supercompresses_a_staged_texture_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = directory.path().join("rock.ktx2");
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 16, 16),
+            &mut dummy_content::rng::Rng::new(8),
+        )
+        .unwrap();
+        let raw =
+            TextureConverter::encode_container(&dds, TextureEncoding::DataLinear, 192, 2).unwrap();
+        fs::write(&staged, &raw).unwrap();
+
+        supercompress_ktx2_file(&staged, &staged).unwrap();
+
+        let published = fs::read(&staged).unwrap();
+        assert!(file_is_zstd_supercompressed(&staged));
+        assert_eq!(decode_ktx2_levels(&published), decode_ktx2_levels(&raw));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn supercompression_keeps_the_order_the_levels_have_in_the_file() {
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 32, 32)
+                .with_mip_levels(3),
+            &mut dummy_content::rng::Rng::new(9),
+        )
+        .unwrap();
+        let raw =
+            TextureConverter::encode_container(&dds, TextureEncoding::DataLinear, 192, 2).unwrap();
+        // A container whose payloads are not stored in mip order: the rewrite follows the file, not
+        // the mip number.
+        let indexes = level_indexes(&raw);
+        let first_data = indexes
+            .iter()
+            .map(|index| index.byte_offset as usize)
+            .min()
+            .unwrap();
+        let mut permuted = raw[..first_data].to_vec();
+        let mut offsets = vec![0u64; indexes.len()];
+        for level in (0..indexes.len()).rev() {
+            offsets[level] = permuted.len() as u64;
+            let start = indexes[level].byte_offset as usize;
+            permuted.extend_from_slice(&raw[start..start + indexes[level].byte_length as usize]);
+        }
+        for (level, offset) in offsets.iter().enumerate() {
+            let index = ktx2::LevelIndex {
+                byte_offset: *offset,
+                byte_length: indexes[level].byte_length,
+                uncompressed_byte_length: indexes[level].uncompressed_byte_length,
+            };
+            let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
+            permuted[start..start + ktx2::LevelIndex::LENGTH].copy_from_slice(&index.as_bytes());
+        }
+
+        let published = supercompress_ktx2(&permuted).unwrap();
+
+        let placement = |bytes: &[u8]| {
+            let mut placed: Vec<(u64, usize, u64)> = level_indexes(bytes)
+                .iter()
+                .enumerate()
+                .map(|(mip, index)| (index.byte_offset, mip, index.byte_length))
+                .collect();
+            placed.sort_unstable();
+            placed
+        };
+        let placed = placement(&published);
+        assert_eq!(
+            placed.iter().map(|(_, mip, _)| *mip).collect::<Vec<_>>(),
+            placement(&permuted)
+                .iter()
+                .map(|(_, mip, _)| *mip)
+                .collect::<Vec<_>>(),
+            "the levels were reordered"
+        );
+        assert_eq!(
+            placed.iter().map(|(_, mip, _)| *mip).collect::<Vec<_>>(),
+            (0..indexes.len()).rev().collect::<Vec<_>>(),
+            "the fixture no longer stores its levels in reverse mip order"
+        );
+        for pair in placed.windows(2) {
+            assert_eq!(
+                pair[0].0 + pair[0].2,
+                pair[1].0,
+                "supercompressed levels carry padding"
+            );
+        }
+        assert_eq!(
+            crate::texture::decode_ktx2_levels(&published),
+            crate::texture::decode_ktx2_levels(&permuted)
+        );
+    }
+
+    #[test]
+    fn rejects_containers_that_already_carry_supercompression_data() {
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
+            &mut dummy_content::rng::Rng::new(13),
+        )
+        .unwrap();
+        let raw =
+            TextureConverter::encode_container(&dds, TextureEncoding::DataLinear, 192, 2).unwrap();
+        let published = supercompress_ktx2(&raw).unwrap();
+
+        let already = supercompress_ktx2(&published).unwrap_err();
+        assert!(
+            format!("{already:#}").contains("already supercompressed"),
+            "{already:#}"
+        );
+
+        // BasisLZ keeps its codebooks and image descriptors in supercompression global data.
+        let mut basis_lz = raw.clone();
+        basis_lz[44..48].copy_from_slice(&1u32.to_le_bytes());
+        basis_lz[64..72].copy_from_slice(&432u64.to_le_bytes());
+        basis_lz[72..80].copy_from_slice(&16u64.to_le_bytes());
+        let error = supercompress_ktx2(&basis_lz).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("already supercompressed"),
+            "{error:#}"
+        );
+
+        // A declared offset with no length is still global data this rewrite cannot carry.
+        let mut offset_only = raw.clone();
+        offset_only[64..72].copy_from_slice(&432u64.to_le_bytes());
+        let error = supercompress_ktx2(&offset_only).unwrap_err();
+        assert!(format!("{error:#}").contains("global data"), "{error:#}");
+    }
+
+    #[test]
+    fn the_file_path_reports_a_damaged_container_instead_of_panicking() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("legacy.ktx2");
+        let output = directory.path().join("published.ktx2");
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
+            &mut dummy_content::rng::Rng::new(14),
+        )
+        .unwrap();
+        let raw =
+            TextureConverter::encode_container(&dds, TextureEncoding::DataLinear, 192, 2).unwrap();
+
+        // Find a descriptor corruption the ktx2 crate's parser panics on: the file path has to
+        // report it, not abort, and the asset is then re-encoded from its DDS.
+        let dfd_start = u32::from_le_bytes(raw[48..52].try_into().unwrap()) as usize;
+        let dfd_end = dfd_start + u32::from_le_bytes(raw[52..56].try_into().unwrap()) as usize;
+        let mut damaged = None;
+        for index in dfd_start..dfd_end {
+            let mut candidate = raw.clone();
+            candidate[index] ^= 0xff;
+            if std::panic::catch_unwind(|| ktx2::Reader::new(&candidate)).is_err() {
+                damaged = Some(candidate);
+                break;
+            }
+        }
+        let damaged = damaged.expect("no descriptor corruption panicked the ktx2 parser");
+
+        fs::write(&source, &damaged).unwrap();
+        let rejected = std::panic::catch_unwind(|| supercompress_ktx2_file(&source, &output));
+        assert!(rejected.is_ok(), "the file path panicked");
+        assert!(rejected.unwrap().is_err(), "a damaged descriptor passed");
+        assert!(!output.exists(), "a damaged container was published");
+
+        // A truncated container is reported the same way.
+        fs::write(&source, &raw[..raw.len() / 2]).unwrap();
+        assert!(supercompress_ktx2_file(&source, &output).is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn supercompression_never_panics_under_truncation_or_mutation() {
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8)
+                .with_mip_levels(2),
+            &mut dummy_content::rng::Rng::new(11),
+        )
+        .unwrap();
+        let raw =
+            TextureConverter::encode_container(&dds, TextureEncoding::ColorSrgb, 192, 2).unwrap();
+        let mut rng = dummy_content::rng::Rng::new(12);
+        let mut lengths: Vec<usize> = (0..raw.len()).step_by(7).collect();
+        lengths.extend(0..raw.len().min(256));
+        for length in lengths {
+            assert!(
+                std::panic::catch_unwind(|| supercompress_ktx2(&raw[..length])).is_ok(),
+                "supercompression panicked at length {length}"
+            );
+        }
+        for _ in 0..256 {
+            let mut mutated = raw.clone();
+            let index = rng.next_u64() as usize % mutated.len();
+            mutated[index] ^= 0xff;
+            assert!(
+                std::panic::catch_unwind(|| supercompress_ktx2(&mutated)).is_ok(),
+                "supercompression panicked on mutation at {index}"
+            );
+        }
+        // A damaged level table can describe an empty level; it still has to produce a frame.
+        let mut empty = raw.clone();
+        empty[88..96].copy_from_slice(&0u64.to_le_bytes());
+        assert!(std::panic::catch_unwind(|| supercompress_ktx2(&empty)).is_ok());
+        assert!(supercompress_ktx2(&empty).is_ok());
+    }
+
+    fn level_indexes(bytes: &[u8]) -> Vec<ktx2::LevelIndex> {
+        let level_count = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
+        (0..level_count)
+            .map(|level| {
+                let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
+                ktx2::LevelIndex::from_bytes(
+                    <&[u8; ktx2::LevelIndex::LENGTH]>::try_from(
+                        &bytes[start..start + ktx2::LevelIndex::LENGTH],
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect()
     }
 
     fn x8r8g8b8_fixture() -> Dds {
