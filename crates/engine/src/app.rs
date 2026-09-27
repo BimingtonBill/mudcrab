@@ -530,8 +530,8 @@ fn drive_streaming_fixture(
     let Ok(mut camera) = camera.single_mut() else {
         return;
     };
-    camera.translation.x += x as f32 * crate::world::components::CELL_SIZE;
-    camera.translation.z -= y as f32 * crate::world::components::CELL_SIZE;
+    // A move of whole cells east and north, which is how far a cell root that many grids away sits.
+    camera.translation += crate::streaming::grid_translation(IVec2::new(x, y), IVec2::ZERO);
     state.total_x += x;
     state.total_y += y;
     profiler.event("streaming-fixture", label, None);

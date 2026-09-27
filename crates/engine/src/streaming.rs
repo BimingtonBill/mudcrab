@@ -66,6 +66,53 @@ fn commit_budget_exceeded(elapsed_micros: u64, budget_micros: u64) -> bool {
     elapsed_micros > budget_micros.saturating_add(COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS)
 }
 
+/// What [`collect_cells`] has committed so far in the frame, and how long the frame's commit work
+/// has taken: what [`commit_waits_for_next_frame`] decides the next commit on.
+#[derive(Debug, Clone, Copy)]
+struct CommitsThisFrame {
+    /// Answers whose commit started this frame, whatever came of them: a cell that failed its
+    /// validation, or a ring grid with nothing in it, took its share of the frame too.
+    started: usize,
+    /// Full cells committed this frame.
+    full: usize,
+    /// Terrain-only cells committed this frame.
+    terrain: usize,
+    /// Microseconds since the frame's commit work started, answers taken from the worker included.
+    elapsed_micros: u64,
+}
+
+/// Whether the next answer, a cell at `detail`, waits for the next frame instead of being
+/// committed in this one.
+///
+/// Two limits apply, and a commit that would break either waits:
+///
+/// - **A count per tier.** A full cell commits under [`EngineConfig::max_cell_commits_per_frame`]
+///   (one by default): its references, their assets and their lights are what that cap protects.
+///   A terrain-only cell is a fraction of that work, so it commits under its own, larger count,
+///   [`MAX_TERRAIN_CELL_COMMITS_PER_FRAME`].
+/// - **The frame's time budget,** [`EngineConfig::max_commit_micros_per_frame`], for both tiers:
+///   no commit *starts* once the frame's commit work has used the budget up. A full commit that
+///   finds the budget spent by the terrain-only commits before it waits a frame like they would.
+///
+/// The budget is checked before a commit, not during one, so it bounds when commits start rather
+/// than when they finish: the last commit that starts under budget can still take the frame past
+/// it, and [`collect_cells`] counts that frame as a budget violation afterwards
+/// ([`commit_budget_exceeded`]). The first commit of a frame is never held by the time budget - only
+/// by a count of zero - so however small the budget, or however long taking the answers from the
+/// worker took, every frame commits at least one cell and a held answer, which is the first in
+/// line the next frame, cannot wait forever.
+fn commit_waits_for_next_frame(
+    detail: CellDetail,
+    done: CommitsThisFrame,
+    config: &EngineConfig,
+) -> bool {
+    let over_count = match detail {
+        CellDetail::Full => done.full >= config.max_cell_commits_per_frame,
+        CellDetail::Terrain => done.terrain >= MAX_TERRAIN_CELL_COMMITS_PER_FRAME,
+    };
+    over_count || (done.started > 0 && done.elapsed_micros >= config.max_commit_micros_per_frame)
+}
+
 /// The time since `started` in whole microseconds, saturating at `u64::MAX`.
 fn elapsed_micros(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
@@ -143,6 +190,12 @@ pub struct StreamingWorld {
     /// stay in the plan: it is dropped with the cell, so a cell the camera comes back to is asked
     /// for in full again with its budget whole.
     failed_retries: HashMap<CellKey, u32>,
+    /// The interior the camera stood in when [`plan_cells`] last ran: [`ActiveCell::interior`] as
+    /// the plan saw it. It is what lets [`StreamingWorld::has_failed`] tell a failure the plan is
+    /// about to retry ([`retry_failed_interior`]) from one it has given up on, without every
+    /// caller having to pass the active cell in. `None` while the camera is outdoors, and before
+    /// the plan has run at all.
+    active_interior: Option<u32>,
 }
 
 impl StreamingWorld {
@@ -167,14 +220,23 @@ impl StreamingWorld {
     ///
     /// An exterior cell whose full request failed is drawn as terrain-only afterwards, so it is
     /// failed by this test whatever its terrain-only status is.
+    ///
+    /// The interior the camera stands in is the one cell whose failed full request *is* repeated:
+    /// the plan asks for it again up to [`INTERIOR_FAILED_RETRIES`] times
+    /// ([`retry_failed_interior`]). Between a failed answer and the retry that follows it the cell
+    /// reads as failed in the cell table, but a retry is still owed, so it is not failed by this
+    /// test until the last of its retries has failed too. A caller that settled on the first
+    /// failure - a `--shots` pose, a door's destination - would otherwise stop waiting for a cell
+    /// the plan is about to ask for again. An interior that is not the one the camera stands in is
+    /// never retried, so its first failure is final, exactly as an exterior's is.
     pub fn has_failed(&self, key: &CellKey) -> bool {
         self.full_failed.contains(key)
-            || matches!(
+            || (matches!(
                 self.cells.get(key),
                 Some(CellStatus::Failed {
                     detail: CellDetail::Full
                 })
-            )
+            ) && !retry_failed_interior(key, self.active_interior, self))
     }
 }
 
@@ -497,15 +559,13 @@ fn plan_cells(
     mut profiler: ResMut<ProfilingState>,
 ) {
     let plan_started = Instant::now();
+    // Recorded before anything else, so `has_failed` reads the interior the camera is in even on
+    // a frame the plan stops early.
+    streaming.active_interior = active.interior;
     let Ok(camera) = camera.single() else {
         return;
     };
-    let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
-    let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
-    let center = IVec2::new(
-        (global_x / CELL_SIZE).floor() as i32,
-        (global_y / CELL_SIZE).floor() as i32,
-    );
+    let center = camera_grid(camera.translation, origin.0);
     let wanted = wanted_cells(
         &active,
         config.stream_radius,
@@ -525,7 +585,7 @@ fn plan_cells(
         // Whether this is a retry of a failure at exactly the tier the plan is asking for again:
         // only the interior the camera stands in is ever asked for again at the tier it failed at
         // ([`retry_failed_interior`]), and only while its retry budget lasts.
-        let retrying = retry_failed_interior(&key, &active, &streaming);
+        let retrying = retry_failed_interior(&key, active.interior, &streaming);
         // What the cell is streamed as now, and the root that draws it.
         let (held, root) = match streaming.cells.get(&key) {
             None => (None, None),
@@ -730,6 +790,7 @@ fn collect_cells(
         pending.push_back(response);
     }
     let mut commits_this_frame = 0u64;
+    let mut commits_started = 0usize;
     let mut full_commits = 0usize;
     let mut terrain_commits = 0usize;
     while let Some(response) = pending.pop_front() {
@@ -756,23 +817,23 @@ fn collect_cells(
         if replaced.is_some() {
             continuity.edges.remove(&response.key);
         }
-        // A full cell commits at the one-per-frame cap it always had: the references, their assets
-        // and their lights are what that cap protects. A terrain-only cell is a fraction of that
-        // work, so it commits under its own count and the frame's commit budget. What does not fit
-        // is held - with everything behind it, keeping the order - for the next frame, rather than
-        // re-requested or dropped.
-        let over_budget = match detail {
-            CellDetail::Full => full_commits >= config.max_cell_commits_per_frame,
-            CellDetail::Terrain => {
-                terrain_commits >= MAX_TERRAIN_CELL_COMMITS_PER_FRAME
-                    || elapsed_micros(frame_commit_started) >= config.max_commit_micros_per_frame
-            }
-        };
-        if over_budget {
+        // What does not fit this frame ([`commit_waits_for_next_frame`]) is held - with everything
+        // behind it, keeping the order - for the next frame, rather than re-requested or dropped.
+        if commit_waits_for_next_frame(
+            detail,
+            CommitsThisFrame {
+                started: commits_started,
+                full: full_commits,
+                terrain: terrain_commits,
+                elapsed_micros: elapsed_micros(frame_commit_started),
+            },
+            &config,
+        ) {
             deferred.push_back(response);
             deferred.extend(pending.drain(..));
             break;
         }
+        commits_started += 1;
         let commit_started = std::time::Instant::now();
         match response.result {
             Ok(payload) => {
@@ -988,11 +1049,19 @@ fn fail_cell(
 /// Only the interior the camera is *in*: an interior merely pre-streamed behind a nearby door is
 /// not waited on forever either way, and the moment the camera crosses into it, it is the active
 /// interior and this answers `true` for it.
-fn retry_failed_interior(key: &CellKey, active: &ActiveCell, streaming: &StreamingWorld) -> bool {
+///
+/// `active_interior` is [`ActiveCell::interior`]: the plan passes the one it is planning for, and
+/// [`StreamingWorld::has_failed`] the one the plan last saw, so the two answer the same question
+/// the same way.
+fn retry_failed_interior(
+    key: &CellKey,
+    active_interior: Option<u32>,
+    streaming: &StreamingWorld,
+) -> bool {
     let CellKey::Interior(cell_id) = *key else {
         return false;
     };
-    if active.interior != Some(cell_id)
+    if active_interior != Some(cell_id)
         || !matches!(
             streaming.cells.get(key),
             Some(CellStatus::Failed {
@@ -2479,13 +2548,31 @@ fn spawn_diagnostic_fallback(
     ));
 }
 
+/// Where the south-west corner of exterior grid `grid` sits in render coordinates while `origin` is
+/// the render origin: the one place the grid-to-render offset is written.
+///
+/// Creation's cell grid runs `x` east and `y` north, and the Bevy frame has `x` east and `-z`
+/// north, so a grid step north is a step of `-CELL_SIZE` along `z`. The difference is taken in
+/// whole cells before it is scaled, which keeps the answer exact however far from the origin the
+/// grid is. Every other conversion is this one read a different way: a cell root's translation
+/// ([`cell_translation`], [`reposition_cell_roots`]), a camera moved by whole cells (a rebase in
+/// [`update_render_origin`]), and - with `grid` as the render origin and `origin` as zero - the
+/// shift between the rebased frame and the absolute one that [`render_position`] takes off and
+/// [`absolute_render_position`] puts back.
+pub(crate) fn grid_translation(grid: IVec2, origin: IVec2) -> Vec3 {
+    let offset = grid - origin;
+    Vec3::new(
+        offset.x as f32 * CELL_SIZE,
+        0.0,
+        -offset.y as f32 * CELL_SIZE,
+    )
+}
+
 fn cell_translation(key: CellKey, origin: IVec2) -> Vec3 {
     match key {
-        CellKey::Exterior { grid_x, grid_y, .. } => Vec3::new(
-            (grid_x - origin.x) as f32 * CELL_SIZE,
-            0.0,
-            -(grid_y - origin.y) as f32 * CELL_SIZE,
-        ),
+        CellKey::Exterior { grid_x, grid_y, .. } => {
+            grid_translation(IVec2::new(grid_x, grid_y), origin)
+        }
         CellKey::Interior(_) => Vec3::ZERO,
     }
 }
@@ -2503,11 +2590,27 @@ pub(crate) fn creation_to_bevy(position: Vec3) -> Vec3 {
 /// An interior cell root carries no grid offset, so an interior reference at the same point
 /// renders at [`creation_to_bevy`] of it instead.
 pub(crate) fn render_position(creation_position: Vec3, origin: IVec2) -> Vec3 {
-    let position = creation_to_bevy(creation_position);
-    Vec3::new(
-        position.x - origin.x as f32 * CELL_SIZE,
-        position.y,
-        position.z + origin.y as f32 * CELL_SIZE,
+    creation_to_bevy(creation_position) - grid_translation(origin, IVec2::ZERO)
+}
+
+/// The inverse of [`render_position`]'s rebase: a render-space point of an exterior, rendered
+/// against `origin`, back in the absolute Bevy frame - the one [`creation_to_bevy`] maps Creation
+/// into, where `x` is Creation's `x` and `-z` is Creation's `y`.
+///
+/// This is how a camera's render position becomes a Creation position again
+/// (`crate::pose_capture::creation_position`) and a grid ([`camera_grid`]). An interior carries no
+/// grid offset, so for an interior pass the zero origin, which leaves the point as it is.
+pub(crate) fn absolute_render_position(render_position: Vec3, origin: IVec2) -> Vec3 {
+    render_position + grid_translation(origin, IVec2::ZERO)
+}
+
+/// The exterior grid a render-space point stands in while `origin` is the render origin: the cell
+/// [`plan_cells`] streams around a camera there.
+pub(crate) fn camera_grid(render_position: Vec3, origin: IVec2) -> IVec2 {
+    let absolute = absolute_render_position(render_position, origin);
+    IVec2::new(
+        (absolute.x / CELL_SIZE).floor() as i32,
+        (-absolute.z / CELL_SIZE).floor() as i32,
     )
 }
 
@@ -2947,11 +3050,7 @@ pub(crate) fn reposition_cell_roots(
     roots: &mut Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
 ) {
     for (grid, mut transform) in roots.iter_mut() {
-        transform.translation = Vec3::new(
-            (grid.0.x - origin.x) as f32 * CELL_SIZE,
-            0.0,
-            -(grid.0.y - origin.y) as f32 * CELL_SIZE,
-        );
+        transform.translation = grid_translation(grid.0, origin);
     }
 }
 
@@ -2981,8 +3080,7 @@ fn update_render_origin(
         return;
     }
     origin.0 += shift;
-    camera.translation.x -= shift.x as f32 * CELL_SIZE;
-    camera.translation.z += shift.y as f32 * CELL_SIZE;
+    camera.translation -= grid_translation(shift, IVec2::ZERO);
     reposition_cell_roots(origin.0, &mut roots);
     profiler.increment("streaming/origin_rebases", 1);
     metrics.origin_rebases = metrics.origin_rebases.saturating_add(1);
@@ -3108,6 +3206,131 @@ mod tests {
         assert!(!commit_budget_exceeded(16_670, 16_670));
         assert!(!commit_budget_exceeded(17_670, 16_670));
         assert!(commit_budget_exceeded(17_671, 16_670));
+    }
+
+    /// A full commit that finds the frame's time budget already spent waits for the next frame, the
+    /// way a terrain-only one does: the budget stops a commit from *starting*, whatever its tier.
+    #[test]
+    fn a_full_commit_waits_when_the_frame_budget_is_spent_before_it_starts() {
+        let config = EngineConfig::default();
+        let budget = config.max_commit_micros_per_frame;
+        // Sixteen terrain-only commits have used the frame up; the full cell behind them waits.
+        let after_the_ring = CommitsThisFrame {
+            started: 16,
+            full: 0,
+            terrain: 16,
+            elapsed_micros: budget,
+        };
+        assert!(commit_waits_for_next_frame(
+            CellDetail::Full,
+            after_the_ring,
+            &config
+        ));
+        // With budget left it goes ahead: only the count and the time hold a full commit.
+        let with_time_left = CommitsThisFrame {
+            elapsed_micros: budget - 1,
+            ..after_the_ring
+        };
+        assert!(!commit_waits_for_next_frame(
+            CellDetail::Full,
+            with_time_left,
+            &config
+        ));
+        // And its count still holds it with time to spare: one full cell a frame by default.
+        let after_a_full_commit = CommitsThisFrame {
+            started: 1,
+            full: 1,
+            terrain: 0,
+            elapsed_micros: 0,
+        };
+        assert!(commit_waits_for_next_frame(
+            CellDetail::Full,
+            after_a_full_commit,
+            &config
+        ));
+        assert!(!commit_waits_for_next_frame(
+            CellDetail::Terrain,
+            after_a_full_commit,
+            &config
+        ));
+        // A failed commit took its share of the frame too: it counts as started, not committed.
+        let after_a_failed_commit = CommitsThisFrame {
+            started: 1,
+            full: 0,
+            terrain: 0,
+            elapsed_micros: budget,
+        };
+        assert!(commit_waits_for_next_frame(
+            CellDetail::Terrain,
+            after_a_failed_commit,
+            &config
+        ));
+    }
+
+    /// The first commit of a frame is never held by the time budget, however small the budget or
+    /// however long taking the worker's answers took: a held answer is first in line the next
+    /// frame, so it cannot be held forever. Only a count of zero holds it.
+    #[test]
+    fn the_first_commit_of_a_frame_is_never_held_by_the_time_budget() {
+        let config = EngineConfig {
+            max_commit_micros_per_frame: 0,
+            ..EngineConfig::default()
+        };
+        let nothing_yet = CommitsThisFrame {
+            started: 0,
+            full: 0,
+            terrain: 0,
+            elapsed_micros: 50_000,
+        };
+        for detail in [CellDetail::Full, CellDetail::Terrain] {
+            assert!(
+                !commit_waits_for_next_frame(detail, nothing_yet, &config),
+                "{detail:?}: the frame's first commit goes ahead"
+            );
+        }
+        let no_full_cells = EngineConfig {
+            max_cell_commits_per_frame: 0,
+            ..config
+        };
+        assert!(commit_waits_for_next_frame(
+            CellDetail::Full,
+            nothing_yet,
+            &no_full_cells
+        ));
+    }
+
+    /// The grid-to-render offset and its inverse agree at a render origin away from zero: a
+    /// Creation point placed by [`render_position`] comes back from [`absolute_render_position`]
+    /// where [`creation_to_bevy`] puts it, sits in the grid [`camera_grid`] names, and keeps the
+    /// same place inside its cell root ([`cell_translation`]) whatever the origin is.
+    #[test]
+    fn the_grid_offset_and_its_inverse_agree_at_a_non_zero_origin() {
+        let origin = IVec2::new(5, -3);
+        let creation = Vec3::new(7.0 * CELL_SIZE + 1234.5, -2.0 * CELL_SIZE + 301.25, 812.0);
+        let grid = IVec2::new(7, -2);
+        let key = exterior_cell(grid.x, grid.y);
+
+        let render = render_position(creation, origin);
+        assert_eq!(
+            absolute_render_position(render, origin),
+            creation_to_bevy(creation)
+        );
+        assert_eq!(camera_grid(render, origin), grid);
+        assert_eq!(
+            render - cell_translation(key, origin),
+            render_position(creation, IVec2::ZERO) - cell_translation(key, IVec2::ZERO),
+            "a point keeps its place inside its cell root whatever the origin"
+        );
+        // Two cells east and one north of the origin, in render space.
+        assert_eq!(
+            grid_translation(origin + IVec2::new(2, 1), origin),
+            Vec3::new(2.0 * CELL_SIZE, 0.0, -CELL_SIZE)
+        );
+        // The origin's own cell sits at the render-space zero.
+        assert_eq!(
+            cell_translation(exterior_cell(origin.x, origin.y), origin),
+            Vec3::ZERO
+        );
     }
 
     fn terrain_fixture(cell_id: u32, height: f32) -> TerrainSnapshot {
@@ -4194,6 +4417,119 @@ mod tests {
         );
         app.update();
         assert_eq!(status(&app), "failed Full", "and it stays that way");
+    }
+
+    /// The interior the camera stands in is not failed by [`StreamingWorld::has_failed`] while the
+    /// plan still owes it a retry: a caller that settled on the first failure (a `--shots` pose, a
+    /// door's destination) would stop waiting for a cell that is about to be asked for again. Once
+    /// the last retry has failed too, it is failed for good - and an interior the camera is not in,
+    /// which is never retried, is failed at its first failure.
+    #[test]
+    fn a_retried_interior_is_not_failed_until_its_retries_run_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: Some(INTERIOR_CELL),
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, plan_cells);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        let key = CellKey::Interior(INTERIOR_CELL);
+        let has_failed = |app: &App| app.world().resource::<StreamingWorld>().has_failed(&key);
+        // What `fail_cell` leaves behind when the answer comes back an error.
+        let answer_failed = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<StreamingWorld>()
+                .cells
+                .insert(
+                    key,
+                    CellStatus::Failed {
+                        detail: CellDetail::Full,
+                    },
+                );
+        };
+
+        // The first request, and every retry, fails: in each gap before the next retry the cell
+        // is waited for, not given up on.
+        app.update();
+        for attempt in 0..=INTERIOR_FAILED_RETRIES {
+            answer_failed(&mut app);
+            let retries_spent = attempt == INTERIOR_FAILED_RETRIES;
+            assert_eq!(
+                has_failed(&app),
+                retries_spent,
+                "after failure {} of {}",
+                attempt + 1,
+                INTERIOR_FAILED_RETRIES + 1
+            );
+            app.update();
+        }
+        assert!(has_failed(&app), "its budget spent, the failure is final");
+
+        // The camera steps out to the worldspace: the same failed cell, no longer the interior it
+        // stands in, is never retried, so its failure is final at once - whatever budget it has.
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .failed_retries
+            .clear();
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 60,
+            interior: None,
+        };
+        app.world_mut()
+            .resource_mut::<PrestreamCells>()
+            .request_interior(INTERIOR_CELL);
+        app.update();
+        answer_failed(&mut app);
+        assert!(
+            has_failed(&app),
+            "an interior the camera is not in is failed at its first failure"
+        );
+    }
+
+    /// An exterior's failed full request reads as failed at once, as it always has: it is never
+    /// asked for in full again while it stays planned, and is drawn as terrain-only instead.
+    #[test]
+    fn an_exterior_full_failure_is_failed_at_once() {
+        let mut streaming = StreamingWorld {
+            active_interior: Some(INTERIOR_CELL),
+            ..StreamingWorld::default()
+        };
+        let key = exterior_cell(0, 0);
+        streaming.cells.insert(
+            key,
+            CellStatus::Failed {
+                detail: CellDetail::Full,
+            },
+        );
+        assert!(streaming.has_failed(&key), "failed in full");
+        streaming.full_failed.insert(key);
+        streaming.cells.insert(
+            key,
+            CellStatus::Failed {
+                detail: CellDetail::Terrain,
+            },
+        );
+        assert!(
+            streaming.has_failed(&key),
+            "and still failed while its terrain-only request is failed too"
+        );
+        streaming.full_failed.clear();
+        assert!(
+            !streaming.has_failed(&key),
+            "a ring grid that held nothing as terrain-only has not failed in full"
+        );
     }
 
     /// The plan asks for a saturated worker's cells one frame later, and a cell that is waiting for

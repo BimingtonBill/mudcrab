@@ -45,9 +45,9 @@ use crate::{
         MAX_PITCH_DEGREES, MIN_PITCH_DEGREES, Shot, ShotsFile, shot_camera_rotation,
         vertical_fov_degrees,
     },
-    streaming::{ActiveCell, RenderOrigin},
+    streaming::{ActiveCell, RenderOrigin, absolute_render_position},
     transition::switch_space,
-    world::components::{CELL_SIZE, ExteriorCellGrid, StreamingCamera},
+    world::components::{ExteriorCellGrid, StreamingCamera},
 };
 use bevy::{prelude::*, window::PrimaryWindow};
 use serde::{Deserialize, Serialize};
@@ -164,11 +164,7 @@ pub fn horizontal_fov_degrees(vertical_fov_degrees: f32, aspect: f32) -> f32 {
 /// for an interior the zero origin, because an interior is placed at its absolute Creation
 /// coordinates and carries no cell grid.
 pub fn creation_position(render_position: Vec3, origin: IVec2) -> Vec3 {
-    let bevy = Vec3::new(
-        render_position.x + origin.x as f32 * CELL_SIZE,
-        render_position.y,
-        render_position.z - origin.y as f32 * CELL_SIZE,
-    );
+    let bevy = absolute_render_position(render_position, origin);
     Vec3::from_array(shared::coordinates::runtime_to_creation_vector(
         bevy.to_array(),
     ))

@@ -86,21 +86,18 @@
 //! (`Time<Real>`), so a bench run is a timing run only when this engine runs alone on the machine.
 
 use crate::{
-    config::{EngineConfig, grid_of},
+    config::EngineConfig,
     door_animation::DoorAnimation,
     doors::{ActivateDoor, DoorAnchor, DoorCrossed, DoorState, LoadDoor},
     metrics::percentile,
     player::{DOOR_CONE_DEGREES, DOOR_RANGE, Player, PlayerInput},
     shots::{settle_counts, shot_camera_rotation, shots_settled},
     streaming::{
-        ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy,
+        ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, camera_grid, creation_to_bevy,
         render_position,
     },
     transition::{OpenDoor, distance_in_front_of_door, door_frame, door_is_open},
-    world::{
-        components::{CELL_SIZE, StreamingCamera},
-        database::CellKey,
-    },
+    world::{components::StreamingCamera, database::CellKey},
 };
 use bevy::{
     prelude::*,
@@ -875,16 +872,12 @@ fn camera_space_key(
         return Some(CellKey::Interior(cell_id));
     }
     // A rebase moves the camera in render space, so the origin goes back on before the grid is
-    // taken; the Bevy camera's `x` and `z` are Creation's `x` and `-y` (`plan_cells`).
-    let origin = origin?;
-    let (grid_x, grid_y) = grid_of(
-        position.x + origin.0.x as f32 * CELL_SIZE,
-        -position.z + origin.0.y as f32 * CELL_SIZE,
-    );
+    // taken, which is what `camera_grid` does for the plan too.
+    let grid = camera_grid(position, origin?.0);
     Some(CellKey::Exterior {
         worldspace_id: active.worldspace_id,
-        grid_x,
-        grid_y,
+        grid_x: grid.x,
+        grid_y: grid.y,
     })
 }
 
