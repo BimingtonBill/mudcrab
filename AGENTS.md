@@ -33,8 +33,14 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   `C:\Modding\SkyrimConverted-upstream`, upstream's commit style, worker tasks `<kind>-<nnn>-p2-<slug>` numbered 500-599.
 - **Portal**: the user's seamless-door feature and demos. This checkout, branch `portal`, assets
   `C:\Modding\SkyrimConverted`, `[claude]`/`[deepseek]` prefixes, worker tasks `<kind>-<nnn>-portal-<slug>` numbered 100-199 (then 600+).
-- Changes flow one way: `main` and `phase2/*` merge into `portal`, never the reverse. A Phase 2 bug
-  found on the portal is fixed on a `phase2/*` branch first.
+- **Phase 1** (added 2026-09-27, the user's new Phase 1 Dev session): improvements to upstream's
+  finished converter (`docs/roadmap/01-asset-pipeline.md`), sent upstream like Phase 2. Worktree
+  `C:\Modding\wkj-phase1`, branches `phase1/<topic>` cut from `main`, upstream's commit style, build
+  targets and conversion output on D:, worker tasks `<kind>-<nnn>-p1-<slug>` numbered 800-899. It owns
+  `crates/converter/**` and `crates/dummy-content/**`; `crates/shared/**` changes are agreed by message.
+  Starting brief: `local/handover-phase1-dev.md`.
+- Changes flow one way: `main`, `phase1/*` and `phase2/*` merge into `portal`, never the reverse. A
+  Phase 1 or Phase 2 bug found on the portal is fixed on a `phase1/*` or `phase2/*` branch first.
 
 Which work belongs to which track, the PR rules and the reasons: `docs/pr/two-tracks.md`. Read it
 before starting any `phase2/*` branch or moving work between tracks.
