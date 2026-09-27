@@ -71,6 +71,8 @@ Built locally from main 6f583cd by Upstream Dev (merges of the component branche
  
 **SENT 2026-09-27 with the user's OK ("open all 7 prepped PRs"):** #43 converter-hardening a3e132f, #44 engine-hardening fe010d0, #45 tooling 36fd76f, #46 sky 9ddddf9, #47 sun-shadows 5714ec6, #48 water 55439de, #49 terrain-textures ab2f3e7 (credits #42). These branches are now live PR heads.
 
+**CodeRabbit round 1 (2026-09-27, the user OK'd the 8 replies):** fixes pushed: #43 9adf30d (LAND proptest at valid lengths), #45 970cbdd (main_world ordering; frame-times write failure exits with an error), #46 4093038+8cc206a (sky.md fog 0.47 at the ring edge), #47 f3c70e8 (far check projects the bounds on the forward axis, plus a cell-sized test), #49 bc313d3 (a failed normal map falls back instead of hiding the quadrant). Declined with reasons: #45 last-render-frame drain (one frame; distributions) and #48 WATER_LAYER in LIGHT_LAYERS (Bevy skips directional lights per view, not per mesh). #44 had no findings. Texts: local/pr-drafts/26-coderabbit-bundles.md.
+
 ## Staged branches, in send order
 
 Branch scan of 2026-09-25 against origin/main 417a262 ("fork" means the same commit is on
