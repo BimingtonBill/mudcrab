@@ -407,6 +407,23 @@ line per state averaged over the doors. The columns:
 Render diagnostics name their spans by pass, not by camera, so the portal's own cost is read as
 `offscreen_opaque_gpu`, or as the difference between a door's `open-in-view` and `closed` rows.
 
+**Looking out of an interior.** Every door of the main list is looked at from the side the portal
+draws *into* (a room). To measure what the destination *sun* costs, run the bench on
+`tools/bench/portal_bench_doors_out.json` instead, which
+`python tools/bench/portal_bench_doors.py` writes beside the main list: four hand-picked doors that
+stand inside a house in Riverwood or Whiterun and open onto a sunlit exterior.
+
+```powershell
+pwsh -Command "& tools/bench/portal-bench.ps1 -Doors tools/bench/portal_bench_doors_out.json"
+```
+
+Those doors are timed in two states of their own - **closed-out** (inside, facing the closed door)
+and **open-out-view** (the same pose, the door fully open, so the portal draws the exterior) - 160
+units back from the door rather than 320, because a house's far wall is nearer (Alvor's is). The
+rest of the list keeps the six states above. A door in the file whose `kind` is not
+`interior-to-exterior`, or that has no authored outward direction, is skipped with a `SKIP` line in
+`<csv>.summary.txt`.
+
 ## 5. Controls
 
 | Input | Action |

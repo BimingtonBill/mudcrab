@@ -1,0 +1,74 @@
+{
+  "note": "Written by tools/bench/portal_bench_doors.py; the portal bench's look-out doors. Each stands inside an interior whose door opens onto a worldspace, so the bench's closed-out and open-out-view states look out through it at that exterior. near = references within 3000 units of the door in its own space; beyond = references within the same radius of the destination door (exterior).",
+  "radius": 3000.0,
+  "doors": [
+    {
+      "ref_id": "0x0001CBAF",
+      "place": "Riverwood",
+      "kind": "interior-to-exterior",
+      "space": "RiverwoodSvensHouse",
+      "worldspace_id": null,
+      "interior_cell_id": 117636,
+      "position": [
+        -511.49,
+        -254.94,
+        -16.0
+      ],
+      "destination": "Tamriel",
+      "near_references": 145,
+      "beyond_references": 740,
+      "reason": "Riverwood, interior-to-exterior: 145 references within 3000 units of the door, 740 in the far door's surroundings"
+    },
+    {
+      "ref_id": "0x000133FB",
+      "place": "Riverwood",
+      "kind": "interior-to-exterior",
+      "space": "RiverwoodAlvorsHouse",
+      "worldspace_id": null,
+      "interior_cell_id": 78792,
+      "position": [
+        -512.53,
+        -254.86,
+        240.0
+      ],
+      "destination": "Tamriel",
+      "near_references": 230,
+      "beyond_references": 751,
+      "reason": "Riverwood, interior-to-exterior: 230 references within 3000 units of the door, 751 in the far door's surroundings"
+    },
+    {
+      "ref_id": "0x00013419",
+      "place": "Riverwood",
+      "kind": "interior-to-exterior",
+      "space": "RiverwoodSleepingGiantInn",
+      "worldspace_id": null,
+      "interior_cell_id": 78790,
+      "position": [
+        -255.78,
+        -422.47,
+        -0.0
+      ],
+      "destination": "Tamriel",
+      "near_references": 484,
+      "beyond_references": 643,
+      "reason": "Riverwood, interior-to-exterior: 484 references within 3000 units of the door, 643 in the far door's surroundings"
+    },
+    {
+      "ref_id": "0x000918E6",
+      "place": "Whiterun",
+      "kind": "interior-to-exterior",
+      "space": "WhiterunUthgerdTheUnbrokensHouse",
+      "worldspace_id": null,
+      "interior_cell_id": 596179,
+      "position": [
+        2225.17,
+        1599.98,
+        397.45
+      ],
+      "destination": "WhiterunWorld",
+      "near_references": 213,
+      "beyond_references": 646,
+      "reason": "Whiterun, interior-to-exterior: 213 references within 3000 units of the door, 646 in the far door's surroundings"
+    }
+  ]
+}

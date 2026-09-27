@@ -19,6 +19,16 @@ JARLS_QUARTERS = ("interior", 11)
 BLUE_PALACE = ("interior", 20)
 FARMHOUSE = ("interior", 30)
 
+#: Sven's House, for the look-out table: the door out to Tamriel, its return door outside, and the
+#: house's editor id (the out list names the cell the door stands in).
+SVENS_HOUSE = ("interior", 40)
+CELLAR = ("interior", 41)
+SVEN_IN = 0x120
+SVEN_OUT = 0x220
+UNLINKED_IN = 0x122
+UNLINKED_OUT = 0x222
+SVEN_ROW = (SVEN_IN, "Riverwood", "RiverwoodSvensHouse", "Tamriel")
+
 
 def refs(count, at=(0.0, 0.0, 0.0), spread=10.0):
     x, y, z = at
@@ -53,6 +63,31 @@ def fixture():
     worldspaces = {1: "WhiterunWorld", 2: "SolitudeWorld\x00", 3: "Tamriel"}
     names = {10: "WhiterunDragonsreach", 11: "JarlsQuarters", 20: "BluePalace", 30: "Farm"}
     return bench.World(doors, references, worldspaces, names)
+
+
+def out_world():
+    """`fixture()` plus Sven's House: its door out to Tamriel with the link back in, a cellar door
+    under it that stays inside, and a door out that nothing links back to."""
+    world = fixture()
+    world.doors.extend(
+        [
+            bench.Door(
+                SVEN_IN, SVENS_HOUSE, (0.0, 0.0, 0.0), SVEN_OUT, TAMRIEL, "FarmhouseLDoor01.nif"
+            ),
+            bench.Door(
+                SVEN_OUT, TAMRIEL, (0.0, 0.0, 0.0), SVEN_IN, SVENS_HOUSE, "FarmhouseLDoor01.nif"
+            ),
+            bench.Door(0x121, SVENS_HOUSE, (200.0, 0.0, 0.0), 0x221, CELLAR, "Door.nif"),
+            bench.Door(0x221, CELLAR, (0.0, 0.0, 0.0), 0x121, SVENS_HOUSE, "Door.nif"),
+            bench.Door(UNLINKED_IN, SVENS_HOUSE, (400.0, 0.0, 0.0), UNLINKED_OUT, TAMRIEL, "Door.nif"),
+            bench.Door(UNLINKED_OUT, TAMRIEL, (600.0, 0.0, 0.0), 0x999, DRAGONSREACH, "Door.nif"),
+        ]
+    )
+    world.references[SVENS_HOUSE] = refs(6, spread=50.0)
+    world.references[CELLAR] = refs(3)
+    world.interior_names[SVENS_HOUSE[1]] = "RiverwoodSvensHouse"
+    world.interior_names[CELLAR[1]] = "RiverwoodSvensHouseCellar"
+    return world
 
 
 class RankingTests(unittest.TestCase):
@@ -90,6 +125,62 @@ class RankingTests(unittest.TestCase):
         self.assertIsNone(written["interior_cell_id"])
         self.assertEqual((written["near_references"], written["beyond_references"]), (40, 100))
         self.assertIn("Whiterun", written["reason"])
+
+
+class LookOutTests(unittest.TestCase):
+    """The bench's out states look out of an interior, so their list must be the interior side of
+    a door that opens onto a worldspace."""
+
+    def test_a_look_out_door_is_written_from_inside_facing_the_exterior(self):
+        doors = bench.looking_out_doors(out_world(), table=(SVEN_ROW,))
+        self.assertEqual([door.ref_id for door in doors], [SVEN_IN])
+        written = bench.door_json(doors[0])
+        self.assertEqual(written["kind"], "interior-to-exterior")
+        self.assertIsNone(written["worldspace_id"], "the door stands in an interior")
+        self.assertEqual(written["interior_cell_id"], SVENS_HOUSE[1])
+        self.assertEqual(written["space"], "RiverwoodSvensHouse")
+        self.assertEqual(written["destination"], "Tamriel")
+        self.assertEqual(written["place"], "Riverwood")
+        self.assertEqual(written["near_references"], 6)
+        self.assertIn("Riverwood", written["reason"])
+
+    def test_an_out_door_that_leads_indoors_is_refused(self):
+        row = (0x121, "Riverwood", "RiverwoodSvensHouseCellar", "Tamriel")
+        with self.assertRaises(bench.LookingOutError) as raised:
+            bench.looking_out_doors(out_world(), table=(row,))
+        self.assertIn("interior-to-interior", str(raised.exception))
+
+    def test_an_out_door_with_no_link_back_into_it_is_refused(self):
+        row = (UNLINKED_IN, "Riverwood", "RiverwoodSvensHouse", "Tamriel")
+        with self.assertRaises(bench.LookingOutError) as raised:
+            bench.looking_out_doors(out_world(), table=(row,))
+        self.assertIn("no return link", str(raised.exception))
+
+    def test_an_out_door_the_database_does_not_know_is_refused(self):
+        row = (0x777, "Riverwood", "RiverwoodSvensHouse", "Tamriel")
+        with self.assertRaises(bench.LookingOutError) as raised:
+            bench.looking_out_doors(out_world(), table=(row,))
+        self.assertIn("no load door", str(raised.exception))
+
+    def test_an_out_door_that_opens_onto_the_wrong_space_is_refused(self):
+        row = (SVEN_IN, "Riverwood", "RiverwoodSvensHouse", "WhiterunWorld")
+        with self.assertRaises(bench.LookingOutError) as raised:
+            bench.looking_out_doors(out_world(), table=(row,))
+        self.assertIn("Tamriel", str(raised.exception))
+
+    def test_the_look_out_doors_do_not_change_the_main_list(self):
+        self.assertEqual(
+            [bench.door_json(door) for door in bench.pick_doors(fixture())],
+            [bench.door_json(door) for door in bench.pick_doors(out_world())],
+        )
+
+    def test_the_look_out_table_names_four_doors_from_two_places(self):
+        self.assertEqual(len(bench.LOOKING_OUT), 4)
+        self.assertEqual(len({row[0] for row in bench.LOOKING_OUT}), 4, "four different doors")
+        self.assertEqual(sorted({row[1] for row in bench.LOOKING_OUT}), ["Riverwood", "Whiterun"])
+        self.assertEqual(
+            len({row[2] for row in bench.LOOKING_OUT}), 4, "four different interiors"
+        )
 
 
 if __name__ == "__main__":

@@ -16,6 +16,13 @@
 //!    turn) and `open-occluded` (standing behind the door's wall, facing the doorway);
 //! 4. closes the door and moves on.
 //!
+//! A door the second file, `portal_bench_doors_out.json`, lists as `interior-to-exterior` stands
+//! inside a house and its door opens onto a sunlit exterior. That is not the same measurement, so
+//! it is timed in its own two states only - `closed-out` and `open-out-view`, both
+//! [`OUT_STANDOFF`] units inside the doorway facing out - rather than in the six above, which all
+//! look into a room. Measuring the destination sun's cost is the point of them; every other door
+//! keeps the chain above.
+//!
 //! At the end it writes one CSV row per door and state ([`CSV_HEADER`]) and a summary beside it
 //! (`<csv>.summary.txt`), then exits.
 //!
@@ -66,6 +73,9 @@ use std::{
 
 /// How far in front of the door the camera stands, in Creation units: the demo tour's standoff.
 pub const STANDOFF: f32 = 320.0;
+/// How far in front of the door the camera stands in the out states. A house's far wall is nearer
+/// than [`STANDOFF`] (Alvor's is), so a camera standing that far inside would be behind it.
+pub const OUT_STANDOFF: f32 = 160.0;
 /// The camera's height above the door's origin: a player's eye.
 pub const EYE_HEIGHT: f32 = 120.0;
 /// How long a state is held before its frames are timed, so a turn or a door's last frame of swing
@@ -110,6 +120,10 @@ pub struct BenchDoor {
     pub ref_id: HexFormId,
     #[serde(default)]
     pub place: Option<String>,
+    /// `interior-to-exterior`, `interior-to-interior` or another pairing, as the doors file names
+    /// it. An older or hand-written file that does not say is timed in the six states.
+    #[serde(default)]
+    pub kind: String,
     #[serde(default)]
     pub worldspace_id: Option<u32>,
     #[serde(default)]
@@ -117,6 +131,10 @@ pub struct BenchDoor {
     /// The door reference's position, in Creation units.
     pub position: [f32; 3],
 }
+
+/// The kind of a door that stands inside a space and opens onto a worldspace: what
+/// `tools/bench/portal_bench_doors_out.json` lists, and what the out states are for.
+const INTERIOR_TO_EXTERIOR: &str = "interior-to-exterior";
 
 impl BenchDoor {
     fn space(&self) -> Option<SpaceTarget> {
@@ -129,6 +147,21 @@ impl BenchDoor {
 
     fn place(&self) -> &str {
         self.place.as_deref().unwrap_or("")
+    }
+
+    /// Does this door stand inside and open onto an exterior? Those are timed in the out states
+    /// alone, which look out at the destination's sunlit exterior.
+    fn looks_out(&self) -> bool {
+        self.kind == INTERIOR_TO_EXTERIOR
+    }
+
+    /// The state this door's chain starts in: the first out state or the first of the six.
+    fn first_state(&self) -> BenchState {
+        if self.looks_out() {
+            BenchState::ClosedOut
+        } else {
+            BenchState::Closed
+        }
     }
 }
 
@@ -167,16 +200,24 @@ pub enum BenchState {
     /// The door open, the view standing behind the door's wall and facing the doorway: in the
     /// frustum, but behind the wall the door stands in.
     OpenOccluded,
+    /// Inside an interior, [`OUT_STANDOFF`] units from its load door and facing it, the door
+    /// closed: the portal has nothing to draw, but the sun the doorway leads to is behind it.
+    ClosedOut,
+    /// The same pose with the door fully open: the portal draws the sunlit exterior, and this is
+    /// what the destination sun's cost is read from.
+    OpenOutView,
 }
 
 impl BenchState {
-    pub const ALL: [BenchState; 6] = [
+    pub const ALL: [BenchState; 8] = [
         BenchState::Closed,
         BenchState::ClosedBehind,
         BenchState::ClosedOccluded,
         BenchState::OpenInView,
         BenchState::OpenBehind,
         BenchState::OpenOccluded,
+        BenchState::ClosedOut,
+        BenchState::OpenOutView,
     ];
 
     pub fn name(self) -> &'static str {
@@ -187,18 +228,24 @@ impl BenchState {
             BenchState::OpenInView => "open-in-view",
             BenchState::OpenBehind => "open-behind",
             BenchState::OpenOccluded => "open-occluded",
+            BenchState::ClosedOut => "closed-out",
+            BenchState::OpenOutView => "open-out-view",
         }
     }
 
-    /// What the bench does after timing this state.
+    /// What the bench does after timing this state: the next one, or the door's own move. Each
+    /// state has one successor, whichever chain reached it, so a look-out door's two states are a
+    /// chain of their own with no other state in it.
     fn after(self) -> After {
         match self {
             BenchState::Closed => After::Time(BenchState::ClosedBehind),
             BenchState::ClosedBehind => After::Time(BenchState::ClosedOccluded),
-            BenchState::ClosedOccluded => After::OpenTheDoor,
+            BenchState::ClosedOccluded => After::OpenTheDoor(BenchState::OpenInView),
             BenchState::OpenInView => After::Time(BenchState::OpenBehind),
             BenchState::OpenBehind => After::Time(BenchState::OpenOccluded),
             BenchState::OpenOccluded => After::CloseTheDoor,
+            BenchState::ClosedOut => After::OpenTheDoor(BenchState::OpenOutView),
+            BenchState::OpenOutView => After::CloseTheDoor,
         }
     }
 
@@ -206,9 +253,27 @@ impl BenchState {
     /// faces the door or away from it.
     fn pose(self) -> (Side, Facing) {
         match self {
-            BenchState::Closed | BenchState::OpenInView => (Side::Front, Facing::Door),
+            BenchState::Closed
+            | BenchState::OpenInView
+            | BenchState::ClosedOut
+            | BenchState::OpenOutView => (Side::Front, Facing::Door),
             BenchState::OpenBehind | BenchState::ClosedBehind => (Side::Front, Facing::Away),
             BenchState::OpenOccluded | BenchState::ClosedOccluded => (Side::Back, Facing::Door),
+        }
+    }
+
+    /// The door is shut in this state (its clips are resolving and it is about to be asked to
+    /// open), as opposed to one the door has already been opened for.
+    fn is_closed(self) -> bool {
+        matches!(self, BenchState::Closed | BenchState::ClosedOut)
+    }
+
+    /// How far in front of the door the camera stands in this state. The out states stand inside a
+    /// house, whose far wall is nearer than [`STANDOFF`].
+    fn standoff(self) -> f32 {
+        match self {
+            BenchState::ClosedOut | BenchState::OpenOutView => OUT_STANDOFF,
+            _ => STANDOFF,
         }
     }
 }
@@ -216,7 +281,8 @@ impl BenchState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum After {
     Time(BenchState),
-    OpenTheDoor,
+    /// Ask the door to open, then settle into this state and time it.
+    OpenTheDoor(BenchState),
     CloseTheDoor,
 }
 
@@ -232,20 +298,21 @@ enum Facing {
     Away,
 }
 
-/// The states a door is timed in when everything goes to plan, in order.
+/// The states a door is timed in when everything goes to plan, in order, from the state its chain
+/// starts in.
 #[cfg(test)]
-fn state_sequence() -> Vec<BenchState> {
-    let mut order = vec![BenchState::Closed];
-    let mut state = BenchState::Closed;
+fn state_sequence(first: BenchState) -> Vec<BenchState> {
+    let mut order = vec![first];
+    let mut state = first;
     loop {
         match state.after() {
             After::Time(next) => {
                 order.push(next);
                 state = next;
             }
-            After::OpenTheDoor => {
-                order.push(BenchState::OpenInView);
-                state = BenchState::OpenInView;
+            After::OpenTheDoor(next) => {
+                order.push(next);
+                state = next;
             }
             After::CloseTheDoor => return order,
         }
@@ -556,14 +623,15 @@ enum Phase {
     Teleport,
     /// Wait for the door to stream in.
     FindDoor,
-    /// Wait for the view in front of the closed door to settle.
-    Settle,
+    /// Wait for the view in `state` to settle before timing it: in front of the closed door at the
+    /// start, and in front of the open one after it has been asked to open.
+    Settle(BenchState),
     /// Hold a state and time it.
     Time(BenchState),
-    /// The door has been asked to open; wait until it is fully open.
-    Opening,
-    /// Open: wait for the destination the portal draws to settle.
-    OpenSettle,
+    /// The door has been asked to open; wait until it is fully open, then settle and time `then`.
+    Opening {
+        then: BenchState,
+    },
     /// Ask the door to close and wait for it.
     Closing {
         asked: bool,
@@ -667,8 +735,14 @@ impl PortalBench {
     }
 }
 
-/// The camera's pose for `state` in front of (or behind) the door at `transform`.
-fn door_pose(transform: &GlobalTransform, door: &LoadDoor, state: BenchState) -> Transform {
+/// The camera's pose for `state` in front of (or behind) the door at `transform`, `standoff` units
+/// out from it ([`BenchState::standoff`]).
+fn door_pose(
+    transform: &GlobalTransform,
+    door: &LoadDoor,
+    state: BenchState,
+    standoff: f32,
+) -> Transform {
     let position = transform.translation();
     let mut outward = match door.outward {
         Some(outward) => creation_to_bevy(Vec3::from_array(outward)),
@@ -681,7 +755,7 @@ fn door_pose(transform: &GlobalTransform, door: &LoadDoor, state: BenchState) ->
         Side::Front => outward,
         Side::Back => -outward,
     };
-    let eye = position + away * STANDOFF + Vec3::Y * EYE_HEIGHT;
+    let eye = position + away * standoff + Vec3::Y * EYE_HEIGHT;
     let target = position + Vec3::Y * EYE_HEIGHT;
     let mut pose = Transform::from_translation(eye).looking_at(target, Vec3::Y);
     if facing == Facing::Away {
@@ -801,14 +875,29 @@ fn run_portal_bench(
             if let Some((entity, transform, door, _)) =
                 doors.iter().find(|(_, _, door, _)| door.ref_id == wanted)
             {
+                // A look-out door's chain starts in its own first state. The out states stand on
+                // the door's authored outward side and have no model-axis fallback, so a door
+                // without one is skipped rather than posed the wrong way round.
+                let first = bench
+                    .current()
+                    .map_or(BenchState::Closed, BenchDoor::first_state);
+                if first == BenchState::ClosedOut && door.outward.is_none() {
+                    let line = format!(
+                        "SKIP door {wanted:08X}: no outward direction, and the out states have \
+                         no fallback"
+                    );
+                    bench.note(line);
+                    bench.next_door();
+                    return;
+                }
                 bench.door = Some(entity);
-                *camera = door_pose(transform, door, BenchState::Closed);
+                *camera = door_pose(transform, door, first, first.standoff());
                 let line = format!(
                     "door {wanted:08X} -> \"{}\" streamed in after {:.1} s",
                     door.label, bench.timer
                 );
                 bench.note(line);
-                bench.enter(Phase::Settle);
+                bench.enter(Phase::Settle(first));
             } else if bench.timer >= DOOR_SPAWN_TIMEOUT_SECONDS {
                 let line = format!(
                     "SKIP door {wanted:08X}: not streamed in within {DOOR_SPAWN_TIMEOUT_SECONDS:.0} s"
@@ -817,25 +906,20 @@ fn run_portal_bench(
                 bench.next_door();
             }
         }
-        Phase::Settle | Phase::OpenSettle => {
-            let state = if bench.phase == Phase::Settle {
-                BenchState::Closed
-            } else {
-                BenchState::OpenInView
-            };
+        Phase::Settle(state) => {
             let Some((_, transform, door, _)) = door_row else {
                 let line = "SKIP: the door unloaded while the view settled";
                 bench.note(line);
                 bench.next_door();
                 return;
             };
-            *camera = door_pose(transform, door, state);
+            *camera = door_pose(transform, door, state, state.standoff());
             bench.quiet = if counts.is_quiet() {
                 bench.quiet.saturating_add(1)
             } else {
                 0
             };
-            let wanted = if state == BenchState::Closed {
+            let wanted = if state.is_closed() {
                 DOOR_QUIET_FRAMES
             } else {
                 SETTLE_QUIET_FRAMES
@@ -861,7 +945,7 @@ fn run_portal_bench(
                 bench.next_door();
                 return;
             };
-            *camera = door_pose(transform, door, state);
+            *camera = door_pose(transform, door, state, state.standoff());
             let step = step(bench.timer, bench.timing_seconds);
             // The render thread's timings are kept only inside a state's window.
             if let Some(timings) = render_timings.as_deref() {
@@ -905,22 +989,22 @@ fn run_portal_bench(
                     bench.rows.push(row);
                     match state.after() {
                         After::Time(next) => bench.enter(Phase::Time(next)),
-                        After::OpenTheDoor => {
+                        After::OpenTheDoor(then) => {
                             open_door.write(OpenDoor { door: entity });
-                            bench.enter(Phase::Opening);
+                            bench.enter(Phase::Opening { then });
                         }
                         After::CloseTheDoor => bench.enter(Phase::Closing { asked: false }),
                     }
                 }
             }
         }
-        Phase::Opening => {
+        Phase::Opening { then } => {
             let Some((_, transform, door, state)) = door_row else {
                 bench.note("SKIP: the door unloaded while it opened");
                 bench.next_door();
                 return;
             };
-            *camera = door_pose(transform, door, BenchState::OpenInView);
+            *camera = door_pose(transform, door, then, then.standoff());
             match state {
                 Some(DoorState::Open { animated }) => {
                     let line = format!(
@@ -933,7 +1017,7 @@ fn run_portal_bench(
                         }
                     );
                     bench.note(line);
-                    bench.enter(Phase::OpenSettle);
+                    bench.enter(Phase::Settle(then));
                 }
                 _ if bench.timer >= OPEN_TIMEOUT_SECONDS => {
                     let line = format!(
@@ -990,12 +1074,18 @@ mod tests {
 
     #[test]
     fn a_door_is_timed_closed_then_open_in_view_behind_and_occluded() {
-        assert_eq!(state_sequence(), BenchState::ALL.to_vec());
+        assert_eq!(
+            state_sequence(BenchState::Closed),
+            BenchState::ALL[..6].to_vec()
+        );
         assert_eq!(
             BenchState::Closed.after(),
             After::Time(BenchState::ClosedBehind)
         );
-        assert_eq!(BenchState::ClosedOccluded.after(), After::OpenTheDoor);
+        assert_eq!(
+            BenchState::ClosedOccluded.after(),
+            After::OpenTheDoor(BenchState::OpenInView)
+        );
         assert_eq!(BenchState::OpenOccluded.after(), After::CloseTheDoor);
         assert_eq!(
             BenchState::ALL.map(BenchState::name),
@@ -1005,9 +1095,77 @@ mod tests {
                 "closed-occluded",
                 "open-in-view",
                 "open-behind",
-                "open-occluded"
+                "open-occluded",
+                "closed-out",
+                "open-out-view"
             ]
         );
+    }
+
+    #[test]
+    fn a_look_out_door_is_timed_from_inside_facing_the_exterior() {
+        assert_eq!(
+            state_sequence(BenchState::ClosedOut),
+            vec![BenchState::ClosedOut, BenchState::OpenOutView]
+        );
+        assert_eq!(
+            BenchState::ClosedOut.after(),
+            After::OpenTheDoor(BenchState::OpenOutView)
+        );
+        assert_eq!(BenchState::OpenOutView.after(), After::CloseTheDoor);
+        assert!(BenchState::ClosedOut.is_closed(), "its door is still shut");
+        assert!(!BenchState::OpenOutView.is_closed());
+        assert_eq!(BenchState::ClosedOut.pose(), (Side::Front, Facing::Door));
+        assert_eq!(BenchState::OpenOutView.pose(), (Side::Front, Facing::Door));
+    }
+
+    #[test]
+    fn only_a_door_that_opens_onto_a_worldspace_starts_in_an_out_state() {
+        let door = |kind: &str| BenchDoor {
+            ref_id: HexFormId(1),
+            place: Some("Riverwood".to_owned()),
+            kind: kind.to_owned(),
+            worldspace_id: None,
+            interior_cell_id: Some(7),
+            position: [0.0; 3],
+        };
+        assert!(door(INTERIOR_TO_EXTERIOR).looks_out());
+        assert_eq!(
+            door(INTERIOR_TO_EXTERIOR).first_state(),
+            BenchState::ClosedOut
+        );
+        assert_eq!(
+            door("interior-to-interior").first_state(),
+            BenchState::Closed
+        );
+        assert_eq!(door("").first_state(), BenchState::Closed);
+    }
+
+    #[test]
+    fn a_door_without_a_kind_is_timed_in_the_six_states() {
+        let plain: BenchDoor = serde_json::from_str(
+            r#"{"ref_id": "0x00000001", "position": [0, 0, 0], "interior_cell_id": 7}"#,
+        )
+        .unwrap();
+        assert_eq!(plain.kind, "");
+        assert_eq!(plain.first_state(), BenchState::Closed);
+        let out: BenchDoor = serde_json::from_str(
+            r#"{"ref_id": "0x00000002", "kind": "interior-to-exterior", "position": [0, 0, 0],
+                "interior_cell_id": 7}"#,
+        )
+        .unwrap();
+        assert!(out.looks_out());
+        assert_eq!(out.first_state(), BenchState::ClosedOut);
+    }
+
+    #[test]
+    fn the_out_states_stand_closer_to_the_door_than_the_rest() {
+        assert_eq!(BenchState::ClosedOut.standoff(), OUT_STANDOFF);
+        assert_eq!(BenchState::OpenOutView.standoff(), OUT_STANDOFF);
+        for state in BenchState::ALL[..6].iter() {
+            assert_eq!(state.standoff(), STANDOFF);
+        }
+        const { assert!(OUT_STANDOFF < STANDOFF) };
     }
 
     #[test]
@@ -1040,18 +1198,45 @@ mod tests {
             outward: Some([0.0, 1.0, 0.0]),
         };
         let transform = GlobalTransform::from_translation(Vec3::ZERO);
-        let front = door_pose(&transform, &door, BenchState::OpenInView);
+        let front = door_pose(
+            &transform,
+            &door,
+            BenchState::OpenInView,
+            BenchState::OpenInView.standoff(),
+        );
         assert!((front.translation - Vec3::new(0.0, EYE_HEIGHT, -STANDOFF)).length() < 1e-3);
         assert!(front.forward().dot(Vec3::Z) > 0.99, "faces the door");
-        let behind = door_pose(&transform, &door, BenchState::OpenBehind);
+        let behind = door_pose(
+            &transform,
+            &door,
+            BenchState::OpenBehind,
+            BenchState::OpenBehind.standoff(),
+        );
         assert_eq!(behind.translation, front.translation);
         assert!(behind.forward().dot(Vec3::NEG_Z) > 0.99, "faces away");
-        let occluded = door_pose(&transform, &door, BenchState::OpenOccluded);
+        let occluded = door_pose(
+            &transform,
+            &door,
+            BenchState::OpenOccluded,
+            BenchState::OpenOccluded.standoff(),
+        );
         assert!((occluded.translation - Vec3::new(0.0, EYE_HEIGHT, STANDOFF)).length() < 1e-3);
         assert!(
             occluded.forward().dot(Vec3::NEG_Z) > 0.99,
             "faces the door from its back"
         );
+        // An out state stands on the door's outward side, facing out through it, nearer in.
+        for state in [BenchState::ClosedOut, BenchState::OpenOutView] {
+            let out = door_pose(&transform, &door, state, state.standoff());
+            assert!(
+                (out.translation - Vec3::new(0.0, EYE_HEIGHT, -OUT_STANDOFF)).length() < 1e-3,
+                "{state:?} stands {OUT_STANDOFF} units out on the door's front"
+            );
+            assert!(
+                out.forward().dot(Vec3::Z) > 0.99,
+                "{state:?} faces the door"
+            );
+        }
     }
 
     #[test]

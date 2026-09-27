@@ -1,9 +1,18 @@
 """Pick the portal bench's stress doors from the world database.
 
 The portal bench (`engine --portal-bench <doors.json>`) times the doorway at a fixed list of load
-doors. This script writes that list: the doors where the portal has the most to draw, in the big
-cities (Whiterun, Solitude, Windhelm, Markarth, Riften and their interiors), mixing
-exterior-to-interior and interior-to-interior doors, spread over several places.
+doors. This script writes two lists from the world database, opened read-only:
+
+* ``tools/bench/portal_bench_doors.json`` - the doors where the portal has the most to draw, in the
+  big cities (Whiterun, Solitude, Windhelm, Markarth, Riften and their interiors), mixing
+  exterior-to-interior and interior-to-interior doors, spread over several places. Every one of
+  them is looked at from the side the portal draws *into*.
+* ``tools/bench/portal_bench_doors_out.json`` - the hand-picked doors of :data:`LOOKING_OUT`: each
+  stands inside an interior whose door opens onto a worldspace, so the bench's ``closed-out`` and
+  ``open-out-view`` states stand inside and look out through it, and the destination sun's cost is
+  measured. Each row is checked against the database (it must be an ``interior-to-exterior`` door
+  with a return link back into it); a row the database disagrees with is an error, never a silent
+  omission.
 
 A door's load is two counts:
 
@@ -19,6 +28,7 @@ Usage::
 
     python tools/bench/portal_bench_doors.py [--db C:/Modding/SkyrimConverted/skyrim_world.db]
         [--out tools/bench/portal_bench_doors.json]
+        [--view-out tools/bench/portal_bench_doors_out.json]
 
 The database is opened read-only.
 """
@@ -34,9 +44,24 @@ from pathlib import Path
 
 DEFAULT_DB = "C:/Modding/SkyrimConverted/skyrim_world.db"
 DEFAULT_OUT = Path(__file__).with_name("portal_bench_doors.json")
+DEFAULT_VIEW_OUT = Path(__file__).with_name("portal_bench_doors_out.json")
 
 #: How far around a door its references count, in Creation units.
 RADIUS = 3000.0
+
+#: The bench's look-out doors, hand-picked: each one stands inside a house whose door opens onto a
+#: sunlit exterior, which is what the out states measure (the destination sun's cost). Rows are
+#: ``(interior-side reference, place, the interior cell's editor id, the worldspace outside)`` and
+#: every field is checked against the database when the list is written.
+LOOKING_OUT = (
+    (0x0001CBAF, "Riverwood", "RiverwoodSvensHouse", "Tamriel"),
+    (0x000133FB, "Riverwood", "RiverwoodAlvorsHouse", "Tamriel"),
+    (0x00013419, "Riverwood", "RiverwoodSleepingGiantInn", "Tamriel"),
+    (0x000918E6, "Whiterun", "WhiterunUthgerdTheUnbrokensHouse", "WhiterunWorld"),
+)
+
+#: The kind a look-out door has: it stands in an interior and its link leads to a worldspace.
+LOOKS_OUT = "interior-to-exterior"
 
 #: The city worldspaces, by editor id, and the place name each is reported under.
 CITIES = {
@@ -147,6 +172,22 @@ def benchable(door: Door) -> bool:
     )
 
 
+def fill_load(world: World, door: Door, by_ref: dict[int, Door]) -> None:
+    """Fills a door's ``near``/``beyond`` counts and the names the doors file reports. Both lists
+    need them: the main ranking and the hand-picked look-out doors."""
+    door.near = within(door.position, world.references.get(door.space, []))
+    if door.destination[0] == "interior":
+        door.beyond = len(world.references.get(door.destination, []))
+        door.label = world.interior_names.get(door.destination[1], "")
+    else:
+        far = by_ref.get(door.destination_ref)
+        door.beyond = (
+            within(far.position, world.references.get(door.destination, [])) if far else 0
+        )
+        door.label = world.worldspaces.get(door.destination[1], "")
+    door.source_label = space_name(world, door.space)
+
+
 def score_doors(world: World) -> list[Door]:
     """Every benchable city door, with its place and counts filled in."""
     places = city_places(world)
@@ -156,19 +197,7 @@ def score_doors(world: World) -> list[Door]:
         door.place = places.get(door.space)
         if not door.place or not benchable(door):
             continue
-        door.near = within(door.position, world.references.get(door.space, []))
-        if door.destination[0] == "interior":
-            door.beyond = len(world.references.get(door.destination, []))
-        else:
-            far = by_ref.get(door.destination_ref)
-            door.beyond = (
-                within(far.position, world.references.get(door.destination, [])) if far else 0
-            )
-        door.source_label = space_name(world, door.space)
-        if door.destination[0] == "interior":
-            door.label = world.interior_names.get(door.destination[1], "")
-        else:
-            door.label = world.worldspaces.get(door.destination[1], "")
+        fill_load(world, door, by_ref)
         scored.append(door)
     return scored
 
@@ -198,6 +227,48 @@ def pick_doors(world: World, exterior=EXTERIOR_DOORS, interior=INTERIOR_DOORS) -
 
     take([d for d in scored if d.kind == "exterior-to-interior"], exterior)
     take([d for d in scored if d.kind == "interior-to-interior"], interior)
+    return picked
+
+
+class LookingOutError(RuntimeError):
+    """A hand-picked look-out door does not match the database."""
+
+
+def looking_out_doors(world: World, table=LOOKING_OUT) -> list[Door]:
+    """The doors of the hand-picked ``table``, checked against the database.
+
+    A row names a door, the place to report it under, the interior cell it stands in and the
+    worldspace its door opens onto. The out states stand inside and look out, so a row that is not
+    an interior-to-exterior door with a link back into it would measure nothing: it is an error.
+    """
+    by_ref = {door.ref_id: door for door in world.doors}
+    picked: list[Door] = []
+    for ref_id, place, cell, worldspace in table:
+        where = f"{ref_id:08X} ({place}, {cell})"
+        door = by_ref.get(ref_id)
+        if door is None:
+            raise LookingOutError(f"{where}: the database has no load door with that reference")
+        if door.kind != LOOKS_OUT:
+            raise LookingOutError(
+                f"{where}: {door.kind}, not {LOOKS_OUT}: its link does not lead outside"
+            )
+        if space_name(world, door.space) != cell:
+            raise LookingOutError(
+                f"{where}: the door stands in {space_name(world, door.space)!r}"
+            )
+        if space_name(world, door.destination) != worldspace:
+            raise LookingOutError(
+                f"{where}: the door opens onto {space_name(world, door.destination)!r}, "
+                f"not {worldspace!r}"
+            )
+        far = by_ref.get(door.destination_ref)
+        if far is None or far.destination != door.space:
+            raise LookingOutError(
+                f"{where}: no return link from {door.destination_ref:08X} back into it"
+            )
+        door.place = place
+        fill_load(world, door, by_ref)
+        picked.append(door)
     return picked
 
 
@@ -272,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--db", default=DEFAULT_DB)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--view-out", type=Path, default=DEFAULT_VIEW_OUT)
     args = parser.parse_args(argv)
     uri = f"file:{Path(args.db).as_posix()}?mode=ro"
     with sqlite3.connect(uri, uri=True) as connection:
@@ -291,6 +363,26 @@ def main(argv: list[str] | None = None) -> int:
     for door in picked:
         print(f"{door.ref_id:08X} {door.source_label} -> {door.label}: {reason(door)}")
     print(f"{len(picked)} doors over {len(places)} places ({', '.join(places)}) -> {args.out}")
+
+    try:
+        viewed = looking_out_doors(world)
+    except LookingOutError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    view_document = {
+        "note": "Written by tools/bench/portal_bench_doors.py; the portal bench's look-out doors. "
+        "Each stands inside an interior whose door opens onto a worldspace, so the bench's "
+        "closed-out and open-out-view states look out through it at that exterior. "
+        f"near = references within {RADIUS:.0f} units of the door in its own space; beyond = "
+        "references within the same radius of the destination door (exterior).",
+        "radius": RADIUS,
+        "doors": [door_json(door) for door in viewed],
+    }
+    args.view_out.parent.mkdir(parents=True, exist_ok=True)
+    args.view_out.write_text(json.dumps(view_document, indent=2) + "\n", encoding="utf-8")
+    for door in viewed:
+        print(f"{door.ref_id:08X} {door.source_label} -> {door.label}: {reason(door)}")
+    print(f"{len(viewed)} look-out doors -> {args.view_out}")
     return 0 if len(places) >= 3 else 1
 
 
