@@ -56,10 +56,10 @@ Built locally from main 6f583cd by Upstream Dev (merges of the component branche
 | `phase2/tooling` | scripts-utf8-bom, scripts-schema-from-source, conversion-stage-times, benchmark-frame-times, render-world-timing | sample output | built |
 | (onto #30) | prune-keeps-failed-sources 6bfee13 | test output | ready; a push to our own PR |
 | `phase2/sky` | sky-dome, sky-fog | before/after pairs (p2night) | built |
-| `phase2/water` | water-look, water-colours, reflection-land-only (render.rs: kept both) | lake before/after + reflection | built; reflection citations to verify |
+| `phase2/water` | water-look, water-colours, reflection-land-only (render.rs: kept both) | lake before/after + reflection | built; **evidence** `evidence/water` (white river at the mill -> shaded); send after sky or render with sky merged in (flat grey without a sky); reflection citations to verify |
 | `phase2/vertex-colours` | prepass-vertex-alpha, vertex-alpha-faithful, vertex-alpha-flag | gravel/Whiterun before/after | built; evidence: Phase 2 Dev reconverts a copy on D: (SkyrimConverted-upstream-s15, local evidence converter, not for upstream); needs CONVERTER_SCHEMA_VERSION 14 -> 15 + reuse-window entry right before sending (coordinate with #27's 15 and #40's world DB 3 -> 4) |
 | `phase2/terrain-textures` | terrain-samplers-weights, terrain-normal-maps | ground close-ups | built; #42 covers only the Repeat sampler: drop/adapt our sampler part (c2bcb38, affbd41 fixture) to #42 or base on it if it merges first; keep the weights (17-sample field) + normal maps (engine-only: renders on today's data); expect a streaming.rs conflict; the picture shows blending + relief |
-| `phase2/sun-shadows` | sun-shadow-cascades, water-reflection-gating | wide shadow view; timing | built; needs a benchmark |
+| `phase2/sun-shadows` | sun-shadow-cascades, water-reflection-gating | wide shadow view; timing | built; **evidence** `C:/Modding/wkj-tools/evidence/sun-shadows` (Bleak Falls Barrow, Riften Fishery: no shadows -> long shadows). Open: in the Fishery after-shot the object reflections look gone (reflection gating bug?), asked Phase 2 Dev; needs a benchmark |
 | `phase2/housekeeping` | audit-converter, audit-engine, asset-precedence | test output | built |
 | (later) faster re-conversions | resume-publish-only, staging-hard-links | timing | after #30/#31 merge |
 | (after #27) fire and effects | material-publication, nif-billboard-nodes, shared-converter-schema | before/after | waits on #27 |
