@@ -599,7 +599,7 @@ pub struct PortalTexture(pub Handle<Image>);
 
 /// The second camera that renders a destination cell.
 #[derive(Component)]
-struct PortalCamera;
+pub(crate) struct PortalCamera;
 
 /// The sun the doorway image is lit by: a second [`DirectionalLight`], on the portal camera's
 /// layer, carrying the destination space's own sun ([`update_destination_atmosphere`]) in the

@@ -742,43 +742,72 @@ type WaterReflectionObserver = (
 );
 
 /// What the gate reads off the world camera: its pose, the [`Frustum`] Bevy keeps in step with it,
-/// and the projection whose far distance the frustum itself does not carry.
+/// the projection whose far distance the frustum itself does not carry, and the layers it draws.
 type WaterReflectionObserverView = (
     &'static GlobalTransform,
     Option<&'static Frustum>,
     Option<&'static Projection>,
+    Option<&'static RenderLayers>,
+);
+
+/// What the gate reads off a water plane: its pose and bounds for the frustum test, and the layers
+/// and inherited visibility that say whether any camera sampling the reflection draws it at all.
+type WaterSurfaceView = (
+    &'static GlobalTransform,
+    Option<&'static Aabb>,
+    Option<&'static RenderLayers>,
+    Option<&'static InheritedVisibility>,
+);
+
+/// The portal's camera, read for whether it draws this frame.
+type PortalCameraFilter = (
+    With<crate::portal::PortalCamera>,
+    Without<WaterReflectionCamera>,
 );
 
 fn update_water_reflection_camera(
     main_camera: Query<WaterReflectionObserverView, WaterReflectionObserver>,
-    water: Query<(&GlobalTransform, Option<&Aabb>), With<crate::world::components::WaterSurface>>,
+    water: Query<WaterSurfaceView, With<crate::world::components::WaterSurface>>,
+    portal_cameras: Query<&Camera, PortalCameraFilter>,
     mut reflection_camera: Query<(&mut Transform, &mut Camera), With<WaterReflectionCamera>>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = std::time::Instant::now();
-    let (Ok((main, frustum, projection)), Ok((mut reflection, mut camera))) =
+    let (Ok((main, frustum, projection, main_layers)), Ok((mut reflection, mut camera))) =
         (main_camera.single(), reflection_camera.single_mut())
     else {
         return;
     };
+    let main_layers = main_layers.cloned().unwrap_or_default();
+    let portal_drawn = portal_cameras.iter().any(|camera| camera.is_active);
     // The surface nearest the main camera fixes the mirror plane; a further surface would put the
     // reflection at the wrong height when more than one water level is streamed in.
     let mut mirror_surface = None;
     let mut mirror_distance = f32::INFINITY;
     let mut surface_in_view = false;
-    for (surface, bounds) in &water {
+    for (surface, bounds, layers, visibility) in &water {
+        let Some(seen_by) = water_drawn_by(layers, visibility, &main_layers, portal_drawn) else {
+            // Water no camera draws - a pre-streamed exterior's river behind a shut house door -
+            // neither fixes the mirror plane nor keeps the reflection rendering.
+            continue;
+        };
         let distance = (surface.translation().y - main.translation().y).abs();
         if distance < mirror_distance {
             mirror_distance = distance;
             mirror_surface = Some(surface);
         }
-        surface_in_view |= water_plane_in_view(
-            main,
-            frustum,
-            projection.map(|projection| projection.far()),
-            surface,
-            bounds,
-        );
+        surface_in_view |= match seen_by {
+            WaterSeenBy::Main => water_plane_in_view(
+                main,
+                frustum,
+                projection.map(|projection| projection.far()),
+                surface,
+                bounds,
+            ),
+            // The destination is laid out behind the portal's window, not in the main camera's
+            // view, so the main frustum says nothing about it: drawn by the portal is enough.
+            WaterSeenBy::Portal => true,
+        };
     }
     let Some(surface) = mirror_surface else {
         camera.is_active = false;
@@ -789,6 +818,47 @@ fn update_water_reflection_camera(
     *reflection = reflected_camera_transform(main, surface.translation().y);
     camera.is_active = surface_in_view;
     profiler.record_elapsed("render/water_reflection_camera", started);
+}
+
+/// Which camera sampling the reflection draws a water plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaterSeenBy {
+    /// The main camera: the plane is on one of its layers.
+    Main,
+    /// The portal camera, which draws the destination's cells while a doorway is open.
+    Portal,
+}
+
+/// Whether any camera that samples the water reflection draws this plane, and which one.
+///
+/// Only water a camera draws is worth a reflection: the reflection texture is sampled by water
+/// surfaces alone, so a plane on no drawn layer - a cell the portal hides, or a destination's
+/// river while its door is shut and the portal camera is off - costs a whole second render of the
+/// scene for nothing. Standing inside a Riverwood house with the door shut, the exterior behind
+/// it stays streamed in for the door, and its river kept the reflection on (research-269).
+///
+/// A hidden plane (its [`InheritedVisibility`] false) is drawn by nobody. A plane without
+/// layers is on layer 0, like every entity; a plane without an [`InheritedVisibility`] - a unit
+/// test's bare entity - counts as visible.
+fn water_drawn_by(
+    layers: Option<&RenderLayers>,
+    visibility: Option<&InheritedVisibility>,
+    main_layers: &RenderLayers,
+    portal_drawn: bool,
+) -> Option<WaterSeenBy> {
+    if visibility.is_some_and(|visibility| !visibility.get()) {
+        return None;
+    }
+    let layers = layers.cloned().unwrap_or_default();
+    if layers.intersects(main_layers) {
+        Some(WaterSeenBy::Main)
+    } else if portal_drawn
+        && layers.intersects(&RenderLayers::layer(crate::portal::DESTINATION_LAYER))
+    {
+        Some(WaterSeenBy::Portal)
+    } else {
+        None
+    }
 }
 
 /// Whether a water plane's bounds reach the main camera's view, its bounds grown by
@@ -1496,6 +1566,33 @@ mod tests {
             ));
         }
 
+        /// A water plane as a cell's role leaves it: on these layers, and drawn or hidden.
+        fn spawn_water_on(&mut self, translation: Vec3, layers: RenderLayers, visible: bool) {
+            self.app.world_mut().spawn((
+                GlobalTransform::from(Transform::from_translation(translation)),
+                water_bounds(CELL_WATER_HALF_EXTENTS),
+                layers,
+                if visible {
+                    InheritedVisibility::VISIBLE
+                } else {
+                    InheritedVisibility::HIDDEN
+                },
+                WaterSurface,
+            ));
+        }
+
+        /// The portal's camera, drawing this frame or not.
+        fn spawn_portal_camera(&mut self, drawing: bool) {
+            self.app.world_mut().spawn((
+                Camera {
+                    order: -2,
+                    is_active: drawing,
+                    ..default()
+                },
+                crate::portal::PortalCamera,
+            ));
+        }
+
         fn frame(&mut self) -> ReflectionFrame {
             self.app.update();
             let world = self.app.world();
@@ -1550,6 +1647,51 @@ mod tests {
         let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
         harness.spawn_water(Vec3::new(0.0, 40.0, -800.0), CELL_WATER_HALF_EXTENTS);
         assert!(harness.frame().active);
+    }
+
+    /// Inside a house with its door shut: the exterior behind the door is streamed in on the
+    /// destination layer, but the portal camera is off, so nothing draws its river.
+    #[test]
+    fn reflection_camera_stays_off_for_destination_water_while_the_portal_is_off() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        let destination = RenderLayers::layer(crate::portal::DESTINATION_LAYER);
+        harness.spawn_water_on(Vec3::new(0.0, 40.0, -800.0), destination.clone(), true);
+        assert!(!harness.frame().active, "no portal camera at all");
+        harness.spawn_portal_camera(false);
+        assert!(
+            !harness.frame().active,
+            "a portal camera that is not drawing"
+        );
+    }
+
+    /// The door opens: the portal draws the destination, and its water samples the reflection.
+    #[test]
+    fn reflection_camera_renders_destination_water_while_the_portal_draws() {
+        // Behind the main camera on purpose: the destination is laid out for the portal's window,
+        // so the main frustum must not decide it.
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        let destination = RenderLayers::layer(crate::portal::DESTINATION_LAYER);
+        harness.spawn_water_on(Vec3::new(0.0, 40.0, 5_000.0), destination, true);
+        harness.spawn_portal_camera(true);
+        assert!(harness.frame().active);
+    }
+
+    /// A cell the portal hides (no layers, hidden) keeps neither the reflection on nor the mirror
+    /// plane: the nearer hidden plane must not set the height the visible one is reflected at.
+    #[test]
+    fn hidden_water_neither_keeps_the_reflection_on_nor_fixes_the_mirror() {
+        let main = Transform::from_xyz(0.0, 120.0, 0.0);
+        let mut harness = ReflectionHarness::new(main);
+        harness.spawn_water_on(Vec3::new(0.0, 100.0, -800.0), RenderLayers::none(), false);
+        assert!(!harness.frame().active, "only hidden water");
+        harness.spawn_water_on(Vec3::new(0.0, 40.0, -800.0), RenderLayers::layer(0), true);
+        let frame = harness.frame();
+        assert!(frame.active, "the visible plane is in view");
+        assert_eq!(
+            frame.transform,
+            reflected_camera_transform(&GlobalTransform::from(main), 40.0),
+            "mirrored in the visible plane, not the nearer hidden one"
+        );
     }
 
     #[test]
