@@ -161,15 +161,15 @@ use crate::{
         DoorwayFloorsMeasured, LoadDoor,
     },
     render::TerrainMaterial,
-    streaming::{ActiveCell, RenderOrigin, StreamingWorld},
+    streaming::{ActiveCell, RenderOrigin, StreamingWorld, camera_grid},
     transition::{
         CrossingHeld, DOOR_PRESTREAM_RADIUS, DoorMap, destination_is_resident, destination_keys,
         distance_in_front_of_door, door_map,
     },
     world::{
         components::{
-            CELL_SIZE, CellRef, ExpectedModelBounds, ExteriorCellGrid, InstanceBounds,
-            StreamedCellRoot, StreamingCamera, WaterSurface,
+            CellRef, ExpectedModelBounds, ExteriorCellGrid, InstanceBounds, StreamedCellRoot,
+            StreamingCamera, WaterSurface,
         },
         database::CellKey,
         lighting::{SpaceKey, SpaceLightingCatalog, space_key},
@@ -926,22 +926,15 @@ struct ActiveSpace {
 }
 
 impl ActiveSpace {
-    /// The camera's grid, from its render-space position and the render origin, as
-    /// `streaming::plan_cells` computes it.
-    fn camera_grid(camera: Vec3, origin: IVec2) -> IVec2 {
-        let global_x = camera.x + origin.x as f32 * CELL_SIZE;
-        let global_y = -camera.z + origin.y as f32 * CELL_SIZE;
-        IVec2::new(
-            (global_x / CELL_SIZE).floor() as i32,
-            (global_y / CELL_SIZE).floor() as i32,
-        )
-    }
-
+    /// The active space of a camera at render-space position `camera` while `origin` is the render
+    /// origin. Its centre is the grid `streaming::camera_grid` reads from that position, the one
+    /// place the grid-to-render offset is read backwards, so it is the cell `streaming::plan_cells`
+    /// streams around and never a hand-written copy of it that could drift.
     fn of(active: &ActiveCell, radius: i32, camera: Vec3, origin: IVec2) -> Self {
         Self {
             interior: active.interior,
             worldspace_id: active.worldspace_id,
-            center: Self::camera_grid(camera, origin),
+            center: camera_grid(camera, origin),
             radius,
         }
     }
@@ -9758,5 +9751,30 @@ mod tests {
         probe_frames(&mut probe, floors, FLOOR_PROBE_SETTLE_FRAMES - 1);
         assert_eq!(probe.step(None, true), FloorProbeStep::Wait);
         assert_eq!(probe.step(Some(floors), true), FloorProbeStep::Wait);
+    }
+
+    /// The active space is centred on the camera's cell at a render origin that is not zero, on
+    /// both sides of a cell's south-west corner: a render step north is a step along `-z`, so a
+    /// camera just south of the corner is one grid lower, and one just west of it one grid left.
+    /// The expected grids are worked by hand, not read back through the helper under test.
+    #[test]
+    fn the_active_space_is_centred_on_the_camera_cell_away_from_the_zero_origin() {
+        let active = ActiveCell {
+            worldspace_id: 0x3C,
+            interior: None,
+        };
+        let origin = IVec2::new(19, -7);
+        // Render (0, 0, 0) is the south-west corner of the origin's own cell.
+        for (camera, expected) in [
+            (Vec3::ZERO, IVec2::new(19, -7)),
+            (Vec3::new(100.0, 50.0, 300.0), IVec2::new(19, -8)),
+            (Vec3::new(-1.0, 0.0, -1.0), IVec2::new(18, -7)),
+            (Vec3::new(4096.0, 0.0, -4097.0), IVec2::new(20, -6)),
+        ] {
+            let space = ActiveSpace::of(&active, 3, camera, origin);
+            assert_eq!(space.center, expected, "a camera at render {camera:?}");
+            assert_eq!(space.worldspace_id, 0x3C);
+            assert_eq!(space.radius, 3);
+        }
     }
 }
