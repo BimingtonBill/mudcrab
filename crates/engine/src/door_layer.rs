@@ -319,6 +319,20 @@ type LayerDoorQuery<'world, 'state> = Query<
     Without<DoorCopy>,
 >;
 
+/// Takes a pair off the door layer: its door-layer door and the doorway image's leaf go, and the
+/// doors the pair owned are released in `owned`, so a pair spawned later in the same frame may
+/// claim them again.
+fn drop_pair(commands: &mut Commands, owned: &mut HashSet<Entity>, pair: &LayerPair) {
+    commands.entity(pair.copy).try_despawn();
+    if let Some(window) = pair.window {
+        commands.entity(window).try_despawn();
+    }
+    owned.remove(&pair.driver);
+    if let Some(follower) = pair.follower {
+        owned.remove(&follower);
+    }
+}
+
 /// Puts the load doors near the player on the door layer, takes them off it, hands a crossed
 /// door's model back once nobody can see it, and publishes what the isolation hides.
 ///
@@ -370,26 +384,29 @@ pub(crate) fn manage_door_layer(
 
     // The pairs standing: kept, updated, or dropped.
     let mut kept: Vec<LayerPair> = Vec::with_capacity(layer.pairs.len());
-    // Every door that drives a pair this frame: never re-claimed as another pair's follower.
-    let drivers: Vec<Entity> = layer.pairs.iter().map(|pair| pair.driver).collect();
+    // Every door a pair standing in this frame owns, as each pair is kept or spawned below: one
+    // doorway has one owner, so a door an earlier decision claimed is never claimed again by a
+    // later one - not as another pair's driver, and not as another pair's follower. Seeded with
+    // the doors of the pairs standing now, so a pair kept later in this loop is already claimed
+    // while an earlier pair decides; a pair dropped below releases its doors, so a pair handed
+    // back can be spawned again in this same frame (the crossing's own case).
+    let mut owned: HashSet<Entity> = layer
+        .pairs
+        .iter()
+        .flat_map(|pair| std::iter::once(pair.driver).chain(pair.follower))
+        .collect();
     for mut pair in std::mem::take(&mut layer.pairs) {
-        let drop = |commands: &mut Commands, pair: &LayerPair| {
-            commands.entity(pair.copy).try_despawn();
-            if let Some(window) = pair.window {
-                commands.entity(window).try_despawn();
-            }
-        };
         if !doors.contains(pair.driver) || !copies.contains(pair.copy) {
-            drop(&mut commands, &pair);
+            drop_pair(&mut commands, &mut owned, &pair);
             continue;
         }
         if pair
             .follower
             .is_none_or(|follower| !doors.contains(follower))
         {
-            // Never a twin that drives a pair of its own (the spawn path's rule too): two pairs
-            // would own one doorway.
-            pair.follower = twin_of(pair.driver).filter(|twin| !drivers.contains(twin));
+            // Never a door another pair owns (the spawn path's rule too, against this same set):
+            // two pairs would own one doorway.
+            pair.follower = twin_of(pair.driver).filter(|twin| !owned.contains(twin));
         }
         let driver_active = active(pair.driver);
         let follower_active = pair.follower.is_some_and(active);
@@ -405,7 +422,7 @@ pub(crate) fn manage_door_layer(
         let both_closed = closed(Some(pair.driver)) && closed(pair.follower);
         if !in_players_space {
             // Neither door is the player's any more (a teleport, or a space unloaded under it).
-            drop(&mut commands, &pair);
+            drop_pair(&mut commands, &mut owned, &pair);
             continue;
         }
         let far = standing.map_or(0.0, distance);
@@ -417,7 +434,7 @@ pub(crate) fn manage_door_layer(
         if driver_active && nearest > DOOR_LAYER_KEEP_RADIUS {
             // The player's own door, out of reach: its native draws it again, with the same model
             // in the same pose.
-            drop(&mut commands, &pair);
+            drop_pair(&mut commands, &mut owned, &pair);
             continue;
         }
         if !driver_active {
@@ -436,30 +453,36 @@ pub(crate) fn manage_door_layer(
                     in_view,
                     "door layer: the crossed door takes the model of the player's side"
                 );
-                drop(&mut commands, &pair);
+                drop_pair(&mut commands, &mut owned, &pair);
                 continue;
             }
         }
         pair.ready = copies.get(pair.copy).is_ok_and(|copy| copy.ready);
+        // Kept: it owns its doors for the rest of this frame.
+        owned.insert(pair.driver);
+        if let Some(follower) = pair.follower {
+            owned.insert(follower);
+        }
         kept.push(pair);
     }
     layer.pairs = kept;
 
-    // New pairs: every door of the player's space near enough, whose model swings, not on the
-    // layer yet.
+    // New pairs: every door of the player's space near enough, whose model swings, not owned by a
+    // pair standing this frame.
     for (entity, global, row, _, animation, scene) in &doors {
         let Some(scene) = scene else {
             continue;
         };
         if row.auto_load
             || !animation.is_some_and(DoorAnimation::swings)
-            || layer.pair_of(entity).is_some()
+            || owned.contains(&entity)
             || !active(entity)
             || eye.is_some_and(|eye| global.translation().distance(eye) > DOOR_LAYER_RADIUS)
         {
             continue;
         }
-        let follower = twin_of(entity).filter(|twin| layer.pair_of(*twin).is_none());
+        // A twin another pair owns is not taken from it: two pairs would own one doorway.
+        let follower = twin_of(entity).filter(|twin| !owned.contains(twin));
         let copy = commands
             .spawn((
                 Name::new(format!("Door layer {:08X}", row.ref_id)),
@@ -476,6 +499,10 @@ pub(crate) fn manage_door_layer(
                 door_layers(),
             ))
             .id();
+        owned.insert(entity);
+        if let Some(follower) = follower {
+            owned.insert(follower);
+        }
         layer.pairs.push(LayerPair {
             driver: entity,
             follower,
@@ -1036,5 +1063,141 @@ mod tests {
             layer.driven_pairs().collect::<Vec<_>>(),
             vec![(a, b), (d, e)]
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The one-owner-per-doorway guard, on the app the system really runs in.
+    // -----------------------------------------------------------------------------------------
+
+    /// An app running [`manage_door_layer`] alone, over no world: nothing classifies a cell, so
+    /// [`PortalState::is_in_active_space`] answers `true` for every door, which is two linked
+    /// doors standing in the same space.
+    fn layer_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<DoorLayer>()
+            .init_resource::<PortalState>()
+            .add_systems(Update, manage_door_layer);
+        app
+    }
+
+    fn layer_camera(app: &mut App, position: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((Transform::from_translation(position), StreamingCamera))
+            .id()
+    }
+
+    /// A swinging, non-auto-load load door whose link leads to `destination_ref_id`, standing at
+    /// `position`.
+    fn layer_door(app: &mut App, ref_id: u32, destination_ref_id: u32, position: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                LoadDoor {
+                    ref_id,
+                    destination: crate::doors::DoorDestination {
+                        destination_ref_id,
+                        interior_cell_id: Some(1),
+                        worldspace_id: None,
+                        arrival_position: [0.0; 3],
+                        arrival_rotation: [0.0; 3],
+                    },
+                    label: "Door layer test".into(),
+                    auto_load: false,
+                    outward: None,
+                },
+                DoorState::Closed,
+                crate::door_animation::DoorAnimation::swinging_for_test(),
+                WorldAssetRoot(Handle::default()),
+                Transform::from_translation(position),
+                GlobalTransform::from_translation(position),
+            ))
+            .id()
+    }
+
+    /// How many pairs on the layer claim each door, as a driver or as a follower: the guard's
+    /// whole question is that no door is in there twice.
+    fn claimed(app: &App) -> HashMap<Entity, usize> {
+        let mut claimed: HashMap<Entity, usize> = HashMap::new();
+        for pair in app.world().resource::<DoorLayer>().pairs() {
+            *claimed.entry(pair.driver).or_default() += 1;
+            if let Some(follower) = pair.follower {
+                *claimed.entry(follower).or_default() += 1;
+            }
+        }
+        claimed
+    }
+
+    /// Two linked doors standing in the player's space - Whiterun's double gate - are **one
+    /// doorway**: one pair owns both of them, and neither door is claimed by a second pair in the
+    /// same frame.
+    #[test]
+    fn two_linked_doors_of_the_players_space_own_one_doorway() {
+        let mut app = layer_app();
+        layer_camera(&mut app, Vec3::new(0.0, 120.0, 0.0));
+        let door = layer_door(&mut app, 0x1234, 0x5678, Vec3::new(0.0, 0.0, -300.0));
+        let twin = layer_door(&mut app, 0x5678, 0x1234, Vec3::new(160.0, 0.0, -320.0));
+
+        app.update();
+        assert_eq!(
+            app.world().resource::<DoorLayer>().pairs().len(),
+            1,
+            "the two doors are one doorway, not two"
+        );
+        let claims = claimed(&app);
+        assert_eq!(
+            claims,
+            HashMap::from([(door, 1), (twin, 1)]),
+            "one of the two drives the door-layer door and the other follows it"
+        );
+
+        // The ownership does not move between frames: nothing is claimed twice, and no second
+        // pair appears for the doorway.
+        app.update();
+        assert_eq!(claimed(&app), claims);
+        assert_eq!(app.world().resource::<DoorLayer>().pairs().len(), 1);
+    }
+
+    /// A door another pair already follows is not claimed again, even by a pair kept in the same
+    /// frame: two of the player's doors leading to one door is still one doorway with one owner.
+    ///
+    /// This is the case the guard missed while it knew only a pair's *driver*, and only as of the
+    /// previous frame: the follower of a pair kept in this frame was free to be adopted by the next
+    /// pair as well, so the door was in two pairs at once.
+    #[test]
+    fn a_door_another_pair_already_follows_is_not_claimed_again() {
+        let mut app = layer_app();
+        layer_camera(&mut app, Vec3::new(0.0, 120.0, 0.0));
+        // Two doors of the player's space leading to the same door, which leads back to the first.
+        let first = layer_door(&mut app, 0x1234, 0x9999, Vec3::new(0.0, 0.0, -300.0));
+        let second = layer_door(&mut app, 0x4321, 0x9999, Vec3::new(120.0, 0.0, -340.0));
+        let shared = layer_door(&mut app, 0x9999, 0x1234, Vec3::new(200.0, 0.0, -360.0));
+
+        // The first frame spawns the pairs; every frame after is one the guard decides in, with the
+        // pair that owns the shared door kept.
+        for frame in 0..3 {
+            app.update();
+            if frame == 0 {
+                continue;
+            }
+            let claims = claimed(&app);
+            assert!(
+                claims.values().all(|count| *count == 1),
+                "no door is claimed twice, on frame {frame}: {claims:?}"
+            );
+            assert_eq!(
+                claims,
+                HashMap::from([(first, 1), (second, 1), (shared, 1)]),
+                "each of the three doors owns one doorway, on frame {frame}"
+            );
+            let pairs = app.world().resource::<DoorLayer>().pairs();
+            assert_eq!(pairs.len(), 2, "one pair per door of the player's space");
+            assert_eq!(
+                pairs
+                    .iter()
+                    .filter(|pair| pair.driver == shared || pair.follower == Some(shared))
+                    .count(),
+                1,
+                "the door both pairs reach is in one pair only, as its driver or as its follower"
+            );
+        }
     }
 }

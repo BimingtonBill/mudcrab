@@ -262,7 +262,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // this run gets is the plugin's own decision (docs/design/portal-plugin.md).
         app.add_plugins(crate::portal::PortalPlugin);
         // The portal graph: every load door and where it leads, read once from the world
-        // database (`crate::portal_graph`). Nothing reads it yet.
+        // database (`crate::portal_graph`). The transition layer reads it every frame to rank the
+        // doors the camera is most likely to take next and pre-stream what is behind them
+        // (`transition::predicted_doors`).
         app.add_plugins(crate::portal_graph::PortalGraphPlugin);
         // The graphics settings, applied to the main, portal and water cameras and the sun, for
         // every run that opened the world (a `--shots` run included); `M` cycles the tonemapper

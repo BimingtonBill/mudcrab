@@ -53,6 +53,15 @@ const COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS: u64 = 1_000;
 /// not fit is held for the next frame rather than dropped.
 const MAX_TERRAIN_CELL_COMMITS_PER_FRAME: usize = 16;
 
+/// How many times the plan asks again for an interior cell whose full request failed while the
+/// camera stands in it ([`retry_failed_interior`]).
+///
+/// An interior has one tier and no landscape of its own to fall back to, so a failure would
+/// otherwise leave the camera's own space empty for as long as it stays there. The budget gives a
+/// transient failure - a busy worker, a database hiccup - its chances, and is small enough that a
+/// cell the database really does not have is not re-requested every frame.
+const INTERIOR_FAILED_RETRIES: u32 = 3;
+
 fn commit_budget_exceeded(elapsed_micros: u64, budget_micros: u64) -> bool {
     elapsed_micros > budget_micros.saturating_add(COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS)
 }
@@ -130,6 +139,10 @@ pub struct StreamingWorld {
     /// data does not change) and drop that landscape every time. Forgotten when the cell leaves
     /// the plan, so a cell the camera comes back to is asked for in full once more.
     full_failed: HashSet<CellKey>,
+    /// How much of [`INTERIOR_FAILED_RETRIES`] each failed cell has spent. A budget belongs to one
+    /// stay in the plan: it is dropped with the cell, so a cell the camera comes back to is asked
+    /// for in full again with its budget whole.
+    failed_retries: HashMap<CellKey, u32>,
 }
 
 impl StreamingWorld {
@@ -509,6 +522,10 @@ fn plan_cells(
         } else {
             detail
         };
+        // Whether this is a retry of a failure at exactly the tier the plan is asking for again:
+        // only the interior the camera stands in is ever asked for again at the tier it failed at
+        // ([`retry_failed_interior`]), and only while its retry budget lasts.
+        let retrying = retry_failed_interior(&key, &active, &streaming);
         // What the cell is streamed as now, and the root that draws it.
         let (held, root) = match streaming.cells.get(&key) {
             None => (None, None),
@@ -518,9 +535,11 @@ fn plan_cells(
             // question: a cell that held nothing as terrain-only may still hold the references,
             // lights and doors the full request asks for, and a cell the camera is standing in must
             // be complete; a full request that failed may have failed on its references, and the
-            // ring can still draw that cell's landscape. Each tier is tried once.
+            // ring can still draw that cell's landscape. Each tier is tried once - except the
+            // interior the camera stands in, which is the one cell whose failure leaves it nowhere
+            // to be, and which is retried while its budget lasts.
             Some(CellStatus::Failed { detail: failed }) => {
-                if *failed == detail {
+                if *failed == detail && !retrying {
                     continue;
                 }
                 (None, None)
@@ -549,6 +568,11 @@ fn plan_cells(
             // stopping keeps the cells closest to the camera at the head of the queue; the rest are
             // asked for again next frame.
             break;
+        }
+        if retrying {
+            // A retry is spent once the queue takes it: a request the full queue refused costs
+            // nothing, and the cell is asked for again next frame on the same budget.
+            *streaming.failed_retries.entry(key).or_default() += 1;
         }
         match (held, detail) {
             (Some(CellDetail::Terrain), CellDetail::Full) => {
@@ -603,9 +627,15 @@ fn plan_cells(
         keep
     });
     let StreamingWorld {
-        cells, full_failed, ..
+        cells,
+        full_failed,
+        failed_retries,
+        ..
     } = &mut *streaming;
     full_failed.retain(|key| cells.contains_key(key));
+    // A retry budget is spent on one stay in the plan: a cell that leaves it - which is how the
+    // camera leaves a failed interior, and comes back to it - starts with the whole budget again.
+    failed_retries.retain(|key, _| cells.contains_key(key));
     metrics.resident_cells = streaming
         .cells
         .values()
@@ -932,10 +962,47 @@ fn fail_cell(
     if let Some(replaced) = replaced {
         commands.entity(replaced).try_despawn();
     }
+    // Only an exterior: this set is the *terrain* rescue, and an interior has no landscape of its
+    // own to be drawn by instead. A failed interior - the one failure that leaves the camera with
+    // nowhere to be - is retried rather than demoted ([`retry_failed_interior`]).
     if detail == CellDetail::Full && matches!(key, CellKey::Exterior { .. }) {
         streaming.full_failed.insert(key);
     }
     streaming.cells.insert(key, CellStatus::Failed { detail });
+}
+
+/// Whether the plan asks again for `key`, which failed at exactly the tier it is asking for.
+///
+/// A failed cell is otherwise never asked for again at the same tier - the data does not change,
+/// and a ring grid that holds nothing would be re-requested every frame (see [`plan_cells`]) - and
+/// an exterior that failed in full is covered instead by [`StreamingWorld::full_failed`], which
+/// asks for its landscape on its own. An **interior** has neither: it is one tier, with no
+/// landscape to fall back to, and the cell the camera stands in is the whole of what it can see.
+/// Left as failed it would stay empty for as long as the camera stands in it, with no retry at
+/// all, and a crossing into it is what turns it into the active interior, a door whose destination
+/// counts as settled once it has failed (`crate::transition::destination_is_loaded`): the player
+/// can walk into that emptiness. So the interior the camera stands in is asked for again, up to
+/// [`INTERIOR_FAILED_RETRIES`] times: a bounded number, so a cell the database really does not
+/// have costs its budget and is then left alone rather than re-requested every frame.
+///
+/// Only the interior the camera is *in*: an interior merely pre-streamed behind a nearby door is
+/// not waited on forever either way, and the moment the camera crosses into it, it is the active
+/// interior and this answers `true` for it.
+fn retry_failed_interior(key: &CellKey, active: &ActiveCell, streaming: &StreamingWorld) -> bool {
+    let CellKey::Interior(cell_id) = *key else {
+        return false;
+    };
+    if active.interior != Some(cell_id)
+        || !matches!(
+            streaming.cells.get(key),
+            Some(CellStatus::Failed {
+                detail: CellDetail::Full
+            })
+        )
+    {
+        return false;
+    }
+    streaming.failed_retries.get(key).copied().unwrap_or(0) < INTERIOR_FAILED_RETRIES
 }
 
 /// The cells the active cell wants resident, and what it wants of each: the interior the camera is
@@ -4012,6 +4079,82 @@ mod tests {
             "loading Terrain",
             "a full cell that failed can still be drawn as terrain by the ring, once"
         );
+    }
+
+    /// The interior cell `write_plan_database` writes.
+    const INTERIOR_CELL: u32 = 99;
+
+    /// The interior the camera stands in is asked for again after a failed full request - a bounded
+    /// number of times, and then never again.
+    ///
+    /// It is the one cell with no other tier to fall back to: an exterior that failed in full is
+    /// drawn as terrain-only instead (`full_failed`), but an interior has no landscape of its own,
+    /// so without a retry the whole space the camera is in would stay empty for as long as it stood
+    /// there.
+    #[test]
+    fn a_failed_interior_is_asked_for_again_while_the_camera_stands_in_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: Some(INTERIOR_CELL),
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, plan_cells);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        let status = |app: &App| match app
+            .world()
+            .resource::<StreamingWorld>()
+            .cells
+            .get(&CellKey::Interior(INTERIOR_CELL))
+        {
+            Some(CellStatus::Loading { detail, .. }) => format!("loading {detail:?}"),
+            Some(CellStatus::Resident { detail, .. }) => format!("resident {detail:?}"),
+            Some(CellStatus::Failed { detail }) => format!("failed {detail:?}"),
+            None => "gone".to_owned(),
+        };
+        // What `fail_cell` leaves behind when the answer comes back an error.
+        let answer_failed = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<StreamingWorld>()
+                .cells
+                .insert(
+                    CellKey::Interior(INTERIOR_CELL),
+                    CellStatus::Failed {
+                        detail: CellDetail::Full,
+                    },
+                );
+        };
+
+        answer_failed(&mut app);
+        for attempt in 1..=INTERIOR_FAILED_RETRIES {
+            app.update();
+            assert_eq!(
+                status(&app),
+                "loading Full",
+                "the interior the camera stands in is asked for again, attempt {attempt}"
+            );
+            answer_failed(&mut app);
+        }
+        // The budget is spent: the last answer fails and the plan leaves the cell alone.
+        app.update();
+        assert_eq!(
+            status(&app),
+            "failed Full",
+            "a cell whose data really is not there is not re-requested every frame"
+        );
+        app.update();
+        assert_eq!(status(&app), "failed Full", "and it stays that way");
     }
 
     /// The plan asks for a saturated worker's cells one frame later, and a cell that is waiting for
