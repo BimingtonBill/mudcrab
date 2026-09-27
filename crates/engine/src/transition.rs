@@ -525,8 +525,11 @@ impl DoorPrediction {
         let now = RankedFrom {
             space,
             position: creation_from_render(camera.translation, target, origin),
-            // Runtime (x, y, z) is Creation (x, -z, y): the horizontal heading is (x, -z).
-            forward: Vec2::new(forward.x, -forward.z).normalize_or_zero(),
+            // The horizontal heading, in Creation's ground plane (x, y).
+            forward: {
+                let [x, y, _] = shared::coordinates::runtime_to_creation_vector(forward.to_array());
+                Vec2::new(x, y).normalize_or_zero()
+            },
         };
         if !should_rerank(self.ranked_from.as_ref(), &now) {
             return;
