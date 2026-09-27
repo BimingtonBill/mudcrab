@@ -13,7 +13,8 @@
 //!   door -> arrival map and set [`ActiveCell`] from the door's link. Nothing is snapped, so the
 //!   doorway the portal was showing and the room the player ends up in are the same view from the
 //!   same pose (design section 4.2). [`ActivateDoor`] keeps the old behaviour for scripted runs:
-//!   it puts the camera down on the `XTEL` arrival point instead.
+//!   it puts the camera down on the `XTEL` arrival point instead - unless the door it crosses is
+//!   open, when it lands on the pose the portal was showing, like a walk ([`landing_style`]).
 //! * **Hold.** A crossing whose destination is not streamed in yet waits for it (design section
 //!   4.4), so a crossing can never land in an empty space.
 //!
@@ -187,8 +188,8 @@ pub struct OpenDoor {
 /// room rather than at the back of a closed leaf, and it has to leave the doorway walkable.
 ///
 /// Written by `apply_door_crossings` for a **mapped** crossing through an anchored door and for no
-/// other crossing: a `CrossingStyle::Snap` crossing and every door without an anchor land at
-/// `XTEL`, clear of the door they lead to. Read by [`crate::door_animation`], which opens the far
+/// other crossing: a snapped landing and every door without an anchor land at `XTEL`, clear of the
+/// door they lead to. Read by [`crate::door_animation`], which opens the far
 /// door the way the window showed it - at the point of its own `Open` clip that the source door's
 /// clip had reached, or as a hole when it has no animation of its own.
 ///
@@ -271,8 +272,29 @@ enum CrossingStyle {
     /// one that makes the swap invisible (design section 4.2).
     Mapped,
     /// Put the camera down on the `XTEL` arrival point, facing the arrival heading. What a
-    /// crossing has always done, and what a scripted run asks for with [`ActivateDoor`].
+    /// crossing has always done, and what a scripted run asks for with [`ActivateDoor`] - while the
+    /// door it crosses is shut ([`landing_style`]).
     Snap,
+}
+
+/// Where a crossing through a door in `state` puts the camera.
+///
+/// A scripted crossing ([`ActivateDoor`]) asks for the `XTEL` snap and gets it while the door it
+/// crosses is **closed**. An open or opening door is one the portal draws its window through
+/// ([`crate::portal`]'s `portal_shows_through`), so the frame the crossing lands in is the
+/// doorway-anchored view of the destination, not the `XTEL` end of the room: a snap there would
+/// abandon the view for a pose the run's own `NN-portal-view.png` never showed (review-258's
+/// finding 1). Such a crossing takes the mapped landing instead, exactly as a player walking through
+/// the same doorway does.
+///
+/// A door with no [`DoorState`] at all counts as closed, as it does everywhere else
+/// ([`door_is_open`]): a run that does not add [`crate::door_animation`], and the tests that drive
+/// crossings without one, keep the `XTEL` landing.
+fn landing_style(requested: CrossingStyle, state: Option<&DoorState>) -> CrossingStyle {
+    match requested {
+        CrossingStyle::Snap if !door_is_open(state) => CrossingStyle::Snap,
+        _ => CrossingStyle::Mapped,
+    }
 }
 
 /// Requests the destination of every load door the camera is close to - and the destination of any
@@ -1199,9 +1221,13 @@ pub(crate) fn switch_space(
 ///   swap frame is the same view of the destination from the same pose.
 /// * An [`ActivateDoor`] - a scripted run, `--demo-tour` among them - puts the camera down on the
 ///   `XTEL` arrival point facing the arrival heading, which is what a crossing has always done. It
-///   is deliberately *not* moved to the doorway anchor: it is the game's own landing, scripted runs
-///   and tests pin it, and a scripted run never opens the door it crosses - so no portal is drawing
-///   the anchored view of that door for the snap to disagree with.
+///   is deliberately *not* moved to the doorway anchor while the door it crosses is shut: it is the
+///   game's own landing, tests pin it, and a closed door has no window drawn through it for the
+///   snap to disagree with. A scripted crossing through a door that is **open or opening** takes
+///   the mapped landing like any walk ([`landing_style`]): the portal is drawing the
+///   doorway-anchored view of the destination through that door, so the run that opened it - the
+///   tour opens the door before its own scripted crossing, and photographs the portal view through
+///   it - has to land on that view rather than abandon it for `XTEL`.
 ///
 /// Either way the crossing waits until the destination is streamed in (design section 4.4): the
 /// request is held and applied in the frame the destination becomes resident, which is normally
@@ -1214,8 +1240,14 @@ fn apply_door_crossings(
     mut pending: ResMut<PendingCrossing>,
     // The door's own scale comes from its `GlobalTransform` rather than its `Transform`: the
     // camera and the cell roots are queried for their `Transform`s in this system, and a second
-    // `&Transform` access here would have to be proven disjoint from both.
-    doors: Query<(&GlobalTransform, &LoadDoor, Option<&DoorAnchor>)>,
+    // `&Transform` access here would have to be proven disjoint from both. Its `DoorState` is read
+    // for the landing a scripted crossing takes ([`landing_style`]).
+    doors: Query<(
+        &GlobalTransform,
+        &LoadDoor,
+        Option<&DoorAnchor>,
+        Option<&DoorState>,
+    )>,
     streaming: Option<Res<StreamingWorld>>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut active: ResMut<ActiveCell>,
@@ -1273,7 +1305,7 @@ fn apply_door_crossings(
         // No camera to move: the request stays pending until there is one.
         return;
     };
-    let Ok((door_transform, door, anchor)) = doors.get(request.door) else {
+    let Ok((door_transform, door, anchor, state)) = doors.get(request.door) else {
         // The door was unloaded before its crossing could be made.
         pending.request = None;
         commands.entity(request.door).try_remove::<CrossingHeld>();
@@ -1292,7 +1324,11 @@ fn apply_door_crossings(
             .try_insert_if_new(CrossingHeld);
         return;
     }
-    let (creation_feet, rotation) = match request.style {
+    // Read now, not when the request arrived: a crossing held for its destination can be let go in
+    // a frame the door is already open in, and it is the landing at the swap that has to match the
+    // window the portal is drawing.
+    let landing = landing_style(request.style, state);
+    let (creation_feet, rotation) = match landing {
         CrossingStyle::Snap => (
             Vec3::from_array(door.destination.arrival_position),
             arrival_camera_rotation(door.destination.arrival_rotation),
@@ -1330,7 +1366,7 @@ fn apply_door_crossings(
     // itself, where the far door of the link stands closed: the window was drawn with that door out
     // of the way, so it has to be out of the way in the frame the player arrives too
     // ([`OpenDestinationDoor`]). Every other crossing lands at `XTEL`, clear of it.
-    if request.style == CrossingStyle::Mapped && anchor.is_some() {
+    if landing == CrossingStyle::Mapped && anchor.is_some() {
         openings.write(OpenDestinationDoor {
             door: request.door,
             destination_ref_id: door.destination.destination_ref_id,
@@ -3088,14 +3124,115 @@ mod tests {
             "a door without a doorway anchor leaves its far door as it is"
         );
 
-        // A scripted crossing (`--demo-tour`'s `ActivateDoor`), which snaps to that same point.
+        // A scripted crossing (`--demo-tour`'s `ActivateDoor`) of this door while it is shut - no
+        // `DoorState` at all, as a run without `door_animation` and the fixtures see it - snaps to
+        // that same point. One through an *open* door lands like the walk above
+        // (`a_scripted_crossing_through_an_open_door_lands_where_a_walked_one_does`).
         let (mut scripted, door, _) = doorways_app(true);
         scripted.world_mut().write_message(ActivateDoor { door });
         scripted.update();
         assert!(
             scripted.world().resource::<CapturedOpenings>().0.is_empty(),
-            "a snapped crossing is the game's own landing, clear of the door"
+            "a snapped crossing through a closed door is the game's own landing, clear of the door"
         );
+    }
+
+    /// The landing a crossing takes, from the style it was asked for and the state of the door it
+    /// crosses: the `XTEL` snap only for a scripted crossing through a closed door, and the mapped
+    /// doorway landing for everything else (review-258's finding 1).
+    #[test]
+    fn a_scripted_crossing_lands_on_the_doorway_only_while_its_door_is_shut() {
+        for shut in [None, Some(DoorState::Closed), Some(DoorState::Closing)] {
+            assert_eq!(
+                landing_style(CrossingStyle::Snap, shut.as_ref()),
+                CrossingStyle::Snap,
+                "a scripted crossing through a {shut:?} door keeps the XTEL snap"
+            );
+        }
+        for open in [
+            DoorState::Opening,
+            DoorState::Open { animated: true },
+            DoorState::Open { animated: false },
+        ] {
+            assert_eq!(
+                landing_style(CrossingStyle::Snap, Some(&open)),
+                CrossingStyle::Mapped,
+                "a scripted crossing through an {open:?} door - a door the portal draws its window \
+                 through - takes the mapped landing"
+            );
+        }
+        assert_eq!(
+            landing_style(CrossingStyle::Mapped, None),
+            CrossingStyle::Mapped,
+            "and a walk's own crossing is mapped whatever the door is doing"
+        );
+    }
+
+    /// The same rule through the real system, on real geometry: a scripted crossing through the
+    /// open Sven's House door puts the camera in the destination doorway - where the portal was
+    /// drawing the room from - and asks for the far door to be opened, exactly as a walked crossing
+    /// does; through the same door shut it stays on the `XTEL` point.
+    #[test]
+    fn a_scripted_crossing_through_an_open_door_lands_where_a_walked_one_does() {
+        // Shut: the game's own landing, tens of units inside the room, clear of the far door.
+        let (mut shut, door, _) = doorways_app(true);
+        shut.world_mut().write_message(ActivateDoor { door });
+        shut.update();
+        let arrival = creation_to_bevy(Vec3::from_array(SVENS_HOUSE_ARRIVAL))
+            + Vec3::Y * crate::player::EYE_HEIGHT;
+        let landed = camera_translation(&mut shut);
+        assert!(
+            landed.abs_diff_eq(arrival, 1.0e-3),
+            "a closed door's scripted crossing snapped to {landed:?}, not the XTEL point \
+             {arrival:?}"
+        );
+
+        // Open: the door the tour opened itself (its `Phase::PortalOpen`), which the portal is
+        // drawing the destination through.
+        for state in [DoorState::Opening, DoorState::Open { animated: true }] {
+            let (mut open, door, far) = doorways_app(true);
+            let far_ref = open
+                .world()
+                .get::<LoadDoor>(far)
+                .expect("the far door")
+                .ref_id;
+            open.world_mut().entity_mut(door).insert(state);
+            open.world_mut().write_message(ActivateDoor { door });
+            open.update();
+
+            let anchor = open
+                .world()
+                .get::<DoorAnchor>(door)
+                .expect("the crossing's door has its anchor")
+                .clone();
+            let landed = camera_translation(&mut open);
+            assert!(
+                landed.abs_diff_eq(
+                    destination_doorway_centre(&anchor, true, IVec2::ZERO),
+                    1.0e-3
+                ),
+                "a scripted crossing through a {state:?} door landed at {landed:?}, not in the \
+                 destination doorway the portal was drawing"
+            );
+            assert_eq!(
+                open.world().resource::<CapturedOpenings>().0,
+                vec![OpenDestinationDoor {
+                    door,
+                    destination_ref_id: far_ref,
+                }],
+                "and it arrives in that doorway, so - like the walked crossing - it asks for the far \
+                 door of the link to be out of the way"
+            );
+        }
+    }
+
+    /// Where the streaming camera stands, for the landing tests.
+    fn camera_translation(app: &mut App) -> Vec3 {
+        app.world_mut()
+            .query_filtered::<&Transform, With<StreamingCamera>>()
+            .single(app.world())
+            .expect("the camera")
+            .translation
     }
 
     #[test]

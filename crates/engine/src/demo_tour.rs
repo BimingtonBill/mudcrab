@@ -404,8 +404,10 @@ pub struct DemoTour {
     /// whose destination is still streaming in (`crate::door_animation`), so a door that has been
     /// asked to open is waited on and never pressed at again.
     walk_pressed: bool,
-    /// Whether the log's one line for the door the walk waited on has been written this stage: the
-    /// frame the door is seen open and the walk starts ([`WalkAction::Walk`]).
+    /// Whether the log's one line for the door the walk is at has been written this stage: the
+    /// frame the door is seen open and the walk starts ([`WalkAction::Walk`]) - which is also the
+    /// frame the portal's view of the destination is photographed at, whether or not the walk
+    /// pressed `E` to get the door open.
     walk_open_noted: bool,
     /// The swing check of the door the walk-through is opening ([`SwingWatch`]): what it has seen
     /// of the door's state, and the line it has yet to write.
@@ -1245,6 +1247,41 @@ fn far_door(found: Option<Option<DoorState>>) -> FarDoor {
     }
 }
 
+/// What [`Phase::PortalOpen`] makes of one frame's look at the door it asked to open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortalWait {
+    /// Fully open: move on to photograph the portal's target and the doorway
+    /// ([`Phase::PortalShot`]).
+    Open,
+    /// On its way open, or not yet in the world: keep waiting.
+    Waiting,
+    /// The door is in the world and the wait ran out: it did not open.
+    NeverOpened,
+    /// The door entity is not in the query at all - its cell has not streamed in, or it was
+    /// despawned - and the wait ran out. A different failure from a door that is there and did not
+    /// open, and it is named separately: this case used to fall into the "did not open within ten
+    /// seconds" arm on the phase's own first frame, when a tenth of a second had passed
+    /// (review-258's finding 3).
+    Missing,
+}
+
+/// What the portal-open wait does this frame, from the door query's answer and how long the phase
+/// has waited: `state` is `Option<Option<DoorState>>` because the outer `None` - no door entity to
+/// look at - is a different thing from a door that carries no state of its own (`Some(None)`, which
+/// counts as closed, as [`door_is_open`] does).
+///
+/// The door is waited for as long as a door that is opening is ([`WALK_OPEN_SECONDS`]): a door
+/// whose cell has not streamed in yet appears a frame or two later, and giving up before then would
+/// skip the photograph for no reason.
+fn portal_wait(state: Option<Option<DoorState>>, waited: f32) -> PortalWait {
+    match state {
+        Some(Some(DoorState::Open { .. })) => PortalWait::Open,
+        _ if waited < WALK_OPEN_SECONDS => PortalWait::Waiting,
+        Some(_) => PortalWait::NeverOpened,
+        None => PortalWait::Missing,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_demo_tour(
     mut commands: Commands,
@@ -1479,12 +1516,22 @@ fn run_demo_tour(
                         start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
                     }
                     // What the portal camera itself renders: it renders only through a door that
-                    // is open ([`crate::portal`]), and a scripted crossing snaps through a closed
-                    // one, so the door is opened first and photographed open
-                    // ([`Phase::PortalOpen`]). A walk-through opens the door itself and takes the
-                    // same photograph once it is open (`WalkAction::Walk`).
+                    // is open ([`crate::portal`]), and a scripted crossing through a closed door
+                    // snaps to `XTEL`, so the door is opened first and photographed open
+                    // ([`Phase::PortalOpen`]). A walk-through takes the same photograph at the
+                    // first frame its door stands open (`WalkAction::Walk`), whether it opened it
+                    // with `E` or found it open already.
                     Some((_, _)) if portal_texture.is_some() && player.is_none() => {
-                        if let Some(entity) = tour.door {
+                        // Only a door that is shut is asked to open: `OpenDoor` is what `E` writes,
+                        // and `E` at an open door *closes* it (`crate::door_animation`) - so a door
+                        // the run's own crossing already opened at the arrival
+                        // ([`OpenDestinationDoor`]) is left standing open, exactly as the walk
+                        // leaves it ([`walk_action`]).
+                        let already_open = tour
+                            .door
+                            .and_then(|door| doors.get(door).ok())
+                            .is_some_and(|(_, _, _, state, ..)| door_is_open(state));
+                        if !already_open && let Some(entity) = tour.door {
                             open_door.write(OpenDoor { door: entity });
                         }
                         tour.enter(Phase::PortalOpen);
@@ -1498,14 +1545,22 @@ fn run_demo_tour(
                 .door
                 .and_then(|door| doors.get(door).ok())
                 .map(|(_, _, _, state, ..)| state.copied());
-            match state {
+            match portal_wait(state, tour.timer) {
                 // Fully open, and the portal has had frames to draw the destination into its
                 // target: photograph it, and the doorway as the main camera shows it.
-                Some(Some(DoorState::Open { .. })) => tour.enter(Phase::PortalShot),
-                Some(_) if tour.timer < WALK_OPEN_SECONDS => {}
-                _ => {
+                PortalWait::Open => tour.enter(Phase::PortalShot),
+                PortalWait::Waiting => {}
+                PortalWait::NeverOpened => {
                     let line = format!(
                         "stage {}: the door did not open within {WALK_OPEN_SECONDS:.0} s, so the portal view is not photographed",
+                        tour.stage
+                    );
+                    tour.note(line);
+                    start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
+                }
+                PortalWait::Missing => {
+                    let line = format!(
+                        "stage {}: the door was not in the world at all in the {WALK_OPEN_SECONDS:.0} s the tour waited for it (not spawned, or unloaded), so the portal view is not photographed",
                         tour.stage
                     );
                     tour.note(line);
@@ -1800,11 +1855,19 @@ fn run_demo_tour(
                     keys.release(KeyCode::KeyW);
                 }
                 WalkAction::Walk => {
-                    if tour.walk_pressed && !tour.walk_open_noted {
+                    // The first frame of the walk at this door, whether or not `E` was pressed to
+                    // get here: an auto-load marker, and a door the crossing opened at the arrival,
+                    // are walked at with no press at all, and the portal draws the destination
+                    // through them just as it does through a door the walk opened itself.
+                    if !tour.walk_open_noted {
                         tour.walk_open_noted = true;
                         let line = format!(
-                            "stage {}: door {:08X} open after {:.1} s; walking in from {:.0} units",
-                            tour.stage, door.ref_id, tour.timer, WALK_STANDOFFS[tour.walk_standoff]
+                            "stage {}: door {:08X} open after {:.1} s (pressed_E={}); walking in from {:.0} units",
+                            tour.stage,
+                            door.ref_id,
+                            tour.timer,
+                            tour.walk_pressed,
+                            WALK_STANDOFFS[tour.walk_standoff]
                         );
                         tour.note(line);
                         // The door is fully open and the player has not moved yet: the portal
@@ -2658,6 +2721,59 @@ mod tests {
             FarDoor::Missing,
             "no load door in the world carries the reference the link names"
         );
+    }
+
+    /// A door that is not in the world yet is waited for like a door that is opening, and given up
+    /// on with a line of its own - not the "did not open within ten seconds" one, which the phase
+    /// used to write on its very first frame for a door that was simply not spawned yet
+    /// (review-258's finding 3). The two are told apart because the outer `None` (no door entity)
+    /// and `Some(None)` (a door with no state of its own) mean different things.
+    #[test]
+    fn a_door_that_is_not_in_the_world_is_waited_for_and_named_separately() {
+        assert_eq!(
+            portal_wait(None, 0.0),
+            PortalWait::Waiting,
+            "a door that has not streamed in is not a door that failed to open"
+        );
+        assert_eq!(
+            portal_wait(None, WALK_OPEN_SECONDS - 0.1),
+            PortalWait::Waiting,
+            "it is waited for as long as a door that is opening"
+        );
+        assert_eq!(
+            portal_wait(None, WALK_OPEN_SECONDS),
+            PortalWait::Missing,
+            "and named as missing, not as one that did not open"
+        );
+
+        for present in [
+            Some(DoorState::Closed),
+            Some(DoorState::Opening),
+            Some(DoorState::Closing),
+            None,
+        ] {
+            assert_eq!(
+                portal_wait(Some(present), 0.0),
+                PortalWait::Waiting,
+                "a door in the world that is not fully open is waited for ({present:?})"
+            );
+            assert_eq!(
+                portal_wait(Some(present), WALK_OPEN_SECONDS),
+                PortalWait::NeverOpened,
+                "and named as one that did not open ({present:?})"
+            );
+        }
+
+        for open in [
+            DoorState::Open { animated: true },
+            DoorState::Open { animated: false },
+        ] {
+            assert_eq!(
+                portal_wait(Some(Some(open)), 0.0),
+                PortalWait::Open,
+                "an open door is photographed at once"
+            );
+        }
     }
 
     /// What a player does at a closed door: press `E` once, stand still while it opens, then walk.
