@@ -47,11 +47,11 @@ The #30 reply promised it. **Written 2026-09-25 night:** `phase2/prune-keeps-fai
 
 ## Bundles (the user, 2026-09-27: fewer, bigger PRs, each with photo/video evidence)
 
-Built locally from main 6f583cd by Upstream Dev (merges of the component branches; conflicts noted). These replace sending the components one by one.
+Built locally from main 6f583cd by Upstream Dev (merges of the component branches; conflicts noted). **All nine pass fmt, workspace clippy -D warnings and nextest --workspace (2026-09-27)**: converter-hardening a3e132f 284, engine-loading a649381 258, tooling 36fd76f 265, sky 9ddddf9 274, water 55439de 267, vertex-colours 7397f00 260, terrain-textures ab2f3e7 274, sun-shadows 5714ec6 269, housekeeping 81439cc 284. These replace sending the components one by one.
 
 | Bundle branch | Components | Evidence needed | Status |
 |---|---|---|---|
-| `phase2/converter-hardening` | converter-snapshots, cell-name-nul, parser-never-panic (Cargo.toml/lock + dummy-content.md: kept both) | test output (never-panic properties, snapshot) | built, checks running |
+| `phase2/converter-hardening` | converter-snapshots, cell-name-nul, parser-never-panic (Cargo.toml/lock + dummy-content.md: kept both) | test output (never-panic properties, snapshot) | built, checks green |
 | `phase2/engine-loading` | io-pool-stack, cell-cache-validate-once | Markarth crash log before/after; stress A/B table (claim the cell-commit drop 2.86 -> 0.37 ms, not fps) | built |
 | `phase2/tooling` | scripts-utf8-bom, scripts-schema-from-source, conversion-stage-times, benchmark-frame-times, render-world-timing | sample output | built |
 | (onto #30) | prune-keeps-failed-sources 6bfee13 | test output | ready; a push to our own PR |
