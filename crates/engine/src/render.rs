@@ -93,18 +93,7 @@ impl Plugin for VercidiumRendererPlugin {
         // installed on every run; `--reflection-cascades all` (or 4) keeps every cascade of the sun
         // and leaves the system out of the frame. Without an `EngineConfig` (unit tests) nothing is
         // limited.
-        if let Some(limit) = app
-            .world()
-            .get_resource::<crate::config::EngineConfig>()
-            .and_then(|config| config.reflection.cascades)
-        {
-            app.insert_resource(WaterReflectionCascadeLimit(limit))
-                .add_systems(
-                    PostUpdate,
-                    limit_water_reflection_cascades
-                        .after(SimulationLightSystems::UpdateLightFrusta),
-                );
-        }
+        add_configured_water_reflection_cascade_limit(app);
 
         let bridge = RendererProofBridge::default();
         app.insert_resource(bridge.clone());
@@ -654,6 +643,35 @@ fn setup_water_reflection(
 #[derive(Resource, Debug, Clone, Copy)]
 struct WaterReflectionCascadeLimit(usize);
 
+/// Registers the reflection's cascade limiter from the run's [`EngineConfig`]: one for the limit
+/// [`ReflectionOptions::cascades`](crate::config::ReflectionOptions::cascades) holds, and nothing at
+/// all for `--reflection-cascades all` (or 4), which is `None` and keeps every cascade the sun has.
+/// A run with no `EngineConfig` (some unit tests) is left unlimited too.
+fn add_configured_water_reflection_cascade_limit(app: &mut App) {
+    if let Some(limit) = app
+        .world()
+        .get_resource::<crate::config::EngineConfig>()
+        .and_then(|config| config.reflection.cascades)
+    {
+        add_water_reflection_cascade_limit(app, limit);
+    }
+}
+
+/// Registers the reflection's cascade limiter: [`WaterReflectionCascadeLimit`] and its system, in
+/// `PostUpdate` after Bevy's own frustum update (`SimulationLightSystems::UpdateLightFrusta`, where
+/// `bevy_light` puts `update_directional_light_frusta`, `bevy_light-0.19.0/src/lib.rs:187-188`).
+///
+/// The ordering is part of the design, not an aside: a limiter running before the frusta would have
+/// them built from the shortened lists, and a view with fewer frusta than the one before it panics
+/// Bevy's directional light visibility check (see [`limit_water_reflection_cascades`]).
+fn add_water_reflection_cascade_limit(app: &mut App, limit: usize) {
+    app.insert_resource(WaterReflectionCascadeLimit(limit))
+        .add_systems(
+            PostUpdate,
+            limit_water_reflection_cascades.after(SimulationLightSystems::UpdateLightFrusta),
+        );
+}
+
 /// Keeps only the first [`WaterReflectionCascadeLimit`] shadow cascades of each directional light
 /// for the reflection view, and none of a light the reflection view cannot see.
 ///
@@ -1198,7 +1216,9 @@ mod tests {
     use super::*;
     use crate::world::cache::TerrainLayerSnapshot;
     use crate::world::components::{StreamingCamera, WaterSurface};
+    use bevy::camera::{primitives::CascadesFrusta, visibility::ViewVisibility};
     use bevy::image::ImageFilterMode;
+    use bevy::light::update_directional_light_frusta;
     use bevy::mesh::VertexAttributeValues;
 
     const MAIN_CAMERA_FAR: f32 = 1000.0;
@@ -1277,48 +1297,141 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_reflection_view_keeps_only_the_cascades_asked_for() {
-        let mut app = App::new();
-        app.insert_resource(WaterReflectionCascadeLimit(1))
-            .add_systems(Update, limit_water_reflection_cascades);
-        let main = app.world_mut().spawn_empty().id();
-        let reflection = app
-            .world_mut()
-            .spawn((WaterReflectionCamera, RenderLayers::layer(0)))
-            .id();
-        let sun = app
-            .world_mut()
-            .spawn((
-                DirectionalLight::default(),
-                four_cascades_for(&[main, reflection]),
-            ))
-            .id();
-        let doorway_sun = app
-            .world_mut()
-            .spawn((
-                DirectionalLight::default(),
-                four_cascades_for(&[main, reflection]),
-                RenderLayers::layer(2),
-            ))
-            .id();
-        app.update();
+    /// The app the cascade-limit tests drive: the limiter registered from an `EngineConfig` the way
+    /// `VercidiumRendererPlugin` registers it, Bevy's own `update_directional_light_frusta` in the
+    /// set the limiter is ordered after (`bevy_light-0.19.0/src/lib.rs:187-188`), and a sun and a
+    /// doorway sun (layer 2, out of the reflection's sight) over a main and a reflection view.
+    ///
+    /// Bevy's system is registered *after* the limiter, the way `VercidiumRendererPlugin` has it,
+    /// so the frusta the tests read are the ones the ordering edge produces. Bevy's own update
+    /// writes each light's whole frustum map from the cascade lists as they stand when it runs
+    /// (`bevy_light-0.19.0/src/directional_light.rs:239-251`), so a limiter that ran before it
+    /// would leave the reflection view with only the cascades it kept - which is what the frustum
+    /// assertions below would see.
+    struct CascadeLimitApp {
+        app: App,
+        main: Entity,
+        reflection: Entity,
+        sun: Entity,
+        doorway_sun: Entity,
+    }
 
-        let count = |light: Entity, view: Entity| {
-            app.world().get::<Cascades>(light).unwrap().cascades[&view].len()
-        };
+    impl CascadeLimitApp {
+        fn new(args: &[&str]) -> Self {
+            let mut app = App::new();
+            app.insert_resource(crate::config::EngineConfig::from_args(
+                args.iter().map(|arg| (*arg).to_owned()),
+            ));
+            add_configured_water_reflection_cascade_limit(&mut app);
+            app.add_systems(
+                PostUpdate,
+                update_directional_light_frusta.in_set(SimulationLightSystems::UpdateLightFrusta),
+            );
+            let main = app.world_mut().spawn_empty().id();
+            let reflection = app
+                .world_mut()
+                .spawn((WaterReflectionCamera, RenderLayers::layer(0)))
+                .id();
+            let light = || {
+                (
+                    DirectionalLight {
+                        // Without shadow maps the frusta are left alone
+                        // (`bevy_light-0.19.0/src/directional_light.rs:235`).
+                        shadow_maps_enabled: true,
+                        ..default()
+                    },
+                    ViewVisibility::VISIBLE,
+                    CascadesFrusta::default(),
+                )
+            };
+            let sun = app
+                .world_mut()
+                .spawn((light(), four_cascades_for(&[main, reflection])))
+                .id();
+            let doorway_sun = app
+                .world_mut()
+                .spawn((
+                    light(),
+                    four_cascades_for(&[main, reflection]),
+                    RenderLayers::layer(2),
+                ))
+                .id();
+            app.update();
+            Self {
+                app,
+                main,
+                reflection,
+                sun,
+                doorway_sun,
+            }
+        }
+
+        /// The cascades `light` lists for `view`.
+        fn cascades(&self, light: Entity, view: Entity) -> usize {
+            self.app.world().get::<Cascades>(light).unwrap().cascades[&view].len()
+        }
+
+        /// The frusta `light` built for `view`.
+        fn frusta(&self, light: Entity, view: Entity) -> usize {
+            self.app
+                .world()
+                .get::<CascadesFrusta>(light)
+                .unwrap()
+                .frusta[&view]
+                .len()
+        }
+    }
+
+    #[test]
+    fn the_reflection_view_keeps_only_the_cascades_asked_for_and_every_frustum() {
+        let run = CascadeLimitApp::new(&["--reflection-cascades", "1"]);
+
         assert_eq!(
-            count(sun, reflection),
+            run.cascades(run.sun, run.reflection),
             1,
             "the sun keeps one cascade for the reflection"
         );
-        assert_eq!(count(sun, main), 4, "the main camera keeps every cascade");
         assert_eq!(
-            count(doorway_sun, reflection),
+            run.cascades(run.sun, run.main),
+            4,
+            "the main camera keeps every cascade"
+        );
+        assert_eq!(
+            run.cascades(run.doorway_sun, run.reflection),
             0,
             "a light the reflection cannot see keeps none for it"
         );
-        assert_eq!(count(doorway_sun, main), 4);
+        assert_eq!(run.cascades(run.doorway_sun, run.main), 4);
+
+        // The frusta are left as Bevy's own update built them, one per cascade the sun has for the
+        // view: this is the ordering `add_water_reflection_cascade_limit` buys, since Bevy writes
+        // the whole map from the cascade lists as they stand when it runs. Shortening them would be
+        // the panic `check_dir_light_mesh_visibility` takes: it sizes its thread-local queues to one
+        // view's frustum count and indexes them by the next view's cascade index
+        // (`bevy_light-0.19.0/src/lib.rs:403-407`, `:466-476`).
+        assert_eq!(
+            run.frusta(run.sun, run.reflection),
+            4,
+            "the reflection's frusta are left full"
+        );
+        assert_eq!(run.frusta(run.sun, run.main), 4);
+        assert_eq!(
+            run.frusta(run.doorway_sun, run.reflection),
+            4,
+            "a light kept out of the reflection keeps every frustum too"
+        );
+    }
+
+    #[test]
+    fn all_the_cascades_leaves_the_limiter_out_of_the_frame() {
+        let run = CascadeLimitApp::new(&["--reflection-cascades", "all"]);
+        assert_eq!(
+            run.cascades(run.sun, run.reflection),
+            4,
+            "`all` keeps every cascade and installs no limiter"
+        );
+        assert_eq!(run.cascades(run.doorway_sun, run.reflection), 4);
+        assert_eq!(run.frusta(run.sun, run.reflection), 4);
     }
 
     /// The mesh bounds of the water plane streaming.rs spawns: a `Plane3d` quad a cell wide with no

@@ -133,18 +133,39 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    /// The command line's configuration. A flag with a value that is not one ends the run with its
+    /// message and exit code 2 - a usage error, not a crash report.
     pub fn from_env() -> Self {
-        Self::from_args(std::env::args().skip(1))
+        Self::try_from_args(std::env::args().skip(1)).unwrap_or_else(|error| {
+            eprintln!("error: {error}");
+            std::process::exit(2)
+        })
     }
 
+    /// The configuration from the command line. A reflection cost flag with a value that is not one
+    /// stops the run here, before anything is opened, with the message [`try_from_args`] returns.
+    ///
+    /// [`try_from_args`]: Self::try_from_args
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Self {
+        Self::try_from_args(args).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// The same parse as [`from_args`](Self::from_args), with an unusable value returned instead of
+    /// stopping the run. The flags are parsed before `app::run` exists to report an error the way it
+    /// reports a bad graphics setting (`graphics_settings::from_config`), and the parse entry point
+    /// (`from_env`, `main`) hands the configuration straight to `run`, so the panic in `from_args`
+    /// is what turns a message here into an exit before the window and the world database exist.
+    pub fn try_from_args(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut config = Self::default();
         let mut terrain_radius_given = false;
         let mut args = args.into_iter();
         while let Some(argument) = args.next() {
-            // The water reflection's cost flags ([`ReflectionOptions`]).
-            if ReflectionOptions::parse_flag(&mut config.reflection, &argument, &mut args) {
-                continue;
+            // The water reflection's cost flags ([`ReflectionOptions`]); a value that is not one is
+            // refused rather than left at its default.
+            match ReflectionOptions::parse_flag(&mut config.reflection, &argument, &mut args) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => return Err(error),
             }
             // The portal's own flags, parsed by one block at the end of this file.
             if PortalOptions::parse_flag(&mut config, &argument, &mut args) {
@@ -287,7 +308,7 @@ impl EngineConfig {
         {
             config.terrain_radius = config.stream_radius;
         }
-        config
+        Ok(config)
     }
 }
 
@@ -746,43 +767,57 @@ impl Default for ReflectionOptions {
 
 impl ReflectionOptions {
     /// Parses one reflection flag, taking the argument it needs from `args`, and says whether
-    /// `argument` was one of them. A value out of range leaves the option as it was.
+    /// `argument` was one of them.
+    ///
+    /// A value that is not one is an [`Err`] naming the flag, the value and what is accepted, and
+    /// [`EngineConfig::from_args`] stops the run on it: every one of these flags drops work from the
+    /// reflection view, so a run that asked for one by name would otherwise measure the default
+    /// without a word (`GraphicsSettings::set` refuses a bad knob the same way). The value flags
+    /// take their value either as the next argument or after `=`, so no spelling of a reflection
+    /// flag is ignored.
     pub fn parse_flag(
         options: &mut Self,
         argument: &str,
         args: &mut impl Iterator<Item = String>,
-    ) -> bool {
+    ) -> Result<bool, String> {
         match argument {
-            "--reflection-prepass=off" => options.prepass = false,
-            "--reflection-prepass=on" => options.prepass = true,
-            "--reflection-occlusion=off" => options.occlusion = false,
-            "--reflection-occlusion=on" => options.occlusion = true,
-            "--reflection-cascades" => match args.next().as_deref() {
-                Some("all") => options.cascades = None,
-                Some(value) => {
-                    if let Some(cascades) = value
+            // The switches carry their value: a bare `--reflection-prepass` (or any value but
+            // `on`/`off`) is an error rather than the default.
+            flag if flag.starts_with("--reflection-prepass") => {
+                options.prepass = reflection_switch(flag, "--reflection-prepass")?;
+            }
+            flag if flag.starts_with("--reflection-occlusion") => {
+                options.occlusion = reflection_switch(flag, "--reflection-occlusion")?;
+            }
+            flag if flag.starts_with("--reflection-cascades") => {
+                let accepted = cascades_accepted();
+                let value = reflection_value(flag, "--reflection-cascades", &accepted, args)?;
+                options.cascades = if value.value == "all" {
+                    None
+                } else {
+                    let count = value
+                        .value
                         .parse::<usize>()
                         .ok()
-                        .filter(|cascades| *cascades <= MAX_REFLECTION_CASCADES)
-                    {
-                        // Every cascade Bevy gives a light is the same as no limit at all.
-                        options.cascades = (cascades < MAX_REFLECTION_CASCADES).then_some(cascades);
-                    }
-                }
-                None => {}
-            },
-            "--reflection-scale" => {
-                if let Some(scale) = args
-                    .next()
-                    .and_then(|value| value.parse::<f32>().ok())
-                    .filter(|scale| scale.is_finite() && *scale > 0.0 && *scale <= 1.0)
-                {
-                    options.scale = scale;
-                }
+                        .filter(|count| *count <= MAX_REFLECTION_CASCADES)
+                        .ok_or_else(|| value.rejected(&accepted))?;
+                    // Every cascade Bevy gives a light is the same as no limit at all.
+                    (count < MAX_REFLECTION_CASCADES).then_some(count)
+                };
             }
-            _ => return false,
+            flag if flag.starts_with("--reflection-scale") => {
+                let accepted = "a fraction above 0, at most 1";
+                let value = reflection_value(flag, "--reflection-scale", accepted, args)?;
+                options.scale = value
+                    .value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|scale| scale.is_finite() && *scale > 0.0 && *scale <= 1.0)
+                    .ok_or_else(|| value.rejected(accepted))?;
+            }
+            _ => return Ok(false),
         }
-        true
+        Ok(true)
     }
 
     /// Whether the reflection camera carries `OcclusionCulling`: asked for, and with the depth
@@ -796,6 +831,70 @@ impl ReflectionOptions {
     pub fn target_size(&self) -> (u32, u32) {
         let side = |full: u32| ((full as f32 * self.scale).round() as u32).max(MIN_REFLECTION_SIDE);
         (side(REFLECTION_SIZE.0), side(REFLECTION_SIZE.1))
+    }
+}
+
+/// What `--reflection-cascades` accepts, for the message a value that is not one is refused with.
+/// The count is [`MAX_REFLECTION_CASCADES`], so the message cannot drift from the limit.
+fn cascades_accepted() -> String {
+    format!("0 to {MAX_REFLECTION_CASCADES} (Bevy 0.19's limit), or all")
+}
+
+/// The `=on`/`=off` a reflection switch carries: the value is part of the argument, so a bare flag
+/// or anything else after its name is an error naming what the flag accepts.
+fn reflection_switch(argument: &str, flag: &str) -> Result<bool, String> {
+    match argument
+        .strip_prefix(flag)
+        .and_then(|value| value.strip_prefix('='))
+    {
+        Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        _ => Err(format!("{argument}: valid: {flag}=on, {flag}=off")),
+    }
+}
+
+/// A reflection flag's value, and the flag with that value as it was written, for the message a
+/// value that is not one is refused with: `--reflection-scale "wide"` for `--flag value`, and
+/// `--reflection-scale=wide` for `--flag=value`.
+struct ReflectionValue {
+    value: String,
+    written: String,
+}
+
+impl ReflectionValue {
+    /// The message refusing this value: what was written, and what the flag accepts.
+    fn rejected(&self, accepted: &str) -> String {
+        format!("{}: {accepted}", self.written)
+    }
+}
+
+/// The value of a reflection flag that takes one, written `--flag value` or `--flag=value`. A flag
+/// with nothing after its name, with no value following it, or with anything else after its name
+/// (`--flag`, a name that is not this flag) is an error naming the flag and what it accepts.
+fn reflection_value(
+    argument: &str,
+    flag: &str,
+    accepted: &str,
+    args: &mut impl Iterator<Item = String>,
+) -> Result<ReflectionValue, String> {
+    match argument.strip_prefix(flag) {
+        Some("") => {
+            let value = args
+                .next()
+                .ok_or_else(|| format!("{flag}: the value is missing; valid: {accepted}"))?;
+            Ok(ReflectionValue {
+                written: format!("{flag} {value:?}"),
+                value,
+            })
+        }
+        Some(value) => match value.strip_prefix('=') {
+            Some(value) => Ok(ReflectionValue {
+                value: value.to_owned(),
+                written: argument.to_owned(),
+            }),
+            None => Err(format!("{argument}: valid: {flag} <value>, {accepted}")),
+        },
+        None => Err(format!("{argument}: valid: {flag} <value>, {accepted}")),
     }
 }
 
@@ -1378,15 +1477,95 @@ mod tests {
         assert_eq!(options.cascades, Some(1));
         assert_eq!(options.target_size(), (512, 288));
         assert_eq!(parse(&["--reflection-cascades", "2"]).cascades, Some(2));
-        assert_eq!(parse(&["--reflection-cascades", "5"]).cascades, Some(0));
-        assert_eq!(parse(&["--reflection-cascades", "two"]).cascades, Some(0));
-        assert_eq!(parse(&["--reflection-scale", "0"]).scale, 1.0);
-        assert_eq!(parse(&["--reflection-scale", "1.5"]).scale, 1.0);
+        assert_eq!(
+            parse(&["--reflection-cascades=2"]).cascades,
+            Some(2),
+            "the value may follow the flag after `=`"
+        );
+        assert_eq!(parse(&["--reflection-scale=0.5"]).target_size(), (512, 288));
         assert_eq!(
             parse(&["--reflection-scale", "0.001"]).target_size(),
             (16, 16),
             "a tiny scale keeps a usable target"
         );
+    }
+
+    /// Every reflection flag with a value that is not one stops the run with a message naming the
+    /// flag, the value and what is accepted, instead of leaving the option at its default
+    /// (review-258 item 2; `parses_the_reflection_cost_flags` used to assert the swallowing).
+    #[test]
+    fn a_reflection_flag_value_that_is_not_one_is_refused() {
+        let refused = |args: &[&str]| {
+            EngineConfig::try_from_args(args.iter().map(|arg| (*arg).to_owned()))
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} is refused, but it parsed"))
+        };
+        assert_eq!(
+            refused(&["--reflection-cascades", "5"]),
+            "--reflection-cascades \"5\": 0 to 4 (Bevy 0.19's limit), or all"
+        );
+        assert_eq!(
+            refused(&["--reflection-cascades", "two"]),
+            "--reflection-cascades \"two\": 0 to 4 (Bevy 0.19's limit), or all"
+        );
+        assert_eq!(
+            refused(&["--reflection-cascades", "-1"]),
+            "--reflection-cascades \"-1\": 0 to 4 (Bevy 0.19's limit), or all"
+        );
+        assert_eq!(
+            refused(&["--reflection-cascades"]),
+            "--reflection-cascades: the value is missing; valid: 0 to 4 (Bevy 0.19's limit), or all"
+        );
+        assert_eq!(
+            refused(&["--reflection-cascades=5"]),
+            "--reflection-cascades=5: 0 to 4 (Bevy 0.19's limit), or all"
+        );
+        assert_eq!(
+            refused(&["--reflection-scale", "0"]),
+            "--reflection-scale \"0\": a fraction above 0, at most 1"
+        );
+        assert_eq!(
+            refused(&["--reflection-scale", "1.5"]),
+            "--reflection-scale \"1.5\": a fraction above 0, at most 1"
+        );
+        assert_eq!(
+            refused(&["--reflection-scale", "wide"]),
+            "--reflection-scale \"wide\": a fraction above 0, at most 1"
+        );
+        assert_eq!(
+            refused(&["--reflection-scale"]),
+            "--reflection-scale: the value is missing; valid: a fraction above 0, at most 1"
+        );
+        assert_eq!(
+            refused(&["--reflection-prepass"]),
+            "--reflection-prepass: valid: --reflection-prepass=on, --reflection-prepass=off"
+        );
+        assert_eq!(
+            refused(&["--reflection-prepass=maybe"]),
+            "--reflection-prepass=maybe: valid: --reflection-prepass=on, --reflection-prepass=off"
+        );
+        assert_eq!(
+            refused(&["--reflection-occlusion"]),
+            "--reflection-occlusion: valid: --reflection-occlusion=on, --reflection-occlusion=off"
+        );
+        assert_eq!(
+            refused(&["--reflection-occlusion=yes"]),
+            "--reflection-occlusion=yes: valid: --reflection-occlusion=on, \
+             --reflection-occlusion=off"
+        );
+        assert_eq!(
+            refused(&["--reflection-prepass=on", "--reflection-scale", "2"]),
+            "--reflection-scale \"2\": a fraction above 0, at most 1",
+            "the run stops on the bad flag whatever good ones came before it"
+        );
+    }
+
+    /// `from_args` is the parse the run uses (`from_env`, `main`): a bad value has to stop it with
+    /// the message, not hand back a configuration that quietly differs from the one asked for.
+    #[test]
+    #[should_panic(expected = "--reflection-cascades \"5\": 0 to 4 (Bevy 0.19's limit), or all")]
+    fn from_args_stops_the_run_on_a_bad_reflection_value() {
+        EngineConfig::from_args(["--reflection-cascades", "5"].map(str::to_owned));
     }
 
     #[test]
