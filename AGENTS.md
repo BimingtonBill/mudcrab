@@ -98,6 +98,15 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
   may use the rest. It replaces the older "3 Phase 2 coders and 2 Portal coders a day". The Claude
   plan is shared too (one account): when its week runs ahead of pace, every session keeps Claude
   subagents to short lookups.
+- **Other worker providers (the user, 2026-09-28):** every dev session may use them beside DeepSeek
+  (details in the deepseek-agents skill, "Other providers"). **Meta Muse Spark:** the user opted
+  OpenSkyrim in to its contributor tier (Meta may use what it is sent): `-Provider meta -Tier
+  contributor`, panel `Muse <kind> #nnn: ...`, tracked files only (no `local/`, captures or game
+  data). Use it for code research and analysis, standing audits, map and pitfalls refreshes, and a
+  second review beside DeepSeek's, never as the only reviewer. Screenshots go to its standard tier
+  (`-Provider meta`, no `-Tier`), never the contributor tier. **Xiaomi MiMo** (`-Provider xiaomi`,
+  panel `MiMo ...`, plan ends 27 Oct): non-urgent background work only; rerun a failed MiMo run on
+  DeepSeek. Coders stay on DeepSeek for now.
 
 ## While working
 
