@@ -178,6 +178,28 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-28 - Claude [phase2] Phase 2 Dev (overnight + day; wrap-up)
+
+**The user's decisions:** plans cover one day or one night at a time; the portal is PARKED (Portal Dev
+idle); tonight's acceptance run CANCELLED at the project-wide wrap-up (~14:30); PR texts and hand-overs
+follow `local/pr-drafts/STYLE.md`; DeepSeek split Phase 1 $3.75 / Phase 2 $3.75 / Phase 3 $1.50 /
+Upstream $0.73; a new **Phase 3 Dev** owns `crates/launcher` + `crates/converter-gui`.
+
+**Branches (from main 6f583cd, green, reviewed, all with Upstream Dev, held by the PR pacing rule):**
+`schema-mismatch-error` 7cce96c (which asset check failed + the reconvert command),
+`fixture-interior-crossing` 3b41d4d (M5.1), `engine-help` a57dff0 (`--help`, unknown options and bad
+values refused; send after #41/#45), and the crossing-stutter set `paced-cell-unloads` 8f980f6 ->
+`upload-throttle` cb917c9 -> `paced-model-spawns` c8b2801: worst streaming frame ~21-25 -> ~17 ms,
+p50-p99 unchanged (`C:/Modding/wkj-tools/crossing-ab/summary.txt`; the rebase costs nothing; the spikes
+were model arrival). Also: `audit-engine` onto portal (merged d940251), the fast-texture FLIP pair for
+Phase 1, research-615/618/625 (in `C:/Modding/wkj-phase2/local/agents/runs/`).
+
+**Acceptance:** `accepted` needs three campaigns (evidence, `-UpdateBaseline` with the user's signed
+review, compare): `local/acceptance-plan-2026-09-28.md`; clean pre-built worktree `C:/Modding/wkj-accept`.
+Not run. **No workers running.** Details: `local/handover-2026-09-26-phase2.md` (2026-09-28 section).
+**Next:** the acceptance campaigns; cell-commit cost (main_world ~11-12 ms, the remaining worst frames);
+M4.1/M4.2 terrain inspection after #49/#42; M8.2 plan-doc fixes.
+
 ### 2026-09-28 - Claude [phase3] Phase 3 Dev (first session: converter window folded into the launcher)
 
 **Set-up:** the user confirmed the Phase 3 rules (see "Two tracks"): worktree `C:/Modding/wkj-phase3`,
