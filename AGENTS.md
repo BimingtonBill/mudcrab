@@ -69,6 +69,8 @@ before starting any `phase2/*` branch or moving work between tracks.
 > - Upstream Dev shows the user each item (a rendered preview for text, AI label at the top) and
 >   publishes only after the user's clear yes, given in Upstream Dev's own session. A yes relayed
 >   by another session does not count, and one yes covers only the item it was given for.
+> - Exception (the user, 2026-09-28): Upstream Dev may reply to CodeRabbit (the bot) on our PRs
+  without asking, AI-labelled. Replies to people still need the user's yes.
 > - Reading GitHub (`gh pr view`, `gh api` GETs, `git fetch`) is fine for every session.
 
 The user's standing rule since 2026-09-25: the dev sessions work as one team by default, the way
