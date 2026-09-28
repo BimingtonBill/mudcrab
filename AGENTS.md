@@ -219,6 +219,10 @@ after a hard kill; Phase 1 fixed it on `phase1/atomic-writes` 50f421c (one copy 
 Screenshots: `local/research/launcher-merged-*.png`, `launcher-resume-done.png`. Fixture data for launcher
 runs: `D:/Modding-overflow/phase3-scratch/game_data` (run the exe with that folder as working directory).
 
+**Test kit for the user:** `D:\OpenSkyrim-Launcher-Test\` (174 MB: quick launcher + engine from local-only
+`phase3/try-launcher` 734982a = L3 + L4, fake Skyrim in `game_data\Data`, Start/Reset/Make-leftover scripts,
+README). Play on the fake data opens a grey engine window: the launcher passes only `--assets`, and the
+fixture needs a worldspace the engine doesn't start in by default.
 **Parked by the user:** a folder picker (Browse) for the Data folder (`local/handover-phase3-dev.md` §7).
 **Open:** L2 (progress, after #45), PR texts for L3/L4, the notice pane's mouse wheel untried by hand,
 the launcher's monospace font (ask the user). **No workers running.** Project-wide wrap-up (the user).
