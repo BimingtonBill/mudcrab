@@ -178,6 +178,36 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-28 (day) - Claude [phase1] Phase 1 Dev (converter bundle evidence, check command, window handed to Phase 3)
+
+**Branches (local, green; Upstream Dev holds the send queue, every send needs the user's yes):**
+| Branch | Head | What |
+|---|---|---|
+| `phase1/quiet-basis` | 604150b | basisu's per-texture "KTX2 validator bug" printf off stdout (C stdout to null device, Rust stdout kept); Claude review #828 accept + fixes |
+| `phase1/output-check` | b99bc4b | `converter check <output> [--full]` (quick check of a full install ~3 s) + `check_output_with_cancel(.., &AtomicBool)` |
+| `phase1/atomic-writes` | 50f421c | cache-hit copy + Luau write via temp + rename (`atomic_file.rs`); `-zstd` aa567c6 = the ktx2-zstd resolution |
+| `phase1/cheap-io-zstd` | e5a2047 | cheap-io merged with ktx2-zstd (outcome carries `(ConversionOutcome, Option<OutputStamp>)`) |
+| `phase1/ktx2-zstd` / `fast-textures` | 5a490d0 / 762fe3b | #51 head f14c5a9 merged in (no longer reverts the spill fix); native usage text says RGBA8 |
+| `phase1/converter-window` | a062046 | **now Phase 3 Dev's** (merged into the launcher); includes the Check buttons (Claude impl #830) |
+Upstream Dev's `phase1/converter-bundle` 1746f48 = #51 + zstd + native + quiet-basis + output-check + cheap-io-zstd (320 green).
+
+**Measured (quiet booked machine; `local/research/phase1-bundle-evidence.md`):** zstd frame time
+unchanged (stress 6.20 vs 6.25 ms, textures only differ); native mode re-makes all 33,175 textures in
+**4.7 min** (vs ~4.5-5.1 h UASTC; 247 fallbacks; textures 14.42 GB native vs 12.96 UASTC+zstd);
+cheap-io A-B-A: texture stage 3.1 -> 1.4 min, other stages unchanged, no extraction regression.
+**Extraction and validation are latency-bound** (11-15 % of 16 threads, disk ~95 % idle): issue draft
+`local/pr-drafts/36-issue-latency-bound-conversion.md`, HELD for the user's decision on the reply to
+Lucas (who called converter work top priority). `converter check` found main's prune pass leaves ~230
+GLBs with stale manifest entries (already fixed by glue 0fdc08a, rides #30/#31).
+
+**Next (not started; the user's project-wide wrap-up):** sweep stale `*.partial` files in staging on
+resume + guard before publish (Upstream Dev's review of atomic-writes; main has the same gap for
+texture/mesh temporaries); make the archive `copy_file`/link fallback atomic on top of #51; parallel
+cache verification + validation hashing, `--io-jobs` wired (plan: see the issue draft); native mode
+RGBA8 for 24-bit BGR8 and the remaining layouts; the #31 x ktx2-zstd resolution when the second lands.
+**Running:** nothing. Scratch: `D:/Modding-overflow/p1-timing` (native tree + A/B results),
+`wt/p1-merge`, `wt/p1-bundle`, `wt/p1-fasttex`, `shared-check-target/*` can be discarded.
+
 ### 2026-09-28 - Claude [phase2] Upstream Dev (converter priority, new dev lanes, PR style, bundle evidence)
 
 **Upstream:** main still 6f583cd (no maintainer merge since #39 on 09-26). Ours open: #29-31, #38,
