@@ -33,7 +33,8 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   `docs/roadmap/02-completion-plan.md` describe. Worktree `C:\Modding\wkj-phase2`, branches
   `phase2/<topic>` cut from `main` (a mirror of `origin/main`), assets
   `C:\Modding\SkyrimConverted-upstream`, upstream's commit style, worker tasks `<kind>-<nnn>-p2-<slug>` numbered 500-599.
-- **Portal**: the user's seamless-door feature and demos. This checkout, branch `portal`, assets
+- **Portal** (**PARKED by the user, 2026-09-28**: no new portal work; the Portal Dev session is
+  idle until the user restarts it): the user's seamless-door feature and demos. This checkout, branch `portal`, assets
   `C:\Modding\SkyrimConverted`, `[claude]`/`[deepseek]` prefixes, worker tasks `<kind>-<nnn>-portal-<slug>` numbered 100-199 (then 600+).
 - **Phase 1** (added 2026-09-27, the user's new Phase 1 Dev session): improvements to upstream's
   finished converter (`docs/roadmap/01-asset-pipeline.md`), sent upstream like Phase 2. Worktree
@@ -92,8 +93,9 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
   pick them up without asking.
 - **Budgets are shared:** the DeepSeek daily limit (`ds_spend.py status`; a stretch to Sat 3 Oct, about
   $9.73 a day) covers every session; say in the log when a session holds coders. **The split (the
-  user, 2026-09-27):** Phase 1 Dev about 41% of the day ($4.00 of $9.73), Phase 2 Dev 26% ($2.50),
-  Portal Dev 26% ($2.50), Upstream Dev 7% ($0.73). The launcher cannot enforce a per-session share,
+  user, 2026-09-27; Portal's share split between Phase 1 and Phase 2 when the portal was parked,
+  2026-09-28):** Phase 1 Dev about 54% of the day ($5.25 of $9.73), Phase 2 Dev 39% ($3.75),
+  Upstream Dev 7% ($0.73). The launcher cannot enforce a per-session share,
   so each session keeps to its own; a session that finishes early says so in the log and the others
   may use the rest. It replaces the older "3 Phase 2 coders and 2 Portal coders a day". The Claude
   plan is shared too (one account): when its week runs ahead of pace, every session keeps Claude
