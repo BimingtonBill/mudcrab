@@ -225,6 +225,13 @@ runs: `D:/Modding-overflow/phase3-scratch/game_data` (run the exe with that fold
 `phase3/try-launcher` 734982a = L3 + L4, fake Skyrim in `game_data\Data`, Start/Reset/Make-leftover scripts,
 README). Play on the fake data opens a grey engine window: the launcher passes only `--assets`, and the
 fixture needs a worldspace the engine doesn't start in by default.
+**Evening, the user (via Upstream Dev): get the launcher rework up.** `phase3/launcher-rework` **77b9869**
+(worktree `C:/Modding/wkj-phase3-rework`) = main + `phase1/progress-on-55` 67f00ba (#55 + #45 + converter
+progress + `converter::find_resumable_staging`) + launcher commit 880bad5 (L3's launcher, no auto-resume,
+converter's staging finder) + #55 6788d10. nextest 257. Handed to Upstream Dev (the user allowed it to open it
+once green), text `local/pr-drafts/phase3-launcher-rework.md`, evidence `local/research/rework/`. This
+supersedes L1 (retired) and L3's old stack; L4 is upstream in #56. Follow-ups: merge Phase 1's next
+progress-on-55 head (per-entry Stop in extraction, impl #834); "Start over" label after Delete staging.
 **Parked by the user:** a folder picker (Browse) for the Data folder (`local/handover-phase3-dev.md` §7).
 **Open:** L2 (progress, after #45), PR texts for L3/L4, the notice pane's mouse wheel untried by hand,
 the launcher's monospace font (ask the user). **No workers running.** Project-wide wrap-up (the user).
