@@ -42,6 +42,13 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   targets and conversion output on D:, worker tasks `<kind>-<nnn>-p1-<slug>` numbered 800-899. It owns
   `crates/converter/**` and `crates/dummy-content/**`; `crates/shared/**` changes are agreed by message.
   Starting brief: `local/handover-phase1-dev.md`.
+- **Phase 3** (added 2026-09-28, the user's Phase 3 Dev session): the launcher (upstream Phase 3
+  item 3.4, `docs/roadmap/03-luau-and-ui.md`), sent upstream like Phase 2. Worktree
+  `C:\Modding\wkj-phase3`, branches `phase3/<topic>` cut from `main`, upstream's commit style
+  (`feat(launcher): ...`), build targets on D:, worker tasks `<kind>-<nnn>-p3-<slug>` numbered
+  900-999. It owns `crates/launcher/**` and `crates/converter-gui/**` (being folded into the
+  launcher; the crate is then deleted); converter API changes go through Phase 1 Dev by message.
+  Starting brief: `local/handover-phase3-dev.md`.
 - Changes flow one way: `main`, `phase1/*` and `phase2/*` merge into `portal`, never the reverse. A
   Phase 1 or Phase 2 bug found on the portal is fixed on a `phase1/*` or `phase2/*` branch first.
 
@@ -56,7 +63,7 @@ before starting any `phase2/*` branch or moving work between tracks.
 > reviews and replies (bots included), pushes to an open PR's branch, and pushes to the user's
 > public fork (`BimingtonBill/wah-krah-jol`, `myfork`), including `public/portal`.
 >
-> - Dev sessions (Phase 1 Dev, Phase 2 Dev, Portal Dev and any new one) never run `git push`,
+> - Dev sessions (Phase 1 Dev, Phase 2 Dev, Phase 3 Dev, Portal Dev and any new one) never run `git push`,
 >   `gh pr create`, `gh pr comment`, `gh issue create`, or any `gh api` call that writes to
 >   GitHub. Hand the finished branch, commit and evidence to Upstream Dev by message instead.
 > - Upstream Dev shows the user each item (a rendered preview for text, AI label at the top) and
@@ -94,8 +101,8 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
 - **Budgets are shared:** the DeepSeek daily limit (`ds_spend.py status`; a stretch to Sat 3 Oct, about
   $9.73 a day) covers every session; say in the log when a session holds coders. **The split (the
   user, 2026-09-27; Portal's share split between Phase 1 and Phase 2 when the portal was parked,
-  2026-09-28):** Phase 1 Dev about 54% of the day ($5.25 of $9.73), Phase 2 Dev 39% ($3.75),
-  Upstream Dev 7% ($0.73). The launcher cannot enforce a per-session share,
+  2026-09-28; $1.50 of Phase 1's share to the new Phase 3 Dev, the user, 2026-09-28):** Phase 1 Dev
+  $3.75 of $9.73, Phase 2 Dev $3.75, Phase 3 Dev $1.50, Upstream Dev $0.73. The launcher cannot enforce a per-session share,
   so each session keeps to its own; a session that finishes early says so in the log and the others
   may use the rest. It replaces the older "3 Phase 2 coders and 2 Portal coders a day". The Claude
   plan is shared too (one account): when its week runs ahead of pace, every session keeps Claude
