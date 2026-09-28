@@ -255,6 +255,11 @@ KTX2 by default, no mode flag) and #54 (per-mip zstd, level 6), all stacked on o
 cache-dir, atomic-writes, fast-textures and ktx2-zstd (ours HELD; the user decides how to cooperate).
 Do a diff-level comparison (correctness, #31/resume interplay, `.partial` handling, tests) and say
 whether our full-install evidence (sizes, 4.7 min native run, FLIP, timing A/Bs) would strengthen his PRs.
+**Sent upstream (Upstream Dev, with the user's OK, ~15:40):** #55 contributor-experience
+(`phase1/contributor-experience` e45183c = contributor-onboarding + output-check), decoder-bounds
+pushed into #43 (head 0914347), and a comment on #53 backing his stack and offering our numbers. #43
+and #55 are frozen PR heads. Held for the comparison: cheap-io, atomic-writes, ktx2-zstd,
+fast-textures, cache-dir. converter-progress would have to be rebuilt on #45's head 970cbdd to ride #45.
 **Then (not started; the user's project-wide wrap-up):** sweep stale `*.partial` files in staging on
 resume + guard before publish (Upstream Dev's review of atomic-writes; main has the same gap for
 texture/mesh temporaries); make the archive `copy_file`/link fallback atomic on top of #51; parallel
