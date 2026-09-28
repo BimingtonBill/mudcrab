@@ -249,7 +249,13 @@ cheap-io A-B-A: texture stage 3.1 -> 1.4 min, other stages unchanged, no extract
 Lucas (who called converter work top priority). `converter check` found main's prune pass leaves ~230
 GLBs with stale manifest entries (already fixed by glue 0fdc08a, rides #30/#31).
 
-**Next (not started; the user's project-wide wrap-up):** sweep stale `*.partial` files in staging on
+**First next session (Upstream Dev's ask, 15:20):** TaylorTurnerIT opened #52 (runtime pack: publish
+artifacts only, blobs to `<output>.assets-cache`, hardened staging writers), #53 (native DDS blocks in
+KTX2 by default, no mode flag) and #54 (per-mip zstd, level 6), all stacked on our #51 and overlapping
+cache-dir, atomic-writes, fast-textures and ktx2-zstd (ours HELD; the user decides how to cooperate).
+Do a diff-level comparison (correctness, #31/resume interplay, `.partial` handling, tests) and say
+whether our full-install evidence (sizes, 4.7 min native run, FLIP, timing A/Bs) would strengthen his PRs.
+**Then (not started; the user's project-wide wrap-up):** sweep stale `*.partial` files in staging on
 resume + guard before publish (Upstream Dev's review of atomic-writes; main has the same gap for
 texture/mesh temporaries); make the archive `copy_file`/link fallback atomic on top of #51; parallel
 cache verification + validation hashing, `--io-jobs` wired (plan: see the issue draft); native mode
