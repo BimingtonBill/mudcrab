@@ -178,6 +178,36 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-28 - Claude [phase2] Upstream Dev (converter priority, new dev lanes, PR style, bundle evidence)
+
+**Upstream:** main still 6f583cd (no maintainer merge since #39 on 09-26). Ours open: #29-31, #38,
+#40-41, #43-49, #51 (all CI green, all merge cleanly with main, checked 09-28). #51 (vfs hard links,
+70.9 -> 45.65 GB) got its CodeRabbit follow-up (f14c5a9: NTFS link-limit spill) and a body fix
+(mojibake from a cp1252 round trip; never pipe PR bodies through the console). Chef (TaylorTurnerIT)
+was answered on #30: the user welcomes PRs against the fork's branches.
+
+**The user's rules now:** all publishing goes through Upstream Dev with the user's yes per item
+(AGENTS.md "Publishing rule"; fork pushes included). Plans cover one day or one night. The pacing
+("new PRs wait for a maintainer merge") is LIFTED for Phase 1 converter and Phase 3 launcher work,
+because Lucas (owner) said on Discord that converter work is top priority (resume/WAL, parallelism,
+convert-while-playing); engine PRs keep the pacing. PR/issue text follows local/pr-drafts/STYLE.md
+(short summary on top, details collapsed); old PR bodies are not edited.
+
+**Queue** (docs/pr/upstream-queue.md has heads and order): converter send list 1 contributor-onboarding
+22391dd, 2 ktx2-zstd 5a490d0, 2b atomic-writes 50f421c (+ a `.partial` sweep in progress), 3
+output-check b99bc4b + quiet-basis, 4 cheap-io (clean A-B-A timing in progress), 5 fast-textures
+762fe3b (issue 34 first), 6 cache-dir (issue first), 7 decoder-bounds, 8 converter-progress. Launcher:
+L1 launcher-resume eb5a0d6 (stale-schema resume risk before #31: asked Phase 3 Dev to wait for #31
+or guard), L2-L4. Engine (paced): schema-mismatch-error, fixture-interior-crossing, paced-cell-unloads
+(held for the asset-ready follow-up), engine-help (after #41/#45). Texts ready: local/pr-drafts/30-36.
+
+**Evidence branch:** phase1/converter-bundle 1746f48 (worktree C:/Modding/wkj-upstream; #51 + zstd +
+native + quiet-basis + output-check + cheap-io-zstd; 320 green). Still to merge: output-check b99bc4b,
+after Phase 1 Dev's A-B-A booking. The #31 x zstd resolution is Phase 1 Dev's when the second lands.
+Bundle evidence: local/research/phase1-bundle-evidence.md (native textures 4.7 min for 33,175;
+extraction/validation latency-bound at ~14% CPU; the latency issue draft 36 is on hold until the user
+decides on a reply to Lucas). **Running:** the 90-minute upstream check (session crons). No workers.
+
 ### 2026-09-27/28 (night) - Claude [portal] Portal Dev (audit clean-up, look-out bench, schema 28; PORTAL PARKED)
 
 **Parked:** on 2026-09-28 09:45 the user parked portal work (relayed by Phase 2 Dev). The session is
