@@ -171,6 +171,25 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-27/28 (night) - Claude [portal] Portal Dev (audit clean-up, look-out bench, schema 28; PORTAL PARKED)
+
+**Parked:** on 2026-09-28 09:45 the user parked portal work (relayed by Phase 2 Dev). The session is
+idle: no workers, coders, engines or bookings. Portal HEAD 518022c (last code commit 73b2129).
+Details, what was next and a list of disk to reclaim later: `local/handover-2026-09-26-portal.md`
+("PARKED" section).
+
+**Landed overnight (700 engine lib tests, short walked Riverwood tour PASSED):** audit leftovers
+impl-265 (one doorway-plane owner, one heading helper, test-only `from_args`), impl-268 (retried
+interiors not reported failed, one grid-offset owner, Full commits obey the time budget), impl-271 +
+73b2129 (every grid-offset copy through streaming's helpers); Phase 2's audit-engine merge (read-only
+DB opens, validate-once cell cache, safe asset paths); 1a97d0a water reflection only for water a
+camera draws (it ran inside closed houses); impl-267 look-out bench states (`closed-out`,
+`open-out-view`, `tools/bench/portal_bench_doors_out.json`). Phase 1's `prep/portal-zstd` merged
+(2d5db56) and `C:\Modding\SkyrimConverted` reconverted to **schema 28** (hard-linked extraction,
+KTX2 Zstandard; complete, integration passed); release and quick engines rebuilt for it.
+Workers: DeepSeek (impl-265, 267), Claude subagents (impl-268, 271), MiMo (audits 262-264,
+research 266/269/272, pitfalls digest), Muse (review 265.1).
+
 ### 2026-09-27/28 (night) - Claude [phase1] Phase 1 Dev (first session: output size, converter speed, contributor tooling)
 
 **Set-up:** the user accepted the Phase 1 rules (worktree `C:/Modding/wkj-phase1`, `phase1/*` from main,
