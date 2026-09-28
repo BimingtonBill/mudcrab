@@ -251,7 +251,7 @@ cheap-io A-B-A: texture stage 3.1 -> 1.4 min, other stages unchanged, no extract
 Lucas (who called converter work top priority). `converter check` found main's prune pass leaves ~230
 GLBs with stale manifest entries (already fixed by glue 0fdc08a, rides #30/#31).
 
-**First next session (Upstream Dev's ask, 15:20):** TaylorTurnerIT opened #52 (runtime pack: publish
+**Done later the same day (the user's launcher push):** `phase1/converter-progress-main` 74c9a8c (on #45 970cbdd: status line, Cancellation, ProgressEstimate, `find_resumable_staging`), `phase1/progress-on-55` 67f00ba (+ #55, for Phase 3), and the #52-#54 comparison `local/research/phase1-chef-prs-comparison.md` (back each with changes; our `phase1/cache-dir` has a corrupt-blob re-link bug, archive/mod.rs:221). Background of that ask (15:20): TaylorTurnerIT opened #52 (runtime pack: publish
 artifacts only, blobs to `<output>.assets-cache`, hardened staging writers), #53 (native DDS blocks in
 KTX2 by default, no mode flag) and #54 (per-mip zstd, level 6), all stacked on our #51 and overlapping
 cache-dir, atomic-writes, fast-textures and ktx2-zstd (ours HELD; the user decides how to cooperate).
