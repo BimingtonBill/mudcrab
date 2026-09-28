@@ -272,9 +272,10 @@ convert-while-playing); engine PRs keep the pacing. PR/issue text follows local/
 22391dd, 2 ktx2-zstd 5a490d0, 2b atomic-writes 50f421c (+ a `.partial` sweep in progress), 3
 output-check b99bc4b + quiet-basis, 4 cheap-io (clean A-B-A timing in progress), 5 fast-textures
 762fe3b (issue 34 first), 6 cache-dir (issue first), 7 decoder-bounds, 8 converter-progress. Launcher:
-L1 launcher-resume eb5a0d6 (stale-schema resume risk before #31: asked Phase 3 Dev to wait for #31
-or guard), L2-L4. Engine (paced): schema-mismatch-error, fixture-interior-crossing, paced-cell-unloads
-(held for the asset-ready follow-up), engine-help (after #41/#45). Texts ready: local/pr-drafts/30-36.
+L1 launcher-resume eb5a0d6 (after #31), L3 launcher-conversion e1ffb36 (held), L4 engine-exit-message
+bd26dfc (needs text + a manual refusal check). Engine (paced): schema-mismatch-error,
+fixture-interior-crossing, the crossing-stutter set c8b2801 (worst streaming frame ~21-25 -> ~17 ms;
+272 green), engine-help (after #41/#45). Texts ready: local/pr-drafts/30-36.
 
 **Evidence branch:** phase1/converter-bundle c7a79b2 (worktree C:/Modding/wkj-upstream; #51 + zstd +
 native + quiet-basis + output-check b99bc4b + cheap-io-zstd; 323 green). Cheap-io A-B-A: texture
