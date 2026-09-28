@@ -231,8 +231,8 @@ L1 launcher-resume eb5a0d6 (stale-schema resume risk before #31: asked Phase 3 D
 or guard), L2-L4. Engine (paced): schema-mismatch-error, fixture-interior-crossing, paced-cell-unloads
 (held for the asset-ready follow-up), engine-help (after #41/#45). Texts ready: local/pr-drafts/30-36.
 
-**Evidence branch:** phase1/converter-bundle 1746f48 (worktree C:/Modding/wkj-upstream; #51 + zstd +
-native + quiet-basis + output-check + cheap-io-zstd; 320 green). Still to merge: output-check b99bc4b,
+**Evidence branch:** phase1/converter-bundle c7a79b2 (1746f48 + output-check b99bc4b, 323 green) (worktree C:/Modding/wkj-upstream; #51 + zstd +
+native + quiet-basis + output-check + cheap-io-zstd; 320 green). Merged: output-check b99bc4b
 after Phase 1 Dev's A-B-A booking. The #31 x zstd resolution is Phase 1 Dev's when the second lands.
 Bundle evidence: local/research/phase1-bundle-evidence.md (native textures 4.7 min for 33,175;
 extraction/validation latency-bound at ~14% CPU; the latency issue draft 36 is on hold until the user
