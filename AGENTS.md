@@ -178,6 +178,29 @@ Commit your work, then add a dated entry at the top of the handoff log: what cha
 
 ## Handoff log
 
+### 2026-09-28 - Claude [phase3] Phase 3 Dev (first session: converter window folded into the launcher)
+
+**Set-up:** the user confirmed the Phase 3 rules (see "Two tracks"): worktree `C:/Modding/wkj-phase3`,
+`phase3/*`, targets on D:, workers 900-999, owns `crates/launcher` + `crates/converter-gui`, DeepSeek share
+$1.50 (from Phase 1's). The user's design call: converter-gui moves into the launcher and the crate is
+deleted. Upstream Dev's split: L1 resume, L2 progress, L3 merged window, L4 engine exit message.
+
+**Branches (all green, reviewed, handed to Upstream Dev; nothing pushed):**
+| Branch | Head | What |
+|---|---|---|
+| `phase3/launcher-resume` (L1, from main) | eb5a0d6 | the launcher resumes a leftover `<output>.staging-*` instead of starting over. **Send after #31** (its journal re-checks schema/config/hash, so an automatic resume never publishes stale or torn outputs). Text `local/pr-drafts/phase3-L1-launcher-resume.md` |
+| `phase3/engine-exit-message` (L4, from main) | bd26dfc | engine stdout+stderr to a temp log (never a pipe); on an early exit the launcher shows the tail + log path; no second engine. Not yet tried against a real refusing engine |
+| `phase3/launcher-conversion` (L3) | e1ffb36 | converter-gui folded into `crates/launcher/src/conversion/`, crate deleted; no auto-start; Start/Stop/Resume/Delete staging/Check/Full check; leftover staging from an earlier session offered for Resume; Stop cancels a check (phase1/output-check b99bc4b merged); 270 tests. Stacks on #51, #45, the converter bundle: held |
+
+**Found:** on main, `--resume-staging` could reuse a torn GLB (cache-hit copy) or Luau (plain write)
+after a hard kill; Phase 1 fixed it on `phase1/atomic-writes` 50f421c (one copy path left, on their list).
+Screenshots: `local/research/launcher-merged-*.png`, `launcher-resume-done.png`. Fixture data for launcher
+runs: `D:/Modding-overflow/phase3-scratch/game_data` (run the exe with that folder as working directory).
+
+**Parked by the user:** a folder picker (Browse) for the Data folder (`local/handover-phase3-dev.md` §7).
+**Open:** L2 (progress, after #45), PR texts for L3/L4, the notice pane's mouse wheel untried by hand,
+the launcher's monospace font (ask the user). **No workers running.** Project-wide wrap-up (the user).
+
 ### 2026-09-28 (day) - Claude [phase1] Phase 1 Dev (converter bundle evidence, check command, window handed to Phase 3)
 
 **Branches (local, green; Upstream Dev holds the send queue, every send needs the user's yes):**
