@@ -3,6 +3,25 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+### 2026-09-30/10-01 - Claude [phase3] Phase 3 Dev (launcher safety, reviews, overnight drop-and-console)
+
+**Upstream:** #70 (launcher safety: refuse a non-conversion Output, no Start while the game runs) MERGED,
+with a Sol review (#914) doc fix and Phase 1's #69 fix. Issue #76 posted (launcher version installs, Chef's
+idea, credited). Reviewed Phase 2's launcher lines on `phase2/schema-range-shared` 9e9effe2: OK (raw manifest
+read matches the engine). Held-work audit: no built Phase 3 branch still held
+(`local/research/held-branches-phase3.md`); `brand/mudcrab-text` obsolete. The name stays Mudcrab (the user).
+
+**Overnight (the user's "Go" via Upstream Dev), HELD locally:** `phase3/launcher-drop-and-console` **0761e0e**
+(worktree `C:/Modding/wkj-phase3-safety`, target `D:/Modding-overflow/phase3-target-safety`), from origin/main
+a896b90: no console on Windows release builds + `%TEMP%\mudcrab-launcher.log`; engine with CREATE_NO_WINDOW;
+Output/Data overlap refused on drop, press, Detect (Phase 1's `phase1/check-outside-data` 2faea76 merged:
+merge after it). Workspace 712/712 on 5c8447e, launcher 113/113 on 0761e0e; a real release run checked.
+DeepSeek impl #915/#916, review #918 (its "println panics without a console" disproved by test). PR text
+`local/pr-drafts/phase3-launcher-drop-and-console.md`; handed to Upstream Dev.
+**Lesson:** a launcher test run whose working folder lacks `game_data` falls back to the real Steam
+Skyrim; use a fixture-only setup. **No workers running.** **Next:** the user's yes on the branch; the
+Browse picker only if handed out.
+
 ### 2026-09-28 - Claude [phase2] Phase 2 Dev (overnight + day; wrap-up)
 
 **The user's decisions:** plans cover one day or one night at a time; the portal is PARKED (Portal Dev
