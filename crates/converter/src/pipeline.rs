@@ -1587,6 +1587,14 @@ fn overlay_loose_assets(data: &Path, vfs: &Path, files: &[PathBuf]) -> Result<()
                 )
             });
         }
+        // Flushed before the rename, like the converter's other writers, so a crash right after
+        // it cannot leave a torn file under the real name.
+        // Opened for writing: on Windows a flush needs write access.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
+            .and_then(|file| file.sync_all())
+            .wrap_err_with(|| format!("failed to flush {}", temporary.display()))?;
         if destination.exists() {
             fs::remove_file(&destination)?;
         }
@@ -1764,8 +1772,8 @@ fn parked_journal_path(staging: &Path) -> PathBuf {
 
 /// The temporary names the converter's own writers use while publishing a file: each appends a
 /// suffix carrying the writing process's id to the real name and renames the file over its
-/// destination, so a run killed between the two leaves the temporary behind. The process id is
-/// what tells a leftover from a real file that merely ends in `.partial`.
+/// destination, so a run killed between the two leaves the temporary behind. The numeric
+/// process-id segment is what tells a leftover from a real file that merely ends in `.partial`.
 ///
 /// One entry per writer:
 /// - `archive::atomic_write`: `.<name>.<pid>.partial`
@@ -1774,8 +1782,16 @@ fn parked_journal_path(staging: &Path) -> PathBuf {
 /// - the texture writer: `<name>.ktx2.<pid>.partial`
 /// - the script writer: `.<name>.<pid>-<counter>.partial`
 /// - `link_or_copy_spilling`: `<name>.<index>.partial-<pid>`
+/// - `write_glb_atomic` and the texture writer also park the previous output as
+///   `<name>.glb.<pid>.backup` / `<name>.ktx2.<pid>.backup` while they swap; a leftover one makes
+///   the writer refuse, and the output it held is converted again on resume.
 fn is_converter_temporary_name(name: &str) -> bool {
     let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if let Some(head) = name.strip_suffix(".backup") {
+        return head.rsplit_once('.').is_some_and(|(stem, pid)| {
+            digits(pid) && (stem.ends_with(".glb") || stem.ends_with(".ktx2"))
+        });
+    }
     if let Some(head) = name.strip_suffix(".partial") {
         // A script temporary carries a per-call counter after the process id; every other shape
         // ends at the process id itself.
@@ -3678,11 +3694,18 @@ mod tests {
             staging.join(format!("meshes/one.glb.{pid}.partial")),
             // The spill copy: `<name>.<index>.partial-<pid>`.
             staging.join(format!("cache/deadbeef.1.partial-{pid}")),
+            // The previous output the mesh and texture writers park while they swap.
+            staging.join(format!("meshes/two.glb.{pid}.backup")),
+            staging.join(format!("textures/two.ktx2.{pid}.backup")),
         ];
         for path in &stale {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, b"torn").unwrap();
         }
+        // A real file named like a backup of something else stays.
+        let kept_backup = staging.join("notes/settings.ini.7.backup");
+        fs::create_dir_all(kept_backup.parent().unwrap()).unwrap();
+        fs::write(&kept_backup, b"a real file").unwrap();
         let kept = staging.join("notes/hand-authored.partial");
         fs::create_dir_all(kept.parent().unwrap()).unwrap();
         fs::write(&kept, b"a real file").unwrap();
@@ -3712,6 +3735,10 @@ mod tests {
             fs::read(&kept).unwrap(),
             b"a real file",
             "a file that merely ends in .partial was removed"
+        );
+        assert!(
+            kept_backup.is_file(),
+            "a file that merely ends in .backup was removed"
         );
         assert!(
             events
