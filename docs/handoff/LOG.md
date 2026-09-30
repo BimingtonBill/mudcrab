@@ -17,7 +17,7 @@ local only (#74 reverted the rebrand).
 | `phase1/staging-leftovers` | 93c9e5d5 | resume clears own temporaries; atomic loose-override copy |
 | `phase1/lod-containers` | e6972697 | .btr/.bto to GLB; all 9,584 .btr + 1,078 .bto real files parse and convert |
 | `phase1/check-outside-data` | 2faea763 | shared Data-overlap check (Phase 3 uses it) |
-| `phase1/parallel-validation` | 64ad53af | validation on a rayon pool (25.5 s to 3.3 s); waits for the user's Discord heads-up |
+| `phase1/parallel-validation` (#97) | 64ad53af | validation on a rayon pool (25.5 s to 3.3 s); open upstream as draft #97 |
 
 **Lessons:** ds_impl coders fill C: (run one at a time, or Claude subagents in D: worktrees); Python
 heredocs with `\`+newline break Rust string continuations; Windows `sync_all` needs a writable handle.
