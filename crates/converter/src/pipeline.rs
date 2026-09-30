@@ -1871,12 +1871,27 @@ fn stale_backup(output: &Path) -> Option<PathBuf> {
         .map(|entry| entry.path())
         .find(|path| {
             path.file_name().is_some_and(|file_name| {
+                // Only the converter's own shape, `<output name>.backup-<process id>`: a folder the
+                // user named `<output>.backup-old` is not ours and must not block every run.
                 file_name
                     .to_string_lossy()
                     .to_ascii_lowercase()
-                    .starts_with(&prefix)
+                    .strip_prefix(&prefix)
+                    .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
             })
         })
+}
+
+/// Stops a run when an earlier publish left a backup of the output behind. That folder may hold
+/// the only copy of the previous output, so it is named and kept, never deleted.
+fn refuse_stale_backup(output: &Path) -> Result<()> {
+    if let Some(stale) = stale_backup(output) {
+        bail!(
+            "refusing to overwrite stale backup {}: it may hold your previous output; move it aside (delete it only if you no longer need that output) and run the conversion again",
+            stale.display()
+        );
+    }
+    Ok(())
 }
 
 /// The filesystem operations a publish is built from, and where its non-fatal news goes. A test
@@ -1913,12 +1928,7 @@ fn publish_directory_with(staging: &Path, output: &Path, ops: &impl PublishOps) 
     // Any backup, not only this process's: one left under another pid is neither noticed nor
     // protected by a check scoped to the current pid, and deleting it would lose the previous
     // output for good.
-    if let Some(stale) = stale_backup(output) {
-        bail!(
-            "refusing to overwrite stale backup {}; move or delete it and run the conversion again",
-            stale.display()
-        );
-    }
+    refuse_stale_backup(output)?;
     let backup = backup_path(output);
     if output.exists() {
         ops.rename(output, &backup)
@@ -2604,6 +2614,20 @@ mod tests {
         assert!(
             warnings[0].contains(&backup.display().to_string()),
             "the warning does not name {backup:?}: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_folder_the_user_named_like_a_backup_does_not_block_a_publish() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("modern");
+        fs::create_dir_all(temp.path().join("modern.backup-old")).unwrap();
+        fs::create_dir_all(temp.path().join("modern.backup-")).unwrap();
+        assert_eq!(stale_backup(&output), None);
+        fs::create_dir_all(temp.path().join("Modern.BACKUP-4242")).unwrap();
+        assert_eq!(
+            stale_backup(&output),
+            Some(temp.path().join("Modern.BACKUP-4242"))
         );
     }
 
