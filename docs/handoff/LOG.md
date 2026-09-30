@@ -3,6 +3,27 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+### 2026-09-30/10-01 - Claude [phase1] Phase 1 Dev (Sol-review fixes sent; overnight jobs 1-4 held)
+
+**Sent via Upstream Dev (the user's yes each):** #69 output-dir guard, #71 restore #30 + fixes, #73 remove
+resumed staging, #75 fixture player race, #93 resume keeps prune records. Main-green fixes after #66 were
+local only (#74 reverted the rebrand).
+
+**Overnight jobs (handed out by Upstream Dev, all HELD, texts in `local/pr-drafts/`, summary sent to Upstream Dev):**
+| Branch | Head | What |
+|---|---|---|
+| `phase1/check-schema-range` | a1a3ba03 | `converter check` accepts the runtime's schema range (on #95) |
+| `phase1/publish-robustness` | f1c5b906 | publish failures keep the previous output findable; any stale backup stops publish |
+| `phase1/staging-leftovers` | 93c9e5d5 | resume clears own temporaries; atomic loose-override copy |
+| `phase1/lod-containers` | e6972697 | .btr/.bto to GLB; all 9,584 .btr + 1,078 .bto real files parse and convert |
+| `phase1/check-outside-data` | 2faea763 | shared Data-overlap check (Phase 3 uses it) |
+| `phase1/parallel-validation` | 64ad53af | validation on a rayon pool (25.5 s to 3.3 s); waits for the user's Discord heads-up |
+
+**Lessons:** ds_impl coders fill C: (run one at a time, or Claude subagents in D: worktrees); Python
+heredocs with `\`+newline break Rust string continuations; Windows `sync_all` needs a writable handle.
+**Next:** LOD pieces 2, 5, 7 with Phase 2 (after the go); discard D: worktrees p1-parval, p1-checkrange,
+p1-publish, p1-leftovers, p1-outside, p1-pruneresume and their targets once sent. **No workers running.**
+
 ### 2026-09-30/10-01 - Claude [phase3] Phase 3 Dev (launcher safety, reviews, overnight drop-and-console)
 
 **Upstream:** #70 (launcher safety: refuse a non-conversion Output, no Start while the game runs) MERGED,
