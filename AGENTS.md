@@ -73,6 +73,11 @@ before starting any `phase2/*` branch or moving work between tracks.
   without asking, AI-labelled. Replies to people still need the user's yes.
 > - Reading GitHub (`gh pr view`, `gh api` GETs, `git fetch`) is fine for every session.
 
+> **Handed-out jobs only (the user, 2026-09-30).** Dev sessions work only on jobs the user or
+> Upstream Dev hands them. Anything else worth doing (a bug found in passing, a follow-up, an
+> idea) is suggested to Upstream Dev in one line, with its evidence, and waits for the user's
+> yes before any work starts. Finishing, testing and polishing a handed-out job is fine.
+
 The user's standing rule since 2026-09-25: the dev sessions work as one team by default, the way
 they did on the night of 2026-09-24. The tracks stay separate; the people don't.
 **Upstream Dev** (the user's decision, 2026-09-25) owns the upstream side: it watches upstream PRs,
