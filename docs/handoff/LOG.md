@@ -13,7 +13,7 @@ publish-robustness, staging-leftovers, check-outside-data (3570acb8). Reconverte
 
 **Texture speed-up = draft #114** (`phase1/native-rgba8` 12a257fa): uncompressed DDS to native BC1/BC7 via
 intel_tex_2 instead of Basis UASTC. Quiet A/B on textures-only data: texture stage 13:27 -> 5:23, disk/GPU equal,
-FLIP better on all samples (`D:\Modding-overflow	ex-ab\`). **LOD containers = draft #115** (reference for Chef;
+FLIP better on all samples (`D:/Modding-overflow/tex-ab/`). **LOD containers = draft #115** (reference for Chef;
 LOD is his, #103/#105). **#104 phase (a)** `phase1/physics-bodies` 448a51c2 FROZEN pending the user's yes on the
 draft; contract `local/research/p104-physics-body-contract.md`; clutter census 727/1,686/1,745 vs 754/1,781/1,746
 (gap = existing skips). Convert-while-playing scoped (`local/research/convert-while-playing-scope.md`, issue #111)
