@@ -3,6 +3,29 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+### 2026-10-02 (night) - Claude [phase2] Phase 2 Dev (pacing rework #117: measured, first change built)
+
+**Branches, local only** (worktree `D:/Modding-overflow/wt/p2-pacing`, base upstream main 461517bf):
+`phase2/pacing-measure` (1a7f6eb7, 1d3778a2, 336f36f1, d454c3d4: time to a loaded world, `--benchmark-jump`,
+fly lag, per-main-schedule timing, asset arrivals per frame, frame-time windows while loading) and
+`phase2/load-faster` on top (a75bb1b4, 6d7d2ad7, d5fe5593, c0038e37: IO pool = half the hardware threads, at
+most 16, `--io-threads`; 16 models armed a frame instead of 4; review fixes). The two review-fix commits also
+touch measurement code, so split them if the branches go up as two PRs.
+**Numbers** (Ryzen 7 5800X 16 threads, release, jump to 4,-21): world ready 2.26-2.46 s -> 1.12-1.36 s, ready
+after jump 2.36-2.75 s -> 1.30-1.57 s, worst frame while loading 14.7 -> 16-34 ms (one frame over 33 ms in seven
+runs), fly 5000 mean model wait 899 -> 207-295 ms; emulated 4-thread machine world ready 10 s -> 5.4 s. Upload
+budget and unload rate made no difference. Run-worst 100-250 ms frames are a startup one-off (Bevy blocks on the
+upscaling pipeline), not loading. Raw runs and notes: `C:/Modding/wkj-tools/pacing-baseline/notes-night.md`.
+**Reviews:** DeepSeek #658 small fixes, MiMo #658 fix first (small); all valid points fixed (#659, #661).
+Tested on the final head c0038e37: fmt, clippy -D warnings, nextest workspace 732/732 (15 skipped).
+**Found for Phase 1 (suggestion only):** every converted texture is UASTC transcoded to BC7 at load, 56 ms mean
+per texture on one thread; stored BC7 loads in under 1 ms at the same size, about half of today's load time
+(`local/research/texture-load-cost.md`); tangents are generated per mesh at load (~1 s CPU per start).
+PR texts: `local/pr-drafts/117a-pr-pacing-measure.md`, `117b-pr-load-faster.md` (not sent; the user's
+maintainer-focus rule: nothing new upstream without their yes). Plan doc updated (Claude Docs, rev 18).
+No worker running. **Next:** the user decides whether the branches go up; the converter texture idea goes to
+Upstream Dev as one line.
+
 ### 2026-10-01 (day) - Claude [portal] Portal Dev (catch-up with main, steps 1-5 of 7)
 
 **Branch `portal-merge-main`** (worktree `C:\Modding\wkj-portal-merge`, head 7bc1de29, not yet merged into
