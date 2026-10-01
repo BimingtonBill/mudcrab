@@ -42,7 +42,8 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   targets and conversion output on D:, worker tasks `<kind>-<nnn>-p1-<slug>` numbered 800-899. It owns
   `crates/converter/**` and `crates/dummy-content/**`; `crates/shared/**` changes are agreed by message.
   Starting brief: `local/handover-phase1-dev.md`.
-- **Phase 3** (added 2026-09-28, the user's Phase 3 Dev session): the launcher (upstream Phase 3
+- **Phase 3** (added 2026-09-28, the user's Phase 3 Dev session; **PARKED for new work by the user,
+  2026-10-01**: finish, package and send the launcher work already built, start nothing new): the launcher (upstream Phase 3
   item 3.4, `docs/roadmap/03-luau-and-ui.md`), sent upstream like Phase 2. Worktree
   `C:\Modding\wkj-phase3`, branches `phase3/<topic>` cut from `main`, upstream's commit style
   (`feat(launcher): ...`), build targets on D:, worker tasks `<kind>-<nnn>-p3-<slug>` numbered
