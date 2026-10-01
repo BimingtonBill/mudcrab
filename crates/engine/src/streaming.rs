@@ -18,6 +18,7 @@ use crate::{
             AssetCatalog, CellDetail, CellKey, CellPayload, DatabaseRequest, DatabaseResponse,
             ReferenceRow, WorldDatabase,
         },
+        is_safe_relative_asset_path,
     },
 };
 use bevy::{
@@ -379,11 +380,6 @@ impl StreamingWorld {
     }
 }
 
-/// The exterior grid square the camera is over, from its rebased translation and the render origin.
-pub(crate) fn streaming_center(translation: Vec3, origin: IVec2) -> IVec2 {
-    camera_grid(translation, origin)
-}
-
 /// The cell the camera streams from: the exterior worldspace around it, or the interior it is
 /// inside. While `interior` is `Some`, `worldspace_id` still names the worldspace the camera came
 /// from and no exterior is streamed.
@@ -567,7 +563,6 @@ pub struct StreamingMetrics {
     pub static_colliders_authored: u64,
     pub static_colliders_partial: u64,
     pub static_colliders_proxy: u64,
-    pub resident_static_colliders: usize,
     pub static_colliders_authored_absent: u64,
     pub static_colliders_skipped: u64,
     pub physics_fixture_validated: bool,
@@ -3447,9 +3442,12 @@ pub(crate) fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
     ))
 }
 
-fn converted_model_path(path: String) -> Option<String> {
-    let normalized = path.replace('\\', "/");
-    let lowercase = normalized.to_ascii_lowercase();
+/// The converted `.glb` a database model path names, or `None` for a marker, sky or effects model
+/// and for a path that could leave `meshes/`. Lowercased throughout like main's resolver and like
+/// the converter's published names (`crates/converter/src/pipeline.rs`); world-inspect calls this
+/// too, so its model counts match the engine's.
+pub fn converted_model_path(path: String) -> Option<String> {
+    let lowercase = path.replace('\\', "/").to_ascii_lowercase();
     let filename = lowercase.rsplit('/').next().unwrap_or_default();
     if lowercase.starts_with("meshes/sky/")
         || lowercase.starts_with("sky/")
@@ -3461,28 +3459,13 @@ fn converted_model_path(path: String) -> Option<String> {
     {
         return None;
     }
-    let without_prefix = normalized
-        .strip_prefix("meshes/")
-        .or_else(|| normalized.strip_prefix("Meshes/"))
-        .unwrap_or(&normalized);
+    let without_prefix = lowercase.strip_prefix("meshes/").unwrap_or(&lowercase);
     if without_prefix.is_empty() || !is_safe_relative_asset_path(without_prefix) {
         return None;
     }
     let mut converted = std::path::PathBuf::from("meshes").join(without_prefix);
     converted.set_extension("glb");
     Some(converted.to_string_lossy().replace('\\', "/"))
-}
-
-/// Rejects a database-supplied relative path that could escape the assets
-/// root once re-rooted under `meshes/` with `PathBuf::join`. A `..` segment
-/// walks back out of the base directory, and a rooted or drive-prefixed path
-/// makes `PathBuf::join` replace the base entirely instead of appending to it
-/// (see the `std::path::PathBuf::push` docs). Every component must therefore
-/// be a plain, non-empty path segment.
-fn is_safe_relative_asset_path(path: &str) -> bool {
-    std::path::Path::new(path)
-        .components()
-        .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 /// Rapier consumes the exact vertex and triangle buffers rendered by this quadrant.
@@ -3507,9 +3490,8 @@ fn terrain_collider_from_mesh(mesh: &Mesh) -> Result<Collider, String> {
 /// Fixed Riverwood solids with a declared render-triangle proxy policy. Record type remains
 /// authoritative: plant TREE records outside the pine family and movable clutter stay excluded.
 ///
-/// The path is compared in the lowercase canonical form main's converter publishes and main's own
-/// `converted_model_path` returns; portal's keeps the database's capitalisation, so
-/// [`static_collision_from_hierarchy`] lowercases before asking.
+/// The path is compared in the lowercase canonical form the converter publishes and
+/// [`converted_model_path`] returns.
 fn static_proxy_eligible(record_type: Option<&str>, path: &str) -> bool {
     let pine = path.starts_with("meshes/landscape/trees/treepineforest");
     match record_type {
@@ -3795,10 +3777,6 @@ fn attach_authored_collision(
 
 /// The collision decision for one placement: authored shapes when the model has them, otherwise a
 /// render-triangle proxy when the record and path are eligible, otherwise nothing.
-///
-/// The path is lowercased for the rules below: portal's [`converted_model_path`] keeps the
-/// database's capitalisation (`Architecture\Farmhouse\...`) while the converted assets are
-/// published lowercase, and main's eligibility rules are written against that lowercase form.
 #[allow(clippy::too_many_arguments)] // Scene queries and assets belong to this extraction pass.
 fn static_collision_from_hierarchy(
     record_type: Option<&str>,
@@ -3811,7 +3789,6 @@ fn static_collision_from_hierarchy(
     meshes: &Assets<Mesh>,
     materials: &Assets<StandardMaterial>,
 ) -> StaticCollisionDecision {
-    let path = path.to_ascii_lowercase();
     match authored_collision_from_hierarchy(root, children, scene_extras) {
         Ok(Some(asset)) => match collider_parts_from_authored(&asset) {
             Ok(parts) if !parts.is_empty() => {
@@ -3821,9 +3798,9 @@ fn static_collision_from_hierarchy(
             Ok(_) => StaticCollisionDecision::Skipped(asset.skipped.join("; ")),
             Err(reason) => StaticCollisionDecision::Skipped(reason),
         },
-        Ok(None) if static_proxy_eligible(record_type, &path) => {
+        Ok(None) if static_proxy_eligible(record_type, path) => {
             match static_proxy_from_hierarchy(
-                &path, root, children, transforms, primitives, meshes, materials,
+                path, root, children, transforms, primitives, meshes, materials,
             ) {
                 Ok(Some(collider)) => StaticCollisionDecision::RenderProxy(collider),
                 Ok(None) => StaticCollisionDecision::Skipped(
@@ -4174,7 +4151,7 @@ fn validate_and_register_terrain_edges(
             terrain.heights[index] = *height;
         }
         if moved > 0 {
-            warn!(
+            debug!(
                 cell = format_args!("{:08X}", terrain.cell_id),
                 neighbor = ?neighbor_key,
                 max_delta,
@@ -4719,6 +4696,10 @@ mod tests {
         assert_eq!(
             converted_model_path("meshes/Sky/CloudShape01.nif".into()),
             None
+        );
+        assert_eq!(
+            converted_model_path("meshes/Architecture/Wall.nif".into()).as_deref(),
+            Some("meshes/architecture/wall.glb")
         );
         assert_eq!(converted_model_path("meshes/Marker_Map.nif".into()), None);
         assert_eq!(
@@ -8986,13 +8967,13 @@ mod tests {
             .resource_mut::<Assets<StandardMaterial>>()
             .add(StandardMaterial::default());
         let model = add_converted_model(&mut app, converted_scene_with_material(mesh, material));
-        // The database's own capitalisation, which the eligibility rules are not written in: the
-        // decision lowercases the path before it asks them.
+        // The converted (lowercase) path `converted_model_path` returns, which the eligibility
+        // rules are written in.
         let stat = spawn_pending_reference_with(
             &mut app,
             model.clone(),
             0,
-            "meshes/Architecture/Farmhouse/Farmhouse01.glb",
+            "meshes/architecture/farmhouse/farmhouse01.glb",
             "STAT",
             true,
         );
@@ -9001,7 +8982,7 @@ mod tests {
             &mut app,
             model,
             1,
-            "meshes/Architecture/Farmhouse/FarmhouseLDoor01.glb",
+            "meshes/architecture/farmhouse/farmhouseldoor01.glb",
             "DOOR",
             true,
         );

@@ -273,7 +273,7 @@ fn report_movement_tuning(tuning: Res<MovementTuning>) {
         .record_speeds
         .as_ref()
         .map_or("legacy provisional constants", |s| s.source.as_str());
-    info!(
+    debug!(
         "WALK speeds: forward walk={} run={} Creation units/s (first-pass factor 1); provisional sprint={} ({}x directional run); source={source}; jump_launch={} and gravity={} provisional",
         tuning.walk_speed,
         tuning.run_speed,

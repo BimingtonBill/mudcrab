@@ -15,10 +15,10 @@ use crate::{
         WaterReflectionTexture, terrain_layer_sampler,
     },
     shots::{ShotsFile, ShotsRun},
-    sky::{FogCamera, SkyCamera},
+    sky::SkyCamera,
     streaming::{
         AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, StreamingWorld,
-        build_terrain_quadrant_mesh, streaming_center, validate_standard_material,
+        build_terrain_quadrant_mesh, camera_grid, validate_standard_material,
     },
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
@@ -231,6 +231,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 })
                 .set(LogPlugin {
                     level: Level::INFO,
+                    // Bevy's default filter plus: gilrs logs an unknown-gamepad-mapping line and
+                    // this engine has no gamepad input.
+                    filter: "wgpu=error,naga=warn,gilrs=off".to_string(),
                     ..default()
                 }),
         )
@@ -719,7 +722,7 @@ fn cross_streaming_fixture_interior(
     let Ok(camera) = camera.single() else {
         return;
     };
-    let center = streaming_center(camera.translation, origin.0);
+    let center = camera_grid(camera.translation, origin.0);
     if state.interior.requested_frame.is_none() {
         if state.frames < STREAMING_FIXTURE_INTERIOR_FRAME {
             return;
@@ -755,10 +758,11 @@ fn cross_streaming_fixture_interior(
 
 /// Whether this run's camera is main's rapier walking player ([`WorldPlayerPlugin`]).
 ///
-/// Off on the portal branch until main's world collision is ported: the player stands on the rapier
-/// colliders main's streamer builds for terrain and statics, and portal's streamer does not build
-/// them yet, so the player would fall through the world. Portal runs keep their own walking player
-/// (`crate::player::PlayerPlugin`, `--walk`) and the free camera instead.
+/// Off on the portal branch because main's capsule player knows nothing of doors: it cannot pass
+/// through a load door's doorway into the room beyond or follow the portal's space changes. Portal
+/// runs keep their own walking player (`crate::player::PlayerPlugin`, `--walk`), which does, and
+/// the free camera instead. (The streamer does build the terrain and static colliders for walked
+/// runs; the gate is not about them.)
 const WORLD_PHYSICS_PLAYER: bool = false;
 
 fn world_physics_player(config: &EngineConfig) -> bool {
@@ -958,7 +962,6 @@ fn setup_material_fixture(
         Camera3d::default(),
         Transform::from_xyz(0.0, 5.0, 18.0).looking_at(Vec3::ZERO, Vec3::Y),
         StreamingCamera,
-        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
@@ -1216,7 +1219,6 @@ fn setup_terrain_water_fixture(
         Camera3d::default(),
         Transform::from_xyz(CELL_SIZE_HALF, 1800.0, 2600.0).looking_at(target, Vec3::Y),
         StreamingCamera,
-        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
@@ -1385,7 +1387,6 @@ fn setup_transform_bounds_fixture(
         Camera3d::default(),
         Transform::from_xyz(2.0, 5.5, 16.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
         StreamingCamera,
-        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
@@ -1592,7 +1593,6 @@ fn setup_renderer_fixture(
         Camera3d::default(),
         Transform::from_xyz(0.0, 1.5, 16.0).looking_at(Vec3::ZERO, Vec3::Y),
         StreamingCamera,
-        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
@@ -2096,7 +2096,6 @@ fn setup_world(
         camera_transform,
         StreamingCamera,
         // This camera draws the streamed world, so the weather's distance fog covers it.
-        FogCamera,
         // The sky draws a dome around this camera and clears it to the weather's fog colour.
         SkyCamera,
         Msaa::Off,
@@ -2702,10 +2701,10 @@ mod tests {
         }
     }
 
-    /// Main's walking player stands on colliders portal's streamer does not build yet, so no run
-    /// may switch it on until the collision port lands.
+    /// Main's capsule player knows nothing of doors, so no run may switch it on; the portal's own
+    /// `PlayerPlugin` walks instead.
     #[test]
-    fn the_world_physics_player_is_off_until_collision_is_ported() {
+    fn the_world_physics_player_is_off_because_it_knows_nothing_of_doors() {
         assert!(EngineConfig::default().interactive_world_physics());
         assert!(!world_physics_player(&EngineConfig::default()));
     }

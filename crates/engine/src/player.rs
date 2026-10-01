@@ -1288,7 +1288,7 @@ pub(crate) fn player_walk(
     };
     transform.translation = outcome.position;
     if outcome.unsupported && !*held {
-        warn!("no ground under the player: holding position until the cell streams in (F to fly)");
+        info!("no ground under the player: holding position until the cell streams in (F to fly)");
     }
     *held = outcome.unsupported;
     profiler.record_elapsed("player/move", started);
