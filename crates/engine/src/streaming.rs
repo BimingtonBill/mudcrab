@@ -26,13 +26,16 @@ use bevy::{
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::primitives::MeshAabb,
     ecs::system::SystemParam,
-    gltf::GltfExtras,
+    gltf::{GltfExtras, GltfMaterialName, GltfSceneExtras},
     image::{ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler},
-    mesh::{Indices, PrimitiveTopology},
+    math::Affine3A,
+    mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
     prelude::*,
     world_serialization::{WorldInstance, WorldInstanceReady},
 };
+use bevy_rapier3d::prelude::{Collider, ColliderDisabled, RigidBody, WriteRapierContext};
 use serde::{Deserialize, Serialize};
+use shared::collision::{COLLISION_ASSET_VERSION, CollisionAsset, CollisionShape};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::time::Instant;
@@ -119,9 +122,6 @@ fn elapsed_micros(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
-#[cfg(test)]
-use bevy::mesh::VertexAttributeValues;
-
 pub struct StreamingPlugin;
 
 impl Plugin for StreamingPlugin {
@@ -131,6 +131,7 @@ impl Plugin for StreamingPlugin {
             .init_resource::<DiagnosticFallbackAssets>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<SceneSpawnBatch>()
+            .init_resource::<StaticCollisionCache>()
             .init_resource::<ActiveCell>()
             .init_resource::<PrestreamCells>()
             // Empty until the startup system reads the database, and empty for every run whose
@@ -273,10 +274,59 @@ impl StreamingWorld {
     }
 }
 
-/// Marks a terrain quadrant that carries a rapier collider. Portal's streaming does not build
-/// terrain colliders yet (main's does); the marker exists so `crate::physics` compiles.
+/// Whether this run builds world colliders (main's `interactive_world_physics`, narrowed to a run
+/// that walks).
+///
+/// Colliders exist for the player's ray probe to hit ([`crate::player`]), so a run that never walks
+/// (a `--shots` pose, a benchmark, an auto-flight tour) builds none and is the run it was before:
+/// no collider work in `spawn_cell`, no static collision extraction in [`track_asset_readiness`],
+/// nothing for the rebase to shift. The one gate, so the streaming side and the player side cannot
+/// disagree about whether the world collides.
+pub(crate) fn builds_world_colliders(config: &EngineConfig) -> bool {
+    config.walks()
+}
+
+/// Marks a terrain quadrant that carries a rapier collider. Built only for a full-detail cell of a
+/// run that walks ([`builds_world_colliders`]); a ring cell ([`CellDetail::Terrain`]) is landscape
+/// seen from a distance and never walked on, so it gets none.
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct TerrainCollider;
+
+/// A fixed placement's collision provenance.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticColliderSource {
+    /// The model's NIF carries authored Havok shapes (`openSkyrimCollision`).
+    NifAuthored,
+    /// The model has no authored shapes, so its rendered triangles stand in as a proxy.
+    RenderProxy,
+}
+
+/// One model's collision decision, keyed by `(base record type, converted model path)`.
+///
+/// A converted model is the same collision problem wherever it is placed, so the decision is made
+/// once and cloned per placement. The key includes the record type because the same model placed as
+/// a `STAT` and as movable clutter must not share an answer.
+#[derive(Resource, Default)]
+struct StaticCollisionCache(HashMap<(Option<String>, String), StaticCollisionDecision>);
+
+#[derive(Clone)]
+enum StaticCollisionDecision {
+    Authored(Vec<AuthoredColliderPart>, Vec<String>),
+    RenderProxy(Collider),
+    /// The NIF declares it has no collision at all, and it is proxy-excluded: nothing is attached.
+    AuthoredAbsent,
+    /// No authored collision, and the record/path is not proxy-eligible.
+    LegacyExcluded,
+    /// Eligible, but no usable collision could be built: logged once per model and skipped.
+    Skipped(String),
+}
+
+/// One piece of an authored collision asset, at its offset in the model's own space.
+#[derive(Clone)]
+struct AuthoredColliderPart {
+    translation: Vec3,
+    collider: Collider,
+}
 
 impl StreamingWorld {
     /// Submits one full-detail load for `key` unless it is already loading, resident or failed,
@@ -496,9 +546,9 @@ pub struct StreamingMetrics {
     pub streaming_fixture_validated: bool,
     pub streaming_fixture_failures: u64,
     pub asset_failures: Vec<AssetFailure>,
-    // Main's paced-unload, paced-model-spawn and collision counters. Portal's streaming does not
-    // drive them yet (they stay zero); they exist so the shared profiling and physics code, which
-    // came in with main, reads one metrics struct.
+    // Main's paced-unload, paced-model-spawn and collision counters. The paced-unload and arming
+    // counters are portal's own now; the collision ones are driven only by a walked run, where the
+    // world's colliders are built ([`builds_world_colliders`]), and stay zero everywhere else.
     pub despawns_this_frame: u64,
     pub max_despawns_per_frame: u64,
     pub despawned_entities: u64,
@@ -1135,6 +1185,9 @@ fn collect_cells(
     mut deferred: Local<VecDeque<DatabaseResponse>>,
 ) {
     let frame_commit_started = Instant::now();
+    // One answer for the whole frame, from the one gate: a walked run's cells carry colliders, and
+    // every other run's do not (see [`builds_world_colliders`]).
+    let world_physics = builds_world_colliders(&config);
     // Everything the worker has answered this frame, behind whatever the last frame had no room
     // for. Answers are taken out of the channel here rather than inside the commit loop, so a
     // response held over is counted - and timed - exactly once.
@@ -1303,6 +1356,7 @@ fn collect_cells(
                     payload,
                     terrain,
                     detail,
+                    world_physics,
                     &mut streaming.next_model_sequence,
                     &mut profiler,
                 );
@@ -1629,6 +1683,9 @@ fn spawn_cell(
     payload: CellPayload,
     terrain: Option<TerrainSnapshot>,
     detail: CellDetail,
+    // Whether this run builds world colliders ([`builds_world_colliders`]). Only a full cell gets
+    // terrain colliders; a ring cell is never walked on.
+    world_physics: bool,
     model_sequence: &mut u64,
     profiler: &mut ProfilingState,
 ) -> Entity {
@@ -1662,6 +1719,25 @@ fn spawn_cell(
                 let mesh = build_terrain_quadrant_mesh(&terrain, quadrant)
                     .expect("validated terrain must build");
                 profiler.record_elapsed("streaming/terrain_mesh", started);
+                // Built before the mesh is handed to the asset collection: Rapier reads the same
+                // vertex and triangle buffers the quadrant renders. Only a full cell of a run that
+                // walks gets one, and a quadrant whose collider cannot be built is drawn without
+                // one - the collider is skipped and the cell still commits (main fails the whole
+                // cell here, which a portal cell in the player's own window must not do).
+                let collider = (world_physics && detail == CellDetail::Full)
+                    .then(|| terrain_collider_from_mesh(&mesh))
+                    .and_then(|collider| match collider {
+                        Ok(collider) => Some(collider),
+                        Err(reason) => {
+                            warn!(
+                                cell = format_args!("{:08X}", terrain.cell_id),
+                                quadrant,
+                                %reason,
+                                "terrain collider build failed; drawing the quadrant without one"
+                            );
+                            None
+                        }
+                    });
                 let (extension, images) =
                     TerrainExtension::from_quadrant(&terrain, quadrant, catalog, asset_server)
                         .expect("validated terrain material must build");
@@ -1689,6 +1765,19 @@ fn spawn_cell(
                         normals: images.normal,
                     },
                 ));
+                if let Some(collider) = collider {
+                    // Born disabled: only `crate::portal`'s space gate enables a collider, and only
+                    // for a cell whose role is Active (decision 4 of the collision brief). Surface
+                    // readiness must not enable one - a pre-streamed destination becomes ready while
+                    // it is not active.
+                    patch.insert((
+                        TerrainCollider,
+                        RigidBody::Fixed,
+                        collider,
+                        ColliderDisabled,
+                        crate::physics::world_collision_groups(),
+                    ));
+                }
                 if detail == CellDetail::Terrain {
                     // A ring cell casts no shadow: its own shadows fall on the ring, tens of
                     // thousands of units away and past the last shadow cascade, so nobody can see
@@ -1868,6 +1957,8 @@ fn spawn_cell(
                             path,
                             form_id: reference.form_id,
                             base_form_id: reference.base_form_id,
+                            base_record_type: reference.base_record_type.clone(),
+                            static_physics: world_physics,
                             cell_id: reference.cell_id,
                         },
                     ));
@@ -1958,6 +2049,13 @@ struct PendingAssetProfile {
     path: String,
     form_id: u32,
     base_form_id: u32,
+    /// The base record's type (`STAT`, `TREE`, `FURN`, ...), which decides whether this placement
+    /// may carry a collider at all.
+    base_record_type: Option<String>,
+    /// Whether this run builds world colliders ([`builds_world_colliders`]). Carried on the
+    /// placement rather than read from the config in the readiness scan, so the scan and the spawn
+    /// that queued it cannot disagree.
+    static_physics: bool,
     cell_id: u32,
 }
 
@@ -1983,6 +2081,7 @@ type RenderPrimitiveQuery<'world, 'state> = Query<
     (
         &'static Mesh3d,
         Option<&'static MeshMaterial3d<StandardMaterial>>,
+        Option<&'static GltfMaterialName>,
         Option<&'static GltfExtras>,
     ),
 >;
@@ -2232,8 +2331,10 @@ fn track_asset_readiness(
     children: Query<&Children>,
     primitives: RenderPrimitiveQuery,
     transforms: SpawnedNodeQuery,
+    scene_extras: Query<&GltfSceneExtras>,
     images: Res<Assets<Image>>,
     mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
+    mut static_cache: ResMut<StaticCollisionCache>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut metrics: ResMut<StreamingMetrics>,
@@ -2245,6 +2346,11 @@ fn track_asset_readiness(
     metrics.pending_asset_instances = pending.iter().count() + unarmed.iter().count();
     let mut completed_this_scan = 0usize;
     for (entity, root, pending, local, global, world_transform, expected_bounds) in &pending {
+        // Whether this placement is one the collision rules want a collider for at all: the run
+        // must build colliders, and the record must be a fixed STAT/TREE/FURN. Everything the
+        // static pass below counts as skipped is one of these.
+        let static_candidate = pending.static_physics
+            && fixed_collision_record_eligible(pending.base_record_type.as_deref());
         let load_failure =
             asset_server
                 .get_load_states(root.0.id())
@@ -2256,6 +2362,9 @@ fn track_asset_readiness(
         if let Some(error) = load_failure {
             let chain = error_chain(error.as_ref());
             record_asset_failure(&mut metrics, &mut profiler, pending, chain, false);
+            if static_candidate {
+                note_static_proxy_skip(&mut metrics, &mut profiler);
+            }
             hide_partial_scene(&mut commands, entity, &children);
             if config.diagnostic_asset_fallbacks {
                 spawn_diagnostic_fallback(
@@ -2289,6 +2398,9 @@ fn track_asset_readiness(
                         .saturating_add(1);
                     profiler.increment("transforms/validation_failures", 1);
                     record_asset_failure(&mut metrics, &mut profiler, pending, vec![reason], false);
+                    if static_candidate {
+                        note_static_proxy_skip(&mut metrics, &mut profiler);
+                    }
                     hide_partial_scene(&mut commands, entity, &children);
                     if config.diagnostic_asset_fallbacks {
                         spawn_diagnostic_fallback(
@@ -2312,6 +2424,9 @@ fn track_asset_readiness(
             // reference stays: it keeps its transform, its load door and its light, and its scene
             // is left alone (it is empty; there is nothing in it to hide).
             if transform_summary.empty_model {
+                if static_candidate {
+                    note_static_proxy_skip(&mut metrics, &mut profiler);
+                }
                 metrics.empty_model_references = metrics.empty_model_references.saturating_add(1);
                 profiler.increment("assets/empty_model_references", 1);
                 profiler.event(&pending.path, "empty_model", None);
@@ -2331,6 +2446,9 @@ fn track_asset_readiness(
                 Ok(summary) => summary,
                 Err(reason) => {
                     record_asset_failure(&mut metrics, &mut profiler, pending, vec![reason], true);
+                    if static_candidate {
+                        note_static_proxy_skip(&mut metrics, &mut profiler);
+                    }
                     hide_partial_scene(&mut commands, entity, &children);
                     if config.diagnostic_asset_fallbacks {
                         spawn_diagnostic_fallback(
@@ -2348,6 +2466,70 @@ fn track_asset_readiness(
                     continue;
                 }
             };
+            if static_candidate {
+                // One decision per (record type, model): the same converted model is the same
+                // collision problem wherever it is placed, and the cache is what keeps a village of
+                // repeated statics from re-walking the same hierarchy. A placement that fails here
+                // logs once and is skipped; it never fails the cell.
+                let key = (pending.base_record_type.clone(), pending.path.clone());
+                let first_placement = !static_cache.0.contains_key(&key);
+                let decision = static_cache.0.entry(key).or_insert_with(|| {
+                    static_collision_from_hierarchy(
+                        pending.base_record_type.as_deref(),
+                        &pending.path,
+                        entity,
+                        &children,
+                        &scene_extras,
+                        &transforms,
+                        &primitives,
+                        &meshes,
+                        &materials,
+                    )
+                });
+                match decision {
+                    StaticCollisionDecision::Authored(parts, skipped) => {
+                        attach_authored_collision(&mut commands, entity, parts);
+                        metrics.static_colliders_authored =
+                            metrics.static_colliders_authored.saturating_add(1);
+                        profiler.increment("physics/static_authored_placements", 1);
+                        if !skipped.is_empty() {
+                            metrics.static_colliders_partial =
+                                metrics.static_colliders_partial.saturating_add(1);
+                            profiler.increment("physics/static_authored_partial", 1);
+                            if first_placement {
+                                warn!(model = %pending.path, reason = %skipped.join("; "), "authored collision is partial");
+                            }
+                        }
+                    }
+                    StaticCollisionDecision::RenderProxy(collider) => {
+                        // Born disabled: the space gate in `crate::portal` enables it only while its
+                        // cell's role is Active. Asset readiness must not enable it - a pre-streamed
+                        // destination becomes ready while it is not active.
+                        commands.entity(entity).insert((
+                            StaticColliderSource::RenderProxy,
+                            RigidBody::Fixed,
+                            collider.clone(),
+                            ColliderDisabled,
+                            crate::physics::world_collision_groups(),
+                        ));
+                        metrics.static_colliders_proxy =
+                            metrics.static_colliders_proxy.saturating_add(1);
+                        profiler.increment("physics/static_proxy_placements", 1);
+                    }
+                    StaticCollisionDecision::AuthoredAbsent => {
+                        metrics.static_colliders_authored_absent =
+                            metrics.static_colliders_authored_absent.saturating_add(1);
+                        profiler.increment("physics/static_authored_absent", 1);
+                    }
+                    StaticCollisionDecision::LegacyExcluded => {}
+                    StaticCollisionDecision::Skipped(reason) => {
+                        if first_placement {
+                            warn!(model = %pending.path, %reason, "static collision skipped");
+                        }
+                        note_static_proxy_skip(&mut metrics, &mut profiler);
+                    }
+                }
+            }
             let micros = pending
                 .started
                 .elapsed()
@@ -2882,7 +3064,7 @@ fn spawned_relative_bounds(
         if let Ok(grandchildren) = children.get(descendant) {
             stack.extend(grandchildren.iter().map(|child| (child, relative)));
         }
-        let Ok((mesh_handle, _, _)) = primitives.get(descendant) else {
+        let Ok((mesh_handle, _, _, _)) = primitives.get(descendant) else {
             continue;
         };
         let mesh = meshes.get(mesh_handle).ok_or_else(|| {
@@ -2973,7 +3155,7 @@ fn validate_spawned_asset(
 ) -> Result<AssetValidationSummary, String> {
     let mut summary = AssetValidationSummary::default();
     for descendant in children.iter_descendants(root) {
-        let Ok((mesh, material_handle, extras)) = primitives.get(descendant) else {
+        let Ok((mesh, material_handle, _, extras)) = primitives.get(descendant) else {
             continue;
         };
         if meshes.get(mesh).is_none() {
@@ -3301,6 +3483,364 @@ fn is_safe_relative_asset_path(path: &str) -> bool {
     std::path::Path::new(path)
         .components()
         .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+/// Rapier consumes the exact vertex and triangle buffers rendered by this quadrant.
+fn terrain_collider_from_mesh(mesh: &Mesh) -> Result<Collider, String> {
+    let Some(VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+    else {
+        return Err("terrain mesh lacks Float32x3 positions".to_owned());
+    };
+    let Some(Indices::U32(indices)) = mesh.indices() else {
+        return Err("terrain mesh lacks U32 triangle indices".to_owned());
+    };
+    if !indices.len().is_multiple_of(3) {
+        return Err("terrain mesh triangle indices are incomplete".to_owned());
+    }
+    let vertices = positions.iter().copied().map(Vec3::from_array).collect();
+    let triangles = indices.as_chunks::<3>().0.to_vec();
+    Collider::trimesh(vertices, triangles)
+        .map_err(|error| format!("invalid terrain trimesh: {error}"))
+}
+
+/// Fixed Riverwood solids with a declared render-triangle proxy policy. Record type remains
+/// authoritative: plant TREE records outside the pine family and movable clutter stay excluded.
+///
+/// The path is compared in the lowercase canonical form main's converter publishes and main's own
+/// `converted_model_path` returns; portal's keeps the database's capitalisation, so
+/// [`static_collision_from_hierarchy`] lowercases before asking.
+fn static_proxy_eligible(record_type: Option<&str>, path: &str) -> bool {
+    let pine = path.starts_with("meshes/landscape/trees/treepineforest");
+    match record_type {
+        Some("TREE") => pine,
+        Some("STAT") => {
+            path.starts_with("meshes/landscape/rocks/")
+                || path.starts_with("meshes/architecture/")
+                || pine
+                || path.starts_with("meshes/clutter/firewood/firewoodpile")
+                || (path.starts_with("meshes/landscape/roads/road") && path.contains("ramp"))
+        }
+        // FURN is eligible for its *authored* shapes, but never for a render proxy: a chair the
+        // player can sit in is fixed clutter whose rendered triangles would be a phantom block.
+        _ => false,
+    }
+}
+
+/// Placed furniture is fixed in the world, but may use only its authored NIF shape.
+/// Render proxies remain restricted to the verified STAT/TREE families above.
+fn fixed_collision_record_eligible(record_type: Option<&str>) -> bool {
+    matches!(record_type, Some("STAT" | "TREE" | "FURN"))
+}
+
+fn static_proxy_material_allowed(
+    path: &str,
+    material_name: Option<&str>,
+    material: &StandardMaterial,
+) -> bool {
+    matches!(material.alpha_mode, AlphaMode::Opaque)
+        // Riverwood RockCliff GLBs put the large rock faces in BLEND primitives. Their masked
+        // detail primitives stay excluded, as do blended materials on unrelated models.
+        || (path.starts_with("meshes/landscape/rocks/rockcliff")
+            && matches!(material.alpha_mode, AlphaMode::Blend))
+        // The lumbermill's walkable ramp/boards are woodwalkway01 with MASK alpha. Rope and
+        // roof cutouts remain excluded; the material name comes from the converted GLB.
+        || (path == "meshes/architecture/farmhouse/lumbermill01.glb"
+            && material_name.is_some_and(|name| name.starts_with("LumbermillMesh:19"))
+            && matches!(material.alpha_mode, AlphaMode::Mask(_)))
+}
+
+/// Build one model-local proxy from the validated spawned scene. Bevy/Rapier apply the reference
+/// instance translation, rotation, and scale when this collider is attached to its reference root.
+/// Node transforms are baked into vertices, preserving mesh holes such as doorways.
+///
+/// This is what a load-door frame in a cell gets: the proxy is the model's own rendered triangles,
+/// not a box around them, so a doorway arch keeps its opening. That is the property the port's door
+/// frames depend on (see `docs/handoff/impl-279-portal-colliders.md`).
+fn static_proxy_from_hierarchy(
+    path: &str,
+    root: Entity,
+    children: &Query<&Children>,
+    transforms: &SpawnedNodeQuery,
+    primitives: &RenderPrimitiveQuery,
+    meshes: &Assets<Mesh>,
+    materials: &Assets<StandardMaterial>,
+) -> Result<Option<Collider>, String> {
+    let mut vertices = Vec::new();
+    let mut triangles = Vec::new();
+    let mut stack = Vec::new();
+    if let Ok(kids) = children.get(root) {
+        stack.extend(kids.iter().map(|child| (child, Affine3A::IDENTITY)));
+    }
+    while let Some((entity, parent_to_root)) = stack.pop() {
+        let (local, _, _, _) = transforms
+            .get(entity)
+            .map_err(|_| format!("static proxy node {entity:?} has no transform"))?;
+        let node_to_root = parent_to_root * local.compute_affine();
+        if let Ok((mesh_handle, material_handle, material_name, extras)) = primitives.get(entity)
+            && !extras.is_some_and(has_explicit_material_exclusion)
+        {
+            let material = material_handle.and_then(|handle| materials.get(handle));
+            if material.is_some_and(|material| {
+                static_proxy_material_allowed(
+                    path,
+                    material_name.map(|name| name.0.as_str()),
+                    material,
+                )
+            }) {
+                let mesh = meshes.get(mesh_handle).ok_or_else(|| {
+                    format!("static proxy mesh {:?} is missing", mesh_handle.id())
+                })?;
+                if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
+                    return Err("static proxy mesh is not a triangle list".to_owned());
+                }
+                let Some(VertexAttributeValues::Float32x3(positions)) =
+                    mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+                else {
+                    return Err("static proxy mesh lacks Float32x3 positions".to_owned());
+                };
+                let indices: Vec<u32> = match mesh.indices() {
+                    Some(Indices::U16(indices)) => {
+                        indices.iter().map(|index| u32::from(*index)).collect()
+                    }
+                    Some(Indices::U32(indices)) => indices.clone(),
+                    None => return Err("static proxy mesh lacks triangle indices".to_owned()),
+                };
+                if !indices.len().is_multiple_of(3) {
+                    return Err("static proxy mesh has incomplete triangles".to_owned());
+                }
+                let offset = u32::try_from(vertices.len())
+                    .map_err(|_| "static proxy vertex count exceeds u32".to_owned())?;
+                for position in positions {
+                    let position = node_to_root.transform_point3(Vec3::from_array(*position));
+                    if !position.is_finite() {
+                        return Err("static proxy has a non-finite vertex".to_owned());
+                    }
+                    vertices.push(position);
+                }
+                for index in indices.as_chunks::<3>().0 {
+                    if index.iter().any(|index| *index as usize >= positions.len()) {
+                        return Err("static proxy triangle index is out of range".to_owned());
+                    }
+                    triangles.push([offset + index[0], offset + index[1], offset + index[2]]);
+                }
+            }
+        }
+        if let Ok(kids) = children.get(entity) {
+            stack.extend(kids.iter().map(|child| (child, node_to_root)));
+        }
+    }
+    if triangles.is_empty() {
+        return Ok(None);
+    }
+    Collider::trimesh(vertices, triangles)
+        .map(Some)
+        .map_err(|error| format!("invalid static proxy trimesh: {error}"))
+}
+
+/// The authored `openSkyrimCollision` a converted model publishes in its GLB scene extras, if it
+/// has one.
+fn authored_collision_from_hierarchy(
+    root: Entity,
+    children: &Query<&Children>,
+    extras: &Query<&GltfSceneExtras>,
+) -> Result<Option<CollisionAsset>, String> {
+    let mut stack = vec![root];
+    while let Some(entity) = stack.pop() {
+        if let Ok(scene_extras) = extras.get(entity) {
+            if scene_extras.value.len() > 64 * 1024 * 1024 {
+                return Err("GLB collision extras exceed 64 MiB".to_owned());
+            }
+            let value: serde_json::Value = serde_json::from_str(&scene_extras.value)
+                .map_err(|error| format!("invalid GLB scene extras: {error}"))?;
+            if let Some(collision) = value.get("openSkyrimCollision") {
+                let asset: CollisionAsset = serde_json::from_value(collision.clone())
+                    .map_err(|error| format!("invalid GLB collision data: {error}"))?;
+                if asset.version != COLLISION_ASSET_VERSION || !asset.authored {
+                    return Err("unsupported GLB collision contract".to_owned());
+                }
+                return Ok(Some(asset));
+            }
+        }
+        if let Ok(kids) = children.get(entity) {
+            stack.extend(kids.iter());
+        }
+    }
+    Ok(None)
+}
+
+fn collider_parts_from_authored(
+    asset: &CollisionAsset,
+) -> Result<Vec<AuthoredColliderPart>, String> {
+    let mut shapes = Vec::new();
+    for shape in &asset.shapes {
+        let (translation, collider) = match shape {
+            CollisionShape::Mesh {
+                vertices,
+                triangles,
+            } => {
+                if vertices.len() > 1_000_000 || triangles.len() > 2_000_000 {
+                    return Err("authored mesh exceeds safety limit".to_owned());
+                }
+                if vertices.iter().flatten().any(|value| !value.is_finite())
+                    || triangles
+                        .iter()
+                        .flatten()
+                        .any(|index| *index as usize >= vertices.len())
+                {
+                    return Err("authored mesh contains invalid vertices or indices".to_owned());
+                }
+                let collider = Collider::trimesh(
+                    vertices.iter().copied().map(Vec3::from_array).collect(),
+                    triangles.clone(),
+                )
+                .map_err(|error| format!("invalid authored trimesh: {error}"))?;
+                (Vec3::ZERO, collider)
+            }
+            CollisionShape::Capsule { a, b, radius } => {
+                if !a.iter().chain(b).all(|value| value.is_finite())
+                    || !radius.is_finite()
+                    || *radius <= 0.0
+                {
+                    return Err("invalid authored capsule".to_owned());
+                }
+                (
+                    Vec3::ZERO,
+                    Collider::capsule(Vec3::from_array(*a), Vec3::from_array(*b), *radius),
+                )
+            }
+            CollisionShape::Box {
+                center,
+                half_extents,
+            } => {
+                if !center
+                    .iter()
+                    .chain(half_extents)
+                    .all(|value| value.is_finite())
+                    || half_extents.iter().any(|value| *value <= 0.0)
+                {
+                    return Err("invalid authored box".to_owned());
+                }
+                (
+                    Vec3::from_array(*center),
+                    Collider::cuboid(half_extents[0], half_extents[1], half_extents[2]),
+                )
+            }
+            CollisionShape::Hull { points } => {
+                if points.len() > 1_000_000
+                    || points.iter().flatten().any(|value| !value.is_finite())
+                {
+                    return Err("invalid authored hull".to_owned());
+                }
+                let collider = Collider::convex_hull(
+                    &points
+                        .iter()
+                        .copied()
+                        .map(Vec3::from_array)
+                        .collect::<Vec<_>>(),
+                )
+                .ok_or_else(|| "invalid authored convex hull".to_owned())?;
+                (Vec3::ZERO, collider)
+            }
+        };
+        shapes.push(AuthoredColliderPart {
+            translation,
+            collider,
+        });
+    }
+    Ok(shapes)
+}
+
+/// Attaches an authored collision to the reference root: one part at the origin becomes the body's
+/// own collider, several become children of the fixed body so Rapier keeps one body per placement
+/// instead of a nested compound. Every collider is born `ColliderDisabled`; the space gate in
+/// `crate::portal` is the only thing that enables one (decision 4 of the collision brief).
+fn attach_authored_collision(
+    commands: &mut Commands,
+    entity: Entity,
+    parts: &[AuthoredColliderPart],
+) {
+    if let [
+        AuthoredColliderPart {
+            translation,
+            collider,
+        },
+    ] = parts
+        && *translation == Vec3::ZERO
+    {
+        commands.entity(entity).insert((
+            StaticColliderSource::NifAuthored,
+            RigidBody::Fixed,
+            collider.clone(),
+            ColliderDisabled,
+            crate::physics::world_collision_groups(),
+        ));
+        return;
+    }
+    commands.entity(entity).insert((
+        StaticColliderSource::NifAuthored,
+        RigidBody::Fixed,
+        ColliderDisabled,
+    ));
+    for part in parts {
+        commands.spawn((
+            part.collider.clone(),
+            Transform::from_translation(part.translation),
+            ColliderDisabled,
+            crate::physics::world_collision_groups(),
+            ChildOf(entity),
+        ));
+    }
+}
+
+/// The collision decision for one placement: authored shapes when the model has them, otherwise a
+/// render-triangle proxy when the record and path are eligible, otherwise nothing.
+///
+/// The path is lowercased for the rules below: portal's [`converted_model_path`] keeps the
+/// database's capitalisation (`Architecture\Farmhouse\...`) while the converted assets are
+/// published lowercase, and main's eligibility rules are written against that lowercase form.
+#[allow(clippy::too_many_arguments)] // Scene queries and assets belong to this extraction pass.
+fn static_collision_from_hierarchy(
+    record_type: Option<&str>,
+    path: &str,
+    root: Entity,
+    children: &Query<&Children>,
+    scene_extras: &Query<&GltfSceneExtras>,
+    transforms: &SpawnedNodeQuery,
+    primitives: &RenderPrimitiveQuery,
+    meshes: &Assets<Mesh>,
+    materials: &Assets<StandardMaterial>,
+) -> StaticCollisionDecision {
+    let path = path.to_ascii_lowercase();
+    match authored_collision_from_hierarchy(root, children, scene_extras) {
+        Ok(Some(asset)) => match collider_parts_from_authored(&asset) {
+            Ok(parts) if !parts.is_empty() => {
+                StaticCollisionDecision::Authored(parts, asset.skipped)
+            }
+            Ok(_) if asset.skipped.is_empty() => StaticCollisionDecision::AuthoredAbsent,
+            Ok(_) => StaticCollisionDecision::Skipped(asset.skipped.join("; ")),
+            Err(reason) => StaticCollisionDecision::Skipped(reason),
+        },
+        Ok(None) if static_proxy_eligible(record_type, &path) => {
+            match static_proxy_from_hierarchy(
+                &path, root, children, transforms, primitives, meshes, materials,
+            ) {
+                Ok(Some(collider)) => StaticCollisionDecision::RenderProxy(collider),
+                Ok(None) => StaticCollisionDecision::Skipped(
+                    "legacy render proxy has no eligible triangles".to_owned(),
+                ),
+                Err(reason) => StaticCollisionDecision::Skipped(reason),
+            }
+        }
+        Ok(None) => StaticCollisionDecision::LegacyExcluded,
+        Err(reason) => StaticCollisionDecision::Skipped(reason),
+    }
+}
+
+/// Counts a placement the eligibility rules wanted collision for but could not get one.
+fn note_static_proxy_skip(metrics: &mut StreamingMetrics, profiler: &mut ProfilingState) {
+    metrics.static_colliders_skipped = metrics.static_colliders_skipped.saturating_add(1);
+    profiler.increment("physics/static_proxy_skipped", 1);
 }
 
 pub(crate) fn quadrant_layers(
@@ -3699,11 +4239,15 @@ pub(crate) fn reposition_cell_roots(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // The collider queries belong to this pass, not the caller.
 fn update_render_origin(
     active: Res<ActiveCell>,
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    terrain_colliders: Query<Entity, With<TerrainCollider>>,
+    static_colliders: Query<Entity, With<StaticColliderSource>>,
+    mut physics: WriteRapierContext,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -3725,7 +4269,24 @@ fn update_render_origin(
         return;
     }
     origin.0 += shift;
-    camera.translation -= grid_translation(shift, IVec2::ZERO);
+    let displacement = grid_translation(shift, IVec2::ZERO);
+    camera.translation -= displacement;
+    // A fixed rapier body does not follow its Bevy transform through a rebase teleport, so every
+    // collider body is shifted by hand - all spaces included, because every cell root moved,
+    // destination and hidden ones as much as the active one. Nothing to do, and nothing to panic
+    // on, in a run without the rapier plugin: the context query simply finds no context.
+    let mut bodies: Vec<Entity> = terrain_colliders.iter().collect();
+    bodies.extend(static_colliders.iter());
+    if let Ok(mut context) = physics.single_mut() {
+        for entity in bodies {
+            if let Some(handle) = context.entity2body().get(&entity).copied()
+                && let Some(body) = context.rigidbody_set.bodies.get_mut(handle)
+            {
+                body.set_translation(body.translation() - displacement, false);
+            }
+        }
+        context.propagate_modified_body_positions_to_colliders();
+    }
     reposition_cell_roots(origin.0, &mut roots);
     profiler.increment("streaming/origin_rebases", 1);
     metrics.origin_rebases = metrics.origin_rebases.saturating_add(1);
@@ -4079,6 +4640,7 @@ mod tests {
                 payload,
                 Some(terrain.clone()),
                 CellDetail::Full,
+                false,
                 &mut 0,
                 &mut profiler,
             );
@@ -6578,6 +7140,7 @@ mod tests {
             },
             None,
             CellDetail::Full,
+            false,
             &mut 0,
             &mut profiler,
         ));
@@ -6916,6 +7479,8 @@ mod tests {
                 path: "meshes/dwefacadetowerroof01.glb".into(),
                 form_id: 0x100,
                 base_form_id: SNOW_STATIC,
+                base_record_type: Some("STAT".into()),
+                static_physics: false,
                 cell_id: 99,
             },
         ));
@@ -7979,6 +8544,7 @@ mod tests {
         .init_resource::<StreamingMetrics>()
         .init_resource::<ProfilingState>()
         .init_resource::<DiagnosticFallbackAssets>()
+        .init_resource::<StaticCollisionCache>()
         .add_observer(mark_world_instance_ready)
         .add_systems(Update, track_asset_readiness);
         let handle = app
@@ -8014,6 +8580,8 @@ mod tests {
                 path: "meshes/furniture/creatureexit/wispambush.glb".to_owned(),
                 form_id: 0x00F9907,
                 base_form_id: 0x00EF957,
+                base_record_type: Some("STAT".to_owned()),
+                static_physics: false,
                 cell_id: 0x02D4E0,
             },
         ));
@@ -8054,6 +8622,7 @@ mod tests {
         .init_resource::<TerrainContinuity>()
         .init_resource::<ProfilingState>()
         .init_resource::<DiagnosticFallbackAssets>()
+        .init_resource::<StaticCollisionCache>()
         .init_resource::<SceneSpawnBatch>()
         // The converted scene holds entities, and the spawner reads each of their components out
         // of the type registry.
@@ -8158,6 +8727,8 @@ mod tests {
                     path: "meshes/furniture/creatureexit/wispambush.glb".to_owned(),
                     form_id: 0x00F9907,
                     base_form_id: 0x00EF957,
+                    base_record_type: Some("STAT".to_owned()),
+                    static_physics: false,
                     cell_id: 0x02D4E0,
                 },
             ))

@@ -206,6 +206,7 @@ use bevy::{
     },
     shader::ShaderRef,
 };
+use bevy_rapier3d::prelude::{Collider, ColliderDisabled};
 use std::{
     collections::{HashMap, HashSet},
     f32::consts::PI,
@@ -512,6 +513,9 @@ impl Plugin for PortalPlugin {
                     // leaf is back. Before the isolation, which is about cells rather than doors.
                     show_load_door_leaves,
                     isolate_cells,
+                    // After it, in the same frame: the colliders of the roles it just published are
+                    // enabled for the active space and disabled for every other cell.
+                    gate_cell_colliders,
                     // After it: the destination is revealed, so its floor can be found.
                     anchor_on_measured_floors,
                 )
@@ -3104,6 +3108,76 @@ fn isolate_cells(
         }
     }
     state.door_layer_applied = hidden_doors;
+}
+
+/// The role each cell root's colliders were last left in, so [`gate_cell_colliders`] walks a root's
+/// subtree only when its role changed.
+#[derive(Default)]
+struct AppliedColliderRoles(HashMap<Entity, CellRole>);
+
+/// Enables the colliders of the cells that are part of the active space, and disables every other
+/// cell's, so the player's probe (`crate::player`) hits the space it stands in and nothing else.
+///
+/// It runs directly after [`isolate_cells`] and therefore sees the roles that system published for
+/// this frame. Colliders are born `ColliderDisabled` (`crate::streaming`), and this system is the
+/// only thing that removes it: a collider may never be enabled by its own readiness, because a
+/// pre-streamed destination becomes ready while its cell is not active (port-prep-collision, point
+/// 2). A crossing changes `ActiveCell` before [`PortalFrame`] runs, so the destination's colliders
+/// are live in the frame the player arrives in it - the same one-frame contract the mesh layers
+/// have.
+///
+/// A root's subtree is walked only when the root's role changed since the last frame; a collider
+/// that appears under a root whose role is settled (a model armed later, a destination's scene
+/// finishing its spawn) is caught by its own `Added` flag the first time this system sees it.
+fn gate_cell_colliders(
+    mut commands: Commands,
+    state: Res<PortalState>,
+    mut applied: Local<AppliedColliderRoles>,
+    children: Query<&Children>,
+    parents: Query<&ChildOf>,
+    colliders: Query<(), With<Collider>>,
+    newly_added: Query<Entity, Added<Collider>>,
+) {
+    // A root that is gone took its colliders with its subtree; nothing to flip.
+    applied.0.retain(|root, _| state.roles.contains_key(root));
+    for (&root, &role) in &state.roles {
+        if applied.0.get(&root) == Some(&role) {
+            continue;
+        }
+        applied.0.insert(root, role);
+        for entity in children.iter_descendants(root) {
+            apply_collider_role(&mut commands, entity, role, &colliders);
+        }
+    }
+    let unmarked = HashSet::new();
+    for entity in &newly_added {
+        let Some((root, _)) = owning_root(entity, &state.roles, &parents, &unmarked) else {
+            continue;
+        };
+        apply_collider_role(&mut commands, entity, state.roles[&root], &colliders);
+    }
+}
+
+/// Puts one collider in the state its cell's role calls for: live in the active space, disabled
+/// everywhere else. Anything that is not a collider is left alone (the walk covers a cell's whole
+/// subtree, not only its colliders).
+fn apply_collider_role(
+    commands: &mut Commands,
+    entity: Entity,
+    role: CellRole,
+    colliders: &Query<(), With<Collider>>,
+) {
+    if colliders.get(entity).is_err() {
+        return;
+    }
+    match role {
+        CellRole::Active => {
+            commands.entity(entity).try_remove::<ColliderDisabled>();
+        }
+        CellRole::Destination | CellRole::Hidden => {
+            commands.entity(entity).try_insert(ColliderDisabled);
+        }
+    }
 }
 
 /// Places the portal camera in the destination of the nearest usable door and puts the doorway quad
