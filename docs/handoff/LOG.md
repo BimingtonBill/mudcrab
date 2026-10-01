@@ -23,8 +23,12 @@ static collider on a rebase, but pre-streamed interior roots never move, so Alft
 boundary first). Fixed 0c9da8fb (only bodies under an `ExteriorCellGrid` root shift; new test). Merged
 origin/main #67 (2a880791). Walked short tours: Alftand 4/4 PASS, Riverwood 2/2 PASS; nextest 850/850.
 Conversion compare old vs new (`local/merge/conversion-compare.json`): no file, cell or reference lost.
-**Next:** showcase re-shoot (walked crossing clip), merge `portal-merge-main` into `portal`. Later: pacing
-A/B rerun (timing booking), lit-slope check. **No workers running.**
+**Done in the evening:** showcase B (`local/showcase/b`: the A poses re-rendered, 4 Alftand interiors,
+`walked-crossings.mp4` from the new portal-only `--tour-clip`, 7dd86661). **`portal-merge-main` merged into
+`portal` (f6b70c14)**; crates/Cargo identical to the tested branch. The user played the merged build
+(Honningbrew, Falkreath Hall of the Dead crossings fine; two doors without an open clip, some partial/skipped
+authored collision warnings, e.g. Whiterun wall caps). **Next:** pacing A/B rerun (timing booking), lit-slope
+check of `NORMAL_GREEN_SIGN`; worktree `C:\Modding\wkj-portal-merge` can go. **No workers running.**
 
 ### 2026-10-01 (day) - Claude [phase1] Phase 1 Dev (portal catch-up converter half; textures; #104a)
 
