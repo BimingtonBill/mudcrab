@@ -33,6 +33,7 @@ pub mod render_timing;
 pub mod shadow_layers;
 pub mod shots;
 pub mod sky;
+pub mod sky_dome;
 pub mod snow;
 pub mod streaming;
 pub mod tonemapper;

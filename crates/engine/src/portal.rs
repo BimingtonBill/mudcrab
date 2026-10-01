@@ -161,6 +161,9 @@ use crate::{
         DoorwayFloorsMeasured, LoadDoor,
     },
     render::TerrainMaterial,
+    // The doorway's own dome: the marker that gives its camera one, and the destination's colours.
+    sky::SkyCamera,
+    sky_dome::CameraSky,
     streaming::{ActiveCell, RenderOrigin, StreamingWorld, camera_grid},
     transition::{
         CrossingHeld, DOOR_PRESTREAM_RADIUS, DoorMap, destination_is_resident, destination_keys,
@@ -2287,38 +2290,45 @@ fn sub_view_frustum(
 fn setup_portal_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let image = images.add(portal_target_image(PORTAL_TEXTURE_FALLBACK_SIZE));
     commands.insert_resource(PortalTexture(image.clone()));
-    commands.spawn((
-        Name::new("Portal camera"),
-        Camera3d::default(),
-        Camera {
-            order: PORTAL_CAMERA_ORDER,
-            is_active: false,
-            ..default()
-        },
-        // The destination is drawn from the doorway's own clip plane to the shared far plane, and
-        // handed over untonemapped ([`portal_camera_output`]).
-        portal_camera_output(),
-        RenderTarget::Image(image.clone().into()),
-        Projection::Perspective(PerspectiveProjection::default()),
-        Transform::default(),
-        Msaa::Off,
-        DepthPrepass,
-        OcclusionCulling,
-        RenderLayers::layer(DESTINATION_LAYER),
-        // The destination's own atmosphere, written every frame the doorway is open by
-        // [`update_destination_atmosphere`]. All three are components on this camera and not on the
-        // main one, which is what lets a doorway open off a lit hall into a black cave and show the
-        // cave: `AmbientLight` overrides `GlobalAmbientLight` for this view alone, `DistanceFog` is
-        // per view, and so is the clear colour. They start at the engine's daylight defaults - this
-        // camera draws nothing until a portal is up.
-        AmbientLight::default(),
-        DistanceFog::default(),
-        PortalCamera,
-        // The graphics settings that are part of the main view's pipeline key (SSAO, contact
-        // shadows, the shadow filter, TAA's prepass and jitter) and its exposure, written by
-        // `crate::graphics_settings` so the doorway's pipelines stay the main view's.
-        crate::graphics_settings::GraphicsCamera::Portal,
-    ));
+    commands
+        .spawn((
+            Name::new("Portal camera"),
+            Camera3d::default(),
+            Camera {
+                order: PORTAL_CAMERA_ORDER,
+                is_active: false,
+                ..default()
+            },
+            // The destination is drawn from the doorway's own clip plane to the shared far plane, and
+            // handed over untonemapped ([`portal_camera_output`]).
+            portal_camera_output(),
+            RenderTarget::Image(image.clone().into()),
+            Projection::Perspective(PerspectiveProjection::default()),
+            Transform::default(),
+            Msaa::Off,
+            DepthPrepass,
+            OcclusionCulling,
+            RenderLayers::layer(DESTINATION_LAYER),
+            // The destination's own atmosphere, written every frame the doorway is open by
+            // [`update_destination_atmosphere`]. All three are components on this camera and not on the
+            // main one, which is what lets a doorway open off a lit hall into a black cave and show the
+            // cave: `AmbientLight` overrides `GlobalAmbientLight` for this view alone, `DistanceFog` is
+            // per view, and so is the clear colour. They start at the engine's daylight defaults - this
+            // camera draws nothing until a portal is up.
+            AmbientLight::default(),
+            DistanceFog::default(),
+            PortalCamera,
+            // The graphics settings that are part of the main view's pipeline key (SSAO, contact
+            // shadows, the shadow filter, TAA's prepass and jitter) and its exposure, written by
+            // `crate::graphics_settings` so the doorway's pipelines stay the main view's.
+            crate::graphics_settings::GraphicsCamera::Portal,
+        ))
+        // The camera's own sky dome (`crate::sky_dome`): `SkyCamera` is the marker a dome is spawned
+        // for, and `CameraSky` is the colours it is drawn with. Cleared here, and written by
+        // [`update_destination_atmosphere`] with the destination's own the frame a doorway opens in, so
+        // the dome is never drawn over a space this camera has not been told about. In a second
+        // `insert`, not the spawn tuple: Bevy's tuple bundles stop at fifteen components.
+        .insert((SkyCamera, CameraSky { palette: None }));
     // The doorway's own sun, next to the camera it lights and on that camera's layer alone. Off
     // until [`update_destination_atmosphere`] gives it the destination's own - the frame a doorway
     // first opens in is the frame that writes it - and pointing nowhere in particular until
@@ -2511,11 +2521,19 @@ fn update_destination_atmosphere(
     catalog: Option<Res<SpaceLightingCatalog>>,
     config: Option<Res<EngineConfig>>,
     doors: Query<&LoadDoor>,
-    mut camera: Query<(&mut Camera, &mut AmbientLight, &mut DistanceFog), With<PortalCamera>>,
+    mut camera: Query<
+        (
+            &mut Camera,
+            &mut AmbientLight,
+            &mut DistanceFog,
+            &mut CameraSky,
+        ),
+        With<PortalCamera>,
+    >,
     mut suns: Query<&mut DirectionalLight, With<PortalDestinationSun>>,
     mut applied: Local<Option<SpaceKey>>,
 ) {
-    let Ok((mut camera, mut ambient, mut fog)) = camera.single_mut() else {
+    let Ok((mut camera, mut ambient, mut fog, mut sky)) = camera.single_mut() else {
         return;
     };
     let Some(config) = config else {
@@ -2550,6 +2568,10 @@ fn update_destination_atmosphere(
             config.stream_radius,
             config.terrain_radius,
         );
+        // And the colours the doorway's own dome is drawn with, from the same destination: this
+        // camera draws the space behind the door and nothing of the room the player stands in, so
+        // it is the destination's sky or none at all (`crate::sky_dome`).
+        sky.palette = crate::atmosphere::space_sky(catalog.as_deref(), destination);
     }
     // The sun is written whenever it is not the sun this destination wants, and not only on a
     // change of destination: `crate::atmosphere::update_atmosphere` writes *every*

@@ -16,6 +16,10 @@ use crate::{
     // moves them to `crate::terrain_ring`, and then only this line changes.
     app::{exterior_fog, fog_off},
     config::EngineConfig,
+    // The space's colours as the sky dome draws them (`crate::sky_dome`), which is the one place
+    // the weather's Sky-Upper, Sky-Lower and Fog Far are read.
+    sky::SkyPalette,
+    sky_dome::CameraSky,
     streaming::ActiveCell,
     world::{
         components::StreamingCamera,
@@ -300,7 +304,7 @@ pub(crate) fn space_atmosphere(
     // leaves `has_sky` clear for it, and a space with a roof over it can never be drawn against
     // one. The flag is the converter's, so a `has_sky` set on a cell is a bug in the data and not
     // a sky to draw.
-    let has_sky = row.has_sky && !key.is_interior;
+    let has_sky = space_has_sky(key, Some(row));
     // Whether that sky is what lights the space. A weather whose daylight is a measured zero is
     // published, is drawn as a sky, and is not a sun: Blackreach and the Alftand cavern are lit by
     // their own teal ambient with no sun over them, and a space under one is a cave however its
@@ -363,6 +367,52 @@ pub(crate) fn space_atmosphere(
         sun,
         has_sky,
     }
+}
+
+/// Whether a space is drawn against a sky, which is what a camera's dome hangs on: the row's own
+/// `has_sky`, never set for an interior whatever the row says, and the engine's own answer
+/// ([`fallback_atmosphere`]) for a space no row covers.
+fn space_has_sky(key: SpaceKey, row: Option<&SpaceLighting>) -> bool {
+    match row {
+        Some(row) => row.has_sky && !key.is_interior,
+        None => fallback_atmosphere(key).has_sky,
+    }
+}
+
+/// The colours a space draws its sky dome with, or `None` where it has no sky to draw.
+///
+/// The three colours are the weather's own, on the space's `space_lighting` row: Sky-Upper,
+/// Sky-Lower and the Fog Far group - the haze the sun sets behind, which is also what the camera
+/// clears to ([`backdrop_of`]). A column the row leaves out falls back to the engine's
+/// [`SkyPalette::SKYRIM_CLEAR_DAY`], the weather the daylight calibration was measured on, and so
+/// does a space the database has no row for at all.
+///
+/// The row carries no Horizon group, so the dome's horizon band takes the same haze the backdrop
+/// does: vanilla's dome fades out over its lowest 2.1 degrees to let whatever is behind it show
+/// through, and the band where it fades back in has to be that colour or the horizon line becomes
+/// a seam. [`SkyPalette::fog_far`] is kept apart from it because the palette carries both, even
+/// though the dome's own shader reads only the Horizon, Sky-Lower and Sky-Upper colours.
+pub(crate) fn space_sky(
+    catalog: Option<&SpaceLightingCatalog>,
+    key: SpaceKey,
+) -> Option<SkyPalette> {
+    let row = catalog.and_then(|catalog| catalog.get(key.space_id));
+    if !space_has_sky(key, row) {
+        return None;
+    }
+    let fallback = SkyPalette::SKYRIM_CLEAR_DAY;
+    let Some(row) = row else {
+        return Some(fallback);
+    };
+    Some(SkyPalette {
+        upper: row.sky_upper.map_or(fallback.upper, srgb_u8),
+        lower: row.sky_lower.map_or(fallback.lower, srgb_u8),
+        horizon: backdrop_of(row, true, fallback.horizon),
+        fog_far: row.sky_fog.map_or(fallback.fog_far, srgb_u8),
+        // The dome's own brightness scale, calibrated against lit surfaces later; the sky record
+        // carries no level of its own.
+        brightness: fallback.brightness,
+    })
 }
 
 /// How much of the sky's upper colour a daylit space's fill takes on, the rest being the weather's
@@ -628,10 +678,12 @@ fn update_atmosphere(
         return;
     }
     *applied = true;
-    let atmosphere = space_atmosphere(
-        catalog.as_deref(),
-        space_key(active.worldspace_id, active.interior),
-    );
+    let key = space_key(active.worldspace_id, active.interior);
+    let atmosphere = space_atmosphere(catalog.as_deref(), key);
+    // The colours this camera's sky dome is drawn with, from the same space and the same row. The
+    // doorway's own camera takes the destination's (`crate::portal`); both answer through
+    // `CameraSky`, which only `crate::sky_dome` reads.
+    let sky = space_sky(catalog.as_deref(), key);
     // The backdrop is the clear colour of every view of this space - the water reflection camera
     // takes the resource, the main camera takes the component below, and the portal camera takes
     // the destination's own (`crate::portal`).
@@ -639,7 +691,9 @@ fn update_atmosphere(
     let fog = atmosphere_fog(&atmosphere, config.stream_radius, config.terrain_radius);
     for (entity, mut camera) in &mut cameras {
         camera.clear_color = ClearColorConfig::Custom(atmosphere.backdrop);
-        commands.entity(entity).try_insert(fog.clone());
+        commands
+            .entity(entity)
+            .try_insert((fog.clone(), CameraSky { palette: sky }));
     }
     if let Some(mut ambient) = ambient {
         (ambient.color, ambient.brightness) =
@@ -1405,6 +1459,63 @@ mod tests {
         assert_eq!(bare.sun, SunLight::OFF);
     }
 
+    /// The dome's colours, per space: the weather's own Sky-Upper, Sky-Lower and Fog Far, with the
+    /// horizon band in the haze the camera clears to, and nothing at all for a space with no sky.
+    #[test]
+    fn a_spaces_sky_colours_come_from_its_own_row() {
+        let (_directory, catalog) = real_spaces();
+        let tamriel =
+            space_sky(Some(&catalog), space_key(TAMRIEL, None)).expect("Tamriel has a sky");
+        assert_eq!(tamriel.upper, Color::srgb_u8(41, 97, 117));
+        assert_eq!(tamriel.lower, Color::srgb_u8(94, 149, 179));
+        assert_eq!(tamriel.fog_far, Color::srgb_u8(139, 175, 194));
+        assert_eq!(
+            tamriel.horizon,
+            world_of(&catalog, TAMRIEL).backdrop,
+            "the band the dome fades back in at is the colour the camera clears to, or the \
+             horizon line is a seam"
+        );
+        assert_eq!(tamriel.brightness, SkyPalette::SKYRIM_CLEAR_DAY.brightness);
+
+        // The landscape's ceiling is a sky: its row says so and it owns the colours to draw one
+        // with, teal where Tamriel is blue.
+        let blackreach =
+            space_sky(Some(&catalog), space_key(BLACKREACH, None)).expect("its row has a sky");
+        assert_eq!(blackreach.horizon, Color::srgb_u8(14, 156, 156));
+        assert_eq!(blackreach.upper, Color::srgb_u8(0, 169, 183));
+        assert_ne!(blackreach.horizon, tamriel.horizon);
+
+        // An interior has no sky whatever its row says.
+        for key in [
+            space_key(TAMRIEL, Some(ALFTAND01)),
+            space_key(TAMRIEL, Some(ALFTAND_ZCELL)),
+        ] {
+            assert_eq!(space_sky(Some(&catalog), key), None, "{key:?} is indoors");
+        }
+    }
+
+    /// A space the table says nothing about keeps the engine's own sky - the one weather the
+    /// daylight calibration was measured on - and the engine's own idea of which spaces have one.
+    #[test]
+    fn a_space_without_a_row_keeps_the_engines_own_sky() {
+        let empty = SpaceLightingCatalog::default();
+        for catalog in [None, Some(&empty)] {
+            assert_eq!(
+                space_sky(catalog, space_key(TAMRIEL, None)),
+                Some(SkyPalette::SKYRIM_CLEAR_DAY)
+            );
+            assert_eq!(
+                space_sky(catalog, space_key(TAMRIEL, Some(ALFTAND01))),
+                None
+            );
+            assert_eq!(
+                space_sky(catalog, space_key(BLACKREACH, None)),
+                None,
+                "the underground worldspaces have no sky without the table"
+            );
+        }
+    }
+
     /// The wiring, not the arithmetic: the system writes the space's atmosphere onto the camera,
     /// the global ambient and the sun, and it is the *camera's* clear colour the doorway and the
     /// main view each get their own of.
@@ -1459,6 +1570,47 @@ mod tests {
             0.0,
             "an interior has no sun"
         );
+        assert_eq!(
+            camera
+                .get::<CameraSky>()
+                .expect("the dome's colours are written with the atmosphere")
+                .palette,
+            None,
+            "an interior has no sky for a dome to draw"
+        );
+    }
+
+    /// The main camera's dome is coloured from the space it stands in, and the same system is the
+    /// only writer: a run out into Tamriel brings the weather's own colours with it.
+    #[test]
+    fn the_atmosphere_system_gives_the_main_camera_its_spaces_sky() {
+        let (_directory, catalog) = real_spaces();
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(ClearColor(SKY_COLOR))
+            .insert_resource(catalog)
+            .init_resource::<ActiveCell>();
+        let camera = app
+            .world_mut()
+            .spawn((Camera3d::default(), Transform::default(), StreamingCamera))
+            .id();
+        app.add_systems(Update, update_atmosphere);
+
+        app.update();
+        let written = |app: &App| {
+            app.world()
+                .entity(camera)
+                .get::<CameraSky>()
+                .expect("the sky was written")
+                .palette
+        };
+        let sky = written(&app).expect("Tamriel is drawn against a sky");
+        assert_eq!(sky.upper, Color::srgb_u8(41, 97, 117));
+        assert_eq!(sky.horizon, Color::srgb_u8(139, 175, 194));
+
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(ALFTAND01);
+        app.update();
+        assert_eq!(written(&app), None);
     }
 
     /// The frame a crossing lands in is drawn in the space it lands in (impl-203): the plugin runs
