@@ -23,7 +23,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt, fs,
+    fmt, fs, io,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -1921,20 +1921,96 @@ fn prune_stale_ingestion_blobs(cache_root: &Path, manifest: &ConversionManifest)
     Ok(())
 }
 
+/// Where a publish parks the previous output while it swaps the new one in. The whole file name,
+/// like `staging_path`: an output name that contains a dot must keep all of it.
+fn backup_path(output: &Path) -> PathBuf {
+    let name = output.file_name().unwrap_or_default().to_string_lossy();
+    output.with_file_name(format!("{name}.backup-{}", std::process::id()))
+}
+
+/// A backup sibling left behind by any run, this one or another: `<output file name>.backup-*`
+/// beside `output`. It may hold the only copy of a previous output — a run that died between the
+/// two renames leaves exactly that — so it is named and refused, never deleted.
+fn stale_backup(output: &Path) -> Option<PathBuf> {
+    let output_name = output.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let prefix = format!("{output_name}.backup-");
+    // A bare file name has an empty parent; the folder it names is the working directory.
+    let parent = match output.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::read_dir(parent)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name().is_some_and(|file_name| {
+                // Only the converter's own shape, `<output name>.backup-<process id>`: a folder the
+                // user named `<output>.backup-old` is not ours and must not block every run.
+                file_name
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .strip_prefix(&prefix)
+                    .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+}
+
+/// Stops a run when an earlier publish left a backup of the output behind. That folder may hold
+/// the only copy of the previous output, so it is named and kept, never deleted.
+fn refuse_stale_backup(output: &Path) -> Result<()> {
+    if let Some(stale) = stale_backup(output) {
+        bail!(
+            "refusing to overwrite stale backup {}: it may hold your previous output; move it aside (delete it only if you no longer need that output) and run the conversion again",
+            stale.display()
+        );
+    }
+    Ok(())
+}
+
+/// The filesystem operations a publish is built from, and where its non-fatal news goes. A test
+/// can replace an operation to make it fail where the real filesystem on a healthy machine would
+/// not.
+trait PublishOps {
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        fs::remove_dir_all(path)
+    }
+
+    /// Reports news that does not stop the run, the way `remove_staging` does.
+    fn warn(&self, message: &str) {
+        eprintln!("warning: {message}");
+    }
+}
+
+/// The real filesystem.
+struct Filesystem;
+
+impl PublishOps for Filesystem {}
+
 fn publish_directory(staging: &Path, output: &Path) -> Result<()> {
+    publish_directory_with(staging, output, &Filesystem)
+}
+
+fn publish_directory_with(staging: &Path, output: &Path, ops: &impl PublishOps) -> Result<()> {
     // Checked again here, not only before the run: the old output is deleted
     // below, so a folder that became unsafe during the run must stop it.
     crate::config::check_output_dir(output)?;
-    let backup = output.with_extension(format!("backup-{}", std::process::id()));
-    if backup.exists() {
-        bail!("refusing to overwrite stale backup {}", backup.display());
-    }
+    // Any backup, not only this process's: one left under another pid is neither noticed nor
+    // protected by a check scoped to the current pid, and deleting it would lose the previous
+    // output for good.
+    refuse_stale_backup(output)?;
+    let backup = backup_path(output);
     if output.exists() {
-        fs::rename(output, &backup).wrap_err("failed to preserve previous asset output")?;
+        ops.rename(output, &backup)
+            .wrap_err("failed to preserve previous asset output")?;
         // The folder is checked once more under its backup name: something written into it
         // between the check above and the rename would otherwise be deleted with it below.
         if let Err(error) = crate::config::check_output_dir(&backup) {
-            if let Err(restore) = fs::rename(&backup, output) {
+            if let Err(restore) = ops.rename(&backup, output) {
                 bail!(
                     "{error}; the previous output could not be moved back from {} to {}: {restore}",
                     backup.display(),
@@ -1944,14 +2020,31 @@ fn publish_directory(staging: &Path, output: &Path) -> Result<()> {
             return Err(error.into());
         }
     }
-    if let Err(error) = fs::rename(staging, output) {
-        if backup.exists() {
-            let _ = fs::rename(&backup, output);
+    if let Err(error) = ops.rename(staging, output) {
+        if backup.exists()
+            && let Err(restore) = ops.rename(&backup, output)
+        {
+            // Both errors, and the backup's path: that folder is the only copy of the
+            // previous output, and the user has to be told where it is.
+            bail!(
+                "failed to publish converted assets: {error}; the previous output is still at {} \
+                 and could not be moved back to {}: {restore}",
+                backup.display(),
+                output.display()
+            );
         }
         return Err(error).wrap_err("failed to publish converted assets");
     }
-    if backup.exists() {
-        fs::remove_dir_all(backup)?;
+    // The new output is already in place, so a backup that cannot be removed is a leftover for
+    // the user to finish with, not a failed publish. On Windows a handle held inside it (an
+    // Explorer window, an indexer, antivirus, a running engine) makes the removal fail.
+    if backup.exists()
+        && let Err(error) = ops.remove_dir_all(&backup)
+    {
+        ops.warn(&format!(
+            "could not remove the backup folder {}: {error}",
+            backup.display()
+        ));
     }
     Ok(())
 }
@@ -2489,6 +2582,153 @@ mod tests {
 
         assert!(publish_directory(&staging, &output).is_err());
         assert_eq!(fs::read(output.join("keep.txt")).unwrap(), b"keep me");
+        assert!(staging.join("conversion-manifest.json").is_file());
+    }
+
+    /// A previous output that passes `check_output_dir`: a manifest inside a non-empty folder.
+    fn write_previous_output(output: &Path, contents: &[u8]) {
+        fs::create_dir_all(output).unwrap();
+        fs::write(output.join("conversion-manifest.json"), b"{}").unwrap();
+        fs::write(output.join("old.txt"), contents).unwrap();
+    }
+
+    /// Fails every rename whose destination is `output`, so the pack rename and the rename that
+    /// would put the previous output back both fail.
+    struct FailingRenames {
+        staging: PathBuf,
+        output: PathBuf,
+    }
+
+    impl PublishOps for FailingRenames {
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            if to == self.output.as_path() {
+                let message = if from == self.staging.as_path() {
+                    "pack rename failed"
+                } else {
+                    "backup restore failed"
+                };
+                return Err(io::Error::other(message));
+            }
+            fs::rename(from, to)
+        }
+    }
+
+    /// Removes nothing and keeps every warning, so a test can read them.
+    #[derive(Default)]
+    struct LockedBackup {
+        warnings: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl PublishOps for LockedBackup {
+        fn remove_dir_all(&self, _path: &Path) -> io::Result<()> {
+            Err(io::Error::other("locked"))
+        }
+
+        fn warn(&self, message: &str) {
+            self.warnings.borrow_mut().push(message.to_owned());
+        }
+    }
+
+    #[test]
+    fn a_failed_publish_reports_a_stranded_previous_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("pack");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("new.txt"), b"new").unwrap();
+        write_previous_output(&output, b"old");
+        let operations = FailingRenames {
+            staging: staging.clone(),
+            output: output.clone(),
+        };
+
+        let error = publish_directory_with(&staging, &output, &operations).unwrap_err();
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("failed to publish converted assets"),
+            "{message}"
+        );
+        assert!(message.contains("pack rename failed"), "{message}");
+        assert!(message.contains("backup restore failed"), "{message}");
+        let backup = backup_path(&output);
+        assert!(
+            message.contains(&backup.display().to_string()),
+            "the message does not name the stranded output at {backup:?}: {message}"
+        );
+        // The previous output is still whole, under the name the message gives.
+        assert_eq!(fs::read(backup.join("old.txt")).unwrap(), b"old");
+        assert!(!output.exists());
+        assert!(staging.is_dir());
+    }
+
+    #[test]
+    fn a_backup_that_cannot_be_removed_only_warns() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("pack");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("new.txt"), b"new").unwrap();
+        fs::write(staging.join("conversion-manifest.json"), b"{}").unwrap();
+        write_previous_output(&output, b"old");
+        let operations = LockedBackup::default();
+
+        publish_directory_with(&staging, &output, &operations).unwrap();
+
+        // The publish stands: the new output is in place, and the leftover is only reported.
+        assert_eq!(fs::read(output.join("new.txt")).unwrap(), b"new");
+        let backup = backup_path(&output);
+        assert_eq!(fs::read(backup.join("old.txt")).unwrap(), b"old");
+        let warnings = operations.warnings.borrow();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("could not remove the backup folder"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains(&backup.display().to_string()),
+            "the warning does not name {backup:?}: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_folder_the_user_named_like_a_backup_does_not_block_a_publish() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("modern");
+        fs::create_dir_all(temp.path().join("modern.backup-old")).unwrap();
+        fs::create_dir_all(temp.path().join("modern.backup-")).unwrap();
+        assert_eq!(stale_backup(&output), None);
+        fs::create_dir_all(temp.path().join("Modern.BACKUP-4242")).unwrap();
+        assert_eq!(
+            stale_backup(&output),
+            Some(temp.path().join("Modern.BACKUP-4242"))
+        );
+    }
+
+    #[test]
+    fn publishing_refuses_a_backup_left_by_another_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("pack");
+        let output = temp.path().join("Skyrim.Converted");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("conversion-manifest.json"), b"{}").unwrap();
+        write_previous_output(&output, b"still here");
+        // A backup under another pid: the old check, scoped to this process, cannot see it.
+        let stale = output.with_file_name("Skyrim.Converted.backup-424242");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("old.txt"), b"previous output").unwrap();
+
+        let error = publish_directory(&staging, &output).unwrap_err();
+
+        let message = format!("{error:?}");
+        assert!(message.contains("stale backup"), "{message}");
+        assert!(
+            message.contains(&stale.display().to_string()),
+            "the message does not name {stale:?}: {message}"
+        );
+        // The folder this run did not create is untouched, and so is the output.
+        assert_eq!(fs::read(stale.join("old.txt")).unwrap(), b"previous output");
+        assert_eq!(fs::read(output.join("old.txt")).unwrap(), b"still here");
         assert!(staging.join("conversion-manifest.json").is_file());
     }
 
