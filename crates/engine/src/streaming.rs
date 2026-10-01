@@ -142,6 +142,7 @@ impl Plugin for StreamingPlugin {
                 Update,
                 (
                     plan_cells,
+                    despawn_cells,
                     collect_cells,
                     track_asset_readiness,
                     apply_directional_snow,
@@ -211,13 +212,23 @@ impl StreamingWorld {
     /// crossed into (a load door's destination), looked through (the portal's) or shot (a `--shots`
     /// pose). Every caller wants a cell it can stand in, and a destination a door pre-streamed is
     /// always full, so a terrain-only cell is never the answer they are waiting for.
+    /// A cell waiting for its turn in the unload budget is still resident by this test while it
+    /// holds its full root: it is still drawn, and the plan revives it the same frame if it comes
+    /// back. A door gate waiting on its destination ([`crate::transition`]) would otherwise see a
+    /// destination the pacer has just retired as gone and fall back to holding the camera, for a
+    /// cell that is still there and is about to be revived by the plan's next pass.
     pub fn is_resident(&self, key: &CellKey) -> bool {
         matches!(
             self.cells.get(key),
-            Some(CellStatus::Resident {
-                detail: CellDetail::Full,
-                ..
-            })
+            Some(
+                CellStatus::Resident {
+                    detail: CellDetail::Full,
+                    ..
+                } | CellStatus::Retiring {
+                    detail: CellDetail::Full,
+                    ..
+                }
+            )
         )
     }
 
@@ -255,6 +266,10 @@ impl StreamingWorld {
     /// Submits one full-detail load for `key` unless it is already loading, resident or failed,
     /// and records the request on the streaming metrics. The streaming fixture loads its interior
     /// through this, by id, because nothing in the planner switches the active space on its own.
+    ///
+    /// A cell the unload pacer has retired but not yet despawned is *revived*: pinning it takes it
+    /// out of the retire backlog with the root it kept, so a cell pinned between [`plan_cells`] and
+    /// [`despawn_cells`] is never despawned and requested again.
     pub(crate) fn request_cell(
         &mut self,
         database: &WorldDatabase,
@@ -262,7 +277,13 @@ impl StreamingWorld {
         metrics: &mut StreamingMetrics,
         profiler: &mut ProfilingState,
     ) {
-        if self.cells.contains_key(&key) {
+        if let Some(status) = self.cells.get_mut(&key) {
+            if let CellStatus::Retiring { root, detail } = *status {
+                *status = CellStatus::Resident { root, detail };
+                metrics.revived_cells = metrics.revived_cells.saturating_add(1);
+                profiler.increment("streaming/revived_cells", 1);
+                profiler.event(format!("{key:?}"), "revived_by_pin", None);
+            }
             self.pinned.insert(key);
             return;
         }
@@ -615,6 +636,23 @@ enum CellStatus {
         root: Entity,
         detail: CellDetail,
     },
+    /// The cell has fallen out of the keep-set by distance and is waiting for its turn in the
+    /// unload budget ([`despawn_cells`]). The map entry, the tier it holds and the root stay, so a
+    /// cell that comes back into range before its turn is **revived** as it is instead of being
+    /// despawned and requested again - the same root entity keeps drawing the cell throughout, so
+    /// there is no flicker and nothing is spawned twice. A retiring cell is still drawn until its
+    /// turn; that is harmless for the ones the pacer covers, because they are the far cells of the
+    /// worldspace the camera is standing in.
+    ///
+    /// Only a cell that falls out by *distance* retires. A space change - an interior that is
+    /// neither active nor pre-streamed, or the exterior of a worldspace the camera just left on a
+    /// door crossing - unloads in the frame it falls out, exactly as before the pacer existed:
+    /// such a cell is not visible from where the camera now is, so holding it drawn is not an
+    /// option, and its cell root must not outlive the space it belonged to ([`plan_cells`]).
+    Retiring {
+        root: Entity,
+        detail: CellDetail,
+    },
     /// The request failed and is not repeated at this detail. The detail it failed at is kept: a
     /// cell that held nothing as terrain-only is asked for again in full when the camera reaches
     /// it, because the full request asks a different question (see [`plan_cells`]).
@@ -691,6 +729,10 @@ fn plan_cells(
                 detail, replaced, ..
             }) => (Some(*detail), *replaced),
             Some(CellStatus::Resident { root, detail }) => (Some(*detail), Some(*root)),
+            // A retiring cell holds its tier and its root the way a resident one does, so a plan
+            // that wants it again at its own tier revives it below, and one that wants the other
+            // tier submits the replacement through the same `replaced` path a resident takes.
+            Some(CellStatus::Retiring { root, detail }) => (Some(*detail), Some(*root)),
         };
         if held == Some(detail) {
             continue;
@@ -743,6 +785,7 @@ fn plan_cells(
         );
     }
     let pinned = std::mem::take(&mut streaming.pinned);
+    let mut revived = 0u64;
     streaming.cells.retain(|key, status| {
         let keep = pinned.contains(key)
             || cell_within_unload_radius(
@@ -753,25 +796,79 @@ fn plan_cells(
                 config.terrain_radius,
                 &prestream,
             );
-        if !keep {
-            metrics.unloaded_cells += 1;
-            continuity.edges.remove(key);
-            profiler.event(format!("{key:?}"), "unloaded", None);
-            // A loading cell that still draws the root it is replacing loses that root too: it is
-            // the only root the cell has.
+        if keep {
+            // A cell that comes back before the unload budget reaches it is revived as it is: the
+            // root it kept starts drawing it again - the same entity, so nothing is spawned a
+            // second time - and it is never requested again.
+            if let CellStatus::Retiring { root, detail } = status {
+                *status = CellStatus::Resident {
+                    root: *root,
+                    detail: *detail,
+                };
+                revived += 1;
+            }
+            return true;
+        }
+        // The cell has left the keep-set. One that falls out by distance retires: the entry and
+        // the root stay until the budget in `despawn_cells` reaches it. Everything else is a space
+        // change - an interior left behind, a worldspace just left on a door crossing - and
+        // unloads in this frame, exactly as it did before the pacer existed.
+        if paces_its_unload(*key, &active) {
             match status {
-                CellStatus::Resident { root, .. } => commands.entity(*root).try_despawn(),
-                CellStatus::Loading { replaced, .. } => {
-                    if let Some(root) = replaced {
-                        commands.entity(*root).try_despawn();
-                    }
+                CellStatus::Resident { root, detail } => {
+                    *status = CellStatus::Retiring {
+                        root: *root,
+                        detail: *detail,
+                    };
+                    return true;
                 }
-                CellStatus::Failed { .. } => {}
+                // Already waiting for its turn in the budget.
+                CellStatus::Retiring { .. } => return true,
+                // A cell loading a replacement still draws the root it is replacing, at the tier
+                // that root was committed at ([`other_detail`]).
+                CellStatus::Loading {
+                    replaced: Some(root),
+                    detail,
+                    ..
+                } => {
+                    *status = CellStatus::Retiring {
+                        root: *root,
+                        detail: other_detail(*detail),
+                    };
+                    return true;
+                }
+                // Nothing was spawned, so there is no subtree to pace: drop the entry now and let
+                // the in-flight response turn into a stale one.
+                CellStatus::Loading { replaced: None, .. } | CellStatus::Failed { .. } => {
+                    metrics.unloaded_cells += 1;
+                    continuity.edges.remove(key);
+                    profiler.event(format!("{key:?}"), "unload_dropped", None);
+                    return false;
+                }
             }
         }
-        keep
+        metrics.unloaded_cells += 1;
+        continuity.edges.remove(key);
+        profiler.event(format!("{key:?}"), "unloaded", None);
+        // A loading cell that still draws the root it is replacing loses that root too: it is
+        // the only root the cell has.
+        match status {
+            CellStatus::Resident { root, .. } => commands.entity(*root).try_despawn(),
+            CellStatus::Retiring { root, .. } => commands.entity(*root).try_despawn(),
+            CellStatus::Loading { replaced, .. } => {
+                if let Some(root) = replaced {
+                    commands.entity(*root).try_despawn();
+                }
+            }
+            CellStatus::Failed { .. } => {}
+        }
+        false
     });
     streaming.pinned = pinned;
+    if revived > 0 {
+        metrics.revived_cells = metrics.revived_cells.saturating_add(revived);
+        profiler.increment("streaming/revived_cells", revived);
+    }
     let StreamingWorld {
         cells,
         full_failed,
@@ -792,6 +889,11 @@ fn plan_cells(
         .values()
         .filter(|status| matches!(status, CellStatus::Loading { .. }))
         .count();
+    metrics.retiring_cells = streaming
+        .cells
+        .values()
+        .filter(|status| matches!(status, CellStatus::Retiring { .. }))
+        .count();
     metrics.terrain_cells = streaming
         .cells
         .values()
@@ -807,11 +909,183 @@ fn plan_cells(
         .count();
     metrics.peak_resident_cells = metrics.peak_resident_cells.max(metrics.resident_cells);
     metrics.peak_loading_cells = metrics.peak_loading_cells.max(metrics.loading_cells);
+    metrics.peak_retiring_cells = metrics.peak_retiring_cells.max(metrics.retiring_cells);
     metrics.peak_terrain_cells = metrics.peak_terrain_cells.max(metrics.terrain_cells);
     profiler.set_gauge("streaming/resident_cells", metrics.resident_cells as f64);
     profiler.set_gauge("streaming/loading_cells", metrics.loading_cells as f64);
+    profiler.set_gauge("streaming/retiring_cells", metrics.retiring_cells as f64);
     profiler.set_gauge("streaming/terrain_cells", metrics.terrain_cells as f64);
     profiler.record_elapsed("streaming/plan_cells", plan_started);
+}
+
+/// Whether a cell that has left the keep-set leaves it by *distance* - the case the unload pacer
+/// covers - rather than because the camera changed space.
+///
+/// Only a cell of the worldspace the camera is standing in, while it is outdoors, can have been
+/// left by flying away from it: that is a cell still drawn beside the ones the camera wants, and
+/// its unload is what the budget spreads. An interior is never paced (an interior that is neither
+/// active nor pre-streamed must stop being drawn the frame it falls out), and neither is an
+/// exterior of a worldspace the camera just left, on this frame or on the door crossing before it:
+/// those are the cells of a space the camera is no longer in, and holding them drawn is not an
+/// option. Both unload in [`plan_cells`] itself, as they did before the pacer existed.
+fn paces_its_unload(key: CellKey, active: &ActiveCell) -> bool {
+    match key {
+        CellKey::Exterior { worldspace_id, .. } => {
+            active.interior.is_none() && worldspace_id == active.worldspace_id
+        }
+        CellKey::Interior(_) => false,
+    }
+}
+
+/// The tier a cell holds while it is being replaced: a cell loading a full replacement still draws
+/// the terrain-only root it had, and one loading a terrain-only replacement its full root.
+///
+/// Exact because the plan only submits a request when the cell does not already hold the tier it
+/// is asking for ([`plan_cells`]), so the two tiers of a `Loading` cell's root and its request are
+/// always different.
+fn other_detail(detail: CellDetail) -> CellDetail {
+    match detail {
+        CellDetail::Full => CellDetail::Terrain,
+        CellDetail::Terrain => CellDetail::Full,
+    }
+}
+
+/// How many cells may wait for their turn in the unload budget before the pacer gives up on pacing
+/// and unloads every one of them in a single frame.
+///
+/// One whole window at the unload radius, `(2 * r + 1)^2` cells: the most a single crossing or
+/// teleport can retire at once. Both are paced, so the overflow path only fires when sustained
+/// flight keeps retiring cells faster than the budget unloads them, the case where holding on to
+/// the backlog costs more than one larger frame.
+fn retire_backlog_bound(unload_radius: i32) -> usize {
+    let side = 2 * unload_radius.max(0) as usize + 1;
+    side * side
+}
+
+/// Stable order for the unload budget, so a replayed crossing unloads the same cells on the same
+/// frames whatever order the status map iterates in.
+fn cell_order_key(key: CellKey) -> (u32, i32, i32, u32) {
+    match key {
+        CellKey::Exterior {
+            worldspace_id,
+            grid_x,
+            grid_y,
+        } => (0, grid_y, grid_x, worldspace_id),
+        CellKey::Interior(cell_id) => (1, 0, 0, cell_id),
+    }
+}
+
+/// Unloads retiring cells, at most `max_cell_unloads_per_frame` of them per frame.
+///
+/// This is an exclusive system on purpose: a command-buffered `despawn` only queues the removal and
+/// the real work happens later at a schedule sync point, where no span can see it - and the whole
+/// point of the budget is to keep that work off one frame.
+fn despawn_cells(world: &mut World) {
+    let (budget, backlog_bound) = {
+        let config = world.resource::<EngineConfig>();
+        (
+            // `0` is unbudgeted: every retiring cell unloads at once, as before the budget.
+            match config.max_cell_unloads_per_frame {
+                0 => usize::MAX,
+                budget => budget,
+            },
+            retire_backlog_bound(config.unload_radius),
+        )
+    };
+    let mut retiring: Vec<(CellKey, Entity)> = world
+        .resource::<StreamingWorld>()
+        .cells
+        .iter()
+        .filter_map(|(key, status)| match status {
+            CellStatus::Retiring { root, .. } => Some((*key, *root)),
+            _ => None,
+        })
+        .collect();
+    if retiring.is_empty() {
+        world.resource_mut::<StreamingMetrics>().despawns_this_frame = 0;
+        world
+            .resource_mut::<ProfilingState>()
+            .set_gauge("streaming/despawns_this_frame", 0.0);
+        return;
+    }
+    retiring.sort_by_key(|(key, _)| cell_order_key(*key));
+    let backlog = retiring.len();
+    let overflow = backlog > backlog_bound;
+    let budget = if overflow {
+        backlog
+    } else {
+        budget.min(backlog)
+    };
+    let started = Instant::now();
+    let mut entities = 0usize;
+    for (_, root) in retiring.iter().take(budget) {
+        entities = entities.saturating_add(despawn_subtree(world, *root));
+    }
+    {
+        let mut streaming = world.resource_mut::<StreamingWorld>();
+        for (key, _) in retiring.iter().take(budget) {
+            streaming.cells.remove(key);
+        }
+    }
+    for (key, _) in retiring.iter().take(budget) {
+        world.resource_mut::<TerrainContinuity>().edges.remove(key);
+        world
+            .resource_mut::<ProfilingState>()
+            .event(format!("{key:?}"), "unloaded", None);
+    }
+    let cells = budget as u64;
+    let remaining = backlog - budget;
+    let max_despawns_per_frame = {
+        let mut metrics = world.resource_mut::<StreamingMetrics>();
+        metrics.retiring_cells = remaining;
+        metrics.peak_retiring_cells = metrics.peak_retiring_cells.max(backlog);
+        metrics.unloaded_cells = metrics.unloaded_cells.saturating_add(cells);
+        metrics.despawns_this_frame = cells;
+        metrics.despawned_entities = metrics.despawned_entities.saturating_add(entities as u64);
+        metrics.max_despawns_per_frame = metrics.max_despawns_per_frame.max(cells);
+        if overflow {
+            metrics.retire_backlog_overflows = metrics.retire_backlog_overflows.saturating_add(1);
+        }
+        metrics.max_despawns_per_frame
+    };
+    let mut profiler = world.resource_mut::<ProfilingState>();
+    profiler.record_elapsed("streaming/cell_despawn", started);
+    profiler.increment("streaming/despawned_cells", cells);
+    profiler.increment("streaming/despawned_entities", entities as u64);
+    profiler.set_gauge("streaming/despawns_this_frame", cells as f64);
+    profiler.set_gauge(
+        "streaming/max_despawns_per_frame",
+        max_despawns_per_frame as f64,
+    );
+    profiler.set_gauge("streaming/retiring_cells", remaining as f64);
+    if overflow {
+        profiler.increment("streaming/retire_backlog_overflows", 1);
+        profiler.event("streaming", "retire_backlog_overflow", Some(backlog as f64));
+        warn!(
+            backlog,
+            bound = backlog_bound,
+            "retire backlog exceeded its bound; unloading every retiring cell at once"
+        );
+    }
+}
+
+/// Despawns a cell root and everything under it, returning the number of entities that removes.
+///
+/// The count walks `Children` first, so the batch span covers the accounting as well as the
+/// recursive removal. The walk is only paid on frames that unload cells.
+fn despawn_subtree(world: &mut World, root: Entity) -> usize {
+    let mut entities = 0usize;
+    let mut stack = vec![root];
+    while let Some(entity) = stack.pop() {
+        entities += 1;
+        if let Some(children) = world.get::<Children>(entity) {
+            stack.extend(children.iter());
+        }
+    }
+    if let Ok(entity) = world.get_entity_mut(root) {
+        entity.despawn();
+    }
+    entities
 }
 
 /// The two read-only catalogues a cell commit reads: the landscape and water texture paths
@@ -3195,11 +3469,14 @@ fn validate_streaming_lifecycle(
         .values()
         .filter(|status| matches!(status, CellStatus::Loading { .. }))
         .count();
+    // A retiring cell still owns its root until the unload budget reaches it, so its root is
+    // accounted for here rather than reading as orphaned.
     let resident_entities: HashSet<_> = streaming
         .cells
         .values()
         .filter_map(|status| match status {
             CellStatus::Resident { root, .. } => Some(*root),
+            CellStatus::Retiring { root, .. } => Some(*root),
             // A cell loading at another detail still draws the root it is replacing: it is a root
             // the plan accounts for, not an orphan.
             CellStatus::Loading { replaced, .. } => *replaced,
@@ -4172,6 +4449,555 @@ mod tests {
         )));
     }
 
+    // --- The paced unload budget (upstream main's `despawn_cells`) ------------------------------
+
+    /// An app with the cell plan, the unload pacer and the lifecycle validator chained as they run
+    /// in `StreamingPlugin`. `collect_cells` is left out, so a requested cell stays `Loading` and
+    /// the test drives the resident cells itself through [`spawn_mock_cell`].
+    fn streaming_test_app(config: EngineConfig) -> (App, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<ProfilingState>()
+            .add_systems(
+                Update,
+                (plan_cells, despawn_cells, validate_streaming_lifecycle).chain(),
+            );
+        (app, directory)
+    }
+
+    fn spawn_camera(app: &mut App, center: IVec2) {
+        app.world_mut().spawn((
+            Transform::from_xyz(
+                center.x as f32 * CELL_SIZE,
+                0.0,
+                -(center.y as f32) * CELL_SIZE,
+            ),
+            StreamingCamera,
+        ));
+    }
+
+    fn move_camera(app: &mut App, shift: IVec2) {
+        let mut camera = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<StreamingCamera>>();
+        let world = app.world_mut();
+        let mut transforms = camera.query_mut(world);
+        let mut transform = transforms.single_mut().unwrap();
+        transform.translation.x += shift.x as f32 * CELL_SIZE;
+        transform.translation.z -= shift.y as f32 * CELL_SIZE;
+    }
+
+    fn cell_id_of(grid_x: i32, grid_y: i32) -> u32 {
+        ((grid_x + 64) as u32) * 256 + (grid_y + 64) as u32
+    }
+
+    /// Spawns a cell root with a two-entity subtree under it and records the cell as resident or
+    /// retiring, the state a committed cell is in.
+    fn spawn_mock_cell(app: &mut App, grid_x: i32, grid_y: i32, resident: bool) -> Entity {
+        let root = app
+            .world_mut()
+            .spawn((
+                CellRef(cell_id_of(grid_x, grid_y)),
+                StreamedCellRoot,
+                ExteriorCellGrid(IVec2::new(grid_x, grid_y)),
+                Transform::default(),
+                Visibility::default(),
+            ))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((Transform::default(), ChildOf(root)))
+            .id();
+        app.world_mut()
+            .spawn((Transform::default(), ChildOf(child)));
+        let detail = CellDetail::Full;
+        let status = if resident {
+            CellStatus::Resident { root, detail }
+        } else {
+            CellStatus::Retiring { root, detail }
+        };
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(exterior_cell(grid_x, grid_y), status);
+        root
+    }
+
+    /// The same for the interior the camera stands in, which carries no [`ExteriorCellGrid`].
+    fn spawn_mock_interior(app: &mut App, cell_id: u32) -> Entity {
+        let root = app
+            .world_mut()
+            .spawn((
+                CellRef(cell_id),
+                StreamedCellRoot,
+                Transform::default(),
+                Visibility::default(),
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                CellKey::Interior(cell_id),
+                CellStatus::Resident {
+                    root,
+                    detail: CellDetail::Full,
+                },
+            );
+        root
+    }
+
+    /// A steady window around `center`: the 7x7 cells the camera wants plus the trailing column a
+    /// crossing drops, which is the shape the resident set settles into while flying.
+    fn spawn_steady_window(app: &mut App, center: IVec2) {
+        for grid_y in (center.y - 3)..=(center.y + 3) {
+            for grid_x in (center.x - 4)..=(center.x + 3) {
+                spawn_mock_cell(app, grid_x, grid_y, true);
+            }
+        }
+    }
+
+    fn resident_root_count(app: &mut App) -> usize {
+        let mut query = app
+            .world_mut()
+            .query_filtered::<Entity, With<StreamedCellRoot>>();
+        let world = app.world();
+        query.iter(world).count()
+    }
+
+    fn streaming_metrics(app: &App) -> StreamingMetrics {
+        app.world().resource::<StreamingMetrics>().clone()
+    }
+
+    /// A crossing config with the ring empty (`terrain_radius == stream_radius`), so the wanted
+    /// grid is exactly the stream grid and the numbers are main's.
+    fn crossing_config(unload_budget: usize) -> EngineConfig {
+        EngineConfig {
+            stream_radius: 3,
+            terrain_radius: 3,
+            unload_radius: 4,
+            max_cell_unloads_per_frame: unload_budget,
+            ..EngineConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_zero_unload_budget_unloads_the_whole_crossing_in_one_frame() {
+        let (mut app, _directory) = streaming_test_app(crossing_config(0));
+        spawn_camera(&mut app, IVec2::ZERO);
+        spawn_steady_window(&mut app, IVec2::ZERO);
+        let roots = resident_root_count(&mut app);
+        app.update();
+
+        move_camera(&mut app, IVec2::X);
+        app.update();
+        let metrics = streaming_metrics(&app);
+        assert_eq!(
+            metrics.despawns_this_frame, 7,
+            "0 means unbudgeted, as before"
+        );
+        assert_eq!(metrics.retiring_cells, 0);
+        assert_eq!(metrics.retire_backlog_overflows, 0);
+        assert_eq!(resident_root_count(&mut app), roots - 7);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    #[test]
+    fn a_crossing_unloads_cells_within_the_budget_and_finishes_within_ceil_frames() {
+        let (mut app, _directory) = streaming_test_app(crossing_config(2));
+        spawn_camera(&mut app, IVec2::ZERO);
+        spawn_steady_window(&mut app, IVec2::ZERO);
+        let roots = resident_root_count(&mut app);
+        app.update();
+        let settled = streaming_metrics(&app);
+        assert_eq!(
+            settled.unloaded_cells, 0,
+            "the window fits inside the radius"
+        );
+        assert_eq!(settled.retiring_cells, 0);
+        assert_eq!(settled.streaming_invariant_failures, 0);
+
+        // Cross into the next cell: the whole trailing column leaves the unload radius at once.
+        move_camera(&mut app, IVec2::X);
+        let mut unloads_per_frame = Vec::new();
+        let mut roots_left = Vec::new();
+        for frame in 1..=4 {
+            app.update();
+            let metrics = streaming_metrics(&app);
+            unloads_per_frame.push(metrics.despawns_this_frame);
+            assert!(
+                metrics.despawns_this_frame <= 2,
+                "frame {frame} unloaded {} cells against a budget of 2",
+                metrics.despawns_this_frame
+            );
+            assert_eq!(metrics.streaming_invariant_failures, 0, "frame {frame}");
+            roots_left.push(resident_root_count(&mut app));
+        }
+        assert_eq!(
+            unloads_per_frame,
+            vec![2, 2, 2, 1],
+            "the column's 7 cells must spread over ceil(7 / 2) frames"
+        );
+        assert_eq!(roots_left, vec![roots - 2, roots - 4, roots - 6, roots - 7]);
+        let metrics = streaming_metrics(&app);
+        assert_eq!(metrics.unloaded_cells, 7);
+        assert_eq!(metrics.retiring_cells, 0);
+        assert_eq!(metrics.max_despawns_per_frame, 2);
+        assert_eq!(metrics.peak_retiring_cells, 7);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    #[test]
+    fn a_reversal_revives_retiring_cells_without_another_request() {
+        let (mut app, _directory) = streaming_test_app(crossing_config(2));
+        spawn_camera(&mut app, IVec2::ZERO);
+        spawn_steady_window(&mut app, IVec2::ZERO);
+        app.update();
+        move_camera(&mut app, IVec2::X);
+        app.update();
+        let after_crossing = streaming_metrics(&app);
+        assert_eq!(
+            after_crossing.retiring_cells, 5,
+            "the crossing retires a column of 7 and the budget takes 2 in the same frame"
+        );
+        assert_eq!(after_crossing.unloaded_cells, 2);
+        let roots_after_crossing = resident_root_count(&mut app);
+
+        // Turn around before the budget has worked through the column.
+        move_camera(&mut app, IVec2::NEG_X);
+        app.update();
+        let after_reversal = streaming_metrics(&app);
+        assert_eq!(after_reversal.revived_cells, 5);
+        assert_eq!(after_reversal.retiring_cells, 0);
+        assert_eq!(after_reversal.despawns_this_frame, 0);
+        assert_eq!(after_reversal.unloaded_cells, 2);
+        assert_eq!(
+            after_reversal.requests_submitted, after_crossing.requests_submitted,
+            "a revived cell keeps its root, so it must not be requested again"
+        );
+        assert_eq!(resident_root_count(&mut app), roots_after_crossing);
+        assert_eq!(after_reversal.streaming_invariant_failures, 0);
+    }
+
+    /// The revival keeps the very entity that was drawing the cell: not a despawn and a respawn.
+    #[test]
+    fn a_revived_retiring_cell_keeps_its_root_entity() {
+        let (mut app, _directory) = streaming_test_app(crossing_config(1));
+        spawn_camera(&mut app, IVec2::ZERO);
+        spawn_steady_window(&mut app, IVec2::ZERO);
+        app.update();
+        move_camera(&mut app, IVec2::X);
+        app.update();
+
+        let retiring: Vec<(CellKey, Entity)> = {
+            let streaming = app.world().resource::<StreamingWorld>();
+            let mut retiring: Vec<_> = streaming
+                .cells
+                .iter()
+                .filter_map(|(key, status)| match status {
+                    CellStatus::Retiring { root, .. } => Some((*key, *root)),
+                    _ => None,
+                })
+                .collect();
+            retiring.sort_by_key(|(key, _)| cell_order_key(*key));
+            retiring
+        };
+        assert_eq!(
+            retiring.len(),
+            6,
+            "the budget took one of the column's seven"
+        );
+
+        move_camera(&mut app, IVec2::NEG_X);
+        app.update();
+        let streaming = app.world().resource::<StreamingWorld>();
+        for (key, root) in &retiring {
+            match streaming.cells.get(key) {
+                Some(CellStatus::Resident { root: now, .. }) => assert_eq!(
+                    now, root,
+                    "{key:?} came back under a different root: a despawn and a respawn"
+                ),
+                other => panic!("{key:?} was not revived in place: {other:?}"),
+            }
+            assert!(
+                app.world().get_entity(*root).is_ok(),
+                "{key:?} was despawned and respawned instead of revived"
+            );
+        }
+    }
+
+    /// A cell pinned between the plan and the pacer is revived by the pin, not despawned and
+    /// requested again: the fixture's "load by id and it stays" invariant, under the pacer.
+    #[test]
+    fn a_pinned_retiring_cell_is_revived_with_its_root() {
+        let (mut app, _directory) = streaming_test_app(crossing_config(1));
+        spawn_camera(&mut app, IVec2::ZERO);
+        // An interior is never paced, so one that nothing wants goes the frame it falls out.
+        let unpinned = spawn_mock_interior(&mut app, 98);
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                CellKey::Interior(98),
+                CellStatus::Retiring {
+                    root: unpinned,
+                    detail: CellDetail::Full,
+                },
+            );
+        app.update();
+        assert!(
+            app.world().get_entity(unpinned).is_err(),
+            "an interior left behind goes at once, whatever state it was in"
+        );
+        assert_eq!(streaming_metrics(&app).despawns_this_frame, 0);
+
+        // The same cell again, but pinned this frame: `request_cell` takes it out of the backlog.
+        let root = spawn_mock_interior(&mut app, 99);
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                CellKey::Interior(99),
+                CellStatus::Retiring {
+                    root,
+                    detail: CellDetail::Full,
+                },
+            );
+        let revived = {
+            let world = app.world_mut();
+            let database = world.remove_resource::<WorldDatabase>().unwrap();
+            let mut metrics = world.remove_resource::<StreamingMetrics>().unwrap();
+            let mut profiler = world.remove_resource::<ProfilingState>().unwrap();
+            world.resource_mut::<StreamingWorld>().request_cell(
+                &database,
+                CellKey::Interior(99),
+                &mut metrics,
+                &mut profiler,
+            );
+            let revived = metrics.revived_cells;
+            world.insert_resource(database);
+            world.insert_resource(metrics);
+            world.insert_resource(profiler);
+            revived
+        };
+        assert_eq!(revived, 1, "pinning a retiring cell revives it on the spot");
+        app.update();
+        assert!(
+            app.world().get_entity(root).is_ok(),
+            "the pinned cell kept the root it was drawn by"
+        );
+        assert!(
+            matches!(
+                app.world()
+                    .resource::<StreamingWorld>()
+                    .cells
+                    .get(&CellKey::Interior(99)),
+                Some(CellStatus::Resident { root: now, .. }) if *now == root
+            ),
+            "the pinned cell is resident under the same root"
+        );
+        let metrics = streaming_metrics(&app);
+        assert_eq!(metrics.despawns_this_frame, 0);
+        assert_eq!(metrics.retiring_cells, 0);
+        assert_eq!(metrics.unloaded_cells, 1, "only the unpinned one went");
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    #[test]
+    fn retire_backlog_bound_is_one_window_at_the_unload_radius() {
+        assert_eq!(retire_backlog_bound(4), 81);
+        assert_eq!(retire_backlog_bound(3), 49);
+        assert_eq!(retire_backlog_bound(1), 9);
+        assert_eq!(retire_backlog_bound(0), 1);
+    }
+
+    #[test]
+    fn a_backlog_past_the_bound_unloads_every_retiring_cell_at_once() {
+        let (mut app, _directory) = streaming_test_app(EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 1,
+            unload_radius: 1,
+            max_cell_unloads_per_frame: 2,
+            ..EngineConfig::default()
+        });
+        spawn_camera(&mut app, IVec2::ZERO);
+        // Under the bound the pacer keeps to the budget: 8 cells wait, 2 go per frame.
+        for grid_x in 10..18 {
+            spawn_mock_cell(&mut app, grid_x, 0, false);
+        }
+        app.update();
+        let paced = streaming_metrics(&app);
+        assert_eq!(paced.retire_backlog_overflows, 0);
+        assert_eq!(paced.despawns_this_frame, 2);
+        assert_eq!(paced.retiring_cells, 6);
+        assert_eq!(
+            resident_root_count(&mut app),
+            6,
+            "the waiters keep their roots"
+        );
+
+        // Past the bound the pacer gives up pacing and takes the whole backlog in one frame.
+        for grid_x in 20..40 {
+            spawn_mock_cell(&mut app, grid_x, 0, false);
+        }
+        app.update();
+        let overflowed = streaming_metrics(&app);
+        assert_eq!(overflowed.retire_backlog_overflows, 1);
+        assert_eq!(overflowed.despawns_this_frame, 26);
+        assert_eq!(overflowed.retiring_cells, 0);
+        assert_eq!(overflowed.unloaded_cells, 28);
+        assert_eq!(resident_root_count(&mut app), 0);
+        assert_eq!(overflowed.streaming_invariant_failures, 0);
+    }
+
+    /// A space change is not paced: crossing into an interior takes the exterior window and the
+    /// space left behind with it in one frame, with nothing left retiring.
+    #[test]
+    fn a_crossing_into_an_interior_unloads_the_space_it_left_in_one_frame() {
+        let (mut app, _directory) = streaming_test_app(crossing_config(2));
+        spawn_camera(&mut app, IVec2::ZERO);
+        let left_behind: Vec<Entity> = (0..3)
+            .map(|grid_x| spawn_mock_cell(&mut app, grid_x, 0, true))
+            .collect();
+        app.update();
+        assert_eq!(resident_root_count(&mut app), 3);
+
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 60,
+            interior: Some(99),
+        };
+        let interior = spawn_mock_interior(&mut app, 99);
+        app.update();
+
+        let metrics = streaming_metrics(&app);
+        assert_eq!(
+            metrics.despawns_this_frame, 0,
+            "a space change is not paced: nothing waited for the budget"
+        );
+        assert_eq!(metrics.retiring_cells, 0);
+        for root in &left_behind {
+            assert!(
+                app.world().get_entity(*root).is_err(),
+                "an exterior of the space the camera left must go the frame it falls out"
+            );
+        }
+        assert!(app.world().get_entity(interior).is_ok());
+        assert!(
+            planned_keys(&app).contains(&CellKey::Interior(99)),
+            "the interior the camera is in is the whole plan"
+        );
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    /// A cell already waiting in the retire backlog when the camera changes space unloads at once:
+    /// the delay it was granted for a distance fall-out does not survive the space change.
+    #[test]
+    fn a_space_change_unloads_a_retiring_cell_at_once() {
+        let (mut app, _directory) = streaming_test_app(EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 1,
+            unload_radius: 1,
+            max_cell_unloads_per_frame: 1,
+            ..EngineConfig::default()
+        });
+        spawn_camera(&mut app, IVec2::ZERO);
+        // Two cells outside the unload radius: one takes its turn, one stays in the backlog.
+        let first = spawn_mock_cell(&mut app, 3, 0, true);
+        let waiting = spawn_mock_cell(&mut app, 3, 1, true);
+        app.update();
+        let retiring = streaming_metrics(&app);
+        assert_eq!(retiring.retiring_cells, 1);
+        assert_eq!(retiring.despawns_this_frame, 1);
+        assert!(app.world().get_entity(first).is_err());
+        assert!(app.world().get_entity(waiting).is_ok());
+
+        // The camera crosses into an interior: the waiting cell's space is gone.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 60,
+            interior: Some(99),
+        };
+        spawn_mock_interior(&mut app, 99);
+        app.update();
+
+        assert!(
+            app.world().get_entity(waiting).is_err(),
+            "a retiring cell of a space the camera left cannot outlive the crossing"
+        );
+        let metrics = streaming_metrics(&app);
+        assert_eq!(metrics.despawns_this_frame, 0);
+        assert_eq!(metrics.retiring_cells, 0);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    /// A full-detail cell that is still drawn while it waits for the pacer counts as resident, so a
+    /// door gate or a `--shots` pose waiting on it does not give up on a cell that is still there -
+    /// including one that is *not* pre-streamed behind a door. A ring cell, which holds only its
+    /// landscape, is not resident in either state.
+    #[test]
+    fn a_retiring_full_destination_is_still_resident() {
+        let (mut app, _directory) = streaming_test_app(EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 1,
+            unload_radius: 1,
+            max_cell_unloads_per_frame: 1,
+            ..EngineConfig::default()
+        });
+        spawn_camera(&mut app, IVec2::ZERO);
+        spawn_mock_cell(&mut app, 3, 0, true);
+        let waiting_key = exterior_cell(3, 1);
+        spawn_mock_cell(&mut app, 3, 1, true);
+        app.update();
+
+        let streaming = app.world().resource::<StreamingWorld>();
+        assert!(
+            !app.world()
+                .resource::<PrestreamCells>()
+                .contains(&waiting_key),
+            "the cell is not a destination pre-streamed behind a door"
+        );
+        assert!(
+            matches!(
+                streaming.cells.get(&waiting_key),
+                Some(CellStatus::Retiring { .. })
+            ),
+            "the cell is waiting for its turn in the unload budget"
+        );
+        assert!(
+            streaming.is_resident(&waiting_key),
+            "a retiring full-detail cell is still drawn, so a door gate must still see it"
+        );
+
+        // The other branches of the same rule: a tier that is not full, in either state.
+        let mut streaming = app.world_mut().resource_mut::<StreamingWorld>();
+        for detail in [CellDetail::Terrain, CellDetail::Full] {
+            streaming.cells.insert(
+                CellKey::Interior(7),
+                CellStatus::Retiring {
+                    root: Entity::PLACEHOLDER,
+                    detail,
+                },
+            );
+            assert_eq!(
+                streaming.is_resident(&CellKey::Interior(7)),
+                detail == CellDetail::Full,
+                "a retiring interior at {detail:?}"
+            );
+        }
+    }
+
     /// A cell that moves from the ring into the full-detail grid and back, as the camera crosses a
     /// cell boundary: the plan asks for it again at the new detail, and the tier change is never a
     /// hole - the root the cell has keeps drawing it until its replacement is committed, and the
@@ -4399,6 +5225,7 @@ mod tests {
         {
             Some(CellStatus::Loading { detail, .. }) => format!("loading {detail:?}"),
             Some(CellStatus::Resident { detail, .. }) => format!("resident {detail:?}"),
+            Some(CellStatus::Retiring { detail, .. }) => format!("retiring {detail:?}"),
             Some(CellStatus::Failed { detail }) => format!("failed {detail:?}"),
             None => "gone".to_owned(),
         };
@@ -4463,6 +5290,7 @@ mod tests {
         {
             Some(CellStatus::Loading { detail, .. }) => format!("loading {detail:?}"),
             Some(CellStatus::Resident { detail, .. }) => format!("resident {detail:?}"),
+            Some(CellStatus::Retiring { detail, .. }) => format!("retiring {detail:?}"),
             Some(CellStatus::Failed { detail }) => format!("failed {detail:?}"),
             None => "gone".to_owned(),
         };
@@ -4719,7 +5547,8 @@ mod tests {
         let key = exterior_cell(2, -3);
         let detail_of = |app: &App| match app.world().resource::<StreamingWorld>().cells.get(&key) {
             Some(CellStatus::Loading { detail, .. })
-            | Some(CellStatus::Resident { detail, .. }) => Some(*detail),
+            | Some(CellStatus::Resident { detail, .. })
+            | Some(CellStatus::Retiring { detail, .. }) => Some(*detail),
             Some(CellStatus::Failed { .. }) => None,
             None => None,
         };
