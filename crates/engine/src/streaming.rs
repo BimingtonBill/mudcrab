@@ -198,7 +198,9 @@ pub struct StreamingWorld {
     active_interior: Option<u32>,
     /// Cells loaded by id through [`StreamingWorld::request_cell`] rather than by the plan. The
     /// plan keeps them whatever the camera does, the way main's streamer keeps an interior until
-    /// something unloads it: the streaming fixture loads one this way and checks it stays.
+    /// something unloads it. A pin lasts the run: the streaming fixture, the only caller, loads its
+    /// interior this way and checks it stays. A caller that needs to let a cell go again adds an
+    /// unpin here rather than leaving the cell pinned.
     pinned: HashSet<CellKey>,
 }
 
@@ -260,8 +262,8 @@ impl StreamingWorld {
         metrics: &mut StreamingMetrics,
         profiler: &mut ProfilingState,
     ) {
-        self.pinned.insert(key);
         if self.cells.contains_key(&key) {
+            self.pinned.insert(key);
             return;
         }
         self.generation = self.generation.wrapping_add(1);
@@ -283,6 +285,9 @@ impl StreamingWorld {
                     replaced: None,
                 },
             );
+            // Pinned only once the queue took the request: a refused one leaves nothing behind,
+            // and the next call asks again.
+            self.pinned.insert(key);
         }
     }
 }

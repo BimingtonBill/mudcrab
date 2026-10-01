@@ -74,7 +74,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // written, rather than a silent default (`crate::graphics_settings`).
     let graphics =
         crate::graphics_settings::from_config(&config).map_err(color_eyre::eyre::Report::msg)?;
-    let interactive_world_physics = config.interactive_world_physics();
+    let interactive_world_physics = world_physics_player(&config);
     let streaming_fixture_dir = if config.streaming_fixture {
         let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
         config.assets_dir = fixture.path.clone();
@@ -730,6 +730,18 @@ fn cross_streaming_fixture_interior(
     let away = (center.x - state.interior_center.x).abs() > config.unload_radius
         || (center.y - state.interior_center.y).abs() > config.unload_radius;
     state.interior.observe(away, roots);
+}
+
+/// Whether this run's camera is main's rapier walking player ([`WorldPlayerPlugin`]).
+///
+/// Off on the portal branch until main's world collision is ported: the player stands on the rapier
+/// colliders main's streamer builds for terrain and statics, and portal's streamer does not build
+/// them yet, so the player would fall through the world. Portal runs keep their own walking player
+/// (`crate::player::PlayerPlugin`, `--walk`) and the free camera instead.
+const WORLD_PHYSICS_PLAYER: bool = false;
+
+fn world_physics_player(config: &EngineConfig) -> bool {
+    WORLD_PHYSICS_PLAYER && config.interactive_world_physics()
 }
 
 fn validate_streaming_fixture(
@@ -2024,7 +2036,7 @@ fn setup_world(
 ) {
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
     let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
-    let camera_offset = if config.interactive_world_physics() {
+    let camera_offset = if world_physics_player(&config) {
         let tuning = tuning.as_deref().cloned().unwrap_or_default();
         Vec3::Y * (tuning.eye_height + tuning.capsule_standing_height * 0.5 + 16.0)
     } else {
@@ -2038,7 +2050,7 @@ fn setup_world(
     // along -Z from where the player stands.
     let camera_transform = start_pose.as_deref().map_or_else(
         || {
-            if config.interactive_world_physics() {
+            if world_physics_player(&config) {
                 Transform::from_translation(camera_position)
                     .looking_at(camera_position + Vec3::NEG_Z, Vec3::Y)
             } else {
@@ -2195,7 +2207,7 @@ fn fly_camera(
     mut auto_flight: Local<AutoFlightState>,
 ) {
     // Interactive player paths own the camera; automated camera paths keep legacy controls.
-    if config.physics_fixture || config.interactive_world_physics() {
+    if config.physics_fixture || world_physics_player(&config) {
         return;
     }
     let started = std::time::Instant::now();
@@ -2623,6 +2635,58 @@ mod tests {
         let mut failed_metrics = settled_metrics;
         failed_metrics.failed_cells = 1;
         assert!(!screenshot_assets_ready(&failed_metrics, true, &config));
+    }
+
+    /// The sun is what has to carry the cascades: without a configuration of its own it gets
+    /// Bevy's, which covers the two metres in front of the camera.
+    #[test]
+    fn setup_world_spawns_the_sun_with_its_cascades() {
+        let config = EngineConfig::default();
+        let mut app = App::new();
+        app.insert_resource(config.clone())
+            .add_systems(Startup, setup_world);
+        app.update();
+
+        let world = app.world_mut();
+        let mut suns = world.query::<(&DirectionalLight, &CascadeShadowConfig)>();
+        let Ok((light, cascades)) = suns.single(world) else {
+            panic!("setup_world spawns one shadow-casting directional light");
+        };
+        assert!(light.shadow_maps_enabled);
+        let expected = sun_shadow_cascades(config.stream_radius, SUN_SHADOW_CASCADES, None);
+        assert_eq!(cascades.bounds, expected.bounds);
+        assert_eq!(cascades.minimum_distance, expected.minimum_distance);
+    }
+
+    /// The streaming camera draws the world (layer 0) and the water planes ([`WATER_LAYER`]):
+    /// whatever lives on a layer it does not render vanishes from the player's own view.
+    #[test]
+    fn the_streaming_camera_renders_every_layer_the_world_uses() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .add_systems(Startup, setup_world);
+        app.update();
+
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&RenderLayers, With<StreamingCamera>>();
+        let layers = cameras
+            .single(app.world())
+            .expect("the streaming camera must be spawned");
+        for layer in MAIN_VIEW_LAYERS {
+            assert!(
+                layers.intersects(&RenderLayers::layer(layer)),
+                "the streaming camera must render layer {layer}"
+            );
+        }
+    }
+
+    /// Main's walking player stands on colliders portal's streamer does not build yet, so no run
+    /// may switch it on until the collision port lands.
+    #[test]
+    fn the_world_physics_player_is_off_until_collision_is_ported() {
+        assert!(EngineConfig::default().interactive_world_physics());
+        assert!(!world_physics_player(&EngineConfig::default()));
     }
 
     #[test]
