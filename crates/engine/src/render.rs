@@ -3044,10 +3044,20 @@ mod tests {
     /// A catalogue answering every landscape texture form id the fixtures use, one texture set per
     /// id so each id is its own image path.
     fn texture_catalogue(path: &std::path::Path, form_ids: &[u32]) -> AssetCatalog {
+        catalogue_with_normal_maps(path, form_ids, &[])
+    }
+
+    /// The same catalogue, with a normal map beside the diffuse of every id in `normal_ids`, so a
+    /// quadrant can be shown to bind the normal map of the id whose diffuse it samples.
+    fn catalogue_with_normal_maps(
+        path: &std::path::Path,
+        form_ids: &[u32],
+        normal_ids: &[u32],
+    ) -> AssetCatalog {
         let connection = rusqlite::Connection::open(path).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT);
                  CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
                  CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);",
             )
@@ -3059,10 +3069,13 @@ mod tests {
                     rusqlite::params![form_id],
                 )
                 .unwrap();
+            let normal_path = normal_ids
+                .contains(form_id)
+                .then(|| format!("textures/land/{form_id}_n.dds"));
             connection
                 .execute(
-                    "INSERT INTO texture_sets VALUES(?1,?2)",
-                    rusqlite::params![form_id, format!("textures/land/{form_id}.dds")],
+                    "INSERT INTO texture_sets VALUES(?1,?2,?3)",
+                    rusqlite::params![form_id, format!("textures/land/{form_id}.dds"), normal_path],
                 )
                 .unwrap();
         }
@@ -3113,5 +3126,72 @@ mod tests {
             borrowed.layer_0, own.layer_0,
             "a quadrant with a base of its own keeps it"
         );
+    }
+
+    /// A quadrant that borrows a neighbour's base binds that base's normal map too, so the borrowed
+    /// layer's surface detail matches the diffuse it is drawn with.
+    #[test]
+    fn a_borrowed_base_binds_the_borrowed_layers_normal_map() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 0)],
+                vec![base_layer(1, 0)],
+                vec![base_layer(2, 5)],
+                vec![base_layer(3, 7)],
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let catalog =
+            catalogue_with_normal_maps(&directory.path().join("catalogue.db"), &[5, 7], &[5, 7]);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Image>();
+        let asset_server = app.world().resource::<AssetServer>().clone();
+
+        let borrowed = TerrainExtension::from_quadrant(&terrain, 1, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        let sibling = TerrainExtension::from_quadrant(&terrain, 2, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        assert!(borrowed.has_normal_maps(), "a borrowed base has one too");
+        assert_eq!(
+            borrowed.normal_0, sibling.normal_0,
+            "quadrant 1 samples the normal map of the base it borrows from quadrant 2"
+        );
+        assert!(borrowed.normal_0.is_some());
+        assert_eq!(borrowed.normal_1, None, "the unused slots stay unbound");
+    }
+
+    /// A layer whose form id has no normal map leaves its flag 0, so the shader never samples a
+    /// stand-in for it: the maps that are there are blended alone.
+    #[test]
+    fn a_quadrant_whose_layers_have_no_normal_maps_leaves_the_flags_clear() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 5)],
+                vec![base_layer(1, 7)],
+                vec![base_layer(2, 5)],
+                vec![base_layer(3, 7)],
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = texture_catalogue(&directory.path().join("catalogue.db"), &[5, 7]);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Image>();
+        let asset_server = app.world().resource::<AssetServer>().clone();
+
+        let extension = TerrainExtension::from_quadrant(&terrain, 0, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        assert!(!extension.has_normal_maps());
+        assert_eq!(extension.settings.normal_layers_0, Vec4::ZERO);
+        assert_eq!(extension.settings.normal_layers_1, Vec4::ZERO);
+        assert_eq!(extension.normal_0, None);
     }
 }
