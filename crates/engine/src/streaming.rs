@@ -4224,6 +4224,8 @@ fn update_render_origin(
     mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
     terrain_colliders: Query<Entity, With<TerrainCollider>>,
     static_colliders: Query<Entity, With<StaticColliderSource>>,
+    parents: Query<&ChildOf>,
+    exterior_roots: Query<(), With<ExteriorCellGrid>>,
     mut physics: WriteRapierContext,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
@@ -4249,11 +4251,22 @@ fn update_render_origin(
     let displacement = grid_translation(shift, IVec2::ZERO);
     camera.translation -= displacement;
     // A fixed rapier body does not follow its Bevy transform through a rebase teleport, so every
-    // collider body is shifted by hand - all spaces included, because every cell root moved,
-    // destination and hidden ones as much as the active one. Nothing to do, and nothing to panic
-    // on, in a run without the rapier plugin: the context query simply finds no context.
-    let mut bodies: Vec<Entity> = terrain_colliders.iter().collect();
-    bodies.extend(static_colliders.iter());
+    // collider body under a root that moves is shifted by hand - destination and hidden exterior
+    // cells as much as the active one. Only exterior roots move ([`reposition_cell_roots`]): a
+    // pre-streamed interior keeps its absolute place, so its colliders must keep theirs, or a door
+    // crossing into it lands a cell away from its own floor (the Alftand walk, impl-281). Nothing
+    // to do, and nothing to panic on, in a run without the rapier plugin: the context query simply
+    // finds no context.
+    let under_exterior_root = |entity: Entity| {
+        std::iter::once(entity)
+            .chain(parents.iter_ancestors(entity))
+            .any(|ancestor| exterior_roots.contains(ancestor))
+    };
+    let bodies: Vec<Entity> = terrain_colliders
+        .iter()
+        .chain(static_colliders.iter())
+        .filter(|entity| under_exterior_root(*entity))
+        .collect();
     if let Ok(mut context) = physics.single_mut() {
         for entity in bodies {
             if let Some(handle) = context.entity2body().get(&entity).copied()
@@ -5498,6 +5511,95 @@ mod tests {
         assert!(
             (moved - (root_x + 5.0)).abs() < 1.0e-2,
             "the body sits where its root now is: body {moved}, root {root_x}"
+        );
+    }
+
+    /// A pre-streamed interior's root keeps its absolute place through an exterior rebase, so its
+    /// static colliders must too; an exterior static beside it still moves with its root. Before
+    /// the fix the interior's floor slid a cell away and a door crossing into it found no ground
+    /// (the Alftand walked tour, impl-281).
+    #[test]
+    fn a_rebase_leaves_a_prestreamed_interiors_colliders_where_its_root_is() {
+        use bevy::ecs::system::RunSystemOnce;
+        use bevy_rapier3d::prelude::{RapierRigidBodyHandle, ReadRapierContext};
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, TransformPlugin))
+            .add_plugins(crate::physics::PhysicsCorePlugin)
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_secs_f32(1.0 / 60.0),
+            ))
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<ActiveCell>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, update_render_origin);
+        app.finish();
+        let camera = app
+            .world_mut()
+            .spawn((Transform::default(), StreamingCamera))
+            .id();
+        let static_body = |app: &mut App, root: Entity, x: f32| {
+            app.world_mut()
+                .spawn((
+                    StaticColliderSource::NifAuthored,
+                    Collider::cuboid(10.0, 10.0, 10.0),
+                    RigidBody::Fixed,
+                    Transform::from_xyz(x, 0.0, 0.0),
+                    ChildOf(root),
+                ))
+                .id()
+        };
+        // An interior root: no cell grid, placed at its absolute coordinates.
+        let interior = app.world_mut().spawn(Transform::default()).id();
+        let interior_floor = static_body(&mut app, interior, 4000.0);
+        let exterior = app
+            .world_mut()
+            .spawn((
+                ExteriorCellGrid(IVec2::new(1, 0)),
+                Transform::from_xyz(CELL_SIZE, 0.0, 0.0),
+            ))
+            .id();
+        let exterior_static = static_body(&mut app, exterior, 5.0);
+        let body_x = |app: &mut App, entity: Entity| {
+            let handle = app
+                .world()
+                .entity(entity)
+                .get::<RapierRigidBodyHandle>()
+                .expect("rapier has the body")
+                .0;
+            app.world_mut()
+                .run_system_once(move |context: ReadRapierContext| {
+                    context.single().unwrap().rigidbody_set.bodies[handle]
+                        .translation()
+                        .x
+                })
+                .unwrap()
+        };
+        for _ in 0..5 {
+            app.update();
+        }
+        assert!((body_x(&mut app, interior_floor) - 4000.0).abs() < 1.0e-2);
+
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation
+            .x = CELL_SIZE;
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(app.world().resource::<StreamingMetrics>().origin_rebases, 1);
+        let floor = body_x(&mut app, interior_floor);
+        assert!(
+            (floor - 4000.0).abs() < 1.0e-2,
+            "the interior's floor stays under its unmoved root: {floor}"
+        );
+        let moved = body_x(&mut app, exterior_static);
+        assert!(
+            (moved - 5.0).abs() < 1.0e-2,
+            "the exterior static moves back a cell with its root: {moved}"
         );
     }
 
