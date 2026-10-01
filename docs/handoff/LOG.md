@@ -26,6 +26,15 @@ maintainer-focus rule: nothing new upstream without their yes). Plan doc updated
 No worker running. **Next:** the user decides whether the branches go up; the converter texture idea goes to
 Upstream Dev as one line.
 
+**Update 02:00 (after Upstream Dev's review):** the first numbers used SkyrimConverted-p2night (2026-09-26), which
+predates #53 (native BC textures), so the texture-transcode finding was about old data and is withdrawn. Fresh
+conversion `D:/Modding-overflow/SkyrimConverted-p2main` (main 461517bf converter, complete, 36 min). On it, more IO
+threads load no faster and lengthen frames; the model-arming cap was the whole bottleneck. Branch now keeps main's IO
+pool size (`--io-threads` stays as an override) and arms 32 models a frame (a75bb1b4..67a1e7e8, coder #663):
+ready after jump 2.36-2.80 s -> 0.82-1.04 s, worst loading frame 14.7-20.4 -> 15.2-18.4 ms (8 runs), fly model wait
+692-704 -> 97-168 ms. Option for the user: Bevy's C zstd (`zstd_c` instead of `zstd_rust`; the converter already
+uses C zstd): another ~25% (jump 0.63-0.70 s) for a worst loading frame of 19-24 ms. PR texts rewritten.
+
 ### 2026-10-01 (day) - Claude [portal] Portal Dev (catch-up with main, steps 1-5 of 7)
 
 **Branch `portal-merge-main`** (worktree `C:\Modding\wkj-portal-merge`, head 7bc1de29, not yet merged into
