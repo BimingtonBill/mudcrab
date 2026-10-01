@@ -3,6 +3,27 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+### 2026-10-01 (day) - Claude [portal] Portal Dev (catch-up with main, steps 1-5 of 7)
+
+**Branch `portal-merge-main`** (worktree `C:\Modding\wkj-portal-merge`, head 7bc1de29, not yet merged into
+`portal`; schema converter 101_601 / DB 100_401; assets `D:\Modding-overflow\SkyrimConverted-portal`).
+Done: main merged; ports of paced unloads + model arming, terrain normal maps, per-camera sky dome, rapier
+colliders + player rapier probe (impl-276..280); doorway carve impl-281 (f2a5579b); **missing-objects fix**
+9089fd6e: main's per-frame upload budget let `--shots`/`--demo-tour` photograph before textures/meshes reached
+the GPU under CPU load (Alftand rooms without benches, or fog only). Capture runs now upload unthrottled; A/B
+evidence `local/demo/r283-u0` vs `r283-u16`; checked under load, 6/6 frames identical to the good ones. Phase 2
+Dev told (main's `--acceptance-screenshot` gate may share the gap; passed to Upstream Dev). Cleanup pass
+impl-284 from MiMo audit #282 (0ea83c7b, 7bc1de29): log noise demoted, `converted_model_path` lowercases like
+main, dead leftovers removed; main's gated `WorldPlayerPlugin`/`SkyPlugin` code kept on purpose (merge cost).
+Tested: engine nextest 849/849, clippy -D warnings, fmt. Walked short tours: Riverwood PASS (2 crossings).
+
+**Open:** walked Alftand tour FAILS at stage 1, door 00092809 ("cannot walk in from any of the standoffs")
+even with the doorway carve. Investigation stopped at wrap-up: debug WIP patch
+`local/merge/impl-281b-wip.patch`, worktree `D:\Modding-overflow\wt-281b` (remove when done). Next: find the
+blocker (which collider/step), fix, rerun both walked tours; then showcase re-shoot (walked crossing clip),
+merge `portal-merge-main` into `portal`. Later: pacing A/B rerun (timing booking), lit-slope check.
+**No workers running.**
+
 ### 2026-10-01 (day) - Claude [phase1] Phase 1 Dev (portal catch-up converter half; textures; #104a)
 
 **Portal catch-up (the user's option B):** converter-state brief `local/research/converter-state-for-portal-merge.md`;
