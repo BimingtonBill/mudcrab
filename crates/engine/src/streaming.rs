@@ -27,7 +27,7 @@ use bevy::{
     camera::primitives::MeshAabb,
     ecs::system::SystemParam,
     gltf::GltfExtras,
-    image::{ImageFilterMode, ImageLoaderSettings, ImageSampler},
+    image::{ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
     world_serialization::{WorldInstance, WorldInstanceReady},
@@ -2569,11 +2569,15 @@ fn track_surface_readiness(
             &asset_server,
             &images,
             &pending.images,
-            true,
+            SurfaceImageKind::Terrain,
         ) {
             SurfaceDependencyState::Ready => {
-                match validate_surface_dependencies(&asset_server, &images, &pending.normals, false)
-                {
+                match validate_surface_dependencies(
+                    &asset_server,
+                    &images,
+                    &pending.normals,
+                    SurfaceImageKind::TerrainNormal,
+                ) {
                     // A normal map is optional detail: without it the quadrant is lit by its
                     // geometric normal, as a quadrant whose layers have none is.
                     SurfaceDependencyState::Failed(reason) => {
@@ -2643,7 +2647,12 @@ fn track_surface_readiness(
     }
     for (entity, pending) in &water {
         let handles: Vec<_> = pending.flow_normal.iter().cloned().collect();
-        match validate_surface_dependencies(&asset_server, &images, &handles, false) {
+        match validate_surface_dependencies(
+            &asset_server,
+            &images,
+            &handles,
+            SurfaceImageKind::Water,
+        ) {
             SurfaceDependencyState::Pending => {}
             SurfaceDependencyState::Ready => {
                 metrics.water_surfaces_validated =
@@ -2688,11 +2697,30 @@ enum SurfaceDependencyState {
     Failed(String),
 }
 
+/// Which surface a set of images belongs to, and so which colour space and sampler each must have
+/// loaded with: a landscape's diffuse layers are sRGB, its normal maps are linear, and water's flow
+/// normals are linear.
+#[derive(Clone, Copy)]
+enum SurfaceImageKind {
+    Terrain,
+    TerrainNormal,
+    Water,
+}
+
+fn terrain_sampler_repeats(sampler: &ImageSampler) -> bool {
+    matches!(
+        sampler,
+        ImageSampler::Descriptor(descriptor)
+            if descriptor.address_mode_u == ImageAddressMode::Repeat
+                && descriptor.address_mode_v == ImageAddressMode::Repeat
+    )
+}
+
 fn validate_surface_dependencies(
     asset_server: &AssetServer,
     images: &Assets<Image>,
     handles: &[Handle<Image>],
-    expects_srgb: bool,
+    kind: SurfaceImageKind,
 ) -> SurfaceDependencyState {
     for handle in handles {
         if let Some((load, _, recursive)) = asset_server.get_load_states(handle.id()) {
@@ -2711,7 +2739,7 @@ fn validate_surface_dependencies(
         let Some(image) = images.get(handle) else {
             return SurfaceDependencyState::Pending;
         };
-        if image.texture_descriptor.format.is_srgb() != expects_srgb {
+        if image.texture_descriptor.format.is_srgb() != matches!(kind, SurfaceImageKind::Terrain) {
             return SurfaceDependencyState::Failed(format!(
                 "image {:?} has wrong color space {:?}",
                 handle.id(),
@@ -2720,6 +2748,16 @@ fn validate_surface_dependencies(
         }
         if let Err(reason) = validate_image_sampler("surface", &image.sampler) {
             return SurfaceDependencyState::Failed(reason);
+        }
+        if matches!(
+            kind,
+            SurfaceImageKind::Terrain | SurfaceImageKind::TerrainNormal
+        ) && !terrain_sampler_repeats(&image.sampler)
+        {
+            return SurfaceDependencyState::Failed(format!(
+                "terrain image {:?} did not load with a repeating sampler",
+                handle.id()
+            ));
         }
     }
     SurfaceDependencyState::Ready
@@ -3805,6 +3843,19 @@ mod tests {
         world::database::DoorLinkRow,
     };
     use bevy::asset::{AssetApp, AssetPlugin};
+
+    #[test]
+    fn terrain_sampler_check_rejects_default_and_clamped_images() {
+        assert!(!terrain_sampler_repeats(&ImageSampler::Default));
+        assert!(!terrain_sampler_repeats(&ImageSampler::linear()));
+        assert!(terrain_sampler_repeats(&ImageSampler::Descriptor(
+            bevy::image::ImageSamplerDescriptor {
+                address_mode_u: ImageAddressMode::Repeat,
+                address_mode_v: ImageAddressMode::Repeat,
+                ..bevy::image::ImageSamplerDescriptor::linear()
+            }
+        )));
+    }
 
     #[test]
     fn commit_budget_ignores_only_the_documented_scheduler_tolerance() {
