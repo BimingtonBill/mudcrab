@@ -335,6 +335,13 @@ fn weight_field(overlay_weights: &[Vec<f32>]) -> [Vec4; WEIGHT_FIELD_WORDS] {
 }
 
 impl TerrainSettings {
+    /// Marks which layers have a normal map bound, for the shader to blend only those.
+    fn set_normal_layers(&mut self, normals: &[Option<Handle<Image>>; 6]) {
+        let present = |index: usize| if normals[index].is_some() { 1.0 } else { 0.0 };
+        self.normal_layers_0 = Vec4::new(present(0), present(1), present(2), present(3));
+        self.normal_layers_1 = Vec4::new(present(4), present(5), 0.0, 0.0);
+    }
+
     /// The settings of one streamed quadrant: the tiling the shader repeats every layer by, the
     /// quadrant's origin inside the cell, and its overlay weight field - which the shader
     /// interpolates itself, so the weights reach the fragment stage exactly as LAND records them.
@@ -425,13 +432,22 @@ fn strongest_overlay_texture(layers: &[&TerrainLayerSnapshot]) -> Option<u32> {
     strongest.map(|(_, texture_form_id)| texture_form_id)
 }
 
+/// The images a terrain quadrant's material waits on, by the colour space each
+/// must decode to.
+pub struct TerrainImages {
+    /// The layers' diffuse images, sRGB.
+    pub color: Vec<Handle<Image>>,
+    /// The layers' normal maps, linear.
+    pub normal: Vec<Handle<Image>>,
+}
+
 impl TerrainExtension {
     pub fn from_quadrant(
         terrain: &TerrainSnapshot,
         quadrant: u8,
         catalog: &AssetCatalog,
         asset_server: &AssetServer,
-    ) -> Result<(Self, Vec<Handle<Image>>), String> {
+    ) -> Result<(Self, TerrainImages), String> {
         let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
         // The layer slots in the order the shader samples them: slot 0 is the base, which a
         // quadrant without a `BTXT` of its own samples from the texture
@@ -442,10 +458,27 @@ impl TerrainExtension {
             slots[slot] = layer.texture_form_id;
         }
         let mut textures: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
+        let mut normals: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
         let mut handles = Vec::new();
-        for (target, texture_form_id) in textures.iter_mut().zip(slots) {
-            if texture_form_id == 0 {
+        let mut normal_handles = Vec::new();
+        for (slot, texture_form_id) in slots.iter().enumerate() {
+            if *texture_form_id == 0 {
                 continue;
+            }
+            let texture_form_id = *texture_form_id;
+            // A borrowed base samples the borrowed form id's normal map too, so its detail
+            // matches the diffuse it is drawn with.
+            if let Some(path) = catalog.landscape_normal(texture_form_id) {
+                // A normal map holds directions, not colours: it must not be decoded as sRGB.
+                let handle = asset_server
+                    .load_builder()
+                    .with_settings(|settings: &mut ImageLoaderSettings| {
+                        settings.sampler = ImageSampler::Descriptor(terrain_layer_sampler());
+                        settings.is_srgb = false;
+                    })
+                    .load(path.to_owned());
+                normals[slot] = Some(handle.clone());
+                normal_handles.push(handle);
             }
             let path = catalog.landscape_diffuse(texture_form_id).ok_or_else(|| {
                 format!(
@@ -459,10 +492,12 @@ impl TerrainExtension {
                     settings.sampler = ImageSampler::Descriptor(terrain_layer_sampler());
                 })
                 .load(path.to_owned());
-            *target = Some(handle.clone());
+            textures[slot] = Some(handle.clone());
             handles.push(handle);
         }
         let overlay_weights = crate::streaming::quadrant_overlay_weights(terrain, quadrant)?;
+        let mut settings = TerrainSettings::for_quadrant(quadrant, layers.len(), &overlay_weights);
+        settings.set_normal_layers(&normals);
         Ok((
             Self {
                 layer_0: textures[0].clone(),
@@ -471,15 +506,18 @@ impl TerrainExtension {
                 layer_3: textures[3].clone(),
                 layer_4: textures[4].clone(),
                 layer_5: textures[5].clone(),
-                settings: TerrainSettings::for_quadrant(quadrant, layers.len(), &overlay_weights),
-                normal_0: None,
-                normal_1: None,
-                normal_2: None,
-                normal_3: None,
-                normal_4: None,
-                normal_5: None,
+                settings,
+                normal_0: normals[0].clone(),
+                normal_1: normals[1].clone(),
+                normal_2: normals[2].clone(),
+                normal_3: normals[3].clone(),
+                normal_4: normals[4].clone(),
+                normal_5: normals[5].clone(),
             },
-            handles,
+            TerrainImages {
+                color: handles,
+                normal: normal_handles,
+            },
         ))
     }
 
@@ -499,6 +537,28 @@ impl TerrainExtension {
             normal_4: None,
             normal_5: None,
         }
+    }
+
+    /// Unbinds every layer's normal map, so the quadrant is lit by its geometric normal as a
+    /// quadrant without normal maps is. Used when a normal map fails to load: a normal map is
+    /// optional detail, and losing one must not hide the terrain its diffuse layers can draw.
+    pub(crate) fn drop_normal_maps(&mut self) {
+        let none: [Option<Handle<Image>>; 6] = Default::default();
+        self.settings.set_normal_layers(&none);
+        [
+            self.normal_0,
+            self.normal_1,
+            self.normal_2,
+            self.normal_3,
+            self.normal_4,
+            self.normal_5,
+        ] = none;
+    }
+
+    /// Whether any layer has a normal map bound.
+    #[cfg(test)]
+    pub(crate) fn has_normal_maps(&self) -> bool {
+        self.settings.normal_layers_0 != Vec4::ZERO || self.settings.normal_layers_1 != Vec4::ZERO
     }
 }
 
@@ -2810,6 +2870,36 @@ mod tests {
             )
             .is_none(),
             "straight alpha-over is what glTF's `BLEND` already renders"
+        );
+    }
+
+    /// A normal map that fails to load must not leave the material pointing at it: the flags that
+    /// make the shader read the six maps are cleared with them, so the quadrant falls back to its
+    /// geometric normal instead of sampling a stand-in white image as a steep tilt.
+    #[test]
+    fn dropping_normal_maps_unbinds_them_and_clears_their_flags() {
+        let mut extension = TerrainExtension::default();
+        let normals: [Option<Handle<Image>>; 6] =
+            std::array::from_fn(|index| (index % 2 == 0).then(Handle::default));
+        extension.settings.set_normal_layers(&normals);
+        [extension.normal_0, extension.normal_2, extension.normal_4] =
+            [normals[0].clone(), normals[2].clone(), normals[4].clone()];
+        assert!(extension.has_normal_maps());
+
+        extension.drop_normal_maps();
+
+        assert!(!extension.has_normal_maps());
+        assert!(
+            [
+                &extension.normal_0,
+                &extension.normal_1,
+                &extension.normal_2,
+                &extension.normal_3,
+                &extension.normal_4,
+                &extension.normal_5,
+            ]
+            .iter()
+            .all(|normal| normal.is_none())
         );
     }
 

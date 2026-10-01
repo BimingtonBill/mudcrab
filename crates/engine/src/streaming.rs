@@ -1662,7 +1662,7 @@ fn spawn_cell(
                 let mesh = build_terrain_quadrant_mesh(&terrain, quadrant)
                     .expect("validated terrain must build");
                 profiler.record_elapsed("streaming/terrain_mesh", started);
-                let (extension, layer_images) =
+                let (extension, images) =
                     TerrainExtension::from_quadrant(&terrain, quadrant, catalog, asset_server)
                         .expect("validated terrain material must build");
                 let material = terrain_materials.add(TerrainMaterial {
@@ -1685,7 +1685,8 @@ fn spawn_cell(
                     PendingTerrainProfile {
                         cell_id: terrain.cell_id,
                         quadrant,
-                        images: layer_images,
+                        images: images.color,
+                        normals: images.normal,
                     },
                 ));
                 if detail == CellDetail::Terrain {
@@ -1965,6 +1966,9 @@ struct PendingTerrainProfile {
     cell_id: u32,
     quadrant: u8,
     images: Vec<Handle<Image>>,
+    /// The layers' normal maps, which the quadrant can be drawn without: see
+    /// [`crate::render::TerrainExtension::drop_normal_maps`].
+    normals: Vec<Handle<Image>>,
 }
 
 #[derive(Component)]
@@ -2542,27 +2546,71 @@ fn palette_material_for(
     Some(palette_materials.add(EffectPaletteMaterial { base, extension }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn track_surface_readiness(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     images: Res<Assets<Image>>,
-    terrain: Query<(Entity, &PendingTerrainProfile)>,
+    terrain: Query<(
+        Entity,
+        &PendingTerrainProfile,
+        Option<&MeshMaterial3d<TerrainMaterial>>,
+    )>,
     water: Query<(Entity, &PendingWaterProfile)>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     metrics.pending_surface_instances = terrain.iter().count() + water.iter().count();
     let mut completed = 0usize;
-    for (entity, pending) in &terrain {
-        match validate_surface_dependencies(&asset_server, &images, &pending.images, true) {
+    for (entity, pending, material) in &terrain {
+        let mut normals_dropped = false;
+        let state = match validate_surface_dependencies(
+            &asset_server,
+            &images,
+            &pending.images,
+            true,
+        ) {
+            SurfaceDependencyState::Ready => {
+                match validate_surface_dependencies(&asset_server, &images, &pending.normals, false)
+                {
+                    // A normal map is optional detail: without it the quadrant is lit by its
+                    // geometric normal, as a quadrant whose layers have none is.
+                    SurfaceDependencyState::Failed(reason) => {
+                        warn!(
+                            cell = format_args!("{:08X}", pending.cell_id),
+                            quadrant = pending.quadrant,
+                            %reason,
+                            "terrain normal map failed; drawing the quadrant without normal maps"
+                        );
+                        if let Some(mut material) =
+                            material.and_then(|material| terrain_materials.get_mut(&material.0))
+                        {
+                            material.extension.drop_normal_maps();
+                        }
+                        profiler.increment("terrain/normal_map_fallbacks", 1);
+                        normals_dropped = true;
+                        SurfaceDependencyState::Ready
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        };
+        match state {
             SurfaceDependencyState::Pending => {}
             SurfaceDependencyState::Ready => {
+                let normals_validated = if normals_dropped {
+                    0
+                } else {
+                    pending.normals.len()
+                };
                 metrics.terrain_patches_validated =
                     metrics.terrain_patches_validated.saturating_add(1);
                 metrics.materials_validated = metrics.materials_validated.saturating_add(1);
                 metrics.images_validated = metrics
                     .images_validated
-                    .saturating_add(pending.images.len() as u64);
+                    .saturating_add((pending.images.len() + normals_validated) as u64);
                 profiler.increment("terrain/patches_validated", 1);
                 commands.entity(entity).try_insert(Visibility::Inherited);
                 commands
