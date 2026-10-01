@@ -17,12 +17,14 @@ impl-284 from MiMo audit #282 (0ea83c7b, 7bc1de29): log noise demoted, `converte
 main, dead leftovers removed; main's gated `WorldPlayerPlugin`/`SkyPlugin` code kept on purpose (merge cost).
 Tested: engine nextest 849/849, clippy -D warnings, fmt. Walked short tours: Riverwood PASS (2 crossings).
 
-**Open:** walked Alftand tour FAILS at stage 1, door 00092809 ("cannot walk in from any of the standoffs")
-even with the doorway carve. Investigation stopped at wrap-up: debug WIP patch
-`local/merge/impl-281b-wip.patch`, worktree `D:\Modding-overflow\wt-281b` (remove when done). Next: find the
-blocker (which collider/step), fix, rerun both walked tours; then showcase re-shoot (walked crossing clip),
-merge `portal-merge-main` into `portal`. Later: pacing A/B rerun (timing booking), lit-slope check.
-**No workers running.**
+**Later the same day:** the walked Alftand failure was not a wall: `update_render_origin` shifted every
+static collider on a rebase, but pre-streamed interior roots never move, so Alftand01's floor ended a cell
+(4096) from the door and the walk in found no ground (flaky: only when the exterior walk crossed a cell
+boundary first). Fixed 0c9da8fb (only bodies under an `ExteriorCellGrid` root shift; new test). Merged
+origin/main #67 (2a880791). Walked short tours: Alftand 4/4 PASS, Riverwood 2/2 PASS; nextest 850/850.
+Conversion compare old vs new (`local/merge/conversion-compare.json`): no file, cell or reference lost.
+**Next:** showcase re-shoot (walked crossing clip), merge `portal-merge-main` into `portal`. Later: pacing
+A/B rerun (timing booking), lit-slope check. **No workers running.**
 
 ### 2026-10-01 (day) - Claude [phase1] Phase 1 Dev (portal catch-up converter half; textures; #104a)
 
