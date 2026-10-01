@@ -22,6 +22,7 @@ use crate::{
 };
 use bevy::{
     animation::AnimationTargetId,
+    app::SceneSpawnerSystems,
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::primitives::MeshAabb,
     ecs::system::SystemParam,
@@ -29,7 +30,7 @@ use bevy::{
     image::{ImageFilterMode, ImageLoaderSettings, ImageSampler},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
-    world_serialization::WorldInstanceReady,
+    world_serialization::{WorldInstance, WorldInstanceReady},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -129,6 +130,7 @@ impl Plugin for StreamingPlugin {
             .init_resource::<StreamingMetrics>()
             .init_resource::<DiagnosticFallbackAssets>()
             .init_resource::<TerrainContinuity>()
+            .init_resource::<SceneSpawnBatch>()
             .init_resource::<ActiveCell>()
             .init_resource::<PrestreamCells>()
             // Empty until the startup system reads the database, and empty for every run whose
@@ -144,6 +146,7 @@ impl Plugin for StreamingPlugin {
                     plan_cells,
                     despawn_cells,
                     collect_cells,
+                    arm_pending_models,
                     track_asset_readiness,
                     apply_directional_snow,
                     apply_effect_palettes,
@@ -157,6 +160,16 @@ impl Plugin for StreamingPlugin {
                     // They are added by `crate::portal::PortalPlugin`, which this plugin is always
                     // added with; an ordering edge onto a set with no members is not an error.
                     .after(crate::transition::DoorTransition),
+            )
+            // Bevy instantiates every ready converted model in one unbudgeted pass inside
+            // `SceneSpawnerSystems::WorldInstanceSpawn`; these two systems bracket that pass so the
+            // profile can tell a frame that spawned a batch from one that spawned nothing.
+            .add_systems(
+                SpawnScene,
+                (
+                    begin_scene_spawn_batch.before(SceneSpawnerSystems::WorldInstanceSpawn),
+                    end_scene_spawn_batch.after(SceneSpawnerSystems::WorldInstanceSpawn),
+                ),
             );
     }
 }
@@ -180,6 +193,9 @@ fn load_directional_snow_catalog(
 #[derive(Resource, Default)]
 pub struct StreamingWorld {
     generation: u64,
+    /// Spawn order for the models [`arm_pending_models`] has yet to arm, so a backlog drains
+    /// oldest first whatever order the queries iterate in.
+    next_model_sequence: u64,
     cells: HashMap<CellKey, CellStatus>,
     /// Exterior cells whose full request failed, while they stay planned. The plan asks for them
     /// as terrain-only instead, wherever they are: a cell the camera stands in whose references
@@ -1287,6 +1303,7 @@ fn collect_cells(
                     payload,
                     terrain,
                     detail,
+                    &mut streaming.next_model_sequence,
                     &mut profiler,
                 );
                 streaming
@@ -1612,6 +1629,7 @@ fn spawn_cell(
     payload: CellPayload,
     terrain: Option<TerrainSnapshot>,
     detail: CellDetail,
+    model_sequence: &mut u64,
     profiler: &mut ProfilingState,
 ) -> Entity {
     let spawn_started = Instant::now();
@@ -1834,11 +1852,15 @@ fn spawn_cell(
                     ));
                 }
                 if let Some(path) = reference.model_path.and_then(converted_model_path) {
+                    let sequence = *model_sequence;
+                    *model_sequence = model_sequence.saturating_add(1);
                     entity.insert((
                         MeshHandle(path.clone()),
-                        WorldAssetRoot(
-                            asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.clone())),
-                        ),
+                        PendingModel {
+                            handle: asset_server
+                                .load(GltfAssetLabel::Scene(0).from_asset(path.clone())),
+                            sequence,
+                        },
                         PendingAssetProfile {
                             started: Instant::now(),
                             scene_spawned: false,
@@ -1912,6 +1934,20 @@ pub(crate) fn door_anchor(reference: &ReferenceRow) -> Option<crate::doors::Door
         door.arrival_position,
         door.destination_worldspace_id.is_some(),
     )
+}
+
+/// A converted model [`spawn_cell`] found for a reference but has not handed to Bevy yet.
+///
+/// Bevy instantiates every model it is handed in one unbudgeted pass, so handing it a whole cell's
+/// models at once is what makes an arrival frame expensive. [`arm_pending_models`] replaces this
+/// component with [`WorldAssetRoot`] once the converted scene is loaded and the budget allows it.
+/// A model whose cell is unloaded before its turn needs no cleanup: this is a component on that
+/// cell's subtree, not an entry in a queue of its own, so it disappears with the subtree.
+#[derive(Component)]
+struct PendingModel {
+    handle: Handle<WorldAsset>,
+    /// Where the reference was in spawn order, so a backlog is armed oldest first.
+    sequence: u64,
 }
 
 #[derive(Component)]
@@ -2016,6 +2052,126 @@ type PendingAssetQuery<'world, 'state> = Query<
     ),
 >;
 
+/// Wall-clock timing for the pass Bevy spends instantiating converted models.
+#[derive(Resource, Default)]
+struct SceneSpawnBatch {
+    started: Option<Instant>,
+}
+
+fn begin_scene_spawn_batch(mut batch: ResMut<SceneSpawnBatch>) {
+    batch.started = Some(Instant::now());
+}
+
+/// Records the cost of Bevy's world-instance spawn pass and counts what the pass did.
+///
+/// The counts read the world rather than Bevy's instance bookkeeping: a reference gains a child the
+/// moment its converted scene is written below it, so `Changed<Children>` on a reference that owns
+/// an instance is exactly "this model was instantiated this frame". `WorldInstance` itself is
+/// inserted when the reference joins the spawner's queue
+/// (`bevy_world_serialization::world_asset_spawner`, `world_instance_spawner`) - which happens
+/// whether or not the asset has landed - so `Added<WorldInstance>` counts the models *handed to*
+/// the spawner this frame, the same thing as spawned only once arming waits for the asset.
+fn end_scene_spawn_batch(
+    mut batch: ResMut<SceneSpawnBatch>,
+    spawned: Query<(), (With<WorldInstance>, Changed<Children>)>,
+    armed: Query<(), Added<WorldInstance>>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if let Some(started) = batch.started.take() {
+        profiler.record_elapsed("scene/spawn_batch", started);
+    }
+    let spawned = spawned.iter().count() as u64;
+    let armed = armed.iter().count() as u64;
+    metrics.instances_spawned_this_frame = spawned;
+    metrics.max_instances_spawned_per_frame = metrics.max_instances_spawned_per_frame.max(spawned);
+    metrics.instances_armed_this_frame = armed;
+    metrics.max_instances_armed_per_frame = metrics.max_instances_armed_per_frame.max(armed);
+    profiler.set_gauge("scene/instances_spawned_this_frame", spawned as f64);
+    profiler.set_gauge("scene/instances_armed_this_frame", armed as f64);
+}
+
+/// Hands loaded converted models to Bevy's scene spawner, at most `max_model_spawns_per_frame` of
+/// them per frame.
+///
+/// Bevy instantiates every model whose converted scene is ready in the frame it is handed over, in
+/// `SceneSpawnerSystems::WorldInstanceSpawn`, so the batch a frame pays to instantiate is the batch
+/// this system lets through. The budget is spent on the models that are ready and skipped over the
+/// ones that are still loading, so a slow load cannot hold the models behind it back; among the
+/// ready ones the oldest reference is armed first. `0` arms every ready model, the unbudgeted
+/// behaviour the engine had before this budget existed.
+fn arm_pending_models(
+    config: Res<EngineConfig>,
+    asset_server: Res<AssetServer>,
+    world_assets: Option<Res<Assets<WorldAsset>>>,
+    pending: Query<(Entity, &PendingModel)>,
+    mut commands: Commands,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let started = Instant::now();
+    let backlog = pending.iter().count();
+    let mut ready: Vec<(u64, Entity, Handle<WorldAsset>)> = pending
+        .iter()
+        .filter(|(_, model)| model_can_spawn(world_assets.as_deref(), &asset_server, &model.handle))
+        .map(|(entity, model)| (model.sequence, entity, model.handle.clone()))
+        .collect();
+    ready.sort_by_key(|(sequence, _, _)| *sequence);
+    let budget = config.max_model_spawns_per_frame;
+    let armed = if budget == 0 {
+        ready.len()
+    } else {
+        budget.min(ready.len())
+    };
+    for (_, entity, handle) in ready.drain(..armed) {
+        commands
+            .entity(entity)
+            .insert(WorldAssetRoot(handle))
+            .remove::<PendingModel>();
+    }
+    // The depth is what is left waiting once the budget has been spent; the peak is the backlog the
+    // pacer was handed, which is the number that says how far behind on a burst it is.
+    let depth = backlog.saturating_sub(armed);
+    metrics.arming_queue_depth = depth;
+    metrics.peak_arming_queue_depth = metrics.peak_arming_queue_depth.max(backlog);
+    profiler.increment("streaming/models_armed", armed as u64);
+    profiler.set_gauge("streaming/arming_queue_depth", depth as f64);
+    profiler.set_gauge(
+        "streaming/peak_arming_queue_depth",
+        metrics.peak_arming_queue_depth as f64,
+    );
+    profiler.record_elapsed("streaming/arm_models", started);
+}
+
+/// Whether Bevy can instantiate this model now.
+///
+/// The converted scene being in `Assets<WorldAsset>` is exactly the condition the spawner retries
+/// on, so arming on it hands a model over on the first frame it can actually spawn. A model whose
+/// load failed will never arrive: it is armed too, so the readiness scan reports the failure
+/// exactly as it did when every model was armed at commit, instead of leaving the reference
+/// pending for as long as its cell lives.
+///
+/// `world_assets` is `None` in an app that never registered the converted-scene asset collection:
+/// the streaming, portal and transition tests add [`StreamingPlugin`] without the renderer's
+/// world-serialization plugin, and such an app has no spawner either. There the asset server's own
+/// answer decides, which is what keeps a reference from being pending forever in a world that
+/// cannot load the model at all.
+fn model_can_spawn(
+    world_assets: Option<&Assets<WorldAsset>>,
+    asset_server: &AssetServer,
+    handle: &Handle<WorldAsset>,
+) -> bool {
+    world_assets.map_or_else(
+        || asset_server.is_loaded_with_dependencies(handle.id()),
+        |assets| assets.contains(handle.id()),
+    ) || matches!(
+        asset_server
+            .get_load_states(handle.id())
+            .map(|(load, _, _)| load),
+        Some(LoadState::Failed(_))
+    )
+}
+
 fn mark_world_instance_ready(
     ready: On<WorldInstanceReady>,
     mut commands: Commands,
@@ -2036,6 +2192,7 @@ fn track_asset_readiness(
     config: Res<EngineConfig>,
     asset_server: Res<AssetServer>,
     pending: PendingAssetQuery,
+    unarmed: Query<(), (With<PendingAssetProfile>, With<PendingModel>)>,
     children: Query<&Children>,
     primitives: RenderPrimitiveQuery,
     transforms: SpawnedNodeQuery,
@@ -2047,7 +2204,9 @@ fn track_asset_readiness(
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = Instant::now();
-    metrics.pending_asset_instances = pending.iter().count();
+    // A model still waiting in the arming queue has no scene yet, so the scan below cannot see it;
+    // count it here so the readiness gates keep waiting for every queued model.
+    metrics.pending_asset_instances = pending.iter().count() + unarmed.iter().count();
     let mut completed_this_scan = 0usize;
     for (entity, root, pending, local, global, world_transform, expected_bounds) in &pending {
         let load_failure =
@@ -2184,9 +2343,17 @@ fn track_asset_readiness(
     metrics.pending_asset_instances = metrics
         .pending_asset_instances
         .saturating_sub(completed_this_scan);
+    metrics.instances_completed_this_scan = completed_this_scan as u64;
+    metrics.max_instances_completed_per_scan = metrics
+        .max_instances_completed_per_scan
+        .max(metrics.instances_completed_this_scan);
     profiler.set_gauge(
         "assets/pending_instances",
         metrics.pending_asset_instances as f64,
+    );
+    profiler.set_gauge(
+        "assets/instances_completed_this_scan",
+        metrics.instances_completed_this_scan as f64,
     );
     profiler.record_elapsed("assets/readiness_scan", started);
 }
@@ -3781,6 +3948,7 @@ mod tests {
                 payload,
                 Some(terrain.clone()),
                 CellDetail::Full,
+                &mut 0,
                 &mut profiler,
             );
             streaming.cells.insert(
@@ -6213,6 +6381,7 @@ mod tests {
             },
             None,
             CellDetail::Full,
+            &mut 0,
             &mut profiler,
         ));
     }
@@ -7663,6 +7832,468 @@ mod tests {
             app.update();
         }
         app.world().resource::<StreamingMetrics>().clone()
+    }
+
+    // --- Paced model spawns (upstream main's `arm_pending_models`) ------------------------------
+
+    /// The app the model-pacing tests run in: the unload pacer, the arming pacer and the real
+    /// readiness scan ([`track_asset_readiness`]) over an asset server and the world serialization
+    /// spawner the engine uses, so a converted model is spawned and its reference becomes ready by
+    /// the same route a converted glb takes. The three run chained, in the order `StreamingPlugin`
+    /// runs them, so a test can tell which frame of that chain a model answered on.
+    fn model_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            WorldSerializationPlugin,
+        ))
+        .init_asset::<Mesh>()
+        .init_asset::<Image>()
+        .init_asset::<StandardMaterial>()
+        .insert_resource(EngineConfig::default())
+        .init_resource::<StreamingMetrics>()
+        .init_resource::<StreamingWorld>()
+        .init_resource::<TerrainContinuity>()
+        .init_resource::<ProfilingState>()
+        .init_resource::<DiagnosticFallbackAssets>()
+        .init_resource::<SceneSpawnBatch>()
+        // The converted scene holds entities, and the spawner reads each of their components out
+        // of the type registry.
+        .register_type::<ChildOf>()
+        .register_type::<Children>()
+        .register_type::<GlobalTransform>()
+        .register_type::<Mesh3d>()
+        .register_type::<MeshMaterial3d<StandardMaterial>>()
+        .register_type::<Name>()
+        .register_type::<Transform>()
+        .add_observer(mark_world_instance_ready)
+        .add_systems(
+            Update,
+            (despawn_cells, arm_pending_models, track_asset_readiness).chain(),
+        )
+        .add_systems(
+            SpawnScene,
+            (
+                begin_scene_spawn_batch.before(SceneSpawnerSystems::WorldInstanceSpawn),
+                end_scene_spawn_batch.after(SceneSpawnerSystems::WorldInstanceSpawn),
+            ),
+        );
+        app
+    }
+
+    /// Adds `scene` to the asset server as the converted model a reference points at, and runs the
+    /// frame the asset system needs to publish it, so `is_loaded_with_dependencies` is true for it
+    /// exactly as it is for a loaded glb.
+    fn add_converted_model(app: &mut App, scene: World) -> Handle<WorldAsset> {
+        let handle = app
+            .world()
+            .resource::<AssetServer>()
+            .add(WorldAsset::new(scene));
+        // The `Loaded` event is applied in the asset schedule, before the spawner reads it.
+        app.update();
+        handle
+    }
+
+    /// A converted model as the loader builds one for the converter's empty scene: the scene's own
+    /// root entity and nothing below it, so the model has no node and no mesh.
+    fn empty_converted_scene() -> World {
+        let mut world = World::new();
+        world.spawn((Name::new("wispambush"), Transform::default()));
+        world
+    }
+
+    /// A converted model whose primitive passes readiness: the mesh the converter exported and the
+    /// material it points at, so the scan has something to validate rather than an empty model.
+    fn converted_scene_with_material(
+        mesh: Handle<Mesh>,
+        material: Handle<StandardMaterial>,
+    ) -> World {
+        let mut world = World::new();
+        // The loader gives every node a transform, the scene's own root included: the bounds walk
+        // reads one from every node below the reference.
+        let root = world
+            .spawn((Name::new("wispambush"), Transform::default()))
+            .id();
+        world.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            Transform::default(),
+            ChildOf(root),
+        ));
+        world
+    }
+
+    /// The aggregate bounds the converter writes for a `Cuboid::new(2.0, 4.0, 6.0)` primitive in a
+    /// reference's own frame, which is the frame the bounds check compares them in.
+    fn cuboid_bounds() -> ExpectedModelBounds {
+        ExpectedModelBounds::new(Vec3::new(-1.0, -2.0, -3.0), Vec3::new(1.0, 2.0, 3.0))
+            .expect("the fixture bounds are finite and not degenerate")
+    }
+
+    /// A config whose arming budget is `budget` models per frame.
+    fn paced_config(budget: usize) -> EngineConfig {
+        EngineConfig {
+            max_model_spawns_per_frame: budget,
+            ..EngineConfig::default()
+        }
+    }
+
+    /// A reference as [`spawn_cell`] leaves one for [`arm_pending_models`]: the root components and
+    /// the model it found, but still pending, with `sequence` its place in spawn order. The cell
+    /// path assigns that sequence from [`StreamingWorld::next_model_sequence`] as it walks the
+    /// cell's references, so handing the sequence in is what a test does instead of committing a
+    /// cell.
+    fn spawn_pending_reference(app: &mut App, handle: Handle<WorldAsset>, sequence: u64) -> Entity {
+        let transform = Transform::from_translation(Vec3::new(3.0, -4.0, 5.0));
+        app.world_mut()
+            .spawn((
+                Name::new("Reference 000F9907"),
+                FormId(0x00F9907),
+                CellRef(0x02D4E0),
+                transform,
+                GlobalTransform::from(transform),
+                WorldTransform(transform.to_matrix()),
+                PendingModel { handle, sequence },
+                PendingAssetProfile {
+                    started: Instant::now(),
+                    scene_spawned: false,
+                    path: "meshes/furniture/creatureexit/wispambush.glb".to_owned(),
+                    form_id: 0x00F9907,
+                    base_form_id: 0x00EF957,
+                    cell_id: 0x02D4E0,
+                },
+            ))
+            .id()
+    }
+
+    /// The references the arming pacer has handed to the spawner and the ones still waiting for
+    /// their turn, which is the whole queue: arming removes the component that put a model in it.
+    fn armed_and_pending(app: &mut App) -> (usize, usize) {
+        let mut armed = app
+            .world_mut()
+            .query_filtered::<Entity, With<WorldAssetRoot>>();
+        let armed = armed.iter(app.world()).count();
+        let mut pending = app
+            .world_mut()
+            .query_filtered::<Entity, With<PendingModel>>();
+        let pending = pending.iter(app.world()).count();
+        (armed, pending)
+    }
+
+    /// Runs the readiness scan until the reference leaves the pending set, and fails the test
+    /// rather than reading an unsettled metric. The world instance is spawned in `SpawnScene` and
+    /// the scan runs in `Update`, so a reference settles over more than one frame. A model still
+    /// waiting in the arming queue is not pending yet, so the queue has to drain too.
+    fn settle_armed_readiness(app: &mut App) -> StreamingMetrics {
+        for _ in 0..16 {
+            app.update();
+            let streaming = app.world().resource::<StreamingMetrics>();
+            if streaming.pending_asset_instances == 0 && streaming.arming_queue_depth == 0 {
+                break;
+            }
+        }
+        let metrics = app.world().resource::<StreamingMetrics>().clone();
+        assert_eq!(
+            metrics.pending_asset_instances, 0,
+            "the reference never left the pending set"
+        );
+        assert_eq!(
+            metrics.arming_queue_depth, 0,
+            "the arming queue never drained"
+        );
+        metrics
+    }
+
+    /// The spawn-batch measurement reads the world rather than the spawner's bookkeeping: three
+    /// models whose assets are already loaded are reported as three instances on the frame Bevy
+    /// writes them into the world, and as none on the frame after, while the readiness scan
+    /// completes the three of them on its own, later, scan.
+    #[test]
+    fn the_spawn_batch_counts_the_instances_bevy_instantiated_this_frame() {
+        let mut app = model_app();
+        // Every model is published before any reference points at it, so all three references are
+        // handed to the spawner on the same frame.
+        let handles: Vec<_> = (0..3)
+            .map(|_| add_converted_model(&mut app, empty_converted_scene()))
+            .collect();
+        for handle in handles {
+            spawn_model_reference(&mut app, handle, None);
+        }
+
+        app.update();
+        let arrival = streaming_metrics(&app);
+        assert_eq!(
+            arrival.instances_spawned_this_frame, 3,
+            "three references were handed to the spawner with their assets loaded"
+        );
+        assert_eq!(
+            arrival.instances_armed_this_frame, 3,
+            "the references joining the spawner's queue are the models armed this frame"
+        );
+        assert_eq!(
+            arrival.instances_completed_this_scan, 0,
+            "the scan validates an instance on a later frame than the one it spawns on"
+        );
+
+        app.update();
+        let quiet = streaming_metrics(&app);
+        assert_eq!(
+            quiet.instances_spawned_this_frame, 0,
+            "an instance spawns once, so the frame after reports none"
+        );
+        assert_eq!(
+            quiet.instances_armed_this_frame, 0,
+            "a model arms once, so the frame after reports none"
+        );
+        assert_eq!(quiet.max_instances_spawned_per_frame, 3);
+        assert_eq!(
+            quiet.instances_completed_this_scan, 3,
+            "the scan completes the three instances it accepts"
+        );
+        assert_eq!(quiet.max_instances_completed_per_scan, 3);
+        assert_eq!(
+            quiet.empty_model_references, 3,
+            "the empty converted scenes are counted, not failed"
+        );
+    }
+
+    /// Pacing is what a frame instantiates: a cell's models wait in the arming queue and are handed
+    /// over a budget at a time, so the spawn batch is the armed batch and a drained queue stays
+    /// drained.
+    #[test]
+    fn the_arming_budget_spreads_a_cells_models_over_frames() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(2));
+        let handles: Vec<_> = (0..5)
+            .map(|_| add_converted_model(&mut app, empty_converted_scene()))
+            .collect();
+        for (sequence, handle) in handles.into_iter().enumerate() {
+            spawn_pending_reference(&mut app, handle, sequence as u64);
+        }
+
+        app.update();
+        let first = streaming_metrics(&app);
+        assert_eq!(
+            armed_and_pending(&mut app),
+            (2, 3),
+            "a budget of two hands two models over and leaves the rest queued"
+        );
+        assert_eq!(first.arming_queue_depth, 3);
+        assert_eq!(
+            first.peak_arming_queue_depth, 5,
+            "the peak is the cell's whole backlog"
+        );
+        assert_eq!(
+            first.instances_spawned_this_frame, 2,
+            "the frame instantiates the models the budget armed, not the whole cell"
+        );
+
+        app.update();
+        assert_eq!(armed_and_pending(&mut app), (4, 1));
+        app.update();
+        assert_eq!(armed_and_pending(&mut app), (5, 0));
+        assert_eq!(streaming_metrics(&app).arming_queue_depth, 0);
+
+        app.update();
+        assert_eq!(
+            armed_and_pending(&mut app),
+            (5, 0),
+            "a model left the queue when it was armed, so none is armed twice"
+        );
+        assert_eq!(streaming_metrics(&app).instances_spawned_this_frame, 0);
+    }
+
+    /// A backlog drains oldest first, whatever order the references were spawned in: the entities
+    /// here are created newest-first, so arming in entity order would arm the wrong model.
+    #[test]
+    fn the_arming_budget_arms_the_oldest_reference_first() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(1));
+        let handles: Vec<_> = (0..4)
+            .map(|_| add_converted_model(&mut app, empty_converted_scene()))
+            .collect();
+        let mut oldest_first = Vec::new();
+        for (index, handle) in handles.into_iter().enumerate() {
+            // The reference spawned first is the newest model: the sequences run the other way.
+            oldest_first.push(spawn_pending_reference(&mut app, handle, 3 - index as u64));
+        }
+        oldest_first.reverse();
+
+        for (frame, reference) in oldest_first.iter().enumerate() {
+            app.update();
+            assert!(
+                app.world().entity(*reference).contains::<WorldAssetRoot>(),
+                "frame {frame} armed a newer model while the oldest one was still waiting"
+            );
+            assert_eq!(armed_and_pending(&mut app), (frame + 1, 3 - frame));
+        }
+    }
+
+    /// A budget is spent on the models that can spawn now: a model whose converted scene has not
+    /// arrived keeps its place in the queue without holding up the models behind it, and takes its
+    /// turn as soon as it can.
+    #[test]
+    fn a_model_still_loading_does_not_use_a_budget_slot() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(2));
+        // A handle `Assets<WorldAsset>` has no entry for is the state a loading model is in: the
+        // loader has not published the scene yet. The default handle is exactly that - identity
+        // without storage - and this one gets its scene before the test ends.
+        let loading = Handle::<WorldAsset>::default();
+        let oldest = spawn_pending_reference(&mut app, loading.clone(), 0);
+        let handles: Vec<_> = (0..4)
+            .map(|_| add_converted_model(&mut app, empty_converted_scene()))
+            .collect();
+        for (sequence, handle) in handles.into_iter().enumerate() {
+            spawn_pending_reference(&mut app, handle, sequence as u64 + 1);
+        }
+
+        app.update();
+        assert!(
+            !app.world().entity(oldest).contains::<WorldAssetRoot>(),
+            "a model whose scene has not arrived is not armed"
+        );
+        assert_eq!(
+            armed_and_pending(&mut app),
+            (2, 3),
+            "the budget went to the two models that are ready, not to the loading one"
+        );
+        assert_eq!(streaming_metrics(&app).arming_queue_depth, 3);
+
+        app.world_mut()
+            .resource_mut::<Assets<WorldAsset>>()
+            .insert(&loading, WorldAsset::new(empty_converted_scene()))
+            .expect("publishing the model's scene cannot fail");
+        app.update();
+        assert!(
+            app.world().entity(oldest).contains::<WorldAssetRoot>(),
+            "the loading model is armed once its scene arrives"
+        );
+        assert_eq!(armed_and_pending(&mut app), (4, 1));
+    }
+
+    /// A model whose cell is unloaded before its turn needs no cleanup, and the pacer cannot trip
+    /// over it: the queue is the component set, and the despawn takes it with the subtree.
+    #[test]
+    fn a_pending_model_whose_cell_is_despawned_leaves_nothing_queued() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(1));
+        let handle = add_converted_model(&mut app, empty_converted_scene());
+        let cell = app
+            .world_mut()
+            .spawn((
+                Name::new("Cell"),
+                StreamedCellRoot,
+                ExteriorCellGrid(IVec2::ZERO),
+                Transform::default(),
+                Visibility::default(),
+            ))
+            .id();
+        for sequence in 0..2 {
+            let reference = spawn_pending_reference(&mut app, handle.clone(), sequence);
+            app.world_mut().entity_mut(reference).insert(ChildOf(cell));
+        }
+        // The cell is outside the unload radius and its turn in the unload budget has come.
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                exterior_cell(4, 4),
+                CellStatus::Retiring {
+                    root: cell,
+                    detail: CellDetail::Full,
+                },
+            );
+
+        app.update();
+
+        assert_eq!(
+            armed_and_pending(&mut app),
+            (0, 0),
+            "the cell took its pending models with it; none was armed and none is queued"
+        );
+        let metrics = streaming_metrics(&app);
+        assert_eq!(metrics.arming_queue_depth, 0);
+        assert_eq!(metrics.unloaded_cells, 1, "the cell itself was unloaded");
+        assert_eq!(metrics.instances_spawned_this_frame, 0);
+    }
+
+    /// `0` is the unbudgeted behaviour: every model whose scene is ready is handed over at once.
+    #[test]
+    fn an_arming_budget_of_zero_arms_every_ready_model() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(0));
+        let handles: Vec<_> = (0..5)
+            .map(|_| add_converted_model(&mut app, empty_converted_scene()))
+            .collect();
+        for (sequence, handle) in handles.into_iter().enumerate() {
+            spawn_pending_reference(&mut app, handle, sequence as u64);
+        }
+
+        app.update();
+        assert_eq!(armed_and_pending(&mut app), (5, 0));
+        assert_eq!(
+            streaming_metrics(&app).instances_spawned_this_frame,
+            5,
+            "without a budget the whole batch lands on one frame, as it did before the pacer"
+        );
+    }
+
+    /// Pacing moves the frame a model is spawned on, not the totals: every queued model is armed
+    /// once, spawned once, and validated exactly once, and no frame instantiates more than the
+    /// budget.
+    #[test]
+    fn every_paced_model_is_spawned_and_validated_exactly_once() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(2));
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let mesh = app
+                .world_mut()
+                .resource_mut::<Assets<Mesh>>()
+                .add(Cuboid::new(2.0, 4.0, 6.0));
+            let material = app
+                .world_mut()
+                .resource_mut::<Assets<StandardMaterial>>()
+                .add(StandardMaterial::default());
+            handles.push(add_converted_model(
+                &mut app,
+                converted_scene_with_material(mesh, material),
+            ));
+        }
+        for (sequence, handle) in handles.into_iter().enumerate() {
+            let reference = spawn_pending_reference(&mut app, handle, sequence as u64);
+            app.world_mut()
+                .entity_mut(reference)
+                .insert(cuboid_bounds());
+        }
+
+        let metrics = settle_armed_readiness(&mut app);
+
+        assert_eq!(
+            metrics.assets_ready, 5,
+            "every instance is validated once: {:?}",
+            metrics.asset_failures
+        );
+        assert_eq!(metrics.meshes_validated, 5);
+        assert_eq!(metrics.materials_validated, 5);
+        assert_eq!(metrics.transform_instances_validated, 5);
+        assert_eq!(metrics.empty_model_references, 0);
+        assert_eq!(metrics.peak_arming_queue_depth, 5);
+        assert_eq!(
+            metrics.max_instances_spawned_per_frame, 2,
+            "no frame instantiated more than the budget allowed"
+        );
+        assert_eq!(armed_and_pending(&mut app), (5, 0));
+        let mut instances = app
+            .world_mut()
+            .query_filtered::<Entity, With<WorldInstance>>();
+        assert_eq!(
+            instances.iter(app.world()).count(),
+            5,
+            "one instance per reference, paced or not"
+        );
     }
 
     /// The converter exports an editor marker as an **empty scene** on purpose - every shape is
