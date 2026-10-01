@@ -810,6 +810,78 @@ fn in_active_space(
     portal.is_none_or(|portal| portal.is_in_active_space(entity, parents))
 }
 
+/// How far a doorway volume reaches past each side of the door's own model bounds, horizontally and
+/// above, in units: a body's width either side of the opening, so a wall that closes the doorway
+/// right beside the frame is let through too. Never below the doorway: the floor stays the floor.
+const DOORWAY_MARGIN: f32 = 32.0;
+
+/// How far a doorway volume reaches in front of and behind the middle of the door's model, in
+/// units, along the door's own depth axis. The backing geometry that closes a doorway stands close
+/// behind it (the Dwemer facade of Alftand's entrance, 16 units); 64 covers that with room and is
+/// still thin beside a room, so a real wall further on is still a wall. Both sides, because a door
+/// model's own front axis is the wrong way round often enough (`LoadDoor::outward`).
+const DOORWAY_DEPTH_REACH: f32 = 64.0;
+
+/// A ray whose normalized `y` is below this looks down: it is a ground probe, not a wall probe.
+const DOORWAY_GROUND_RAY_Y: f32 = -0.5;
+
+/// The doorway volume of a load door: the box the walk-through trigger and the portal quad measure
+/// ([`measured_portal_extents`], in the door's own frame), grown by [`DOORWAY_MARGIN`] across and
+/// above and made [`DOORWAY_DEPTH_REACH`] deep each way from the model's middle. `None` for a door
+/// whose model has no usable bounds - the invisible auto-load markers - whose doorway is not known.
+fn doorway_volume(
+    position: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+    instance_bounds: Option<&InstanceBounds>,
+    expected_bounds: Option<&ExpectedModelBounds>,
+) -> Option<AutoDoorTrigger> {
+    let (size, centre) =
+        measured_portal_extents(instance_bounds, expected_bounds, rotation, scale)?;
+    // Grown upward only: the margin above is half of a half-height more and the centre rises by it.
+    let half = Vec3::new(
+        size.x * 0.5 + DOORWAY_MARGIN,
+        size.y * 0.5 + DOORWAY_MARGIN * 0.5,
+        DOORWAY_DEPTH_REACH,
+    );
+    let centre = centre + Vec3::Y * (DOORWAY_MARGIN * 0.5);
+    Some(AutoDoorTrigger {
+        centre: position + rotation * centre,
+        rotation,
+        half,
+    })
+}
+
+/// A load door's placement, state and the bounds its doorway is measured from.
+type DoorwayQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static GlobalTransform,
+        &'static DoorState,
+        Option<&'static InstanceBounds>,
+        Option<&'static ExpectedModelBounds>,
+    ),
+    With<LoadDoor>,
+>;
+
+/// The doorway volumes of every load door that is open and in the player's space (`in_space`), once
+/// per frame for the walk's rays to check ([`WorldProbe`]). A closed door has none - its leaf blocks,
+/// through the mesh half - and a door that is not yet placed has not got a position to measure.
+fn open_doorways(doors: &DoorwayQuery, in_space: impl Fn(Entity) -> bool) -> Vec<AutoDoorTrigger> {
+    doors
+        .iter()
+        .filter(|(entity, global, state, ..)| {
+            state.is_open() && door_is_placed(global) && in_space(*entity)
+        })
+        .filter_map(|(_, global, _, instance_bounds, expected_bounds)| {
+            let (scale, rotation, position) = global.to_scale_rotation_translation();
+            doorway_volume(position, rotation, scale, instance_bounds, expected_bounds)
+        })
+        .collect()
+}
+
 /// The walking collision queries, against the meshes the streamer has spawned.
 struct MeshProbe<'a, 'w, 's> {
     ray_cast: &'a mut MeshRayCast<'w, 's>,
@@ -901,11 +973,24 @@ struct WorldProbe<'a, 'w, 's> {
     /// of mesh the mesh half answers for. Everything else it skips, as the mesh-only probe skips the
     /// meshes the colliders now cover.
     door_solid: &'a dyn Fn(Entity) -> bool,
+    /// The doorway volumes of the open load doors of the player's space ([`open_doorways`]): a
+    /// wall the world half meets inside one is the authored collision that closes a doorway the
+    /// render mesh leaves open, and is not something to walk into.
+    doorways: &'a [AutoDoorTrigger],
 }
 
 impl CollisionWorld for WorldProbe<'_, '_, '_> {
     fn ray_hit(&mut self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RayHit> {
-        let world = self.world.ray_hit(origin, direction, max_distance);
+        // A ray that looks down is the ground, and a doorway's floor has to hold the player; only
+        // the rays that look along the walls are let through a doorway's volume.
+        let looks_down = direction.normalize_or_zero().y < DOORWAY_GROUND_RAY_Y;
+        let doorways = self.doorways;
+        let world = self
+            .world
+            .ray_hit(origin, direction, max_distance)
+            .filter(|hit| {
+                looks_down || !doorways.iter().any(|doorway| doorway.contains(hit.point))
+            });
         let solid = self.door_solid;
         let door = MeshProbe {
             ray_cast: &mut *self.ray_cast,
@@ -1117,8 +1202,10 @@ fn player_look(
 ///
 /// A run that builds world colliders ([`builds_world_colliders`] - a walked run) walks on them: the
 /// ground and the walls are the rapier colliders the streamer builds, and the mesh probe is kept for
-/// load-door leaves alone ([`WorldProbe`]). Every other run keeps the mesh-only probe it has always
-/// had ([`MeshProbe`]).
+/// load-door leaves alone ([`WorldProbe`]). A wall of those colliders inside the doorway of an open
+/// load door is let through, the authored collision behind a load door being closed where the
+/// door's render mesh is open ([`open_doorways`]). Every other run keeps the mesh-only probe it has
+/// always had ([`MeshProbe`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn player_walk(
     time: Res<Time>,
@@ -1134,6 +1221,7 @@ pub(crate) fn player_walk(
     parents: Query<&ChildOf>,
     leaves: Query<&DoorLeaf>,
     states: Query<&DoorState>,
+    doorway_doors: DoorwayQuery,
     mut held: Local<bool>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -1164,11 +1252,21 @@ pub(crate) fn player_walk(
         let rapier = (config.as_deref().is_some_and(builds_world_colliders))
             .then(|| context.single().ok())
             .flatten();
+        // The open doors' doorways, once for all of this frame's rays; only the composite probe
+        // reads them.
+        let doorways = if rapier.is_some() {
+            open_doorways(&doorway_doors, |entity| {
+                in_active_space(portal.as_deref(), entity, &parents)
+            })
+        } else {
+            Vec::new()
+        };
         let mut probe = match rapier {
             Some(context) => WalkProbe::World(WorldProbe {
                 world: RapierProbe { context },
                 ray_cast: &mut ray_cast,
                 door_solid: &door_solid,
+                doorways: &doorways,
             }),
             None => WalkProbe::Meshes(MeshProbe {
                 ray_cast: &mut ray_cast,
@@ -3923,6 +4021,7 @@ mod world_probe_tests {
     struct ProbeHits(Vec<Option<RayHit>>);
 
     /// Casts every queued ray through the full composite probe: colliders plus door-leaf meshes.
+    #[allow(clippy::too_many_arguments)]
     fn cast_world_and_door_rays(
         rays: Res<ProbeRays>,
         mut hits: ResMut<ProbeHits>,
@@ -3931,6 +4030,7 @@ mod world_probe_tests {
         parents: Query<&ChildOf>,
         leaves: Query<&DoorLeaf>,
         states: Query<&DoorState>,
+        doors: DoorwayQuery,
     ) {
         hits.0.clear();
         let context = context
@@ -3938,10 +4038,12 @@ mod world_probe_tests {
             .expect("the physics plugin's rapier context");
         let door_solid =
             |entity: Entity| door_mesh_is_solid(entity, None, &parents, &leaves, &states);
+        let doorways = open_doorways(&doors, |_| true);
         let mut probe = WorldProbe {
             world: RapierProbe { context },
             ray_cast: &mut ray_cast,
             door_solid: &door_solid,
+            doorways: &doorways,
         };
         for (origin, direction, reach) in &rays.0 {
             hits.0.push(probe.ray_hit(*origin, *direction, *reach));
@@ -4236,5 +4338,222 @@ mod world_probe_tests {
             (held - 600.0).abs() < 1.0,
             "a walked run stood on a mesh with no collider: the eye is at {held}"
         );
+    }
+
+    /// Runs `ticks` fixed steps of the real [`walk_step`] over the composite probe, doorways and
+    /// all.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_the_world_probe(
+        mut walk: ResMut<ProbeWalk>,
+        context: ReadRapierContext,
+        mut ray_cast: MeshRayCast,
+        parents: Query<&ChildOf>,
+        leaves: Query<&DoorLeaf>,
+        states: Query<&DoorState>,
+        doors: DoorwayQuery,
+    ) {
+        let Ok(context) = context.single() else {
+            return;
+        };
+        let door_solid =
+            |entity: Entity| door_mesh_is_solid(entity, None, &parents, &leaves, &states);
+        let doorways = open_doorways(&doors, |_| true);
+        let mut probe = WorldProbe {
+            world: RapierProbe { context },
+            ray_cast: &mut ray_cast,
+            door_solid: &door_solid,
+            doorways: &doorways,
+        };
+        let mut player = Player::default();
+        let mut position = walk.start;
+        for _ in 0..walk.ticks {
+            position = walk_step(
+                &mut probe,
+                &mut player,
+                position,
+                walk.input,
+                PHYSICS_TIMESTEP,
+            )
+            .position;
+        }
+        walk.position = position;
+    }
+
+    /// A walk along `+X` from the origin through the doorway scene, and where it ended.
+    fn walk_through(app: &mut App) -> Vec3 {
+        app.insert_resource(ProbeWalk {
+            start: Vec3::new(0.0, EYE_HEIGHT, 0.0),
+            input: MoveInput {
+                right: 1.0,
+                sprint: true,
+                ..MoveInput::default()
+            },
+            ticks: 180,
+            ..ProbeWalk::default()
+        });
+        app.world_mut()
+            .run_system_once(walk_the_world_probe)
+            .unwrap();
+        app.world().resource::<ProbeWalk>().position
+    }
+
+    /// A floor, and a wall of authored collision across a load door's doorway: the door at `+X =
+    /// 200` and `z = door_z`, its model 120 wide and 240 tall around its origin, 20 deep, turned a
+    /// quarter so that its depth runs along the walk. The wall's near face is at `x = 210`, ten
+    /// units behind the door and well inside the doorway volume wherever the door stands over it.
+    fn doorway_scene(state: DoorState, door_z: f32) -> (App, Entity) {
+        let mut app = mesh_app();
+        spawn_world_collider(
+            &mut app,
+            Vec3::new(0.0, -20.0, 0.0),
+            Vec3::new(1000.0, 20.0, 1000.0),
+        );
+        spawn_world_collider(
+            &mut app,
+            Vec3::new(230.0, 100.0, 0.0),
+            Vec3::new(20.0, 100.0, 400.0),
+        );
+        let position = Vec3::new(200.0, 0.0, door_z);
+        let door = app
+            .world_mut()
+            .spawn((
+                doorway_door(),
+                state,
+                ExpectedModelBounds::new(
+                    Vec3::new(-60.0, 0.0, -10.0),
+                    Vec3::new(60.0, 240.0, 10.0),
+                )
+                .unwrap(),
+                Transform::from_translation(position)
+                    .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+                GlobalTransform::from(
+                    Transform::from_translation(position)
+                        .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+                ),
+            ))
+            .id();
+        sync_physics(&mut app);
+        (app, door)
+    }
+
+    /// The door's own link, as the tests above build one.
+    fn doorway_door() -> LoadDoor {
+        LoadDoor {
+            ref_id: 0x92809,
+            destination: crate::doors::DoorDestination {
+                destination_ref_id: 0x92909,
+                interior_cell_id: Some(1),
+                worldspace_id: None,
+                arrival_position: [0.0; 3],
+                arrival_rotation: [0.0; 3],
+            },
+            label: "Alftand".to_owned(),
+            auto_load: false,
+            outward: None,
+        }
+    }
+
+    /// The Alftand failure: an open door whose doorway the authored collision behind it closes.
+    /// The walk goes through, and out past the wall.
+    #[test]
+    fn a_wall_across_an_open_doorway_does_not_block_the_walk() {
+        let (mut app, _) = doorway_scene(DoorState::Open { animated: true }, 0.0);
+        let end = walk_through(&mut app);
+        assert!(
+            end.x > 330.0,
+            "the open doorway's wall stopped the walk at {end:?}"
+        );
+        assert!(
+            (end.y - EYE_HEIGHT).abs() < 1.0,
+            "the walk through the doorway left the floor: {end:?}"
+        );
+    }
+
+    /// The same wall with the door closed is a wall, and a closed leaf in front of it blocks first.
+    #[test]
+    fn the_same_wall_blocks_a_closed_door_and_so_does_its_leaf() {
+        let (mut app, _) = doorway_scene(DoorState::Closed, 0.0);
+        let end = walk_through(&mut app);
+        assert!(
+            end.x > 50.0 && end.x < 210.0,
+            "a closed door's wall did not stop the walk at its face: {end:?}"
+        );
+
+        let (mut app, door) = doorway_scene(DoorState::Closed, 0.0);
+        let leaf = spawn_mesh_box(
+            &mut app,
+            Vec3::new(150.0, 100.0, 0.0),
+            Vec3::new(10.0, 200.0, 200.0),
+        );
+        app.world_mut().entity_mut(leaf).insert(DoorLeaf { door });
+        app.update();
+        let end = walk_through(&mut app);
+        assert!(
+            end.x > 50.0 && end.x < 150.0,
+            "a closed leaf did not stop the walk before it: {end:?}"
+        );
+    }
+
+    /// A wall where there is no door still blocks: the carve is the doorway's alone.
+    #[test]
+    fn the_same_wall_away_from_a_doorway_still_blocks() {
+        // An open door 400 units to the side: its doorway volume starts well past the wall's face
+        // where the player meets it.
+        let (mut app, _) = doorway_scene(DoorState::Open { animated: true }, 400.0);
+        let end = walk_through(&mut app);
+        assert!(
+            end.x > 50.0 && end.x < 210.0,
+            "a wall away from the open doorway let the walk through: {end:?}"
+        );
+    }
+
+    /// The floor inside a doorway is still a floor, and so is the top of something in it: only the
+    /// rays that look along the walls are let through.
+    #[test]
+    fn the_floor_inside_a_doorway_still_supports_the_player() {
+        let (mut app, _) = doorway_scene(DoorState::Open { animated: true }, 0.0);
+        // In the doorway's volume, in front of the wall's face: the floor.
+        app.insert_resource(ProbeRays(vec![
+            (Vec3::new(205.0, 150.0, 0.0), Vec3::NEG_Y, 400.0),
+            // Above the wall inside the volume: the wall's top, which is ground too.
+            (Vec3::new(230.0, 300.0, 0.0), Vec3::NEG_Y, 400.0),
+            // The wall itself, along it: let through.
+            (Vec3::new(0.0, EYE_HEIGHT, 0.0), Vec3::X, 400.0),
+        ]));
+        app.init_resource::<ProbeHits>();
+        app.world_mut()
+            .run_system_once(cast_world_and_door_rays)
+            .unwrap();
+        let hits = &app.world().resource::<ProbeHits>().0;
+        let floor = hits[0].expect("the doorway's floor is ground");
+        assert!(floor.point.y.abs() < 1.0, "the floor is at {floor:?}");
+        let top = hits[1].expect("the top of the wall in the doorway is ground");
+        assert!((top.point.y - 200.0).abs() < 1.0, "the top is at {top:?}");
+        assert!(hits[2].is_none(), "a wall ray was stopped by {:?}", hits[2]);
+    }
+
+    /// A door that is not in the player's space has no doorway: it carves nothing, open or not.
+    #[test]
+    fn a_door_of_another_space_carves_no_doorway() {
+        let (mut app, door) = doorway_scene(DoorState::Open { animated: true }, 0.0);
+        let own = app
+            .world_mut()
+            .run_system_once(move |doors: DoorwayQuery| open_doorways(&doors, |_| true).len())
+            .unwrap();
+        assert_eq!(own, 1, "the open door of the player's space has a doorway");
+        let foreign = app
+            .world_mut()
+            .run_system_once(move |doors: DoorwayQuery| {
+                open_doorways(&doors, |entity| entity != door).len()
+            })
+            .unwrap();
+        assert_eq!(foreign, 0, "a door of another space carved a doorway");
+        // And the closed door of the player's space has none either.
+        let (mut app, _) = doorway_scene(DoorState::Closed, 0.0);
+        let closed = app
+            .world_mut()
+            .run_system_once(|doors: DoorwayQuery| open_doorways(&doors, |_| true).len())
+            .unwrap();
+        assert_eq!(closed, 0, "a closed door carved a doorway");
     }
 }
