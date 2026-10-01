@@ -40,6 +40,8 @@ nextest engine 255/255, clippy, fmt. Branch head **3adba3bf**.
 commits + review follow-ups, no default changes; engine 253/253). Combined scratch merge clean, workspace 732/732.
 Texts `local/pr-drafts/117b-pr-load-faster.md`, `117a-pr-pacing-measure.md`. Handed to Upstream Dev; the user
 expects to open them as drafts. `phase2/load-faster` and `phase2/pacing-measure` are superseded.
+**Kept in the tank (the user, via Upstream Dev):** both branches frozen at those heads; nothing opens yet. Final texts
+are `local/pr-drafts/105-pr-117b-load-faster.md` and `106-pr-117a-pacing-measure.md` (Upstream Dev's edits).
 
 ### 2026-10-01 (day) - Claude [portal] Portal Dev (catch-up with main, steps 1-5 of 7)
 
