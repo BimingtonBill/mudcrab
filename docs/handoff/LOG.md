@@ -35,6 +35,11 @@ ready after jump 2.36-2.80 s -> 0.82-1.04 s, worst loading frame 14.7-20.4 -> 15
 692-704 -> 97-168 ms. Option for the user: Bevy's C zstd (`zstd_c` instead of `zstd_rust`; the converter already
 uses C zstd): another ~25% (jump 0.63-0.70 s) for a worst loading frame of 19-24 ms. PR texts rewritten. Final DeepSeek review #664: small fixes (wording, report format 10), done in 3adba3bf;
 nextest engine 255/255, clippy, fmt. Branch head **3adba3bf**.
+**Packaged as two unstacked PRs (the user, 02:xx):** `phase2/arm-32-models` 872b2c27 (from main: arm 32 a frame,
+`--io-threads`, docs; workspace 708/708) and `phase2/pacing-measure-v2` 51a367c5 (from main: the measurement
+commits + review follow-ups, no default changes; engine 253/253). Combined scratch merge clean, workspace 732/732.
+Texts `local/pr-drafts/117b-pr-load-faster.md`, `117a-pr-pacing-measure.md`. Handed to Upstream Dev; the user
+expects to open them as drafts. `phase2/load-faster` and `phase2/pacing-measure` are superseded.
 
 ### 2026-10-01 (day) - Claude [portal] Portal Dev (catch-up with main, steps 1-5 of 7)
 
