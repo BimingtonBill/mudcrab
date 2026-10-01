@@ -269,12 +269,22 @@ fn default_linear_sampler() -> ImageSamplerDescriptor {
     ImageSamplerDescriptor::linear()
 }
 
+/// The render layer of water planes. The world, its placed objects and the doorway frames sit on
+/// layer 0; the destination space of a portal is [`crate::portal::DESTINATION_LAYER`].
+pub const WATER_LAYER: usize = 1;
+
+/// The layers the main camera draws.
+pub const MAIN_VIEW_LAYERS: [usize; 2] = [0, WATER_LAYER];
+
+/// The layers a light of the active space shines on.
+pub const LIGHT_LAYERS: [usize; 2] = [0, WATER_LAYER];
+
 /// The sampler a terrain layer texture needs: the shader tiles each layer `tiling` times across
 /// the cell (`uv * 8`), so the address mode must repeat. Bevy's default sampler clamps to the
 /// edge, which stretches the texture's last texel column, row and corner across most of a cell -
 /// long streaks where the edge column is stretched, and one flat colour where the corner texel
 /// covers everything past the first tile.
-fn terrain_layer_sampler() -> ImageSamplerDescriptor {
+pub(crate) fn terrain_layer_sampler() -> ImageSamplerDescriptor {
     ImageSamplerDescriptor {
         address_mode_u: ImageAddressMode::Repeat,
         address_mode_v: ImageAddressMode::Repeat,

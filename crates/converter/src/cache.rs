@@ -2,13 +2,178 @@ use color_eyre::{Result, eyre::WrapErr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
-    io::{BufReader, Read, Write},
-    path::Path,
+    io::{BufReader, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 28;
+/// Portal numbering: `PORTAL_SCHEMA_BASE + main_version * 100 + portal_revision`.
+///
+/// The portal branch carries main's formats plus its own (door links, per-space
+/// lighting, material animation, distant LOD, ...), so its numbers must never be
+/// mistaken for main's. Main stays below `PORTAL_SCHEMA_BASE`, so a main
+/// runtime (range `MIN..=16`) refuses portal output and the portal runtime
+/// (minimum 101_601) refuses main output, including future main versions.
+/// A portal-only format change adds 1; merging a main bump moves the hundreds
+/// and resets the revision (main 17 = 101_701). Never take main's raw number
+/// in a merge: `portal_schema_numbers_encode_main` fails if that happens.
+pub const CONVERTER_SCHEMA_VERSION: u32 = 101_601;
+
+/// Where portal schema numbers start; see [`CONVERTER_SCHEMA_VERSION`].
+pub const PORTAL_SCHEMA_BASE: u32 = 100_000;
+
+/// The main-line schema a version corresponds to: itself below
+/// [`PORTAL_SCHEMA_BASE`], the encoded main version above it.
+pub const fn main_schema_version(version: u32) -> u32 {
+    if version >= PORTAL_SCHEMA_BASE {
+        (version - PORTAL_SCHEMA_BASE) / 100
+    } else {
+        version
+    }
+}
+
+/// Provenance journal the converter keeps inside a staging directory.
+///
+/// A staging directory outlives the run that filled it, so a resumed run finds
+/// outputs this process did not write. The journal records, per output, the
+/// source hash, the converter schema and the configuration hash it was produced
+/// under, together with the output's size and hash, appended as the output is
+/// written. A resumed run reuses a staged output only while its record still
+/// matches the current source, schema and configuration and the bytes on disk.
+/// The name is dotted so it can never collide with a converted asset, and the
+/// file is dropped from the output directory once the staging directory has
+/// been published.
+pub const STAGING_JOURNAL_FILE: &str = ".conversion-staging-journal.jsonl";
+
+/// What a staged output was produced from, as recorded when it was written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedOutput {
+    pub schema_version: u32,
+    pub configuration_hash: String,
+    pub source_hash: String,
+    pub output_size: u64,
+    pub output_hash: String,
+}
+
+impl StagedOutput {
+    /// True when the file at `path` is the output this record describes,
+    /// produced from `source_hash` by the current converter schema and
+    /// configuration.
+    pub fn is_current(&self, path: &Path, source_hash: &str, configuration_hash: &str) -> bool {
+        self.schema_version == CONVERTER_SCHEMA_VERSION
+            && self.configuration_hash == configuration_hash
+            && self.source_hash == source_hash
+            && fs::metadata(path).is_ok_and(|metadata| metadata.len() == self.output_size)
+            && hash_file(path).is_ok_and(|hash| hash == self.output_hash)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StagingJournalLine {
+    key: String,
+    #[serde(flatten)]
+    output: StagedOutput,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes every journal write on this thread fail, for tests of the
+    /// pipeline's error path. The batch loop records on the test's own thread.
+    pub(crate) static FAIL_JOURNAL_WRITES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+pub struct StagingJournal {
+    path: PathBuf,
+    file: fs::File,
+}
+
+impl StagingJournal {
+    pub fn path_in(staging: &Path) -> PathBuf {
+        staging.join(STAGING_JOURNAL_FILE)
+    }
+
+    /// Opens the journal belonging to `staging`, creating it when the directory
+    /// has none yet. A run killed mid-append leaves a partial last line; it is
+    /// ended here, so the next record starts a line of its own and only the
+    /// partial one is dropped when the journal is read.
+    pub fn open(staging: &Path) -> Result<Self> {
+        let path = Self::path_in(staging);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .wrap_err_with(|| format!("failed to open staging journal {}", path.display()))?;
+        let length = file.metadata()?.len();
+        if length > 0 {
+            let mut last = [0_u8];
+            file.seek(SeekFrom::Start(length - 1))?;
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                // Append mode writes at the end whatever the read position.
+                file.write_all(b"\n")
+                    .wrap_err_with(|| format!("failed to repair {}", path.display()))?;
+            }
+        }
+        Ok(Self { path, file })
+    }
+
+    /// Appends one output's provenance. Each record reaches the journal in a
+    /// single write, so a run killed mid-append loses at most the last record,
+    /// and the output it describes is converted again. The journal is not
+    /// fsynced after each record, so that holds for a crashed or killed process;
+    /// a power loss can lose more of the unsynced tail, and those outputs are
+    /// converted again too.
+    pub fn record(&mut self, key: &str, output: &StagedOutput) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_JOURNAL_WRITES.with(std::cell::Cell::get) {
+            color_eyre::eyre::bail!("injected journal write failure");
+        }
+        let mut line = serde_json::to_vec(&StagingJournalLine {
+            key: key.to_owned(),
+            output: output.clone(),
+        })?;
+        line.push(b'\n');
+        self.file
+            .write_all(&line)
+            .wrap_err_with(|| format!("failed to append to {}", self.path.display()))
+    }
+}
+
+/// Reads the records a previous run left in `staging`, keyed by canonical
+/// source key. The last record for a key wins, so an output converted by this
+/// run replaces the record of the run it resumes. A truncated or otherwise
+/// unreadable line is dropped with a warning: the output it described has no
+/// provenance and is converted again.
+pub fn load_staged_outputs(staging: &Path) -> Result<BTreeMap<String, StagedOutput>> {
+    let mut records = BTreeMap::new();
+    let path = StagingJournal::path_in(staging);
+    if !path.is_file() {
+        return Ok(records);
+    }
+    let bytes = fs::read(&path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    let mut dropped = 0u32;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        match serde_json::from_slice::<StagingJournalLine>(line) {
+            Ok(parsed) => {
+                records.insert(parsed.key, parsed.output);
+            }
+            Err(_) => dropped += 1,
+        }
+    }
+    if dropped > 0 {
+        eprintln!(
+            "warning: dropped {dropped} unreadable record(s) from {}; those outputs are converted again",
+            path.display()
+        );
+    }
+    Ok(records)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -41,12 +206,16 @@ pub struct ConversionManifest {
     pub inputs_by_kind: BTreeMap<String, u64>,
     #[serde(default)]
     pub failures: BTreeMap<String, String>,
-    /// Texture references pruned from a published mesh because the game data does
-    /// not contain that texture, keyed by the published `.glb` and holding the
+    /// Texture references a published mesh omits because the game data does not
+    /// contain that texture, keyed by the published `.glb` and holding the
     /// resolved texture paths it dropped. Kept out of `failures`: nothing failed
     /// to convert, so these do not make the conversion incomplete.
+    ///
+    /// This is an audit record for whoever reads the published manifest: the
+    /// engine and launcher accept an asset set on `complete` plus the converter
+    /// schema version, and nothing else in the workspace reads this list.
     #[serde(default)]
-    pub pruned_texture_references: BTreeMap<String, Vec<String>>,
+    pub pruned_texture_references: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     pub archives: BTreeMap<String, IngestionCacheEntry>,
     pub entries: BTreeMap<String, CacheEntry>,
@@ -64,41 +233,16 @@ impl ConversionManifest {
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
-        if matches!(manifest.schema_version, 12..=26) && CONVERTER_SCHEMA_VERSION == 28 {
-            // Schemas 13-27 change only NIF publication (15: vertex alpha is not blend, blend
-            // factors, editor markers dropped; 16: door Open/Close animation clips; 17: scale
-            // channels written as VEC3, which 16 wrote as SCALAR and no conforming glTF reader
-            // would load; 18: glossiness mapped to roughness as a Blinn-Phong exponent rather than
-            // a linear percentage; 19: the specular mask published as
-            // `KHR_materials_specular.specularTexture`, and the environment cube's colour space
-            // made consistent between its label, its URI and its file; 20: an effect shader's
-            // source texture published as its emissive, with the tint as the factor; 21: refraction-
-            // only surfaces whose diffuse slot is a normal map - fire heat haze - excluded; 22: shader
-            // float controllers published as material animation, and the static UV transform; 23: BSTriShape
-            // vertex colours kept and published by the shader's vertex-colour rule, NiBillboardNode kept
-            // and marked, effect falloff published, colour controllers as material animation; 24: vertex alpha
-            // kept as opacity only on blended shapes; 25: the NIF root block's transform not exported;
-            // 26: portal's schema-25 conversion carried schema 23's vertex-alpha rule, so its GLBs are
-            // rebuilt; 27: vertex alpha is opacity on lighting shapes with SLSF1_Vertex_Alpha, in the
-            // alpha test too) and the world
-            // database (16: space_lighting, matos and the statics DNAM columns, all additive) and
-            // LAND normalization. Preserve verified archive ingestion, textures, and scripts, but
-            // force every GLB plus the always-rebuilt world database and cell cache through the
-            // new contracts.
+        if matches!(manifest.schema_version, 12..=15)
+            && main_schema_version(CONVERTER_SCHEMA_VERSION) == 16
+        {
+            // Schemas 13-15 changed mesh/material publication; schema 16 adds
+            // authored collision to GLBs. Preserve verified archive ingestion,
+            // textures, and scripts, but rebuild every GLB and the world data.
             manifest.complete = false;
             manifest
                 .entries
                 .retain(|_, entry| !entry.output.to_ascii_lowercase().ends_with(".glb"));
-            return Ok(manifest);
-        }
-        if manifest.schema_version == 27 && CONVERTER_SCHEMA_VERSION == 28 {
-            // Schema 28 changes only how texture levels are compressed. Every
-            // recorded output still describes bytes this build can publish:
-            // a texture whose levels are not supercompressed yet is rewritten
-            // from its own levels, and meshes, scripts and archive ingestion
-            // are untouched. Nothing is dropped, so a full reconversion
-            // re-encodes no DDS.
-            manifest.complete = false;
             return Ok(manifest);
         }
         if manifest.schema_version != CONVERTER_SCHEMA_VERSION {
@@ -134,12 +278,15 @@ pub fn configuration_hash_for_schema(
     config: &crate::config::PipelineConfig,
     schema: u32,
 ) -> Result<String> {
-    let relevant = serde_json::json!({
+    let mut relevant = serde_json::json!({
         "schema": schema,
-        "texture_etc1s_quality": config.texture_etc1s_quality,
+        "texture_etc1s_quality": config.texture_fallback_quality,
         "texture_uastc_level": config.texture_uastc_level,
         "script_abi_version": config.script_abi_version,
     });
+    if schema >= 16 {
+        relevant["texture_zstd_level"] = serde_json::json!(config.texture_zstd_level);
+    }
     Ok(hash_bytes(&serde_json::to_vec(&relevant)?))
 }
 
@@ -290,21 +437,21 @@ mod tests {
     fn manifests_written_before_pruned_reference_tracking_still_load() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("conversion-manifest.json");
-        // Schema 22 keys only, as written before `pruned_texture_references` existed. The
-        // schema has to be the current one: an older one is migrated first (see
-        // `recent_schema_migrations_reuse_only_unchanged_asset_kinds`), which clears
-        // `complete` and is not what this test is about.
+        // Every key but `pruned_texture_references`, exactly as manifests were
+        // written before that field existed.
         fs::write(
             &path,
-            r#"{
-                "schema_version": 28,
-                "complete": true,
-                "configuration_hash": "configuration",
-                "inputs_by_kind": {"nif": 4},
-                "failures": {},
-                "archives": {},
-                "entries": {}
-            }"#,
+            format!(
+                r#"{{
+                    "schema_version": {CONVERTER_SCHEMA_VERSION},
+                    "complete": true,
+                    "configuration_hash": "configuration",
+                    "inputs_by_kind": {{"nif": 4}},
+                    "failures": {{}},
+                    "archives": {{}},
+                    "entries": {{}}
+                }}"#
+            ),
         )
         .unwrap();
 
@@ -315,6 +462,52 @@ mod tests {
         assert_eq!(manifest.configuration_hash, "configuration");
         assert_eq!(manifest.inputs_by_kind.get("nif"), Some(&4));
         assert!(manifest.pruned_texture_references.is_empty());
+    }
+
+    #[test]
+    fn journal_keeps_the_last_record_and_drops_a_truncated_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        let stale = StagedOutput {
+            schema_version: CONVERTER_SCHEMA_VERSION,
+            configuration_hash: "config".to_owned(),
+            source_hash: "stale".to_owned(),
+            output_size: 4,
+            output_hash: "stale".to_owned(),
+        };
+        let current = StagedOutput {
+            source_hash: "current".to_owned(),
+            ..stale.clone()
+        };
+        let mut journal = StagingJournal::open(staging).unwrap();
+        journal.record("scripts/one.pex", &stale).unwrap();
+        journal.record("scripts/one.pex", &current).unwrap();
+        journal.record("scripts/two.pex", &stale).unwrap();
+        drop(journal);
+
+        // A run killed mid-append leaves a partial line behind.
+        let path = StagingJournal::path_in(staging);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"key\":\"scripts/three.pex\",\"schema_ver");
+        fs::write(&path, &bytes).unwrap();
+
+        let records = load_staged_outputs(staging).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records["scripts/one.pex"], current);
+        assert_eq!(records["scripts/two.pex"], stale);
+        assert!(!records.contains_key("scripts/three.pex"));
+
+        // A resumed run appends after the partial line without losing its record.
+        let mut journal = StagingJournal::open(staging).unwrap();
+        journal.record("scripts/four.pex", &current).unwrap();
+        drop(journal);
+        let records = load_staged_outputs(staging).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records["scripts/four.pex"], current);
+        assert!(!records.contains_key("scripts/three.pex"));
+
+        let missing = directory.path().join("absent");
+        assert!(load_staged_outputs(&missing).unwrap().is_empty());
     }
 
     #[test]
@@ -418,44 +611,23 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_27_manifest_reuses_every_recorded_output() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("conversion-manifest.json");
-        let mut manifest = ConversionManifest {
-            schema_version: 27,
-            complete: true,
-            configuration_hash: "configuration".to_owned(),
-            ..ConversionManifest::default()
-        };
-        for output in ["meshes/a.glb", "textures/a.ktx2", "scripts/a.luau"] {
-            manifest.entries.insert(
-                output.to_owned(),
-                CacheEntry {
-                    source_hash: "source".to_owned(),
-                    output: output.to_owned(),
-                    output_size: 1,
-                    output_hash: "output".to_owned(),
-                },
-            );
-        }
-        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-
-        let migrated = ConversionManifest::load(&path).unwrap();
-
-        assert_eq!(migrated.schema_version, 27);
-        assert!(!migrated.complete);
-        assert_eq!(migrated.configuration_hash, "configuration");
-        for output in ["meshes/a.glb", "textures/a.ktx2", "scripts/a.luau"] {
-            assert!(
-                migrated.entries.contains_key(output),
-                "{output} lost its reuse entry"
-            );
-        }
+    fn portal_schema_numbers_encode_main() {
+        // Portal numbers sit above main's line and decode to the main version
+        // they were built on (converter 16, world database 4). A merge that
+        // takes main's raw numbers fails here.
+        const { assert!(CONVERTER_SCHEMA_VERSION >= PORTAL_SCHEMA_BASE) };
+        const { assert!(shared::WORLD_DATABASE_SCHEMA_VERSION >= PORTAL_SCHEMA_BASE) };
+        assert_eq!(main_schema_version(CONVERTER_SCHEMA_VERSION), 16);
+        assert_eq!(
+            main_schema_version(shared::WORLD_DATABASE_SCHEMA_VERSION),
+            4
+        );
+        assert_eq!(main_schema_version(15), 15);
     }
 
     #[test]
     fn recent_schema_migrations_reuse_only_unchanged_asset_kinds() {
-        for schema_version in [12, 13, 14, 15, 16, 17, 18, 19, 20, 21] {
+        for schema_version in [12, 13, 14, 15] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");
             let mut manifest = ConversionManifest {

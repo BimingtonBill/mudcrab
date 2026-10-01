@@ -29,7 +29,10 @@ impl Plugin for AcceptanceMetricsPlugin {
                 SystemInformationDiagnosticsPlugin,
                 RenderTimingPlugin,
             ))
-            .add_systems(Last, collect_and_finish);
+            .add_systems(
+                Last,
+                collect_and_finish.after(crate::render_timing::end_main_world),
+            );
     }
 }
 
@@ -189,7 +192,8 @@ fn collect_and_finish(
     ) && (!config.streaming_fixture
         || streaming
             .as_deref()
-            .is_some_and(|value| value.streaming_fixture_validated));
+            .is_some_and(|value| value.streaming_fixture_validated))
+        && physics_fixture_ready(config.physics_fixture, streaming.as_deref());
     let commit_budget_respected = streaming
         .as_deref()
         .is_none_or(|value| value.commit_budget_violations == 0);
@@ -320,6 +324,14 @@ fn collect_and_finish(
         samples.finished = true;
         return;
     }
+    if let Some(path) = &config.benchmark_frame_times
+        && let Err(error) = write_frame_times(path, &samples.frame_ms)
+    {
+        error!(%error, path = %path.display(), "failed to write benchmark frame times");
+        exit.write(AppExit::error());
+        samples.finished = true;
+        return;
+    }
     match serde_json::to_vec_pretty(&report)
         .map_err(std::io::Error::other)
         .and_then(|json| fs::write(&config.benchmark_output, json))
@@ -352,6 +364,13 @@ fn diagnostic_value(
     path: &bevy::diagnostic::DiagnosticPath,
 ) -> Option<f64> {
     store.get(path).and_then(|diagnostic| diagnostic.value())
+}
+
+fn physics_fixture_ready(selected: bool, metrics: Option<&StreamingMetrics>) -> bool {
+    !selected
+        || metrics.is_some_and(|value| {
+            value.physics_fixture_validated && value.physics_fixture_failures == 0
+        })
 }
 
 fn no_runtime_failures(
@@ -393,9 +412,78 @@ pub(crate) fn percentile(sorted: &[f64], percentile: f64) -> f64 {
     sorted[index.min(sorted.len() - 1)]
 }
 
+/// Writes the measured frame times as CSV (`frame,ms`), one row per frame after the warm-up, in
+/// the order they were measured: the series behind the report's mean and percentiles.
+fn write_frame_times(path: &std::path::Path, frame_ms: &[f64]) -> std::io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, frame_times_csv(frame_ms))
+}
+
+fn frame_times_csv(frame_ms: &[f64]) -> String {
+    let mut csv = String::with_capacity(16 + frame_ms.len() * 12);
+    csv.push_str(
+        "frame,ms
+",
+    );
+    for (frame, milliseconds) in frame_ms.iter().enumerate() {
+        csv.push_str(&format!(
+            "{frame},{milliseconds:.4}
+"
+        ));
+    }
+    csv
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_times_are_written_in_measured_order() {
+        assert_eq!(
+            frame_times_csv(&[4.0, 3.25, 16.6667]),
+            "frame,ms
+0,4.0000
+1,3.2500
+2,16.6667
+"
+        );
+        assert_eq!(
+            frame_times_csv(&[]),
+            "frame,ms
+"
+        );
+    }
+
+    #[test]
+    fn parses_the_frame_times_path() {
+        let config = EngineConfig::from_args(
+            ["--benchmark-frame-times", "out/frames.csv"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert_eq!(
+            config.benchmark_frame_times.as_deref(),
+            Some(std::path::Path::new("out/frames.csv"))
+        );
+    }
+
+    #[test]
+    fn physics_fixture_benchmark_requires_validation_without_failures() {
+        let mut metrics = StreamingMetrics::default();
+        assert!(physics_fixture_ready(false, None));
+        assert!(!physics_fixture_ready(true, None));
+        assert!(!physics_fixture_ready(true, Some(&metrics)));
+        metrics.physics_fixture_validated = true;
+        assert!(physics_fixture_ready(true, Some(&metrics)));
+        metrics.physics_fixture_failures = 1;
+        assert!(!physics_fixture_ready(true, Some(&metrics)));
+    }
 
     #[test]
     fn calculates_nearest_rank_percentiles() {

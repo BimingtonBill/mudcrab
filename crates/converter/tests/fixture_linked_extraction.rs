@@ -1,11 +1,12 @@
-//! A conversion stores each extracted archive entry once: in the published tree, a `vfs` file and
-//! its content-addressed blob in `.ingestion-cache` are one file, not two copies of its bytes.
+//! A conversion stores each extracted archive entry once: in the staging workspace, a `vfs`
+//! file and its content-addressed blob in `.ingestion-cache` are one file, not two copies of its
+//! bytes. Neither ships in the published runtime pack.
 
 use converter::PipelineConfig;
 use std::{fs, io::Write};
 
 #[tokio::test]
-async fn published_vfs_entries_are_one_file_with_their_cache_blobs() {
+async fn staged_vfs_entries_are_one_file_with_their_cache_blobs() {
     let directory = tempfile::tempdir().unwrap();
     let data = directory.path().join("Data");
     dummy_content::layout::prepare_directory(&data, false).unwrap();
@@ -26,28 +27,32 @@ async fn published_vfs_entries_are_one_file_with_their_cache_blobs() {
     .unwrap();
 
     let output = directory.path().join("modern");
-    let config = PipelineConfig::new(&data, &output);
+    // A stale backup makes publishing refuse, so the run stops with its staging folder kept and
+    // the workspace links stay inspectable.
+    let backup = output.with_extension(format!("backup-{}", std::process::id()));
+    std::fs::create_dir_all(&backup).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let report = converter::AssetPipeline::run_async(config, tx)
+    let failure = converter::AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
         .await
-        .unwrap();
+        .unwrap_err();
     drain.await.unwrap();
-    assert!(report.complete, "the fixture conversion did not complete");
+    assert!(format!("{:?}", failure.error).contains("stale backup"));
+    let staging = failure.staging.expect("the staging folder was kept");
 
     let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(output.join("conversion-manifest.json")).unwrap())
+        serde_json::from_slice(&fs::read(staging.join("conversion-manifest.json")).unwrap())
             .unwrap();
     // On a filesystem without hard links the converter copies by design (`link_or_copy`), so only
     // equal bytes can be asked of the two names there.
-    let links = hard_links_supported(&output);
+    let links = hard_links_supported(&staging);
     let mut entries = 0;
     for archive in manifest["archives"].as_object().unwrap().values() {
         for file in archive["files"].as_array().unwrap() {
             let path = file["path"].as_str().unwrap();
             let hash = file["hash"].as_str().unwrap();
-            let vfs = output.join("vfs").join(path);
-            let blob = output
+            let vfs = staging.join("vfs").join(path);
+            let blob = staging
                 .join(".ingestion-cache/sha256")
                 .join(&hash[..2])
                 .join(hash);
@@ -74,6 +79,14 @@ async fn published_vfs_entries_are_one_file_with_their_cache_blobs() {
         }
     }
     assert!(entries > 0, "no archive entry was extracted");
+    assert!(
+        !output.join("vfs").exists(),
+        "the runtime pack must not ship the staging workspace"
+    );
+    assert!(
+        !output.join(".ingestion-cache").exists(),
+        "the runtime pack must not ship the ingestion cache"
+    );
 }
 
 /// Whether the filesystem holding `directory` can hard-link.

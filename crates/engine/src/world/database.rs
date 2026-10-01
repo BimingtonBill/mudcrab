@@ -21,6 +21,21 @@ pub(crate) const EXTERIOR_CELL_ID_SQL: &str = "SELECT c.id FROM cells c
      ORDER BY (l.cell_id IS NOT NULL) DESC, c.id DESC
      LIMIT 1";
 
+/// The oldest world database schema the runtime reads. On the portal branch it is the current one:
+/// the portal's own tables (door links, lights, per-space lighting, LOD) are required, so a database
+/// from a plain-main converter, or from before the portal numbering (`100_000 + main * 100 +
+/// portal_revision`, see [`shared::WORLD_DATABASE_SCHEMA_VERSION`]), is refused with the reconvert
+/// message instead of loading half of what the portal needs.
+pub const MIN_RUNTIME_DATABASE_SCHEMA_VERSION: u32 = shared::WORLD_DATABASE_SCHEMA_VERSION;
+
+/// The newest world database schema the runtime reads: the one this revision's converter writes.
+pub const MAX_RUNTIME_DATABASE_SCHEMA_VERSION: u32 = shared::WORLD_DATABASE_SCHEMA_VERSION;
+
+/// Whether the runtime (engine and `world-inspect`) reads a world database of this schema.
+pub fn supports_runtime_database_schema(version: u32) -> bool {
+    (MIN_RUNTIME_DATABASE_SCHEMA_VERSION..=MAX_RUNTIME_DATABASE_SCHEMA_VERSION).contains(&version)
+}
+
 #[derive(Reflect, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CellKey {
     Exterior {
@@ -52,6 +67,8 @@ pub struct ReferenceRow {
     pub form_id: u32,
     pub cell_id: u32,
     pub base_form_id: u32,
+    /// Authoritative base record type; `statics` also contains movable clutter.
+    pub base_record_type: Option<String>,
     pub model_path: Option<String>,
     pub position: [f32; 3],
     pub rotation: [f32; 3],
@@ -205,6 +222,7 @@ fn unpack_color(value: u32) -> [u8; 3] {
 #[derive(Resource, Default)]
 pub struct AssetCatalog {
     landscape_diffuse: std::collections::HashMap<u32, String>,
+    landscape_normal: std::collections::HashMap<u32, String>,
     water_flow: std::collections::HashMap<u32, String>,
     water_colors: std::collections::HashMap<u32, WaterColors>,
 }
@@ -223,6 +241,24 @@ impl AssetCatalog {
             .filter_map(|(id, path)| converted_texture_path(path).map(|path| (id, path)))
             .collect();
         drop(statement);
+        // Each landscape texture's normal map, where its texture set has one. A database written
+        // before `texture_sets` carried `normal_path` (the in-memory fixtures) has none, and the
+        // terrain then draws with the geometric normal alone.
+        let landscape_normal = connection
+            .prepare(
+                "SELECT l.id,t.normal_path FROM landscape_textures l JOIN texture_sets t ON t.id=l.texture_set_id WHERE t.normal_path IS NOT NULL AND t.normal_path <> ''",
+            )
+            .map(|mut statement| {
+                statement
+                    .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)))
+                    .map(|rows| {
+                        rows.filter_map(std::result::Result::ok)
+                            .filter_map(|(id, path)| converted_texture_path(path).map(|path| (id, path)))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
         let mut statement = connection.prepare(
             "SELECT id,flow_normal_path FROM waters WHERE flow_normal_path IS NOT NULL AND flow_normal_path <> ''",
         )?;
@@ -264,6 +300,7 @@ impl AssetCatalog {
             .unwrap_or_default();
         Ok(Self {
             landscape_diffuse,
+            landscape_normal,
             water_flow,
             water_colors,
         })
@@ -271,6 +308,11 @@ impl AssetCatalog {
 
     pub fn landscape_diffuse(&self, form_id: u32) -> Option<&str> {
         self.landscape_diffuse.get(&form_id).map(String::as_str)
+    }
+
+    /// The converted normal map of landscape texture `form_id`, if its texture set has one.
+    pub fn landscape_normal(&self, form_id: u32) -> Option<&str> {
+        self.landscape_normal.get(&form_id).map(String::as_str)
     }
 
     pub fn water_flow(&self, form_id: u32) -> Option<&str> {
@@ -282,13 +324,23 @@ impl AssetCatalog {
     }
 }
 
+/// Maps a texture path stored in the world database to the converted `.ktx2` under `textures/`.
+///
+/// The database is input the engine did not write, so a path that could leave `textures/` - a
+/// `..` or `.` segment, an absolute or drive-prefixed path, an empty segment, or a `:` (a Windows
+/// drive or stream, or an asset source such as `embedded://`) - is refused rather than loaded.
 fn converted_texture_path(path: String) -> Option<String> {
-    let normalized = path.replace('\\', "/");
-    let without_prefix = normalized
-        .strip_prefix("textures/")
-        .or_else(|| normalized.strip_prefix("Textures/"))
-        .unwrap_or(&normalized);
-    if without_prefix.is_empty() || !is_safe_relative_asset_path(without_prefix) {
+    // Converted assets are published with lowercase canonical paths, so the
+    // lookup must lowercase too (matching world-inspect's resolver).
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let without_prefix = normalized.strip_prefix("textures/").unwrap_or(&normalized);
+    if without_prefix.is_empty()
+        || !is_safe_relative_asset_path(without_prefix)
+        || without_prefix.contains(':')
+        || without_prefix
+            .split('/')
+            .any(|segment| matches!(segment, "" | "." | ".."))
+    {
         return None;
     }
     let mut converted = std::path::PathBuf::from("textures").join(without_prefix);
@@ -399,9 +451,10 @@ fn validate(path: &Path) -> Result<()> {
         })
         .wrap_err("world database has no schema version")?;
     color_eyre::eyre::ensure!(
-        version == shared::WORLD_DATABASE_SCHEMA_VERSION,
-        "world database schema {version} is unsupported; reconvert assets for version {}",
-        shared::WORLD_DATABASE_SCHEMA_VERSION
+        supports_runtime_database_schema(version),
+        "world database schema {version} is unsupported; supported versions are {} through {}",
+        MIN_RUNTIME_DATABASE_SCHEMA_VERSION,
+        MAX_RUNTIME_DATABASE_SCHEMA_VERSION
     );
     Ok(())
 }
@@ -411,13 +464,20 @@ fn worker(
     requests: Receiver<DatabaseRequest>,
     responses: Sender<DatabaseResponse>,
 ) {
-    let connection = match Connection::open_with_flags(
+    // Which optional tables and columns this database has does not change while it is open, so
+    // the reference query is built once for the connection. If the database cannot be opened or
+    // probed, every request is still answered, with that error, so the cells fail visibly instead
+    // of waiting forever.
+    let setup = Connection::open_with_flags(
         &path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        Ok(connection) => connection,
-        Err(_) => return,
-    };
+    )
+    .map_err(color_eyre::eyre::Report::from)
+    .and_then(|connection| {
+        let query = ReferenceQuery::for_connection(&connection)?;
+        Ok((connection, query))
+    })
+    .map_err(|error| format!("world database {} is unusable: {error:#}", path.display()));
     // The links that lead back into a door, and every door's own doorway, are the same rows for
     // every cell, so they are read once for the life of the connection instead of once per cell.
     let mut tables = DoorTables::default();
@@ -433,8 +493,13 @@ fn worker(
         };
         let queue_wait_micros = elapsed_micros(queued_at);
         let started = Instant::now();
-        let result = load_cell(&connection, generation, key, detail, &mut tables)
-            .map_err(|error| format!("{error:#}"));
+        let result = match &setup {
+            Ok((connection, query)) => {
+                load_cell(connection, query, generation, key, detail, &mut tables)
+                    .map_err(|error| format!("{error:#}"))
+            }
+            Err(error) => Err(error.clone()),
+        };
         let query_micros = elapsed_micros(started);
         let row_count = result
             .as_ref()
@@ -527,10 +592,16 @@ const DOOR_JOIN: &str = concat!(
     " LEFT JOIN cells dc ON dc.id=d.destination_cell_id",
     " LEFT JOIN worldspaces ws ON ws.id=d.destination_worldspace_id",
 );
-
 /// The `lights` row of the reference's base record: one `LIGH` record can be placed many times,
 /// each reference lighting the space at its own radius.
 const LIGHT_JOIN: &str = " LEFT JOIN lights l ON l.id=r.base_form_id";
+
+fn has_records(connection: &Connection) -> Result<bool> {
+    let count: i64 = connection
+        .prepare_cached("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='records'")?
+        .query_row([], |row| row.get(0))?;
+    Ok(count > 0)
+}
 
 /// Whether the database carries the `door_links` table. A database converted before doors were
 /// exported still loads; every reference then reads as a non-door.
@@ -824,8 +895,65 @@ fn model_conventions(offsets: &HashMap<String, Vec<f32>>) -> HashMap<String, f32
     conventions
 }
 
+/// The reference query's column list and joins for one database: every optional table (`records`,
+/// `door_links`, `lights`) and column (`radius_override`, `statics.editor_id`) is joined when the
+/// database has it and read as `NULL` (or the model-only auto-load rule) when it does not, so
+/// [`map_reference`]'s column indices are the same either way.
+struct ReferenceQuery {
+    columns: String,
+    joins: String,
+    has_doors: bool,
+}
+
+impl ReferenceQuery {
+    fn for_connection(connection: &Connection) -> Result<Self> {
+        let has_records = has_records(connection)?;
+        let record_column = if has_records { "b.record_type" } else { "NULL" };
+        let has_doors = has_door_links(connection)?;
+        let door_columns = if has_doors {
+            DOOR_COLUMNS
+        } else {
+            ABSENT_DOOR_COLUMNS
+        };
+        let has_lights = has_lights(connection)?;
+        let light_columns = if has_lights {
+            LIGHT_COLUMNS
+        } else {
+            ABSENT_LIGHT_COLUMNS
+        };
+        let override_column = if has_radius_override(connection)? {
+            RADIUS_OVERRIDE_COLUMN
+        } else {
+            ABSENT_RADIUS_OVERRIDE_COLUMN
+        };
+        let auto_load_column = if has_statics_editor_id(connection)? {
+            AUTO_LOAD_COLUMN
+        } else {
+            ABSENT_EDITOR_ID_AUTO_LOAD_COLUMN
+        };
+        let mut joins = String::from(REFERENCE_JOIN);
+        if has_records {
+            joins.push_str(" LEFT JOIN records b ON b.form_id=r.base_form_id");
+        }
+        if has_doors {
+            joins.push_str(DOOR_JOIN);
+        }
+        if has_lights {
+            joins.push_str(LIGHT_JOIN);
+        }
+        Ok(Self {
+            columns: format!(
+                "{REFERENCE_COLUMNS},{record_column},{door_columns},{light_columns},                 {override_column},{auto_load_column}"
+            ),
+            joins,
+            has_doors,
+        })
+    }
+}
+
 fn load_cell(
     connection: &Connection,
+    query: &ReferenceQuery,
     generation: u64,
     key: CellKey,
     detail: CellDetail,
@@ -844,8 +972,8 @@ fn load_cell(
         CellKey::Interior(cell_id) => cell_id,
     };
     // A terrain-only cell is drawn and never entered, so the landscape the cell cache holds for
-    // `cell_id` is everything the request needs. Answering it here also skips the table probes and
-    // the reference query below, which is the whole cost of a request at this distance.
+    // `cell_id` is everything the request needs. Answering it here also skips the reference query
+    // below, which is the whole cost of a request at this distance.
     if detail == CellDetail::Terrain && matches!(key, CellKey::Exterior { .. }) {
         return Ok(CellPayload {
             generation,
@@ -854,40 +982,11 @@ fn load_cell(
             references: Vec::new(),
         });
     }
-    let has_doors = has_door_links(connection)?;
-    let has_lights = has_lights(connection)?;
-    let has_override = has_radius_override(connection)?;
-    let has_editor_id = has_statics_editor_id(connection)?;
-    let door_columns = if has_doors {
-        DOOR_COLUMNS
-    } else {
-        ABSENT_DOOR_COLUMNS
-    };
-    let light_columns = if has_lights {
-        LIGHT_COLUMNS
-    } else {
-        ABSENT_LIGHT_COLUMNS
-    };
-    let override_column = if has_override {
-        RADIUS_OVERRIDE_COLUMN
-    } else {
-        ABSENT_RADIUS_OVERRIDE_COLUMN
-    };
-    let auto_load_column = if has_editor_id {
-        AUTO_LOAD_COLUMN
-    } else {
-        ABSENT_EDITOR_ID_AUTO_LOAD_COLUMN
-    };
-    let columns = format!(
-        "{REFERENCE_COLUMNS},{door_columns},{light_columns},{override_column},{auto_load_column}"
-    );
-    let mut joins = String::from(REFERENCE_JOIN);
-    if has_doors {
-        joins.push_str(DOOR_JOIN);
-    }
-    if has_lights {
-        joins.push_str(LIGHT_JOIN);
-    }
+    let ReferenceQuery {
+        columns,
+        joins,
+        has_doors,
+    } = query;
     let mut references = match key {
         CellKey::Exterior {
             worldspace_id,
@@ -896,7 +995,7 @@ fn load_cell(
         } => {
             let sql = format!(
                 "SELECT {columns} FROM exterior_spatial x JOIN \"references\" r ON r.id=x.id{joins} \
-WHERE x.worldspace_id=?1 AND x.minX>=?2 AND x.minX<?3 AND x.minY>=?4 AND x.minY<?5"
+                 WHERE x.worldspace_id=?1 AND x.minX>=?2 AND x.minX<?3 AND x.minY>=?4 AND x.minY<?5"
             );
             let min_x = grid_x as f32 * 4096.0;
             let min_y = grid_y as f32 * 4096.0;
@@ -920,7 +1019,7 @@ WHERE x.worldspace_id=?1 AND x.minX>=?2 AND x.minX<?3 AND x.minY>=?4 AND x.minY<
     // lead back to it (the doors of this cell are the rows a `door_links` row's
     // `destination_ref_id` can name), and its own doorway and its destination's, from the doorway
     // table. Both are read once for the whole run.
-    if has_doors && references.iter().any(|reference| reference.door.is_some()) {
+    if *has_doors && references.iter().any(|reference| reference.door.is_some()) {
         let links = tables.links.get_or_build(connection)?;
         let doorways = tables.doorways.get_or_build(connection)?;
         for reference in &mut references {
@@ -942,17 +1041,18 @@ WHERE x.worldspace_id=?1 AND x.minX>=?2 AND x.minX<?3 AND x.minY>=?4 AND x.minY<
 }
 
 fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
-    let destination_ref_id: Option<u32> = row.get(18)?;
-    let destination_cell_id: Option<u32> = row.get(19)?;
-    let destination_worldspace_id: Option<u32> = row.get(20)?;
+    let base_record_type: Option<String> = row.get(18)?;
+    let destination_ref_id: Option<u32> = row.get(19)?;
+    let destination_cell_id: Option<u32> = row.get(20)?;
+    let destination_worldspace_id: Option<u32> = row.get(21)?;
     let door = match destination_ref_id {
         Some(destination_ref_id) => Some(DoorLinkRow {
             destination_ref_id,
             destination_cell_id,
             destination_worldspace_id,
-            arrival_position: [row.get(21)?, row.get(22)?, row.get(23)?],
-            arrival_rotation: [row.get(24)?, row.get(25)?, row.get(26)?],
-            label: door_label(row.get(27)?),
+            arrival_position: [row.get(22)?, row.get(23)?, row.get(24)?],
+            arrival_rotation: [row.get(25)?, row.get(26)?, row.get(27)?],
+            label: door_label(row.get(28)?),
             // Both filled in after the query: the return link from the links that lead back into
             // this cell, the destination doorway from the doorway table.
             return_arrival: None,
@@ -962,14 +1062,14 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
     };
     // The `lights` row is present exactly when the join found one and it has the radius the design
     // makes `NOT NULL`; anything else is a reference this database cannot light.
-    let radius: Option<f32> = row.get(28)?;
+    let radius: Option<f32> = row.get(29)?;
     let light = match radius {
         Some(radius) => Some(LightRow {
             radius,
-            color: [row.get(29)?, row.get(30)?, row.get(31)?],
-            flags: row.get(32)?,
-            falloff: row.get(33)?,
-            fade: row.get(34)?,
+            color: [row.get(30)?, row.get(31)?, row.get(32)?],
+            flags: row.get(33)?,
+            falloff: row.get(34)?,
+            fade: row.get(35)?,
         }),
         None => None,
     };
@@ -977,6 +1077,7 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
         form_id: row.get(0)?,
         cell_id: row.get(1)?,
         base_form_id: row.get(2)?,
+        base_record_type,
         model_path: row.get(3)?,
         position: [row.get(4)?, row.get(5)?, row.get(6)?],
         rotation: [row.get(7)?, row.get(8)?, row.get(9)?],
@@ -987,8 +1088,8 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
         door,
         doorway: None,
         light,
-        light_radius_override: row.get(35)?,
-        auto_load: row.get(36)?,
+        light_radius_override: row.get(36)?,
+        auto_load: row.get(37)?,
     })
 }
 
@@ -1005,6 +1106,7 @@ mod tests {
     fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<CellPayload> {
         super::load_cell(
             connection,
+            &ReferenceQuery::for_connection(connection)?,
             generation,
             key,
             CellDetail::Full,
@@ -1111,20 +1213,50 @@ mod tests {
     }
 
     #[test]
+    fn base_record_type_distinguishes_fixed_static_from_movable_model() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        connection
+            .execute_batch(
+                "CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT NOT NULL);
+                 INSERT INTO records VALUES(20,'STAT');
+                 INSERT INTO statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(22,'clutter/barrel.nif',-1,-1,-1,1,1,1,1);
+                 INSERT INTO records VALUES(22,'MISC');
+                 INSERT INTO \"references\" VALUES(40,10,22,8250,-12150,55,0,0,0,1);
+                 INSERT INTO exterior_spatial VALUES(40,8250,8250,-12150,-12150,55,55,10,60);",
+            )
+            .unwrap();
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        let fixed = payload.references.iter().find(|r| r.form_id == 30).unwrap();
+        let movable = payload.references.iter().find(|r| r.form_id == 40).unwrap();
+        assert_eq!(fixed.base_record_type.as_deref(), Some("STAT"));
+        assert_eq!(movable.base_record_type.as_deref(), Some("MISC"));
+    }
+
+    #[test]
     fn catalog_rewrites_landscape_texture_paths() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(2,'textures/land/grass.dds'); INSERT INTO landscape_textures VALUES(1,2); INSERT INTO waters VALUES(9,'textures/water/flow.dds');",
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(2,'Textures\\Landscape\\Tundra02.DDS'); INSERT INTO landscape_textures VALUES(1,2); INSERT INTO waters VALUES(9,'textures/water/flow.dds');",
             )
             .unwrap();
         drop(connection);
         let catalog = AssetCatalog::open(&path).unwrap();
         assert_eq!(
             catalog.landscape_diffuse(1),
-            Some("textures/land/grass.ktx2")
+            Some("textures/landscape/tundra02.ktx2")
         );
         assert_eq!(catalog.water_flow(9), Some("textures/water/flow.ktx2"));
         // This fixture's `waters` table predates the fresnel/reflectivity columns entirely, the
@@ -1168,6 +1300,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn texture_paths_that_could_leave_the_textures_folder_are_refused() {
+        for path in [
+            "textures/../../secret.dds",
+            "..\\..\\secret.dds",
+            "textures/land/../../../secret.dds",
+            "/etc/secret.dds",
+            "C:/Windows/secret.dds",
+            "C:secret.dds",
+            "textures//grass.dds",
+            "textures/./grass.dds",
+            "embedded://grass.dds",
+            "textures/grass.dds:stream",
+            "",
+            "textures/",
+        ] {
+            assert_eq!(converted_texture_path(path.to_owned()), None, "{path}");
+        }
+        assert_eq!(
+            converted_texture_path("Textures\\Land\\Grass01.dds".to_owned()).as_deref(),
+            Some("textures/land/grass01.ktx2")
+        );
+        assert_eq!(
+            converted_texture_path("land/grass..old.dds".to_owned()).as_deref(),
+            Some("textures/land/grass..old.ktx2")
+        );
+    }
+
+    #[test]
+    fn catalog_finds_landscape_normal_maps_and_tolerates_their_absence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(2,'textures/land/snow.dds','textures/land/snow_n.dds'); INSERT INTO texture_sets VALUES(3,'textures/land/dirt.dds',''); INSERT INTO landscape_textures VALUES(1,2); INSERT INTO landscape_textures VALUES(4,3);",
+            )
+            .unwrap();
+        drop(connection);
+        let catalog = AssetCatalog::open(&path).unwrap();
+        assert_eq!(
+            catalog.landscape_normal(1),
+            Some("textures/land/snow_n.ktx2")
+        );
+        assert_eq!(
+            catalog.landscape_normal(4),
+            None,
+            "an empty normal path is no normal map"
+        );
+
+        // A database whose texture sets have no normal_path column at all still opens; the
+        // terrain then draws with its geometric normal.
+        let older = directory.path().join("older.db");
+        let connection = Connection::open(&older).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); INSERT INTO texture_sets VALUES(2,'textures/land/grass.dds'); INSERT INTO landscape_textures VALUES(1,2);",
+            )
+            .unwrap();
+        drop(connection);
+        let catalog = AssetCatalog::open(&older).unwrap();
+        assert_eq!(
+            catalog.landscape_diffuse(1),
+            Some("textures/land/grass.ktx2")
+        );
+        assert_eq!(catalog.landscape_normal(1), None);
+    }
+
     /// The terrain ring asks for the cell's landscape and nothing else: the cell id is what the
     /// cell cache is keyed by, and the references - which are most of a cell's cost - are not
     /// queried at all.
@@ -1186,6 +1386,7 @@ mod tests {
 
         let terrain_only = super::load_cell(
             &connection,
+            &ReferenceQuery::for_connection(&connection).unwrap(),
             7,
             key,
             CellDetail::Terrain,
@@ -1219,6 +1420,7 @@ mod tests {
 
         let payload = super::load_cell(
             &connection,
+            &ReferenceQuery::for_connection(&connection).unwrap(),
             1,
             CellKey::Interior(99),
             CellDetail::Terrain,
@@ -1244,6 +1446,7 @@ mod tests {
         assert!(
             super::load_cell(
                 &connection,
+                &ReferenceQuery::for_connection(&connection).unwrap(),
                 1,
                 absent,
                 CellDetail::Terrain,
@@ -1254,6 +1457,7 @@ mod tests {
         assert!(
             super::load_cell(
                 &connection,
+                &ReferenceQuery::for_connection(&connection).unwrap(),
                 1,
                 absent,
                 CellDetail::Full,
@@ -1306,6 +1510,37 @@ mod tests {
         let path = directory.path().join("truncated.db");
         std::fs::write(&path, b"SQLite format 3\0truncated").unwrap();
         assert!(WorldDatabase::open(&path).is_err());
+    }
+
+    #[test]
+    fn an_unusable_database_answers_every_request_with_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.db");
+        let (request_tx, request_rx) = bounded(4);
+        let (response_tx, response_rx) = unbounded();
+        let key = CellKey::Interior(99);
+        for generation in 0..2 {
+            request_tx
+                .send(DatabaseRequest::Load {
+                    generation,
+                    key,
+                    detail: CellDetail::Full,
+                    queued_at: Instant::now(),
+                })
+                .unwrap();
+        }
+        request_tx.send(DatabaseRequest::Shutdown).unwrap();
+
+        worker(path, request_rx, response_tx);
+
+        let responses: Vec<DatabaseResponse> = response_rx.try_iter().collect();
+        assert_eq!(responses.len(), 2, "every request is answered");
+        for response in responses {
+            let error = response
+                .result
+                .expect_err("the cell fails instead of loading");
+            assert!(error.contains("is unusable"), "{error}");
+        }
     }
 
     #[test]
@@ -1690,7 +1925,15 @@ mod tests {
 
         let mut cache = DoorTables::default();
         let loaded = |connection: &Connection, cache: &mut DoorTables| {
-            super::load_cell(connection, 1, key, CellDetail::Full, cache).unwrap()
+            super::load_cell(
+                connection,
+                &ReferenceQuery::for_connection(connection).unwrap(),
+                1,
+                key,
+                CellDetail::Full,
+                cache,
+            )
+            .unwrap()
         };
         assert!(
             arrival(&loaded(&connection, &mut cache)).is_some(),

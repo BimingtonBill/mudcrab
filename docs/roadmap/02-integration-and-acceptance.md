@@ -5,8 +5,13 @@ owned Skyrim Special Edition installation is required only for the final real-wo
 
 ## What is enforced
 
-- Converter schema 14, cell cache version 3, and world database schema 4 are exact-version contracts; stale outputs are
-  rejected by both launcher and engine.
+- The engine accepts converter manifest schemas 15–16, cell cache version 3, and world database
+  schemas 3–4, and rejects stale or incompatible outputs with the accepted range in the message.
+  The ranges are defined in `crates/engine/src/app.rs` (`MIN_RUNTIME_CONVERTER_SCHEMA_VERSION`)
+  and `crates/engine/src/world/database.rs` (`MIN_`/`MAX_RUNTIME_DATABASE_SCHEMA_VERSION`). The
+  launcher's "ready to play" check is stricter: it wants the current converter and world database
+  schemas exactly. (Portal branch: converter 101_601 and world database 100_401, each accepted
+  exactly; see `crates/shared/src/lib.rs`.)
 - Every converted `STAT`, `MSTT`, and `FURN` GLB is inspected. POSITION accessor bounds are
   transformed through the glTF node hierarchy and stored with `bounds_valid=1`.
 - `integration-report.json` records missing/invalid meshes, missing diffuse textures, database

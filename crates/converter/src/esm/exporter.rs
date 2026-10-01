@@ -17,6 +17,80 @@ use std::{collections::HashMap, str::from_utf8};
 
 const CELL_SIZE: f32 = 4096.0;
 
+fn invalid_movement_field(form_id: u32, field: &str) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("record {form_id:08X} has invalid {field}"),
+    )))
+}
+
+fn decode_npc_default_speeds(view: &SubrecordView<'_>, form_id: u32) -> Result<[f32; 8]> {
+    if view.get_string(b"EDID").as_deref() != Some("NPC_Default_MT") {
+        return Err(invalid_movement_field(
+            form_id,
+            "MOVT EDID (expected NPC_Default_MT)",
+        ));
+    }
+    let data = view
+        .find(b"SPED")
+        .ok_or_else(|| invalid_movement_field(form_id, "MOVT SPED"))?;
+    if data.len() != 40 && data.len() != 44 {
+        return Err(invalid_movement_field(
+            form_id,
+            "MOVT SPED length (expected 40 or 44 bytes)",
+        ));
+    }
+    let mut speeds = [0.0; 8];
+    for (index, speed) in speeds.iter_mut().enumerate() {
+        *speed = f32::from_le_bytes(data[index * 4..index * 4 + 4].try_into().unwrap());
+        if !speed.is_finite() || *speed <= 0.0 {
+            return Err(invalid_movement_field(
+                form_id,
+                &format!("MOVT SPED[{index}]"),
+            ));
+        }
+    }
+    Ok(speeds)
+}
+
+fn decode_movement_setting(view: &SubrecordView<'_>, form_id: u32) -> Result<f32> {
+    let data = view
+        .find(b"DATA")
+        .ok_or_else(|| invalid_movement_field(form_id, "GMST DATA"))?;
+    if data.len() != 4 {
+        return Err(invalid_movement_field(
+            form_id,
+            "GMST DATA length (expected 4 bytes)",
+        ));
+    }
+    let value = f32::from_le_bytes(data.try_into().unwrap());
+    if !value.is_finite() {
+        return Err(invalid_movement_field(form_id, "GMST DATA value"));
+    }
+    Ok(value)
+}
+
+fn optional_race_movement_link(
+    view: &SubrecordView<'_>,
+    form_id: u32,
+    tag: &[u8; 4],
+) -> Result<Option<u32>> {
+    let Some(data) = view.find(tag) else {
+        return Ok(None);
+    };
+    if data.len() != 4 {
+        return Err(invalid_movement_field(
+            form_id,
+            &format!(
+                "RACE {} length (expected 4 bytes)",
+                String::from_utf8_lossy(tag)
+            ),
+        ));
+    }
+    let value = u32::from_le_bytes(data.try_into().unwrap());
+    Ok((value != 0).then_some(value))
+}
+
 pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"PRAGMA foreign_keys = ON;
@@ -132,6 +206,26 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              tree_index INTEGER NOT NULL, pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
              rotation REAL NOT NULL DEFAULT 0, scale REAL NOT NULL DEFAULT 1
          );
+         CREATE TABLE IF NOT EXISTS movement_types (
+             id INTEGER PRIMARY KEY, editor_id TEXT NOT NULL,
+             left_walk REAL NOT NULL, left_run REAL NOT NULL,
+             right_walk REAL NOT NULL, right_run REAL NOT NULL,
+             forward_walk REAL NOT NULL, forward_run REAL NOT NULL,
+             back_walk REAL NOT NULL, back_run REAL NOT NULL,
+             load_order INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS race_movement_links (
+             id INTEGER PRIMARY KEY, walk_movt_id INTEGER, run_movt_id INTEGER,
+             load_order INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS movement_game_settings (
+             id INTEGER PRIMARY KEY, editor_id TEXT NOT NULL,
+             value REAL NOT NULL, load_order INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS lod (
+             cell_id INTEGER NOT NULL, lod_level INTEGER NOT NULL, mesh_data BLOB NOT NULL,
+             PRIMARY KEY (cell_id, lod_level)
+         );
          CREATE INDEX IF NOT EXISTS idx_lod_tree_block ON lod_tree_instance(worldspace_id, block_x, block_y);
          CREATE TABLE IF NOT EXISTS waters (
              id INTEGER PRIMARY KEY, editor_id TEXT, opacity INTEGER, flags INTEGER NOT NULL,
@@ -199,6 +293,9 @@ type CellMetadata = (Option<i32>, Option<i32>, Option<u32>);
 
 pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM movement_types", [])?;
+    tx.execute("DELETE FROM movement_game_settings", [])?;
+    tx.execute("DELETE FROM race_movement_links", [])?;
     let mut cells: HashMap<u32, CellMetadata> = HashMap::new();
 
     for (&form_id, record) in master
@@ -276,22 +373,40 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
                 let cell_id = record.cell_form_id.unwrap_or(form_id);
                 tx.execute("INSERT OR REPLACE INTO land(cell_id, heightmap, vtex, vclr, normals) VALUES (?1, ?2, ?3, ?4, ?5)", params![cell_id, heightmap, vtex, vclr, normals])?;
             }
-            "STAT" | "MSTT" | "FURN" | "DOOR" | "ACTI" | "FLOR" | "CONT" | "TREE" | "LIGH" => {
+            "LIGH" => {
                 let view = SubrecordView::new(&record.subrecords);
                 // Every `LIGH` lights the space whether or not it has
                 // geometry, so it gets a `lights` row regardless.
-                if record.record_type == *b"LIGH" {
-                    insert_light(&tx, form_id, &view)?;
-                }
-                let model_path = view.get_string(b"MODL").filter(|path| !path.is_empty());
+                insert_light(&tx, form_id, &view)?;
                 // Most `LIGH` records carry no model: they light the space with
                 // nothing to draw. Storing one row per invisible light would put
                 // a meshless entry in `statics` for every candle in the game, so
                 // those are skipped; a light with geometry is stored like any
                 // other base object.
-                if record.record_type == *b"LIGH" && model_path.is_none() {
-                    continue;
+                if let Some(model_path) = view.get_string(b"MODL").filter(|path| !path.is_empty()) {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO statics(id, editor_id, model_path, flags) VALUES (?1, ?2, ?3, ?4)",
+                        params![form_id, view.get_string(b"EDID"), model_path, record.flags],
+                    )?;
                 }
+            }
+            // Every base record type with a world model. The runtime spawns
+            // anything that resolves a model path here, so trees, flora,
+            // containers, doors, activators, and placed inventory all render;
+            // records without MODL (triggers, markers) store NULL and are
+            // skipped at spawn time. `LIGH` is handled above: the light goes
+            // in `lights` and only a light with geometry lands in `statics`.
+            "STAT" | "MSTT" | "FURN" | "TREE" | "FLOR" | "CONT" | "DOOR" | "ACTI" | "WEAP"
+            | "MISC" | "BOOK" | "AMMO" | "ALCH" | "INGR" | "SLGM" | "KEYM" | "SCRL" | "ARMO" => {
+                let view = SubrecordView::new(&record.subrecords);
+                // ARMO has no MODL path; its world models live in the
+                // gendered MOD2/MOD3 slots (male first, female fallback).
+                let model = if type_str == "ARMO" {
+                    view.get_string(b"MOD2")
+                        .or_else(|| view.get_string(b"MOD3"))
+                } else {
+                    view.get_string(b"MODL")
+                };
                 // A `STAT`'s `DNAM` names a directional material object and the
                 // angle it covers: the snow on a roof is this, not a separate
                 // model. Only `STAT` carries it; other base objects leave both
@@ -304,7 +419,7 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
                     params![
                         form_id,
                         view.get_string(b"EDID"),
-                        model_path,
+                        model,
                         record.flags,
                         directional.map(|material| material.material_object),
                         directional.map(|material| material.max_angle),
@@ -341,6 +456,34 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
                     "INSERT OR REPLACE INTO npcs(id, editor_id, full_name, race_id, class_id, flags) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![form_id, view.get_string(b"EDID"), view.get_string(b"FULL"), view.get_form_id(b"RNAM"), view.get_form_id(b"CNAM"), record.flags],
                 )?;
+            }
+            "RACE" => {
+                let walk = optional_race_movement_link(&view, form_id, b"WKMV")?;
+                let run = optional_race_movement_link(&view, form_id, b"RNMV")?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO race_movement_links(id, walk_movt_id, run_movt_id, load_order) VALUES (?1, ?2, ?3, ?4)",
+                    params![form_id, walk, run, record.load_order],
+                )?;
+            }
+            "MOVT" if form_id == 0x0003_580D => {
+                let speeds = decode_npc_default_speeds(&view, form_id)?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO movement_types(id, editor_id, left_walk, left_run, right_walk, right_run, forward_walk, forward_run, back_walk, back_run, load_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![form_id, "NPC_Default_MT", speeds[0], speeds[1], speeds[2], speeds[3], speeds[4], speeds[5], speeds[6], speeds[7], record.load_order],
+                )?;
+            }
+            "GMST" => {
+                let editor_id = view.get_string(b"EDID");
+                if matches!(
+                    editor_id.as_deref(),
+                    Some("fMoveCharWalkBase" | "fJumpHeightMin")
+                ) {
+                    let value = decode_movement_setting(&view, form_id)?;
+                    tx.execute(
+                        "INSERT OR REPLACE INTO movement_game_settings(id, editor_id, value, load_order) VALUES (?1, ?2, ?3, ?4)",
+                        params![form_id, editor_id, value, record.load_order],
+                    )?;
+                }
             }
             "WATR" => {
                 let view = SubrecordView::new(&record.subrecords);
@@ -382,15 +525,15 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
             }
             "LTEX" => {
                 let view = SubrecordView::new(&record.subrecords);
-                let material = view
-                    .find(b"HNAM")
-                    .filter(|bytes| bytes.len() >= 2)
-                    .map(|bytes| {
-                        u16::from_le_bytes(bytes[..2].try_into().expect("two-byte material type"))
-                    });
+                let havok = view.find(b"HNAM");
+                let friction = havok
+                    .and_then(|bytes| bytes.first())
+                    .copied()
+                    .map(f32::from);
+                let restitution = havok.and_then(|bytes| bytes.get(1)).copied().map(f32::from);
                 tx.execute(
                     "INSERT OR REPLACE INTO landscape_textures(id,editor_id,texture_set_id,material_type,friction,restitution) VALUES (?1,?2,?3,?4,?5,?6)",
-                    params![form_id, view.get_string(b"EDID"), view.get_form_id(b"TNAM"), material, Option::<f32>::None, Option::<f32>::None],
+                    params![form_id, view.get_string(b"EDID"), view.get_form_id(b"TNAM"), view.get_form_id(b"MNAM"), friction, restitution],
                 )?;
             }
             _ => {}
@@ -782,8 +925,7 @@ pub fn insert_reference(
     let blob = serialize_subrecords(subs);
     // `XRDS` is the reference's own radius, in the same Creation units as a
     // light's `DATA` radius and usually different from it: 10,810 of the
-    // 12,148 `LIGH` references in Skyrim.esm carry one, including 228 of the
-    // 231 on the Alftand -> Blackreach demo route. It rides on glow and beam
+    // 12,148 `LIGH` references in Skyrim.esm carry one. It rides on glow and beam
     // references as well, so any reference that has it keeps it; the engine
     // reads it for light references only, where it overrides the base
     // light's radius. It is a single little-endian `f32` and may be negative.
@@ -906,6 +1048,9 @@ mod tests {
             "statics",
             "lights",
             "npcs",
+            "movement_types",
+            "race_movement_links",
+            "movement_game_settings",
             "scripts",
             "waters",
             "texture_sets",
@@ -944,6 +1089,107 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(rows, vec![shared::WORLD_DATABASE_SCHEMA_VERSION]);
+    }
+
+    #[test]
+    fn exports_selected_movement_values_and_rejects_bad_sped() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let speeds: Vec<u8> = [
+            80.09f32,
+            370.0,
+            79.75,
+            370.0,
+            80.1,
+            370.0,
+            71.93,
+            205.25,
+            std::f32::consts::PI,
+            std::f32::consts::PI,
+            std::f32::consts::PI,
+        ]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+        let movement = RawRecord {
+            form_id: 0x0003_580D,
+            record_type: *b"MOVT",
+            flags: 0,
+            subrecords: vec![
+                (b"EDID".to_vec(), b"NPC_Default_MT\0".to_vec()),
+                (b"SPED".to_vec(), speeds),
+            ],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 2,
+        };
+        let jump = RawRecord {
+            form_id: 0x000A_BEF6,
+            record_type: *b"GMST",
+            flags: 0,
+            subrecords: vec![
+                (b"EDID".to_vec(), b"fJumpHeightMin\0".to_vec()),
+                (b"DATA".to_vec(), 76.0f32.to_le_bytes().to_vec()),
+            ],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 0,
+        };
+        let race = RawRecord {
+            form_id: 0x0001_3746,
+            record_type: *b"RACE",
+            flags: 0,
+            subrecords: vec![(b"EDID".to_vec(), b"NordRace\0".to_vec())],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 1,
+        };
+        let master = HashMap::from([
+            (movement.form_id, movement.clone()),
+            (jump.form_id, jump),
+            (race.form_id, race.clone()),
+        ]);
+        export_to_db(&conn, &master).unwrap();
+        let (walk_link, run_link, race_source): (Option<u32>, Option<u32>, u32) = conn
+            .query_row(
+                "SELECT walk_movt_id, run_movt_id, load_order FROM race_movement_links WHERE id=79686",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((walk_link, run_link, race_source), (None, None, 1));
+        let (forward_walk, forward_run, back_run, source): (f32, f32, f32, u32) = conn.query_row(
+            "SELECT forward_walk, forward_run, back_run, load_order FROM movement_types WHERE id=219149",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            (forward_walk, forward_run, back_run, source),
+            (80.1, 370.0, 205.25, 2)
+        );
+        let height: f32 = conn
+            .query_row(
+                "SELECT value FROM movement_game_settings WHERE editor_id='fJumpHeightMin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(height, 76.0);
+
+        let mut legacy = movement.clone();
+        legacy.subrecords[1].1.truncate(40);
+        export_to_db(&conn, &HashMap::from([(legacy.form_id, legacy)])).unwrap();
+
+        let mut broken = movement;
+        broken.subrecords[1].1[0..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        let error = export_to_db(&conn, &HashMap::from([(broken.form_id, broken)])).unwrap_err();
+        assert!(error.to_string().contains("MOVT SPED[0]"));
+        let mut broken_race = race;
+        broken_race
+            .subrecords
+            .push((b"WKMV".to_vec(), vec![1, 2, 3]));
+        let error =
+            export_to_db(&conn, &HashMap::from([(broken_race.form_id, broken_race)])).unwrap_err();
+        assert!(error.to_string().contains("RACE WKMV length"));
     }
 
     #[test]
@@ -1036,6 +1282,126 @@ mod tests {
         assert_eq!(reflection, u32::from_le_bytes([119, 140, 157, 0]));
         assert!((fresnel - 0.10).abs() < 1.0e-6);
         assert!((reflectivity - 0.8).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn reads_ltex_material_from_mnam_and_havok_from_hnam() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        // Real-world shape: MNAM is the material-type MATT FormID, HNAM is two
+        // Havok bytes (friction, restitution). Values mirror observed rows like
+        // LDirtSnowPath01 (HNAM 1e 1e).
+        let record = RawRecord {
+            form_id: 0x0001_B342,
+            record_type: *b"LTEX",
+            flags: 0,
+            subrecords: vec![
+                (b"EDID".to_vec(), b"LDirtSnowPath01\0".to_vec()),
+                (b"TNAM".to_vec(), 0x0001_2F38u32.to_le_bytes().to_vec()),
+                (b"MNAM".to_vec(), 0x0001_2F38u32.to_le_bytes().to_vec()),
+                (b"HNAM".to_vec(), vec![0x1e, 0x1e]),
+            ],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 0,
+        };
+        let mut master = HashMap::new();
+        master.insert(record.form_id, record);
+        export_to_db(&conn, &master).unwrap();
+
+        let (texture_set_id, material, friction, restitution): (
+            Option<u32>,
+            Option<u32>,
+            Option<f32>,
+            Option<f32>,
+        ) = conn
+            .query_row(
+                "SELECT texture_set_id, material_type, friction, restitution FROM landscape_textures WHERE id=?1",
+                [0x0001_B342u32],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(texture_set_id, Some(0x0001_2F38));
+        assert_eq!(material, Some(0x0001_2F38));
+        assert_eq!(friction, Some(30.0));
+        assert_eq!(restitution, Some(30.0));
+    }
+
+    #[test]
+    fn exports_world_models_for_every_placeable_base_type() {
+        fn base(
+            form_id: u32,
+            record_type: &[u8; 4],
+            model_tag: &[u8; 4],
+            model: Option<&str>,
+        ) -> RawRecord {
+            let mut subrecords = vec![(b"EDID".to_vec(), b"TestBase\0".to_vec())];
+            if let Some(model) = model {
+                let mut path = model.as_bytes().to_vec();
+                path.push(0);
+                subrecords.push((model_tag.to_vec(), path));
+            }
+            RawRecord {
+                form_id,
+                record_type: *record_type,
+                flags: 0,
+                subrecords,
+                cell_form_id: None,
+                worldspace_form_id: None,
+                load_order: 0,
+            }
+        }
+        let master: HashMap<u32, RawRecord> = [
+            base(1, b"TREE", b"MODL", Some("Landscape\\Trees\\Pine01.nif")),
+            base(
+                2,
+                b"FLOR",
+                b"MODL",
+                Some("Landscape\\Plants\\Thistle01.nif"),
+            ),
+            base(3, b"CONT", b"MODL", Some("Furniture\\Chest01.nif")),
+            base(4, b"DOOR", b"MODL", Some("Architecture\\Door01.nif")),
+            base(5, b"ACTI", b"MODL", None),
+            // A light with geometry lands in `statics` like any other modelled
+            // base object; a modelless light lives only in the `lights` table
+            // (PR40) and gets no `statics` row at all.
+            base(6, b"LIGH", b"MODL", Some("Clutter\\Lantern01.nif")),
+            base(7, b"WEAP", b"MODL", Some("Weapons\\Sword01.nif")),
+            base(8, b"ARMO", b"MOD2", Some("Armor\\Helmet01.nif")),
+            base(9, b"ARMO", b"MOD3", Some("Armor\\HelmetFemale01.nif")),
+            base(10, b"NPC_", b"MODL", None),
+            // ARMO carries a binary MODL chunk that is not a path; with no
+            // MOD2/MOD3 present the row must store NULL, not garbage.
+            base(11, b"ARMO", b"MODL", Some("G.\u{1}binary")),
+        ]
+        .into_iter()
+        .map(|record| (record.form_id, record))
+        .collect();
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        export_to_db(&conn, &master).unwrap();
+        let models: Vec<(u32, Option<String>)> = conn
+            .prepare("SELECT id, model_path FROM statics ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            models,
+            vec![
+                (1, Some("Landscape\\Trees\\Pine01.nif".to_owned())),
+                (2, Some("Landscape\\Plants\\Thistle01.nif".to_owned())),
+                (3, Some("Furniture\\Chest01.nif".to_owned())),
+                (4, Some("Architecture\\Door01.nif".to_owned())),
+                (5, None),
+                (6, Some("Clutter\\Lantern01.nif".to_owned())),
+                (7, Some("Weapons\\Sword01.nif".to_owned())),
+                (8, Some("Armor\\Helmet01.nif".to_owned())),
+                (9, Some("Armor\\HelmetFemale01.nif".to_owned())),
+                (11, None),
+            ]
+        );
     }
 
     #[test]
@@ -1661,8 +2027,7 @@ mod tests {
     /// - `DATA` is 48 bytes in every `LIGH` record of Skyrim.esm, which is the
     ///   size of the layout UESP documents.
     /// - `XRDS`, the reference's own radius, rides on almost every light
-    ///   reference (10,810 of 12,148 in Skyrim.esm, 228 of the 231 inside
-    ///   Alftand01 / Alftand02 / AlftandWorld / Blackreach), which is why the
+    ///   reference (10,810 of 12,148 in Skyrim.esm), which is why the
     ///   `references` table has a `radius_override` column at all.
     ///
     /// The expected torch values are the bytes `DefaultTorch01NS_FastSaturate`
@@ -1670,15 +2035,17 @@ mod tests {
     /// `E9 9E 4B 00` colour (233, 158, 75), `09 20 00 00` flags 0x2009,
     /// `00 00 80 3F` falloff 1.0, and `FNAM` 1.0.
     ///
-    /// Reads the game install (`OPENSKYRIM_SKYRIM_DATA`), so it is opt-in and
-    /// skips without it: `cargo test -p converter --lib -- --ignored`.
+    /// Reads the game install, so it is opt-in:
+    /// `cargo test -p converter --lib -- --ignored`.
     #[test]
-    #[ignore = "reads Skyrim.esm from the Skyrim SE install"]
+    #[ignore = "requires OPENSKYRIM_SKYRIM_DATA with locally installed game assets"]
     fn lights_of_the_real_plugin_decode_through_export() {
         use std::collections::HashSet;
-        let Some(plugin) = installed_plugin("Skyrim.esm") else {
-            return;
-        };
+        let data_dir = std::env::var_os("OPENSKYRIM_SKYRIM_DATA")
+            .map(std::path::PathBuf::from)
+            .expect("set OPENSKYRIM_SKYRIM_DATA to the Skyrim Data directory");
+        let plugin = data_dir.join("Skyrim.esm");
+        assert!(plugin.is_file(), "no Skyrim.esm at {}", plugin.display());
         let records = crate::esm::binary::parse_plugin_file(&plugin).unwrap();
 
         let mut light_count = 0usize;
@@ -1699,15 +2066,12 @@ mod tests {
         eprintln!("LIGH records with a 48-byte DATA: {light_count}");
         assert!(light_count > 400, "only {light_count} LIGH records found");
 
-        // Alftand01 cell, Alftand02 cell, AlftandWorld worldspace, Blackreach.
-        const ROUTE: [u32; 4] = [0x152C3, 0x56C1B, 0x69857, 0x1EE62];
         let light_ids: HashSet<u32> = records
             .iter()
             .filter(|record| record.record_type == *b"LIGH")
             .map(|record| record.form_id)
             .collect();
         let (mut all_refs, mut all_overrides) = (0usize, 0usize);
-        let (mut route_refs, mut route_overrides) = (0usize, 0usize);
         for record in records.iter().filter(|r| r.record_type == *b"REFR") {
             let base = record
                 .subrecords
@@ -1724,34 +2088,18 @@ mod tests {
                 .any(|(tag, data)| tag.as_slice() == b"XRDS" && data.len() >= 4);
             all_refs += 1;
             all_overrides += usize::from(has_override);
-            let on_route = record
-                .cell_form_id
-                .is_some_and(|cell| ROUTE.contains(&cell))
-                || record
-                    .worldspace_form_id
-                    .is_some_and(|world| ROUTE.contains(&world));
-            if on_route {
-                route_refs += 1;
-                route_overrides += usize::from(has_override);
-            }
         }
-        eprintln!(
-            "LIGH references with an XRDS radius override: {all_overrides}/{all_refs} of the \
-             plugin, {route_overrides}/{route_refs} on the Alftand -> Blackreach route"
-        );
+        eprintln!("LIGH references with an XRDS radius override: {all_overrides}/{all_refs}");
         assert!(
             all_overrides * 10 > all_refs * 8,
             "an override is common in the plugin itself"
         );
-        assert!(
-            route_overrides * 20 > route_refs * 19,
-            "an override is nearly universal on the demo route"
-        );
 
         const TORCH: u32 = 0xCB3B0;
-        const ROUTE_REF: u32 = 0x56D56;
-        const ROUTE_LIGHT: u32 = 0x194F4;
-        let wanted: HashSet<u32> = [TORCH, ROUTE_REF, ROUTE_LIGHT, 0x152C3]
+        // An ice candle's reference, its `IceCandleLight01` base, and the cell it stands in.
+        const CANDLE_REF: u32 = 0x56D56;
+        const CANDLE_LIGHT: u32 = 0x194F4;
+        let wanted: HashSet<u32> = [TORCH, CANDLE_REF, CANDLE_LIGHT, 0x152C3]
             .into_iter()
             .collect();
         let master: HashMap<u32, RawRecord> = records
@@ -1807,7 +2155,7 @@ mod tests {
         let override_radius: Option<f64> = conn
             .query_row(
                 "SELECT radius_override FROM \"references\" WHERE id=?1",
-                [ROUTE_REF],
+                [CANDLE_REF],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1815,7 +2163,7 @@ mod tests {
         let base_radius: f64 = conn
             .query_row(
                 "SELECT radius FROM lights WHERE id=?1",
-                [ROUTE_LIGHT],
+                [CANDLE_LIGHT],
                 |row| row.get(0),
             )
             .unwrap();

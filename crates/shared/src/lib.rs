@@ -1,10 +1,21 @@
 //! Stable data contracts shared by the offline converter and the runtime.
 
+pub mod collision;
 pub mod coordinates;
 
 use rkyv::{Archive, Deserialize, Serialize};
 
-pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 6;
+/// The world database's schema version.
+///
+/// **Portal numbering.** On the `portal` branch this is `100_000 + main * 100 + portal_revision`:
+/// main's number (4 when this was merged) in the hundreds, the portal's own extra tables (LOD,
+/// lights, door links, per-space lighting) in the last two digits, and the 100_000 offset keeps a
+/// portal number from ever being mistaken for a number main reaches by itself (main's next bump,
+/// Chef's #105, takes world DB 5). When main's number moves, merge it into the middle digits and
+/// reset the revision; never take main's raw value here. The matching converter constant is
+/// `CONVERTER_SCHEMA_VERSION` in `converter::cache`; the converter has a test that fails if either
+/// falls back below 100_000.
+pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 100_401;
 pub const CELL_CACHE_VERSION: u32 = 3;
 pub const LAND_SIDE: u16 = 33;
 

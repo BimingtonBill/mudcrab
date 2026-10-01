@@ -196,6 +196,10 @@ pub struct StreamingWorld {
     /// caller having to pass the active cell in. `None` while the camera is outdoors, and before
     /// the plan has run at all.
     active_interior: Option<u32>,
+    /// Cells loaded by id through [`StreamingWorld::request_cell`] rather than by the plan. The
+    /// plan keeps them whatever the camera does, the way main's streamer keeps an interior until
+    /// something unloads it: the streaming fixture loads one this way and checks it stays.
+    pinned: HashSet<CellKey>,
 }
 
 impl StreamingWorld {
@@ -238,6 +242,54 @@ impl StreamingWorld {
                 })
             ) && !retry_failed_interior(key, self.active_interior, self))
     }
+}
+
+/// Marks a terrain quadrant that carries a rapier collider. Portal's streaming does not build
+/// terrain colliders yet (main's does); the marker exists so `crate::physics` compiles.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct TerrainCollider;
+
+impl StreamingWorld {
+    /// Submits one full-detail load for `key` unless it is already loading, resident or failed,
+    /// and records the request on the streaming metrics. The streaming fixture loads its interior
+    /// through this, by id, because nothing in the planner switches the active space on its own.
+    pub(crate) fn request_cell(
+        &mut self,
+        database: &WorldDatabase,
+        key: CellKey,
+        metrics: &mut StreamingMetrics,
+        profiler: &mut ProfilingState,
+    ) {
+        self.pinned.insert(key);
+        if self.cells.contains_key(&key) {
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        if database.try_request(DatabaseRequest::Load {
+            generation,
+            key,
+            detail: CellDetail::Full,
+            queued_at: Instant::now(),
+        }) {
+            metrics.requests_submitted += 1;
+            profiler.increment("streaming/requests", 1);
+            profiler.event(format!("{key:?}"), "requested", None);
+            self.cells.insert(
+                key,
+                CellStatus::Loading {
+                    generation,
+                    detail: CellDetail::Full,
+                    replaced: None,
+                },
+            );
+        }
+    }
+}
+
+/// The exterior grid square the camera is over, from its rebased translation and the render origin.
+pub(crate) fn streaming_center(translation: Vec3, origin: IVec2) -> IVec2 {
+    camera_grid(translation, origin)
 }
 
 /// The cell the camera streams from: the exterior worldspace around it, or the interior it is
@@ -402,6 +454,32 @@ pub struct StreamingMetrics {
     pub streaming_fixture_validated: bool,
     pub streaming_fixture_failures: u64,
     pub asset_failures: Vec<AssetFailure>,
+    // Main's paced-unload, paced-model-spawn and collision counters. Portal's streaming does not
+    // drive them yet (they stay zero); they exist so the shared profiling and physics code, which
+    // came in with main, reads one metrics struct.
+    pub despawns_this_frame: u64,
+    pub max_despawns_per_frame: u64,
+    pub despawned_entities: u64,
+    pub instances_spawned_this_frame: u64,
+    pub max_instances_spawned_per_frame: u64,
+    pub arming_queue_depth: usize,
+    pub peak_arming_queue_depth: usize,
+    pub instances_armed_this_frame: u64,
+    pub max_instances_armed_per_frame: u64,
+    pub instances_completed_this_scan: u64,
+    pub max_instances_completed_per_scan: u64,
+    pub retiring_cells: usize,
+    pub peak_retiring_cells: usize,
+    pub revived_cells: u64,
+    pub retire_backlog_overflows: u64,
+    pub static_colliders_authored: u64,
+    pub static_colliders_partial: u64,
+    pub static_colliders_proxy: u64,
+    pub resident_static_colliders: usize,
+    pub static_colliders_authored_absent: u64,
+    pub static_colliders_skipped: u64,
+    pub physics_fixture_validated: bool,
+    pub physics_fixture_failures: u64,
 }
 
 #[derive(Debug, Clone, Reflect, Serialize, Deserialize, PartialEq, Eq)]
@@ -659,15 +737,17 @@ fn plan_cells(
             },
         );
     }
+    let pinned = std::mem::take(&mut streaming.pinned);
     streaming.cells.retain(|key, status| {
-        let keep = cell_within_unload_radius(
-            *key,
-            &active,
-            center,
-            config.unload_radius,
-            config.terrain_radius,
-            &prestream,
-        );
+        let keep = pinned.contains(key)
+            || cell_within_unload_radius(
+                *key,
+                &active,
+                center,
+                config.unload_radius,
+                config.terrain_radius,
+                &prestream,
+            );
         if !keep {
             metrics.unloaded_cells += 1;
             continuity.edges.remove(key);
@@ -686,6 +766,7 @@ fn plan_cells(
         }
         keep
     });
+    streaming.pinned = pinned;
     let StreamingWorld {
         cells,
         full_failed,
@@ -5069,6 +5150,7 @@ mod tests {
             door,
             doorway: None,
             light: None,
+            base_record_type: None,
             light_radius_override: None,
             auto_load,
         };
@@ -5136,6 +5218,7 @@ mod tests {
                 }),
                 doorway: None,
                 light: None,
+                base_record_type: None,
                 light_radius_override: None,
                 auto_load: false,
             })
@@ -5202,6 +5285,7 @@ mod tests {
                 }),
                 doorway: None,
                 light: None,
+                base_record_type: None,
                 light_radius_override: None,
                 auto_load,
             })
@@ -5250,6 +5334,7 @@ mod tests {
             door: None,
             doorway: None,
             light,
+            base_record_type: None,
             light_radius_override: radius_override,
             auto_load: false,
         }
