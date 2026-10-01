@@ -3,6 +3,27 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+### 2026-10-01 (day) - Claude [phase1] Phase 1 Dev (portal catch-up converter half; textures; #104a)
+
+**Portal catch-up (the user's option B):** converter-state brief `local/research/converter-state-for-portal-merge.md`;
+schema numbering approved, portal = 100_000 + main*100 + rev (converter 101_601, DB 100_401; `cache.rs` doc +
+test). Resolved converter/dummy-content conflicts on `portal-merge-main` (386044af), merged held
+publish-robustness, staging-leftovers, check-outside-data (3570acb8). Reconverted to
+`D:\Modding-overflow\SkyrimConverted-portal` (44:55, complete, 0 failed, `converter check` all good).
+
+**Texture speed-up = draft #114** (`phase1/native-rgba8` 12a257fa): uncompressed DDS to native BC1/BC7 via
+intel_tex_2 instead of Basis UASTC. Quiet A/B on textures-only data: texture stage 13:27 -> 5:23, disk/GPU equal,
+FLIP better on all samples (`D:\Modding-overflow	ex-ab\`). **LOD containers = draft #115** (reference for Chef;
+LOD is his, #103/#105). **#104 phase (a)** `phase1/physics-bodies` 448a51c2 FROZEN pending the user's yes on the
+draft; contract `local/research/p104-physics-body-contract.md`; clutter census 727/1,686/1,745 vs 754/1,781/1,746
+(gap = existing skips). Convert-while-playing scoped (`local/research/convert-while-playing-scope.md`, issue #111)
+and ON HOLD (Chef suggested run-time loading; one-cell spike proposed).
+
+**Lesson (the user):** a silent runner failure plus an open-ended booking cost ~1.5 h: runners signal failure
+in `finally`, waits have deadlines, disk checked first, bookings carry an END-by time (memory
+`feedback-long-runs-fail-safe`). Conversions run in a visible console (memory `feedback-conversions-visible-console`).
+**Waiting on the user:** #104a draft, #104 coverage follow-up. **No workers running.**
+
 ### 2026-09-30/10-01 - Claude [phase1] Phase 1 Dev (Sol-review fixes sent; overnight jobs 1-4 held)
 
 **Sent via Upstream Dev (the user's yes each):** #69 output-dir guard, #71 restore #30 + fixes, #73 remove
