@@ -33,7 +33,8 @@ threads load no faster and lengthen frames; the model-arming cap was the whole b
 pool size (`--io-threads` stays as an override) and arms 32 models a frame (a75bb1b4..67a1e7e8, coder #663):
 ready after jump 2.36-2.80 s -> 0.82-1.04 s, worst loading frame 14.7-20.4 -> 15.2-18.4 ms (8 runs), fly model wait
 692-704 -> 97-168 ms. Option for the user: Bevy's C zstd (`zstd_c` instead of `zstd_rust`; the converter already
-uses C zstd): another ~25% (jump 0.63-0.70 s) for a worst loading frame of 19-24 ms. PR texts rewritten.
+uses C zstd): another ~25% (jump 0.63-0.70 s) for a worst loading frame of 19-24 ms. PR texts rewritten. Final DeepSeek review #664: small fixes (wording, report format 10), done in 3adba3bf;
+nextest engine 255/255, clippy, fmt. Branch head **3adba3bf**.
 
 ### 2026-10-01 (day) - Claude [portal] Portal Dev (catch-up with main, steps 1-5 of 7)
 
