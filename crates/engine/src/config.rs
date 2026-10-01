@@ -455,6 +455,10 @@ pub struct PortalOptions {
     /// to hide a defect that only shows up when the player does not linger. Inert unless
     /// `--demo-tour` names an output folder for it.
     pub tour_dwell: Option<f32>,
+    /// `--tour-clip`: the walk-through keeps a clip's worth of frames around each crossing instead
+    /// of the twenty a check needs - the whole walk in from the standoff and a second and a half
+    /// after the swap - for making a video of the crossing. Inert unless `--demo-tour` is given.
+    pub tour_clip: bool,
     /// `--tour-bench <file.csv>`: at each outside door of the `--demo-tour` route, before the walk
     /// presses `E`, hold the view still and time the frames with the door closed, open in view and
     /// open behind the camera, then write one CSV row per door and state here
@@ -542,6 +546,7 @@ impl Default for PortalOptions {
             tour_doors: None,
             tour_repeat: None,
             tour_dwell: None,
+            tour_clip: false,
             tour_bench: None,
             portal_bench: None,
             bench_out: None,
@@ -611,6 +616,7 @@ impl PortalOptions {
             "--tour-dwell" => {
                 config.portal.tour_dwell = args.next().and_then(|value| value.parse().ok());
             }
+            "--tour-clip" => config.portal.tour_clip = true,
             "--tour-bench" => config.portal.tour_bench = args.next().map(PathBuf::from),
             "--portal-bench" => config.portal.portal_bench = args.next().map(PathBuf::from),
             "--bench-out" => config.portal.bench_out = args.next().map(PathBuf::from),
@@ -1457,6 +1463,14 @@ mod tests {
                 .tour_repeat,
             None
         );
+    }
+
+    #[test]
+    fn a_tour_clip_flag_asks_for_a_clip_of_each_crossing() {
+        let config =
+            EngineConfig::from_args(["--demo-tour", "out", "--tour-clip"].map(str::to_owned));
+        assert!(config.portal.tour_clip);
+        assert!(!EngineConfig::default().portal.tour_clip);
     }
 
     #[test]

@@ -271,6 +271,22 @@ const WALK_WINDOW: u32 = 10;
 /// it are the ones the run is judged on. Thirty is the ten the window needs plus a wide margin
 /// (`docs/research/faster-automated-checks.md`, P4).
 const WALK_RING: usize = 30;
+/// The frames a `--tour-clip` run keeps on either side of the swap: a second and a half at 60 fps,
+/// enough to cut a video of the crossing from.
+const CLIP_WINDOW: u32 = 90;
+/// How far out a `--tour-clip` run starts photographing: past the farthest standoff, so the clip
+/// holds the whole walk in.
+const CLIP_DISTANCE: f32 = 1000.0;
+
+/// The frames kept on either side of the swap, the frames the approach holds while walking in,
+/// and how far out the approach starts photographing, for this run (`--tour-clip`).
+fn walk_capture(config: &EngineConfig) -> (u32, usize, f32) {
+    if config.portal.tour_clip {
+        (CLIP_WINDOW, CLIP_WINDOW as usize + 20, CLIP_DISTANCE)
+    } else {
+        (WALK_WINDOW, WALK_RING, CAPTURE_DISTANCE)
+    }
+}
 /// Where the walk-through's frames go, under the tour's output directory.
 const WALK_DIRECTORY: &str = "walk-through";
 /// How many frames after the swap the walk-through looks at the other end of the crossing: the far
@@ -598,8 +614,8 @@ impl DemoTour {
     /// the last [`WALK_RING`] captures and nothing older. The file goes a ring's worth of frames
     /// after it was asked for - some frames after it was written - so nothing is deleted before it
     /// reaches the disk.
-    fn ring_walk_frames(&mut self) {
-        while self.walk_frames.len() > WALK_RING {
+    fn ring_walk_frames(&mut self, ring: usize) {
+        while self.walk_frames.len() > ring {
             let dropped = self.walk_frames.remove(0);
             remove_walk_file(&dropped.path);
         }
@@ -1877,11 +1893,12 @@ fn run_demo_tour(
             // while walking in: the frames are the walk up to the doorway, not the wait in front of
             // it. Walking, not running: the frames are what the crossing is judged on, and they are
             // dense enough to cover the ten before the swap at this speed.
-            if action == WalkAction::Walk && in_front > 0.0 && in_front <= CAPTURE_DISTANCE {
+            let (_, ring, capture_distance) = walk_capture(&config);
+            if action == WalkAction::Walk && in_front > 0.0 && in_front <= capture_distance {
                 capture_walk_frame(&mut commands, &mut tour, &camera);
                 // Everything older than the ring goes, files and all: the swap this walk is heading
                 // for cannot use it (`WALK_RING`).
-                tour.ring_walk_frames();
+                tour.ring_walk_frames(ring);
             }
 
             if tour.timer >= WALK_THROUGH_SECONDS {
@@ -1956,7 +1973,8 @@ fn run_demo_tour(
                 };
                 tour.note(line);
             }
-            if tour.frame <= swap + WALK_WINDOW {
+            let (walk_window, ..) = walk_capture(&config);
+            if tour.frame <= swap + walk_window {
                 capture_walk_frame(&mut commands, &mut tour, &camera);
                 return;
             }
@@ -1964,8 +1982,8 @@ fn run_demo_tour(
             // Nothing else the walk photographed is kept - the ring has already deleted the older
             // frames of the approach as they fell out of it, and this deletes the rest of the tail,
             // so what is left in the folder is the window and the file that describes it.
-            let first = swap.saturating_sub(WALK_WINDOW);
-            let last = swap + WALK_WINDOW;
+            let first = swap.saturating_sub(walk_window);
+            let last = swap + walk_window;
             tour.keep_walk_window(first, last);
             let poses = tour
                 .walk_frames
