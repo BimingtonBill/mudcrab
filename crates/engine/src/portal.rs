@@ -5159,6 +5159,146 @@ mod tests {
         }
     }
 
+    /// Gives every root in `roles` the role in `roles`, and nothing else: what [`isolate_cells`]
+    /// publishes for the frame, without the rest of the portal running.
+    fn set_roles<const N: usize>(app: &mut App, roles: [(Entity, CellRole); N]) {
+        let mut state = app.world_mut().resource_mut::<PortalState>();
+        state.roles.clear();
+        for (root, role) in roles {
+            state.roles.insert(root, role);
+        }
+    }
+
+    /// Whether the collider on `entity` is live.
+    fn collider_enabled(app: &App, entity: Entity) -> bool {
+        let entity = app.world().entity(entity);
+        entity.contains::<Collider>() && !entity.contains::<ColliderDisabled>()
+    }
+
+    /// A collider is live only while its cell is part of the active space. The roles
+    /// [`isolate_cells`] publishes are the single answer, and a subtree is flipped in the same
+    /// update the role changed in - which is what makes a crossing's destination collidable in the
+    /// frame the player arrives in it.
+    #[test]
+    fn the_space_gate_enables_only_the_active_cells_colliders() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<PortalState>()
+            .add_systems(Update, gate_cell_colliders);
+        let active = app.world_mut().spawn(Name::new("active")).id();
+        let destination = app.world_mut().spawn(Name::new("destination")).id();
+        let hidden = app.world_mut().spawn(Name::new("hidden")).id();
+        let collider = |app: &mut App, root: Entity| {
+            app.world_mut()
+                .spawn((Collider::cuboid(1.0, 1.0, 1.0), ChildOf(root)))
+                .id()
+        };
+        let active_collider = collider(&mut app, active);
+        let destination_collider = collider(&mut app, destination);
+        let hidden_collider = collider(&mut app, hidden);
+        set_roles(
+            &mut app,
+            [
+                (active, CellRole::Active),
+                (destination, CellRole::Destination),
+                (hidden, CellRole::Hidden),
+            ],
+        );
+
+        app.update();
+
+        assert!(
+            collider_enabled(&app, active_collider),
+            "the active space's collider is live"
+        );
+        assert!(
+            !collider_enabled(&app, destination_collider),
+            "a pre-streamed destination's collider must not block the player's space"
+        );
+        assert!(
+            !collider_enabled(&app, hidden_collider),
+            "a cell no camera draws is not walked into either"
+        );
+
+        // The crossing: the space the camera stands in changes, and the two swap in one update.
+        set_roles(
+            &mut app,
+            [
+                (active, CellRole::Destination),
+                (destination, CellRole::Active),
+                (hidden, CellRole::Hidden),
+            ],
+        );
+        app.update();
+
+        assert!(
+            !collider_enabled(&app, active_collider),
+            "the cell left behind is disabled at once"
+        );
+        assert!(
+            collider_enabled(&app, destination_collider),
+            "the cell arrived in is live in the same update"
+        );
+        assert!(!collider_enabled(&app, hidden_collider));
+    }
+
+    /// A collider that appears after its cell's role settled - a model the arming pacer hands to
+    /// the spawner later, a destination whose scene finishes loading after it - takes the role the
+    /// cell has *now*. A destination's stays disabled: readiness is not a reason to enable a
+    /// collider (port-prep-collision, point 2), so nothing re-enables it on the frames after.
+    #[test]
+    fn a_collider_that_appears_later_takes_its_cells_settled_role() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<PortalState>()
+            .add_systems(Update, gate_cell_colliders);
+        let active = app.world_mut().spawn(Name::new("active")).id();
+        let destination = app.world_mut().spawn(Name::new("destination")).id();
+        set_roles(
+            &mut app,
+            [
+                (active, CellRole::Active),
+                (destination, CellRole::Destination),
+            ],
+        );
+        app.update();
+
+        // What a completed readiness scan leaves: a collider under its reference, still disabled.
+        let late_destination = app
+            .world_mut()
+            .spawn((
+                Collider::cuboid(1.0, 1.0, 1.0),
+                ColliderDisabled,
+                ChildOf(destination),
+            ))
+            .id();
+        let late_active = app
+            .world_mut()
+            .spawn((
+                Collider::cuboid(1.0, 1.0, 1.0),
+                ColliderDisabled,
+                ChildOf(active),
+            ))
+            .id();
+
+        app.update();
+
+        assert!(
+            !collider_enabled(&app, late_destination),
+            "a destination's collider stays disabled after its readiness completes"
+        );
+        assert!(
+            collider_enabled(&app, late_active),
+            "an active cell's collider goes live as soon as the gate sees it"
+        );
+
+        app.update();
+        assert!(
+            !collider_enabled(&app, late_destination),
+            "and nothing enables it on a later frame either"
+        );
+    }
+
     /// An app with the visibility and transform systems the doors and the isolation rely on.
     ///
     /// [`update_portal`] is not among them: it needs a door whose destination says it is resident,

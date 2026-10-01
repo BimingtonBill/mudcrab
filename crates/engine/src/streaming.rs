@@ -4605,12 +4605,19 @@ mod tests {
     #[derive(Resource, Default)]
     struct QueuedCells(Vec<(CellKey, TerrainSnapshot)>);
 
+    /// The walk gate's answer for [`spawn_queued_cells`]. These apps add no [`StreamingPlugin`], so
+    /// the gate [`collect_cells`] reads never runs; handing the answer in is what a test does
+    /// instead of committing a cell through the plan.
+    #[derive(Resource, Default)]
+    struct QueuedCellsPhysics(bool);
+
     /// Spawns each queued cell through the real [`spawn_cell`] and records it as resident, so the
     /// lifecycle validator next in the chain sees entities and bookkeeping that agree.
     #[allow(clippy::too_many_arguments)]
     fn spawn_queued_cells(
         mut commands: Commands,
         queued: Res<QueuedCells>,
+        physics: Res<QueuedCellsPhysics>,
         asset_server: Res<AssetServer>,
         catalog: Res<AssetCatalog>,
         reflection: Res<WaterReflectionTexture>,
@@ -4640,7 +4647,7 @@ mod tests {
                 payload,
                 Some(terrain.clone()),
                 CellDetail::Full,
-                false,
+                physics.0,
                 &mut 0,
                 &mut profiler,
             );
@@ -4657,6 +4664,15 @@ mod tests {
     /// An app that streams the given cells the way a commit does - spawn first, then the lifecycle
     /// validator, in one frame - with the assets `spawn_cell` writes into.
     fn spawn_cells_app(cells: Vec<(CellKey, TerrainSnapshot)>, metrics: StreamingMetrics) -> App {
+        spawn_cells_app_with_physics(cells, metrics, false)
+    }
+
+    /// The same, with the walk gate's answer: `true` builds the colliders a walked run builds.
+    fn spawn_cells_app_with_physics(
+        cells: Vec<(CellKey, TerrainSnapshot)>,
+        metrics: StreamingMetrics,
+        world_physics: bool,
+    ) -> App {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("catalogue.db");
         write_empty_catalogue(&path);
@@ -4678,6 +4694,7 @@ mod tests {
             .init_resource::<DirectionalSnowCatalog>()
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(QueuedCells(cells))
+            .insert_resource(QueuedCellsPhysics(world_physics))
             .insert_resource(metrics)
             .init_resource::<StreamingWorld>()
             .init_resource::<PrestreamCells>()
@@ -5173,12 +5190,276 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// The terrain colliders a cell holds: how many, and how many of those are disabled.
+    fn terrain_collider_state(app: &mut App) -> (usize, usize) {
+        let mut query = app
+            .world_mut()
+            .query_filtered::<(Entity, Option<&ColliderDisabled>), With<TerrainCollider>>();
+        let mut total = 0;
+        let mut disabled = 0;
+        for (_, flag) in query.iter(app.world()) {
+            total += 1;
+            disabled += usize::from(flag.is_some());
+        }
+        (total, disabled)
+    }
+
+    /// The ring is landscape seen from a distance: the plan holds the camera inside the full
+    /// window, so no collider is ever walked on out there, and a walked run builds none for it.
+    #[test]
+    fn ring_cells_build_no_terrain_colliders() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_terrain_cache(&cache_path, 1);
+        let mut app = terrain_streaming_app_with(&database_path, &cache_path, true);
+        let key = exterior_cell(2, -3);
+        // The camera stands one cell east of the cell, so the cell is the ring.
+        app.world_mut()
+            .spawn((Transform::from_xyz(CELL_SIZE, 0.0, 0.0), StreamingCamera));
+        run_until(&mut app, "the ring's terrain-only cell", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Resident {
+                    detail: CellDetail::Terrain,
+                    ..
+                })
+            )
+        });
+
+        assert_eq!(
+            terrain_collider_state(&mut app),
+            (0, 0),
+            "a ring cell is never walked on, so it carries no collider at all"
+        );
+    }
+
+    /// A full cell of a walked run carries one terrain collider per quadrant, and every one of them
+    /// is born disabled: only the space gate in `crate::portal` enables a collider, and only for a
+    /// cell that is part of the active space. A run that does not walk builds none, which is what
+    /// leaves every shot, tour and benchmark run exactly as it was.
+    #[test]
+    fn a_full_cell_builds_terrain_colliders_only_in_a_walked_run() {
+        for &(walk, expected) in &[(true, (4, 4)), (false, (0, 0))] {
+            let directory = tempfile::tempdir().unwrap();
+            let database_path = directory.path().join("world.db");
+            write_terrain_database(&database_path);
+            let cache_path = directory.path().join("cell_cache.rkyv");
+            write_terrain_cache(&cache_path, 1);
+            let mut app = terrain_streaming_app_with(&database_path, &cache_path, walk);
+            let key = exterior_cell(2, -3);
+            // The camera stands in the cell, which is the full window's centre.
+            app.world_mut()
+                .spawn((Transform::default(), StreamingCamera));
+            run_until(&mut app, "the camera's own full cell", |app| {
+                matches!(
+                    app.world().resource::<StreamingWorld>().cells.get(&key),
+                    Some(CellStatus::Resident {
+                        detail: CellDetail::Full,
+                        ..
+                    })
+                )
+            });
+
+            assert_eq!(
+                terrain_collider_state(&mut app),
+                expected,
+                "a walked run ({walk}) builds one collider per quadrant, disabled until the gate"
+            );
+        }
+    }
+
+    /// A quadrant whose collider cannot be built is drawn without one and the cell still commits.
+    ///
+    /// The extraction refuses a mesh that is not a U32 triangle list, and that is the only error
+    /// its caller can return; `build_terrain_quadrant_mesh` always emits one, so the branch is
+    /// defensive in the real path. What is reachable is asserted here from both ends: the
+    /// extraction's refusal, and a cell of a walked run that builds no collider (the ring) still
+    /// becoming resident and drawing its quadrants - see
+    /// [`ring_cells_build_no_terrain_colliders`], which drives the same "no collider" outcome.
+    #[test]
+    fn a_quadrant_without_a_usable_collider_does_not_fail_the_cell() {
+        let mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vec![Vec3::ZERO, Vec3::X, Vec3::Y]);
+        assert!(
+            terrain_collider_from_mesh(&mesh).is_err(),
+            "a mesh with no U32 triangle indices cannot become a terrain collider"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_terrain_cache(&cache_path, 1);
+        let mut app = terrain_streaming_app_with(&database_path, &cache_path, true);
+        let key = exterior_cell(2, -3);
+        app.world_mut()
+            .spawn((Transform::from_xyz(CELL_SIZE, 0.0, 0.0), StreamingCamera));
+        run_until(&mut app, "the cell drawn without a collider", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Resident { .. })
+            )
+        });
+        assert_eq!(
+            terrain_collider_state(&mut app),
+            (0, 0),
+            "the cell commits and draws its quadrants with no collider built for them"
+        );
+        assert!(
+            !app.world().resource::<StreamingWorld>().has_failed(&key),
+            "and its commit is not a cell failure"
+        );
+        let roots = app
+            .world_mut()
+            .query_filtered::<Entity, With<TerrainPatch>>()
+            .iter(app.world())
+            .count();
+        assert_eq!(roots, 4, "four quadrants are drawn for it");
+    }
+
+    /// A collider belongs to its cell's subtree, so the paced despawn that removes a retired cell's
+    /// root takes its colliders with it - nothing is left colliding in a space that is gone.
+    #[test]
+    fn a_retiring_cells_colliders_go_with_its_subtree() {
+        let (mut app, _directory) = streaming_test_app(crossing_config(1));
+        spawn_camera(&mut app, IVec2::ZERO);
+        let root = spawn_mock_interior(&mut app, 98);
+        let collider = app
+            .world_mut()
+            .spawn((
+                TerrainCollider,
+                Collider::cuboid(1.0, 1.0, 1.0),
+                RigidBody::Fixed,
+                ColliderDisabled,
+                ChildOf(root),
+            ))
+            .id();
+        // What the pacer leaves behind: a root nothing wants any more, waiting for the unload
+        // budget. An interior is despawned the frame it falls out.
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                CellKey::Interior(98),
+                CellStatus::Retiring {
+                    root,
+                    detail: CellDetail::Full,
+                },
+            );
+
+        app.update();
+
+        assert!(
+            app.world().get_entity(collider).is_err(),
+            "the collider was despawned with the subtree its cell root owns"
+        );
+        assert!(app.world().get_entity(root).is_err(), "the root went too");
+    }
+
+    /// The rebase moves the camera and every cell root with it, and shifts the rapier bodies of the
+    /// colliders they own by the same displacement: a fixed body does not follow its Bevy
+    /// transform through a rebase teleport.
+    ///
+    /// This app has no rapier plugin - which is every run today, and every run that does not walk -
+    /// so the context query finds nothing, the collider stays where its root put it and the pass is
+    /// a no-op rather than a panic. The body shift itself needs the plugin's PreStartup context
+    /// entity and its FixedUpdate ECS-to-rapier sync (see the handoff note).
+    #[test]
+    fn a_rebase_moves_the_camera_and_the_roots_with_colliders_present() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<ActiveCell>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, update_render_origin);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Transform::from_xyz(CELL_SIZE * 2.0, 0.0, 0.0),
+                StreamingCamera,
+            ))
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((ExteriorCellGrid(IVec2::new(3, 0)), Transform::default()))
+            .id();
+        let collider = app
+            .world_mut()
+            .spawn((
+                TerrainCollider,
+                Collider::cuboid(1.0, 1.0, 1.0),
+                RigidBody::Fixed,
+                ColliderDisabled,
+                Transform::default(),
+                GlobalTransform::default(),
+                ChildOf(root),
+            ))
+            .id();
+
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<RenderOrigin>().0,
+            IVec2::new(2, 0),
+            "the origin advances by the cells the camera moved"
+        );
+        assert_eq!(
+            app.world()
+                .entity(camera)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            Vec3::ZERO,
+            "and the camera is put back at the space it stands in"
+        );
+        assert_eq!(
+            app.world()
+                .entity(root)
+                .get::<Transform>()
+                .unwrap()
+                .translation,
+            Vec3::new(CELL_SIZE, 0.0, 0.0),
+            "the cell root moves with the origin, so it keeps its place in the world"
+        );
+        assert!(
+            app.world().entity(collider).contains::<Collider>(),
+            "the collider is still there: without a rapier context there is no body to shift"
+        );
+        assert_eq!(app.world().resource::<StreamingMetrics>().origin_rebases, 1);
+    }
+
     /// An app that streams through the real plan and the real commit, with the assets and the
     /// database a terrain-only and a full cell both need, and a camera that does not move itself.
     fn terrain_streaming_app(database_path: &std::path::Path, cache_path: &std::path::Path) -> App {
+        terrain_streaming_app_with(database_path, cache_path, false)
+    }
+
+    /// The same app as a walked run, or as any other: `walk` is the whole of what
+    /// [`builds_world_colliders`] reads, so it is what decides whether the cells it streams carry
+    /// colliders.
+    fn terrain_streaming_app_with(
+        database_path: &std::path::Path,
+        cache_path: &std::path::Path,
+        walk: bool,
+    ) -> App {
         let catalogue_path = database_path.with_extension("catalogue");
         write_empty_catalogue(&catalogue_path);
         let mut app = App::new();
+        let mut config = EngineConfig {
+            // The camera's own cell is the inner grid; one cell out from it is the ring, so the
+            // same cell can be streamed either way by moving the camera one cell.
+            stream_radius: 0,
+            unload_radius: 1,
+            terrain_radius: 2,
+            ..EngineConfig::default()
+        };
+        config.portal.walk = walk;
         app.add_plugins(MinimalPlugins)
             .add_plugins(AssetPlugin::default())
             .init_asset::<Mesh>()
@@ -5186,14 +5467,7 @@ mod tests {
             .init_asset::<StandardMaterial>()
             .init_asset::<TerrainMaterial>()
             .init_asset::<WaterMaterial>()
-            .insert_resource(EngineConfig {
-                // The camera's own cell is the inner grid; one cell out from it is the ring, so the
-                // same cell can be streamed either way by moving the camera one cell.
-                stream_radius: 0,
-                unload_radius: 1,
-                terrain_radius: 2,
-                ..EngineConfig::default()
-            })
+            .insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::new(2, -3)))
             .insert_resource(ActiveCell {
                 worldspace_id: 60,
@@ -8606,6 +8880,78 @@ mod tests {
     /// spawner the engine uses, so a converted model is spawned and its reference becomes ready by
     /// the same route a converted glb takes. The three run chained, in the order `StreamingPlugin`
     /// runs them, so a test can tell which frame of that chain a model answered on.
+    /// A fixed placement the proxy rules cover gets a collider once its model is ready, and a load
+    /// door never does, whatever it is made of: main gives DOOR records no collision at all, and a
+    /// collider on a door reference would seal the doorway its leaf swings in.
+    ///
+    /// The reference is left with `ColliderDisabled`: asset readiness is not a reason to enable a
+    /// collider, because a pre-streamed destination becomes ready while its cell is not active
+    /// (port-prep-collision, point 2). `crate::portal`'s space gate is the only thing that removes
+    /// it, and its own test covers the role half.
+    #[test]
+    fn a_fixed_static_gets_a_proxy_collider_and_a_door_gets_none() {
+        let mut app = model_app();
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::new(2.0, 4.0, 6.0));
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let model = add_converted_model(&mut app, converted_scene_with_material(mesh, material));
+        // The database's own capitalisation, which the eligibility rules are not written in: the
+        // decision lowercases the path before it asks them.
+        let stat = spawn_pending_reference_with(
+            &mut app,
+            model.clone(),
+            0,
+            "meshes/Architecture/Farmhouse/Farmhouse01.glb",
+            "STAT",
+            true,
+        );
+        app.world_mut().entity_mut(stat).insert(cuboid_bounds());
+        let door = spawn_pending_reference_with(
+            &mut app,
+            model,
+            1,
+            "meshes/Architecture/Farmhouse/FarmhouseLDoor01.glb",
+            "DOOR",
+            true,
+        );
+        app.world_mut().entity_mut(door).insert(cuboid_bounds());
+
+        let metrics = settle_armed_readiness(&mut app);
+
+        assert_eq!(
+            metrics.static_colliders_proxy, 1,
+            "one of the two placements is known collision: {:?}",
+            metrics.asset_failures
+        );
+        assert_eq!(
+            metrics.static_colliders_skipped, 0,
+            "a DOOR is not eligible for collision, which is not the same as a proxy that failed"
+        );
+        let world = app.world();
+        let stat_entity = world.entity(stat);
+        assert_eq!(
+            stat_entity.get::<StaticColliderSource>(),
+            Some(&StaticColliderSource::RenderProxy)
+        );
+        assert!(stat_entity.contains::<Collider>());
+        assert!(stat_entity.contains::<RigidBody>());
+        assert!(
+            stat_entity.contains::<ColliderDisabled>(),
+            "readiness must not enable a collider; only the space gate does"
+        );
+        let door_entity = world.entity(door);
+        assert!(
+            door_entity.get::<StaticColliderSource>().is_none(),
+            "a load door gets no collider"
+        );
+        assert!(!door_entity.contains::<Collider>());
+    }
+
     fn model_app() -> App {
         let mut app = App::new();
         app.add_plugins((
@@ -8711,6 +9057,26 @@ mod tests {
     /// cell's references, so handing the sequence in is what a test does instead of committing a
     /// cell.
     fn spawn_pending_reference(app: &mut App, handle: Handle<WorldAsset>, sequence: u64) -> Entity {
+        spawn_pending_reference_with(
+            app,
+            handle,
+            sequence,
+            "meshes/furniture/creatureexit/wispambush.glb",
+            "STAT",
+            false,
+        )
+    }
+
+    /// The same reference with the model path, base record type and walk gate a collision test
+    /// needs: those three are the whole of what the static-collision rules read.
+    fn spawn_pending_reference_with(
+        app: &mut App,
+        handle: Handle<WorldAsset>,
+        sequence: u64,
+        path: &str,
+        record_type: &str,
+        static_physics: bool,
+    ) -> Entity {
         let transform = Transform::from_translation(Vec3::new(3.0, -4.0, 5.0));
         app.world_mut()
             .spawn((
@@ -8724,11 +9090,11 @@ mod tests {
                 PendingAssetProfile {
                     started: Instant::now(),
                     scene_spawned: false,
-                    path: "meshes/furniture/creatureexit/wispambush.glb".to_owned(),
+                    path: path.to_owned(),
                     form_id: 0x00F9907,
                     base_form_id: 0x00EF957,
-                    base_record_type: Some("STAT".to_owned()),
-                    static_physics: false,
+                    base_record_type: Some(record_type.to_owned()),
+                    static_physics,
                     cell_id: 0x02D4E0,
                 },
             ))
