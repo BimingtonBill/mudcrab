@@ -36,6 +36,8 @@ Every task belongs to one track; name it in the brief, the commit and the handof
 - **Portal** (parked 2026-09-28; **ACTIVE again since 2026-10-01** (the user): catch up with main and
   build a showcase of where the project and the portals are now): the user's seamless-door feature and demos. This checkout, branch `portal`, assets
   `C:\Modding\SkyrimConverted`, `[claude]`/`[deepseek]` prefixes, worker tasks `<kind>-<nnn>-portal-<slug>` numbered 100-199 (then 600+).
+  Portal schema numbers = 100_000 + main_version*100 + portal_revision (converter 101_601, world DB 100_401 at
+  main 16/4); a main bump merged into portal moves the hundreds and resets the revision; never take main's raw numbers.
 - **Phase 1** (added 2026-09-27, the user's new Phase 1 Dev session): improvements to upstream's
   finished converter (`docs/roadmap/01-asset-pipeline.md`), sent upstream like Phase 2. Worktree
   `C:\Modding\wkj-phase1`, branches `phase1/<topic>` cut from `main`, upstream's commit style, build
