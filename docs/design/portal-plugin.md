@@ -6,6 +6,9 @@ run `cargo` in its session; the lead fixed three tests and fmt, and both tours p
 tree (Riverwood 8/8, Alftand 4/4, 0 panics). Step 0 (the baseline) was done before it: schema 19 on
 disk, Riverwood 8/8, Alftand 4/4 on the pre-refactor tree.
 
+**Status (2026-10-01): step 6 was never finished.** `terrain_ring.rs` does not exist;
+`camera_far_plane`, `exterior_fog` and `fog_off` still live in `app.rs`.
+
 **Step 6 is half done** (impl-154, one commit per file). `crates/engine/src/atmosphere.rs` now holds
 the sky, the fog, the ambient and the per-space lighting, with `AtmospherePlugin` and their tests;
 `run()` adds it with one `add_plugins` under exactly today's `atmosphere_applies` gate, and the sun

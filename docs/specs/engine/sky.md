@@ -38,6 +38,11 @@ The converted `atmosphere.glb` keeps no vertex colours, so the engine builds the
 
 ## What the engine does
 
+> **On the `portal` branch** this section describes main's wiring (`SkyPlugin`, the global
+> `SkyPalette`, `apply_fog` in `sky.rs`), which the portal does not add. There the dome is
+> `sky_dome.rs` (one per camera, coloured from the `SpaceAtmosphere` rows) and the fog is
+> `atmosphere.rs` / `portal.rs`. The `DOME_MASKS` and `SkyMaterial` parts below are still exact.
+
 - **Colours.** `SkyPalette` holds Sky-Upper, Sky-Lower, Horizon and Fog Far, plus a linear
   brightness scale. The built-in palette is `SkyrimClear`'s day column (Upper 21,77,117;
   Lower 60,135,183; Horizon 125,163,183; Fog Far 116,168,203, 8-bit sRGB). The table above is
