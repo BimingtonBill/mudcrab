@@ -5434,6 +5434,92 @@ mod tests {
         assert_eq!(app.world().resource::<StreamingMetrics>().origin_rebases, 1);
     }
 
+    /// With rapier running, a rebase moves a fixed collider body by the same displacement as the
+    /// cell root it sits under, so the player keeps standing on what is drawn (review-279).
+    #[test]
+    fn a_rebase_moves_live_rapier_bodies_with_their_roots() {
+        use bevy::ecs::system::RunSystemOnce;
+        use bevy_rapier3d::prelude::{RapierRigidBodyHandle, ReadRapierContext};
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, TransformPlugin))
+            .add_plugins(crate::physics::PhysicsCorePlugin)
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_secs_f32(1.0 / 60.0),
+            ))
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<ActiveCell>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, update_render_origin);
+        app.finish();
+        let camera = app
+            .world_mut()
+            .spawn((Transform::default(), StreamingCamera))
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((
+                ExteriorCellGrid(IVec2::new(3, 0)),
+                Transform::from_xyz(CELL_SIZE * 3.0, 0.0, 0.0),
+            ))
+            .id();
+        let body = app
+            .world_mut()
+            .spawn((
+                TerrainCollider,
+                Collider::cuboid(10.0, 10.0, 10.0),
+                RigidBody::Fixed,
+                Transform::from_xyz(5.0, 0.0, 0.0),
+                ChildOf(root),
+            ))
+            .id();
+        let body_x = |app: &mut App| {
+            let handle = app
+                .world()
+                .entity(body)
+                .get::<RapierRigidBodyHandle>()
+                .expect("rapier has the body")
+                .0;
+            app.world_mut()
+                .run_system_once(move |context: ReadRapierContext| {
+                    context.single().unwrap().rigidbody_set.bodies[handle]
+                        .translation()
+                        .x
+                })
+                .unwrap()
+        };
+        for _ in 0..5 {
+            app.update();
+        }
+        assert!((body_x(&mut app) - (CELL_SIZE * 3.0 + 5.0)).abs() < 1.0e-2);
+
+        // Two cells east: the origin moves by two cells and everything drawn shifts back by them.
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation
+            .x = CELL_SIZE * 2.0;
+        app.update();
+        let root_x = app
+            .world()
+            .entity(root)
+            .get::<Transform>()
+            .unwrap()
+            .translation
+            .x;
+        assert!(
+            (root_x - CELL_SIZE).abs() < 1.0e-2,
+            "the root moved: {root_x}"
+        );
+        let moved = body_x(&mut app);
+        assert!(
+            (moved - (root_x + 5.0)).abs() < 1.0e-2,
+            "the body sits where its root now is: body {moved}, root {root_x}"
+        );
+    }
+
     /// An app that streams through the real plan and the real commit, with the assets and the
     /// database a terrain-only and a full cell both need, and a camera that does not move itself.
     fn terrain_streaming_app(database_path: &std::path::Path, cache_path: &std::path::Path) -> App {

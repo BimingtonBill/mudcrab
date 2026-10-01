@@ -952,13 +952,18 @@ impl CollisionWorld for WalkProbe<'_, '_, '_> {
 /// The mirror of [`mesh_is_out_of_the_way`] - the same walk up from the hit mesh to the door state,
 /// answering "solid" where that answers "out of the way" - so the composite probe's mesh half sees
 /// exactly the door geometry the mesh-only probe blocks on, and leaves the ground and the walls to
-/// the colliders.
+/// the colliders. Only a door of the player's own space counts: another space's closed leaf is
+/// drawn elsewhere entirely ([`in_active_space`], review-280).
 fn door_mesh_is_solid(
     hit: Entity,
+    portal: Option<&PortalState>,
     parents: &Query<&ChildOf>,
     leaves: &Query<&DoorLeaf>,
     states: &Query<&DoorState>,
 ) -> bool {
+    if !in_active_space(portal, hit, parents) {
+        return false;
+    }
     let mut entity = Some(hit);
     while let Some(current) = entity {
         if let Ok(leaf) = leaves.get(current) {
@@ -1147,7 +1152,12 @@ pub(crate) fn player_walk(
                 || mesh_is_out_of_the_way(entity, &parents, &leaves, &states)
                 || !in_active_space(portal.as_deref(), entity, &parents)
         };
-        let door_solid = |entity: Entity| door_mesh_is_solid(entity, &parents, &leaves, &states);
+        // Only a door of the player's own space can be in the way: another space's closed leaf is
+        // drawn somewhere else entirely (review-280), exactly as the mesh-only probe's skip says.
+        let door_solid = |entity: Entity| {
+            !door_copies.contains(entity)
+                && door_mesh_is_solid(entity, portal.as_deref(), &parents, &leaves, &states)
+        };
         // Without a context (a test app, or a run the physics plugin was not added to) the colliders
         // are not there to walk on, so the mesh probe answers as it always has rather than the walk
         // holding position on ground it cannot see.
@@ -3926,7 +3936,8 @@ mod world_probe_tests {
         let context = context
             .single()
             .expect("the physics plugin's rapier context");
-        let door_solid = |entity: Entity| door_mesh_is_solid(entity, &parents, &leaves, &states);
+        let door_solid =
+            |entity: Entity| door_mesh_is_solid(entity, None, &parents, &leaves, &states);
         let mut probe = WorldProbe {
             world: RapierProbe { context },
             ray_cast: &mut ray_cast,

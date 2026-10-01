@@ -290,6 +290,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(cache)
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
+        // A walked run's world collision: the streamer builds the colliders and enables only the
+        // player's space (`crate::portal::gate_cell_colliders`), and `crate::player` walks on them
+        // through rapier ray casts. Only rapier itself is added - not main's capsule player
+        // (`WorldPlayerPlugin`), which knows nothing of doors.
+        if crate::streaming::builds_world_colliders(app.world().resource::<EngineConfig>()) {
+            app.add_plugins(crate::physics::PhysicsCorePlugin);
+        }
         // The portal, in one call: the crossing for every run that opened the world, and everything
         // else the demo is - the doorway image, the door and model animation, the player, the demo
         // tour, the shots run - for the runs that are looked at rather than measured. Which of them
