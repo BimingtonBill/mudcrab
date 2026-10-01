@@ -2100,30 +2100,39 @@ fn end_scene_spawn_batch(
 /// ones that are still loading, so a slow load cannot hold the models behind it back; among the
 /// ready ones the oldest reference is armed first. `0` arms every ready model, the unbudgeted
 /// behaviour the engine had before this budget existed.
+#[allow(clippy::too_many_arguments)]
 fn arm_pending_models(
     config: Res<EngineConfig>,
     asset_server: Res<AssetServer>,
     world_assets: Option<Res<Assets<WorldAsset>>>,
-    pending: Query<(Entity, &PendingModel)>,
+    pending: Query<(Entity, &PendingModel, Option<&GlobalTransform>)>,
+    camera: Query<&GlobalTransform, With<StreamingCamera>>,
     mut commands: Commands,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = Instant::now();
     let backlog = pending.iter().count();
-    let mut ready: Vec<(u64, Entity, Handle<WorldAsset>)> = pending
+    let eye = camera.single().ok().map(GlobalTransform::translation);
+    // Nearest to the camera first, then oldest: a model in front of the player matters more than
+    // one in a cell the camera has already flown past. Without a camera (tests) or a placed
+    // reference, the order is the commit order.
+    let mut ready: Vec<(u64, u64, Entity, Handle<WorldAsset>)> = pending
         .iter()
-        .filter(|(_, model)| model_can_spawn(world_assets.as_deref(), &asset_server, &model.handle))
-        .map(|(entity, model)| (model.sequence, entity, model.handle.clone()))
+        .filter(|(_, model, _)| {
+            model_can_spawn(world_assets.as_deref(), &asset_server, &model.handle)
+        })
+        .map(|(entity, model, placed)| {
+            let distance = match (eye, placed) {
+                (Some(eye), Some(placed)) => placed.translation().distance_squared(eye) as u64,
+                _ => 0,
+            };
+            (distance, model.sequence, entity, model.handle.clone())
+        })
         .collect();
-    ready.sort_by_key(|(sequence, _, _)| *sequence);
-    let budget = config.max_model_spawns_per_frame;
-    let armed = if budget == 0 {
-        ready.len()
-    } else {
-        budget.min(ready.len())
-    };
-    for (_, entity, handle) in ready.drain(..armed) {
+    ready.sort_by_key(|(distance, sequence, _, _)| (*distance, *sequence));
+    let armed = models_to_arm(config.max_model_spawns_per_frame, ready.len());
+    for (_, _, entity, handle) in ready.drain(..armed) {
         commands
             .entity(entity)
             .insert(WorldAssetRoot(handle))
@@ -2142,6 +2151,29 @@ fn arm_pending_models(
     );
     profiler.record_elapsed("streaming/arm_models", started);
 }
+
+/// How many ready models to arm this frame.
+///
+/// `budget` is `--max-model-spawns-per-frame` (0 = every ready model). A burst larger than the budget
+/// can drain in about [`ARMING_DRAIN_FRAMES`]: on arrival in a new place the whole window becomes
+/// ready at once (2,000+ models at Riverwood), and at 4 a frame they would pop in over several
+/// seconds. The budget grows with the backlog, up to [`ARMING_BURST_FACTOR`] times itself, so a
+/// burst still never instantiates more than that in one frame.
+fn models_to_arm(budget: usize, ready: usize) -> usize {
+    if budget == 0 {
+        return ready;
+    }
+    let scaled = ready
+        .div_ceil(ARMING_DRAIN_FRAMES)
+        .clamp(budget, budget * ARMING_BURST_FACTOR);
+    scaled.min(ready)
+}
+
+/// The frames a backlog of ready models is spread over before the budget grows past its floor.
+const ARMING_DRAIN_FRAMES: usize = 60;
+
+/// The most the arming budget may grow to under a backlog, as a multiple of its configured floor.
+const ARMING_BURST_FACTOR: usize = 8;
 
 /// Whether Bevy can instantiate this model now.
 ///
@@ -8194,6 +8226,48 @@ mod tests {
             );
             assert_eq!(armed_and_pending(&mut app), (frame + 1, 3 - frame));
         }
+    }
+
+    /// The arming budget grows with a burst so the whole window drains in about a second, never
+    /// past eight times its floor; a small backlog keeps the configured floor, and 0 still means
+    /// every ready model.
+    #[test]
+    fn the_arming_budget_grows_with_a_burst_within_its_cap() {
+        assert_eq!(models_to_arm(4, 3), 3, "never more than is ready");
+        assert_eq!(models_to_arm(4, 100), 4, "a small backlog keeps the floor");
+        assert_eq!(models_to_arm(4, 600), 10, "600 ready drain over 60 frames");
+        assert_eq!(models_to_arm(4, 2_744), 32, "capped at 8x the floor");
+        assert_eq!(models_to_arm(0, 2_744), 2_744, "0 arms every ready model");
+    }
+
+    /// With a camera, the model nearest to it is armed first, whatever its age: the player sees the
+    /// cell in front of them fill in before the ones behind.
+    #[test]
+    fn the_arming_budget_arms_the_model_nearest_the_camera_first() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(1));
+        app.world_mut().spawn((
+            StreamingCamera,
+            Transform::default(),
+            GlobalTransform::IDENTITY,
+        ));
+        let far = add_converted_model(&mut app, empty_converted_scene());
+        let near = add_converted_model(&mut app, empty_converted_scene());
+        // The far model is the older one, so commit order alone would arm it first.
+        let far = spawn_pending_reference(&mut app, far, 0);
+        let near = spawn_pending_reference(&mut app, near, 1);
+        let place = |app: &mut App, entity: Entity, at: Vec3| {
+            let transform = Transform::from_translation(at);
+            app.world_mut()
+                .entity_mut(entity)
+                .insert((transform, GlobalTransform::from(transform)));
+        };
+        place(&mut app, far, Vec3::new(5_000.0, 0.0, 0.0));
+        place(&mut app, near, Vec3::new(10.0, 0.0, 0.0));
+
+        app.update();
+        assert!(app.world().entity(near).contains::<WorldAssetRoot>());
+        assert!(!app.world().entity(far).contains::<WorldAssetRoot>());
     }
 
     /// A budget is spent on the models that can spawn now: a model whose converted scene has not
