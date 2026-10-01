@@ -242,6 +242,11 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
     report.passed =
         report.schema_version == shared::WORLD_DATABASE_SCHEMA_VERSION && report.issues.is_empty();
     let output = staging.join("integration-report.json");
+    // Staged outputs may share an inode with a previous pack via
+    // hard link; replace the path instead of writing through it.
+    if output.is_file() {
+        fs::remove_file(&output)?;
+    }
     fs::write(&output, serde_json::to_vec_pretty(&report)?)
         .wrap_err_with(|| format!("failed to write {}", output.display()))?;
     Ok(Some(report))

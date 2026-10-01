@@ -1,21 +1,19 @@
 use crate::{
-    archive::ArchiveExtractor,
+    archive::{ArchiveExtractor, ExtractionProgress},
     asset_path::{AssetKind, canonical_asset_path, normalize_separators, resolve_asset_uri},
     cache::{
-        CacheEntry, ConversionManifest, configuration_hash, configuration_hash_for_schema,
-        hash_file, link_or_copy,
+        CONVERTER_SCHEMA_VERSION, CacheEntry, ConversionManifest, StagedOutput, StagingJournal,
+        configuration_hash, configuration_hash_for_schema, hash_file, link_or_copy,
+        load_staged_outputs,
     },
     config::PipelineConfig,
     esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database, read_plugins_txt},
     integration::{IntegrationReport, finalize_world_database},
     lod,
     mesh::MeshConverter,
-    progress::{ProgressEvent, ProgressStage},
+    progress::{AssetOutcome, ProgressEvent, ProgressStage},
     script::ScriptConverter,
-    texture::{
-        TextureConverter, TextureEncoding, TextureSemantic, file_is_zstd_supercompressed,
-        is_zstd_supercompressed, supercompress_ktx2_file,
-    },
+    texture::{TextureConverter, TextureEncoding, TextureSemantic},
 };
 use color_eyre::{
     Result,
@@ -25,10 +23,10 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fmt, fs, io,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -39,39 +37,18 @@ use tokio::{
 };
 use walkdir::WalkDir;
 
-/// What a worker did for one asset; it decides whether the previous manifest entry can be kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConversionOutcome {
-    /// The asset was converted from its source (or a staged output was kept or rewritten in place).
-    Converted,
-    /// The previous output was copied byte for byte.
-    Copied,
-    /// The previous output's levels were recompressed into the published form.
-    Recompressed,
-}
-
-/// Whether the output already staged for an asset can be reused as it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Staged {
-    /// The staged output is complete, including the supercompression this build publishes.
-    Keep,
-    /// The staged output is a valid texture whose levels still have to be supercompressed.
-    Supercompress,
-    /// The staged output cannot be reused and the asset has to be converted again.
-    Rebuild,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineReport {
     pub complete: bool,
     pub converted: u64,
     pub cache_hits: u64,
     pub skipped: u64,
-    /// Dangling texture references pruned from published meshes because the game
-    /// data does not contain the texture at all. Recorded separately from
-    /// `skipped` and `warnings`: nothing failed to convert, so a prune never
-    /// makes the run incomplete.
-    #[serde(default)]
+    /// Dangling texture references the published meshes omit because the game
+    /// data does not contain those textures: references this run pruned plus the
+    /// records it carried forward for meshes it reused. Matches the
+    /// `pruned_texture_references` map published in the manifest. Counted
+    /// separately from `skipped` and `warnings`: nothing failed to convert, so a
+    /// prune never makes the run incomplete.
     pub pruned_texture_references: u64,
     pub warnings: Vec<String>,
     pub artifacts: Vec<PathBuf>,
@@ -93,60 +70,150 @@ fn conversion_is_complete(report: &PipelineReport) -> bool {
     report.skipped == 0 && report.warnings.is_empty()
 }
 
+/// A run's stop button. The command line sets it when the user interrupts (Ctrl+C); the pipeline
+/// checks it between units of work, finishes the asset in flight, and leaves the staging folder
+/// behind so `--resume-staging` can pick the run up where it stopped.
+#[derive(Clone, Default)]
+pub struct Cancellation {
+    flag: Arc<AtomicBool>,
+}
+
+impl Cancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+
+/// The error a run ends with when it was stopped (Ctrl+C, a launcher's Stop button) rather than
+/// failing. A stop that raced a real error keeps that error as its cause, so a front end can still
+/// show it; a plain stop has no cause. Front ends find it with `report.downcast_ref::<Interrupted>()`
+/// instead of matching the error text.
+#[derive(Debug, Default)]
+pub struct Interrupted {
+    cause: Option<color_eyre::Report>,
+}
+
+impl Interrupted {
+    /// A stop with no error behind it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A stop that landed while `error` was ending the same work. An `error` that is itself a
+    /// plain stop (the extractor noticed the stop first) adds nothing, so it is not kept as a cause.
+    pub fn after(error: color_eyre::Report) -> Self {
+        match error.downcast_ref::<Interrupted>() {
+            Some(stop) if stop.cause.is_none() => Self::new(),
+            _ => Self { cause: Some(error) },
+        }
+    }
+
+    /// The error that raced the stop, if there was one.
+    pub fn cause(&self) -> Option<&color_eyre::Report> {
+        self.cause.as_ref()
+    }
+}
+
+impl fmt::Display for Interrupted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.cause {
+            Some(cause) => write!(formatter, "conversion interrupted ({cause:#})"),
+            None => formatter.write_str("conversion interrupted"),
+        }
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+/// A run that stopped short of publishing. `staging` is the folder left behind, when one was kept,
+/// and `cancelled` says whether the user interrupted the run rather than it failing.
+#[derive(Debug)]
+pub struct PipelineFailure {
+    pub error: color_eyre::Report,
+    pub staging: Option<PathBuf>,
+    pub cancelled: bool,
+}
+
+impl fmt::Display for PipelineFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for PipelineFailure {}
+
+impl From<color_eyre::Report> for PipelineFailure {
+    fn from(error: color_eyre::Report) -> Self {
+        Self {
+            error,
+            staging: None,
+            cancelled: false,
+        }
+    }
+}
+
+/// Renames the staged tree over the output, unless the run was interrupted while it was packing
+/// up. The check here is the last one before the output changes, so an interrupt that lands after
+/// the final stage stops the run instead of publishing over a good output — the staging folder is
+/// kept either way, so the run resumes from where it stopped.
+#[cfg(test)]
+fn publish_if_not_interrupted(
+    staging: &Path,
+    output: &Path,
+    cancellation: &Cancellation,
+) -> Result<(), PipelineFailure> {
+    if cancellation.is_cancelled() {
+        return Err(failure(Interrupted::new().into(), staging, cancellation));
+    }
+    publish_directory(staging, output).map_err(|error| failure(error, staging, cancellation))
+}
+
+/// A failure with the staging folder attached when one was kept, so the caller can tell the user
+/// how to resume.
+fn failure(
+    error: color_eyre::Report,
+    staging: &Path,
+    cancellation: &Cancellation,
+) -> PipelineFailure {
+    PipelineFailure {
+        error,
+        staging: staging.exists().then(|| staging.to_path_buf()),
+        cancelled: cancellation.is_cancelled(),
+    }
+}
+
 pub struct AssetPipeline;
 
 impl AssetPipeline {
+    /// Runs a conversion, reporting on `progress_tx`.
+    ///
+    /// The channel is bounded, and a front end should keep reading it. Events that matter on their
+    /// own (a stage or an archive starting and ending, an asset failing, a notice) wait for room;
+    /// the per-file updates sent while an archive is extracted are dropped when the channel is
+    /// full, so extraction never waits on the front end. Each of them carries cumulative numbers,
+    /// so the next one that gets through is as good as any that were dropped.
     pub async fn run_async(
         config: PipelineConfig,
         progress_tx: Sender<ProgressEvent>,
-    ) -> Result<PipelineReport> {
+    ) -> Result<PipelineReport, PipelineFailure> {
+        Self::run_async_with_cancel(config, progress_tx, Cancellation::new()).await
+    }
+
+    pub async fn run_async_with_cancel(
+        config: PipelineConfig,
+        progress_tx: Sender<ProgressEvent>,
+        cancellation: Cancellation,
+    ) -> Result<PipelineReport, PipelineFailure> {
         config.validate()?;
         let started = Instant::now();
-        let resumed = config.resume_staging.is_some();
-        let staging = config
-            .resume_staging
-            .clone()
-            .unwrap_or_else(|| staging_path(&config.output_dir));
-        let resume_reason = if resumed {
-            send(
-                &progress_tx,
-                ProgressStage::Discovering,
-                0,
-                0,
-                None,
-                "Inspecting the staging folder",
-            )
-            .await;
-            match probe_finished_staging(&config, &staging) {
-                ResumeVerdict::Finished(finished) => {
-                    return Self::publish_finished_staging(
-                        &config,
-                        &staging,
-                        *finished,
-                        &progress_tx,
-                        started,
-                    )
-                    .await;
-                }
-                ResumeVerdict::Incomplete(reason) => {
-                    mark_staging_unfinished(&staging)?;
-                    Some(reason)
-                }
-            }
-        } else {
-            None
-        };
-        if let Some(reason) = resume_reason {
-            send(
-                &progress_tx,
-                ProgressStage::Discovering,
-                0,
-                0,
-                None,
-                &format!("Re-converting every asset: {reason}"),
-            )
-            .await;
-        }
         send(
             &progress_tx,
             ProgressStage::Discovering,
@@ -156,32 +223,101 @@ impl AssetPipeline {
             "Discovering Skyrim assets",
         )
         .await;
-        let previous_manifest = if config.invalidate_cache {
+        let loaded_manifest = if config.invalidate_cache {
             ConversionManifest::default()
         } else {
             ConversionManifest::load(&config.output_dir.join("conversion-manifest.json"))?
         };
         let expected_configuration = configuration_hash(&config)?;
-        let configuration_is_compatible = previous_manifest.configuration_hash
+        let configuration_is_compatible = loaded_manifest.configuration_hash
             == expected_configuration
-            || (matches!(previous_manifest.schema_version, 12..=27)
-                && previous_manifest.configuration_hash
-                    == configuration_hash_for_schema(&config, previous_manifest.schema_version)?);
+            || (matches!(loaded_manifest.schema_version, 12..=15)
+                && loaded_manifest.configuration_hash
+                    == configuration_hash_for_schema(&config, loaded_manifest.schema_version)?);
         let previous_manifest = if configuration_is_compatible {
-            previous_manifest
+            loaded_manifest
         } else {
             ConversionManifest::default()
         };
-        fs::create_dir_all(staging.join("vfs"))?;
-        let run_result = Self::run_into(&config, &staging, &previous_manifest, &progress_tx).await;
+        let staging = config
+            .resume_staging
+            .clone()
+            .unwrap_or_else(|| staging_path(&config.output_dir));
+        let resumed = config.resume_staging.is_some();
+        fs::create_dir_all(staging.join("vfs"))
+            .wrap_err_with(|| format!("failed to create {}", staging.join("vfs").display()))?;
+        if resumed {
+            // A killed run leaves its writers' temporaries behind, and a stale one makes the
+            // writer refuse to publish (`write_glb_atomic`, the texture writer) or is simply
+            // never cleaned up. Clear them before this run treats the folder as its own.
+            let removed = remove_stale_temporary_files(&staging).wrap_err_with(|| {
+                format!(
+                    "failed to remove stale temporary files from {}",
+                    staging.display()
+                )
+            })?;
+            if removed > 0 {
+                send_notice(
+                    &progress_tx,
+                    ProgressStage::Discovering,
+                    None,
+                    &format!(
+                        "removed {removed} stale temporary file(s) left by an interrupted run"
+                    ),
+                )
+                .await;
+            }
+            let mut verified = BTreeSet::new();
+            if !config.invalidate_cache {
+                if let Ok(staged) = load_staged_outputs(&staging) {
+                    for (key, record) in staged {
+                        if record.schema_version == CONVERTER_SCHEMA_VERSION
+                            && record.configuration_hash == expected_configuration
+                        {
+                            let mut glb_path = PathBuf::from(key);
+                            glb_path.set_extension("glb");
+                            let rel = glb_path.to_string_lossy().replace('\\', "/");
+                            let full = staging.join(&rel);
+                            if full.is_file()
+                                && fs::metadata(&full).is_ok_and(|m| m.len() == record.output_size)
+                                && hash_file(&full).is_ok_and(|h| h == record.output_hash)
+                            {
+                                verified.insert(rel);
+                            }
+                        }
+                    }
+                }
+                for glb in previous_manifest.pruned_texture_references.keys() {
+                    let full = staging.join(glb);
+                    if full.is_file() {
+                        verified.insert(glb.clone());
+                    }
+                }
+                for entry in previous_manifest.entries.values() {
+                    if entry.output.ends_with(".glb") {
+                        let full = staging.join(&entry.output);
+                        if full.is_file() {
+                            verified.insert(entry.output.clone());
+                        }
+                    }
+                }
+            }
+            invalidate_staged_mesh_outputs(&staging, &verified)?;
+        }
+        // A run that stops keeps its staging folder, whether it failed or was interrupted: the
+        // folder is everything the run has done so far, and the caller reports the command that
+        // resumes from it. Only a successful publish removes it, once the runtime pack is out.
+        let run_result = Self::run_into(
+            &config,
+            &staging,
+            &previous_manifest,
+            &progress_tx,
+            &cancellation,
+        )
+        .await;
         let mut report = match run_result {
             Ok(report) => report,
-            Err(error) => {
-                if !resumed {
-                    let _ = fs::remove_dir_all(&staging);
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(failure(error, &staging, &cancellation)),
         };
         send(
             &progress_tx,
@@ -192,7 +328,29 @@ impl AssetPipeline {
             "Publishing converted assets",
         )
         .await;
-        publish_directory(&staging, &config.output_dir)?;
+        // The run's own checks are behind it, but an interrupt that landed while it was packing up
+        // must still stop it before the runtime pack is published. The folder is kept, so the run
+        // resumes from where it stopped.
+        if cancellation.is_cancelled() {
+            return Err(failure(Interrupted::new().into(), &staging, &cancellation));
+        }
+        publish_runtime_pack(&staging, &config.output_dir, &report)
+            .map_err(|error| failure(error, &staging, &cancellation))?;
+        let cache_root = config.ingestion_cache_dir().join(".ingestion-cache");
+        if staging.join(".ingestion-cache").is_dir() {
+            persist_ingestion_cache(&staging.join(".ingestion-cache"), &cache_root)
+                .map_err(|error| failure(error, &staging, &cancellation))?;
+        }
+        let manifest =
+            ConversionManifest::load(&config.output_dir.join("conversion-manifest.json"))
+                .map_err(|error| failure(error, &staging, &cancellation))?;
+        prune_stale_ingestion_blobs(&cache_root, &manifest)
+            .map_err(|error| failure(error, &staging, &cancellation))?;
+        // Resumed or not, the staging folder has done its job: the pack links the published files,
+        // so removing it frees only names. Kept, a resumed folder would be offered for resume
+        // again (`find_resumable_staging`) while holding a full copy's worth of disk. The output is
+        // already published, so a folder that cannot or must not be removed is only a warning.
+        remove_staging(&staging, &config.data_dir);
         report.elapsed_ms = started.elapsed().as_millis();
         if report.complete {
             send(
@@ -208,75 +366,34 @@ impl AssetPipeline {
         Ok(report)
     }
 
-    /// Publishes a staging folder whose conversion already finished.
-    ///
-    /// `probe_finished_staging` has re-checked the cheap half of a normal run's
-    /// post-conversion validation before this: the manifest's schema,
-    /// configuration hash and completion flag match this run; every converted
-    /// asset the manifest lists is present at its recorded size; the world
-    /// database passes `validate_database` (`PRAGMA integrity_check` and the
-    /// database schema version); `integration-report.json` parses; and the
-    /// files the run writes last exist. What is left to re-check here is the
-    /// generated-artifact validation over those last-written files, which
-    /// re-parses `scripts/papyrus_runtime.luau`; the other last-written files
-    /// (the world database, the cell cache and the JSON reports) carry
-    /// extensions that validation ignores.
-    ///
-    /// Two checks a normal run performs after converting are skipped because
-    /// they cost a large part of a conversion: the per-asset half of the
-    /// generated-artifact validation first re-derives every texture semantic by
-    /// walking the staging folder and parsing each GLB and the database, then
-    /// reads and hashes every converted KTX2 and GLB; and the integration pass
-    /// walks the staging folder twice for a verdict the finished run already
-    /// wrote to `integration-report.json`.
-    async fn publish_finished_staging(
-        config: &PipelineConfig,
-        staging: &Path,
-        finished: FinishedStaging,
-        progress_tx: &Sender<ProgressEvent>,
-        started: Instant,
-    ) -> Result<PipelineReport> {
-        send(
-            progress_tx,
-            ProgressStage::Publishing,
-            1,
-            1,
-            None,
-            "Staging is complete: publishing without re-converting",
-        )
-        .await;
-        validate_artifacts(staging, &finished.artifacts, &BTreeMap::new())?;
-        publish_directory(staging, &config.output_dir)?;
-        send(
-            progress_tx,
-            ProgressStage::Complete,
-            1,
-            1,
-            None,
-            "Asset conversion complete",
-        )
-        .await;
-        Ok(PipelineReport {
-            complete: true,
-            artifacts: finished.artifacts,
-            inputs_by_kind: finished.inputs_by_kind,
-            integration: finished.integration,
-            elapsed_ms: started.elapsed().as_millis(),
-            ..PipelineReport::default()
-        })
-    }
-
     async fn run_into(
         config: &PipelineConfig,
         staging: &Path,
         previous: &ConversionManifest,
         progress_tx: &Sender<ProgressEvent>,
+        cancellation: &Cancellation,
     ) -> Result<PipelineReport> {
         let mut report = PipelineReport::default();
+        let expected_configuration = configuration_hash(config)?;
+        // Provenance of the outputs already in `staging`, written by the run
+        // that was interrupted. Invalidation drops it along with the published
+        // manifest, so with `--invalidate-cache` every output is converted
+        // again.
+        let staged_outputs = Arc::new(if config.invalidate_cache {
+            BTreeMap::new()
+        } else {
+            load_staged_outputs(staging).wrap_err_with(|| {
+                format!(
+                    "failed to read the staging journal in {}",
+                    staging.display()
+                )
+            })?
+        });
+        let mut journal = StagingJournal::open(staging)?;
         let mut manifest = ConversionManifest {
-            schema_version: crate::cache::CONVERTER_SCHEMA_VERSION,
+            schema_version: CONVERTER_SCHEMA_VERSION,
             complete: false,
-            configuration_hash: configuration_hash(config)?,
+            configuration_hash: expected_configuration.clone(),
             inputs_by_kind: Default::default(),
             failures: Default::default(),
             pruned_texture_references: Default::default(),
@@ -310,7 +427,12 @@ impl AssetPipeline {
         let vfs_dir = staging.join("vfs");
         fs::create_dir_all(&vfs_dir)?;
 
+        // Bytes already extracted, so each archive reports progress against the whole run instead
+        // of restarting at zero.
+        let mut extracted_bytes = 0u64;
+
         for (index, archive) in enabled_archives.iter().enumerate() {
+            interrupt(cancellation)?;
             send(
                 progress_tx,
                 ProgressStage::Extracting,
@@ -322,7 +444,7 @@ impl AssetPipeline {
             .await;
             let archive_for_worker = archive.clone();
             let vfs_for_worker = vfs_dir.clone();
-            let previous_cache_root = config.output_dir.join(".ingestion-cache");
+            let previous_cache_root = config.ingestion_cache_dir().join(".ingestion-cache");
             let cache_root = staging.join(".ingestion-cache");
             let archive_key = archive
                 .strip_prefix(&config.data_dir)
@@ -333,7 +455,59 @@ impl AssetPipeline {
             let previous_entry = previous.archives.get(&archive_key).cloned();
             let verify_cache = config.verify_cache;
 
-            let result = match spawn_blocking(move || {
+            // The extractor reports file by file; the event keeps the archive count the launcher
+            // reads and carries the smoother per-file fraction for the status line.
+            let archive_totals = Arc::new(Mutex::new((0u64, 0u64)));
+            let totals_for_worker = Arc::clone(&archive_totals);
+            let progress_for_worker = progress_tx.clone();
+            let progress_archive = archive.clone();
+            let archives_total = enabled_archives.len() as u64;
+            let archive_index = index as u64;
+            let progress = move |extracted: ExtractionProgress| {
+                *totals_for_worker
+                    .lock()
+                    .expect("archive totals mutex poisoned") =
+                    (extracted.total_files, extracted.total_bytes);
+                let archive_fraction = if extracted.total_bytes > 0 {
+                    extracted.completed_bytes as f32 / extracted.total_bytes as f32
+                } else if extracted.total_files > 0 {
+                    extracted.completed_files as f32 / extracted.total_files as f32
+                } else {
+                    1.0
+                };
+                // The extraction threads never wait on the front end: an update that finds the
+                // channel full is dropped, and the next one carries the cumulative numbers. The
+                // archive's start and end events, and every failure, are still sent reliably.
+                let _ = progress_for_worker.try_send(
+                    ProgressEvent::new(
+                        ProgressStage::Extracting,
+                        archive_index,
+                        archives_total,
+                        Some(progress_archive.clone()),
+                        "Extracting archive",
+                    )
+                    .with_bytes(
+                        extracted_bytes + extracted.completed_bytes,
+                        extracted_bytes + extracted.total_bytes,
+                    )
+                    .with_stage_fraction(
+                        (archive_index as f32 + archive_fraction) / archives_total as f32,
+                    ),
+                );
+            };
+
+            // A stop is checked before every entry, so it does not wait for a multi-gigabyte
+            // archive to finish.
+            let stop_for_worker = cancellation.clone();
+            #[cfg(test)]
+            let output_for_hook = config.output_dir.clone();
+            let stop = move || {
+                #[cfg(test)]
+                stop_hook::tick(&output_for_hook, &stop_for_worker);
+                stop_for_worker.is_cancelled()
+            };
+
+            let result = spawn_blocking(move || {
                 ArchiveExtractor::extract_cached(
                     &archive_for_worker,
                     &vfs_for_worker,
@@ -341,16 +515,21 @@ impl AssetPipeline {
                     &cache_root,
                     previous_entry.as_ref(),
                     verify_cache,
+                    Some(&progress),
+                    Some(&stop),
                 )
             })
             .await
-            {
-                Ok(result) => result,
-                // A panicking archive worker is this archive's failure, not a
-                // reason to abandon the whole run (CP-05).
-                Err(error) => {
-                    Err(color_eyre::eyre::Report::new(error).wrap_err("archive worker panicked"))
+            .wrap_err("archive worker panicked")?;
+            // An archive abandoned by a stop ends the run as an interrupt, the same as a stop
+            // between archives, rather than being counted as a skipped archive. Its cache entry
+            // was never recorded, so a resume extracts it again from the start.
+            let result = match result {
+                // A stop that races an archive error keeps the archive's error as its cause.
+                Err(error) if cancellation.is_cancelled() => {
+                    return Err(Interrupted::after(error).into());
                 }
+                result => result,
             };
 
             send(
@@ -365,6 +544,10 @@ impl AssetPipeline {
 
             match result {
                 Ok(outcome) => {
+                    let (_, bytes) = *archive_totals
+                        .lock()
+                        .expect("archive totals mutex poisoned");
+                    extracted_bytes += bytes;
                     if outcome.cache_hit {
                         report.cache_hits += outcome.files.len() as u64;
                     } else {
@@ -374,13 +557,11 @@ impl AssetPipeline {
                 }
                 Err(error) if !config.fail_fast => {
                     report.skipped += 1;
-                    // The manifest is published, so key and name the archive the
-                    // same relative way as its ingestion-cache entry above; the
-                    // absolute path would leak the converting machine.
-                    let message = format!("{archive_key}: {error:#}");
-                    manifest
-                        .failures
-                        .insert(archive_key.clone(), message.clone());
+                    let message = format!("{}: {error:#}", archive.display());
+                    manifest.failures.insert(
+                        archive.to_string_lossy().replace('\\', "/"),
+                        message.clone(),
+                    );
                     report.warnings.push(message);
                 }
                 Err(error) => return Err(error),
@@ -388,6 +569,7 @@ impl AssetPipeline {
         }
 
         overlay_loose_assets(&config.data_dir, &staging.join("vfs"), &files)?;
+        interrupt(cancellation)?;
 
         if !plugins.is_empty() {
             send(
@@ -400,6 +582,11 @@ impl AssetPipeline {
             )
             .await;
             let db_path = staging.join("skyrim_world.db");
+            // SQLite writes in place; a resumed staging db may share an
+            // inode with a previous pack via hard link, so unlink first.
+            if db_path.is_file() {
+                fs::remove_file(&db_path)?;
+            }
             EsmParser::convert_plugins(&plugins, &db_path)?;
             validate_database(&Connection::open(&db_path)?)?;
             let merged = EsmParser::merge_plugins(&plugins)?;
@@ -411,14 +598,22 @@ impl AssetPipeline {
         }
 
         let vfs_files = discover(&staging.join("vfs"))?;
+        // Canonical source texture keys, used to tell a failed publication from absent game data
+        // and to detect a pruned texture whose source is back in the installed data.
+        let source_textures = texture_source_keys(staging, &vfs_files);
+        let restored_meshes = restored_mesh_outputs(previous, &source_textures);
         {
             let mut batch = ConversionBatch {
                 config,
                 staging,
                 previous,
+                staged: Arc::clone(&staged_outputs),
+                expected_configuration: &expected_configuration,
+                journal: &mut journal,
                 manifest: &mut manifest,
                 report: &mut report,
                 progress_tx,
+                cancellation,
             };
             batch
                 .convert_kind(
@@ -426,6 +621,7 @@ impl AssetPipeline {
                     &["nif", "btr", "bto"],
                     ProgressStage::Meshes,
                     None,
+                    &restored_meshes,
                 )
                 .await?;
         }
@@ -440,9 +636,7 @@ impl AssetPipeline {
         report.warnings.extend(lod.errors.iter().cloned());
         if lod.worldspaces > 0 {
             eprintln!(
-                "distant LOD inventory: {} worldspaces, {} grids, {} terrain and {} object blocks, \
-                 {} tree types, {} tree instances ({} unresolved), {} trailing-byte blocks, \
-                 {} unbounded blocks, {} error(s), {} issue(s)",
+                "distant LOD inventory: {} worldspaces, {} grids, {} terrain and {} object blocks,                  {} tree types, {} tree instances ({} unresolved), {} trailing-byte blocks,                  {} unbounded blocks, {} error(s), {} issue(s)",
                 lod.worldspaces,
                 lod.grids,
                 lod.terrain_blocks,
@@ -463,9 +657,13 @@ impl AssetPipeline {
                 config,
                 staging,
                 previous,
+                staged: Arc::clone(&staged_outputs),
+                expected_configuration: &expected_configuration,
+                journal: &mut journal,
                 manifest: &mut manifest,
                 report: &mut report,
                 progress_tx,
+                cancellation,
             };
             batch
                 .convert_kind(
@@ -473,11 +671,25 @@ impl AssetPipeline {
                     &["dds"],
                     ProgressStage::Textures,
                     Some(&texture_semantics),
+                    &BTreeSet::new(),
                 )
                 .await?;
             let aliases = publish_srgb_texture_aliases(staging)?;
             batch.report.artifacts.extend(aliases);
-            let pruned = MeshConverter::prune_dangling_texture_uris(staging)?;
+            // A reused mesh that still holds its published bytes keeps the prune record of the
+            // run that wrote it: a prune only removes references, so an older record stays true.
+            // Captured before the prune pass rewrites any staged GLB, because afterwards a mesh
+            // pruned again no longer matches its published copy.
+            let mut carried_prunes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (glb, references) in &previous.pruned_texture_references {
+                if files_are_identical(&staging.join(glb), &config.output_dir.join(glb)) {
+                    carried_prunes.insert(glb.clone(), references.iter().cloned().collect());
+                }
+            }
+            // A missing artifact whose DDS source exists under `staging/vfs` is a failed
+            // publication, not absent game data: the prune leaves those references alone.
+            let pruned =
+                MeshConverter::prune_dangling_texture_uris_with_sources(staging, &source_textures)?;
             let pruned_uris: u64 = pruned
                 .iter()
                 .map(|file| file.removed_uris.len() as u64)
@@ -486,13 +698,18 @@ impl AssetPipeline {
             for file in &pruned {
                 for uri in &file.removed_uris {
                     pruned_completed += 1;
-                    // The converter has no logging framework; progress events
-                    // carry only a generic message, so warn on stderr with the
-                    // exact dangling reference while the run log is watching.
-                    eprintln!(
-                        "warning: pruned dangling texture {uri} referenced by {} (no converted artifact)",
-                        file.glb
-                    );
+                    // The warning goes out as a notice on the progress channel rather than to
+                    // stderr, so it cannot splice into the status line the CLI is redrawing.
+                    send_notice(
+                        progress_tx,
+                        ProgressStage::Textures,
+                        Some(PathBuf::from(&file.glb)),
+                        &format!(
+                            "warning: pruned dangling texture {uri} referenced by {} (no converted artifact)",
+                            file.glb
+                        ),
+                    )
+                    .await;
                     let reference = resolve_asset_uri(staging, &staging.join(&file.glb), uri)
                         .ok()
                         .and_then(|resolved| {
@@ -500,21 +717,69 @@ impl AssetPipeline {
                         })
                         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
                         .unwrap_or_else(|| uri.clone());
-                    batch
-                        .record_pruned_texture_reference(
+                    if batch.record_pruned_texture_reference(&file.glb, &reference) {
+                        send(
+                            batch.progress_tx,
                             ProgressStage::Textures,
                             pruned_completed,
                             pruned_uris,
-                            file.glb.clone(),
-                            reference,
+                            Some(PathBuf::from(&file.glb)),
+                            "Texture reference pruned",
                         )
                         .await;
+                    }
                 }
             }
+            // Merge the carried records with this run's prunes: a reused mesh that already
+            // omitted A and has just had B pruned must report both. A mesh whose source changed
+            // was converted again before this pass, so its staged bytes no longer matched the
+            // published copy and its stale records were not carried.
+            for (glb, references) in &carried_prunes {
+                for reference in references {
+                    batch.record_pruned_texture_reference(glb, reference);
+                }
+            }
+            // The prune rewrote the GLB after its cache entry was recorded, so refresh every
+            // entry and journal record that publishes it from the rewritten bytes. Otherwise the
+            // next run fails the entry's size and hash check and converts the mesh again, and a
+            // resume finds a journal record that no longer matches the staged file.
+            let pruned_outputs: BTreeSet<String> = pruned
+                .iter()
+                .filter(|file| !file.removed_uris.is_empty())
+                .map(|file| file.glb.clone())
+                .collect();
+            for (key, entry) in batch.manifest.entries.iter_mut() {
+                if !pruned_outputs.contains(&entry.output) {
+                    continue;
+                }
+                let path = staging.join(&entry.output);
+                entry.output_size = fs::metadata(&path)
+                    .wrap_err_with(|| format!("failed to inspect pruned {}", path.display()))?
+                    .len();
+                entry.output_hash = hash_file(&path)?;
+                let record = staged_output(entry, batch.expected_configuration);
+                batch.journal.record(key, &record)?;
+            }
+            // The run summary reports what the manifest records, whether this run
+            // pruned it or carried the record forward for a reused mesh.
+            let recorded: u64 = batch
+                .manifest
+                .pruned_texture_references
+                .values()
+                .map(|references| references.len() as u64)
+                .sum();
+            batch.report.pruned_texture_references = recorded;
             batch
-                .convert_kind(&vfs_files, &["pex"], ProgressStage::Scripts, None)
+                .convert_kind(
+                    &vfs_files,
+                    &["pex"],
+                    ProgressStage::Scripts,
+                    None,
+                    &BTreeSet::new(),
+                )
                 .await?;
         }
+        interrupt(cancellation)?;
         if let Some(integration) = finalize_world_database(staging)? {
             if !integration.passed {
                 report.warnings.push(format!(
@@ -567,6 +832,7 @@ impl AssetPipeline {
             "Generated artifacts are valid",
         )
         .await;
+        interrupt(cancellation)?;
         manifest.complete = conversion_is_complete(&report);
         report.complete = manifest.complete;
         report.inputs_by_kind = manifest.inputs_by_kind.clone();
@@ -582,9 +848,15 @@ struct ConversionBatch<'a> {
     config: &'a PipelineConfig,
     staging: &'a Path,
     previous: &'a ConversionManifest,
+    /// Provenance of the outputs already in `staging`, keyed by canonical
+    /// source key; empty when the cache is invalidated.
+    staged: Arc<BTreeMap<String, StagedOutput>>,
+    expected_configuration: &'a str,
+    journal: &'a mut StagingJournal,
     manifest: &'a mut ConversionManifest,
     report: &'a mut PipelineReport,
     progress_tx: &'a Sender<ProgressEvent>,
+    cancellation: &'a Cancellation,
 }
 
 impl ConversionBatch<'_> {
@@ -594,6 +866,7 @@ impl ConversionBatch<'_> {
         source_exts: &[&str],
         stage: ProgressStage,
         texture_semantics: Option<&BTreeMap<String, BTreeSet<TextureSemantic>>>,
+        force_reconvert: &BTreeSet<String>,
     ) -> Result<()> {
         let selected_paths: Vec<_> = files
             .iter()
@@ -611,12 +884,15 @@ impl ConversionBatch<'_> {
         };
         let staging_vfs = self.staging.join("vfs");
         let mut target_sources = BTreeMap::<String, PathBuf>::new();
-        // Every extension of the group is counted, even when it matches nothing.
-        let mut inputs_by_kind = source_exts
-            .iter()
-            .map(|source_ext| ((*source_ext).to_owned(), 0u64))
-            .collect::<BTreeMap<_, _>>();
+        // The group's primary extension is always recorded, even at zero; the secondary
+        // distant-LOD containers appear only when an install actually has some.
+        let mut inputs_by_kind = BTreeMap::<String, u64>::new();
+        inputs_by_kind.insert(source_exts[0].to_owned(), 0);
         let mut selected = Vec::with_capacity(selected_paths.len());
+        // The source sizes are one `stat` each and give the status line something to weigh the
+        // stage by: a mesh and a texture are the same "item" but not the same work.
+        let mut source_sizes = BTreeMap::<String, u64>::new();
+        let mut bytes_total = 0u64;
         for source in selected_paths {
             let relative = source.strip_prefix(&staging_vfs)?.to_owned();
             let source_ext = relative
@@ -647,6 +923,9 @@ impl ConversionBatch<'_> {
                 None
             };
             *inputs_by_kind.entry(source_ext).or_default() += 1;
+            let source_bytes = fs::metadata(&source).map_or(0, |metadata| metadata.len());
+            bytes_total += source_bytes;
+            source_sizes.insert(source_key.clone(), source_bytes);
             selected.push((
                 source,
                 relative,
@@ -663,6 +942,7 @@ impl ConversionBatch<'_> {
         if selected.is_empty() {
             return Ok(());
         }
+        interrupt(self.cancellation)?;
 
         let total_files = selected.len() as u64;
         let progress_tx = self.progress_tx.clone();
@@ -670,12 +950,17 @@ impl ConversionBatch<'_> {
 
         let staging_root = self.staging.to_path_buf();
         let output_dir = self.config.output_dir.clone();
-        let etc1s_quality = self.config.texture_etc1s_quality;
+        let etc1s_quality = self.config.texture_fallback_quality;
         let uastc_level = self.config.texture_uastc_level;
+        let zstd_level = self.config.texture_zstd_level;
         let cpu_jobs = self.config.cpu_jobs;
         let previous_entries = self.previous.entries.clone();
+        let staged_outputs = Arc::clone(&self.staged);
+        let expected_configuration = self.expected_configuration.to_owned();
+        let force_reconvert = force_reconvert.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let run_cancelled = self.cancellation.clone();
 
         let rayon_handle = spawn_blocking(move || -> Result<()> {
             use rayon::prelude::*;
@@ -687,213 +972,159 @@ impl ConversionBatch<'_> {
             pool.install(|| {
                 selected.into_par_iter().enumerate().for_each(
                     |(index, (source, relative, target_rel, key, encoding))| {
-                        if worker_cancelled.load(Ordering::Relaxed) {
+                        // An interrupted run stops before starting another asset; the one already
+                        // in flight finishes, so no half-written output is left behind.
+                        if worker_cancelled.load(Ordering::Relaxed) || run_cancelled.is_cancelled()
+                        {
                             return;
                         }
+                        // A mesh whose pruned texture source is back must be converted again:
+                        // the mesh cache does not hash texture dependencies, so a reused GLB
+                        // would never regain the reference.
                         let source_kind = relative
                             .extension()
                             .and_then(|value| value.to_str())
                             .unwrap_or_default()
                             .to_ascii_lowercase();
+                        let forced =
+                            force_reconvert.contains(target_rel.to_string_lossy().as_ref());
                         let target = staging_root.join(&target_rel);
-                        // One panicking asset must be recorded as that asset's
-                        // failure, not turn into a whole-run abort, so the item
-                        // body runs under `catch_unwind` (CP-05).
-                        let panic_key = key.clone();
-                        let panic_relative = relative.clone();
-                        let panic_target_rel = target_rel.clone();
-                        let panic_target = target.clone();
-                        let item = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            // Tests inject a panic on a named file to exercise the
-                            // catch below.
-                            #[cfg(test)]
-                            if source.file_name().is_some_and(|name| {
-                                name.to_string_lossy().starts_with("panic-on-convert.")
-                            }) {
-                                panic!("test-injected asset worker panic");
+
+                        let mut hash = match hash_file(&source) {
+                            Ok(h) => h,
+                            Err(err) => {
+                                let _ = outcome_tx.send((
+                                    index,
+                                    key,
+                                    String::new(),
+                                    target_rel,
+                                    relative.clone(),
+                                    Err(err),
+                                    target,
+                                ));
+                                return;
                             }
+                        };
 
-                            let mut hash = match hash_file(&source) {
-                                Ok(h) => h,
-                                Err(err) => {
-                                    let _ = outcome_tx.send((
-                                        index,
-                                        key,
-                                        String::new(),
-                                        target_rel,
-                                        relative.clone(),
-                                        Err(err),
-                                        target,
-                                    ));
-                                    return;
-                                }
-                            };
+                        if let Some(encoding) = encoding {
+                            hash.push_str(&format!(":texture-encoding:{encoding:?}"));
+                        }
 
-                            if let Some(encoding) = encoding {
-                                hash.push_str(&format!(":texture-encoding:{encoding:?}"));
-                            }
-
-                            if matches!(source_kind.as_str(), "nif" | "btr" | "bto") {
-                                for dependency in MeshConverter::dependency_paths(&source) {
-                                    match hash_file(&dependency) {
-                                        Ok(dep_hash) => {
-                                            hash.push(':');
-                                            hash.push_str(&dep_hash);
-                                        }
-                                        Err(err) => {
-                                            let _ = outcome_tx.send((
-                                                index,
-                                                key,
-                                                hash,
-                                                target_rel,
-                                                relative.clone(),
-                                                Err(err),
-                                                target,
-                                            ));
-                                            return;
-                                        }
+                        if matches!(source_kind.as_str(), "nif" | "btr" | "bto") {
+                            for dependency in MeshConverter::dependency_paths(&source) {
+                                match hash_file(&dependency) {
+                                    Ok(dep_hash) => {
+                                        hash.push(':');
+                                        hash.push_str(&dep_hash);
                                     }
-                                }
-                            }
-
-                            // Check cache
-                            if let Some(entry) =
-                                previous_entries.get(&key).filter(|e| e.source_hash == hash)
-                            {
-                                let old = output_dir.join(&entry.output);
-                                if old.is_file()
-                                    && fs::metadata(&old)
-                                        .is_ok_and(|m| m.len() == entry.output_size)
-                                    && hash_file(&old).is_ok_and(|h| h == entry.output_hash)
-                                {
-                                    if let Some(parent) = target.parent() {
-                                        let _ = fs::create_dir_all(parent);
-                                    }
-                                    // A texture is only reused when it already carries the
-                                    // supercompression this build publishes. A container of raw
-                                    // levels (published before the converter wrote them, or left by
-                                    // an earlier schema) is recompressed from its own levels: that
-                                    // costs milliseconds where re-encoding the DDS costs minutes, and
-                                    // it decodes to the same texels either way.
-                                    let reused: Result<ConversionOutcome> = if source_kind == "dds"
-                                        && !file_is_zstd_supercompressed(&old)
-                                    {
-                                        supercompress_ktx2_file(&old, &target)
-                                            .map(|_| ConversionOutcome::Recompressed)
-                                    } else {
-                                        link_or_copy(&old, &target)
-                                            .map(|_| ConversionOutcome::Copied)
-                                            .map_err(Into::into)
-                                    };
-                                    // A reuse that fails falls through to a full conversion below.
-                                    if let Ok(outcome) = reused {
+                                    Err(err) => {
                                         let _ = outcome_tx.send((
                                             index,
                                             key,
                                             hash,
                                             target_rel,
                                             relative.clone(),
-                                            Ok(outcome),
+                                            Err(err),
                                             target,
                                         ));
                                         return;
                                     }
                                 }
                             }
-
-                            let staged = if !target.is_file()
-                                || !fs::metadata(&target).is_ok_and(|metadata| metadata.len() > 0)
-                            {
-                                Staged::Rebuild
-                            } else {
-                                match source_kind.as_str() {
-                                    "dds" => match fs::read(&target) {
-                                        Ok(bytes) => match crate::texture::inspect_ktx2(
-                                            &bytes,
-                                            encoding.expect("DDS conversion requires an encoding"),
-                                        ) {
-                                            Ok(_) if is_zstd_supercompressed(&bytes) => {
-                                                Staged::Keep
-                                            }
-                                            Ok(_) => Staged::Supercompress,
-                                            Err(_) => Staged::Rebuild,
-                                        },
-                                        Err(_) => Staged::Rebuild,
-                                    },
-                                    "nif" | "btr" | "bto" | "pex" => Staged::Keep,
-                                    _ => Staged::Rebuild,
-                                }
-                            };
-
-                            let convert = || {
-                                // A staged output may be a hard link to the published one
-                                // (`link_or_copy`); a converter that writes its output in place
-                                // would write through the link into the published set, so the old
-                                // file is unlinked first.
-                                let _ = fs::remove_file(&target);
-                                match source_kind.as_str() {
-                                    "dds" => TextureConverter::convert_dds_to_ktx2_with_options(
-                                        &source,
-                                        &target,
-                                        encoding.expect("DDS conversion requires an encoding"),
-                                        etc1s_quality,
-                                        uastc_level,
-                                    )
-                                    .map(|_| ()),
-                                    "nif" | "btr" | "bto" => {
-                                        MeshConverter::convert_nif_to_glb(&source, &target)
-                                    }
-                                    "pex" => ScriptConverter::convert_pex_to_luau(&source, &target),
-                                    _ => unreachable!(),
-                                }
-                            };
-                            let result = match staged {
-                                Staged::Keep => Ok(()),
-                                // A staged texture that cannot be rewritten (a damaged container,
-                                // say) is encoded again from its source rather than failing the
-                                // asset, which is what a full reconversion would have done anyway.
-                                Staged::Supercompress => {
-                                    supercompress_ktx2_file(&target, &target).or_else(|_| convert())
-                                }
-                                Staged::Rebuild => convert(),
-                            };
-
-                            let result = result
-                                .map(|()| ConversionOutcome::Converted)
-                                .wrap_err_with(|| {
-                                    format!("failed to convert {}", relative.display())
-                                });
-                            let _ = outcome_tx.send((
-                                index,
-                                key,
-                                hash,
-                                target_rel,
-                                relative.to_path_buf(),
-                                result,
-                                target,
-                            ));
-                        }));
-                        if let Err(panic) = item {
-                            let detail = panic
-                                .downcast_ref::<&str>()
-                                .map(|message| (*message).to_owned())
-                                .or_else(|| panic.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "no panic message".to_owned());
-                            // The worker may have died mid-write; a partial output must not be
-                            // published, or a later run could reuse it as a converted artifact.
-                            let _ = fs::remove_file(&panic_target);
-                            let _ = outcome_tx.send((
-                                index,
-                                panic_key,
-                                String::new(),
-                                panic_target_rel,
-                                panic_relative,
-                                Err(color_eyre::eyre::eyre!(
-                                    "asset conversion worker panicked: {detail}"
-                                )),
-                                panic_target,
-                            ));
                         }
+
+                        // Check cache
+                        if !forced
+                            && let Some(entry) =
+                                previous_entries.get(&key).filter(|e| e.source_hash == hash)
+                        {
+                            let old = output_dir.join(&entry.output);
+                            if old.is_file()
+                                && fs::metadata(&old).is_ok_and(|m| m.len() == entry.output_size)
+                                && hash_file(&old).is_ok_and(|h| h == entry.output_hash)
+                            {
+                                if let Some(parent) = target.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
+                                // `link_or_copy`, not `fs::copy`: on a resumed
+                                // run the staged target may already be a hard
+                                // link to the pack file, and copying a file
+                                // onto its own link truncates both. A shared
+                                // inode is already the cached bytes.
+                                if link_or_copy(&old, &target).is_ok() {
+                                    let _ = outcome_tx.send((
+                                        index,
+                                        key,
+                                        hash,
+                                        target_rel,
+                                        relative.clone(),
+                                        Ok(true), // is_cache_hit = true
+                                        target,
+                                    ));
+                                    return;
+                                };
+                            }
+                        }
+
+                        // A staged output survives from an earlier run, so it
+                        // is reused only when the journal says it was produced
+                        // from the current source under the current schema and
+                        // configuration and its bytes still match the recorded
+                        // size and hash. Any other output is converted again.
+                        let staged_is_current = !forced
+                            && (staged_outputs.get(&key).is_some_and(|record| {
+                                record.is_current(&target, &hash, &expected_configuration)
+                            }) || previous_entries.get(&key).is_some_and(|entry| {
+                                entry.source_hash == hash
+                                    && entry.output_hash == hash_file(&target).unwrap_or_default()
+                            }));
+                        let existing_is_valid = staged_is_current
+                            && fs::metadata(&target).is_ok_and(|metadata| metadata.len() > 0)
+                            && match source_kind.as_str() {
+                                "dds" => fs::read(&target).is_ok_and(|bytes| {
+                                    crate::texture::inspect_ktx2(
+                                        &bytes,
+                                        encoding.expect("DDS conversion requires an encoding"),
+                                    )
+                                    .is_ok()
+                                }),
+                                "nif" | "btr" | "bto" | "pex" => true,
+                                _ => false,
+                            };
+
+                        let result = if existing_is_valid {
+                            Ok(())
+                        } else {
+                            match source_kind.as_str() {
+                                "dds" => TextureConverter::convert_dds_to_ktx2_with_options(
+                                    &source,
+                                    &target,
+                                    encoding.expect("DDS conversion requires an encoding"),
+                                    etc1s_quality,
+                                    uastc_level,
+                                    zstd_level,
+                                )
+                                .map(|_| ()),
+                                "nif" | "btr" | "bto" => {
+                                    MeshConverter::convert_nif_to_glb(&source, &target)
+                                }
+                                "pex" => ScriptConverter::convert_pex_to_luau(&source, &target),
+                                _ => unreachable!(),
+                            }
+                        };
+
+                        let result = result
+                            .map(|_| false)
+                            .wrap_err_with(|| format!("failed to convert {}", relative.display()));
+                        let _ = outcome_tx.send((
+                            index,
+                            key,
+                            hash,
+                            target_rel,
+                            relative.to_path_buf(),
+                            result,
+                            target,
+                        ));
                     },
                 );
             });
@@ -903,17 +1134,24 @@ impl ConversionBatch<'_> {
         let mut completed = 0u64;
         let mut first_error = None;
         let fail_fast = self.config.fail_fast;
+        let mut bytes_completed = 0u64;
         while let Some((_, key, hash, target_rel, relative, conversion, target)) =
             outcome_rx.recv().await
         {
             completed += 1;
+            bytes_completed += source_sizes.get(&key).copied().unwrap_or(0);
+            if self.cancellation.is_cancelled() {
+                break;
+            }
 
             match conversion {
-                Ok(outcome) => {
-                    if fail_fast && first_error.is_some() {
+                Ok(is_cache_hit) => {
+                    // Without fail-fast only a journal write sets the first
+                    // error, and after one nothing more can be recorded.
+                    if first_error.is_some() {
                         continue;
                     }
-                    if outcome != ConversionOutcome::Copied {
+                    if !is_cache_hit {
                         let size = match fs::metadata(&target) {
                             Ok(metadata) => metadata.len(),
                             Err(error) => {
@@ -954,49 +1192,53 @@ impl ConversionBatch<'_> {
                                 continue;
                             }
                         };
-                        send(
-                            &progress_tx,
-                            stage,
-                            completed,
-                            total_files,
-                            Some(relative.clone()),
-                            match outcome {
-                                ConversionOutcome::Recompressed => "Recompressed asset",
-                                _ => "Converted asset",
-                            },
-                        )
-                        .await;
-                        self.manifest.entries.insert(
-                            key,
-                            CacheEntry {
-                                source_hash: hash,
-                                output: target_rel
-                                    .to_string_lossy()
-                                    .into_owned()
-                                    .replace('\\', "/"),
-                                output_size: size,
-                                output_hash,
-                            },
-                        );
-                        // A recompressed texture rewrote the previous output instead of encoding
-                        // the source again, and its hash above is the hash of the new bytes.
-                        if outcome == ConversionOutcome::Recompressed {
-                            self.report.cache_hits += 1;
-                        } else {
-                            self.report.converted += 1;
-                        }
-                    } else {
-                        send(
+                        send_with_bytes(
                             &progress_tx,
                             stage,
                             completed,
                             total_files,
                             Some(relative.clone()),
                             "Converted asset",
+                            (bytes_completed, bytes_total),
                         )
                         .await;
-                        if let Some(entry) = self.previous.entries.get(&key) {
-                            self.manifest.entries.insert(key, entry.clone());
+                        let entry = CacheEntry {
+                            source_hash: hash,
+                            output: target_rel.to_string_lossy().into_owned().replace('\\', "/"),
+                            output_size: size,
+                            output_hash,
+                        };
+                        if let Err(error) = self
+                            .journal
+                            .record(&key, &staged_output(&entry, self.expected_configuration))
+                        {
+                            stop_batch(&cancelled, &mut first_error, error);
+                            continue;
+                        }
+                        self.manifest.entries.insert(key, entry);
+                        self.report.converted += 1;
+                    } else {
+                        send_with_bytes(
+                            &progress_tx,
+                            stage,
+                            completed,
+                            total_files,
+                            Some(relative.clone()),
+                            "Converted asset",
+                            (bytes_completed, bytes_total),
+                        )
+                        .await;
+                        if let Some(entry) = self.previous.entries.get(&key).cloned() {
+                            // The staged copy holds the published bytes, so the
+                            // published entry is its provenance.
+                            if let Err(error) = self
+                                .journal
+                                .record(&key, &staged_output(&entry, self.expected_configuration))
+                            {
+                                stop_batch(&cancelled, &mut first_error, error);
+                                continue;
+                            }
+                            self.manifest.entries.insert(key, entry);
                         }
                         self.report.cache_hits += 1;
                     }
@@ -1006,15 +1248,18 @@ impl ConversionBatch<'_> {
                     if fail_fast {
                         if first_error.is_none() {
                             cancelled.store(true, Ordering::Relaxed);
-                            send(
-                                &progress_tx,
-                                stage,
-                                completed,
-                                total_files,
-                                Some(relative),
-                                "Asset conversion failed",
-                            )
-                            .await;
+                            let _ = progress_tx
+                                .send(
+                                    ProgressEvent::new(
+                                        stage,
+                                        completed,
+                                        total_files,
+                                        Some(relative),
+                                        "Asset conversion failed",
+                                    )
+                                    .with_outcome(AssetOutcome::Failed),
+                                )
+                                .await;
                             first_error = Some(error);
                         }
                     } else {
@@ -1025,28 +1270,10 @@ impl ConversionBatch<'_> {
             }
         }
 
-        match rayon_handle.await {
-            Ok(result) => result?,
-            // Item panics are caught in the per-item body, so this is a
-            // batch-level panic with no file to blame: record it against the
-            // batch instead of aborting the run with it unrecorded (CP-05).
-            Err(error) if !fail_fast => {
-                self.record_skip(
-                    stage,
-                    completed,
-                    total_files,
-                    format!("{}/*", source_exts.join("|")),
-                    PathBuf::from(format!("{}/*", source_exts.join("|"))),
-                    color_eyre::eyre::Report::new(error)
-                        .wrap_err("asset conversion batch panicked"),
-                )
-                .await;
-            }
-            Err(error) => {
-                return Err(color_eyre::eyre::Report::new(error)
-                    .wrap_err("asset conversion batch panicked"));
-            }
-        }
+        rayon_handle
+            .await
+            .wrap_err("rayon batch worker panicked")??;
+        interrupt(self.cancellation)?;
         if let Some(error) = first_error {
             return Err(error);
         }
@@ -1062,49 +1289,39 @@ impl ConversionBatch<'_> {
         relative: PathBuf,
         error: color_eyre::eyre::Error,
     ) {
-        send(
-            self.progress_tx,
-            stage,
-            completed,
-            total,
-            Some(relative.clone()),
-            "Asset skipped",
-        )
-        .await;
+        let _ = self
+            .progress_tx
+            .send(
+                ProgressEvent::new(
+                    stage,
+                    completed,
+                    total,
+                    Some(relative.clone()),
+                    "Asset skipped",
+                )
+                .with_outcome(AssetOutcome::Skipped),
+            )
+            .await;
         let message = format!("{}: {error:#}", relative.display());
         self.manifest.failures.insert(key, message.clone());
         self.report.warnings.push(message);
         self.report.skipped += 1;
     }
 
-    /// Records a texture reference pruned from a published mesh because the game
-    /// data does not contain that texture. Loud like a skip - the progress event
-    /// still names the mesh and the run summary counts the prunes - but it is not
-    /// a skip: no warning is recorded and nothing lands in `manifest.failures`, so
-    /// the conversion stays complete.
-    async fn record_pruned_texture_reference(
-        &mut self,
-        stage: ProgressStage,
-        completed: u64,
-        total: u64,
-        glb: String,
-        reference: String,
-    ) {
-        send(
-            self.progress_tx,
-            stage,
-            completed,
-            total,
-            Some(PathBuf::from(&glb)),
-            "Asset skipped",
-        )
-        .await;
-        self.report.pruned_texture_references += 1;
+    /// Records a texture reference a published mesh omits because the game data
+    /// does not contain that texture, whether this run pruned it or an earlier
+    /// run did and the mesh was reused. Returns whether the reference is new, so
+    /// the caller reports progress only for work this run performed.
+    ///
+    /// A prune is loud like a skip - the progress stream and the run summary name
+    /// the mesh - but it is not a skip: no warning is recorded and nothing lands
+    /// in `manifest.failures`, so the conversion stays complete.
+    fn record_pruned_texture_reference(&mut self, glb: &str, reference: &str) -> bool {
         self.manifest
             .pruned_texture_references
-            .entry(glb)
+            .entry(glb.to_owned())
             .or_default()
-            .push(reference);
+            .insert(reference.to_owned())
     }
 }
 
@@ -1198,6 +1415,51 @@ fn insert_texture_semantic(
     Ok(())
 }
 
+/// Canonical source texture keys of every discovered texture under `staging/vfs`, as
+/// [`canonical_asset_path`] produces them (`textures/rock01.dds`). Used to tell "the game data
+/// never contained this texture" from "the game data contains it and its publication failed".
+fn texture_source_keys(staging: &Path, files: &[PathBuf]) -> BTreeSet<String> {
+    let vfs = staging.join("vfs");
+    files
+        .iter()
+        .filter(|path| extension(path, &["dds"]))
+        .filter_map(|path| {
+            let relative = path.strip_prefix(&vfs).ok()?;
+            canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "dds").ok()
+        })
+        .collect()
+}
+
+/// The canonical `.dds` source key a pruned mesh reference came from: `textures/foo.ktx2` and
+/// its `.opensky-srgb` alias both map to `textures/foo.dds`. Returns `None` for references that
+/// are not converted texture paths.
+fn texture_reference_source_key(reference: &str) -> Option<String> {
+    let stem = reference
+        .strip_suffix(".opensky-srgb.ktx2")
+        .or_else(|| reference.strip_suffix(".ktx2"))?;
+    canonical_asset_path(&format!("{stem}.dds"), AssetKind::Texture, "dds").ok()
+}
+
+/// Target outputs of meshes that must be converted again: one of their pruned references has
+/// its source back under `staging/vfs`. The mesh cache does not hash texture dependencies, so a
+/// reused GLB would never regain the restored reference.
+fn restored_mesh_outputs(
+    previous: &ConversionManifest,
+    source_textures: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    previous
+        .pruned_texture_references
+        .iter()
+        .filter(|(_, references)| {
+            references.iter().any(|reference| {
+                texture_reference_source_key(reference)
+                    .is_some_and(|key| source_textures.contains(&key))
+            })
+        })
+        .map(|(glb, _)| glb.clone())
+        .collect()
+}
+
 fn source_texture_key(runtime_key: &str) -> Result<String> {
     if let Some(stem) = runtime_key.strip_suffix(".opensky-srgb.ktx2") {
         return Ok(format!("{stem}.ktx2"));
@@ -1237,7 +1499,13 @@ fn publish_srgb_texture_aliases(staging: &Path) -> Result<Vec<PathBuf>> {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        link_or_copy(&source, &destination)?;
+        link_or_copy(&source, &destination).wrap_err_with(|| {
+            format!(
+                "failed to publish sRGB alias {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
         published.push(alias);
     }
     Ok(published)
@@ -1253,6 +1521,22 @@ fn discover(root: &Path) -> Result<Vec<PathBuf>> {
         .collect();
     files.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
     Ok(files)
+}
+
+/// Whether two paths hold byte-identical files. Used to decide whether a prune
+/// record from an earlier manifest still describes the mesh about to be
+/// published, so a record is never repeated for a mesh that changed.
+fn files_are_identical(left: &Path, right: &Path) -> bool {
+    let (Ok(left_metadata), Ok(right_metadata)) = (fs::metadata(left), fs::metadata(right)) else {
+        return false;
+    };
+    if left_metadata.len() != right_metadata.len() {
+        return false;
+    }
+    match (hash_file(left), hash_file(right)) {
+        (Ok(left_hash), Ok(right_hash)) => left_hash == right_hash,
+        _ => false,
+    }
 }
 
 fn validate_artifacts(
@@ -1355,10 +1639,44 @@ fn overlay_loose_assets(data: &Path, vfs: &Path, files: &[PathBuf]) -> Result<()
         // A reused archive entry links its `vfs` file to the cache blob, so this override has to
         // replace the path rather than write through it: copying over the link would truncate the
         // file every other name shares, the blob and the previous output included.
+        //
+        // Written beside the destination and renamed, so a kill mid-copy cannot leave a torn file
+        // under the real name for a resumed run to accept. The fallible copy comes first, so a
+        // failed one leaves the previous file in place.
+        let temporary = destination.with_file_name(format!(
+            ".{}.{}.partial",
+            destination
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            std::process::id()
+        ));
+        if let Err(error) = fs::copy(source, &temporary) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source.display(),
+                    temporary.display()
+                )
+            });
+        }
+        // Flushed before the rename, like the converter's other writers, so a crash right after
+        // it cannot leave a torn file under the real name.
+        // Opened for writing: on Windows a flush needs write access.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
+            .and_then(|file| file.sync_all())
+            .wrap_err_with(|| format!("failed to flush {}", temporary.display()))?;
         if destination.exists() {
             fs::remove_file(&destination)?;
         }
-        fs::copy(source, destination)?;
+        fs::rename(&temporary, &destination)
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&temporary);
+            })
+            .wrap_err_with(|| format!("failed to publish {}", destination.display()))?;
     }
     Ok(())
 }
@@ -1430,211 +1748,75 @@ fn extension(path: &Path, expected: &[&str]) -> bool {
         })
 }
 
-/// What a `--resume-staging` folder turned out to hold.
-enum ResumeVerdict {
-    /// The folder finished converting and only the publish failed.
-    Finished(Box<FinishedStaging>),
-    /// The folder does not prove it finished; the reason explains what is
-    /// missing, and the run converts the assets again.
-    Incomplete(String),
-}
-
-/// What a staging folder that finished converting still holds.
-struct FinishedStaging {
-    /// The files a run writes after its last conversion, all present.
-    artifacts: Vec<PathBuf>,
-    /// Input counts the finished run recorded.
-    inputs_by_kind: BTreeMap<String, u64>,
-    /// The world database verdict the finished run recorded.
-    integration: Option<IntegrationReport>,
-}
-
-/// Decides whether a resumed staging folder already holds a finished
-/// conversion, in which case only the publish has to be retried.
+/// Deletes staged meshes no provenance source vouches for.
 ///
-/// `conversion-manifest.json` is the last file a run writes, so a complete one
-/// proves the conversion reached its end. Beyond that this re-checks the
-/// schema, the configuration hash and the files written around it, stats every
-/// converted asset the manifest lists against its recorded size, reopens the
-/// world database and re-reads the integration report — nothing here decodes a
-/// converted asset. Anything unreadable or invalid is reported as incomplete so
-/// that the caller falls back to converting the assets again.
-fn probe_finished_staging(config: &PipelineConfig, staging: &Path) -> ResumeVerdict {
-    if config.invalidate_cache {
-        return ResumeVerdict::Incomplete("cache invalidation was requested".to_owned());
-    }
-    // Parsed directly instead of through `ConversionManifest::load`: that
-    // loader migrates or replaces manifests, and this check has to see the
-    // schema and configuration the staging folder was really converted with.
-    let manifest: ConversionManifest = match fs::read(staging.join("conversion-manifest.json"))
-        .wrap_err("unreadable conversion manifest")
-        .and_then(|bytes| serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest"))
+/// `verified` holds staged-relative mesh paths (forward slashes) whose bytes
+/// a provenance record describes: the PR31 staging journal once merged. A
+/// mesh in that set survives so the journal reuse gate below can certify it;
+/// every other staged mesh is unverified and goes, so a resume can never
+/// publish bytes this converter did not verify.
+fn invalidate_staged_mesh_outputs(staging: &Path, verified: &BTreeSet<String>) -> Result<()> {
+    let vfs = staging.join("vfs");
+    for entry in WalkDir::new(staging)
+        .into_iter()
+        .filter_entry(|entry| entry.path() != vfs.as_path())
     {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            return ResumeVerdict::Incomplete(format!(
-                "its conversion-manifest.json cannot be read: {error:#}"
-            ));
+        let entry = entry?;
+        if !entry.file_type().is_file() || !extension(entry.path(), &["glb"]) {
+            continue;
         }
-    };
-    if manifest.schema_version != crate::cache::CONVERTER_SCHEMA_VERSION {
-        return ResumeVerdict::Incomplete(format!(
-            "it was converted with schema version {}, but this converter writes {}",
-            manifest.schema_version,
-            crate::cache::CONVERTER_SCHEMA_VERSION
-        ));
-    }
-    if !manifest.complete {
-        return ResumeVerdict::Incomplete("its manifest is not complete".to_owned());
-    }
-    let expected_configuration = match configuration_hash(config) {
-        Ok(hash) => hash,
-        Err(error) => {
-            return ResumeVerdict::Incomplete(format!(
-                "its conversion settings cannot be hashed: {error:#}"
-            ));
+        let relative = entry
+            .path()
+            .strip_prefix(staging)
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if verified.contains(&relative) {
+            continue;
         }
-    };
-    if manifest.configuration_hash != expected_configuration {
-        return ResumeVerdict::Incomplete(
-            "it was converted with different texture or script settings".to_owned(),
-        );
-    }
-    let artifacts = last_written_artifacts(config, staging);
-    for artifact in &artifacts {
-        let present = fs::metadata(staging.join(artifact))
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
-        if !present {
-            return ResumeVerdict::Incomplete(format!(
-                "{} is missing or empty",
-                artifact.display()
-            ));
-        }
-    }
-    // Every converted asset the finished run recorded is still there at the
-    // size it was written with. This is a stat per asset, no hashing: it
-    // catches a staging folder that lost files after the conversion finished.
-    let mut mismatched_assets = 0u64;
-    let mut first_mismatch = None;
-    for entry in manifest.entries.values() {
-        // A GLB whose dangling texture references were pruned was rewritten after its size was
-        // recorded, so only its presence can be checked.
-        let rewritten = manifest
-            .pruned_texture_references
-            .contains_key(&entry.output);
-        let present = fs::metadata(staging.join(&entry.output)).is_ok_and(|metadata| {
-            metadata.is_file() && (rewritten || metadata.len() == entry.output_size)
-        });
-        if !present {
-            mismatched_assets += 1;
-            first_mismatch.get_or_insert(&entry.output);
-        }
-    }
-    if let Some(output) = first_mismatch {
-        return ResumeVerdict::Incomplete(if mismatched_assets == 1 {
-            format!("its converted asset {output} is missing or the wrong size")
-        } else {
+        fs::remove_file(entry.path()).wrap_err_with(|| {
             format!(
-                "{mismatched_assets} converted assets are missing or the wrong size, starting with {output}"
+                "failed to invalidate staged mesh {}",
+                entry.path().display()
             )
-        });
+        })?;
     }
-    if staging.join("skyrim_world.db").is_file() {
-        match Connection::open(staging.join("skyrim_world.db"))
-            .wrap_err("cannot be opened")
-            .and_then(|connection| {
-                validate_database(&connection)
-                    .map_err(color_eyre::Report::from)
-                    .wrap_err("does not validate")
-            }) {
-            Ok(()) => {}
-            Err(error) => {
-                return ResumeVerdict::Incomplete(format!("its skyrim_world.db {error:#}"));
-            }
+    Ok(())
+}
+
+/// Removes a staging folder after a successful publish, unless it is or holds the Skyrim Data
+/// folder: a `--resume-staging` folder is named by the user, and removing it must never take the
+/// game data with it. A folder that is kept, or fails to go, is reported on stderr and left behind;
+/// the run has already published, so neither fails it. Returns whether the folder was removed.
+fn remove_staging(staging: &Path, data_dir: &Path) -> bool {
+    match (fs::canonicalize(staging), fs::canonicalize(data_dir)) {
+        (Ok(staging_path), Ok(data_path)) if !data_path.starts_with(&staging_path) => {}
+        (Ok(_), Ok(_)) => {
+            eprintln!(
+                "warning: kept the staging folder {} because it holds the Skyrim Data folder {}",
+                staging.display(),
+                data_dir.display()
+            );
+            return false;
+        }
+        _ => {
+            eprintln!(
+                "warning: kept the staging folder {}: could not compare it with the Skyrim Data folder {}",
+                staging.display(),
+                data_dir.display()
+            );
+            return false;
         }
     }
-    let integration = if staging.join("integration-report.json").is_file() {
-        match fs::read(staging.join("integration-report.json"))
-            .wrap_err("unreadable integration report")
-            .and_then(|bytes| serde_json::from_slice(&bytes).wrap_err("invalid integration report"))
-        {
-            Ok(report) => Some(report),
-            Err(error) => {
-                return ResumeVerdict::Incomplete(format!(
-                    "its integration-report.json cannot be read: {error:#}"
-                ));
-            }
+    match fs::remove_dir_all(staging) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "warning: could not remove the staging folder {}: {error}",
+                staging.display()
+            );
+            false
         }
-    } else {
-        None
-    };
-    ResumeVerdict::Finished(Box::new(FinishedStaging {
-        artifacts,
-        inputs_by_kind: manifest.inputs_by_kind,
-        integration,
-    }))
-}
-
-/// Marks a staging folder's manifest as unfinished before a full resume writes
-/// into the folder again.
-///
-/// A finished run leaves `complete: true` behind, and a resume that was told to
-/// convert again only replaces that manifest once it reaches its own end. If it
-/// stops part-way, the stale manifest must not be taken for a finished
-/// conversion by the next resume, so the flag is cleared first, atomically the
-/// way the manifest is written during a conversion. The entry list is left in
-/// place so the folder still shows what the interrupted run had produced; the
-/// reuse cache lives with the output directory, not here. A manifest this build
-/// cannot parse is left alone: the probe rejects it as it is.
-fn mark_staging_unfinished(staging: &Path) -> Result<()> {
-    let path = staging.join("conversion-manifest.json");
-    if !path.is_file() {
-        return Ok(());
     }
-    let Ok(mut manifest) = ConversionManifest::load(&path) else {
-        return Ok(());
-    };
-    if !manifest.complete {
-        return Ok(());
-    }
-    manifest.complete = false;
-    manifest.save(&path)
-}
-
-/// The files a run writes after its last conversion, in the order it writes
-/// them. The world database, its cell cache and the integration report exist
-/// only when the Data directory offers plugins to build the database from.
-fn last_written_artifacts(config: &PipelineConfig, staging: &Path) -> Vec<PathBuf> {
-    let mut artifacts = Vec::new();
-    if staging.join("skyrim_world.db").is_file() || data_directory_has_plugins(config) {
-        artifacts.push(PathBuf::from("skyrim_world.db"));
-        artifacts.push(PathBuf::from("cell_cache.rkyv"));
-        artifacts.push(PathBuf::from("integration-report.json"));
-    }
-    artifacts.push(PathBuf::from("scripts/papyrus_runtime.luau"));
-    artifacts.push(PathBuf::from("conversion-manifest.json"));
-    artifacts
-}
-
-/// Whether the Data directory offers plugins for the world database.
-///
-/// Only the Data directory itself is listed, not the tree under it: the game
-/// loads plugins from its root, and reading one directory costs far less than
-/// the walk a resume is trying to avoid. A directory that cannot be read counts
-/// as offering plugins, which only asks for more evidence before publishing.
-fn data_directory_has_plugins(config: &PipelineConfig) -> bool {
-    if let Some(path) = &config.plugins_file {
-        return match read_plugins_txt(path, &config.data_dir) {
-            Ok(plugins) => !plugins.is_empty(),
-            Err(_) => true,
-        };
-    }
-    let Ok(entries) = fs::read_dir(&config.data_dir) else {
-        return true;
-    };
-    entries
-        .filter_map(|entry| entry.ok())
-        .any(|entry| extension(&entry.path(), &["esm", "esp", "esl"]))
 }
 
 /// Strips the leading asset kind folder (e.g., "textures", "meshes", "scripts")
@@ -1648,27 +1830,348 @@ fn staging_path(output: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    output.with_extension(format!("staging-{}-{stamp}", std::process::id()))
+    // The whole file name, not `with_extension`: a dotted output name (`Skyrim.Converted`) must
+    // give `Skyrim.Converted.staging-...`, the prefix resuming and `find_resumable_staging` expect.
+    let name = output.file_name().unwrap_or_default().to_string_lossy();
+    output.with_file_name(format!("{name}.staging-{}-{stamp}", std::process::id()))
 }
 
+/// Where the staging journal waits while its staging directory is published.
+#[cfg(test)]
+fn parked_journal_path(staging: &Path) -> PathBuf {
+    let mut name = staging.file_name().unwrap_or_default().to_os_string();
+    name.push(".journal.jsonl");
+    staging.with_file_name(name)
+}
+
+/// The temporary names the converter's own writers use while publishing a file: each appends a
+/// suffix carrying the writing process's id to the real name and renames the file over its
+/// destination, so a run killed between the two leaves the temporary behind. The numeric
+/// process-id segment is what tells a leftover from a real file that merely ends in `.partial`.
+///
+/// One entry per writer:
+/// - `archive::atomic_write`: `.<name>.<pid>.partial`
+/// - `ConversionManifest::save` and the report writer: `<name>.json.<pid>.partial`
+/// - `write_glb_atomic`: `<name>.<extension>.<pid>.partial`
+/// - the texture writer: `<name>.ktx2.<pid>.partial`
+/// - the script writer: `.<name>.<pid>-<counter>.partial`
+/// - `link_or_copy_spilling`: `<name>.<index>.partial-<pid>`
+/// - `write_glb_atomic` and the texture writer also park the previous output as
+///   `<name>.glb.<pid>.backup` / `<name>.ktx2.<pid>.backup` while they swap; a leftover one makes
+///   the writer refuse, and the output it held is converted again on resume.
+fn is_converter_temporary_name(name: &str) -> bool {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if let Some(head) = name.strip_suffix(".backup") {
+        return head.rsplit_once('.').is_some_and(|(stem, pid)| {
+            digits(pid) && (stem.ends_with(".glb") || stem.ends_with(".ktx2"))
+        });
+    }
+    if let Some(head) = name.strip_suffix(".partial") {
+        // A script temporary carries a per-call counter after the process id; every other shape
+        // ends at the process id itself.
+        let head = match head.rsplit_once('-') {
+            Some((before_counter, counter)) if digits(counter) => before_counter,
+            _ => head,
+        };
+        return head.rsplit_once('.').is_some_and(|(_, pid)| digits(pid));
+    }
+    // The spill copy appends `.partial-<pid>` instead of replacing the extension.
+    name.rsplit_once(".partial-")
+        .is_some_and(|(_, pid)| digits(pid))
+}
+
+/// Removes the temporary files an interrupted run left in a staging folder, before a resumed run
+/// treats the folder as its own. Only the converter's own temporary names go: a file that merely
+/// ends in `.partial` belongs to somebody else and is left alone. Returns how many were removed.
+fn remove_stale_temporary_files(staging: &Path) -> Result<usize> {
+    let mut removed = 0;
+    for entry in WalkDir::new(staging).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file()
+            || !is_converter_temporary_name(&entry.file_name().to_string_lossy())
+        {
+            continue;
+        }
+        fs::remove_file(entry.path()).wrap_err_with(|| {
+            format!(
+                "failed to remove stale temporary {}",
+                entry.path().display()
+            )
+        })?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Provenance for a cache entry whose output is now complete inside staging.
+fn staged_output(entry: &CacheEntry, configuration_hash: &str) -> StagedOutput {
+    StagedOutput {
+        schema_version: CONVERTER_SCHEMA_VERSION,
+        configuration_hash: configuration_hash.to_owned(),
+        source_hash: entry.source_hash.clone(),
+        output_size: entry.output_size,
+        output_hash: entry.output_hash.clone(),
+    }
+}
+
+/// Publishes only runtime artifacts. Staging keeps `vfs/` and
+/// `.ingestion-cache/` as build workspace; those never land in `output`.
+fn publish_runtime_pack(staging: &Path, output: &Path, report: &PipelineReport) -> Result<()> {
+    // Beside staging, not inside it: a resumed staging dir keeps the
+    // previous pack's linked files, so the new pack must not share inodes
+    // with anything a resumed run will later unlink and rewrite.
+    let pack_staging = staging.with_extension(format!(
+        "pack-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    if pack_staging.exists() {
+        fs::remove_dir_all(&pack_staging)?;
+    }
+    fs::create_dir_all(&pack_staging)?;
+    let published = (|| -> Result<()> {
+        for artifact in &report.artifacts {
+            let source = staging.join(artifact);
+            if !source.is_file() {
+                continue;
+            }
+            let destination = pack_staging.join(artifact);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            link_or_copy(&source, &destination).wrap_err_with(|| {
+                format!(
+                    "failed to publish {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        }
+        ensure!(
+            pack_staging.join("conversion-manifest.json").is_file(),
+            "runtime pack is missing conversion-manifest.json"
+        );
+        publish_directory(&pack_staging, output)
+    })();
+    if published.is_err() {
+        let _ = fs::remove_dir_all(&pack_staging);
+    }
+    published
+}
+
+/// Copies new ingestion blobs into the persistent cache root outside the pack.
+fn persist_ingestion_cache(staging_cache: &Path, cache_root: &Path) -> Result<()> {
+    for entry in WalkDir::new(staging_cache).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        // A spill copy (`<hash>.N`) only stands in for a full blob while a run links files out of
+        // it; restoring makes fresh ones in staging, so persisting them would just duplicate bytes.
+        if is_spill_copy(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(staging_cache)?;
+        let destination = cache_root.join(relative);
+        if destination.is_file() {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        link_or_copy(entry.path(), &destination).wrap_err_with(|| {
+            format!(
+                "failed to persist cache blob {} to {}",
+                entry.path().display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Whether a cache file name is a spill copy of a blob: 64 hex digits, a dot and a number.
+fn is_spill_copy(name: &str) -> bool {
+    name.split_once('.').is_some_and(|(hash, index)| {
+        hash.len() == 64
+            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            && !index.is_empty()
+            && index.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// Removes ingestion-cache blobs (and spill files) no longer referenced by
+/// the published manifest. Without this, removed or replaced archives leave
+/// orphaned blobs behind forever, since publication only adds.
+fn prune_stale_ingestion_blobs(cache_root: &Path, manifest: &ConversionManifest) -> Result<()> {
+    use std::collections::BTreeSet;
+    if !cache_root.is_dir() {
+        return Ok(());
+    }
+    let mut live = BTreeSet::new();
+    for entry in manifest.archives.values() {
+        for file in &entry.files {
+            live.insert(file.hash.clone());
+        }
+    }
+    for entry in WalkDir::new(cache_root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
+        // Blob names are 64 hex chars; spill files append `.N`. Anything
+        // else (probes, partials from crashed runs) is left alone.
+        let hash = name.split('.').next().unwrap_or("");
+        let is_blob = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+        if is_blob && !live.contains(hash) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Where a publish parks the previous output while it swaps the new one in. The whole file name,
+/// like `staging_path`: an output name that contains a dot must keep all of it.
+fn backup_path(output: &Path) -> PathBuf {
+    let name = output.file_name().unwrap_or_default().to_string_lossy();
+    output.with_file_name(format!("{name}.backup-{}", std::process::id()))
+}
+
+/// A backup sibling left behind by any run, this one or another: `<output file name>.backup-*`
+/// beside `output`. It may hold the only copy of a previous output — a run that died between the
+/// two renames leaves exactly that — so it is named and refused, never deleted.
+fn stale_backup(output: &Path) -> Option<PathBuf> {
+    let output_name = output.file_name()?.to_string_lossy().to_ascii_lowercase();
+    let prefix = format!("{output_name}.backup-");
+    // A bare file name has an empty parent; the folder it names is the working directory.
+    let parent = match output.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::read_dir(parent)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name().is_some_and(|file_name| {
+                // Only the converter's own shape, `<output name>.backup-<process id>`: a folder the
+                // user named `<output>.backup-old` is not ours and must not block every run.
+                file_name
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .strip_prefix(&prefix)
+                    .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+}
+
+/// Stops a run when an earlier publish left a backup of the output behind. That folder may hold
+/// the only copy of the previous output, so it is named and kept, never deleted.
+fn refuse_stale_backup(output: &Path) -> Result<()> {
+    if let Some(stale) = stale_backup(output) {
+        bail!(
+            "refusing to overwrite stale backup {}: it may hold your previous output; move it aside (delete it only if you no longer need that output) and run the conversion again",
+            stale.display()
+        );
+    }
+    Ok(())
+}
+
+/// The filesystem operations a publish is built from, and where its non-fatal news goes. A test
+/// can replace an operation to make it fail where the real filesystem on a healthy machine would
+/// not.
+trait PublishOps {
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        fs::remove_dir_all(path)
+    }
+
+    /// Reports news that does not stop the run, the way `remove_staging` does.
+    fn warn(&self, message: &str) {
+        eprintln!("warning: {message}");
+    }
+}
+
+/// The real filesystem.
+struct Filesystem;
+
+impl PublishOps for Filesystem {}
+
 fn publish_directory(staging: &Path, output: &Path) -> Result<()> {
-    let backup = output.with_extension(format!("backup-{}", std::process::id()));
-    if backup.exists() {
-        bail!("refusing to overwrite stale backup {}", backup.display());
-    }
+    publish_directory_with(staging, output, &Filesystem)
+}
+
+fn publish_directory_with(staging: &Path, output: &Path, ops: &impl PublishOps) -> Result<()> {
+    // Checked again here, not only before the run: the old output is deleted
+    // below, so a folder that became unsafe during the run must stop it.
+    crate::config::check_output_dir(output)?;
+    // Any backup, not only this process's: one left under another pid is neither noticed nor
+    // protected by a check scoped to the current pid, and deleting it would lose the previous
+    // output for good.
+    refuse_stale_backup(output)?;
+    let backup = backup_path(output);
     if output.exists() {
-        fs::rename(output, &backup).wrap_err("failed to preserve previous asset output")?;
+        ops.rename(output, &backup)
+            .wrap_err("failed to preserve previous asset output")?;
+        // The folder is checked once more under its backup name: something written into it
+        // between the check above and the rename would otherwise be deleted with it below.
+        if let Err(error) = crate::config::check_output_dir(&backup) {
+            if let Err(restore) = ops.rename(&backup, output) {
+                bail!(
+                    "{error}; the previous output could not be moved back from {} to {}: {restore}",
+                    backup.display(),
+                    output.display()
+                );
+            }
+            return Err(error.into());
+        }
     }
-    if let Err(error) = fs::rename(staging, output) {
-        if backup.exists() {
-            let _ = fs::rename(&backup, output);
+    if let Err(error) = ops.rename(staging, output) {
+        if backup.exists()
+            && let Err(restore) = ops.rename(&backup, output)
+        {
+            // Both errors, and the backup's path: that folder is the only copy of the
+            // previous output, and the user has to be told where it is.
+            bail!(
+                "failed to publish converted assets: {error}; the previous output is still at {} \
+                 and could not be moved back to {}: {restore}",
+                backup.display(),
+                output.display()
+            );
         }
         return Err(error).wrap_err("failed to publish converted assets");
     }
-    if backup.exists() {
-        fs::remove_dir_all(backup)?;
+    // The new output is already in place, so a backup that cannot be removed is a leftover for
+    // the user to finish with, not a failed publish. On Windows a handle held inside it (an
+    // Explorer window, an indexer, antivirus, a running engine) makes the removal fail.
+    if backup.exists()
+        && let Err(error) = ops.remove_dir_all(&backup)
+    {
+        ops.warn(&format!(
+            "could not remove the backup folder {}: {error}",
+            backup.display()
+        ));
     }
     Ok(())
+}
+
+/// Stops the worker pool and keeps the first error. The batch still drains
+/// its channel and awaits the pool before returning it, so no worker writes
+/// into a staging directory the caller is about to remove.
+fn stop_batch(
+    cancelled: &AtomicBool,
+    first_error: &mut Option<color_eyre::eyre::Error>,
+    error: color_eyre::eyre::Error,
+) {
+    cancelled.store(true, Ordering::Relaxed);
+    first_error.get_or_insert(error);
 }
 
 async fn send(
@@ -1680,92 +2183,107 @@ async fn send(
     message: &str,
 ) {
     let _ = tx
-        .send(ProgressEvent {
+        .send(ProgressEvent::new(
             stage,
             completed,
             total,
             current_file,
-            message: message.to_owned(),
-        })
+            message,
+        ))
         .await;
+}
+
+/// Sends a one-off line for the person watching: the CLI ends any open status line before it, so a
+/// warning never splices into a redrawn line.
+async fn send_notice(
+    tx: &Sender<ProgressEvent>,
+    stage: ProgressStage,
+    current_file: Option<PathBuf>,
+    message: &str,
+) {
+    let _ = tx
+        .send(ProgressEvent::notice(stage, current_file, message))
+        .await;
+}
+
+/// Sends a progress event that also carries byte counts, which the status line weighs a stage by.
+#[allow(clippy::too_many_arguments)]
+async fn send_with_bytes(
+    tx: &Sender<ProgressEvent>,
+    stage: ProgressStage,
+    completed: u64,
+    total: u64,
+    current_file: Option<PathBuf>,
+    message: &str,
+    bytes: (u64, u64),
+) {
+    let _ = tx
+        .send(
+            ProgressEvent::new(stage, completed, total, current_file, message)
+                .with_bytes(bytes.0, bytes.1),
+        )
+        .await;
+}
+
+/// Stops the run at the next safe point when the user interrupted it. The caller keeps the staging
+/// folder, so the run can be resumed where it stopped.
+fn interrupt(cancellation: &Cancellation) -> Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(Interrupted::new().into());
+    }
+    Ok(())
+}
+
+/// Test-only: presses Stop from inside the extractor after a given number of per-entry stop
+/// checks of one output's run, so a test stops part way through an archive without racing it.
+#[cfg(test)]
+mod stop_hook {
+    use super::Cancellation;
+    use std::{
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
+
+    static CANCEL_AFTER: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+    pub(super) fn cancel_after(output: &Path, checks: usize) {
+        CANCEL_AFTER
+            .lock()
+            .unwrap()
+            .push((output.to_path_buf(), checks));
+    }
+
+    pub(super) fn tick(output: &Path, cancellation: &Cancellation) {
+        let mut hooks = CANCEL_AFTER.lock().unwrap();
+        if let Some(index) = hooks.iter().position(|(path, _)| path == output) {
+            if hooks[index].1 == 0 {
+                hooks.remove(index);
+                cancellation.cancel();
+            } else {
+                hooks[index].1 -= 1;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     #[test]
-    fn link_or_copy_shares_the_file_where_the_filesystem_can() {
+    fn a_dotted_output_name_keeps_its_whole_name_in_the_staging_folder() {
+        let staging = staging_path(Path::new("converted/Skyrim.Converted"));
+        let name = staging.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("Skyrim.Converted.staging-"), "{name}");
+        assert_eq!(staging.parent(), Some(Path::new("converted")));
+        // And the folder it names is the one a resume finds.
         let directory = tempfile::tempdir().unwrap();
-        let old = directory.path().join("published.ktx2");
-        let staged = directory.path().join("staging/published.ktx2");
-        fs::write(&old, b"texture").unwrap();
-        fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        link_or_copy(&old, &staged).unwrap();
-        assert_eq!(fs::read(&staged).unwrap(), b"texture");
-        // A hard link sees a write made through the other name; a copy would not. NTFS, ext4
-        // and APFS all support links, so the reuse must not have fallen back to copying.
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&old)
-            .unwrap()
-            .write_all(b"+")
-            .unwrap();
-        assert_eq!(fs::read(&staged).unwrap(), b"texture+");
+        let output = directory.path().join("Skyrim.Converted");
+        let staging = staging_path(&output);
+        fs::create_dir_all(&staging).unwrap();
+        assert_eq!(crate::find_resumable_staging(&output), Some((staging, 0)));
     }
-
-    #[test]
-    fn loose_asset_override_does_not_write_through_a_linked_vfs_entry() {
-        let directory = tempfile::tempdir().unwrap();
-        let previous = directory.path().join("previous");
-        let previous_vfs = previous.join("vfs/textures/rock.dds");
-        fs::create_dir_all(previous_vfs.parent().unwrap()).unwrap();
-        fs::write(&previous_vfs, b"archive bytes").unwrap();
-
-        // What the first conversion publishes: the extracted `vfs` file and its content-addressed
-        // blob share one file (`persist_cache_blobs`).
-        let hash = "ab".repeat(32);
-        let previous_blob = previous.join(".ingestion-cache/sha256/ab").join(&hash);
-        fs::create_dir_all(previous_blob.parent().unwrap()).unwrap();
-        link_or_copy(&previous_vfs, &previous_blob).unwrap();
-
-        // What a reconversion stages for the same archive entry: the cache hit links again.
-        let staging_vfs = directory.path().join("staging/vfs");
-        let staged = staging_vfs.join("textures/rock.dds");
-        fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        link_or_copy(&previous_blob, &staged).unwrap();
-
-        let data = directory.path().join("Data");
-        fs::create_dir_all(data.join("textures")).unwrap();
-        let loose = data.join("textures/rock.dds");
-        fs::write(&loose, b"loose override").unwrap();
-
-        overlay_loose_assets(&data, &staging_vfs, &[loose]).unwrap();
-
-        assert_eq!(fs::read(&staged).unwrap(), b"loose override");
-        assert_eq!(
-            fs::read(&previous_vfs).unwrap(),
-            b"archive bytes",
-            "the override wrote through the link into the previous output"
-        );
-        assert_eq!(fs::read(&previous_blob).unwrap(), b"archive bytes");
-    }
-
-    #[test]
-    fn reconverting_a_linked_staged_output_leaves_the_published_file_alone() {
-        let directory = tempfile::tempdir().unwrap();
-        let old = directory.path().join("published.luau");
-        let staged = directory.path().join("staged.luau");
-        fs::write(&old, b"published").unwrap();
-        link_or_copy(&old, &staged).unwrap();
-        // What the conversion branch does before a converter writes its output in place.
-        let _ = fs::remove_file(&staged);
-        fs::write(&staged, b"reconverted").unwrap();
-        assert_eq!(fs::read(&old).unwrap(), b"published");
-        assert_eq!(fs::read(&staged).unwrap(), b"reconverted");
-    }
-    use crate::cache::hash_bytes;
+    use std::time::Duration;
     use tokio::sync::mpsc;
 
     #[test]
@@ -1778,6 +2296,39 @@ mod tests {
             source_texture_key("textures/effects/fire.ktx2").unwrap(),
             "textures/effects/fire.ktx2"
         );
+    }
+
+    #[test]
+    fn invalidates_unversioned_staged_meshes_but_preserves_vfs() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        fs::create_dir_all(staging.join("meshes")).unwrap();
+        fs::create_dir_all(staging.join("vfs/meshes")).unwrap();
+        fs::write(staging.join("meshes/resumable.glb"), b"mesh").unwrap();
+        fs::write(staging.join("vfs/meshes/source.glb"), b"source").unwrap();
+
+        invalidate_staged_mesh_outputs(staging, &BTreeSet::new()).unwrap();
+
+        assert!(!staging.join("meshes/resumable.glb").exists());
+        assert!(staging.join("vfs/meshes/source.glb").is_file());
+    }
+
+    #[test]
+    fn keeps_a_provenance_verified_staged_mesh() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        fs::create_dir_all(staging.join("meshes")).unwrap();
+        fs::write(staging.join("meshes/verified.glb"), b"mesh").unwrap();
+        fs::write(staging.join("meshes/stale.glb"), b"mesh").unwrap();
+
+        invalidate_staged_mesh_outputs(
+            staging,
+            &BTreeSet::from(["meshes/verified.glb".to_owned()]),
+        )
+        .unwrap();
+
+        assert!(staging.join("meshes/verified.glb").is_file());
+        assert!(!staging.join("meshes/stale.glb").exists());
     }
 
     #[test]
@@ -1814,6 +2365,132 @@ mod tests {
             vec![PathBuf::from("textures/effects/fire.opensky-srgb.ktx2")]
         );
         assert_eq!(fs::read(staging.join(&aliases[0])).unwrap(), b"texture");
+    }
+
+    #[test]
+    fn loose_asset_override_does_not_write_through_a_linked_vfs_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let previous = directory.path().join("previous");
+        let previous_vfs = previous.join("vfs/textures/rock.dds");
+        fs::create_dir_all(previous_vfs.parent().unwrap()).unwrap();
+        fs::write(&previous_vfs, b"archive bytes").unwrap();
+
+        // What a first conversion publishes: the extracted `vfs` file and its content-addressed
+        // blob share one file. What a reconversion stages for the same entry is one file with
+        // that published blob again.
+        let hash = "ab".repeat(32);
+        let previous_blob = previous.join(".ingestion-cache/sha256/ab").join(&hash);
+        fs::create_dir_all(previous_blob.parent().unwrap()).unwrap();
+        link_or_copy(&previous_vfs, &previous_blob).unwrap();
+        let staging_vfs = directory.path().join("staging/vfs");
+        let staged = staging_vfs.join("textures/rock.dds");
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        link_or_copy(&previous_blob, &staged).unwrap();
+
+        let data = directory.path().join("Data");
+        fs::create_dir_all(data.join("textures")).unwrap();
+        let loose = data.join("textures/rock.dds");
+        fs::write(&loose, b"loose override").unwrap();
+
+        overlay_loose_assets(&data, &staging_vfs, &[loose]).unwrap();
+
+        assert_eq!(fs::read(&staged).unwrap(), b"loose override");
+        assert_eq!(
+            fs::read(&previous_vfs).unwrap(),
+            b"archive bytes",
+            "the override wrote through the link into the previous output"
+        );
+        assert_eq!(fs::read(&previous_blob).unwrap(), b"archive bytes");
+    }
+
+    /// Every file under `root` whose name looks like a writer's leftover.
+    fn temporaries_under(root: &Path) -> Vec<PathBuf> {
+        WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry.file_name().to_string_lossy().ends_with(".partial")
+            })
+            .map(|entry| entry.path().to_path_buf())
+            .collect()
+    }
+
+    /// The override copies through a temporary name and renames it into place, so the destination
+    /// name never holds half a file: a failed copy leaves the previous file untouched rather than
+    /// removed or torn.
+    #[test]
+    fn a_loose_override_never_leaves_a_temporary_under_the_destination_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_vfs = directory.path().join("staging/vfs");
+        let destination = staging_vfs.join("textures/rock.dds");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"archive bytes").unwrap();
+
+        // A source the copy cannot read: a directory where a file is expected.
+        let data = directory.path().join("Data");
+        let loose = data.join("textures/rock.dds");
+        fs::create_dir_all(&loose).unwrap();
+
+        assert!(
+            overlay_loose_assets(&data, &staging_vfs, std::slice::from_ref(&loose)).is_err(),
+            "copying a directory as a file fails"
+        );
+
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"archive bytes",
+            "a failed override destroyed the previous file"
+        );
+        assert!(
+            temporaries_under(&staging_vfs).is_empty(),
+            "a failed override left a temporary behind"
+        );
+
+        // The successful copy publishes the new bytes and still leaves no temporary.
+        fs::remove_dir_all(&loose).unwrap();
+        fs::write(&loose, b"loose override").unwrap();
+        overlay_loose_assets(&data, &staging_vfs, std::slice::from_ref(&loose)).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"loose override");
+        assert!(
+            temporaries_under(&staging_vfs).is_empty(),
+            "an override left a temporary behind"
+        );
+    }
+
+    #[test]
+    fn only_the_converters_own_temporary_names_are_temporary() {
+        let pid = std::process::id();
+        for name in [
+            // archive::atomic_write
+            format!(".Skyrim.esm.{pid}.partial"),
+            // the script writer
+            format!(".one.luau.{pid}-7.partial"),
+            // ConversionManifest::save and the report writer
+            format!("conversion-manifest.json.{pid}.partial"),
+            // write_glb_atomic and the texture writer
+            format!("meshes/one.glb.{pid}.partial"),
+            format!("textures/rock.ktx2.{pid}.partial"),
+            // an archive entry written by atomic_write
+            format!(".rock.dds.{pid}.partial"),
+            // link_or_copy_spilling
+            format!("deadbeef.1.partial-{pid}"),
+        ] {
+            assert!(is_converter_temporary_name(&name), "{name} was not matched");
+        }
+        for name in [
+            "hand-authored.partial",
+            "notes.txt.partial",
+            "mod.v2.partial",
+            "rock.dds.partial",
+            "one.luau",
+        ] {
+            assert!(
+                !is_converter_temporary_name(name),
+                "{name} is no temporary of ours and must be kept"
+            );
+        }
     }
 
     #[test]
@@ -1881,172 +2558,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconversion_supercompresses_a_previously_raw_texture() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        fs::create_dir_all(data.join("textures")).unwrap();
-        let dds = dummy_content::dds::generate(
-            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 64, 64)
-                .with_mip_levels(3),
-            &mut dummy_content::rng::Rng::new(21),
-        )
-        .unwrap();
-        fs::write(data.join("textures/rock.dds"), &dds).unwrap();
-        let config = PipelineConfig::new(&data, &output);
-
-        let first = run_without_progress(config.clone()).await;
-        assert_eq!(first.converted, 1);
-        assert!(file_is_zstd_supercompressed(
-            &output.join("textures/rock.ktx2")
-        ));
-
-        // What a reconversion used to find: a published container of raw levels, described by the
-        // manifest entry that makes the next run reuse it instead of encoding the DDS again.
-        let raw = TextureConverter::encode_container(
-            &dds,
-            TextureEncoding::DataLinear,
-            config.texture_etc1s_quality,
-            config.texture_uastc_level,
-        )
-        .unwrap();
-        let published_path = output.join("textures/rock.ktx2");
-        fs::write(&published_path, &raw).unwrap();
-        let manifest_path = output.join("conversion-manifest.json");
-        let mut manifest = ConversionManifest::load(&manifest_path).unwrap();
-        let entry = manifest.entries.get_mut("textures/rock.dds").unwrap();
-        entry.output_size = raw.len() as u64;
-        entry.output_hash = hash_bytes(&raw);
-        manifest.save(&manifest_path).unwrap();
-
-        let second = run_without_progress(config).await;
-
-        assert_eq!(second.cache_hits, 1);
-        assert_eq!(second.converted, 0, "the DDS was encoded again");
-        let republished = fs::read(&published_path).unwrap();
-        assert!(
-            is_zstd_supercompressed(&republished),
-            "a raw container was copied into the new output"
-        );
-        assert_eq!(
-            crate::texture::decode_ktx2_levels(&republished),
-            crate::texture::decode_ktx2_levels(&raw)
-        );
-        let manifest = ConversionManifest::load(&manifest_path).unwrap();
-        assert_eq!(
-            manifest.entries["textures/rock.dds"].output_hash,
-            hash_bytes(&republished),
-            "the manifest still describes the raw container"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_schema_27_output_recompresses_its_textures_without_encoding_the_dds() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        fs::create_dir_all(data.join("textures")).unwrap();
-        let spec = dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 64, 64)
-            .with_mip_levels(3);
-        let source_dds =
-            dummy_content::dds::generate(&spec, &mut dummy_content::rng::Rng::new(33)).unwrap();
-        fs::write(data.join("textures/rock.dds"), &source_dds).unwrap();
-        let config = PipelineConfig::new(&data, &output);
-
-        // What the previous schema published: a container of raw levels whose payloads are not the
-        // encoding of the DDS on disk, so the test can tell a recompression from a re-encode.
-        let first = run_without_progress(config.clone()).await;
-        assert_eq!(first.converted, 1);
-        let published_dds =
-            dummy_content::dds::generate(&spec, &mut dummy_content::rng::Rng::new(21)).unwrap();
-        let raw = TextureConverter::encode_container(
-            &published_dds,
-            TextureEncoding::DataLinear,
-            config.texture_etc1s_quality,
-            config.texture_uastc_level,
-        )
-        .unwrap();
-        let published_path = output.join("textures/rock.ktx2");
-        fs::write(&published_path, &raw).unwrap();
-        let manifest_path = output.join("conversion-manifest.json");
-        let mut manifest = ConversionManifest::load(&manifest_path).unwrap();
-        manifest.schema_version = 27;
-        manifest.complete = true;
-        manifest.configuration_hash = configuration_hash_for_schema(&config, 27).unwrap();
-        let entry = manifest.entries.get_mut("textures/rock.dds").unwrap();
-        entry.output_size = raw.len() as u64;
-        entry.output_hash = hash_bytes(&raw);
-        manifest.save(&manifest_path).unwrap();
-
-        let report = run_without_progress(config.clone()).await;
-
-        assert_eq!(report.cache_hits, 1);
-        assert_eq!(report.converted, 0, "the DDS was encoded again");
-        let republished = fs::read(output.join("textures/rock.ktx2")).unwrap();
-        assert!(
-            is_zstd_supercompressed(&republished),
-            "the schema-27 container was copied forward"
-        );
-        assert_eq!(
-            crate::texture::decode_ktx2_levels(&republished),
-            crate::texture::decode_ktx2_levels(&raw),
-            "the published texture is not the recompressed previous output"
-        );
-        assert_ne!(
-            crate::texture::decode_ktx2_levels(&republished),
-            crate::texture::decode_ktx2_levels(
-                &TextureConverter::encode_container(
-                    &source_dds,
-                    TextureEncoding::DataLinear,
-                    config.texture_etc1s_quality,
-                    config.texture_uastc_level,
-                )
-                .unwrap()
+    async fn resume_does_not_publish_unverified_staged_meshes_for_any_manifest_schema() {
+        let manifests = [
+            ("absent", None),
+            (
+                "schema-14",
+                Some(
+                    br#"{"schema_version":14,"complete":true,"configuration_hash":"","entries":{}}"#
+                        .as_slice(),
+                ),
             ),
-            "the published texture was encoded from the DDS"
-        );
-        let manifest = ConversionManifest::load(&manifest_path).unwrap();
-        assert_eq!(
-            manifest.schema_version,
-            crate::cache::CONVERTER_SCHEMA_VERSION
-        );
-        assert!(manifest.complete);
-        assert_eq!(
-            manifest.entries["textures/rock.dds"].output_hash,
-            hash_bytes(&republished)
-        );
-    }
+            (
+                "schema-15",
+                Some(
+                    br#"{"schema_version":15,"complete":true,"configuration_hash":"","entries":{}}"#
+                        .as_slice(),
+                ),
+            ),
+        ];
 
-    #[tokio::test]
-    async fn resumed_staging_supercompresses_a_raw_texture_in_place() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        let staging = temp.path().join("modern.staging-1-2");
-        fs::create_dir_all(data.join("textures")).unwrap();
-        fs::create_dir_all(staging.join("textures")).unwrap();
-        let dds = dummy_content::dds::generate(
-            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 32, 32)
-                .with_mip_levels(2),
-            &mut dummy_content::rng::Rng::new(22),
-        )
-        .unwrap();
-        fs::write(data.join("textures/rock.dds"), &dds).unwrap();
-        let raw =
-            TextureConverter::encode_container(&dds, TextureEncoding::DataLinear, 192, 2).unwrap();
-        fs::write(staging.join("textures/rock.ktx2"), &raw).unwrap();
+        for (name, manifest) in manifests {
+            let temp = tempfile::tempdir().unwrap();
+            let data = temp.path().join("Data");
+            let output = temp.path().join("modern");
+            let staging = temp.path().join("modern.staging-resume");
+            fs::create_dir_all(&data).unwrap();
+            fs::create_dir_all(&output).unwrap();
+            fs::create_dir_all(staging.join("meshes")).unwrap();
+            fs::write(staging.join("meshes/stale.glb"), b"unverified mesh").unwrap();
+            if let Some(manifest) = manifest {
+                fs::write(output.join("conversion-manifest.json"), manifest).unwrap();
+            }
 
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging);
-        let report = run_without_progress(config).await;
+            let mut config = PipelineConfig::new(&data, &output);
+            config.resume_staging = Some(staging);
+            let report = run_without_progress(config).await;
 
-        assert_eq!(report.converted, 1);
-        let published = fs::read(output.join("textures/rock.ktx2")).unwrap();
-        assert!(is_zstd_supercompressed(&published));
-        assert_eq!(
-            crate::texture::decode_ktx2_levels(&published),
-            crate::texture::decode_ktx2_levels(&raw)
-        );
+            assert!(report.complete, "resume failed with {name} manifest");
+            assert!(
+                !output.join("meshes/stale.glb").exists(),
+                "stale mesh published with {name} manifest"
+            );
+            assert_eq!(
+                ConversionManifest::load(&output.join("conversion-manifest.json"))
+                    .unwrap()
+                    .schema_version,
+                crate::cache::CONVERTER_SCHEMA_VERSION
+            );
+        }
     }
 
     #[tokio::test]
@@ -2069,13 +2628,19 @@ mod tests {
         .unwrap();
         let config = PipelineConfig::new(&data, &output);
 
+        let cache_root = config.ingestion_cache_dir();
         let first = run_without_progress(config.clone()).await;
         assert_eq!(first.converted, 1);
         assert_eq!(first.cache_hits, 0);
-        assert_eq!(
-            fs::read(output.join("vfs/docs/readme.txt")).unwrap(),
-            b"cached asset"
-        );
+        assert!(!output.join("vfs").exists());
+        assert!(!output.join(".ingestion-cache").exists());
+        let blobs: Vec<_> = WalkDir::new(cache_root.join(".ingestion-cache"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .collect();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(fs::read(blobs[0].path()).unwrap(), b"cached asset");
 
         let second = run_without_progress(config.clone()).await;
         assert_eq!(second.converted, 0);
@@ -2089,7 +2654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancels_failed_batch_before_removing_staging() {
+    async fn a_failed_batch_stops_and_keeps_staging_for_a_resume() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("Data");
         let output = temp.path().join("modern");
@@ -2107,27 +2672,353 @@ mod tests {
         });
         let mut config = PipelineConfig::new(&data, &output);
         config.fail_fast = true;
-        let error = AssetPipeline::run_async(config, tx).await.unwrap_err();
+        let failure = AssetPipeline::run_async(config, tx).await.unwrap_err();
         let events = collect.await.unwrap();
 
-        assert!(error.to_string().contains("failed to convert"));
+        assert!(failure.to_string().contains("failed to convert"));
+        assert!(!failure.cancelled);
         assert!(!output.exists());
-        assert!(
-            fs::read_dir(temp.path()).unwrap().all(|entry| {
-                !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("modern.staging-")
-            }),
-            "failed pipeline left a staging directory"
-        );
-        let failure = events.last().unwrap();
-        assert_eq!(failure.stage, ProgressStage::Textures);
-        assert_eq!(failure.message, "Asset conversion failed");
-        assert!(failure.current_file.as_ref().is_some_and(|path| {
+        let staging = failure
+            .staging
+            .expect("a failed run keeps the work it has done");
+        assert!(staging.is_dir());
+        let last = events.last().unwrap();
+        assert_eq!(last.stage, ProgressStage::Textures);
+        assert_eq!(last.outcome, Some(AssetOutcome::Failed));
+        assert_eq!(last.message, "Asset conversion failed");
+        assert!(last.current_file.as_ref().is_some_and(|path| {
             path == Path::new("textures/bad.dds") || path == Path::new("textures/also-bad.dds")
         }));
+    }
+
+    fn staging_entries(parent: &Path) -> Vec<PathBuf> {
+        staging_entries_named(parent, "modern")
+    }
+
+    fn staging_entries_named(parent: &Path, output_name: &str) -> Vec<PathBuf> {
+        let prefix = format!("{output_name}.staging-");
+        fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_journal_write_failure_stops_the_batch_before_removing_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        // Enough work that workers are still converting when the first
+        // journal write fails.
+        for index in 0..400 {
+            let name = format!("Script{index}");
+            fs::write(
+                data.join(format!("scripts/{name}.pex")),
+                dummy_content::pex::minimal(&name).unwrap(),
+            )
+            .unwrap();
+        }
+
+        crate::cache::FAIL_JOURNAL_WRITES.with(|fail| fail.set(true));
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let result = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx).await;
+        crate::cache::FAIL_JOURNAL_WRITES.with(|fail| fail.set(false));
+
+        let error = result.unwrap_err();
+        assert!(format!("{error:?}").contains("injected journal write failure"));
+        let staging = error.staging.expect("staging directory was kept");
+        fs::remove_dir_all(&staging).unwrap();
+        // A worker left running would write into staging after it was removed.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!output.exists());
+        assert_eq!(staging_entries(temp.path()), Vec::<PathBuf>::new());
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_is_not_an_earlier_output_is_refused_and_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("Games");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/One.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(output.join("Skyrim")).unwrap();
+        fs::write(output.join("Skyrim/save.ess"), b"keep me").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let error = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:?}").contains("conversion-manifest.json"));
+        assert_eq!(
+            fs::read(output.join("Skyrim/save.ess")).unwrap(),
+            b"keep me"
+        );
+        assert_eq!(
+            staging_entries_named(temp.path(), "Games"),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
+    fn publishing_refuses_to_replace_a_folder_that_is_not_an_earlier_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("pack");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("conversion-manifest.json"), b"{}").unwrap();
+        let output = temp.path().join("Games");
+        fs::create_dir_all(&output).unwrap();
+        fs::write(output.join("keep.txt"), b"keep me").unwrap();
+
+        assert!(publish_directory(&staging, &output).is_err());
+        assert_eq!(fs::read(output.join("keep.txt")).unwrap(), b"keep me");
+        assert!(staging.join("conversion-manifest.json").is_file());
+    }
+
+    /// A previous output that passes `check_output_dir`: a manifest inside a non-empty folder.
+    fn write_previous_output(output: &Path, contents: &[u8]) {
+        fs::create_dir_all(output).unwrap();
+        fs::write(output.join("conversion-manifest.json"), b"{}").unwrap();
+        fs::write(output.join("old.txt"), contents).unwrap();
+    }
+
+    /// Fails every rename whose destination is `output`, so the pack rename and the rename that
+    /// would put the previous output back both fail.
+    struct FailingRenames {
+        staging: PathBuf,
+        output: PathBuf,
+    }
+
+    impl PublishOps for FailingRenames {
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            if to == self.output.as_path() {
+                let message = if from == self.staging.as_path() {
+                    "pack rename failed"
+                } else {
+                    "backup restore failed"
+                };
+                return Err(io::Error::other(message));
+            }
+            fs::rename(from, to)
+        }
+    }
+
+    /// Removes nothing and keeps every warning, so a test can read them.
+    #[derive(Default)]
+    struct LockedBackup {
+        warnings: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl PublishOps for LockedBackup {
+        fn remove_dir_all(&self, _path: &Path) -> io::Result<()> {
+            Err(io::Error::other("locked"))
+        }
+
+        fn warn(&self, message: &str) {
+            self.warnings.borrow_mut().push(message.to_owned());
+        }
+    }
+
+    #[test]
+    fn a_failed_publish_reports_a_stranded_previous_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("pack");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("new.txt"), b"new").unwrap();
+        write_previous_output(&output, b"old");
+        let operations = FailingRenames {
+            staging: staging.clone(),
+            output: output.clone(),
+        };
+
+        let error = publish_directory_with(&staging, &output, &operations).unwrap_err();
+
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("failed to publish converted assets"),
+            "{message}"
+        );
+        assert!(message.contains("pack rename failed"), "{message}");
+        assert!(message.contains("backup restore failed"), "{message}");
+        let backup = backup_path(&output);
+        assert!(
+            message.contains(&backup.display().to_string()),
+            "the message does not name the stranded output at {backup:?}: {message}"
+        );
+        // The previous output is still whole, under the name the message gives.
+        assert_eq!(fs::read(backup.join("old.txt")).unwrap(), b"old");
+        assert!(!output.exists());
+        assert!(staging.is_dir());
+    }
+
+    #[test]
+    fn a_backup_that_cannot_be_removed_only_warns() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("pack");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("new.txt"), b"new").unwrap();
+        fs::write(staging.join("conversion-manifest.json"), b"{}").unwrap();
+        write_previous_output(&output, b"old");
+        let operations = LockedBackup::default();
+
+        publish_directory_with(&staging, &output, &operations).unwrap();
+
+        // The publish stands: the new output is in place, and the leftover is only reported.
+        assert_eq!(fs::read(output.join("new.txt")).unwrap(), b"new");
+        let backup = backup_path(&output);
+        assert_eq!(fs::read(backup.join("old.txt")).unwrap(), b"old");
+        let warnings = operations.warnings.borrow();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("could not remove the backup folder"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains(&backup.display().to_string()),
+            "the warning does not name {backup:?}: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_folder_the_user_named_like_a_backup_does_not_block_a_publish() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("modern");
+        fs::create_dir_all(temp.path().join("modern.backup-old")).unwrap();
+        fs::create_dir_all(temp.path().join("modern.backup-")).unwrap();
+        assert_eq!(stale_backup(&output), None);
+        fs::create_dir_all(temp.path().join("Modern.BACKUP-4242")).unwrap();
+        assert_eq!(
+            stale_backup(&output),
+            Some(temp.path().join("Modern.BACKUP-4242"))
+        );
+    }
+
+    #[test]
+    fn publishing_refuses_a_backup_left_by_another_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("pack");
+        let output = temp.path().join("Skyrim.Converted");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("conversion-manifest.json"), b"{}").unwrap();
+        write_previous_output(&output, b"still here");
+        // A backup under another pid: the old check, scoped to this process, cannot see it.
+        let stale = output.with_file_name("Skyrim.Converted.backup-424242");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("old.txt"), b"previous output").unwrap();
+
+        let error = publish_directory(&staging, &output).unwrap_err();
+
+        let message = format!("{error:?}");
+        assert!(message.contains("stale backup"), "{message}");
+        assert!(
+            message.contains(&stale.display().to_string()),
+            "the message does not name {stale:?}: {message}"
+        );
+        // The folder this run did not create is untouched, and so is the output.
+        assert_eq!(fs::read(stale.join("old.txt")).unwrap(), b"previous output");
+        assert_eq!(fs::read(output.join("old.txt")).unwrap(), b"still here");
+        assert!(staging.join("conversion-manifest.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_failed_publish_keeps_the_journal_in_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/One.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+        // A stale backup makes `publish_directory` refuse to publish.
+        let backup = output.with_extension(format!("backup-{}", std::process::id()));
+        fs::create_dir_all(&backup).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let error = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:?}").contains("stale backup"));
+        let staging = staging_entries(temp.path());
+        assert_eq!(
+            staging.len(),
+            1,
+            "expected only the staging directory: {staging:?}"
+        );
+        assert!(staging[0].is_dir());
+        assert!(StagingJournal::path_in(&staging[0]).is_file());
+        assert!(!parked_journal_path(&staging[0]).exists());
+
+        // Once the backup is gone the same staging directory publishes, and
+        // neither the output nor its parent keeps the journal.
+        fs::remove_dir_all(&backup).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging[0].clone());
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        AssetPipeline::run_async(config, tx).await.unwrap();
+        assert!(output.join("conversion-manifest.json").is_file());
+        assert!(!StagingJournal::path_in(&output).exists());
+        assert_eq!(staging_entries(temp.path()), Vec::<PathBuf>::new());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_run_keeps_staging_and_resumes_from_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/one.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let failure = AssetPipeline::run_async_with_cancel(
+            PipelineConfig::new(&data, &output),
+            tx,
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+        drain.await.unwrap();
+
+        assert!(failure.cancelled);
+        assert!(failure.to_string().contains("interrupted"));
+        assert!(!output.exists(), "an interrupted run does not publish");
+        let staging = failure
+            .staging
+            .expect("an interrupted run keeps its staging folder");
+        assert!(staging.is_dir());
+
+        // The kept folder is a working resume point: the run finishes from it.
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let report = run_without_progress(config).await;
+        assert!(report.complete);
+        assert!(output.join("scripts/one.luau").is_file());
     }
 
     #[tokio::test]
@@ -2163,7 +3054,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event.message == "Asset skipped")
+                .filter(|event| event.outcome == Some(AssetOutcome::Skipped))
                 .count(),
             2
         );
@@ -2200,34 +3091,60 @@ mod tests {
         let output = temp.path().join("modern");
         fs::create_dir_all(data.join("meshes")).unwrap();
         fs::create_dir_all(data.join("textures")).unwrap();
-        let shape = dummy_content::nif::StaticShape {
-            name: "MissingNormalQuad",
-            positions: &[
-                [-1.0, -1.0, 0.0],
-                [1.0, -1.0, 0.0],
-                [1.0, 1.0, 0.0],
-                [-1.0, 1.0, 0.0],
-            ],
-            normals: &[[0.0, 0.0, 1.0]; 4],
-            uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
-            indices: &[[0, 1, 2], [0, 2, 3]],
-            diffuse: "textures/present.dds",
-            normal_texture: "textures/absent_n.dds",
-        };
-        fs::write(
-            data.join("meshes/missing_normal.nif"),
-            dummy_content::nif::static_shape(&shape).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            data.join("textures/present.dds"),
-            dummy_content::dds::generate(
-                &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
-                &mut dummy_content::rng::Rng::new(7),
+        let positions = [
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+        ];
+        let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let indices = [[0, 1, 2], [0, 2, 3]];
+        let normals = [[0.0, 0.0, 1.0]; 4];
+        // One mesh drops an auxiliary map, the other the mandatory base color.
+        let shapes = [
+            (
+                "meshes/missing_normal.nif",
+                dummy_content::nif::StaticShape {
+                    name: "MissingNormalQuad",
+                    positions: &positions,
+                    normals: &normals,
+                    uvs: &uvs,
+                    indices: &indices,
+                    diffuse: "textures/present.dds",
+                    normal_texture: "textures/absent_n.dds",
+                },
+            ),
+            (
+                "meshes/missing_diffuse.nif",
+                dummy_content::nif::StaticShape {
+                    name: "MissingDiffuseQuad",
+                    positions: &positions,
+                    normals: &normals,
+                    uvs: &uvs,
+                    indices: &indices,
+                    diffuse: "textures/absent.dds",
+                    normal_texture: "textures/present_n.dds",
+                },
+            ),
+        ];
+        for (path, shape) in shapes {
+            fs::write(
+                data.join(path),
+                dummy_content::nif::static_shape(&shape).unwrap(),
             )
-            .unwrap(),
-        )
-        .unwrap();
+            .unwrap();
+        }
+        for texture in ["textures/present.dds", "textures/present_n.dds"] {
+            fs::write(
+                data.join(texture),
+                dummy_content::dds::generate(
+                    &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
+                    &mut dummy_content::rng::Rng::new(7),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
 
         let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
 
@@ -2237,7 +3154,7 @@ mod tests {
             report.complete,
             "a texture the game data does not contain is not an incomplete conversion"
         );
-        assert_eq!(report.pruned_texture_references, 1);
+        assert_eq!(report.pruned_texture_references, 2);
 
         let manifest = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
         assert!(manifest.complete);
@@ -2246,26 +3163,36 @@ mod tests {
             "a pruned reference is not a failure: {:?}",
             manifest.failures
         );
+        // Base color is published through an sRGB alias, so that is the URI the
+        // mesh dropped.
+        assert_eq!(
+            manifest
+                .pruned_texture_references
+                .get("meshes/missing_diffuse.glb"),
+            Some(&BTreeSet::from([
+                "textures/absent.opensky-srgb.ktx2".to_owned()
+            ]))
+        );
         assert_eq!(
             manifest
                 .pruned_texture_references
                 .get("meshes/missing_normal.glb"),
-            Some(&vec!["textures/absent_n.ktx2".to_owned()])
+            Some(&BTreeSet::from(["textures/absent_n.ktx2".to_owned()]))
         );
-        let json: serde_json::Value =
-            serde_json::from_slice(&fs::read(output.join("conversion-manifest.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            json["pruned_texture_references"]["meshes/missing_normal.glb"][0],
-            "textures/absent_n.ktx2"
-        );
-        assert!(
-            !MeshConverter::glb_texture_uris(&output.join("meshes/missing_normal.glb"))
-                .unwrap()
-                .iter()
-                .any(|uri| uri.contains("absent_n")),
-            "the dangling reference is still in the published mesh"
-        );
+        for (glb, kept) in [
+            ("meshes/missing_diffuse.glb", "present_n"),
+            ("meshes/missing_normal.glb", "present.opensky-srgb"),
+        ] {
+            let uris = MeshConverter::glb_texture_uris(&output.join(glb)).unwrap();
+            assert!(
+                !uris.iter().any(|uri| uri.contains("absent")),
+                "the dangling reference is still in {glb}: {uris:?}"
+            );
+            assert!(
+                uris.iter().any(|uri| uri.contains(kept)),
+                "{glb} lost the texture that does exist: {uris:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2290,372 +3217,34 @@ mod tests {
         assert!(manifest.pruned_texture_references.is_empty());
     }
 
-    #[tokio::test]
-    async fn keys_archive_failures_relative_to_the_data_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        fs::create_dir_all(&data).unwrap();
-        fs::write(data.join("broken.bsa"), b"not an archive").unwrap();
+    const PRUNED_MESH: &str = "meshes/dangling_normal.glb";
+    const PRUNED_REFERENCE: &str = "textures/absent_n.ktx2";
 
-        let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
-
-        assert_eq!(report.skipped, 1);
-        assert!(!report.complete);
-        let manifest = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
-        assert_eq!(manifest.failures.len(), 1, "{:?}", manifest.failures);
-        assert!(
-            manifest.failures.contains_key("broken.bsa"),
-            "archive failures must be keyed like the ingestion cache: {:?}",
-            manifest.failures
-        );
-    }
-
-    #[tokio::test]
-    async fn records_a_panicking_asset_as_a_failure_instead_of_aborting() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        fs::create_dir_all(data.join("scripts")).unwrap();
-        fs::write(
-            data.join("scripts/panic-on-convert.pex"),
-            dummy_content::pex::minimal("Panic").unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            data.join("scripts/ok.pex"),
-            dummy_content::pex::minimal("Ok").unwrap(),
-        )
-        .unwrap();
-        let mut config = PipelineConfig::new(&data, &output);
-        config.cpu_jobs = 2;
-
-        let report = run_without_progress(config).await;
-
-        assert_eq!(report.converted, 1);
-        assert_eq!(report.skipped, 1);
-        assert!(!report.complete);
-        let manifest = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
-        assert!(!manifest.complete);
-        assert!(
-            manifest
-                .failures
-                .get("scripts/panic-on-convert.pex")
-                .is_some_and(|message| message.contains("panicked")),
-            "{:?}",
-            manifest.failures
-        );
-        assert!(output.join("scripts/ok.luau").is_file());
-    }
-
-    #[tokio::test]
-    async fn publishes_a_finished_staging_folder_without_converting() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        write_convertible_script(&data);
-        let staging = stage_finished_conversion(&data, &output).await;
-        let staged_script = fs::read(staging.join("scripts/one.luau")).unwrap();
-
-        // A source the converter cannot read: converting it again would report
-        // a skip, so the counters prove the assets were not converted, and the
-        // published script is the one the finished run produced.
-        fs::write(data.join("scripts/broken.pex"), b"not a PEX").unwrap();
-
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging.clone());
-        let (report, events) = run_and_collect(config).await;
-
-        assert!(report.complete);
-        assert_eq!(report.converted, 0);
-        assert_eq!(report.skipped, 0);
-        assert!(report.warnings.is_empty());
-        assert!(!staging.exists(), "the staging folder was not published");
-        assert_eq!(
-            fs::read(output.join("scripts/one.luau")).unwrap(),
-            staged_script
-        );
-        assert!(output.join("conversion-manifest.json").is_file());
-        assert!(events.iter().any(|event| {
-            event.message == "Staging is complete: publishing without re-converting"
-        }));
-    }
-
-    #[tokio::test]
-    async fn re_converts_when_the_staging_manifest_is_incomplete() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        write_convertible_script(&data);
-        let staging = stage_finished_conversion(&data, &output).await;
-        edit_staging_manifest(&staging, |manifest| {
-            manifest["complete"] = serde_json::Value::Bool(false);
-        });
-
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging);
-        let (report, events) = run_and_collect(config).await;
-
-        assert_eq!(report.converted, 1);
-        assert!(events.iter().any(|event| {
-            event.message == "Re-converting every asset: its manifest is not complete"
-        }));
-    }
-
-    #[tokio::test]
-    async fn re_converts_when_the_staging_manifest_has_an_older_schema() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        write_convertible_script(&data);
-        let staging = stage_finished_conversion(&data, &output).await;
-        edit_staging_manifest(&staging, |manifest| {
-            manifest["schema_version"] =
-                serde_json::Value::from(crate::cache::CONVERTER_SCHEMA_VERSION - 1);
-        });
-
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging);
-        let (report, events) = run_and_collect(config).await;
-
-        assert_eq!(report.converted, 1);
-        assert!(events.iter().any(|event| {
-            event
-                .message
-                .starts_with("Re-converting every asset: it was converted with schema version")
-        }));
-    }
-
-    #[tokio::test]
-    async fn re_converts_when_the_conversion_settings_changed() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        write_convertible_script(&data);
-        let staging = stage_finished_conversion(&data, &output).await;
-
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging);
-        config.texture_etc1s_quality = 128;
-        let (report, events) = run_and_collect(config).await;
-
-        assert_eq!(report.converted, 1);
-        assert!(events.iter().any(|event| {
-            event.message
-                == "Re-converting every asset: it was converted with different texture or script settings"
-        }));
-    }
-
-    #[tokio::test]
-    async fn re_converts_when_a_file_written_last_is_missing() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        write_convertible_script(&data);
-        let staging = stage_finished_conversion(&data, &output).await;
-        fs::remove_file(staging.join("scripts/papyrus_runtime.luau")).unwrap();
-
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging);
-        let (report, events) = run_and_collect(config).await;
-
-        assert_eq!(report.converted, 1);
-        assert!(events.iter().any(|event| {
-            event.message.starts_with("Re-converting every asset: ")
-                && event
-                    .message
-                    .contains("papyrus_runtime.luau is missing or empty")
-        }));
-    }
-
-    #[tokio::test]
-    async fn re_converts_when_the_finished_world_database_is_missing() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        write_convertible_script(&data);
-        write_generated_plugin(&data);
-        let staging = stage_finished_conversion(&data, &output).await;
-        assert!(staging.join("skyrim_world.db").is_file());
-        assert!(staging.join("cell_cache.rkyv").is_file());
-        assert!(staging.join("integration-report.json").is_file());
-        fs::remove_file(staging.join("skyrim_world.db")).unwrap();
-
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging);
-        let (report, events) = run_and_collect(config).await;
-
-        assert_eq!(report.converted, 1);
-        assert!(events.iter().any(|event| {
-            event.message.starts_with("Re-converting every asset: ")
-                && event
-                    .message
-                    .contains("skyrim_world.db is missing or empty")
-        }));
-    }
-
-    #[tokio::test]
-    async fn re_converts_when_cache_invalidation_is_requested() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        write_convertible_script(&data);
-        let staging = stage_finished_conversion(&data, &output).await;
-
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging);
-        config.invalidate_cache = true;
-        let (report, events) = run_and_collect(config).await;
-
-        assert_eq!(report.converted, 1);
-        assert!(events.iter().any(|event| {
-            event.message == "Re-converting every asset: cache invalidation was requested"
-        }));
-    }
-
-    #[tokio::test]
-    async fn rejects_a_resume_directory_that_does_not_exist() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        write_convertible_script(&data);
-
-        let mut config = PipelineConfig::new(&data, temp.path().join("modern"));
-        config.resume_staging = Some(temp.path().join("modern.staging-1"));
-        let (tx, _receiver) = mpsc::channel(1);
-        let error = AssetPipeline::run_async(config, tx).await.unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("resume staging directory does not exist"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_interrupted_resume_leaves_the_staging_folder_unfinished() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        write_convertible_script(&data);
-        let staging = stage_finished_conversion(&data, &output).await;
-        fs::write(data.join("scripts/broken.pex"), b"not a PEX").unwrap();
-
-        // The probe refuses this resume (the cache was invalidated), so the run
-        // converts again and stops on the unreadable source before it writes a
-        // new manifest of its own.
-        let mut interrupted = PipelineConfig::new(&data, &output);
-        interrupted.resume_staging = Some(staging.clone());
-        interrupted.invalidate_cache = true;
-        interrupted.fail_fast = true;
-        let (tx, mut rx) = mpsc::channel(64);
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let error = AssetPipeline::run_async(interrupted, tx).await.unwrap_err();
-        drain.await.unwrap();
-
-        assert!(
-            error.to_string().contains("failed to convert"),
-            "unexpected error: {error:#}"
-        );
-        let manifest = ConversionManifest::load(&staging.join("conversion-manifest.json")).unwrap();
-        assert!(
-            !manifest.complete,
-            "the manifest of the earlier finished run survived the interrupted resume"
-        );
-
-        // The second resume has nothing left that proves a finished conversion:
-        // the interrupted run had copied the unreadable source into the staging
-        // folder's vfs, where the conversion finds it and reports it skipped.
-        fs::remove_file(data.join("scripts/broken.pex")).unwrap();
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging);
-        let (report, events) = run_and_collect(config).await;
-
-        assert_eq!(report.converted, 1);
-        assert_eq!(report.skipped, 1);
-        assert!(events.iter().any(|event| {
-            event.message == "Re-converting every asset: its manifest is not complete"
-        }));
-        assert!(!events.iter().any(|event| {
-            event.message == "Staging is complete: publishing without re-converting"
-        }));
-    }
-
-    #[tokio::test]
-    async fn re_converts_when_a_converted_asset_is_missing() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        write_convertible_script(&data);
-        let staging = stage_finished_conversion(&data, &output).await;
-        fs::remove_file(staging.join("scripts/one.luau")).unwrap();
-
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging);
-        let (report, events) = run_and_collect(config).await;
-
-        assert_eq!(report.converted, 1);
-        assert!(report.complete);
-        assert!(events.iter().any(|event| {
-            event.message == "Re-converting every asset: its converted asset scripts/one.luau is missing or the wrong size"
-        }));
-    }
-
-    #[tokio::test]
-    async fn re_converts_when_converted_assets_are_missing_or_resized() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
-        write_convertible_script(&data);
-        fs::write(
-            data.join("scripts/two.pex"),
-            dummy_content::pex::minimal("Two").unwrap(),
-        )
-        .unwrap();
-        let staging = stage_finished_conversion(&data, &output).await;
-        fs::remove_file(staging.join("scripts/one.luau")).unwrap();
-        let resized = format!(
-            "{}\n-- resized\n",
-            fs::read_to_string(staging.join("scripts/two.luau")).unwrap()
-        );
-        fs::write(staging.join("scripts/two.luau"), resized).unwrap();
-
-        let mut config = PipelineConfig::new(&data, &output);
-        config.resume_staging = Some(staging);
-        let (report, events) = run_and_collect(config).await;
-
-        assert_eq!(report.converted, 2);
-        assert!(report.complete);
-        assert!(events.iter().any(|event| {
-            event.message == "Re-converting every asset: 2 converted assets are missing or the wrong size, starting with scripts/one.luau"
-        }));
-    }
-
-    /// Writes a Data directory holding one convertible script.
-    #[tokio::test]
-    async fn a_finished_staging_folder_with_pruned_textures_publishes_without_converting() {
-        // Pruning rewrites a GLB after its size was recorded, and the run is still complete.
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("Data");
-        let output = temp.path().join("modern");
+    /// Writes one NIF whose normal map is absent from the game data, next to the
+    /// base-color DDS the game data does contain.
+    fn write_mesh_with_absent_normal(data: &Path) {
         fs::create_dir_all(data.join("meshes")).unwrap();
         fs::create_dir_all(data.join("textures")).unwrap();
+        let positions = [
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+        ];
+        let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let indices = [[0, 1, 2], [0, 2, 3]];
+        let normals = [[0.0, 0.0, 1.0]; 4];
         let shape = dummy_content::nif::StaticShape {
-            name: "MissingNormalQuad",
-            positions: &[
-                [-1.0, -1.0, 0.0],
-                [1.0, -1.0, 0.0],
-                [1.0, 1.0, 0.0],
-                [-1.0, 1.0, 0.0],
-            ],
-            normals: &[[0.0, 0.0, 1.0]; 4],
-            uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
-            indices: &[[0, 1, 2], [0, 2, 3]],
+            name: "DanglingNormalQuad",
+            positions: &positions,
+            normals: &normals,
+            uvs: &uvs,
+            indices: &indices,
             diffuse: "textures/present.dds",
             normal_texture: "textures/absent_n.dds",
         };
         fs::write(
-            data.join("meshes/missing_normal.nif"),
+            data.join("meshes/dangling_normal.nif"),
             dummy_content::nif::static_shape(&shape).unwrap(),
         )
         .unwrap();
@@ -2668,72 +3257,586 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let staging = stage_finished_conversion(&data, &output).await;
+    }
+
+    #[tokio::test]
+    async fn resumed_runs_carry_reused_mesh_prunes_forward() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+
+        let first = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(first.complete);
+        assert_eq!(first.pruned_texture_references, 1);
+        assert_eq!(
+            published_manifest(&output)
+                .pruned_texture_references
+                .get(PRUNED_MESH),
+            Some(&BTreeSet::from([PRUNED_REFERENCE.to_owned()]))
+        );
+
+        // Resume from a staging directory holding exactly what the first run
+        // published: the mesh is reused instead of converted again, so the prune
+        // pass has nothing left to remove from it.
+        let staging = temp.path().join("modern.staging-resume");
+        copy_tree(&output, &staging);
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+
+        let (resumed, events) = run_collecting_progress(config).await;
+
+        assert!(resumed.complete);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.message == "Texture reference pruned")
+                .count(),
+            0,
+            "the resumed run reused the pruned mesh instead of pruning it again"
+        );
+        assert_eq!(
+            resumed.pruned_texture_references, 1,
+            "the prune record of the reused mesh is carried forward"
+        );
+        let manifest = published_manifest(&output);
+        assert!(manifest.complete);
+        assert_eq!(
+            manifest.pruned_texture_references.get(PRUNED_MESH),
+            Some(&BTreeSet::from([PRUNED_REFERENCE.to_owned()]))
+        );
+        let uris = MeshConverter::glb_texture_uris(&output.join(PRUNED_MESH)).unwrap();
+        assert!(
+            !uris.iter().any(|uri| uri.contains("absent")),
+            "the record describes the published mesh: {uris:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tampered_staged_pruned_mesh_is_not_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+        run_without_progress(PipelineConfig::new(&data, &output)).await;
+        let expected = fs::read(output.join(PRUNED_MESH)).unwrap();
+
+        // The staged copy of the pruned mesh keeps its length but no longer matches the hash the
+        // manifest recorded. The published copy is gone, so the cache-hit path cannot replace it
+        // and only the reuse gate stands between the tampered bytes and the next publish.
+        let staging = temp.path().join("modern.staging-resume");
+        copy_tree(&output, &staging);
+        let mut tampered = expected.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert_ne!(tampered, expected);
+        fs::write(staging.join(PRUNED_MESH), tampered).unwrap();
+        fs::remove_file(output.join(PRUNED_MESH)).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+
+        let resumed = run_without_progress(config).await;
+
+        assert!(resumed.complete);
+        assert_eq!(
+            fs::read(output.join(PRUNED_MESH)).unwrap(),
+            expected,
+            "the tampered staged mesh was converted again, not published"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_meshes_do_not_keep_stale_prune_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+        run_without_progress(PipelineConfig::new(&data, &output)).await;
+
+        let staging = temp.path().join("modern.staging-resume");
+        copy_tree(&output, &staging);
+        // Another build republished the mesh: the stored record no longer
+        // describes the bytes that would be published again.
+        let mut rebuilt = fs::read(output.join(PRUNED_MESH)).unwrap();
+        rebuilt.push(0);
+        fs::write(output.join(PRUNED_MESH), rebuilt).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+
+        let resumed = run_without_progress(config).await;
+
+        assert!(resumed.complete);
+        assert_eq!(resumed.pruned_texture_references, 0);
+        assert!(
+            published_manifest(&output)
+                .pruned_texture_references
+                .is_empty()
+        );
+    }
+
+    /// Pruning rewrites a mesh after its cache entry is written; the refreshed entry keeps the
+    /// mesh a cache hit on the next run instead of converting it again.
+    #[tokio::test]
+    async fn pruned_meshes_remain_cache_hits() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+
+        let first = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(first.complete);
+        assert_eq!(first.pruned_texture_references, 1);
+
+        let second = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(second.complete);
+        assert_eq!(
+            second.converted, 0,
+            "the pruned mesh was converted again instead of reusing its refreshed entry"
+        );
+        assert_eq!(second.pruned_texture_references, 1);
+        let manifest = published_manifest(&output);
+        let entry = manifest
+            .entries
+            .values()
+            .find(|entry| entry.output == PRUNED_MESH)
+            .expect("the pruned mesh has a cache entry");
+        assert_eq!(
+            entry.output_hash,
+            hash_file(&output.join(PRUNED_MESH)).unwrap(),
+            "the cache entry describes the pruned bytes that were published"
+        );
+    }
+
+    /// A pruned reference whose source comes back forces the mesh to be converted again, so the
+    /// reference is restored instead of staying missing behind a cached GLB.
+    #[tokio::test]
+    async fn restored_texture_sources_reconvert_the_mesh() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+
+        let first = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(first.complete);
+        assert_eq!(first.pruned_texture_references, 1);
+
+        // The normal map's source appears: the mesh must be converted again to regain it.
+        fs::write(
+            data.join("textures/absent_n.dds"),
+            dummy_content::dds::generate(
+                &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
+                &mut dummy_content::rng::Rng::new(9),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let second = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(second.complete);
+        assert_eq!(
+            second.pruned_texture_references, 0,
+            "the restored reference must not stay recorded as absent"
+        );
+        assert!(
+            second.converted >= 1,
+            "the mesh was reused without regaining its restored reference"
+        );
+        let uris = MeshConverter::glb_texture_uris(&output.join(PRUNED_MESH)).unwrap();
+        assert!(
+            uris.iter().any(|uri| uri.contains("absent_n")),
+            "the restored texture is not referenced: {uris:?}"
+        );
+    }
+
+    /// A reused mesh that already omitted one texture and has a second pruned now reports both.
+    #[tokio::test]
+    async fn a_second_prune_keeps_the_first_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+
+        let first = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(first.complete);
+        assert_eq!(first.pruned_texture_references, 1);
+
+        // The base-color source disappears: its reference becomes dangling on the next run while
+        // the mesh's own source is unchanged, so the mesh is reused.
+        fs::remove_file(data.join("textures/present.dds")).unwrap();
+        let second = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(second.complete);
+        assert_eq!(second.pruned_texture_references, 2);
+        assert_eq!(
+            published_manifest(&output)
+                .pruned_texture_references
+                .get(PRUNED_MESH),
+            Some(&BTreeSet::from([
+                "textures/absent_n.ktx2".to_owned(),
+                "textures/present.opensky-srgb.ktx2".to_owned(),
+            ]))
+        );
+    }
+
+    /// A source texture that exists but failed to publish is not pruned: the reference stays as
+    /// the record of a failed publication, not of absent game data.
+    #[tokio::test]
+    async fn a_missing_artifact_with_a_present_source_is_not_pruned() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("meshes")).unwrap();
+        fs::create_dir_all(data.join("textures")).unwrap();
+        let positions = [
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+        ];
+        let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let indices = [[0, 1, 2], [0, 2, 3]];
+        let normals = [[0.0, 0.0, 1.0]; 4];
+        let shape = dummy_content::nif::StaticShape {
+            name: "FailedTextureQuad",
+            positions: &positions,
+            normals: &normals,
+            uvs: &uvs,
+            indices: &indices,
+            diffuse: "textures/present.dds",
+            normal_texture: "textures/present_n.dds",
+        };
+        fs::write(
+            data.join("meshes/failed_texture.nif"),
+            dummy_content::nif::static_shape(&shape).unwrap(),
+        )
+        .unwrap();
+        // The base color exists under `vfs` but cannot be converted; the normal map publishes.
+        fs::write(data.join("textures/present.dds"), b"not a DDS").unwrap();
+        fs::write(
+            data.join("textures/present_n.dds"),
+            dummy_content::dds::generate(
+                &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
+                &mut dummy_content::rng::Rng::new(7),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
+
+        assert!(!report.complete, "the failed texture still skips");
+        assert_eq!(report.skipped, 1);
+        assert_eq!(
+            report.pruned_texture_references, 0,
+            "a present source must not be recorded as absent game data"
+        );
+        let uris =
+            MeshConverter::glb_texture_uris(&output.join("meshes/failed_texture.glb")).unwrap();
+        assert!(
+            uris.iter().any(|uri| uri.contains("present.")),
+            "the failed texture's reference was pruned: {uris:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_mid_batch_stops_at_the_next_asset_and_resumes() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        let assets = 300;
+        for index in 0..assets {
+            let script = dummy_content::pex::minimal("Script").unwrap();
+            fs::write(data.join(format!("scripts/script{index:03}.pex")), script).unwrap();
+        }
+
+        let cancellation = Cancellation::new();
+        let interrupt = cancellation.clone();
+        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
+        let watcher = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if event.message == "Converted asset" {
+                    interrupt.cancel();
+                }
+            }
+        });
+        let mut config = PipelineConfig::new(&data, &output);
+        config.cpu_jobs = 1;
+        let failure = AssetPipeline::run_async_with_cancel(config, tx, cancellation)
+            .await
+            .unwrap_err();
+        watcher.await.unwrap();
+
+        assert!(failure.cancelled);
+        let staging = failure
+            .staging
+            .clone()
+            .expect("an interrupted run keeps staging");
+        assert!(staging.is_dir());
+        assert!(!output.exists(), "an interrupted run does not publish");
+        // The manifest is written once, at the end of a run, so nothing in flight — or after it —
+        // is recorded as converted; the resume re-checks the staged files instead.
+        assert!(!staging.join("conversion-manifest.json").exists());
+        let staged: Vec<_> = fs::read_dir(staging.join("scripts"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "luau")
+            })
+            .collect();
+        assert!(
+            staged.len() < assets,
+            "the run converted all {assets} assets despite the interrupt"
+        );
+        for file in &staged {
+            assert!(
+                !fs::read(file).unwrap().is_empty(),
+                "{} was left half written",
+                file.display()
+            );
+        }
+
+        // The kept folder resumes the run to completion.
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let report = run_without_progress(config).await;
+        assert!(report.complete);
+        assert_eq!(report.skipped, 0);
+        let converted = fs::read_dir(output.join("scripts"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "luau")
+            })
+            .count();
+        assert!(converted >= assets, "resume left assets behind");
+    }
+
+    /// A stop pressed while one large archive is being extracted takes effect inside it, not
+    /// when the whole archive is done, and ends the run as an interrupt rather than as a skipped
+    /// archive. Nothing of the archive is cached, so the resume extracts it again in full.
+    #[tokio::test]
+    async fn an_interrupt_inside_an_archive_stops_its_extraction_and_resumes() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(&data).unwrap();
+        let entries = 2048;
+        let names: Vec<String> = (0..entries)
+            .map(|index| format!("docs/file{index:04}.txt"))
+            .collect();
+        let contents: Vec<Vec<u8>> = (0..entries)
+            .map(|index| format!("entry {index}").into_bytes())
+            .collect();
+        let archive_entries: Vec<_> = names
+            .iter()
+            .zip(&contents)
+            .map(|(name, data)| dummy_content::Entry::new(name, data))
+            .collect();
+        fs::write(
+            data.join("assets.ba2"),
+            dummy_content::ba2::general(&archive_entries, dummy_content::ba2::Compression::None)
+                .unwrap(),
+        )
+        .unwrap();
+
+        // Stop from inside the extractor after its first entries: only the entries already in
+        // flight on other threads can still finish, far fewer than the archive holds.
+        stop_hook::cancel_after(&output, 16);
+        let cancellation = Cancellation::new();
+        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
+        let watcher = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let failure = AssetPipeline::run_async_with_cancel(
+            PipelineConfig::new(&data, &output),
+            tx,
+            cancellation,
+        )
+        .await
+        .unwrap_err();
+        watcher.await.unwrap();
+
+        assert!(failure.cancelled, "a stop is reported as an interrupt");
+        assert!(
+            failure
+                .error
+                .downcast_ref::<Interrupted>()
+                .is_some_and(|stop| stop.cause().is_none()),
+            "a plain stop inside an archive has no cause to show: {failure}"
+        );
+        assert!(!output.exists(), "an interrupted run does not publish");
+        let staging = failure
+            .staging
+            .clone()
+            .expect("an interrupted run keeps staging");
+        let written: Vec<_> = fs::read_dir(staging.join("vfs/docs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            written.len() < entries,
+            "the whole archive was extracted despite the stop"
+        );
+        assert!(
+            written.iter().all(|name| !name.ends_with(".partial")),
+            "a stop left a half-written file behind"
+        );
+        // The archive's cache entry is only recorded once it is complete.
+        assert!(!staging.join(".ingestion-cache/sha256").exists());
+        assert!(!staging.join("conversion-manifest.json").exists());
 
         let mut config = PipelineConfig::new(&data, &output);
         config.resume_staging = Some(staging);
-        let (report, events) = run_and_collect(config).await;
-
+        let report = run_without_progress(config.clone()).await;
         assert!(report.complete);
-        assert_eq!(report.converted, 0);
-        assert!(events.iter().any(|event| {
-            event.message == "Staging is complete: publishing without re-converting"
-        }));
+        assert!(!output.join("vfs").exists());
+        let manifest = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+        assert_eq!(manifest.archives["assets.ba2"].files.len(), entries);
+        let file_entry = manifest.archives["assets.ba2"]
+            .files
+            .iter()
+            .find(|file| file.path == "docs/file2047.txt")
+            .expect("file2047.txt not in archive manifest");
+        let blob = config
+            .ingestion_cache_dir()
+            .join(".ingestion-cache/sha256")
+            .join(&file_entry.hash[..2])
+            .join(&file_entry.hash);
+        assert_eq!(fs::read(blob).unwrap(), b"entry 2047");
     }
 
-    fn write_convertible_script(data: &Path) {
-        fs::create_dir_all(data.join("scripts")).unwrap();
+    /// A front end that stops reading progress must not stall extraction: the per-file updates
+    /// find the channel full and are dropped, so the archive's threads run to the end. Only the
+    /// events that matter on their own wait for room, and reading again lets the run finish.
+    #[tokio::test]
+    async fn extraction_does_not_wait_for_a_front_end_that_stopped_reading() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(&data).unwrap();
+        // Enough entries for several per-file updates, one every 512 files.
+        let entries = 2048;
+        let names: Vec<String> = (0..entries)
+            .map(|index| format!("docs/file{index:04}.txt"))
+            .collect();
+        let contents: Vec<Vec<u8>> = (0..entries)
+            .map(|index| format!("entry {index}").into_bytes())
+            .collect();
+        let archive_entries: Vec<_> = names
+            .iter()
+            .zip(&contents)
+            .map(|(name, data)| dummy_content::Entry::new(name, data))
+            .collect();
         fs::write(
-            data.join("scripts/one.pex"),
-            dummy_content::pex::minimal("One").unwrap(),
+            data.join("assets.ba2"),
+            dummy_content::ba2::general(&archive_entries, dummy_content::ba2::Compression::None)
+                .unwrap(),
         )
         .unwrap();
-    }
+        // The extractor caches the files only once every one of them is written, so the last
+        // file's blob in the staging cache shows the extraction threads have finished.
+        let last_blob = crate::cache::hash_bytes(b"entry 2047");
 
-    /// Writes the plugin the generated fixtures describe, which makes the
-    /// conversion build `skyrim_world.db`, its cell cache and the integration
-    /// report.
-    fn write_generated_plugin(data: &Path) {
-        fs::create_dir_all(data).unwrap();
-        let cells = [dummy_content::esm::PRESET_EXTERIOR_CELL];
-        let plugin = dummy_content::esm::plugin(&dummy_content::esm::Plugin {
-            author: "OpenSkyrim dummy-content",
-            worldspace: "GeneratedWorld",
-            cells: &cells,
-            model_path: "meshes/generated.nif",
-            diffuse: "textures/generated_color.dds",
-            normal_texture: "textures/generated_normal.dds",
-        })
-        .unwrap();
-        fs::write(data.join("Skyrim.esm"), plugin).unwrap();
-    }
-
-    /// Runs one conversion and renames the published output back to a staging
-    /// name: the state a run leaves behind when only its publish failed.
-    async fn stage_finished_conversion(data: &Path, output: &Path) -> PathBuf {
-        let report = run_without_progress(PipelineConfig::new(data, output)).await;
-        assert!(
-            report.complete,
-            "the fixture conversion must finish cleanly"
+        // Room for one event: after the archive's first update, the channel stays full.
+        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1);
+        let front_end = async {
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                    .await
+                    .expect("the run reaches extraction")
+                    .expect("the run is still sending");
+                if event.stage == ProgressStage::Extracting && event.stage_fraction.is_none() {
+                    break;
+                }
+            }
+            // Stop reading until the archive is extracted.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let blob = crate::find_resumable_staging(&output).map(|(staging, _)| {
+                    staging
+                        .join(".ingestion-cache/sha256")
+                        .join(&last_blob[..2])
+                        .join(&last_blob)
+                });
+                if blob.is_some_and(|blob| blob.is_file()) {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    // Close the channel first, so stalled threads end and the test fails
+                    // instead of hanging.
+                    drop(rx);
+                    panic!("extraction stalled while nobody read its progress");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // Reading again lets the waiting events through.
+            while rx.recv().await.is_some() {}
+        };
+        let (report, ()) = tokio::join!(
+            AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx),
+            front_end
         );
-        let mut name = output.to_path_buf().into_os_string();
-        name.push(".staging-1");
-        let staging = PathBuf::from(name);
-        fs::rename(output, &staging).unwrap();
-        staging
+
+        let report = report.unwrap();
+        assert!(report.complete);
+        let cache_root = PipelineConfig::new(&data, &output).ingestion_cache_dir();
+        let blobs = WalkDir::new(cache_root.join(".ingestion-cache"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+        assert_eq!(blobs, entries);
+        assert_eq!(report.converted, entries as u64);
     }
 
-    /// Edits the staging manifest, the way an older converter version or an
-    /// interrupted run would leave it.
-    fn edit_staging_manifest(staging: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
-        let path = staging.join("conversion-manifest.json");
-        let mut manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        edit(&mut manifest);
-        fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    /// The window between the last stage and the publish rename cannot be hit from outside in a
+    /// test without racing the run, so the gate itself is driven directly: a run that was
+    /// interrupted while it was packing up must not publish, and must keep its staging folder.
+    #[test]
+    fn an_interrupt_before_the_publish_keeps_staging_and_leaves_the_output_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("modern");
+
+        let staging = temp.path().join("modern.staging-1-1");
+        fs::create_dir_all(staging.join("scripts")).unwrap();
+        fs::write(staging.join("scripts/one.luau"), b"return 1").unwrap();
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        let failure = publish_if_not_interrupted(&staging, &output, &cancellation).unwrap_err();
+        assert!(failure.cancelled);
+        assert!(failure.error.downcast_ref::<Interrupted>().is_some());
+        assert!(failure.to_string().contains("interrupted"));
+        assert!(!output.exists(), "an interrupted run must not publish");
+        assert_eq!(failure.staging.as_deref(), Some(staging.as_path()));
+        assert!(staging.is_dir(), "the staging folder is kept for a resume");
+
+        // Without the interrupt the same gate publishes, so the assertion above is about the
+        // cancellation and not about publishing being broken.
+        let staging = temp.path().join("modern.staging-2-2");
+        fs::create_dir_all(staging.join("scripts")).unwrap();
+        fs::write(staging.join("scripts/one.luau"), b"return 1").unwrap();
+        publish_if_not_interrupted(&staging, &output, &Cancellation::new()).unwrap();
+        assert_eq!(
+            fs::read(output.join("scripts/one.luau")).unwrap(),
+            b"return 1"
+        );
     }
 
-    async fn run_and_collect(config: PipelineConfig) -> (PipelineReport, Vec<ProgressEvent>) {
+    async fn run_without_progress(config: PipelineConfig) -> PipelineReport {
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let report = AssetPipeline::run_async(config, tx).await.unwrap();
+        drain.await.unwrap();
+        report
+    }
+
+    /// Runs the pipeline and returns its report together with every progress
+    /// event it emitted.
+    async fn run_collecting_progress(
+        config: PipelineConfig,
+    ) -> (PipelineReport, Vec<ProgressEvent>) {
         let (tx, mut rx) = mpsc::channel(64);
         let collect = tokio::spawn(async move {
             let mut events = Vec::new();
@@ -2743,15 +3846,239 @@ mod tests {
             events
         });
         let report = AssetPipeline::run_async(config, tx).await.unwrap();
-        let events = collect.await.unwrap();
-        (report, events)
+        (report, collect.await.unwrap())
     }
 
-    async fn run_without_progress(config: PipelineConfig) -> PipelineReport {
+    /// Loads the manifest published in an output directory.
+    fn published_manifest(output: &Path) -> ConversionManifest {
+        ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap()
+    }
+
+    /// Copies a published asset tree into a staging directory, so a run can
+    /// resume from it.
+    fn copy_tree(source: &Path, destination: &Path) {
+        for entry in WalkDir::new(source) {
+            let entry = entry.unwrap();
+            let relative = entry.path().strip_prefix(source).unwrap();
+            let target = destination.join(relative);
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&target).unwrap();
+            } else {
+                fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn published_pack_excludes_build_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/one.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+        let config = PipelineConfig::new(&data, &output);
+        let report = run_without_progress(config.clone()).await;
+
+        assert!(report.complete);
+        assert!(output.join("scripts/one.luau").is_file());
+        assert!(output.join("conversion-manifest.json").is_file());
+        assert!(!output.join("vfs").exists());
+        assert!(!output.join(".ingestion-cache").exists());
+    }
+
+    #[test]
+    fn persisting_the_ingestion_cache_skips_spill_copies() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging-cache");
+        fs::create_dir_all(&staging).unwrap();
+        let blob = "ab".repeat(32);
+        fs::write(staging.join(&blob), b"blob").unwrap();
+        fs::write(staging.join(format!("{blob}.1")), b"spill").unwrap();
+        let root = directory.path().join("cache");
+
+        persist_ingestion_cache(&staging, &root).unwrap();
+
+        assert!(root.join(&blob).is_file());
+        assert!(!root.join(format!("{blob}.1")).exists());
+    }
+
+    #[test]
+    fn prune_removes_only_unreferenced_blobs_and_spills() {
+        use crate::cache::{IngestedFile, IngestionCacheEntry};
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join(".ingestion-cache/sha256/ab");
+        fs::create_dir_all(&cache).unwrap();
+        let live = "ab".repeat(32);
+        let dead = "cd".repeat(32);
+        fs::write(cache.join(&live), b"live").unwrap();
+        fs::write(cache.join(format!("{live}.1")), b"live spill").unwrap();
+        fs::write(cache.join(&dead), b"dead").unwrap();
+        fs::write(cache.join(format!("{dead}.2")), b"dead spill").unwrap();
+        fs::write(cache.join("probe.tmp"), b"not a blob").unwrap();
+
+        let mut manifest = ConversionManifest::default();
+        manifest.archives.insert(
+            "assets.ba2".to_owned(),
+            IngestionCacheEntry {
+                source_hash: "00".repeat(32),
+                files: vec![IngestedFile {
+                    path: "textures/rock.dds".to_owned(),
+                    size: 4,
+                    hash: live.clone(),
+                }],
+            },
+        );
+        prune_stale_ingestion_blobs(
+            directory.path().join(".ingestion-cache").as_path(),
+            &manifest,
+        )
+        .unwrap();
+
+        assert!(cache.join(&live).is_file());
+        assert!(cache.join(format!("{live}.1")).is_file());
+        assert!(!cache.join(&dead).exists());
+        assert!(!cache.join(format!("{dead}.2")).exists());
+        assert!(cache.join("probe.tmp").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_resumed_publish_removes_its_staging_and_keeps_the_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/one.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+        run_without_progress(PipelineConfig::new(&data, &output)).await;
+        let expected = fs::read(output.join("scripts/one.luau")).unwrap();
+
+        // The published pack shares files with staging through hard links, so removing the
+        // resumed staging folder must leave every published file in place.
+        let staging = temp.path().join("modern.staging-resume-links");
+        fs::create_dir_all(&staging).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging.clone());
+        let resumed = run_without_progress(config).await;
+
+        assert!(resumed.complete);
+        assert!(
+            !staging.exists(),
+            "a resumed publish kept its staging folder, which would be offered for resume again"
+        );
+        assert_eq!(fs::read(output.join("scripts/one.luau")).unwrap(), expected);
+        assert_eq!(crate::find_resumable_staging(&output), None);
+    }
+
+    /// A folder a killed run left behind holds the temporaries its writers never renamed into
+    /// place. The resume clears those, and only those: a real file that merely ends in `.partial`
+    /// is somebody else's and stays.
+    #[tokio::test]
+    async fn a_resumed_run_removes_stale_temporaries_and_keeps_other_partials() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/one.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+        // An asset the resumed run fails on, so it keeps its staging folder to inspect.
+        fs::create_dir_all(data.join("textures")).unwrap();
+        fs::write(data.join("textures/bad.dds"), b"not a DDS").unwrap();
+
+        // One leftover per temporary-name shape the converter's writers use. The pid is not this
+        // process's, so a stale name can never collide with the writer that made it.
+        let pid = std::process::id() + 1;
+        let staging = temp.path().join("modern.staging-1-1");
+        let stale = [
+            // The script writer: `.<name>.<pid>-<counter>.partial`.
+            staging.join(format!("scripts/.one.luau.{pid}-0.partial")),
+            // The manifest and report writer: `<name>.json.<pid>.partial`.
+            staging.join(format!("journals/conversion-manifest.json.{pid}.partial")),
+            // The mesh writer: `<name>.<extension>.<pid>.partial`.
+            staging.join(format!("meshes/one.glb.{pid}.partial")),
+            // The spill copy: `<name>.<index>.partial-<pid>`.
+            staging.join(format!("cache/deadbeef.1.partial-{pid}")),
+            // The previous output the mesh and texture writers park while they swap.
+            staging.join(format!("meshes/two.glb.{pid}.backup")),
+            staging.join(format!("textures/two.ktx2.{pid}.backup")),
+        ];
+        for path in &stale {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"torn").unwrap();
+        }
+        // A real file named like a backup of something else stays.
+        let kept_backup = staging.join("notes/settings.ini.7.backup");
+        fs::create_dir_all(kept_backup.parent().unwrap()).unwrap();
+        fs::write(&kept_backup, b"a real file").unwrap();
+        let kept = staging.join("notes/hand-authored.partial");
+        fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        fs::write(&kept, b"a real file").unwrap();
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        config.fail_fast = true;
         let (tx, mut rx) = mpsc::channel(64);
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let report = AssetPipeline::run_async(config, tx).await.unwrap();
-        drain.await.unwrap();
-        report
+        let collect = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let failure = AssetPipeline::run_async(config, tx).await.unwrap_err();
+        let events = collect.await.unwrap();
+
+        assert!(
+            failure.staging.is_some_and(|kept| kept.is_dir()),
+            "a failed run keeps the folder it worked in"
+        );
+        for path in &stale {
+            assert!(!path.exists(), "{} survived the resume", path.display());
+        }
+        assert_eq!(
+            fs::read(&kept).unwrap(),
+            b"a real file",
+            "a file that merely ends in .partial was removed"
+        );
+        assert!(
+            kept_backup.is_file(),
+            "a file that merely ends in .backup was removed"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.message.contains("stale temporary")),
+            "the resume did not report the cleanup"
+        );
+    }
+
+    #[test]
+    fn staging_that_holds_the_data_folder_is_kept_after_publishing() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("modern.staging-1-1");
+        let data = staging.join("Data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("Skyrim.esm"), b"game data").unwrap();
+
+        assert!(!remove_staging(&staging, &data));
+        assert!(!remove_staging(&staging, &staging));
+        assert_eq!(fs::read(data.join("Skyrim.esm")).unwrap(), b"game data");
+
+        // A staging folder beside the data, the normal case, is removed.
+        let beside = temp.path().join("modern.staging-2-2");
+        fs::create_dir_all(beside.join("vfs")).unwrap();
+        assert!(remove_staging(&beside, &data));
+        assert!(!beside.exists());
+        assert!(data.join("Skyrim.esm").is_file());
     }
 }

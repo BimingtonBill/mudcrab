@@ -5,8 +5,16 @@
 //! per cell. A spec can also carry one interior cell joined to an exterior
 //! cell by a reciprocal pair of load doors, which is what a caller needs to
 //! exercise interiors, `XTEL` door links and cell-to-cell crossings without a
-//! local game installation. Only the record types consumed by the converter's
+//! local game installation. A spec can instead carry one `LIGH` base record and
+//! the single reference that places it, which is what a caller needs to exercise
+//! point lights and the `XRDS` radius override a light reference carries without
+//! a local game installation. Only the record types consumed by the converter's
 //! ESM parser, exporter and cell cache are produced.
+//!
+//! The `DOOR` bases carry a `MODL` the way retail data does, but the converter's
+//! exporter fills its `statics` table from `STAT`, `MSTT` and `FURN` only, so a
+//! reference that places one of them exports with no model at all until that
+//! changes; see [`Door::model_path`].
 
 use crate::path::split_asset_name;
 use color_eyre::{
@@ -19,15 +27,43 @@ const WRLD_FORM_ID: u32 = 0x0000_0001;
 const TXST_FORM_ID: u32 = 0x0000_0002;
 const STAT_FORM_ID: u32 = 0x0000_0003;
 const LTEX_FORM_ID: u32 = 0x0000_0004;
+const MATT_FORM_ID: u32 = 0x0000_0008;
 /// The `DOOR` base record the exterior door of an [`Interior`] places.
 const EXTERIOR_DOOR_FORM_ID: u32 = 0x0000_0005;
 /// The `DOOR` base record the interior door of an [`Interior`] places.
 const INTERIOR_DOOR_FORM_ID: u32 = 0x0000_0006;
+/// The `LIGH` base record a [`Light`]'s reference places.
+const LIGHT_FORM_ID: u32 = 0x0000_0009;
+/// The player `NPC_`, at the FormID `Skyrim.esm` gives it. The engine reads
+/// its `RNAM` to find the race whose movement it uses.
+const PLAYER_FORM_ID: u32 = 0x0000_0007;
+/// The `RACE` the player's `RNAM` names. It carries no `WKMV`/`RNMV`, like the
+/// player's race in `Skyrim.esm`, so the default movement type applies.
+const PLAYER_RACE_FORM_ID: u32 = 0x0000_000A;
+/// `NPC_Default_MT`, the `MOVT` the engine selects for an unset race link.
+const NPC_DEFAULT_MOVT_FORM_ID: u32 = 0x0003_580D;
+/// `NPC_Default_MT`'s `SPED` speeds (left, right, forward and back; walk and
+/// run each), the values `Skyrim.esm` carries, plus the three rotation rates.
+const NPC_DEFAULT_MOVT_SPEEDS: [f32; 11] = [
+    80.09,
+    370.0,
+    79.75,
+    370.0,
+    80.1,
+    370.0,
+    71.93,
+    205.25,
+    std::f32::consts::PI,
+    std::f32::consts::PI,
+    std::f32::consts::PI,
+];
 const CELL_BASE_FORM_ID: u32 = 0x0000_0010;
 const CELL_FORM_STRIDE: u32 = 0x10;
 /// A door reference's offset inside its cell's block of [`CELL_FORM_STRIDE`]
 /// FormIDs: past the cell itself, its `LAND` and the static reference.
 const DOOR_REF_OFFSET: u32 = 3;
+/// A light reference's offset in the same block, past the door reference.
+const LIGHT_REF_OFFSET: u32 = 4;
 /// The interior cell's FormID, past every id [`MAX_CELLS`] exterior cells can
 /// hand out.
 const INTERIOR_CELL_FORM_ID: u32 = 0x0001_0000;
@@ -38,9 +74,25 @@ const RECORD_VERSION: u16 = 44;
 const HEADER_RECORD_SIZE: usize = 24;
 const GROUP_HEADER_SIZE: usize = 24;
 const MAX_CELLS: usize = 0x0f00;
+/// The highest FormID [`MAX_CELLS`] exterior cells can hand out is the last
+/// cell's light reference; every exterior id has to stay below the interior
+/// cell's own block, or an interior record would collide with an exterior one.
+const _: () = assert!(
+    CELL_BASE_FORM_ID + (MAX_CELLS as u32 - 1) * CELL_FORM_STRIDE + LIGHT_REF_OFFSET
+        < INTERIOR_CELL_FORM_ID,
+    "the exterior FormID block has grown into the interior block"
+);
 /// `XTEL`'s length: the destination reference's FormID, the arrival position
 /// and rotation as six little-endian `f32`s, then a four-byte flag word.
 const XTEL_SIZE: usize = 32;
+/// A `LIGH` `DATA` subrecord's length, the layout every one of the 435 `LIGH`
+/// records in `Skyrim.esm` carries: time (i32), radius (u32), colour (RGB plus
+/// one unused byte), flags (u32), falloff exponent (f32), then FOV, near clip,
+/// flicker period, flicker intensity amplitude, flicker movement amplitude,
+/// value (u32) and weight (f32). The converter reads the first four fields and
+/// the engine the `FNAM` fade; the fields after the falloff exponent are
+/// written as zero.
+const LIGHT_DATA_SIZE: usize = 48;
 /// `CELL` `DATA` flag `0x01`: the cell is an interior, so it has no grid square
 /// and belongs to no worldspace.
 const INTERIOR_CELL_FLAG: u8 = 0x01;
@@ -66,6 +118,16 @@ pub struct Door<'a> {
     /// two distinct editor ids, because they are two base records.
     pub editor_id: &'a str,
     /// `MODL` model path of the `DOOR` base record.
+    ///
+    /// The path is written to the base record, but the converter's exporter
+    /// fills its `statics` table from `STAT`, `MSTT` and `FURN` records only,
+    /// so a `REFR` that places this door exports as a reference without a model:
+    /// `world-inspect` counts it under `references_without_model`, its entry in
+    /// an `assets` listing never appears, and its mesh never reaches the GLB
+    /// pipeline. That is a converter gap, not a fixture one - the fixture writes
+    /// the `MODL` a retail plugin carries - and it stays until the exporter
+    /// learns `DOOR`. `crates/converter/tests/fixture_interior_pipeline.rs`
+    /// asserts the resulting count so the gap cannot go quiet.
     pub model_path: &'a str,
     /// `FNAM` flags of the `DOOR` base record; [`AUTO_LOAD_FLAG`] marks an
     /// auto-load door.
@@ -100,6 +162,53 @@ pub struct Interior<'a> {
     pub inside: Door<'a>,
 }
 
+/// A `LIGH` base record and the single reference that places it.
+///
+/// The reference carries the light's position and rotation and its own `XRDS`
+/// radius override, [`Light::radius_override`], which wins over the base
+/// record's radius wherever both are read.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Light<'a> {
+    /// `EDID` of the `LIGH` base record.
+    pub editor_id: &'a str,
+    /// `MODL` model path of the `LIGH` base record; `None` writes no `MODL`,
+    /// the shape a light with no visible mesh has. The exporter writes a
+    /// `statics` row for a `LIGH` with a model (the lamp's mesh) and none for
+    /// one without; either way the light itself goes into the `lights` table.
+    pub model_path: Option<&'a str>,
+    /// The exterior cell the reference stands in; one of [`Plugin::cells`].
+    pub cell: Cell,
+    /// `DATA` time (i32). `-1` is what retail data writes for a light that is
+    /// always on (`DefaultTorch01NS_FastSaturate`, `000CB3B0`); the converter
+    /// stores no time.
+    pub time: i32,
+    /// `DATA` radius in Creation units. A `u32`, which the converter widens to
+    /// a float: a radius of 256 reads as 256.0, where the same four bytes read
+    /// as an `f32` are a denormal.
+    pub radius: u32,
+    /// `DATA` colour, RGB. The byte after it is unused and written as zero.
+    pub color: [u8; 3],
+    /// `DATA` flags (u32). Clear, so the light is on and positive: the engine
+    /// renders no light that sets UESP's off-by-default bit (`0x20`) or its
+    /// negative bit (`0x04`), and a fixture that set either would be dark.
+    pub flags: u32,
+    /// `DATA` falloff exponent (f32). The converter reads it; the engine loads
+    /// it and does not apply it.
+    pub falloff: f32,
+    /// `FNAM` fade (f32), the brightness knob of the converted light.
+    pub fade: f32,
+    /// `DATA` position of the reference, in Creation units.
+    pub position: [f32; 3],
+    /// `DATA` rotation of the reference, in radians.
+    pub rotation: [f32; 3],
+    /// `XRDS` radius of the reference, in the same Creation units as
+    /// [`Light::radius`] and deliberately not equal to it, the way retail data
+    /// differs: 10,810 of the 12,148 `LIGH` references in `Skyrim.esm` carry
+    /// an override.
+    /// A single little-endian `f32`, which may be negative.
+    pub radius_override: f32,
+}
+
 /// Description of a generated plugin.
 ///
 /// The worldspace and its exterior cells, with the assets they reference. An
@@ -123,7 +232,7 @@ pub struct Plugin<'a> {
 
 /// Generates a minimal Skyrim SE plugin.
 pub fn plugin(spec: &Plugin<'_>) -> Result<Vec<u8>> {
-    write_plugin(spec, None)
+    write_plugin(spec, None, None)
 }
 
 /// Generates the same plugin as [`plugin`], with `interior` and its two load
@@ -134,15 +243,33 @@ pub fn plugin(spec: &Plugin<'_>) -> Result<Vec<u8>> {
 /// interior moves is the world group's own size field, which grows by the
 /// reference of the door standing in the exterior cell.
 pub fn plugin_with_interior(spec: &Plugin<'_>, interior: &Interior<'_>) -> Result<Vec<u8>> {
-    write_plugin(spec, Some(interior))
+    write_plugin(spec, Some(interior), None)
 }
 
-fn write_plugin(spec: &Plugin<'_>, interior: Option<&Interior<'_>>) -> Result<Vec<u8>> {
-    validate(spec, interior)?;
+/// Generates the same plugin as [`plugin`], with `light`'s `LIGH` base record
+/// and the one reference that places it.
+///
+/// The base record is written after the exterior world, like the `DOOR` records
+/// of [`plugin_with_interior`], and the reference joins the static placement in
+/// the cell's own children group, so the exterior records the two share keep
+/// their order and only the world group's size field moves.
+pub fn plugin_with_lights(spec: &Plugin<'_>, light: &Light<'_>) -> Result<Vec<u8>> {
+    write_plugin(spec, None, Some(light))
+}
+
+fn write_plugin(
+    spec: &Plugin<'_>,
+    interior: Option<&Interior<'_>>,
+    light: Option<&Light<'_>>,
+) -> Result<Vec<u8>> {
+    validate(spec, interior, light)?;
 
     let mut bytes = header_record(spec)?;
     bytes.extend_from_slice(&texture_set_record(spec)?);
     bytes.extend_from_slice(&static_record(spec)?);
+    bytes.extend_from_slice(&movement_type_record()?);
+    bytes.extend_from_slice(&player_race_record()?);
+    bytes.extend_from_slice(&player_record()?);
     bytes.extend_from_slice(&landscape_texture_record()?);
     bytes.extend_from_slice(&worldspace_record(spec)?);
 
@@ -163,6 +290,14 @@ fn write_plugin(spec: &Plugin<'_>, interior: Option<&Interior<'_>>) -> Result<Ve
                 INTERIOR_DOOR_REF_FORM_ID,
             )?);
         }
+        if let Some(light) = light
+            && light.cell == *cell
+        {
+            children.extend_from_slice(&light_reference_record(
+                cell_form_id + LIGHT_REF_OFFSET,
+                light,
+            )?);
+        }
         world_children.extend_from_slice(&group(8, cell_form_id, &children)?);
     }
     bytes.extend_from_slice(&group(1, WRLD_FORM_ID, &world_children)?);
@@ -174,10 +309,17 @@ fn write_plugin(spec: &Plugin<'_>, interior: Option<&Interior<'_>>) -> Result<Ve
         bytes.extend_from_slice(&door_record(INTERIOR_DOOR_FORM_ID, &interior.inside)?);
         bytes.extend_from_slice(&interior_group(interior, exterior_door_ref)?);
     }
+    if let Some(light) = light {
+        bytes.extend_from_slice(&light_record(LIGHT_FORM_ID, light)?);
+    }
     Ok(bytes)
 }
 
-fn validate(spec: &Plugin<'_>, interior: Option<&Interior<'_>>) -> Result<()> {
+fn validate(
+    spec: &Plugin<'_>,
+    interior: Option<&Interior<'_>>,
+    light: Option<&Light<'_>>,
+) -> Result<()> {
     for (label, value) in [("author", spec.author), ("worldspace", spec.worldspace)] {
         ensure!(!value.is_empty(), "ESM {label} is empty");
         ensure!(
@@ -233,6 +375,40 @@ fn validate(spec: &Plugin<'_>, interior: Option<&Interior<'_>>) -> Result<()> {
             }
         }
     }
+
+    if let Some(light) = light {
+        // The light's reference is a reference of an exterior cell, so that
+        // cell has to be one of the generated ones.
+        light_cell_index(spec, light)?;
+        ensure!(!light.editor_id.is_empty(), "ESM light editor id is empty");
+        ensure!(
+            light
+                .editor_id
+                .bytes()
+                .all(|byte| (0x20..0x7f).contains(&byte)),
+            "ESM light editor id is not printable ASCII: {:?}",
+            light.editor_id
+        );
+        if let Some(model_path) = light.model_path {
+            split_asset_name(model_path, "ESM light model")?;
+        }
+        for (field, values) in [("position", light.position), ("rotation", light.rotation)] {
+            ensure!(
+                values.iter().all(|value| value.is_finite()),
+                "ESM light {field} is not finite: {values:?}"
+            );
+        }
+        for (field, value) in [
+            ("falloff", light.falloff),
+            ("fade", light.fade),
+            ("radius override", light.radius_override),
+        ] {
+            ensure!(
+                value.is_finite(),
+                "ESM light {field} is not finite: {value:?}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -245,6 +421,19 @@ fn exterior_cell_index(spec: &Plugin<'_>, interior: &Interior<'_>) -> Result<usi
             eyre!(
                 "ESM interior {} is not attached to a generated exterior cell",
                 interior.editor_id
+            )
+        })
+}
+
+/// The index of the exterior cell a light's reference stands in.
+fn light_cell_index(spec: &Plugin<'_>, light: &Light<'_>) -> Result<usize> {
+    spec.cells
+        .iter()
+        .position(|cell| *cell == light.cell)
+        .ok_or_else(|| {
+            eyre!(
+                "ESM light {} is not attached to a generated exterior cell",
+                light.editor_id
             )
         })
 }
@@ -284,6 +473,40 @@ fn static_record(spec: &Plugin<'_>) -> Result<Vec<u8>> {
     )
 }
 
+/// The `MOVT` the engine's default movement selection reads.
+fn movement_type_record() -> Result<Vec<u8>> {
+    let speeds = NPC_DEFAULT_MOVT_SPEEDS
+        .iter()
+        .flat_map(|speed| speed.to_le_bytes())
+        .collect();
+    record(
+        *b"MOVT",
+        NPC_DEFAULT_MOVT_FORM_ID,
+        &[(*b"EDID", cstring("NPC_Default_MT")), (*b"SPED", speeds)],
+    )
+}
+
+/// The player's `RACE`, with no movement links.
+fn player_race_record() -> Result<Vec<u8>> {
+    record(
+        *b"RACE",
+        PLAYER_RACE_FORM_ID,
+        &[(*b"EDID", cstring("NordRace"))],
+    )
+}
+
+/// The player `NPC_`: its race is the only field the engine needs.
+fn player_record() -> Result<Vec<u8>> {
+    record(
+        *b"NPC_",
+        PLAYER_FORM_ID,
+        &[
+            (*b"EDID", cstring("Player")),
+            (*b"RNAM", PLAYER_RACE_FORM_ID.to_le_bytes().to_vec()),
+        ],
+    )
+}
+
 /// A `DOOR` base record: its editor id, the model a reference of it draws, and
 /// its one-byte `FNAM` flags.
 fn door_record(form_id: u32, door: &Door<'_>) -> Result<Vec<u8>> {
@@ -298,6 +521,31 @@ fn door_record(form_id: u32, door: &Door<'_>) -> Result<Vec<u8>> {
     )
 }
 
+/// A `LIGH` base record: its editor id, an optional `MODL`, the [`LIGHT_DATA_SIZE`]
+/// `DATA` layout and the four-byte `FNAM` fade.
+fn light_record(form_id: u32, light: &Light<'_>) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(LIGHT_DATA_SIZE);
+    data.extend_from_slice(&light.time.to_le_bytes());
+    data.extend_from_slice(&light.radius.to_le_bytes());
+    data.extend_from_slice(&light.color);
+    // The colour's fourth byte is unused; the game writes it as zero.
+    data.push(0);
+    data.extend_from_slice(&light.flags.to_le_bytes());
+    data.extend_from_slice(&light.falloff.to_le_bytes());
+    // FOV, near clip, flicker period, flicker intensity amplitude, flicker
+    // movement amplitude, value and weight: the fields behind the ones the
+    // converter reads, so the fixture leaves them clear rather than inventing
+    // values no consumer can check.
+    data.extend(std::iter::repeat_n(0u8, LIGHT_DATA_SIZE - data.len()));
+    let mut subrecords = vec![(*b"EDID", cstring(light.editor_id))];
+    if let Some(model_path) = light.model_path {
+        subrecords.push((*b"MODL", cstring(model_path)));
+    }
+    subrecords.push((*b"DATA", data));
+    subrecords.push((*b"FNAM", light.fade.to_le_bytes().to_vec()));
+    record(*b"LIGH", form_id, &subrecords)
+}
+
 fn landscape_texture_record() -> Result<Vec<u8>> {
     record(
         *b"LTEX",
@@ -305,7 +553,8 @@ fn landscape_texture_record() -> Result<Vec<u8>> {
         &[
             (*b"EDID", cstring("GeneratedLandscape")),
             (*b"TNAM", TXST_FORM_ID.to_le_bytes().to_vec()),
-            (*b"HNAM", 0u16.to_le_bytes().to_vec()),
+            (*b"MNAM", MATT_FORM_ID.to_le_bytes().to_vec()),
+            (*b"HNAM", vec![30, 30]),
         ],
     )
 }
@@ -379,12 +628,25 @@ fn reference_record(form_id: u32, cell: &Cell) -> Result<Vec<u8>> {
 /// transform and the `XTEL` the door crosses on: the destination reference's
 /// FormID, the arrival position and rotation, and a four-byte flag word -
 /// [`XTEL_SIZE`] bytes, no flag bits set.
+///
+/// `destination_ref_id` is written as the fixture's own local id, and the
+/// converter's load-order remap leaves it that way: remapping rewrites only the
+/// subrecords `is_form_id_subrecord` recognises as 4-byte FormIDs, and `XTEL`
+/// is not one of them, so the id reaches a database unchanged. That is correct
+/// only while this plugin owns load-order index 0, the single-plugin case
+/// `dummy-content gen` writes - a second plugin needs the remap extended to
+/// `XTEL`. Nothing consumes `XTEL` yet either, so the link is only as good as
+/// the fixture's own reader (`crates/converter/tests/fixture_doors.rs`).
 fn door_reference_record(
     form_id: u32,
     base_form_id: u32,
     door: &Door<'_>,
     destination_ref_id: u32,
 ) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(24);
+    for value in door.position.iter().chain(door.rotation.iter()) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
     let mut xtel = Vec::with_capacity(XTEL_SIZE);
     xtel.extend_from_slice(&destination_ref_id.to_le_bytes());
     xtel.extend_from_slice(&floats(&door.arrival_position));
@@ -395,11 +657,31 @@ fn door_reference_record(
         form_id,
         &[
             (*b"NAME", base_form_id.to_le_bytes().to_vec()),
-            (
-                *b"DATA",
-                [floats(&door.position), floats(&door.rotation)].concat(),
-            ),
+            (*b"DATA", data),
             (*b"XTEL", xtel),
+        ],
+    )
+}
+
+/// A `REFR` that places [`LIGHT_FORM_ID`]: `light`'s transform, and the
+/// four-byte `XRDS` radius override the reference carries.
+///
+/// `XRDS` is a single little-endian `f32`, so the load-order remap leaves it
+/// alone: it rewrites only the subrecords it recognises as 4-byte FormIDs, and
+/// `XRDS` is not one of them. The value therefore reaches a database exactly as
+/// written, including when this plugin is not the first.
+fn light_reference_record(form_id: u32, light: &Light<'_>) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(24);
+    for value in light.position.iter().chain(light.rotation.iter()) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    record(
+        *b"REFR",
+        form_id,
+        &[
+            (*b"NAME", LIGHT_FORM_ID.to_le_bytes().to_vec()),
+            (*b"DATA", data),
+            (*b"XRDS", light.radius_override.to_le_bytes().to_vec()),
         ],
     )
 }
@@ -512,16 +794,21 @@ pub const PRESET_EXTERIOR_CELL: Cell = Cell {
 /// `AutoLoadDoor01`) and the inside door is an ordinary one, so a fixture can
 /// exercise both ways a load door opens. Neither door stands on the arrival
 /// point that leads to it, as the game's own `XTEL` data does not. Both doors
-/// draw the fixture's generated mesh, the only model the crate's default data
-/// tree writes; to exercise a marker model's own path a caller has to describe
-/// its own [`Interior`].
+/// draw the fixture's generated mesh ([`crate::layout::GENERATED_MODEL_PATH`],
+/// the only model the crate's default data tree writes); to exercise a marker
+/// model's own path a caller has to describe its own [`Interior`].
+///
+/// Both doors do carry a `MODL`, but the mesh never reaches the converted
+/// world: the exporter fills `statics` from `STAT`, `MSTT` and `FURN` only, so
+/// the two door references export without a model until that changes - see
+/// [`Door::model_path`].
 pub const PRESET_INTERIOR: Interior<'static> = Interior {
     editor_id: "GeneratedInterior",
     full_name: "Generated Interior",
     exterior_cell: PRESET_EXTERIOR_CELL,
     outside: Door {
         editor_id: "AutoLoadDoor01",
-        model_path: "meshes/generated.nif",
+        model_path: crate::layout::GENERATED_MODEL_PATH,
         flags: AUTO_LOAD_FLAG,
         position: [2048.0, 1024.0, 0.0],
         rotation: [0.0, 0.0, 0.0],
@@ -530,13 +817,39 @@ pub const PRESET_INTERIOR: Interior<'static> = Interior {
     },
     inside: Door {
         editor_id: "GeneratedDoor01",
-        model_path: "meshes/generated.nif",
+        model_path: crate::layout::GENERATED_MODEL_PATH,
         flags: 0,
         position: [128.0, 512.0, 0.0],
         rotation: [0.0, 0.0, 0.0],
         arrival_position: [2048.0, 512.0, 0.0],
         arrival_rotation: [0.0, 0.0, 0.0],
     },
+};
+
+/// The `LIGH` base record and the reference that places it, which the
+/// `--with-lights` preset writes and `crates/converter/tests/fixture_lights.rs`
+/// converts.
+///
+/// The values are plausible rather than retail: a radius of 512 Creation units,
+/// the widest common `LIGH` radius, and a warm colour, with flags clear so the
+/// light is on and positive (see [`Light::flags`]). The reference's `XRDS`
+/// radius of 1024 is deliberately twice the base record's, so a reader that
+/// picks up the override cannot be confused with one that picked up the base.
+/// The base record carries the fixture's generated mesh as its `MODL`, so the
+/// exporter writes a `statics` row for it as well as its `lights` row.
+pub const PRESET_LIGHT: Light<'static> = Light {
+    editor_id: "GeneratedLight01",
+    model_path: Some(crate::layout::GENERATED_MODEL_PATH),
+    cell: PRESET_EXTERIOR_CELL,
+    time: -1,
+    radius: 512,
+    color: [216, 128, 39],
+    flags: 0,
+    falloff: 1.0,
+    fade: 1.0,
+    position: [1024.0, 2048.0, 128.0],
+    rotation: [0.0, 0.0, 0.0],
+    radius_override: 1024.0,
 };
 
 #[cfg(test)]
@@ -564,26 +877,77 @@ mod tests {
 
     fn spec() -> Plugin<'static> {
         Plugin {
-            author: "OpenSkyrim dummy-content",
-            worldspace: "GeneratedWorld",
+            author: crate::layout::GENERATED_AUTHOR,
+            worldspace: crate::layout::GENERATED_WORLDSPACE,
             cells: &CELLS,
-            model_path: "meshes/generated.nif",
-            diffuse: "textures/generated_color.dds",
-            normal_texture: "textures/generated_normal.dds",
+            model_path: crate::layout::GENERATED_MODEL_PATH,
+            diffuse: crate::layout::GENERATED_DIFFUSE_PATH,
+            normal_texture: crate::layout::GENERATED_NORMAL_PATH,
         }
     }
 
+    /// Every group, record and subrecord tag in `bytes`, in file order.
+    ///
+    /// Walks the header sizes rather than matching four-byte windows, so a tag
+    /// spelled inside a payload - an `EDID`, a `MODL` path, the bytes of an
+    /// `f32` - can never be counted as a record.
+    fn tags(bytes: &[u8]) -> Vec<[u8; 4]> {
+        /// Subrecords of one record's payload: tag, `u16` length, contents.
+        fn subrecords(payload: &[u8], found: &mut Vec<[u8; 4]>) {
+            let mut offset = 0;
+            while offset + 6 <= payload.len() {
+                let tag: [u8; 4] = payload[offset..offset + 4].try_into().unwrap();
+                let length = u16::from_le_bytes(payload[offset + 4..offset + 6].try_into().unwrap())
+                    as usize;
+                found.push(tag);
+                offset += 6 + length;
+            }
+        }
+
+        fn walk(bytes: &[u8], found: &mut Vec<[u8; 4]>) {
+            let mut offset = 0;
+            while offset + HEADER_RECORD_SIZE <= bytes.len() {
+                let tag: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+                let size =
+                    u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+                found.push(tag);
+                if tag == *b"GRUP" {
+                    // A group's size counts its own 24-byte header, so the group
+                    // ends at `offset + size` and its children start past the
+                    // header; a record's size counts only its payload.
+                    let children = bytes.get(offset + GROUP_HEADER_SIZE..offset + size);
+                    let Some(children) = children else { return };
+                    walk(children, found);
+                    offset += size;
+                } else {
+                    let payload =
+                        bytes.get(offset + HEADER_RECORD_SIZE..offset + HEADER_RECORD_SIZE + size);
+                    if let Some(payload) = payload {
+                        subrecords(payload, found);
+                    }
+                    offset += HEADER_RECORD_SIZE + size;
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        walk(bytes, &mut found);
+        found
+    }
+
+    /// How many tags in `bytes` are `tag`.
     fn count(bytes: &[u8], tag: &[u8; 4]) -> usize {
-        bytes.windows(4).filter(|window| *window == tag).count()
+        tags(bytes).iter().filter(|found| *found == tag).count()
     }
 
     #[test]
     fn writes_tes4_header_and_groups() {
         let bytes = plugin(&spec()).unwrap();
         assert_eq!(&bytes[..4], b"TES4");
-        assert!(bytes.windows(4).any(|window| window == b"GRUP"));
-        assert!(bytes.windows(4).any(|window| window == b"WRLD"));
-        assert!(bytes.windows(4).any(|window| window == b"LAND"));
+        let tags = tags(&bytes);
+        for tag in [b"GRUP", b"WRLD", b"LAND"] {
+            assert!(tags.contains(tag), "{tag:?} is missing from {tags:?}");
+        }
     }
 
     #[test]
@@ -593,38 +957,38 @@ mod tests {
             plugin_with_interior(&spec(), &PRESET_INTERIOR).unwrap(),
             plugin_with_interior(&spec(), &PRESET_INTERIOR).unwrap()
         );
+        assert_eq!(
+            plugin_with_lights(&spec(), &PRESET_LIGHT).unwrap(),
+            plugin_with_lights(&spec(), &PRESET_LIGHT).unwrap()
+        );
     }
 
-    /// [`plugin`] as it stood before interiors existed, kept here for the one
-    /// test that proves the interior writer did not change its bytes. Delete it
-    /// together with that test, not before.
-    fn plugin_before_interiors(spec: &Plugin<'_>) -> Result<Vec<u8>> {
-        validate(spec, None)?;
+    /// FNV-1a of [`plugin`]'s output, recorded from the writer that the
+    /// interiors commit left byte-identical.
+    ///
+    /// The guard used to re-run a copy of the pre-interior writer; the copy is
+    /// gone, and this constant stands in for it. A deliberate change to the
+    /// exterior bytes refreshes it in the same commit, which is what keeps the
+    /// change visible.
+    const EXTERIOR_ONLY_HASH: u64 = 0x390C_B14F_65BA_916F;
 
-        let mut bytes = header_record(spec)?;
-        bytes.extend_from_slice(&texture_set_record(spec)?);
-        bytes.extend_from_slice(&static_record(spec)?);
-        bytes.extend_from_slice(&landscape_texture_record()?);
-        bytes.extend_from_slice(&worldspace_record(spec)?);
-
-        let mut world_children = Vec::new();
-        for (index, cell) in spec.cells.iter().enumerate() {
-            let cell_form_id = cell_form_id(index)?;
-            world_children.extend_from_slice(&cell_record(cell_form_id, cell)?);
-            let mut children = Vec::new();
-            children.extend_from_slice(&land_record(cell_form_id + 1)?);
-            children.extend_from_slice(&reference_record(cell_form_id + 2, cell)?);
-            world_children.extend_from_slice(&group(8, cell_form_id, &children)?);
+    /// FNV-1a over every byte of `bytes`.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        bytes.extend_from_slice(&group(1, WRLD_FORM_ID, &world_children)?);
-        Ok(bytes)
+        hash
     }
 
     #[test]
     fn exterior_only_output_is_unchanged() {
-        let before = plugin_before_interiors(&spec()).unwrap();
-        let now = plugin(&spec()).unwrap();
-        assert_eq!(before, now, "the exterior-only bytes moved");
+        assert_eq!(
+            fnv1a(&plugin(&spec()).unwrap()),
+            EXTERIOR_ONLY_HASH,
+            "the exterior-only bytes moved; if that is intended, refresh the constant"
+        );
     }
 
     #[test]
@@ -662,6 +1026,122 @@ mod tests {
         let mut invalid = spec();
         invalid.worldspace = "";
         assert!(plugin(&invalid).is_err());
+    }
+
+    #[test]
+    fn a_light_is_appended_after_the_exterior_world() {
+        let exterior_only = plugin(&spec()).unwrap();
+        let with_light = plugin_with_lights(&spec(), &PRESET_LIGHT).unwrap();
+        assert_eq!(count(&exterior_only, b"LIGH"), 0);
+        assert_eq!(count(&exterior_only, b"XRDS"), 0);
+        // Every record above the world group is byte-identical, and the base
+        // record starts after the point the exterior-only plugin ends: the
+        // reference it places sits inside a cell group the exterior world owns,
+        // so the world group's own size field is the only byte between them that
+        // moves.
+        let world = with_light
+            .windows(4)
+            .position(|window| window == b"WRLD")
+            .expect("the WRLD record");
+        assert_eq!(&with_light[..world], &exterior_only[..world]);
+        let light = with_light
+            .windows(4)
+            .position(|window| window == b"LIGH")
+            .expect("the LIGH record");
+        assert!(light >= exterior_only.len());
+        assert_eq!(count(&with_light, b"LIGH"), 1, "one base record");
+        assert_eq!(count(&with_light, b"XRDS"), 1, "one radius override");
+        assert_eq!(count(&with_light, b"FNAM"), 1, "one fade");
+        assert_eq!(
+            count(&with_light, b"REFR"),
+            5,
+            "one static per cell and the light"
+        );
+        assert_eq!(count(&with_light, b"DOOR"), 0, "no doors in this preset");
+    }
+
+    /// Every record's FormID in `bytes`, in file order, walking the header
+    /// sizes the way [`tags`] does.
+    fn form_ids(bytes: &[u8]) -> Vec<u32> {
+        fn walk(bytes: &[u8], found: &mut Vec<u32>) {
+            let mut offset = 0;
+            while offset + HEADER_RECORD_SIZE <= bytes.len() {
+                let tag: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+                let size =
+                    u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+                if tag == *b"GRUP" {
+                    // A group header's own word at this offset is the group
+                    // type, not a FormID.
+                    let Some(children) = bytes.get(offset + GROUP_HEADER_SIZE..offset + size)
+                    else {
+                        return;
+                    };
+                    walk(children, found);
+                    offset += size;
+                } else {
+                    found.push(u32::from_le_bytes(
+                        bytes[offset + 12..offset + 16].try_into().unwrap(),
+                    ));
+                    offset += HEADER_RECORD_SIZE + size;
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        walk(bytes, &mut found);
+        found
+    }
+
+    /// An interior and a light are two extras the writer can put on one spec:
+    /// their references take different offsets in the cell's FormID block
+    /// ([`DOOR_REF_OFFSET`] and [`LIGHT_REF_OFFSET`]), so no two records of the
+    /// combined plugin may share an id. The CLI exposes one preset at a time,
+    /// which is why this is the only caller of the combination.
+    #[test]
+    fn an_interior_and_a_light_in_one_cell_get_distinct_form_ids() {
+        let bytes = write_plugin(&spec(), Some(&PRESET_INTERIOR), Some(&PRESET_LIGHT)).unwrap();
+        assert_eq!(count(&bytes, b"DOOR"), 2);
+        assert_eq!(count(&bytes, b"LIGH"), 1);
+        assert_eq!(count(&bytes, b"XTEL"), 2);
+        assert_eq!(count(&bytes, b"XRDS"), 1);
+        assert_eq!(
+            count(&bytes, b"REFR"),
+            7,
+            "one static per cell, two doors and the light"
+        );
+
+        let mut ids = form_ids(&bytes);
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "two records share a FormID: {ids:?}");
+    }
+
+    #[test]
+    fn rejects_invalid_lights() {
+        for mutate in [
+            (|light: &mut Light<'_>| light.editor_id = "") as fn(&mut Light<'_>),
+            |light| light.editor_id = "bad\nlight",
+            |light| light.model_path = Some("../escape.nif"),
+            |light| {
+                light.cell = Cell {
+                    grid_x: 7,
+                    grid_y: 7,
+                }
+            },
+            |light| light.position = [f32::NAN, 0.0, 0.0],
+            |light| light.rotation = [0.0, f32::INFINITY, 0.0],
+            |light| light.falloff = f32::NAN,
+            |light| light.fade = f32::NEG_INFINITY,
+            |light| light.radius_override = f32::NAN,
+        ] {
+            let mut invalid = PRESET_LIGHT;
+            mutate(&mut invalid);
+            assert!(
+                plugin_with_lights(&spec(), &invalid).is_err(),
+                "invalid light {invalid:?} was accepted"
+            );
+        }
     }
 
     #[test]

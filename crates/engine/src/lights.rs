@@ -136,6 +136,15 @@ pub const LIGHT_FLAG_OFF_BY_DEFAULT: u32 = 0x0000_0020;
 /// Like [`LIGHT_FLAG_OFF_BY_DEFAULT`], no shipped record sets it.
 pub const LIGHT_FLAG_NEGATIVE: u32 = 0x0000_0004;
 
+/// The ambient brightness the engine applies in its world path, in Bevy's ambient units: the
+/// `brightness` the world startup of `crate::app` inserts beside its `GlobalAmbientLight` colour.
+///
+/// This is the illuminance a converted light is stated against, so the ratio
+/// [`LIGHT_EXPOSURE`] names is the ratio a rendered surface really sees. A run that lights the
+/// world differently - the fixture paths of `crate::app` each insert their own ambient - is not the
+/// world this scale is written for, and the value has to be re-derived if per-space ambient lands.
+pub const AMBIENT_ILLUMINANCE: f32 = 160.0;
+
 /// How many times the ambient an interior applies a converted light puts on a surface at half its
 /// own radius. This one constant is the brightness knob for every converted light.
 ///
@@ -308,9 +317,21 @@ pub fn point_light(light: &LightRow, radius_override: Option<f32>) -> Option<Poi
 fn radius_of(light: &LightRow, radius_override: Option<f32>) -> Option<f32> {
     let usable = |radius: f32| (radius.is_finite() && radius > 0.0).then_some(radius);
     radius_override
+        .filter(|&radius| radius <= MAX_RADIUS_OVERRIDE)
         .and_then(usable)
         .or_else(|| usable(light.radius))
 }
+
+/// The largest `XRDS` radius a reference may give its light, in Creation units: two exterior
+/// cells. A larger override is ignored and the record's own radius is used.
+///
+/// Across the base game's and the official add-ons' plugins, 13,677 of 15,167 `LIGH` references
+/// carry an override. The largest `LIGH` record radius is 2,000; the positive overrides run
+/// smoothly up to 6,919, and then jump: the nine above that are 15,967, four of 25,074, 456,444,
+/// two of 844,567 and 3,736,737. Taken as a light's range, those reach across many cells (the
+/// largest across the whole map) and put the light into every cluster of the view, while its
+/// brightness is capped anyway ([`INTENSITY_REFERENCE_RADIUS`]). 8,192 sits in the gap.
+pub const MAX_RADIUS_OVERRIDE: f32 = 8_192.0;
 
 /// The intensity a `LIGH` radius is lit with; see the module documentation for the derivation.
 ///
@@ -862,6 +883,21 @@ mod tests {
     /// most route lights carry one (10,810 of the 12,148 `Skyrim.esm` references), and using the
     /// record default would light them at the wrong size.
     #[test]
+    fn an_override_above_the_cap_is_ignored() {
+        let record = light_row(256.0, 0);
+        for kept in [6_919.0, MAX_RADIUS_OVERRIDE] {
+            assert_eq!(point_light(&record, Some(kept)).unwrap().range, kept);
+        }
+        for outlier in [15_967.0, 25_074.0, 3_736_737.5] {
+            assert_eq!(
+                point_light(&record, Some(outlier)).unwrap().range,
+                256.0,
+                "override {outlier}"
+            );
+        }
+    }
+
+    #[test]
     fn a_reference_radius_override_replaces_the_record_radius() {
         let record = light_row(256.0, 0);
         let overridden = point_light(&record, Some(850.8)).unwrap();
@@ -933,6 +969,30 @@ mod tests {
             transform.translation = camera;
         }
         app.update();
+    }
+
+    /// Hides nothing and enables nothing else: a `PointLight` the engine's own code spawns - a
+    /// fixture, a future camera lantern - is never in the ranking.
+    #[test]
+    fn the_budget_leaves_a_point_light_that_is_not_a_skyrim_light_alone() {
+        let mut app = budget_app(
+            Vec3::ZERO,
+            (0..ENABLED_LIGHT_BUDGET + 4).map(|index| Vec3::new(1000.0 + index as f32, 0.0, 0.0)),
+        );
+        let ordinary = app
+            .world_mut()
+            .spawn((
+                point_light(&light_row(512.0, 0), None).unwrap(),
+                Transform::from_translation(Vec3::new(1_000.0, 0.0, 0.0)),
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            *app.world().entity(ordinary).get::<Visibility>().unwrap(),
+            Visibility::Inherited,
+            "a plain `PointLight` is not the budget's to switch"
+        );
+        assert_eq!(enabled_lights(&mut app).len(), ENABLED_LIGHT_BUDGET);
     }
 
     fn visibility_of(app: &App, entity: Entity) -> Visibility {

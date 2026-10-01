@@ -233,6 +233,22 @@ pub struct TerrainExtension {
     layer_5: Option<Handle<Image>>,
     #[uniform(112)]
     settings: TerrainSettings,
+    // Each layer's normal map, sampled through `layer_0_sampler`: every terrain layer image is
+    // loaded with the same repeating sampler (`terrain_layer_sampler`), so the six need no sampler
+    // bindings of their own. Which layers have one is in `TerrainSettings::normal_layers_*`, since
+    // Bevy's stand-in for a missing texture is white, which decodes to a steep tilt.
+    #[texture(113)]
+    normal_0: Option<Handle<Image>>,
+    #[texture(114)]
+    normal_1: Option<Handle<Image>>,
+    #[texture(115)]
+    normal_2: Option<Handle<Image>>,
+    #[texture(116)]
+    normal_3: Option<Handle<Image>>,
+    #[texture(117)]
+    normal_4: Option<Handle<Image>>,
+    #[texture(118)]
+    normal_5: Option<Handle<Image>>,
 }
 
 #[derive(ShaderType, Reflect, Debug, Clone)]
@@ -242,6 +258,10 @@ struct TerrainSettings {
     fallback_weights_0: Vec4,
     fallback_weights_1: Vec4,
     weight_source: Vec4,
+    /// 1.0 in component `i` when layer `i` (0-3) has a normal map bound, else 0.0.
+    normal_layers_0: Vec4,
+    /// Layers 4 and 5 in x and y.
+    normal_layers_1: Vec4,
     weights: [Vec4; WEIGHT_FIELD_WORDS],
 }
 
@@ -269,12 +289,22 @@ fn default_linear_sampler() -> ImageSamplerDescriptor {
     ImageSamplerDescriptor::linear()
 }
 
+/// The render layer of water planes. The world, its placed objects and the doorway frames sit on
+/// layer 0; the destination space of a portal is [`crate::portal::DESTINATION_LAYER`].
+pub const WATER_LAYER: usize = 1;
+
+/// The layers the main camera draws.
+pub const MAIN_VIEW_LAYERS: [usize; 2] = [0, WATER_LAYER];
+
+/// The layers a light of the active space shines on.
+pub const LIGHT_LAYERS: [usize; 2] = [0, WATER_LAYER];
+
 /// The sampler a terrain layer texture needs: the shader tiles each layer `tiling` times across
 /// the cell (`uv * 8`), so the address mode must repeat. Bevy's default sampler clamps to the
 /// edge, which stretches the texture's last texel column, row and corner across most of a cell -
 /// long streaks where the edge column is stretched, and one flat colour where the corner texel
 /// covers everything past the first tile.
-fn terrain_layer_sampler() -> ImageSamplerDescriptor {
+pub(crate) fn terrain_layer_sampler() -> ImageSamplerDescriptor {
     ImageSamplerDescriptor {
         address_mode_u: ImageAddressMode::Repeat,
         address_mode_v: ImageAddressMode::Repeat,
@@ -305,6 +335,13 @@ fn weight_field(overlay_weights: &[Vec<f32>]) -> [Vec4; WEIGHT_FIELD_WORDS] {
 }
 
 impl TerrainSettings {
+    /// Marks which layers have a normal map bound, for the shader to blend only those.
+    fn set_normal_layers(&mut self, normals: &[Option<Handle<Image>>; 6]) {
+        let present = |index: usize| if normals[index].is_some() { 1.0 } else { 0.0 };
+        self.normal_layers_0 = Vec4::new(present(0), present(1), present(2), present(3));
+        self.normal_layers_1 = Vec4::new(present(4), present(5), 0.0, 0.0);
+    }
+
     /// The settings of one streamed quadrant: the tiling the shader repeats every layer by, the
     /// quadrant's origin inside the cell, and its overlay weight field - which the shader
     /// interpolates itself, so the weights reach the fragment stage exactly as LAND records them.
@@ -315,6 +352,8 @@ impl TerrainSettings {
             fallback_weights_0: Vec4::X,
             fallback_weights_1: Vec4::ZERO,
             weight_source: Vec4::X,
+            normal_layers_0: Vec4::ZERO,
+            normal_layers_1: Vec4::ZERO,
             weights: weight_field(overlay_weights),
         }
     }
@@ -330,6 +369,8 @@ impl TerrainSettings {
             fallback_weights_0: Vec4::X,
             fallback_weights_1: Vec4::ZERO,
             weight_source: Vec4::ZERO,
+            normal_layers_0: Vec4::ZERO,
+            normal_layers_1: Vec4::ZERO,
             weights: [Vec4::ZERO; WEIGHT_FIELD_WORDS],
         }
     }
@@ -391,13 +432,22 @@ fn strongest_overlay_texture(layers: &[&TerrainLayerSnapshot]) -> Option<u32> {
     strongest.map(|(_, texture_form_id)| texture_form_id)
 }
 
+/// The images a terrain quadrant's material waits on, by the colour space each
+/// must decode to.
+pub struct TerrainImages {
+    /// The layers' diffuse images, sRGB.
+    pub color: Vec<Handle<Image>>,
+    /// The layers' normal maps, linear.
+    pub normal: Vec<Handle<Image>>,
+}
+
 impl TerrainExtension {
     pub fn from_quadrant(
         terrain: &TerrainSnapshot,
         quadrant: u8,
         catalog: &AssetCatalog,
         asset_server: &AssetServer,
-    ) -> Result<(Self, Vec<Handle<Image>>), String> {
+    ) -> Result<(Self, TerrainImages), String> {
         let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
         // The layer slots in the order the shader samples them: slot 0 is the base, which a
         // quadrant without a `BTXT` of its own samples from the texture
@@ -408,10 +458,27 @@ impl TerrainExtension {
             slots[slot] = layer.texture_form_id;
         }
         let mut textures: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
+        let mut normals: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
         let mut handles = Vec::new();
-        for (target, texture_form_id) in textures.iter_mut().zip(slots) {
-            if texture_form_id == 0 {
+        let mut normal_handles = Vec::new();
+        for (slot, texture_form_id) in slots.iter().enumerate() {
+            if *texture_form_id == 0 {
                 continue;
+            }
+            let texture_form_id = *texture_form_id;
+            // A borrowed base samples the borrowed form id's normal map too, so its detail
+            // matches the diffuse it is drawn with.
+            if let Some(path) = catalog.landscape_normal(texture_form_id) {
+                // A normal map holds directions, not colours: it must not be decoded as sRGB.
+                let handle = asset_server
+                    .load_builder()
+                    .with_settings(|settings: &mut ImageLoaderSettings| {
+                        settings.sampler = ImageSampler::Descriptor(terrain_layer_sampler());
+                        settings.is_srgb = false;
+                    })
+                    .load(path.to_owned());
+                normals[slot] = Some(handle.clone());
+                normal_handles.push(handle);
             }
             let path = catalog.landscape_diffuse(texture_form_id).ok_or_else(|| {
                 format!(
@@ -425,10 +492,12 @@ impl TerrainExtension {
                     settings.sampler = ImageSampler::Descriptor(terrain_layer_sampler());
                 })
                 .load(path.to_owned());
-            *target = Some(handle.clone());
+            textures[slot] = Some(handle.clone());
             handles.push(handle);
         }
         let overlay_weights = crate::streaming::quadrant_overlay_weights(terrain, quadrant)?;
+        let mut settings = TerrainSettings::for_quadrant(quadrant, layers.len(), &overlay_weights);
+        settings.set_normal_layers(&normals);
         Ok((
             Self {
                 layer_0: textures[0].clone(),
@@ -437,9 +506,18 @@ impl TerrainExtension {
                 layer_3: textures[3].clone(),
                 layer_4: textures[4].clone(),
                 layer_5: textures[5].clone(),
-                settings: TerrainSettings::for_quadrant(quadrant, layers.len(), &overlay_weights),
+                settings,
+                normal_0: normals[0].clone(),
+                normal_1: normals[1].clone(),
+                normal_2: normals[2].clone(),
+                normal_3: normals[3].clone(),
+                normal_4: normals[4].clone(),
+                normal_5: normals[5].clone(),
             },
-            handles,
+            TerrainImages {
+                color: handles,
+                normal: normal_handles,
+            },
         ))
     }
 
@@ -452,7 +530,35 @@ impl TerrainExtension {
             layer_4: Some(textures[4].clone()),
             layer_5: Some(textures[5].clone()),
             settings: TerrainSettings::vertex_weights_only(6.0),
+            normal_0: None,
+            normal_1: None,
+            normal_2: None,
+            normal_3: None,
+            normal_4: None,
+            normal_5: None,
         }
+    }
+
+    /// Unbinds every layer's normal map, so the quadrant is lit by its geometric normal as a
+    /// quadrant without normal maps is. Used when a normal map fails to load: a normal map is
+    /// optional detail, and losing one must not hide the terrain its diffuse layers can draw.
+    pub(crate) fn drop_normal_maps(&mut self) {
+        let none: [Option<Handle<Image>>; 6] = Default::default();
+        self.settings.set_normal_layers(&none);
+        [
+            self.normal_0,
+            self.normal_1,
+            self.normal_2,
+            self.normal_3,
+            self.normal_4,
+            self.normal_5,
+        ] = none;
+    }
+
+    /// Whether any layer has a normal map bound.
+    #[cfg(test)]
+    pub(crate) fn has_normal_maps(&self) -> bool {
+        self.settings.normal_layers_0 != Vec4::ZERO || self.settings.normal_layers_1 != Vec4::ZERO
     }
 }
 
@@ -466,6 +572,12 @@ impl Default for TerrainExtension {
             layer_4: None,
             layer_5: None,
             settings: TerrainSettings::vertex_weights_only(0.0),
+            normal_0: None,
+            normal_1: None,
+            normal_2: None,
+            normal_3: None,
+            normal_4: None,
+            normal_5: None,
         }
     }
 }
@@ -1290,6 +1402,7 @@ mod tests {
     use bevy::image::ImageFilterMode;
     use bevy::light::update_directional_light_frusta;
     use bevy::mesh::VertexAttributeValues;
+    use bevy::reflect::{PartialReflect, ReflectRef};
 
     const MAIN_CAMERA_FAR: f32 = 1000.0;
 
@@ -1883,19 +1996,24 @@ mod tests {
         [cell_uv[0] * 2.0 - origin[0], cell_uv[1] * 2.0 - origin[1]]
     }
 
-    /// The weight a fragment receives, mirroring `grid_weight` in `terrain.wgsl`: the
-    /// quadrant-local coordinate scaled to the 17x17 sample grid, read bilinearly, clamped at the
-    /// quadrant's edge.
+    /// The weight a fragment receives, mirroring `grid_point` and `grid_weight` in `terrain.wgsl`:
+    /// the quadrant-local coordinate clamped onto the 17x17 sample square, then read bilinearly,
+    /// clamped at the quadrant's edge.
     fn shader_weight(settings: &TerrainSettings, overlay: usize, local_uv: [f32; 2]) -> f32 {
         let last = (QUADRANT_WEIGHT_SAMPLES - 1) as f32;
         let sample = |x: usize, y: usize| -> f32 {
             let index = y * QUADRANT_WEIGHT_SAMPLES + x;
             settings.weights[overlay * OVERLAY_WEIGHT_WORDS + index / 4][index % 4]
         };
-        let corner = [local_uv[0] * last, local_uv[1] * last];
+        // `grid_point`: clamping before the fraction is taken keeps an edge sample on its own edge
+        // instead of blending a neighbour in.
+        let corner = [
+            (local_uv[0] * last).clamp(0.0, last),
+            (local_uv[1] * last).clamp(0.0, last),
+        ];
         let blend = [corner[0] - corner[0].floor(), corner[1] - corner[1].floor()];
         let axis = |value: f32| -> (usize, usize) {
-            let base = value.clamp(0.0, last) as usize;
+            let base = value as usize;
             (base, (base + 1).min(last as usize))
         };
         let (west, east) = axis(corner[0]);
@@ -1903,6 +2021,212 @@ mod tests {
         let top = sample(west, north) * (1.0 - blend[0]) + sample(east, north) * blend[0];
         let bottom = sample(west, south) * (1.0 - blend[0]) + sample(east, south) * blend[0];
         top * (1.0 - blend[1]) + bottom * blend[1]
+    }
+
+    /// The value of a `const NAME: u32 = <n>u;` declaration in `terrain.wgsl`.
+    fn shader_constant(source: &str, name: &str) -> usize {
+        let declaration = format!("const {name}: u32 = ");
+        let rest = source
+            .split_once(&declaration)
+            .unwrap_or_else(|| panic!("terrain.wgsl declares no `{declaration}`"))
+            .1;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("`{declaration}` is not followed by a number: {rest}"))
+    }
+
+    /// The element count of a `field: array<vec4<f32>, <n>>` declaration in `terrain.wgsl`.
+    fn shader_array_length(source: &str, field: &str) -> usize {
+        let declaration = format!("{field}: array<vec4<f32>, ");
+        let rest = source
+            .split_once(&declaration)
+            .unwrap_or_else(|| panic!("terrain.wgsl declares no `{declaration}`"))
+            .1;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("`{declaration}` is not followed by a number: {rest}"))
+    }
+
+    /// The field names of `struct NAME { .. }` in `terrain.wgsl`, in declaration order, so the
+    /// uniform's layout can be compared with the Rust struct that is written into it.
+    fn shader_struct_fields(source: &str, name: &str) -> Vec<String> {
+        let body = source
+            .split_once(&format!("struct {name} {{"))
+            .unwrap_or_else(|| panic!("terrain.wgsl declares no `struct {name}`"))
+            .1
+            .split_once('}')
+            .expect("the struct declaration must be closed")
+            .0;
+        body.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .map(|line| {
+                line.split_once(':')
+                    .unwrap_or_else(|| panic!("`{line}` is not a field declaration"))
+                    .0
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The expression a `const NAME: u32 = <expression>;` declaration in `terrain.wgsl` holds, so a
+    /// constant derived from another is read as the shader writes it.
+    fn shader_constant_expression<'a>(source: &'a str, name: &str) -> &'a str {
+        let declaration = format!("const {name}: u32 = ");
+        source
+            .split_once(&declaration)
+            .unwrap_or_else(|| panic!("terrain.wgsl declares no `{declaration}`"))
+            .1
+            .split_once(';')
+            .expect("a const declaration must end with a semicolon")
+            .0
+            .trim()
+    }
+
+    /// The body of `fn NAME(..) { <body> }` in `terrain.wgsl`, for the helpers whose whole body is
+    /// the arithmetic under test.
+    fn shader_function_body<'a>(source: &'a str, name: &str) -> &'a str {
+        source
+            .split_once(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("terrain.wgsl declares no `fn {name}`"))
+            .1
+            .split_once('{')
+            .expect("a function declaration must open its body")
+            .1
+            .split_once('}')
+            .expect("a function body must be closed")
+            .0
+    }
+
+    /// `source` without its whitespace, so a pinned expression survives a reformat of the file.
+    fn without_whitespace(source: &str) -> String {
+        source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    /// The value of one of `terrain.wgsl`'s `u32` expressions over the named `terms`: `+`, `-`, `*`,
+    /// `/`, `%`, parentheses, literals with their `u` suffix, and identifiers. This runs the
+    /// shader's own arithmetic rather than a copy of it, which is the only way a test can notice a
+    /// transposed index - a copy of the expression transposes with it.
+    fn evaluate_u32(expression: &str, terms: &[(&str, u32)]) -> u32 {
+        /// The expression left to read, and what the shader's identifiers stand for.
+        struct Parser<'a> {
+            characters: Vec<char>,
+            position: usize,
+            terms: &'a [(&'a str, u32)],
+        }
+
+        impl<'a> Parser<'a> {
+            fn skip_whitespace(&mut self) {
+                while self
+                    .characters
+                    .get(self.position)
+                    .is_some_and(|character| character.is_whitespace())
+                {
+                    self.position += 1;
+                }
+            }
+
+            /// Reads `expected` if it is next, whitespace aside.
+            fn eat(&mut self, expected: char) -> bool {
+                self.skip_whitespace();
+                if self.characters.get(self.position) == Some(&expected) {
+                    self.position += 1;
+                    return true;
+                }
+                false
+            }
+
+            /// `<operand> (('*' | '/' | '%') <operand>)*`, left to right as WGSL binds it.
+            fn product(&mut self) -> u32 {
+                let mut value = self.operand();
+                loop {
+                    if self.eat('*') {
+                        value *= self.operand();
+                    } else if self.eat('/') {
+                        value /= self.operand();
+                    } else if self.eat('%') {
+                        value %= self.operand();
+                    } else {
+                        return value;
+                    }
+                }
+            }
+
+            /// `<product> (('+' | '-') <product>)*`.
+            fn sum(&mut self) -> u32 {
+                let mut value = self.product();
+                loop {
+                    if self.eat('+') {
+                        value += self.product();
+                    } else if self.eat('-') {
+                        value -= self.product();
+                    } else {
+                        return value;
+                    }
+                }
+            }
+
+            /// The whole expression, for the messages of the assertions below.
+            fn text(&self) -> String {
+                self.characters.iter().collect()
+            }
+
+            /// A literal, one of the named terms, or a parenthesised sum.
+            fn operand(&mut self) -> u32 {
+                self.skip_whitespace();
+                if self.eat('(') {
+                    let value = self.sum();
+                    assert!(
+                        self.eat(')'),
+                        "`{}` must close its parentheses",
+                        self.text()
+                    );
+                    return value;
+                }
+                let mut name = String::new();
+                while let Some(&character) = self.characters.get(self.position) {
+                    if !character.is_ascii_alphanumeric() && character != '_' {
+                        break;
+                    }
+                    name.push(character);
+                    self.position += 1;
+                }
+                // A literal may carry WGSL's `u` suffix, which says nothing about its value.
+                if let Ok(literal) = name.trim_end_matches('u').parse::<u32>() {
+                    return literal;
+                }
+                let (_, value) = self
+                    .terms
+                    .iter()
+                    .find(|(term, _)| *term == name.as_str())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "`{}` names `{name}`, which the test does not define",
+                            self.text()
+                        )
+                    });
+                *value
+            }
+        }
+
+        let mut parser = Parser {
+            characters: expression.chars().collect(),
+            position: 0,
+            terms,
+        };
+        let value = parser.sum();
+        parser.skip_whitespace();
+        assert_eq!(
+            parser.position,
+            parser.characters.len(),
+            "`{expression}` has a suffix the test cannot evaluate"
+        );
+        value
     }
 
     /// Defect A. The overlay weight field is the quadrant's own 17x17 sample grid. A layer that is
@@ -1955,6 +2279,109 @@ mod tests {
         for overlay in 1..OVERLAY_WEIGHT_SLOTS {
             assert_eq!(shader_weight(&settings, overlay, [0.0, 0.0]), 0.0);
         }
+    }
+
+    /// A coordinate outside the sample square reads the sample it is clamped onto. `grid_point`
+    /// clamps before `grid_weight` takes its blend fraction, so a coordinate an ulp below the
+    /// quadrant's west or south edge reads that edge sample rather than blending its neighbour in,
+    /// and one past the far edge reads the last sample instead of the next quadrant's.
+    #[test]
+    fn weight_field_clamps_coordinates_onto_the_sample_square() {
+        let last = (QUADRANT_WEIGHT_SAMPLES - 1) as f32;
+        let edge = QUADRANT_WEIGHT_SAMPLES * QUADRANT_WEIGHT_SAMPLES - 1;
+        let terrain = overlay_fixture(0x0001_2345, vec![(0, 1.0), (edge as u16, 0.25)]);
+        let overlay_weights = crate::streaming::quadrant_overlay_weights(&terrain, 0).unwrap();
+        let settings = TerrainSettings::for_quadrant(0, 2, &overlay_weights);
+
+        // Sample `s` sits at `s / 16` in quadrant-local uv, so an ulp outside the square is
+        // `1.0e-7 / 16` beyond its edge.
+        let below = -1.0e-7 / last;
+        let past = 1.0 + 1.0e-7 / last;
+        assert_eq!(shader_weight(&settings, 0, [below, 0.0]), 1.0);
+        assert_eq!(shader_weight(&settings, 0, [0.0, below]), 1.0);
+        assert_eq!(shader_weight(&settings, 0, [past, 1.0]), 0.25);
+        assert_eq!(shader_weight(&settings, 0, [1.0, past]), 0.25);
+    }
+
+    /// The uniform's Rust layout and the shader's must say the same numbers, and list the same
+    /// fields in the same order - an insertion on one side alone shifts every field after it, and
+    /// the shader then reads its neighbour's bytes.
+    #[test]
+    fn terrain_uniform_layout_matches_the_shader_source() {
+        let source = include_str!("shaders/terrain.wgsl");
+        assert_eq!(
+            shader_constant(source, "WEIGHT_GRID_SIDE"),
+            QUADRANT_WEIGHT_SAMPLES
+        );
+        assert_eq!(
+            shader_constant(source, "WEIGHT_GRID_WORDS"),
+            OVERLAY_WEIGHT_WORDS
+        );
+        assert_eq!(shader_array_length(source, "weights"), WEIGHT_FIELD_WORDS);
+        assert_eq!(
+            WEIGHT_FIELD_WORDS,
+            OVERLAY_WEIGHT_SLOTS * OVERLAY_WEIGHT_WORDS
+        );
+        assert_eq!(
+            OVERLAY_WEIGHT_WORDS, 73,
+            "289 samples four to a vec4, rounded up"
+        );
+        assert_eq!(WEIGHT_FIELD_WORDS, 365, "five overlays of 73 vec4s");
+
+        let settings = TerrainSettings::for_quadrant(
+            0,
+            2,
+            &[vec![1.0; QUADRANT_WEIGHT_SAMPLES * QUADRANT_WEIGHT_SAMPLES]],
+        );
+        let ReflectRef::Struct(fields) = settings.reflect_ref() else {
+            panic!("TerrainSettings must reflect as a struct");
+        };
+        let rust_fields: Vec<String> = (0..fields.field_len())
+            .map(|index| {
+                fields
+                    .name_at(index)
+                    .expect("every field is named")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(rust_fields, shader_struct_fields(source, "TerrainSettings"));
+    }
+
+    /// The parts of `terrain.wgsl`'s weight arithmetic the evaluator cannot run, pinned as the
+    /// shader writes them: the two places that bound the sample grid, where a bound of
+    /// `WEIGHT_GRID_SIDE` instead of the last sample would read the next quadrant's edge texels
+    /// along this one, and the fragment's quadrant-local coordinate.
+    #[test]
+    fn shader_weight_field_bounds_its_grid_at_the_last_sample() {
+        let source = include_str!("shaders/terrain.wgsl");
+        let side = evaluate_u32(shader_constant_expression(source, "WEIGHT_GRID_SIDE"), &[]);
+        let last = evaluate_u32(
+            shader_constant_expression(source, "GRID_LAST_SAMPLE"),
+            &[("WEIGHT_GRID_SIDE", side)],
+        );
+        assert_eq!(
+            last,
+            side - 1,
+            "the grid's far edge is its last sample index, not the grid's side"
+        );
+
+        let point = "clamp(coordinate, vec2<f32>(0.0), vec2<f32>(f32(GRID_LAST_SAMPLE)))";
+        assert!(
+            without_whitespace(shader_function_body(source, "grid_point"))
+                .contains(&without_whitespace(point)),
+            "a coordinate must be clamped onto the sample square before its blend fraction is taken"
+        );
+        let next = "min(base + vec2<u32>(1u), vec2<u32>(GRID_LAST_SAMPLE))";
+        assert!(
+            without_whitespace(shader_function_body(source, "grid_weight"))
+                .contains(&without_whitespace(next)),
+            "the blend must pair the far edge's last sample with itself"
+        );
+        let coordinate = "(in.uv * 2.0 - terrain.quadrant_origin.xy) * f32(GRID_LAST_SAMPLE)";
+        assert!(
+            without_whitespace(source).contains(&without_whitespace(coordinate)),
+            "the fragment's coordinate must be quadrant-local, on the grid's own scale"
+        );
     }
 
     /// Defect A, the mechanism this replaced. `build_terrain_quadrant_mesh` still packs overlays
@@ -2446,6 +2873,36 @@ mod tests {
         );
     }
 
+    /// A normal map that fails to load must not leave the material pointing at it: the flags that
+    /// make the shader read the six maps are cleared with them, so the quadrant falls back to its
+    /// geometric normal instead of sampling a stand-in white image as a steep tilt.
+    #[test]
+    fn dropping_normal_maps_unbinds_them_and_clears_their_flags() {
+        let mut extension = TerrainExtension::default();
+        let normals: [Option<Handle<Image>>; 6] =
+            std::array::from_fn(|index| (index % 2 == 0).then(Handle::default));
+        extension.settings.set_normal_layers(&normals);
+        [extension.normal_0, extension.normal_2, extension.normal_4] =
+            [normals[0].clone(), normals[2].clone(), normals[4].clone()];
+        assert!(extension.has_normal_maps());
+
+        extension.drop_normal_maps();
+
+        assert!(!extension.has_normal_maps());
+        assert!(
+            [
+                &extension.normal_0,
+                &extension.normal_1,
+                &extension.normal_2,
+                &extension.normal_3,
+                &extension.normal_4,
+                &extension.normal_5,
+            ]
+            .iter()
+            .all(|normal| normal.is_none())
+        );
+    }
+
     /// A cell whose four quadrants carry exactly the layers given, in quadrant order.
     fn layer_fixture(cell_id: u32, quadrants: [Vec<TerrainLayerSnapshot>; 4]) -> TerrainSnapshot {
         TerrainSnapshot {
@@ -2587,10 +3044,20 @@ mod tests {
     /// A catalogue answering every landscape texture form id the fixtures use, one texture set per
     /// id so each id is its own image path.
     fn texture_catalogue(path: &std::path::Path, form_ids: &[u32]) -> AssetCatalog {
+        catalogue_with_normal_maps(path, form_ids, &[])
+    }
+
+    /// The same catalogue, with a normal map beside the diffuse of every id in `normal_ids`, so a
+    /// quadrant can be shown to bind the normal map of the id whose diffuse it samples.
+    fn catalogue_with_normal_maps(
+        path: &std::path::Path,
+        form_ids: &[u32],
+        normal_ids: &[u32],
+    ) -> AssetCatalog {
         let connection = rusqlite::Connection::open(path).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT);
                  CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
                  CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);",
             )
@@ -2602,10 +3069,13 @@ mod tests {
                     rusqlite::params![form_id],
                 )
                 .unwrap();
+            let normal_path = normal_ids
+                .contains(form_id)
+                .then(|| format!("textures/land/{form_id}_n.dds"));
             connection
                 .execute(
-                    "INSERT INTO texture_sets VALUES(?1,?2)",
-                    rusqlite::params![form_id, format!("textures/land/{form_id}.dds")],
+                    "INSERT INTO texture_sets VALUES(?1,?2,?3)",
+                    rusqlite::params![form_id, format!("textures/land/{form_id}.dds"), normal_path],
                 )
                 .unwrap();
         }
@@ -2656,5 +3126,72 @@ mod tests {
             borrowed.layer_0, own.layer_0,
             "a quadrant with a base of its own keeps it"
         );
+    }
+
+    /// A quadrant that borrows a neighbour's base binds that base's normal map too, so the borrowed
+    /// layer's surface detail matches the diffuse it is drawn with.
+    #[test]
+    fn a_borrowed_base_binds_the_borrowed_layers_normal_map() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 0)],
+                vec![base_layer(1, 0)],
+                vec![base_layer(2, 5)],
+                vec![base_layer(3, 7)],
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let catalog =
+            catalogue_with_normal_maps(&directory.path().join("catalogue.db"), &[5, 7], &[5, 7]);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Image>();
+        let asset_server = app.world().resource::<AssetServer>().clone();
+
+        let borrowed = TerrainExtension::from_quadrant(&terrain, 1, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        let sibling = TerrainExtension::from_quadrant(&terrain, 2, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        assert!(borrowed.has_normal_maps(), "a borrowed base has one too");
+        assert_eq!(
+            borrowed.normal_0, sibling.normal_0,
+            "quadrant 1 samples the normal map of the base it borrows from quadrant 2"
+        );
+        assert!(borrowed.normal_0.is_some());
+        assert_eq!(borrowed.normal_1, None, "the unused slots stay unbound");
+    }
+
+    /// A layer whose form id has no normal map leaves its flag 0, so the shader never samples a
+    /// stand-in for it: the maps that are there are blended alone.
+    #[test]
+    fn a_quadrant_whose_layers_have_no_normal_maps_leaves_the_flags_clear() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 5)],
+                vec![base_layer(1, 7)],
+                vec![base_layer(2, 5)],
+                vec![base_layer(3, 7)],
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = texture_catalogue(&directory.path().join("catalogue.db"), &[5, 7]);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Image>();
+        let asset_server = app.world().resource::<AssetServer>().clone();
+
+        let extension = TerrainExtension::from_quadrant(&terrain, 0, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        assert!(!extension.has_normal_maps());
+        assert_eq!(extension.settings.normal_layers_0, Vec4::ZERO);
+        assert_eq!(extension.settings.normal_layers_1, Vec4::ZERO);
+        assert_eq!(extension.normal_0, None);
     }
 }

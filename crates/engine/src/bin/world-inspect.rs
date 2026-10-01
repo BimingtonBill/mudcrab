@@ -1,7 +1,12 @@
 use color_eyre::{Result, eyre::WrapErr};
+use engine::streaming::converted_model_path;
 use engine::world::{
     cache::CellCache,
     components::{InstanceBounds, WorldPosition},
+    database::{
+        MAX_RUNTIME_DATABASE_SCHEMA_VERSION, MIN_RUNTIME_DATABASE_SCHEMA_VERSION,
+        supports_runtime_database_schema,
+    },
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
@@ -244,9 +249,9 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
         })
         .wrap_err("world database has no schema version")?;
     color_eyre::eyre::ensure!(
-        database_schema == shared::WORLD_DATABASE_SCHEMA_VERSION,
-        "world database schema {database_schema} is unsupported; reconvert assets for version {}",
-        shared::WORLD_DATABASE_SCHEMA_VERSION
+        supports_runtime_database_schema(database_schema),
+        "world database schema {database_schema} is unsupported; reconvert assets for a schema \
+         from {MIN_RUNTIME_DATABASE_SCHEMA_VERSION} through {MAX_RUNTIME_DATABASE_SCHEMA_VERSION}"
     );
     let cache = CellCache::open(&assets.join("cell_cache.rkyv"))?;
     let mut cells = Vec::new();
@@ -696,19 +701,6 @@ fn contract_status(path: &Path, passed_key: &str) -> ContractStatus {
     }
 }
 
-fn converted_model_path(path: String) -> Option<String> {
-    // Converted assets are published with lowercase canonical paths, so the
-    // lookup must lowercase too (matching the engine runtime resolver).
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    let without_prefix = normalized.strip_prefix("meshes/").unwrap_or(&normalized);
-    if without_prefix.is_empty() {
-        return None;
-    }
-    let mut converted = PathBuf::from("meshes").join(without_prefix);
-    converted.set_extension("glb");
-    Some(converted.to_string_lossy().replace('\\', "/"))
-}
-
 fn hex_id(value: u32) -> String {
     format!("{value:08X}")
 }
@@ -835,7 +827,7 @@ mod tests {
             .execute_batch(&format!(
                 "CREATE TABLE schema_info(version INTEGER NOT NULL);
                  INSERT INTO schema_info VALUES({});",
-                shared::WORLD_DATABASE_SCHEMA_VERSION + 1
+                MAX_RUNTIME_DATABASE_SCHEMA_VERSION + 1
             ))
             .unwrap();
         drop(connection);

@@ -161,6 +161,9 @@ use crate::{
         DoorwayFloorsMeasured, LoadDoor,
     },
     render::TerrainMaterial,
+    // The doorway's own dome: the marker that gives its camera one, and the destination's colours.
+    sky::SkyCamera,
+    sky_dome::CameraSky,
     streaming::{ActiveCell, RenderOrigin, StreamingWorld, camera_grid},
     transition::{
         CrossingHeld, DOOR_PRESTREAM_RADIUS, DoorMap, destination_is_resident, destination_keys,
@@ -203,6 +206,7 @@ use bevy::{
     },
     shader::ShaderRef,
 };
+use bevy_rapier3d::prelude::{Collider, ColliderDisabled};
 use std::{
     collections::{HashMap, HashSet},
     f32::consts::PI,
@@ -509,6 +513,9 @@ impl Plugin for PortalPlugin {
                     // leaf is back. Before the isolation, which is about cells rather than doors.
                     show_load_door_leaves,
                     isolate_cells,
+                    // After it, in the same frame: the colliders of the roles it just published are
+                    // enabled for the active space and disabled for every other cell.
+                    gate_cell_colliders,
                     // After it: the destination is revealed, so its floor can be found.
                     anchor_on_measured_floors,
                 )
@@ -2287,38 +2294,45 @@ fn sub_view_frustum(
 fn setup_portal_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let image = images.add(portal_target_image(PORTAL_TEXTURE_FALLBACK_SIZE));
     commands.insert_resource(PortalTexture(image.clone()));
-    commands.spawn((
-        Name::new("Portal camera"),
-        Camera3d::default(),
-        Camera {
-            order: PORTAL_CAMERA_ORDER,
-            is_active: false,
-            ..default()
-        },
-        // The destination is drawn from the doorway's own clip plane to the shared far plane, and
-        // handed over untonemapped ([`portal_camera_output`]).
-        portal_camera_output(),
-        RenderTarget::Image(image.clone().into()),
-        Projection::Perspective(PerspectiveProjection::default()),
-        Transform::default(),
-        Msaa::Off,
-        DepthPrepass,
-        OcclusionCulling,
-        RenderLayers::layer(DESTINATION_LAYER),
-        // The destination's own atmosphere, written every frame the doorway is open by
-        // [`update_destination_atmosphere`]. All three are components on this camera and not on the
-        // main one, which is what lets a doorway open off a lit hall into a black cave and show the
-        // cave: `AmbientLight` overrides `GlobalAmbientLight` for this view alone, `DistanceFog` is
-        // per view, and so is the clear colour. They start at the engine's daylight defaults - this
-        // camera draws nothing until a portal is up.
-        AmbientLight::default(),
-        DistanceFog::default(),
-        PortalCamera,
-        // The graphics settings that are part of the main view's pipeline key (SSAO, contact
-        // shadows, the shadow filter, TAA's prepass and jitter) and its exposure, written by
-        // `crate::graphics_settings` so the doorway's pipelines stay the main view's.
-        crate::graphics_settings::GraphicsCamera::Portal,
-    ));
+    commands
+        .spawn((
+            Name::new("Portal camera"),
+            Camera3d::default(),
+            Camera {
+                order: PORTAL_CAMERA_ORDER,
+                is_active: false,
+                ..default()
+            },
+            // The destination is drawn from the doorway's own clip plane to the shared far plane, and
+            // handed over untonemapped ([`portal_camera_output`]).
+            portal_camera_output(),
+            RenderTarget::Image(image.clone().into()),
+            Projection::Perspective(PerspectiveProjection::default()),
+            Transform::default(),
+            Msaa::Off,
+            DepthPrepass,
+            OcclusionCulling,
+            RenderLayers::layer(DESTINATION_LAYER),
+            // The destination's own atmosphere, written every frame the doorway is open by
+            // [`update_destination_atmosphere`]. All three are components on this camera and not on the
+            // main one, which is what lets a doorway open off a lit hall into a black cave and show the
+            // cave: `AmbientLight` overrides `GlobalAmbientLight` for this view alone, `DistanceFog` is
+            // per view, and so is the clear colour. They start at the engine's daylight defaults - this
+            // camera draws nothing until a portal is up.
+            AmbientLight::default(),
+            DistanceFog::default(),
+            PortalCamera,
+            // The graphics settings that are part of the main view's pipeline key (SSAO, contact
+            // shadows, the shadow filter, TAA's prepass and jitter) and its exposure, written by
+            // `crate::graphics_settings` so the doorway's pipelines stay the main view's.
+            crate::graphics_settings::GraphicsCamera::Portal,
+        ))
+        // The camera's own sky dome (`crate::sky_dome`): `SkyCamera` is the marker a dome is spawned
+        // for, and `CameraSky` is the colours it is drawn with. Cleared here, and written by
+        // [`update_destination_atmosphere`] with the destination's own the frame a doorway opens in, so
+        // the dome is never drawn over a space this camera has not been told about. In a second
+        // `insert`, not the spawn tuple: Bevy's tuple bundles stop at fifteen components.
+        .insert((SkyCamera, CameraSky { palette: None }));
     // The doorway's own sun, next to the camera it lights and on that camera's layer alone. Off
     // until [`update_destination_atmosphere`] gives it the destination's own - the frame a doorway
     // first opens in is the frame that writes it - and pointing nowhere in particular until
@@ -2511,11 +2525,19 @@ fn update_destination_atmosphere(
     catalog: Option<Res<SpaceLightingCatalog>>,
     config: Option<Res<EngineConfig>>,
     doors: Query<&LoadDoor>,
-    mut camera: Query<(&mut Camera, &mut AmbientLight, &mut DistanceFog), With<PortalCamera>>,
+    mut camera: Query<
+        (
+            &mut Camera,
+            &mut AmbientLight,
+            &mut DistanceFog,
+            &mut CameraSky,
+        ),
+        With<PortalCamera>,
+    >,
     mut suns: Query<&mut DirectionalLight, With<PortalDestinationSun>>,
     mut applied: Local<Option<SpaceKey>>,
 ) {
-    let Ok((mut camera, mut ambient, mut fog)) = camera.single_mut() else {
+    let Ok((mut camera, mut ambient, mut fog, mut sky)) = camera.single_mut() else {
         return;
     };
     let Some(config) = config else {
@@ -2550,6 +2572,10 @@ fn update_destination_atmosphere(
             config.stream_radius,
             config.terrain_radius,
         );
+        // And the colours the doorway's own dome is drawn with, from the same destination: this
+        // camera draws the space behind the door and nothing of the room the player stands in, so
+        // it is the destination's sky or none at all (`crate::sky_dome`).
+        sky.palette = crate::atmosphere::space_sky(catalog.as_deref(), destination);
     }
     // The sun is written whenever it is not the sun this destination wants, and not only on a
     // change of destination: `crate::atmosphere::update_atmosphere` writes *every*
@@ -3082,6 +3108,76 @@ fn isolate_cells(
         }
     }
     state.door_layer_applied = hidden_doors;
+}
+
+/// The role each cell root's colliders were last left in, so [`gate_cell_colliders`] walks a root's
+/// subtree only when its role changed.
+#[derive(Default)]
+struct AppliedColliderRoles(HashMap<Entity, CellRole>);
+
+/// Enables the colliders of the cells that are part of the active space, and disables every other
+/// cell's, so the player's probe (`crate::player`) hits the space it stands in and nothing else.
+///
+/// It runs directly after [`isolate_cells`] and therefore sees the roles that system published for
+/// this frame. Colliders are born `ColliderDisabled` (`crate::streaming`), and this system is the
+/// only thing that removes it: a collider may never be enabled by its own readiness, because a
+/// pre-streamed destination becomes ready while its cell is not active (port-prep-collision, point
+/// 2). A crossing changes `ActiveCell` before [`PortalFrame`] runs, so the destination's colliders
+/// are live in the frame the player arrives in it - the same one-frame contract the mesh layers
+/// have.
+///
+/// A root's subtree is walked only when the root's role changed since the last frame; a collider
+/// that appears under a root whose role is settled (a model armed later, a destination's scene
+/// finishing its spawn) is caught by its own `Added` flag the first time this system sees it.
+fn gate_cell_colliders(
+    mut commands: Commands,
+    state: Res<PortalState>,
+    mut applied: Local<AppliedColliderRoles>,
+    children: Query<&Children>,
+    parents: Query<&ChildOf>,
+    colliders: Query<(), With<Collider>>,
+    newly_added: Query<Entity, Added<Collider>>,
+) {
+    // A root that is gone took its colliders with its subtree; nothing to flip.
+    applied.0.retain(|root, _| state.roles.contains_key(root));
+    for (&root, &role) in &state.roles {
+        if applied.0.get(&root) == Some(&role) {
+            continue;
+        }
+        applied.0.insert(root, role);
+        for entity in children.iter_descendants(root) {
+            apply_collider_role(&mut commands, entity, role, &colliders);
+        }
+    }
+    let unmarked = HashSet::new();
+    for entity in &newly_added {
+        let Some((root, _)) = owning_root(entity, &state.roles, &parents, &unmarked) else {
+            continue;
+        };
+        apply_collider_role(&mut commands, entity, state.roles[&root], &colliders);
+    }
+}
+
+/// Puts one collider in the state its cell's role calls for: live in the active space, disabled
+/// everywhere else. Anything that is not a collider is left alone (the walk covers a cell's whole
+/// subtree, not only its colliders).
+fn apply_collider_role(
+    commands: &mut Commands,
+    entity: Entity,
+    role: CellRole,
+    colliders: &Query<(), With<Collider>>,
+) {
+    if colliders.get(entity).is_err() {
+        return;
+    }
+    match role {
+        CellRole::Active => {
+            commands.entity(entity).try_remove::<ColliderDisabled>();
+        }
+        CellRole::Destination | CellRole::Hidden => {
+            commands.entity(entity).try_insert(ColliderDisabled);
+        }
+    }
 }
 
 /// Places the portal camera in the destination of the nearest usable door and puts the doorway quad
@@ -5061,6 +5157,146 @@ mod tests {
             auto_load: false,
             outward: None,
         }
+    }
+
+    /// Gives every root in `roles` the role in `roles`, and nothing else: what [`isolate_cells`]
+    /// publishes for the frame, without the rest of the portal running.
+    fn set_roles<const N: usize>(app: &mut App, roles: [(Entity, CellRole); N]) {
+        let mut state = app.world_mut().resource_mut::<PortalState>();
+        state.roles.clear();
+        for (root, role) in roles {
+            state.roles.insert(root, role);
+        }
+    }
+
+    /// Whether the collider on `entity` is live.
+    fn collider_enabled(app: &App, entity: Entity) -> bool {
+        let entity = app.world().entity(entity);
+        entity.contains::<Collider>() && !entity.contains::<ColliderDisabled>()
+    }
+
+    /// A collider is live only while its cell is part of the active space. The roles
+    /// [`isolate_cells`] publishes are the single answer, and a subtree is flipped in the same
+    /// update the role changed in - which is what makes a crossing's destination collidable in the
+    /// frame the player arrives in it.
+    #[test]
+    fn the_space_gate_enables_only_the_active_cells_colliders() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<PortalState>()
+            .add_systems(Update, gate_cell_colliders);
+        let active = app.world_mut().spawn(Name::new("active")).id();
+        let destination = app.world_mut().spawn(Name::new("destination")).id();
+        let hidden = app.world_mut().spawn(Name::new("hidden")).id();
+        let collider = |app: &mut App, root: Entity| {
+            app.world_mut()
+                .spawn((Collider::cuboid(1.0, 1.0, 1.0), ChildOf(root)))
+                .id()
+        };
+        let active_collider = collider(&mut app, active);
+        let destination_collider = collider(&mut app, destination);
+        let hidden_collider = collider(&mut app, hidden);
+        set_roles(
+            &mut app,
+            [
+                (active, CellRole::Active),
+                (destination, CellRole::Destination),
+                (hidden, CellRole::Hidden),
+            ],
+        );
+
+        app.update();
+
+        assert!(
+            collider_enabled(&app, active_collider),
+            "the active space's collider is live"
+        );
+        assert!(
+            !collider_enabled(&app, destination_collider),
+            "a pre-streamed destination's collider must not block the player's space"
+        );
+        assert!(
+            !collider_enabled(&app, hidden_collider),
+            "a cell no camera draws is not walked into either"
+        );
+
+        // The crossing: the space the camera stands in changes, and the two swap in one update.
+        set_roles(
+            &mut app,
+            [
+                (active, CellRole::Destination),
+                (destination, CellRole::Active),
+                (hidden, CellRole::Hidden),
+            ],
+        );
+        app.update();
+
+        assert!(
+            !collider_enabled(&app, active_collider),
+            "the cell left behind is disabled at once"
+        );
+        assert!(
+            collider_enabled(&app, destination_collider),
+            "the cell arrived in is live in the same update"
+        );
+        assert!(!collider_enabled(&app, hidden_collider));
+    }
+
+    /// A collider that appears after its cell's role settled - a model the arming pacer hands to
+    /// the spawner later, a destination whose scene finishes loading after it - takes the role the
+    /// cell has *now*. A destination's stays disabled: readiness is not a reason to enable a
+    /// collider (port-prep-collision, point 2), so nothing re-enables it on the frames after.
+    #[test]
+    fn a_collider_that_appears_later_takes_its_cells_settled_role() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<PortalState>()
+            .add_systems(Update, gate_cell_colliders);
+        let active = app.world_mut().spawn(Name::new("active")).id();
+        let destination = app.world_mut().spawn(Name::new("destination")).id();
+        set_roles(
+            &mut app,
+            [
+                (active, CellRole::Active),
+                (destination, CellRole::Destination),
+            ],
+        );
+        app.update();
+
+        // What a completed readiness scan leaves: a collider under its reference, still disabled.
+        let late_destination = app
+            .world_mut()
+            .spawn((
+                Collider::cuboid(1.0, 1.0, 1.0),
+                ColliderDisabled,
+                ChildOf(destination),
+            ))
+            .id();
+        let late_active = app
+            .world_mut()
+            .spawn((
+                Collider::cuboid(1.0, 1.0, 1.0),
+                ColliderDisabled,
+                ChildOf(active),
+            ))
+            .id();
+
+        app.update();
+
+        assert!(
+            !collider_enabled(&app, late_destination),
+            "a destination's collider stays disabled after its readiness completes"
+        );
+        assert!(
+            collider_enabled(&app, late_active),
+            "an active cell's collider goes live as soon as the gate sees it"
+        );
+
+        app.update();
+        assert!(
+            !collider_enabled(&app, late_destination),
+            "and nothing enables it on a later frame either"
+        );
     }
 
     /// An app with the visibility and transform systems the doors and the isolation rely on.
@@ -8896,6 +9132,52 @@ mod tests {
             "the doorway's sun is written whenever it is not the destination's, not only on a \
              change of destination"
         );
+    }
+
+    /// The doorway's own sky dome is coloured from the destination it shows, not from the space the
+    /// player stands in: the portal camera's `CameraSky` follows the door it looks through, and a
+    /// door into a space with no sky clears it (review-277).
+    #[test]
+    fn the_doorway_dome_takes_the_destinations_sky() {
+        use crate::atmosphere::space_sky;
+        use crate::sky_dome::CameraSky;
+        use crate::world::lighting::fixtures::{BLACKREACH, real_spaces};
+        let (_directory, catalog) = real_spaces();
+        let tamriel = space_sky(Some(&catalog), space_key(TAMRIEL, None));
+        let blackreach = space_sky(Some(&catalog), space_key(BLACKREACH, None));
+        assert!(tamriel.is_some() && blackreach.is_some() && tamriel != blackreach);
+
+        let SunApp {
+            mut app,
+            portal_camera,
+            ..
+        } = sun_app();
+        app.insert_resource(catalog);
+        let sky = |app: &App| {
+            app.world()
+                .entity(portal_camera)
+                .get::<CameraSky>()
+                .expect("the portal camera carries its dome's colours")
+                .palette
+        };
+        assert_eq!(sky(&app), None, "no doorway open, no sky drawn");
+
+        let day = door_to_space(TAMRIEL, None);
+        let cave = door_to_space(BLACKREACH, None);
+        let room = door_to_space(TAMRIEL, Some(INTERIOR_ALFTAND01));
+        let (day_door, _) = spawn_scened_door(&mut app, day, DoorState::Opening);
+        let (cave_door, _) = spawn_scened_door(&mut app, cave, DoorState::Opening);
+        let (room_door, _) = spawn_scened_door(&mut app, room, DoorState::Opening);
+
+        portal_shows(&mut app, Some(day_door));
+        update(&mut app, 2);
+        assert_eq!(sky(&app), tamriel);
+        portal_shows(&mut app, Some(cave_door));
+        update(&mut app, 2);
+        assert_eq!(sky(&app), blackreach);
+        portal_shows(&mut app, Some(room_door));
+        update(&mut app, 2);
+        assert_eq!(sky(&app), None, "an interior behind the door has no sky");
     }
 
     // -----------------------------------------------------------------------------------------

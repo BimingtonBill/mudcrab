@@ -7,22 +7,27 @@ use converter::esm::{
     exporter::validate_database,
     records::RawRecord,
 };
-use dummy_content::esm::{self, Plugin};
+use dummy_content::{
+    esm::{self, Plugin},
+    layout,
+};
 use rusqlite::{Connection, params};
 use std::{fs, path::Path};
 
 /// The bytes `dummy-content gen --with-interior` writes: one exterior cell,
-/// its auto-load door into one interior cell, and the return door.
+/// its auto-load door into one interior cell, and the return door. The spec is
+/// assembled from the same `layout` constants the command uses, so this file
+/// cannot drift from the plugin the command publishes.
 fn preset_plugin() -> Vec<u8> {
     let cells = [esm::PRESET_EXTERIOR_CELL];
     esm::plugin_with_interior(
         &Plugin {
-            author: "OpenSkyrim dummy-content",
-            worldspace: "GeneratedWorld",
+            author: layout::GENERATED_AUTHOR,
+            worldspace: layout::GENERATED_WORLDSPACE,
             cells: &cells,
-            model_path: "meshes/generated.nif",
-            diffuse: "textures/generated_color.dds",
-            normal_texture: "textures/generated_normal.dds",
+            model_path: layout::GENERATED_MODEL_PATH,
+            diffuse: layout::GENERATED_DIFFUSE_PATH,
+            normal_texture: layout::GENERATED_NORMAL_PATH,
         },
         &esm::PRESET_INTERIOR,
     )
@@ -258,9 +263,8 @@ fn generated_interior_plugin_exports_a_reciprocal_door_pair() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    // `extract_cell_info` stores the `EDID` bytes as they are, trailing NUL
-    // included.
-    assert_eq!(interior_name, "GeneratedInterior\0");
+    // `extract_cell_info` stores the `EDID` without its trailing NUL.
+    assert_eq!(interior_name, "GeneratedInterior");
     assert_eq!(interior_grid, None);
 
     // Exterior -> interior: the destination is a cell of no worldspace.

@@ -1,3 +1,4 @@
+use crate::collision;
 use crate::material::{
     NifAnimationSkips, NifMaterialDisposition, NifShapeMaterial, VertexColourUse,
     build_nif_material_contract, is_editor_marker_shape, publish_gltf_materials,
@@ -15,8 +16,9 @@ use project_wormhole_nif::{
     nif_header::{Endianess, NifFileVersion, NifHeader},
 };
 use serde::{Deserialize, Serialize};
+use shared::collision::CollisionAsset;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     io::Write,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -65,6 +67,7 @@ impl MeshConverter {
             .is_some_and(|extension| {
                 extension.eq_ignore_ascii_case("btr") || extension.eq_ignore_ascii_case("bto")
             });
+        let collision = collision::from_nif(nif_path, &nif)?;
         let skeleton = if nif.has_skeleton() {
             let skeleton_path = find_skeleton(nif_path).ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -119,7 +122,10 @@ impl MeshConverter {
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
             }
-            return write_glb_atomic(output, &empty_scene_glb(&name));
+            return write_glb_atomic(
+                output,
+                &embed_collision(empty_scene_glb(&name), &collision)?,
+            );
         }
         let mut glb = catch_unwind(AssertUnwindSafe(|| model.to_glb(name.clone())))
             .map_err(|_| color_eyre::eyre::eyre!("NIF GLB export panicked"))?;
@@ -139,7 +145,10 @@ impl MeshConverter {
                 if let Some(parent) = output.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                return write_glb_atomic(output, &empty_scene_glb(&name));
+                return write_glb_atomic(
+                    output,
+                    &embed_collision(empty_scene_glb(&name), &collision)?,
+                );
             }
             glb = catch_unwind(AssertUnwindSafe(|| static_model.to_glb(name)))
                 .map_err(|_| color_eyre::eyre::eyre!("static NIF GLB export panicked"))?;
@@ -181,7 +190,17 @@ impl MeshConverter {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
-        write_glb_atomic(output, &glb)
+        write_glb_atomic(output, &embed_collision(glb, &collision)?)
+    }
+
+    /// Add NIF-authored collision to an already converted GLB without changing its render data.
+    /// This supports upgrading a packaged world without repeating texture conversion.
+    pub fn annotate_glb_collision(nif_path: &Path, glb_path: &Path) -> Result<CollisionAsset> {
+        let (nif, _, _) = open_nif_resilient(nif_path)?;
+        let collision = collision::from_nif(nif_path, &nif)?;
+        let glb = fs::read(glb_path)?;
+        write_glb_atomic(glb_path, &embed_collision(glb, &collision)?)?;
+        Ok(collision)
     }
 
     pub fn inspect_nif(path: &Path) -> Result<NifParseDiagnostics> {
@@ -245,6 +264,21 @@ impl MeshConverter {
     /// load. Files without dangling URIs are left untouched. Returns one
     /// report per rewritten file, ordered by path.
     pub fn prune_dangling_texture_uris(root: &Path) -> Result<Vec<PrunedGlb>> {
+        Self::prune_dangling_texture_uris_with_sources(root, &BTreeSet::new())
+    }
+
+    /// [`Self::prune_dangling_texture_uris`], with the canonical source texture keys under
+    /// `root/vfs` supplied.
+    ///
+    /// A missing converted artifact whose source key is in `source_textures` is not pruned: the
+    /// game data contains the texture and only its publication failed, so dropping the reference
+    /// would misrecord a conversion failure as absent source data. `source_textures` holds keys
+    /// as [`crate::asset_path::canonical_asset_path`] produces them, for example
+    /// `textures/rock01.dds`.
+    pub fn prune_dangling_texture_uris_with_sources(
+        root: &Path,
+        source_textures: &BTreeSet<String>,
+    ) -> Result<Vec<PrunedGlb>> {
         let mut glbs: Vec<PathBuf> = WalkDir::new(root)
             .follow_links(false)
             .into_iter()
@@ -261,7 +295,7 @@ impl MeshConverter {
         glbs.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
         let mut pruned = Vec::new();
         for glb_path in glbs {
-            if let Some(report) = prune_dangling_uris_in_glb(root, &glb_path)? {
+            if let Some(report) = prune_dangling_uris_in_glb(root, &glb_path, source_textures)? {
                 pruned.push(report);
             }
         }
@@ -278,7 +312,11 @@ pub struct PrunedGlb {
     pub removed_uris: Vec<String>,
 }
 
-fn prune_dangling_uris_in_glb(root: &Path, glb_path: &Path) -> Result<Option<PrunedGlb>> {
+fn prune_dangling_uris_in_glb(
+    root: &Path,
+    glb_path: &Path,
+    source_textures: &BTreeSet<String>,
+) -> Result<Option<PrunedGlb>> {
     let bytes =
         fs::read(glb_path).wrap_err_with(|| format!("failed to read {}", glb_path.display()))?;
     let mut document = glb_json_from_bytes(&bytes)
@@ -295,7 +333,10 @@ fn prune_dangling_uris_in_glb(root: &Path, glb_path: &Path) -> Result<Option<Pru
                 .and_then(serde_json::Value::as_str)
                 .map(|uri| (index, uri.to_owned()))
         })
-        .filter(|(_, uri)| !texture_uri_resolves(root, glb_path, uri))
+        .filter(|(_, uri)| {
+            !texture_uri_resolves(root, glb_path, uri)
+                && !texture_source_exists(root, glb_path, uri, source_textures)
+        })
         .collect();
     if missing.is_empty() {
         return Ok(None);
@@ -330,6 +371,37 @@ fn texture_uri_resolves(root: &Path, glb_path: &Path, uri: &str) -> bool {
     // Canonical URIs without `../` segments resolve against the tree root.
     crate::asset_path::resolve_asset_uri(root, &root.join("meshes"), uri)
         .is_ok_and(|candidate| candidate.is_file())
+}
+
+/// True when `uri`'s converted artifact is missing but its original source is present under
+/// `root/vfs`, so the reference is a failed publication rather than absent game data. Only
+/// converted KTX2 texture URIs can have a source here; embedded, remote and non-texture URIs
+/// return false.
+fn texture_source_exists(
+    root: &Path,
+    glb_path: &Path,
+    uri: &str,
+    source_textures: &BTreeSet<String>,
+) -> bool {
+    if source_textures.is_empty() {
+        return false;
+    }
+    let Ok(resolved) = crate::asset_path::resolve_asset_uri(root, glb_path, uri) else {
+        return false;
+    };
+    let Ok(relative) = resolved.strip_prefix(root) else {
+        return false;
+    };
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let Some(stem) = relative
+        .strip_suffix(".opensky-srgb.ktx2")
+        .or_else(|| relative.strip_suffix(".ktx2"))
+    else {
+        return false;
+    };
+    let source = format!("{stem}.dds");
+    crate::asset_path::canonical_asset_path(&source, crate::asset_path::AssetKind::Texture, "dds")
+        .is_ok_and(|key| source_textures.contains(&key))
 }
 
 fn prune_document_images(document: &mut serde_json::Value, removed: &HashSet<usize>) {
@@ -535,6 +607,17 @@ fn discard_root_block_transform(model: &mut Model) {
         root.rotation = Default::default();
         root.scale = 1.0;
     }
+}
+
+fn embed_collision(glb: Vec<u8>, collision: &CollisionAsset) -> Result<Vec<u8>> {
+    let mut document = glb_json_from_bytes(&glb)?;
+    let scene = document
+        .get_mut("scenes")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|scenes| scenes.first_mut())
+        .ok_or_else(|| color_eyre::eyre::eyre!("GLB has no scene for collision metadata"))?;
+    scene["extras"]["openSkyrimCollision"] = serde_json::to_value(collision)?;
+    rebuild_glb_with_document(&glb, &document)
 }
 
 fn is_declared_geometry_block(block_type: &str) -> bool {

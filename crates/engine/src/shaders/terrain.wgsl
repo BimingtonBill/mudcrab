@@ -9,6 +9,10 @@
 const WEIGHT_GRID_SIDE: u32 = 17u;
 const WEIGHT_GRID_WORDS: u32 = 73u;
 
+// The highest sample index on either axis: what a coordinate is clamped onto, so the quadrant's far
+// edge reads its own samples rather than the next quadrant's.
+const GRID_LAST_SAMPLE: u32 = WEIGHT_GRID_SIDE - 1u;
+
 struct TerrainSettings {
     tiling_and_layer_count: vec4<f32>,
     // xy = this quadrant's origin in cell units (0 or 1 per axis), from which `in.uv * 2.0` gives
@@ -19,6 +23,10 @@ struct TerrainSettings {
     // x > 0.5 when `weights` holds this quadrant's overlay grids (streamed cells); otherwise the
     // packed vertex attributes above are the only source (the synthetic fixtures).
     weight_source: vec4<f32>,
+    // 1.0 where a layer has a normal map bound: layers 0-3 in `normal_layers_0`, 4-5 in
+    // `normal_layers_1.xy`. A layer without one keeps the geometric normal.
+    normal_layers_0: vec4<f32>,
+    normal_layers_1: vec4<f32>,
     weights: array<vec4<f32>, 365>,
 }
 
@@ -35,6 +43,39 @@ struct TerrainSettings {
 @group(#{MATERIAL_BIND_GROUP}) @binding(110) var layer_5: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(111) var layer_5_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(112) var<uniform> terrain: TerrainSettings;
+// Each layer's normal map; they share `layer_0_sampler` (every terrain layer image carries the same
+// repeating sampler), so they bind no samplers of their own.
+@group(#{MATERIAL_BIND_GROUP}) @binding(113) var normal_0: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(114) var normal_1: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(115) var normal_2: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(116) var normal_3: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(117) var normal_4: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(118) var normal_5: texture_2d<f32>;
+
+// Skyrim's `_n` maps are DirectX-convention: green points down the texture, so it is flipped to
+// the tangent frame's +Y. One constant, settled by an A/B render of lit slopes.
+const NORMAL_GREEN_SIGN: f32 = -1.0;
+
+// One layer's tangent-space normal, or straight up when the layer has no map bound. The z
+// component is rebuilt from x and y, so the map's blue channel does not matter.
+fn layer_normal(map: texture_2d<f32>, uv: vec2<f32>, present: f32) -> vec3<f32> {
+    if present < 0.5 {
+        return vec3<f32>(0.0, 0.0, 1.0);
+    }
+    let xy = textureSample(map, layer_0_sampler, uv).xy * 2.0 - 1.0;
+    let tilt = vec2<f32>(xy.x, NORMAL_GREEN_SIGN * xy.y);
+    return vec3<f32>(tilt, sqrt(max(0.0, 1.0 - dot(tilt, tilt))));
+}
+
+// The terrain's tangent frame. Its texture coordinates run exactly along world +X (u) and world -Z
+// (v) - `build_terrain_quadrant_mesh` maps grid point (x, y) to position (x, h, -y) and uv (x, y) -
+// so the frame is analytic: the u axis made perpendicular to the interpolated normal, and the v
+// axis from their cross product. The mesh's tangent attribute cannot be used: it carries weights.
+fn terrain_tbn(n: vec3<f32>) -> mat3x3<f32> {
+    let u_axis = vec3<f32>(1.0, 0.0, 0.0);
+    let t = normalize(u_axis - n * dot(n, u_axis) + vec3<f32>(0.0, 0.0, 1.0e-6));
+    return mat3x3<f32>(t, cross(n, t), n);
+}
 
 /// One sample of an overlay's weight grid. Sample order is the one LAND's `VTXT` entries use:
 /// `y * 17 + x` on the quadrant's own 17x17 grid, 128 units apart.
@@ -42,15 +83,24 @@ fn packed_weight(overlay: u32, sample: u32) -> f32 {
     return terrain.weights[overlay * WEIGHT_GRID_WORDS + sample / 4u][sample % 4u];
 }
 
+/// A quadrant-local coordinate clamped onto the sample square. Clamping before the blend fraction is
+/// taken keeps a coordinate an ulp outside the quadrant on its edge sample instead of blending the
+/// neighbouring one in, and keeps a coordinate past the far edge on the last sample rather than
+/// reading the next quadrant's.
+fn grid_point(coordinate: vec2<f32>) -> vec2<f32> {
+    return clamp(coordinate, vec2<f32>(0.0), vec2<f32>(f32(GRID_LAST_SAMPLE)));
+}
+
 /// One overlay's opacity at a quadrant-local coordinate: bilinear across the sample grid, clamped
 /// at the quadrant's edge. This is the interpolation Skyrim applies to `VTXT` opacities, and it is
 /// linear between samples - the packed vertex attributes it replaces lost weight to Bevy's
 /// normalization of the tangent, which sharpened every transition into a step.
 fn grid_weight(overlay: u32, coordinate: vec2<f32>) -> f32 {
-    let corner = floor(coordinate);
-    let blend = coordinate - corner;
-    let base = vec2<u32>(clamp(corner, vec2<f32>(0.0), vec2<f32>(f32(WEIGHT_GRID_SIDE - 1u))));
-    let next = min(base + vec2<u32>(1u), vec2<u32>(WEIGHT_GRID_SIDE - 1u));
+    let point = grid_point(coordinate);
+    let corner = floor(point);
+    let blend = point - corner;
+    let base = vec2<u32>(corner);
+    let next = min(base + vec2<u32>(1u), vec2<u32>(GRID_LAST_SAMPLE));
     let west = base.x;
     let east = next.x;
     let north = base.y;
@@ -94,7 +144,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     weights[5] = in.uv_b.y;
 #endif
     if terrain.weight_source.x > 0.5 {
-        let coordinate = (in.uv * 2.0 - terrain.quadrant_origin.xy) * f32(WEIGHT_GRID_SIDE - 1u);
+        let coordinate = (in.uv * 2.0 - terrain.quadrant_origin.xy) * f32(GRID_LAST_SAMPLE);
         weights[1] = grid_weight(0u, coordinate);
         weights[2] = grid_weight(1u, coordinate);
         weights[3] = grid_weight(2u, coordinate);
@@ -111,6 +161,18 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     color += textureSample(layer_4, layer_4_sampler, uv) * weights[4];
     color += textureSample(layer_5, layer_5_sampler, uv) * weights[5];
     pbr_input.material.base_color *= color / total;
+    // The layers' normal maps, blended by the same weights in the shared tangent frame and turned
+    // into a world normal once. Only materials with at least one map do the extra reads.
+    if dot(terrain.normal_layers_0, vec4<f32>(1.0)) + terrain.normal_layers_1.x + terrain.normal_layers_1.y > 0.5 {
+        var tangent_normal = layer_normal(normal_0, uv, terrain.normal_layers_0.x) * weights[0];
+        tangent_normal += layer_normal(normal_1, uv, terrain.normal_layers_0.y) * weights[1];
+        tangent_normal += layer_normal(normal_2, uv, terrain.normal_layers_0.z) * weights[2];
+        tangent_normal += layer_normal(normal_3, uv, terrain.normal_layers_0.w) * weights[3];
+        tangent_normal += layer_normal(normal_4, uv, terrain.normal_layers_1.x) * weights[4];
+        tangent_normal += layer_normal(normal_5, uv, terrain.normal_layers_1.y) * weights[5];
+        let geometric = normalize(pbr_input.world_normal);
+        pbr_input.N = normalize(terrain_tbn(geometric) * normalize(tangent_normal));
+    }
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);

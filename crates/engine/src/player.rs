@@ -55,9 +55,10 @@ use crate::{
     demo_hud,
     door_animation::DoorAnimation,
     doors::{DoorAnchor, DoorCrossed, DoorLeaf, DoorState, LoadDoor, mesh_is_out_of_the_way},
+    physics::{GROUP_PLAYER, GROUP_WORLD},
     portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, PortalState, measured_portal_extents},
     profiling::ProfilingState,
-    streaming::{StreamingWorld, creation_to_bevy},
+    streaming::{StreamingWorld, builds_world_colliders, creation_to_bevy},
     transition::{
         CrossDoor, OpenDoor, destination_is_loaded, distance_in_front_of_door, door_is_open,
         source_doorway_plane,
@@ -72,6 +73,7 @@ use bevy::{
     prelude::*,
     window::{CursorGrabMode, CursorOptions, PrimaryWindow},
 };
+use bevy_rapier3d::prelude::{CollisionGroups, QueryFilter, RapierContext, ReadRapierContext};
 use std::{collections::HashSet, time::Instant};
 
 /// The player's eye height above their feet, in Creation-engine units. Skyrim puts the player's eye
@@ -808,6 +810,78 @@ fn in_active_space(
     portal.is_none_or(|portal| portal.is_in_active_space(entity, parents))
 }
 
+/// How far a doorway volume reaches past each side of the door's own model bounds, horizontally and
+/// above, in units: a body's width either side of the opening, so a wall that closes the doorway
+/// right beside the frame is let through too. Never below the doorway: the floor stays the floor.
+const DOORWAY_MARGIN: f32 = 32.0;
+
+/// How far a doorway volume reaches in front of and behind the middle of the door's model, in
+/// units, along the door's own depth axis. The backing geometry that closes a doorway stands close
+/// behind it (the Dwemer facade of Alftand's entrance, 16 units); 64 covers that with room and is
+/// still thin beside a room, so a real wall further on is still a wall. Both sides, because a door
+/// model's own front axis is the wrong way round often enough (`LoadDoor::outward`).
+const DOORWAY_DEPTH_REACH: f32 = 64.0;
+
+/// A ray whose normalized `y` is below this looks down: it is a ground probe, not a wall probe.
+const DOORWAY_GROUND_RAY_Y: f32 = -0.5;
+
+/// The doorway volume of a load door: the box the walk-through trigger and the portal quad measure
+/// ([`measured_portal_extents`], in the door's own frame), grown by [`DOORWAY_MARGIN`] across and
+/// above and made [`DOORWAY_DEPTH_REACH`] deep each way from the model's middle. `None` for a door
+/// whose model has no usable bounds - the invisible auto-load markers - whose doorway is not known.
+fn doorway_volume(
+    position: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+    instance_bounds: Option<&InstanceBounds>,
+    expected_bounds: Option<&ExpectedModelBounds>,
+) -> Option<AutoDoorTrigger> {
+    let (size, centre) =
+        measured_portal_extents(instance_bounds, expected_bounds, rotation, scale)?;
+    // Grown upward only: the margin above is half of a half-height more and the centre rises by it.
+    let half = Vec3::new(
+        size.x * 0.5 + DOORWAY_MARGIN,
+        size.y * 0.5 + DOORWAY_MARGIN * 0.5,
+        DOORWAY_DEPTH_REACH,
+    );
+    let centre = centre + Vec3::Y * (DOORWAY_MARGIN * 0.5);
+    Some(AutoDoorTrigger {
+        centre: position + rotation * centre,
+        rotation,
+        half,
+    })
+}
+
+/// A load door's placement, state and the bounds its doorway is measured from.
+type DoorwayQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static GlobalTransform,
+        &'static DoorState,
+        Option<&'static InstanceBounds>,
+        Option<&'static ExpectedModelBounds>,
+    ),
+    With<LoadDoor>,
+>;
+
+/// The doorway volumes of every load door that is open and in the player's space (`in_space`), once
+/// per frame for the walk's rays to check ([`WorldProbe`]). A closed door has none - its leaf blocks,
+/// through the mesh half - and a door that is not yet placed has not got a position to measure.
+fn open_doorways(doors: &DoorwayQuery, in_space: impl Fn(Entity) -> bool) -> Vec<AutoDoorTrigger> {
+    doors
+        .iter()
+        .filter(|(entity, global, state, ..)| {
+            state.is_open() && door_is_placed(global) && in_space(*entity)
+        })
+        .filter_map(|(_, global, _, instance_bounds, expected_bounds)| {
+            let (scale, rotation, position) = global.to_scale_rotation_translation();
+            doorway_volume(position, rotation, scale, instance_bounds, expected_bounds)
+        })
+        .collect()
+}
+
 /// The walking collision queries, against the meshes the streamer has spawned.
 struct MeshProbe<'a, 'w, 's> {
     ray_cast: &'a mut MeshRayCast<'w, 's>,
@@ -842,6 +916,150 @@ impl CollisionWorld for MeshProbe<'_, '_, '_> {
             distance: hit.distance,
         })
     }
+}
+
+/// The walking collision queries, against the rapier colliders a walked run streams
+/// ([`builds_world_colliders`]).
+///
+/// The ground and the walls are the colliders the streamer builds: a full cell's terrain quadrants
+/// and each eligible static's authored shapes or render proxy, all in
+/// [`crate::physics::world_collision_groups`] and enabled only in the space the player is in
+/// (`crate::portal::gate_cell_colliders`). A disabled collider - another space's, or one whose cell
+/// has not been classified yet - is not in rapier's broad phase, so it is neither something to
+/// stand on nor something to walk into, which is what keeps a pre-streamed destination invisible to
+/// the walk.
+struct RapierProbe<'a> {
+    context: RapierContext<'a>,
+}
+
+impl CollisionWorld for RapierProbe<'_> {
+    fn ray_hit(&mut self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RayHit> {
+        if !max_distance.is_finite() || max_distance <= 0.0 {
+            return None;
+        }
+        let length = direction.length();
+        if !length.is_finite() || length <= f32::EPSILON {
+            return None;
+        }
+        let direction = direction / length;
+        // The player's own membership against the world's: the same pair [`try_enter_walk`]
+        // intersects with, so a collider the player capsule may meet is one the ground and the walls
+        // are read from. A ray that starts inside a shape (a trimesh the eye is already through)
+        // reports the surface it leaves, which is what the mesh probe reports too.
+        let filter = QueryFilter::default().groups(CollisionGroups::new(GROUP_PLAYER, GROUP_WORLD));
+        let (_, intersection) =
+            self.context
+                .cast_ray_and_get_normal(origin, direction, max_distance, true, filter)?;
+        (intersection.time_of_impact <= max_distance).then_some(RayHit {
+            point: origin + direction * intersection.time_of_impact,
+            normal: intersection.normal,
+            distance: intersection.time_of_impact,
+        })
+    }
+}
+
+/// The walking probe of a run that builds world colliders: rapier for the ground and the walls, the
+/// mesh probe for load-door leaves alone.
+///
+/// No load door carries a collider - the static policy covers STAT/TREE/FURN records, never DOOR -
+/// and the player has to meet a closed leaf and walk through a leaf its door has opened. So the leaf
+/// half stays a mesh ray cast over the door's own geometry, with exactly the rule the mesh-only
+/// probe applies ([`door_mesh_is_solid`], the mirror of [`mesh_is_out_of_the_way`]): every other
+/// mesh is the world's colliders' business.
+struct WorldProbe<'a, 'w, 's> {
+    world: RapierProbe<'a>,
+    ray_cast: &'a mut MeshRayCast<'w, 's>,
+    /// Whether a mesh is part of a load door that is not open ([`door_mesh_is_solid`]): the one kind
+    /// of mesh the mesh half answers for. Everything else it skips, as the mesh-only probe skips the
+    /// meshes the colliders now cover.
+    door_solid: &'a dyn Fn(Entity) -> bool,
+    /// The doorway volumes of the open load doors of the player's space ([`open_doorways`]): a
+    /// wall the world half meets inside one is the authored collision that closes a doorway the
+    /// render mesh leaves open, and is not something to walk into.
+    doorways: &'a [AutoDoorTrigger],
+}
+
+impl CollisionWorld for WorldProbe<'_, '_, '_> {
+    fn ray_hit(&mut self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RayHit> {
+        // A ray that looks down is the ground, and a doorway's floor has to hold the player; only
+        // the rays that look along the walls are let through a doorway's volume.
+        let looks_down = direction.normalize_or_zero().y < DOORWAY_GROUND_RAY_Y;
+        let doorways = self.doorways;
+        let world = self
+            .world
+            .ray_hit(origin, direction, max_distance)
+            .filter(|hit| {
+                looks_down || !doorways.iter().any(|doorway| doorway.contains(hit.point))
+            });
+        let solid = self.door_solid;
+        let door = MeshProbe {
+            ray_cast: &mut *self.ray_cast,
+            // `skip` is what the mesh probe leaves out, so it is the *negation*: only a closed
+            // door's own geometry is something the mesh half still answers for.
+            skip: &|entity| !solid(entity),
+        }
+        .ray_hit(origin, direction, max_distance);
+        // The higher of the two hits under the player is the one they stand on, and the nearer of
+        // two horizontally is the one in the way: both are the shorter ray, so the leaf decides
+        // only where it really is the surface the ray meets first.
+        match (world, door) {
+            (Some(world), Some(door)) => Some(if world.distance <= door.distance {
+                world
+            } else {
+                door
+            }),
+            (Some(hit), None) | (None, Some(hit)) => Some(hit),
+            (None, None) => None,
+        }
+    }
+}
+
+/// The probe one walking frame uses: the mesh probe alone for a run that does not build world
+/// colliders ([`builds_world_colliders`]), the composite when it does.
+enum WalkProbe<'a, 'w, 's> {
+    Meshes(MeshProbe<'a, 'w, 's>),
+    World(WorldProbe<'a, 'w, 's>),
+}
+
+impl CollisionWorld for WalkProbe<'_, '_, '_> {
+    fn ray_hit(&mut self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RayHit> {
+        match self {
+            WalkProbe::Meshes(probe) => probe.ray_hit(origin, direction, max_distance),
+            WalkProbe::World(probe) => probe.ray_hit(origin, direction, max_distance),
+        }
+    }
+}
+
+/// Whether a mesh the walk probe hit is part of a load door that is still solid: a leaf, or one of a
+/// door model's own parts, whose door is [`Closed`](DoorState::Closed) or closing. False for
+/// anything that is not part of a door.
+///
+/// The mirror of [`mesh_is_out_of_the_way`] - the same walk up from the hit mesh to the door state,
+/// answering "solid" where that answers "out of the way" - so the composite probe's mesh half sees
+/// exactly the door geometry the mesh-only probe blocks on, and leaves the ground and the walls to
+/// the colliders. Only a door of the player's own space counts: another space's closed leaf is
+/// drawn elsewhere entirely ([`in_active_space`], review-280).
+fn door_mesh_is_solid(
+    hit: Entity,
+    portal: Option<&PortalState>,
+    parents: &Query<&ChildOf>,
+    leaves: &Query<&DoorLeaf>,
+    states: &Query<&DoorState>,
+) -> bool {
+    if !in_active_space(portal, hit, parents) {
+        return false;
+    }
+    let mut entity = Some(hit);
+    while let Some(current) = entity {
+        if let Ok(leaf) = leaves.get(current) {
+            return states.get(leaf.door).is_ok_and(|state| !state.is_open());
+        }
+        if let Ok(state) = states.get(current) {
+            return !state.is_open();
+        }
+        entity = parents.get(current).ok().map(ChildOf::parent);
+    }
+    false
 }
 
 /// The load door prompt: a small panel a little below the middle of the screen, in the HUD's
@@ -981,10 +1199,19 @@ fn player_look(
 /// `pub(crate)` so that the wiring can be driven end to end in one test: `crate::portal` builds the
 /// cells and runs the isolation behind it, and this is the walk whose probes have to stay inside
 /// the active space.
+///
+/// A run that builds world colliders ([`builds_world_colliders`] - a walked run) walks on them: the
+/// ground and the walls are the rapier colliders the streamer builds, and the mesh probe is kept for
+/// load-door leaves alone ([`WorldProbe`]). A wall of those colliders inside the doorway of an open
+/// load door is let through, the authored collision behind a load door being closed where the
+/// door's render mesh is open ([`open_doorways`]). Every other run keeps the mesh-only probe it has
+/// always had ([`MeshProbe`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn player_walk(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
+    config: Option<Res<EngineConfig>>,
+    context: ReadRapierContext,
     mut camera: Query<(&mut Transform, &mut Player), With<StreamingCamera>>,
     mut ray_cast: MeshRayCast,
     water: Query<(), With<WaterSurface>>,
@@ -994,6 +1221,7 @@ pub(crate) fn player_walk(
     parents: Query<&ChildOf>,
     leaves: Query<&DoorLeaf>,
     states: Query<&DoorState>,
+    doorway_doors: DoorwayQuery,
     mut held: Local<bool>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -1012,9 +1240,38 @@ pub(crate) fn player_walk(
                 || mesh_is_out_of_the_way(entity, &parents, &leaves, &states)
                 || !in_active_space(portal.as_deref(), entity, &parents)
         };
-        let mut probe = MeshProbe {
-            ray_cast: &mut ray_cast,
-            skip: &skip,
+        // Only a door of the player's own space can be in the way: another space's closed leaf is
+        // drawn somewhere else entirely (review-280), exactly as the mesh-only probe's skip says.
+        let door_solid = |entity: Entity| {
+            !door_copies.contains(entity)
+                && door_mesh_is_solid(entity, portal.as_deref(), &parents, &leaves, &states)
+        };
+        // Without a context (a test app, or a run the physics plugin was not added to) the colliders
+        // are not there to walk on, so the mesh probe answers as it always has rather than the walk
+        // holding position on ground it cannot see.
+        let rapier = (config.as_deref().is_some_and(builds_world_colliders))
+            .then(|| context.single().ok())
+            .flatten();
+        // The open doors' doorways, once for all of this frame's rays; only the composite probe
+        // reads them.
+        let doorways = if rapier.is_some() {
+            open_doorways(&doorway_doors, |entity| {
+                in_active_space(portal.as_deref(), entity, &parents)
+            })
+        } else {
+            Vec::new()
+        };
+        let mut probe = match rapier {
+            Some(context) => WalkProbe::World(WorldProbe {
+                world: RapierProbe { context },
+                ray_cast: &mut ray_cast,
+                door_solid: &door_solid,
+                doorways: &doorways,
+            }),
+            None => WalkProbe::Meshes(MeshProbe {
+                ray_cast: &mut ray_cast,
+                skip: &skip,
+            }),
         };
         match player.mode {
             PlayerMode::Walk => walk_step(
@@ -1031,7 +1288,7 @@ pub(crate) fn player_walk(
     };
     transform.translation = outcome.position;
     if outcome.unsupported && !*held {
-        warn!("no ground under the player: holding position until the cell streams in (F to fly)");
+        info!("no ground under the player: holding position until the cell streams in (F to fly)");
     }
     *held = outcome.unsupported;
     profiler.record_elapsed("player/move", started);
@@ -3661,5 +3918,642 @@ mod tests {
             DoorAction::Close.prompt("Sven's House"),
             "E  Close  Sven's House"
         );
+    }
+}
+
+/// The composite probe of a walked run (impl-280): the world's rapier colliders for the ground and
+/// the walls, the mesh probe for load-door leaves alone. Every test here drives the probe - or
+/// [`walk_step`] through it - against a real rapier context in a headless app: no window, no GPU and
+/// no game data.
+#[cfg(test)]
+mod world_probe_tests {
+    use super::*;
+    use crate::physics::{PHYSICS_TIMESTEP, PhysicsCorePlugin, world_collision_groups};
+    use bevy::{
+        camera::{
+            primitives::Aabb,
+            visibility::{ViewVisibility, VisibilityPlugin},
+        },
+        ecs::system::RunSystemOnce,
+        time::TimeUpdateStrategy,
+    };
+    use bevy_rapier3d::prelude::{Collider, ColliderDisabled, RigidBody};
+    use std::time::Duration;
+
+    /// A headless app with the physics core's rapier context, stepped one fixed tick per update.
+    fn physics_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, TransformPlugin, PhysicsCorePlugin))
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                PHYSICS_TIMESTEP,
+            )));
+        app.finish();
+        app.update();
+        app
+    }
+
+    /// The same app with the assets and visibility a mesh ray cast needs.
+    fn mesh_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            bevy::mesh::MeshPlugin,
+            TransformPlugin,
+            VisibilityPlugin,
+            PhysicsCorePlugin,
+        ))
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+            PHYSICS_TIMESTEP,
+        )));
+        app.finish();
+        app.update();
+        app
+    }
+
+    /// Let the ECS-to-rapier sync (the physics plugin's `FixedUpdate`) see everything spawned so
+    /// far. A collider spawned this frame is not in rapier's broad phase until the next fixed step.
+    fn sync_physics(app: &mut App) {
+        for _ in 0..3 {
+            app.update();
+        }
+    }
+
+    /// A fixed world collider, the way `crate::streaming` spawns one.
+    fn spawn_world_collider(app: &mut App, position: Vec3, half: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                crate::streaming::TerrainCollider,
+                Collider::cuboid(half.x, half.y, half.z),
+                RigidBody::Fixed,
+                world_collision_groups(),
+                Transform::from_translation(position),
+                GlobalTransform::from_translation(position),
+            ))
+            .id()
+    }
+
+    /// A mesh the probe can hit, with the bounds and the visibility a renderer would give it by
+    /// hand: there is no render plugin here to compute either.
+    fn spawn_mesh_box(app: &mut App, position: Vec3, size: Vec3) -> Entity {
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::new(size.x, size.y, size.z));
+        let half = size * 0.5;
+        app.world_mut()
+            .spawn((
+                Mesh3d(mesh),
+                Aabb::from_min_max(-half, half),
+                Transform::from_translation(position),
+                GlobalTransform::from_translation(position),
+                Visibility::default(),
+                InheritedVisibility::VISIBLE,
+                ViewVisibility::default(),
+            ))
+            .id()
+    }
+
+    #[derive(Resource, Default)]
+    struct ProbeRays(Vec<(Vec3, Vec3, f32)>);
+
+    #[derive(Resource, Default)]
+    struct ProbeHits(Vec<Option<RayHit>>);
+
+    /// Casts every queued ray through the full composite probe: colliders plus door-leaf meshes.
+    #[allow(clippy::too_many_arguments)]
+    fn cast_world_and_door_rays(
+        rays: Res<ProbeRays>,
+        mut hits: ResMut<ProbeHits>,
+        context: ReadRapierContext,
+        mut ray_cast: MeshRayCast,
+        parents: Query<&ChildOf>,
+        leaves: Query<&DoorLeaf>,
+        states: Query<&DoorState>,
+        doors: DoorwayQuery,
+    ) {
+        hits.0.clear();
+        let context = context
+            .single()
+            .expect("the physics plugin's rapier context");
+        let door_solid =
+            |entity: Entity| door_mesh_is_solid(entity, None, &parents, &leaves, &states);
+        let doorways = open_doorways(&doors, |_| true);
+        let mut probe = WorldProbe {
+            world: RapierProbe { context },
+            ray_cast: &mut ray_cast,
+            door_solid: &door_solid,
+            doorways: &doorways,
+        };
+        for (origin, direction, reach) in &rays.0 {
+            hits.0.push(probe.ray_hit(*origin, *direction, *reach));
+        }
+    }
+
+    /// Where a walk over the rapier world ended up, and how it ended.
+    #[derive(Resource)]
+    struct ProbeWalk {
+        start: Vec3,
+        input: MoveInput,
+        ticks: u32,
+        // The outcome:
+        position: Vec3,
+        grounded: bool,
+        unsupported: bool,
+    }
+
+    impl Default for ProbeWalk {
+        fn default() -> Self {
+            Self {
+                start: Vec3::ZERO,
+                input: MoveInput::default(),
+                ticks: 1,
+                position: Vec3::ZERO,
+                grounded: false,
+                unsupported: false,
+            }
+        }
+    }
+
+    /// Runs `ticks` fixed steps of the real [`walk_step`] over the rapier probe.
+    fn walk_the_rapier_world(mut walk: ResMut<ProbeWalk>, context: ReadRapierContext) {
+        let Ok(context) = context.single() else {
+            return;
+        };
+        let mut probe = RapierProbe { context };
+        let mut player = Player::default();
+        let mut position = walk.start;
+        let mut grounded = false;
+        let mut unsupported = false;
+        for _ in 0..walk.ticks {
+            let outcome = walk_step(
+                &mut probe,
+                &mut player,
+                position,
+                walk.input,
+                PHYSICS_TIMESTEP,
+            );
+            position = outcome.position;
+            grounded = outcome.grounded;
+            unsupported = outcome.unsupported;
+        }
+        walk.position = position;
+        walk.grounded = grounded;
+        walk.unsupported = unsupported;
+    }
+
+    fn walk_resource(app: &mut App, walk: ProbeWalk) -> ProbeWalk {
+        app.insert_resource(walk);
+        app.world_mut()
+            .run_system_once(walk_the_rapier_world)
+            .unwrap();
+        let walked = app.world().resource::<ProbeWalk>();
+        ProbeWalk {
+            position: walked.position,
+            grounded: walked.grounded,
+            unsupported: walked.unsupported,
+            ..ProbeWalk::default()
+        }
+    }
+
+    /// The floor is the rapier body the streamer builds for a terrain quadrant, not a mesh: the
+    /// player falls onto it and rests an eye height above its top.
+    #[test]
+    fn the_player_stands_on_a_terrain_collider() {
+        let mut app = physics_app();
+        spawn_world_collider(
+            &mut app,
+            Vec3::new(0.0, -20.0, 0.0),
+            Vec3::new(500.0, 20.0, 500.0),
+        );
+        sync_physics(&mut app);
+        let walked = walk_resource(
+            &mut app,
+            ProbeWalk {
+                start: Vec3::new(0.0, 600.0, 0.0),
+                ticks: 240,
+                ..ProbeWalk::default()
+            },
+        );
+        assert!(
+            walked.grounded,
+            "the player never grounded on the collider: {:?}",
+            walked.position
+        );
+        assert!(
+            (walked.position.y - EYE_HEIGHT).abs() < 1.0,
+            "the eye rests at {} instead of {EYE_HEIGHT} above the collider top",
+            walked.position.y
+        );
+        assert!(!walked.unsupported);
+    }
+
+    /// A static collider is a wall: a walk straight into it stops short of it.
+    #[test]
+    fn a_static_collider_blocks_a_walk_into_it() {
+        let mut app = physics_app();
+        spawn_world_collider(
+            &mut app,
+            Vec3::new(0.0, -20.0, 0.0),
+            Vec3::new(1000.0, 20.0, 1000.0),
+        );
+        // A wall whose near face is at x = 220.
+        spawn_world_collider(
+            &mut app,
+            Vec3::new(240.0, 100.0, 0.0),
+            Vec3::new(20.0, 100.0, 400.0),
+        );
+        sync_physics(&mut app);
+        let walked = walk_resource(
+            &mut app,
+            ProbeWalk {
+                start: Vec3::new(0.0, EYE_HEIGHT, 0.0),
+                input: MoveInput {
+                    right: 1.0,
+                    sprint: true,
+                    ..MoveInput::default()
+                },
+                ticks: 180,
+                ..ProbeWalk::default()
+            },
+        );
+        assert!(
+            walked.position.x > 50.0,
+            "the player never reached the wall: {:?}",
+            walked.position
+        );
+        assert!(
+            walked.position.x < 220.0,
+            "the player walked through the wall to {:?}",
+            walked.position
+        );
+    }
+
+    /// A disabled collider - another space's, or one whose cell has not been classified yet - is
+    /// neither something to stand on nor something to walk into: the walk holds position rather
+    /// than landing on it, and passes straight through where it stands.
+    #[test]
+    fn a_disabled_collider_neither_supports_nor_blocks() {
+        let mut app = physics_app();
+        let ground = spawn_world_collider(
+            &mut app,
+            Vec3::new(0.0, -20.0, 0.0),
+            Vec3::new(1000.0, 20.0, 1000.0),
+        );
+        let wall = spawn_world_collider(
+            &mut app,
+            Vec3::new(240.0, 100.0, 0.0),
+            Vec3::new(20.0, 100.0, 400.0),
+        );
+        app.world_mut().entity_mut(ground).insert(ColliderDisabled);
+        app.world_mut().entity_mut(wall).insert(ColliderDisabled);
+        sync_physics(&mut app);
+        let walked = walk_resource(
+            &mut app,
+            ProbeWalk {
+                start: Vec3::new(0.0, 300.0, 0.0),
+                input: MoveInput {
+                    right: 1.0,
+                    sprint: true,
+                    ..MoveInput::default()
+                },
+                ticks: 180,
+                ..ProbeWalk::default()
+            },
+        );
+        assert!(
+            walked.unsupported,
+            "the disabled ground supported the player at {:?}",
+            walked.position
+        );
+        assert!(
+            (walked.position.y - 300.0).abs() < 1.0,
+            "an unsupported walk did not hold its height: {:?}",
+            walked.position
+        );
+        assert!(
+            walked.position.x > 600.0,
+            "the disabled wall blocked the walk at {:?}",
+            walked.position
+        );
+    }
+
+    /// A load door has no collider, so the composite probe keeps the mesh half for its leaf: a
+    /// closed leaf is solid, an open one is a hole.
+    #[test]
+    fn a_closed_door_leaf_blocks_the_composite_probe_and_an_open_one_does_not() {
+        let mut app = mesh_app();
+        let door = app.world_mut().spawn(DoorState::Closed).id();
+        let leaf = spawn_mesh_box(
+            &mut app,
+            Vec3::new(200.0, 100.0, 0.0),
+            Vec3::new(10.0, 200.0, 200.0),
+        );
+        app.world_mut().entity_mut(leaf).insert(DoorLeaf { door });
+        app.insert_resource(ProbeRays(vec![(
+            Vec3::new(0.0, EYE_HEIGHT, 0.0),
+            Vec3::X,
+            400.0,
+        )]));
+        app.init_resource::<ProbeHits>();
+        app.update();
+
+        app.world_mut()
+            .run_system_once(cast_world_and_door_rays)
+            .unwrap();
+        let hit = app
+            .world()
+            .resource::<ProbeHits>()
+            .0
+            .first()
+            .copied()
+            .flatten()
+            .expect("the closed leaf is solid");
+        assert!(
+            (hit.distance - 195.0).abs() < 2.0,
+            "the leaf's near face is at 195, the probe hit at {}",
+            hit.distance
+        );
+
+        *app.world_mut()
+            .entity_mut(door)
+            .get_mut::<DoorState>()
+            .unwrap() = DoorState::Open { animated: true };
+        app.world_mut()
+            .run_system_once(cast_world_and_door_rays)
+            .unwrap();
+        assert!(
+            app.world().resource::<ProbeHits>().0[0].is_none(),
+            "an open leaf still blocked the probe"
+        );
+    }
+
+    /// The gate: a run that walks uses the colliders, so a mesh floor it did not build colliders
+    /// for is not something to stand on; a run that does not walk keeps the mesh-only probe and
+    /// stands on it exactly as before.
+    #[test]
+    fn a_run_that_does_not_walk_keeps_the_mesh_probe() {
+        // The mesh floor, the same in both apps: a full cell's terrain would be beside it.
+        fn floor_app(walk: bool) -> App {
+            let mut app = mesh_app();
+            spawn_mesh_box(
+                &mut app,
+                Vec3::new(0.0, -20.0, 0.0),
+                Vec3::new(1000.0, 40.0, 1000.0),
+            );
+            let mut config = EngineConfig::default();
+            config.portal.walk = walk;
+            app.insert_resource(config)
+                .init_resource::<ButtonInput<KeyCode>>()
+                .init_resource::<ProfilingState>()
+                .add_systems(Update, player_walk);
+            app.world_mut().spawn((
+                StreamingCamera,
+                Player::default(),
+                Transform::from_translation(Vec3::new(0.0, 600.0, 0.0)),
+                GlobalTransform::from_translation(Vec3::new(0.0, 600.0, 0.0)),
+            ));
+            app
+        }
+        let eye = |app: &mut App| {
+            for _ in 0..240 {
+                app.update();
+            }
+            let mut camera = app
+                .world_mut()
+                .query_filtered::<&Transform, With<StreamingCamera>>();
+            camera.single(app.world()).unwrap().translation.y
+        };
+
+        let mut unwalked = floor_app(false);
+        let rest = eye(&mut unwalked);
+        assert!(
+            (rest - EYE_HEIGHT).abs() < 1.0,
+            "an unwalked run did not keep the mesh probe: the eye is at {rest}"
+        );
+
+        let mut walked = floor_app(true);
+        let held = eye(&mut walked);
+        assert!(
+            (held - 600.0).abs() < 1.0,
+            "a walked run stood on a mesh with no collider: the eye is at {held}"
+        );
+    }
+
+    /// Runs `ticks` fixed steps of the real [`walk_step`] over the composite probe, doorways and
+    /// all.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_the_world_probe(
+        mut walk: ResMut<ProbeWalk>,
+        context: ReadRapierContext,
+        mut ray_cast: MeshRayCast,
+        parents: Query<&ChildOf>,
+        leaves: Query<&DoorLeaf>,
+        states: Query<&DoorState>,
+        doors: DoorwayQuery,
+    ) {
+        let Ok(context) = context.single() else {
+            return;
+        };
+        let door_solid =
+            |entity: Entity| door_mesh_is_solid(entity, None, &parents, &leaves, &states);
+        let doorways = open_doorways(&doors, |_| true);
+        let mut probe = WorldProbe {
+            world: RapierProbe { context },
+            ray_cast: &mut ray_cast,
+            door_solid: &door_solid,
+            doorways: &doorways,
+        };
+        let mut player = Player::default();
+        let mut position = walk.start;
+        for _ in 0..walk.ticks {
+            position = walk_step(
+                &mut probe,
+                &mut player,
+                position,
+                walk.input,
+                PHYSICS_TIMESTEP,
+            )
+            .position;
+        }
+        walk.position = position;
+    }
+
+    /// A walk along `+X` from the origin through the doorway scene, and where it ended.
+    fn walk_through(app: &mut App) -> Vec3 {
+        app.insert_resource(ProbeWalk {
+            start: Vec3::new(0.0, EYE_HEIGHT, 0.0),
+            input: MoveInput {
+                right: 1.0,
+                sprint: true,
+                ..MoveInput::default()
+            },
+            ticks: 180,
+            ..ProbeWalk::default()
+        });
+        app.world_mut()
+            .run_system_once(walk_the_world_probe)
+            .unwrap();
+        app.world().resource::<ProbeWalk>().position
+    }
+
+    /// A floor, and a wall of authored collision across a load door's doorway: the door at `+X =
+    /// 200` and `z = door_z`, its model 120 wide and 240 tall around its origin, 20 deep, turned a
+    /// quarter so that its depth runs along the walk. The wall's near face is at `x = 210`, ten
+    /// units behind the door and well inside the doorway volume wherever the door stands over it.
+    fn doorway_scene(state: DoorState, door_z: f32) -> (App, Entity) {
+        let mut app = mesh_app();
+        spawn_world_collider(
+            &mut app,
+            Vec3::new(0.0, -20.0, 0.0),
+            Vec3::new(1000.0, 20.0, 1000.0),
+        );
+        spawn_world_collider(
+            &mut app,
+            Vec3::new(230.0, 100.0, 0.0),
+            Vec3::new(20.0, 100.0, 400.0),
+        );
+        let position = Vec3::new(200.0, 0.0, door_z);
+        let door = app
+            .world_mut()
+            .spawn((
+                doorway_door(),
+                state,
+                ExpectedModelBounds::new(
+                    Vec3::new(-60.0, 0.0, -10.0),
+                    Vec3::new(60.0, 240.0, 10.0),
+                )
+                .unwrap(),
+                Transform::from_translation(position)
+                    .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+                GlobalTransform::from(
+                    Transform::from_translation(position)
+                        .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+                ),
+            ))
+            .id();
+        sync_physics(&mut app);
+        (app, door)
+    }
+
+    /// The door's own link, as the tests above build one.
+    fn doorway_door() -> LoadDoor {
+        LoadDoor {
+            ref_id: 0x92809,
+            destination: crate::doors::DoorDestination {
+                destination_ref_id: 0x92909,
+                interior_cell_id: Some(1),
+                worldspace_id: None,
+                arrival_position: [0.0; 3],
+                arrival_rotation: [0.0; 3],
+            },
+            label: "Alftand".to_owned(),
+            auto_load: false,
+            outward: None,
+        }
+    }
+
+    /// The Alftand failure: an open door whose doorway the authored collision behind it closes.
+    /// The walk goes through, and out past the wall.
+    #[test]
+    fn a_wall_across_an_open_doorway_does_not_block_the_walk() {
+        let (mut app, _) = doorway_scene(DoorState::Open { animated: true }, 0.0);
+        let end = walk_through(&mut app);
+        assert!(
+            end.x > 330.0,
+            "the open doorway's wall stopped the walk at {end:?}"
+        );
+        assert!(
+            (end.y - EYE_HEIGHT).abs() < 1.0,
+            "the walk through the doorway left the floor: {end:?}"
+        );
+    }
+
+    /// The same wall with the door closed is a wall, and a closed leaf in front of it blocks first.
+    #[test]
+    fn the_same_wall_blocks_a_closed_door_and_so_does_its_leaf() {
+        let (mut app, _) = doorway_scene(DoorState::Closed, 0.0);
+        let end = walk_through(&mut app);
+        assert!(
+            end.x > 50.0 && end.x < 210.0,
+            "a closed door's wall did not stop the walk at its face: {end:?}"
+        );
+
+        let (mut app, door) = doorway_scene(DoorState::Closed, 0.0);
+        let leaf = spawn_mesh_box(
+            &mut app,
+            Vec3::new(150.0, 100.0, 0.0),
+            Vec3::new(10.0, 200.0, 200.0),
+        );
+        app.world_mut().entity_mut(leaf).insert(DoorLeaf { door });
+        app.update();
+        let end = walk_through(&mut app);
+        assert!(
+            end.x > 50.0 && end.x < 150.0,
+            "a closed leaf did not stop the walk before it: {end:?}"
+        );
+    }
+
+    /// A wall where there is no door still blocks: the carve is the doorway's alone.
+    #[test]
+    fn the_same_wall_away_from_a_doorway_still_blocks() {
+        // An open door 400 units to the side: its doorway volume starts well past the wall's face
+        // where the player meets it.
+        let (mut app, _) = doorway_scene(DoorState::Open { animated: true }, 400.0);
+        let end = walk_through(&mut app);
+        assert!(
+            end.x > 50.0 && end.x < 210.0,
+            "a wall away from the open doorway let the walk through: {end:?}"
+        );
+    }
+
+    /// The floor inside a doorway is still a floor, and so is the top of something in it: only the
+    /// rays that look along the walls are let through.
+    #[test]
+    fn the_floor_inside_a_doorway_still_supports_the_player() {
+        let (mut app, _) = doorway_scene(DoorState::Open { animated: true }, 0.0);
+        // In the doorway's volume, in front of the wall's face: the floor.
+        app.insert_resource(ProbeRays(vec![
+            (Vec3::new(205.0, 150.0, 0.0), Vec3::NEG_Y, 400.0),
+            // Above the wall inside the volume: the wall's top, which is ground too.
+            (Vec3::new(230.0, 300.0, 0.0), Vec3::NEG_Y, 400.0),
+            // The wall itself, along it: let through.
+            (Vec3::new(0.0, EYE_HEIGHT, 0.0), Vec3::X, 400.0),
+        ]));
+        app.init_resource::<ProbeHits>();
+        app.world_mut()
+            .run_system_once(cast_world_and_door_rays)
+            .unwrap();
+        let hits = &app.world().resource::<ProbeHits>().0;
+        let floor = hits[0].expect("the doorway's floor is ground");
+        assert!(floor.point.y.abs() < 1.0, "the floor is at {floor:?}");
+        let top = hits[1].expect("the top of the wall in the doorway is ground");
+        assert!((top.point.y - 200.0).abs() < 1.0, "the top is at {top:?}");
+        assert!(hits[2].is_none(), "a wall ray was stopped by {:?}", hits[2]);
+    }
+
+    /// A door that is not in the player's space has no doorway: it carves nothing, open or not.
+    #[test]
+    fn a_door_of_another_space_carves_no_doorway() {
+        let (mut app, door) = doorway_scene(DoorState::Open { animated: true }, 0.0);
+        let own = app
+            .world_mut()
+            .run_system_once(move |doors: DoorwayQuery| open_doorways(&doors, |_| true).len())
+            .unwrap();
+        assert_eq!(own, 1, "the open door of the player's space has a doorway");
+        let foreign = app
+            .world_mut()
+            .run_system_once(move |doors: DoorwayQuery| {
+                open_doorways(&doors, |entity| entity != door).len()
+            })
+            .unwrap();
+        assert_eq!(foreign, 0, "a door of another space carved a doorway");
+        // And the closed door of the player's space has none either.
+        let (mut app, _) = doorway_scene(DoorState::Closed, 0.0);
+        let closed = app
+            .world_mut()
+            .run_system_once(|doors: DoorwayQuery| open_doorways(&doors, |_| true).len())
+            .unwrap();
+        assert_eq!(closed, 0, "a closed door carved a doorway");
     }
 }

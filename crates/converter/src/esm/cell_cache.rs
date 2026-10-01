@@ -73,6 +73,11 @@ pub fn write_cell_cache(records: &HashMap<u32, RawRecord>, path: &Path) -> Resul
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Staged outputs may share an inode with a previous pack via
+    // hard link; replace the path instead of writing through it.
+    if path.is_file() {
+        std::fs::remove_file(path)?;
+    }
     let mut file = File::create(path)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
@@ -130,7 +135,9 @@ fn water_by_cell(records: &HashMap<u32, RawRecord>) -> HashMap<u32, (Option<f32>
 
 /// A worldspace's default water height, or `None` for the markers some worldspaces use to
 /// mean "no water" (`MossMotherCavernWorld` 9,999,999, `DeepwoodRedoubtWorld` -500,000). No
-/// real Skyrim water lies further than 100,000 units from zero.
+/// real Skyrim water lies further than 100,000 units from zero. The bound is tighter than
+/// `normalize_water_height`'s 1e7, which only has to reject a cell's `FLT_MAX` sentinel and would let
+/// `MossMotherCavernWorld`'s 9,999,999 through.
 fn normalize_default_water_height(height: f32) -> Option<f32> {
     (height.is_finite() && height.abs() < 1.0e5).then_some(height)
 }
@@ -423,6 +430,7 @@ mod tests {
             None,
             &[
                 (b"DNAM", floats(&[-27000.0, -14000.0])),
+                // An arbitrary water type id, not retail data (Tamriel's real NAM2 is 0x18).
                 (b"NAM2", 0x0001_8F2Cu32.to_le_bytes().to_vec()),
             ],
         );
@@ -591,8 +599,17 @@ mod tests {
 
         #[test]
         fn land_decoders_never_panic_on_arbitrary_bytes(
-            heights in arbitrary_bytes(2 * 4 + 33 * 33),
-            normals in arbitrary_bytes(3 * 33 * 33),
+            // Arbitrary lengths reach only the decoders' length checks, so half the cases are
+            // arbitrary bytes at the lengths the decoders accept: a VHGT record (with up to its
+            // three padding bytes) and a raw VNML grid.
+            heights in prop_oneof![
+                arbitrary_bytes(2 * 4 + 33 * 33),
+                proptest::collection::vec(any::<u8>(), 4 + 33 * 33..=4 + 33 * 33 + 3),
+            ],
+            normals in prop_oneof![
+                arbitrary_bytes(3 * 33 * 33),
+                proptest::collection::vec(any::<u8>(), 3 * 33 * 33),
+            ],
             subrecords in arbitrary_bytes(512),
         ) {
             let decoded = decode_vhgt(&heights);
