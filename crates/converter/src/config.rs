@@ -90,26 +90,15 @@ impl PipelineConfig {
             (0..=22).contains(&self.texture_zstd_level),
             "texture_zstd_level must be between 0 and 22"
         );
-        // Compared as resolved folders, not as spelled: the output is replaced
-        // on publish, staging is deleted after it, and the cache is pruned, so
-        // none of them may be, hold, or sit inside the game data.
-        let data = std::fs::canonicalize(&self.data_dir)?;
+        let cache = self.ingestion_cache_dir();
         let mut written = vec![
-            ("output directory", self.output_dir.clone()),
-            ("ingestion cache directory", self.ingestion_cache_dir()),
+            ("output directory", self.output_dir.as_path()),
+            ("ingestion cache directory", cache.as_path()),
         ];
         if let Some(staging) = &self.resume_staging {
-            written.push(("resume staging directory", staging.clone()));
+            written.push(("resume staging directory", staging.as_path()));
         }
-        for (role, path) in written {
-            let resolved = resolve_path(&path)?;
-            color_eyre::eyre::ensure!(
-                !(resolved.starts_with(&data) || data.starts_with(&resolved)),
-                "the {role} {} overlaps the Skyrim Data directory {}; choose a folder outside it that does not contain it",
-                path.display(),
-                self.data_dir.display()
-            );
-        }
+        check_folders_outside_data(&self.data_dir, &written)?;
         check_output_dir(&self.output_dir)?;
         if let Some(staging) = &self.resume_staging {
             color_eyre::eyre::ensure!(
@@ -149,6 +138,43 @@ impl PipelineConfig {
         }
         Ok(())
     }
+}
+
+/// Whether `output_dir` and the ingestion cache a run would keep beside it
+/// (`<output>.assets-cache`) stay clear of the Skyrim Data folder: neither may
+/// be, hold, or sit inside it, compared as resolved folders. Publishing
+/// replaces the output and the cache is pruned, so an overlap would delete
+/// game data. The pipeline checks this before a run; front ends can call it
+/// when a folder is chosen. `data_dir` must exist.
+pub fn check_outside_data(data_dir: &Path, output_dir: &Path) -> color_eyre::Result<()> {
+    let cache = PipelineConfig::new(data_dir, output_dir).ingestion_cache_dir();
+    check_folders_outside_data(
+        data_dir,
+        &[
+            ("output directory", output_dir),
+            ("ingestion cache directory", cache.as_path()),
+        ],
+    )
+}
+
+// Compared as resolved folders, not as spelled: the output is replaced on
+// publish, staging is deleted after it, and the cache is pruned, so none of
+// them may be, hold, or sit inside the game data.
+fn check_folders_outside_data(
+    data_dir: &Path,
+    folders: &[(&str, &Path)],
+) -> color_eyre::Result<()> {
+    let data = std::fs::canonicalize(data_dir)?;
+    for (role, path) in folders {
+        let resolved = resolve_path(path)?;
+        color_eyre::eyre::ensure!(
+            !(resolved.starts_with(&data) || data.starts_with(&resolved)),
+            "the {role} {} overlaps the Skyrim Data directory {}; choose a folder outside it that does not contain it",
+            path.display(),
+            data_dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// Why [`check_output_dir`] refused a folder.
@@ -482,6 +508,22 @@ mod tests {
         assert!(error.contains("resume staging directory"), "{error}");
 
         assert_eq!(std::fs::read(data.join("Skyrim.esm")).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn check_outside_data_matches_the_run_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let (data, _) = config_with_data(directory.path());
+        assert!(check_outside_data(&data, &directory.path().join("modern")).is_ok());
+        let error = check_outside_data(&data, &data.join("modern"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("the output directory"), "{error}");
+        assert!(check_outside_data(&data, directory.path()).is_err());
+        // The default cache sits beside the output: an output named so that
+        // its cache lands inside Data is refused too.
+        let inside = data.join("x");
+        assert!(check_outside_data(&data, &inside).is_err());
     }
 
     #[cfg(unix)]

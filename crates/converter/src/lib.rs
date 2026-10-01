@@ -24,7 +24,9 @@ mod test_strategies;
 pub use check::{
     CheckCancelled, CheckMode, CheckProblem, CheckReport, check_output, check_output_with_cancel,
 };
-pub use config::{OutputDirError, PipelineConfig, check_output_dir, find_resumable_staging};
+pub use config::{
+    OutputDirError, PipelineConfig, check_output_dir, check_outside_data, find_resumable_staging,
+};
 pub use esm::EsmParser;
 pub use integration::IntegrationReport;
 pub use pipeline::{AssetPipeline, Cancellation, PipelineFailure, PipelineReport};
