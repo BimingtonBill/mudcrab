@@ -4907,6 +4907,72 @@ mod tests {
         }
     }
 
+    /// A cell whose replacement is in flight when it falls out by distance retires holding the root
+    /// it was drawn by, at the tier that root was committed at; when the camera comes back it is
+    /// replaced through the same path a resident's tier change takes, on the same root entity.
+    #[test]
+    fn a_retiring_cell_loading_a_replacement_keeps_the_root_it_draws() {
+        let (mut app, _directory) = streaming_test_app(crossing_config(1));
+        spawn_camera(&mut app, IVec2::ZERO);
+        // The cell is drawn by a terrain-only root while its full replacement is in flight.
+        let key = exterior_cell(7, 0);
+        let root = spawn_mock_cell(&mut app, 7, 0, true);
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                key,
+                CellStatus::Loading {
+                    generation: 1,
+                    detail: CellDetail::Full,
+                    replaced: Some(root),
+                },
+            );
+        // A resident cell closer in the budget's order takes the frame's one unload.
+        let decoy = spawn_mock_cell(&mut app, 6, 0, true);
+        app.update();
+
+        assert!(
+            app.world().get_entity(decoy).is_err(),
+            "the decoy took the only unload this frame"
+        );
+        match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Retiring { root: now, detail }) => {
+                assert_eq!(*now, root, "a retiring cell keeps the root it was drawn by");
+                assert_eq!(
+                    *detail,
+                    CellDetail::Terrain,
+                    "and the tier that root was committed at, not the one it is loading"
+                );
+            }
+            other => panic!("the cell did not retire onto its old root: {other:?}"),
+        }
+        assert!(
+            app.world().get_entity(root).is_ok(),
+            "its root must not be despawned while it waits for the budget"
+        );
+
+        // The camera comes back: the plan asks for the tier the cell does not hold, and the root it
+        // kept becomes the replacement's root. Nothing is spawned and nothing is despawned.
+        move_camera(&mut app, IVec2::new(7, 0));
+        app.update();
+        match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Loading {
+                detail, replaced, ..
+            }) => {
+                assert_eq!(*detail, CellDetail::Full);
+                assert_eq!(
+                    *replaced,
+                    Some(root),
+                    "the cell is replaced through the root it kept, not a second one"
+                );
+            }
+            other => panic!("the returned cell did not take the replaced path: {other:?}"),
+        }
+        assert!(app.world().get_entity(root).is_ok());
+        assert_eq!(streaming_metrics(&app).despawns_this_frame, 0);
+    }
+
     /// A cell pinned between the plan and the pacer is revived by the pin, not despawned and
     /// requested again: the fixture's "load by id and it stays" invariant, under the pacer.
     #[test]
