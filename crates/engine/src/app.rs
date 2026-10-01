@@ -278,6 +278,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // The sky, the fog, the ambient and the per-space lighting, in one call: the plugin owns
         // the clear colour and the system that writes them (`crate::atmosphere`).
         app.add_plugins(crate::atmosphere::AtmospherePlugin);
+        // Each sky camera's dome, coloured from the space that camera shows (`crate::sky_dome`).
+        // Upstream main's `SkyPlugin` is not added: it writes every camera's clear colour and fog
+        // from one global palette, which is `crate::atmosphere`'s and `crate::portal`'s job here.
+        app.add_plugins(crate::sky_dome::SkyDomePlugin);
     }
     if let Some((database, catalog, space_lighting, cache, ground_height)) = runtime_data {
         app.insert_resource(database)

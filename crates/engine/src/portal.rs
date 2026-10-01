@@ -8920,6 +8920,52 @@ mod tests {
         );
     }
 
+    /// The doorway's own sky dome is coloured from the destination it shows, not from the space the
+    /// player stands in: the portal camera's `CameraSky` follows the door it looks through, and a
+    /// door into a space with no sky clears it (review-277).
+    #[test]
+    fn the_doorway_dome_takes_the_destinations_sky() {
+        use crate::atmosphere::space_sky;
+        use crate::sky_dome::CameraSky;
+        use crate::world::lighting::fixtures::{BLACKREACH, real_spaces};
+        let (_directory, catalog) = real_spaces();
+        let tamriel = space_sky(Some(&catalog), space_key(TAMRIEL, None));
+        let blackreach = space_sky(Some(&catalog), space_key(BLACKREACH, None));
+        assert!(tamriel.is_some() && blackreach.is_some() && tamriel != blackreach);
+
+        let SunApp {
+            mut app,
+            portal_camera,
+            ..
+        } = sun_app();
+        app.insert_resource(catalog);
+        let sky = |app: &App| {
+            app.world()
+                .entity(portal_camera)
+                .get::<CameraSky>()
+                .expect("the portal camera carries its dome's colours")
+                .palette
+        };
+        assert_eq!(sky(&app), None, "no doorway open, no sky drawn");
+
+        let day = door_to_space(TAMRIEL, None);
+        let cave = door_to_space(BLACKREACH, None);
+        let room = door_to_space(TAMRIEL, Some(INTERIOR_ALFTAND01));
+        let (day_door, _) = spawn_scened_door(&mut app, day, DoorState::Opening);
+        let (cave_door, _) = spawn_scened_door(&mut app, cave, DoorState::Opening);
+        let (room_door, _) = spawn_scened_door(&mut app, room, DoorState::Opening);
+
+        portal_shows(&mut app, Some(day_door));
+        update(&mut app, 2);
+        assert_eq!(sky(&app), tamriel);
+        portal_shows(&mut app, Some(cave_door));
+        update(&mut app, 2);
+        assert_eq!(sky(&app), blackreach);
+        portal_shows(&mut app, Some(room_door));
+        update(&mut app, 2);
+        assert_eq!(sky(&app), None, "an interior behind the door has no sky");
+    }
+
     // -----------------------------------------------------------------------------------------
     // The player controller in a world with a destination: only the active space collides and has
     // usable doors (impl-166). The findings these come from were written from the outside against
