@@ -247,6 +247,26 @@ impl AssetPipeline {
         fs::create_dir_all(staging.join("vfs"))
             .wrap_err_with(|| format!("failed to create {}", staging.join("vfs").display()))?;
         if resumed {
+            // A killed run leaves its writers' temporaries behind, and a stale one makes the
+            // writer refuse to publish (`write_glb_atomic`, the texture writer) or is simply
+            // never cleaned up. Clear them before this run treats the folder as its own.
+            let removed = remove_stale_temporary_files(&staging).wrap_err_with(|| {
+                format!(
+                    "failed to remove stale temporary files from {}",
+                    staging.display()
+                )
+            })?;
+            if removed > 0 {
+                send_notice(
+                    &progress_tx,
+                    ProgressStage::Discovering,
+                    None,
+                    &format!(
+                        "removed {removed} stale temporary file(s) left by an interrupted run"
+                    ),
+                )
+                .await;
+            }
             let mut verified = BTreeSet::new();
             if !config.invalidate_cache {
                 if let Ok(staged) = load_staged_outputs(&staging) {
@@ -1619,10 +1639,44 @@ fn overlay_loose_assets(data: &Path, vfs: &Path, files: &[PathBuf]) -> Result<()
         // A reused archive entry links its `vfs` file to the cache blob, so this override has to
         // replace the path rather than write through it: copying over the link would truncate the
         // file every other name shares, the blob and the previous output included.
+        //
+        // Written beside the destination and renamed, so a kill mid-copy cannot leave a torn file
+        // under the real name for a resumed run to accept. The fallible copy comes first, so a
+        // failed one leaves the previous file in place.
+        let temporary = destination.with_file_name(format!(
+            ".{}.{}.partial",
+            destination
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            std::process::id()
+        ));
+        if let Err(error) = fs::copy(source, &temporary) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source.display(),
+                    temporary.display()
+                )
+            });
+        }
+        // Flushed before the rename, like the converter's other writers, so a crash right after
+        // it cannot leave a torn file under the real name.
+        // Opened for writing: on Windows a flush needs write access.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
+            .and_then(|file| file.sync_all())
+            .wrap_err_with(|| format!("failed to flush {}", temporary.display()))?;
         if destination.exists() {
             fs::remove_file(&destination)?;
         }
-        fs::copy(source, destination)?;
+        fs::rename(&temporary, &destination)
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&temporary);
+            })
+            .wrap_err_with(|| format!("failed to publish {}", destination.display()))?;
     }
     Ok(())
 }
@@ -1788,6 +1842,65 @@ fn parked_journal_path(staging: &Path) -> PathBuf {
     let mut name = staging.file_name().unwrap_or_default().to_os_string();
     name.push(".journal.jsonl");
     staging.with_file_name(name)
+}
+
+/// The temporary names the converter's own writers use while publishing a file: each appends a
+/// suffix carrying the writing process's id to the real name and renames the file over its
+/// destination, so a run killed between the two leaves the temporary behind. The numeric
+/// process-id segment is what tells a leftover from a real file that merely ends in `.partial`.
+///
+/// One entry per writer:
+/// - `archive::atomic_write`: `.<name>.<pid>.partial`
+/// - `ConversionManifest::save` and the report writer: `<name>.json.<pid>.partial`
+/// - `write_glb_atomic`: `<name>.<extension>.<pid>.partial`
+/// - the texture writer: `<name>.ktx2.<pid>.partial`
+/// - the script writer: `.<name>.<pid>-<counter>.partial`
+/// - `link_or_copy_spilling`: `<name>.<index>.partial-<pid>`
+/// - `write_glb_atomic` and the texture writer also park the previous output as
+///   `<name>.glb.<pid>.backup` / `<name>.ktx2.<pid>.backup` while they swap; a leftover one makes
+///   the writer refuse, and the output it held is converted again on resume.
+fn is_converter_temporary_name(name: &str) -> bool {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if let Some(head) = name.strip_suffix(".backup") {
+        return head.rsplit_once('.').is_some_and(|(stem, pid)| {
+            digits(pid) && (stem.ends_with(".glb") || stem.ends_with(".ktx2"))
+        });
+    }
+    if let Some(head) = name.strip_suffix(".partial") {
+        // A script temporary carries a per-call counter after the process id; every other shape
+        // ends at the process id itself.
+        let head = match head.rsplit_once('-') {
+            Some((before_counter, counter)) if digits(counter) => before_counter,
+            _ => head,
+        };
+        return head.rsplit_once('.').is_some_and(|(_, pid)| digits(pid));
+    }
+    // The spill copy appends `.partial-<pid>` instead of replacing the extension.
+    name.rsplit_once(".partial-")
+        .is_some_and(|(_, pid)| digits(pid))
+}
+
+/// Removes the temporary files an interrupted run left in a staging folder, before a resumed run
+/// treats the folder as its own. Only the converter's own temporary names go: a file that merely
+/// ends in `.partial` belongs to somebody else and is left alone. Returns how many were removed.
+fn remove_stale_temporary_files(staging: &Path) -> Result<usize> {
+    let mut removed = 0;
+    for entry in WalkDir::new(staging).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file()
+            || !is_converter_temporary_name(&entry.file_name().to_string_lossy())
+        {
+            continue;
+        }
+        fs::remove_file(entry.path()).wrap_err_with(|| {
+            format!(
+                "failed to remove stale temporary {}",
+                entry.path().display()
+            )
+        })?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// Provenance for a cache entry whose output is now complete inside staging.
@@ -2288,6 +2401,96 @@ mod tests {
             "the override wrote through the link into the previous output"
         );
         assert_eq!(fs::read(&previous_blob).unwrap(), b"archive bytes");
+    }
+
+    /// Every file under `root` whose name looks like a writer's leftover.
+    fn temporaries_under(root: &Path) -> Vec<PathBuf> {
+        WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry.file_name().to_string_lossy().ends_with(".partial")
+            })
+            .map(|entry| entry.path().to_path_buf())
+            .collect()
+    }
+
+    /// The override copies through a temporary name and renames it into place, so the destination
+    /// name never holds half a file: a failed copy leaves the previous file untouched rather than
+    /// removed or torn.
+    #[test]
+    fn a_loose_override_never_leaves_a_temporary_under_the_destination_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_vfs = directory.path().join("staging/vfs");
+        let destination = staging_vfs.join("textures/rock.dds");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"archive bytes").unwrap();
+
+        // A source the copy cannot read: a directory where a file is expected.
+        let data = directory.path().join("Data");
+        let loose = data.join("textures/rock.dds");
+        fs::create_dir_all(&loose).unwrap();
+
+        assert!(
+            overlay_loose_assets(&data, &staging_vfs, std::slice::from_ref(&loose)).is_err(),
+            "copying a directory as a file fails"
+        );
+
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"archive bytes",
+            "a failed override destroyed the previous file"
+        );
+        assert!(
+            temporaries_under(&staging_vfs).is_empty(),
+            "a failed override left a temporary behind"
+        );
+
+        // The successful copy publishes the new bytes and still leaves no temporary.
+        fs::remove_dir_all(&loose).unwrap();
+        fs::write(&loose, b"loose override").unwrap();
+        overlay_loose_assets(&data, &staging_vfs, std::slice::from_ref(&loose)).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"loose override");
+        assert!(
+            temporaries_under(&staging_vfs).is_empty(),
+            "an override left a temporary behind"
+        );
+    }
+
+    #[test]
+    fn only_the_converters_own_temporary_names_are_temporary() {
+        let pid = std::process::id();
+        for name in [
+            // archive::atomic_write
+            format!(".Skyrim.esm.{pid}.partial"),
+            // the script writer
+            format!(".one.luau.{pid}-7.partial"),
+            // ConversionManifest::save and the report writer
+            format!("conversion-manifest.json.{pid}.partial"),
+            // write_glb_atomic and the texture writer
+            format!("meshes/one.glb.{pid}.partial"),
+            format!("textures/rock.ktx2.{pid}.partial"),
+            // an archive entry written by atomic_write
+            format!(".rock.dds.{pid}.partial"),
+            // link_or_copy_spilling
+            format!("deadbeef.1.partial-{pid}"),
+        ] {
+            assert!(is_converter_temporary_name(&name), "{name} was not matched");
+        }
+        for name in [
+            "hand-authored.partial",
+            "notes.txt.partial",
+            "mod.v2.partial",
+            "rock.dds.partial",
+            "one.luau",
+        ] {
+            assert!(
+                !is_converter_temporary_name(name),
+                "{name} is no temporary of ours and must be kept"
+            );
+        }
     }
 
     #[test]
@@ -3772,6 +3975,91 @@ mod tests {
         );
         assert_eq!(fs::read(output.join("scripts/one.luau")).unwrap(), expected);
         assert_eq!(crate::find_resumable_staging(&output), None);
+    }
+
+    /// A folder a killed run left behind holds the temporaries its writers never renamed into
+    /// place. The resume clears those, and only those: a real file that merely ends in `.partial`
+    /// is somebody else's and stays.
+    #[tokio::test]
+    async fn a_resumed_run_removes_stale_temporaries_and_keeps_other_partials() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/one.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+        // An asset the resumed run fails on, so it keeps its staging folder to inspect.
+        fs::create_dir_all(data.join("textures")).unwrap();
+        fs::write(data.join("textures/bad.dds"), b"not a DDS").unwrap();
+
+        // One leftover per temporary-name shape the converter's writers use. The pid is not this
+        // process's, so a stale name can never collide with the writer that made it.
+        let pid = std::process::id() + 1;
+        let staging = temp.path().join("modern.staging-1-1");
+        let stale = [
+            // The script writer: `.<name>.<pid>-<counter>.partial`.
+            staging.join(format!("scripts/.one.luau.{pid}-0.partial")),
+            // The manifest and report writer: `<name>.json.<pid>.partial`.
+            staging.join(format!("journals/conversion-manifest.json.{pid}.partial")),
+            // The mesh writer: `<name>.<extension>.<pid>.partial`.
+            staging.join(format!("meshes/one.glb.{pid}.partial")),
+            // The spill copy: `<name>.<index>.partial-<pid>`.
+            staging.join(format!("cache/deadbeef.1.partial-{pid}")),
+            // The previous output the mesh and texture writers park while they swap.
+            staging.join(format!("meshes/two.glb.{pid}.backup")),
+            staging.join(format!("textures/two.ktx2.{pid}.backup")),
+        ];
+        for path in &stale {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"torn").unwrap();
+        }
+        // A real file named like a backup of something else stays.
+        let kept_backup = staging.join("notes/settings.ini.7.backup");
+        fs::create_dir_all(kept_backup.parent().unwrap()).unwrap();
+        fs::write(&kept_backup, b"a real file").unwrap();
+        let kept = staging.join("notes/hand-authored.partial");
+        fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        fs::write(&kept, b"a real file").unwrap();
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        config.fail_fast = true;
+        let (tx, mut rx) = mpsc::channel(64);
+        let collect = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let failure = AssetPipeline::run_async(config, tx).await.unwrap_err();
+        let events = collect.await.unwrap();
+
+        assert!(
+            failure.staging.is_some_and(|kept| kept.is_dir()),
+            "a failed run keeps the folder it worked in"
+        );
+        for path in &stale {
+            assert!(!path.exists(), "{} survived the resume", path.display());
+        }
+        assert_eq!(
+            fs::read(&kept).unwrap(),
+            b"a real file",
+            "a file that merely ends in .partial was removed"
+        );
+        assert!(
+            kept_backup.is_file(),
+            "a file that merely ends in .backup was removed"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.message.contains("stale temporary")),
+            "the resume did not report the cleanup"
+        );
     }
 
     #[test]
