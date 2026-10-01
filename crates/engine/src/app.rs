@@ -413,9 +413,19 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
 /// and a single asset larger than the whole budget is still prepared. Images
 /// are prepared before meshes and share the one budget, so while new images
 /// use it up, new meshes wait for a later frame.
+///
+/// A capture run (`--shots`, `--demo-tour`) has no budget: its settle gate
+/// counts what the streamer still has to spawn, not what the render world still
+/// has to upload, and a loaded machine left whole rooms undrawn in the frame it
+/// photographed (research-283). The timing runs keep the configured budget.
 fn upload_budget(config: &EngineConfig) -> RenderAssetBytesPerFrame {
+    let captures = config.portal.shots.is_some() || config.portal.demo_tour.is_some();
     RenderAssetBytesPerFrame {
-        max_bytes: config.max_upload_bytes_per_frame(),
+        max_bytes: if captures {
+            None
+        } else {
+            config.max_upload_bytes_per_frame()
+        },
     }
 }
 
@@ -2923,6 +2933,29 @@ mod tests {
         assert_eq!(
             app.world().resource::<RenderAssetBytesPerFrame>().max_bytes,
             None
+        );
+    }
+
+    /// A capture is photographed once its streaming has settled, and nothing in that gate waits
+    /// for the render world's upload backlog, so a capture run uploads unthrottled.
+    #[test]
+    fn capture_runs_upload_without_a_budget() {
+        let with = |set: fn(&mut EngineConfig)| {
+            let mut config = EngineConfig::default();
+            set(&mut config);
+            upload_budget(&config).max_bytes
+        };
+        assert_eq!(
+            with(|c| c.portal.shots = Some(PathBuf::from("shots.json"))),
+            None
+        );
+        assert_eq!(
+            with(|c| c.portal.demo_tour = Some(PathBuf::from("tour.json"))),
+            None
+        );
+        assert_eq!(
+            with(|c| c.portal.portal_bench = Some(PathBuf::from("bench.json"))),
+            Some(16 * 1024 * 1024)
         );
     }
 
