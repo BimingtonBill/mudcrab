@@ -116,7 +116,9 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
   user, 2026-09-27; Portal's share split between Phase 1 and Phase 2 when the portal was parked,
   2026-09-28; $1.50 of Phase 1's share to the new Phase 3 Dev, the user, 2026-09-28; Phase 3's $1.50 to
   Portal Dev when the launcher was parked and the portal restarted, the user, 2026-10-01):** Phase 1 Dev
-  $3.75 of $9.73, Phase 2 Dev $3.75, Portal Dev $1.50, Phase 3 Dev $0 (packaging only), Upstream Dev $0.73. The launcher cannot enforce a per-session share,
+  $3.75 of $9.73, Phase 2 Dev $3.75, Portal Dev $1.50, Phase 3 Dev $0 (packaging only), Upstream Dev $0.73.
+  Since 2026-10-01 the stretch runs to Tue 13 Oct at about $4.29 a day, so the shares apply as proportions:
+  Phase 1 and Phase 2 about 38.5% each, Portal about 15.5%, Upstream about 7.5%. The launcher cannot enforce a per-session share,
   so each session keeps to its own; a session that finishes early says so in the log and the others
   may use the rest. It replaces the older "3 Phase 2 coders and 2 Portal coders a day". The Claude
   plan is shared too (one account): when its week runs ahead of pace, every session keeps Claude
