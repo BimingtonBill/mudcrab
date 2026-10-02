@@ -384,11 +384,16 @@ def run_git(folder: str, *args: str) -> str | None:
     return done.stdout if done.returncode == 0 else None
 
 
+def is_work_line(line: str) -> bool:
+    """A `git status --porcelain` line that is real work, not the folder's own untracked OWNER.txt."""
+    return bool(line.strip()) and line.strip() != "?? OWNER.txt"
+
+
 def worktree_info(folder: str) -> dict:
     """Branch and number of uncommitted/untracked entries (None when git failed)."""
     status = run_git(folder, "status", "--porcelain")
     branch = run_git(folder, "rev-parse", "--abbrev-ref", "HEAD")
-    dirty = None if status is None else len([ln for ln in status.splitlines() if ln.strip()])
+    dirty = None if status is None else len([ln for ln in status.splitlines() if is_work_line(ln)])
     return {"branch": (branch or "").strip() or "?", "dirty": dirty}
 
 

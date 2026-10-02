@@ -388,5 +388,13 @@ class EndToEndTests(TempCase):
         self.assertIn("thing", text)
 
 
+
+class OwnerFileIsNotWork(unittest.TestCase):
+    def test_own_owner_file_is_not_uncommitted_work(self):
+        self.assertFalse(dr.is_work_line("?? OWNER.txt"))
+        self.assertTrue(dr.is_work_line("?? notes.md"))
+        self.assertTrue(dr.is_work_line(" M src/lib.rs"))
+        self.assertFalse(dr.is_work_line("   "))
+
 if __name__ == "__main__":
     unittest.main()
