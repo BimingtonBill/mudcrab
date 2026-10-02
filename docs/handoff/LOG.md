@@ -3,6 +3,15 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+### 2026-10-02 (evening) - Claude [phase2] Phase 2 Dev (second batch: four drafts plus coc/coe, all handed off)
+
+- Handed to Upstream Dev, frozen, not pushed: arm-32 #117 `phase2/arm-32-models` 717f47f0; measure-v2 `phase2/pacing-measure-v2` 9a781f87; console #88 `phase2/dev-console` ee4755c0; physics #104 engine half `phase2/physics-bodies-v2` 1f8e6b5f; coc/coe `phase2/console-coc` b202ae9e (stacked on the console); #98 CodeRabbit round 2 `phase2/reference-shots-v2` bdde9c25. One review round each (DeepSeek + MiMo, Sol held); run ids and verdicts are in the hand-off messages. PR texts in `local/pr-drafts/` 83-, 104-, 105-, 106-, 107-.
+- Evidence: `local/pr-evidence/console/`, `physics/` (partial: a dynamic bucket in F3 outlines, no knock-over clip yet), `coc/`.
+- Physics evidence data: `D:/Modding-overflow/SkyrimConverted-p118mirror`, a hard-link copy of p2main with Phase 1's #118 clutter models laid over it (delete when no longer needed). s15 conversion deleted (the user's yes).
+- Lessons: never `git stash` in coder briefs (the stash list is shared by all worktrees); name each provider's run separately (`DeepSeek review #nnn`, `MiMo review #nnn`).
+- The load-flaky fixture test fails often while several sessions build; it passes alone. Its fix is a row in the user's table, not started.
+- Workers: none running. Next: CodeRabbit rounds on the drafts once they open.
+
 ### 2026-10-02 (afternoon) - Claude [phase1] Phase 1 Dev (physics coverage draft; #97 CodeRabbit round)
 
 - `phase1/physics-coverage` frozen at 87081482 and handed to Upstream Dev (draft, Merge after #118): #118 head
