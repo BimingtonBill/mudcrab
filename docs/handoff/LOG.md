@@ -3,6 +3,22 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+### 2026-10-02 (evening) - Claude [phase2] Portal Dev: #112 door crossing handed off
+
+Un-parked by the user. `phase2/door-preload` frozen at **e88f9bcc** (main merged through #92) and handed to Upstream
+Dev as one draft: engine door-link reader (optional `door_links` table) + E/fade/space switch/teleport crossing;
+the converter `door_links` export is its own later PR (waits for eclepso's #110), preload third. Checks on the
+head: fmt, clippy `--workspace --all-targets --all-features`, nextest 784/784, doctests. Real data (main conversion
++ door_links copied from the portal DB, `D:\Modding-overflow\p2main-doors`): Riverwood -> Sven's house 1,235 ms
+E-to-fade-in, back 7,426 ms. Fixed on the way: fade-in waited for GPU uploads (budget lifted while black), gate
+scoped to the landing cell (was global: the exterior always hit the 10 s timeout), interior restore offset.
+Reviews: DeepSeek 700/703, MiMo 701/704 (Sol pace-held), final "small fixes"; worldspace-0 rejection left under
+Still open. `TeleportPlayer` in physics.rs is byte-identical with Phase 2's `phase2/console-coc` (trial merge:
+three keep-both conflicts). Local-only evidence driver on `local/door-evidence` (wt-697; never push). PR text
+`local/pr-drafts/door-crossing.md`, media in `local/review/pr-phase2-door-preload/`. Incident: a coder's
+`git stash pop` applied Phase 2's stash (stashes are shared by worktrees); nothing lost; coders now banned from
+git stash. **No workers running.**
+
 ### 2026-10-02 (evening) - Claude [phase3] Phase 3 Dev (Mudcrab rename re-land prepared, handed off)
 
 - Upstream Dev's handout: the scripted re-land of the Mudcrab rename (#66 + #68's fixes). Branch `chore/mudcrab-rename` from origin/main 1b70b9b0, frozen head 26297359 (worktree D:/Modding-overflow/wt/p3-rename). Not pushed; handed to Upstream Dev; PR text `local/pr-drafts/109-pr-mudcrab-rename.md` (re-land recipe in its Status).
