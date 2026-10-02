@@ -46,6 +46,8 @@ NEVER_TOUCH_PATTERNS = [
     "Wabbajack",
     "OpenSkyrimProject",  # the main checkout
     "SkyrimConverted*",  # converted game data; measuring it once blocked a conversion
+    ".cargo",  # C:\Modding\.cargo holds the quick build profile for every checkout
+    "wkj-contributor-status",  # the user's local-only contributor status tool
 ]
 
 DRIVES = ["C:\\", "D:\\"]
