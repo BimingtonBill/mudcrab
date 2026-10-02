@@ -70,8 +70,10 @@ before starting any `phase2/*` branch or moving work between tracks.
 >   `gh pr create`, `gh pr comment`, `gh issue create`, or any `gh api` call that writes to
 >   GitHub. Hand the finished branch, commit and evidence to Upstream Dev by message instead.
 > - Upstream Dev shows the user each item (a rendered preview for text, AI label at the top) and
->   publishes only after the user's clear yes, given in Upstream Dev's own session. A yes relayed
->   by another session does not count, and one yes covers only the item it was given for.
+>   publishes only after the user's clear yes, given in Upstream Dev's own session. A yes for
+>   PUBLISHING relayed by another session does not count, and one yes covers only the item it was
+>   given for. (Job hand-outs are different: a job the user approved in Upstream Dev's session and
+>   Upstream Dev hands to a dev session is a valid hand-out.)
 > - Exception (the user, 2026-09-28): Upstream Dev may reply to CodeRabbit (the bot) on our PRs
   without asking, AI-labelled. Replies to people still need the user's yes.
 > - Reading GitHub (`gh pr view`, `gh api` GETs, `git fetch`) is fine for every session.
@@ -113,14 +115,11 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
 - **Shared findings go in shared places:** reference shots and grades (`local/reference/`), the
   look-gaps list (`docs/research/look-gaps-*.md`), research (`local/research/`), so any session can
   pick them up without asking.
-- **Budgets are shared:** the DeepSeek daily limit (`ds_spend.py status`; a stretch to Sat 3 Oct, about
-  $9.73 a day) covers every session; say in the log when a session holds coders. **The split (the
-  user, 2026-09-27; Portal's share split between Phase 1 and Phase 2 when the portal was parked,
-  2026-09-28; $1.50 of Phase 1's share to the new Phase 3 Dev, the user, 2026-09-28; Phase 3's $1.50 to
-  Portal Dev when the launcher was parked and the portal restarted, the user, 2026-10-01):** Phase 1 Dev
-  $3.75 of $9.73, Phase 2 Dev $3.75, Portal Dev $1.50, Phase 3 Dev $0 (packaging only), Upstream Dev $0.73.
-  Since 2026-10-01 the stretch runs to Tue 13 Oct at about $4.29 a day, so the shares apply as proportions:
-  Phase 1 and Phase 2 about 38.5% each, Portal about 15.5%, Upstream about 7.5%. The launcher cannot enforce a per-session share,
+- **Budgets are shared:** the DeepSeek credit is stretched to Tue 13 Oct (`ds_spend.py status` shows
+  today's share, about $4.3-4.5 a day) and covers every session; say in the log when a session holds
+  coders. **The split (the user, last changed 2026-10-01), as proportions of each day's share:**
+  Phase 1 and Phase 2 about 38.5% each, Portal about 15.5%, Upstream Dev about 7.5%, Phase 3 none
+  (packaging only). The launcher cannot enforce a per-session share,
   so each session keeps to its own; a session that finishes early says so in the log and the others
   may use the rest. It replaces the older "3 Phase 2 coders and 2 Portal coders a day". The Claude
   plan is shared too (one account): when its week runs ahead of pace, every session keeps Claude
@@ -128,20 +127,26 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
 - **Other worker providers (the user, 2026-09-28):** every dev session may use them beside DeepSeek
   (details in the deepseek-agents skill, "Other providers"). **Meta Muse Spark:** the user opted
   OpenSkyrim in to its contributor tier (Meta may use what it is sent): `-Provider meta -Tier
-  contributor`, panel `Muse <kind> #nnn: ...`, tracked files only (no `local/`, captures or game
-  data). Use it for code research and analysis, standing audits, map and pitfalls refreshes, and a
-  second review beside DeepSeek's, never as the only reviewer. Screenshots go to its standard tier
-  (`-Provider meta`, no `-Tier`), never the contributor tier. **Xiaomi MiMo** (`-Provider xiaomi`,
+  contributor`, panel `Muse <kind> #nnn: ...`. Since 2026-10-02 (the user, "not super sensitive
+  data") it has full access like the other workers (`contributorFullAccess` in providers.json):
+  it reads `local/` and `-AddDir` folders; still never captures, screenshots or game data. Use it for code research and analysis, standing audits, map and pitfalls refreshes, and a
+  second review beside DeepSeek's, never as the only reviewer. Screenshots go to DeepSeek or MiMo
+  (Muse runs only on its contributor tier here, the user's choice). **Xiaomi MiMo** (`-Provider xiaomi`,
   panel `MiMo ...`, plan ends 27 Oct): non-urgent background work only; rerun a failed MiMo run on
   DeepSeek. Coders stay on DeepSeek for now.
 
 ## While working
 
 - Do not rewrite history (no amend, rebase or force-push on commits already made).
-- **Division of labour (delegation level 4 of 5, set back to 4 by the user on 2026-09-24 after a morning at 3; spend is now capped by a $20 weekly DeepSeek limit, and the generated delegation block governs; see the block above):** Claude plans, writes briefs, reviews and integrates; DeepSeek workers do the research, audits, analysis of completed profiling and acceptance runs, assigned documentation, and most implementation - including multi-file changes within a crate - each in its own worktree with an owned-file list (`tools/ds_impl.ps1`). Claude keeps integration, cross-crate architecture, the `crates/shared/` contracts, dependency changes, and the acceptance/sign-off runs. Every worker patch gets an independent review and harness-run acceptance before it is merged; a tuning or calibration task (thresholds, geometry, heuristics fitted to samples) must also pass on examples the worker never saw. Minimize Claude's investigation, review and repair load; DeepSeek cost is negligible to the user, so do not cut useful reasoning or review to save it. See `tasks/deepseek/delegation-policy.md`.
-- Commit each meaningful step. Prefix the commit subject with who wrote the change: `[claude]`, `[deepseek]`, or `[chatgpt]` if ChatGPT/Codex joins. DeepSeek workers launched from `tasks/deepseek/` commit only their own paths and leave handoff notes in `docs/handoff/`.
+- **Division of labour (delegation level 4 of 5, set back to 4 by the user on 2026-09-24 after a morning at 3; spend follows the stretch in `ds_spend.py status`, and the generated delegation block governs; see the block above):** Claude plans, writes briefs, reviews and integrates; DeepSeek workers do the research, audits, analysis of completed profiling and acceptance runs, assigned documentation, and most implementation - including multi-file changes within a crate - each in its own worktree with an owned-file list (`tools/ds_impl.ps1`). Claude keeps integration, cross-crate architecture, the `crates/shared/` contracts, dependency changes, and the acceptance/sign-off runs. Every worker patch gets an independent review and harness-run acceptance before it is merged; a tuning or calibration task (thresholds, geometry, heuristics fitted to samples) must also pass on examples the worker never saw. Minimize Claude's investigation, review and repair load; DeepSeek cost is negligible to the user, so do not cut useful reasoning or review to save it. See `tasks/deepseek/delegation-policy.md`.
+- Commit each meaningful step. On `portal` and this checkout's own files, prefix the commit subject with who wrote the change: `[claude]`, `[deepseek]`, or `[chatgpt]` if ChatGPT/Codex joins. Upstream-bound branches (`phase1/*`, `phase2/*`, `phase3/*`, `chore/*`, `docs/*`) use upstream's conventional commits instead (`fix(converter): ...`, no prefix). DeepSeek workers launched from `tasks/deepseek/` commit only their own paths and leave handoff notes in `docs/handoff/`.
 - Task queue for DeepSeek workers and how to run it: `tasks/deepseek/README.md`. Review `[deepseek]` commits and their handoff notes before building on them.
-- Before committing Rust changes, run what CI runs: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and the tests of the crates you touched.
+- **The checks (one list; SEND-CHECKLIST.md and STYLE.md point here).** Before committing Rust changes:
+  `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`;
+  `cargo nextest run` for the crates you touched (`-p <crate> --all-targets`). Before handing a branch
+  to Upstream Dev, and for every PR's Verification boxes: the whole workspace, `cargo nextest run
+  --workspace --all-targets` plus `cargo test --workspace --doc` (nextest skips doctests). Each in the
+  session's own build folder (see "Disk"); a combined or branch-vs-main check in a throwaway one.
 - Keep `docs/` current. Findings go in the docs (`docs/research/`, `docs/roadmap/`), not only in chat.
 - **Installed dev tools (2026-09-26):** `cargo nextest run` matches CI's test runner, so prefer it
   locally; it still compiles, so the build rules above apply. For render bugs, capture a frame

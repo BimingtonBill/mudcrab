@@ -16,6 +16,8 @@ so re-read upstream's roadmap before sending anything more.
 **Priority:** the Phase 2 track comes first. Portal work fills the time Phase 2 PRs spend waiting on
 upstream review.
 
+> **Current state (2026-10-02):** upstream is `Mudcrab-Team/mudcrab` (renamed from realfakenerd/OpenSkyrim); the 2026-09-23 send hold, the schema numbers, the conversion plans and the PR 1-12 list below are **history**. For live rules see AGENTS.md (tracks, publishing, checks, disk), `local/pr-drafts/SEND-CHECKLIST.md` and the send queue `docs/pr/upstream-queue.md`. Portal Dev may build `phase2/*` work for upstream (e.g. the door crossing, #128); it goes upstream through Upstream Dev like any Phase 2 branch.
+
 ## Why
 
 Upstream (`realfakenerd/OpenSkyrim`, now **Wah Krah Jol**) counts Phase 2 as implemented and waiting
