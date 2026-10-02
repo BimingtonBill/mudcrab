@@ -43,6 +43,22 @@ expects to open them as drafts. `phase2/load-faster` and `phase2/pacing-measure`
 **Kept in the tank (the user, via Upstream Dev):** both branches frozen at those heads; nothing opens yet. Final texts
 are `local/pr-drafts/105-pr-117b-load-faster.md` and `106-pr-117a-pacing-measure.md` (Upstream Dev's edits).
 
+### 2026-10-02 - Claude [phase2] Portal Dev on #112 door preload (PARKED by the user)
+
+Upstream Dev's hand-out: Chef's Mudcrab-Team/mudcrab#112. Main has no load doors at all (no `door_links`, XTEL never
+decoded, no activation, no space switch, no fade); scope `local/research/door-preload-scope.md`, plan posted on #112
+(issuecomment-5942868617): PR A = converter door_links + engine reader (optional table, no schema bump), PR B =
+crossing + fade, PR C = preload. Branch `phase2/door-preload` (worktree `C:\Modding\wkj-door-preload`, from
+origin/main 461517bf): 6e663fd9 engine reads door links (tests pass); b4609a15 **WIP** crossing + fade
+(`door_crossing.rs`, `ActiveSpace`, `TeleportPlayer` event in physics.rs as agreed with Phase 2 Dev; headless
+tests pass, fmt ok; clippy not run; never run on real data). **Open in the WIP:** arrival height (XTEL is feet,
+teleport sets the body origin), activation needs `ExpectedModelBounds`, restore pose after a rebase during the
+fade-out, E also reaches the debug tankard grab. Converter XTEL decode is HELD for eclepso (#110 plugin-local
+form IDs). Local evidence data: `D:\Modding-overflow\p2main-doors` (Phase 2's main conversion + door_links copied
+from the portal DB; local only). **Next when unparked:** clippy (`--workspace --all-targets --all-features`),
+an evidence run at Riverwood, converter slice after eclepso answers, then the two-provider pre-open review
+(SEND-CHECKLIST §1) per PR. Upstream Dev relays Chef's/eclepso's replies. **No workers running.**
+
 ### 2026-10-01 (day) - Claude [portal] Portal Dev (catch-up with main, steps 1-5 of 7)
 
 **Branch `portal-merge-main`** (worktree `C:\Modding\wkj-portal-merge`, head 7bc1de29, not yet merged into
