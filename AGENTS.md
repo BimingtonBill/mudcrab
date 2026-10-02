@@ -112,6 +112,12 @@ before starting any `phase2/*` branch or moving work between tracks.
 >   maintainer waiting on us); a clash over the shared PC (a timing run against a build, a
 >   conversion's publish); a tool outage blocking every track. Anything the user asks is answered
 >   at once.
+> - **Less work coming at the user (added 2026-10-03, same trial).** The evening table holds at most
+>   about 8 decisions, most important first; the rest roll to the next day. Each morning brief
+>   proposes at most 2 active tracks for the day; the others pause (finishing round-2 fixes on
+>   already-open PRs is allowed). New work found during the day (an idea, a follow-up, a request)
+>   goes into the next morning's plan instead of starting the same day, unless the user says
+>   otherwise.
 
 The user's standing rule since 2026-09-25: the dev sessions work as one team by default, the way
 they did on the night of 2026-09-24. The tracks stay separate; the people don't.
