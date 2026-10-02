@@ -190,9 +190,47 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
     Bevy link plus a parallel archive extraction crossed it on 2026-09-23 ("memory allocation of
     1048576 bytes failed" at 26% extraction). The converting session announces start and end.
 
+## Disk: folders, owners and clean-up (the user, 2026-10-02)
+
+Deleting data is the risk here, so these rules lean towards keeping. Step 1 (now): owner files and a
+read-only report; nothing is deleted automatically. A standing yes for class A may follow later,
+only if the user gives one.
+
+- **One build folder per session**, never shared between sessions; combined or branch-vs-main
+  checks use a throwaway folder deleted afterwards. A shared folder mixed worktrees on 2026-10-02
+  (an engine built against another branch's `shared` crate).
+- **Every folder a session creates** under `C:\Modding` or `D:\Modding-overflow` (build folder,
+  worktree, evidence or data copy, scratch) gets an `OWNER.txt` the moment it is made
+  (`python tools/disk_report.py --template`): owner, purpose, class, keep-until (`pr:N`,
+  `date:YYYY-MM-DD` or `while-open`), links (yes/no).
+- **Classes.** A: rebuildable (build folders, scratch, throwaway checks). B: evidence or data
+  copies; they go only after their PR has merged or closed plus a few days, and only once the
+  evidence is safe in `local/review/` or the fork's `pr-assets`. C: converted game data, anything
+  containing junctions, symlinks or hard links, and anything without an owner file: never on a
+  routine list; each one is its own decision by the user, with the safe method written down.
+- **Unknown means keep.** A folder without `OWNER.txt` is never treated as rubbish; it goes on the
+  report's "Who owns this?" list.
+- **Only the owner deletes**, only its own folders, only with the user's yes for the folders named
+  (`tools/disk_report.py` and Upstream Dev only report). Never while the owner has a worker, build,
+  engine or conversion running in or against it.
+- **How to delete.** Worktrees with `git worktree remove` (it refuses uncommitted changes; never
+  `--force`). Branches are not deleted as part of clean-up. Before any recursive delete, check the
+  folder for junctions and symlinks; if there are any, stop: it is class C. A recursive delete can
+  follow a junction and wipe the real folder behind it (`p2main-doors` links into Phase 2's
+  conversion).
+- **Never touch:** the repo checkouts themselves, the game install, `SkyrimConverted*` (except by
+  the user's own decision), and the user's own tools in `C:\Modding` (Wabbajack, Modlists,
+  Bethini Pie).
+- **When clean-up happens:** when a PR merges or closes, Upstream Dev tells the owner, which offers
+  that PR's worktree, folder and evidence for deletion; at the end of every session, each session
+  removes its own throwaway (class A, expired) folders; before a build or conversion, a session
+  below ~40 GB free on that drive offers its own expired folders first. Upstream Dev runs
+  `tools/disk_report.py` at the start of each day and gives the user the "can go" list.
+- **Log every deletion** in that day's team log: path, size, owner, reason.
+
 ## At the end of every session
 
-Commit your work, then add a dated entry at the top of `docs/handoff/LOG.md`: what changed, what was tested, whether a worker is still running, and the next step.
+Commit your work, then add a dated entry at the top of `docs/handoff/LOG.md`: what changed, what was tested, whether a worker is still running, and the next step. Then delete your own expired class A folders (see "Disk" above; the user's yes covers only folders already named in a "can go" list) and log them.
 
 ## Handoff log
 
