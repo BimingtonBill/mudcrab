@@ -76,6 +76,14 @@ before starting any `phase2/*` branch or moving work between tracks.
 >   Upstream Dev hands to a dev session is a valid hand-out.)
 > - Exception (the user, 2026-09-28): Upstream Dev may reply to CodeRabbit (the bot) on our PRs
   without asking, AI-labelled. Replies to people still need the user's yes.
+> - **Standing yes for fix pushes (the user, 2026-10-02).** Upstream Dev may push, without asking
+>   each time, a fix to one of OUR already-open PRs when all hold: it answers findings someone
+>   raised (CodeRabbit, a reviewer, our own pre-open review), no new features; the dev session's
+>   delta check passed and Upstream Dev read the change; it is a fast-forward of the PR branch;
+>   the PR stays within the 3-round cap. Upstream Dev then answers the bot threads and lists every
+>   such push in one summary table for the user the same day. Still the user's yes each time:
+>   opening a new PR (drafts too), marking a draft ready, any reply to a person, anything on
+>   someone else's PR, and anything that is not a fast-forward.
 > - Reading GitHub (`gh pr view`, `gh api` GETs, `git fetch`) is fine for every session.
 
 > **Handed-out jobs only (the user, 2026-09-30).** Dev sessions work only on jobs the user or
