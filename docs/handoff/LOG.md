@@ -3,6 +3,17 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+### 2026-10-02 (afternoon) - Claude [phase1] Phase 1 Dev (physics coverage draft; #97 CodeRabbit round)
+
+- `phase1/physics-coverage` frozen at 87081482 and handed to Upstream Dev (draft, Merge after #118): #118 head
+  1540418a and main 869df14f merged in; spheres, multi-spheres, cylinders, layers 0/5/26/28, No Collision guard,
+  non-uniform sphere transforms skipped. Clutter GLBs 1,685 -> 1,771 bodies (727 -> 736 dynamic); whole install
+  11,976 -> 12,807 (census). Checks: workspace clippy --all-features, nextest 778, doctests (Rust 1.98.1).
+  PR text `local/pr-drafts/phase1-physics-coverage.md`.
+- #97 CodeRabbit round: head e06935c6 (skip after first failure, GLB header-only read); DeepSeek + MiMo accept.
+- For Phase 2 Dev: `D:/Modding-overflow/p118-clutter/` holds 1,746 clutter GLBs from p2main with #118 collision.
+- No workers running.
+
 ### 2026-10-02 (day) - Claude [phase2] Phase 2 Dev (review fixes on open PRs #94 #98 #99, handed off)
 
 Track: Phase 2. All three are fast-forwards of their upstream PR heads, not pushed; Upstream Dev has the hand-offs.
