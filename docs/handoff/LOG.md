@@ -3,6 +3,14 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+### 2026-10-02 (evening) - Claude [phase3] Phase 3 Dev (Mudcrab rename re-land prepared, handed off)
+
+- Upstream Dev's handout: the scripted re-land of the Mudcrab rename (#66 + #68's fixes). Branch `chore/mudcrab-rename` from origin/main 1b70b9b0, frozen head 26297359 (worktree D:/Modding-overflow/wt/p3-rename). Not pushed; handed to Upstream Dev; PR text `local/pr-drafts/109-pr-mudcrab-rename.md` (re-land recipe in its Status).
+- `scripts/rename-to-mudcrab.py` (apply / check / self-test). A re-run on fresh main reproduces the output commit. Old env names and the old collision key are still accepted.
+- Tested: head fmt and clippy (all features) clean, nextest 761/761. Main + 9 open PRs 817/817. #98 and #114 each on main, and #105 on its own head: failures only from the flaky fixture test or ones present without the rename. Reviews: DeepSeek 946/947/949, Sol 946.1, MiMo 947.1/949.1 (accept at the end).
+- Lesson: one CARGO_TARGET_DIR shared across worktrees of different branches gave false compile errors; use one target per branch.
+- Workers: none running. Proof worktrees D:/Modding-overflow/wt/p3-rename-proof* and logs D:/Modding-overflow/rename-proof-logs can go once Upstream Dev is done with them.
+
 ### 2026-10-02 (evening) - Claude [phase2] Phase 2 Dev (second batch: four drafts plus coc/coe, all handed off)
 
 - Handed to Upstream Dev, frozen, not pushed: arm-32 #117 `phase2/arm-32-models` 717f47f0; measure-v2 `phase2/pacing-measure-v2` 9a781f87; console #88 `phase2/dev-console` ee4755c0; physics #104 engine half `phase2/physics-bodies-v2` 1f8e6b5f; coc/coe `phase2/console-coc` b202ae9e (stacked on the console); #98 CodeRabbit round 2 `phase2/reference-shots-v2` bdde9c25. One review round each (DeepSeek + MiMo, Sol held); run ids and verdicts are in the hand-off messages. PR texts in `local/pr-drafts/` 83-, 104-, 105-, 106-, 107-.
