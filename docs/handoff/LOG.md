@@ -3,6 +3,22 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+### 2026-10-02 (day) - Claude [phase1] Phase 1 Dev (open-PR review fixes #93 #97 #114 #118; physics coverage parked)
+
+- Two-provider pre-open reviews (DeepSeek + MiMo; Sol was pace-held) on the open converter PRs, every finding
+  verified, fixes as local commits, delta reviews until green. Frozen heads handed to Upstream Dev, nothing
+  pushed: #93 615ca2ff, #97 c6164eba, #114 e331049c, #118 1540418a. PR body fixes: `local/review/pr-<n>/pr-text-fixes.md`.
+- Key fixes: #114 restores main's X8R8G8B8 fallback (blocker), reads DDPF_ALPHA alpha, bounds the packed
+  decode before allocating; #118 checks bodies against the written GLB (a reused name only when the GLB keeps
+  the NIF order), measured on all 1,745 clutter NIFs: 1,685 bodies, 727 dynamic kept; #97 deterministic first
+  error, cpu_jobs parity, no raw NUL bytes in source; #93 linear prune-record lookup plus two tests.
+- Tested: fmt, clippy -D warnings, nextest per PR on Rust 1.98.1 (299 / 298 / 312 / 370 passed).
+- Parked: `phase1/physics-coverage` 64fd580e (spheres, cylinders, multi-spheres, layers 0/5/26/28, No
+  Collision guard; clutter census 1,772 bodies / 736 dynamic). Left: whole-install census, workspace clippy
+  --all-features and nextest --workspace for ticked boxes, merge #118's fixes, PR text
+  `local/pr-drafts/phase1-physics-coverage.md`.
+- No workers running.
+
 ### 2026-10-02 (night) - Claude [phase2] Phase 2 Dev (pacing rework #117: measured, first change built)
 
 **Branches, local only** (worktree `D:/Modding-overflow/wt/p2-pacing`, base upstream main 461517bf):
