@@ -894,3 +894,13 @@ tour.
 - **Skyrim SE** is installed at `C:\Games\Steam\steamapps\common\Skyrim Special Edition`. Workers can read it (in `readOnlyDirs` and described in `tasks/deepseek/context.md`) but never write to it.
 - **Private project:** the user wants none of this public. Commit locally only, never push, never open PRs against the upstream repository.
 - **Next:** run the harness self-test (`tasks/deepseek/selftest.md`), then choose the first tasks.
+
+## 2026-10-02 Phase 2 Dev: review fixes on open PRs #94, #98, #99 handed off
+
+Track: Phase 2. All three are fast-forwards of their upstream PR heads, not pushed; Upstream Dev has the hand-offs.
+- #98 `phase2/reference-shots-v2` head 5b18ec81: failed PNG writes fail the shot (temp file, PNG check, rename), valueless `--shots`/`--shots-out` are errors, settle counts failures per shot, PrimaryWindow query. Final check review-684: DeepSeek small fixes (nits), MiMo ready. Reply to Chef: `local/pr-drafts/98-reply-chef.md`; text edits `98-text-edits.md`.
+- #99 `phase2/prepass-vertex-alpha-v2` head 78afd410: anchors pinned to Bevy's source, bounded retry, column-0 directives with the anchor's indent kept. Final check review-685: DeepSeek accept, MiMo ready. Text edits `99-text-edits.md`.
+- #94 `phase2/engine-help-v2` head 2bfee9c8: `--help` wins anywhere, bare `--` ignored, script scans recurse and are line-scoped, numbers only. Delta 2 review-687: both small fixes, test-scan nits only (listed in the hand-off). Text edits `94-text-edits.md`.
+- Tested: fmt, clippy with --all-features, nextest --workspace --all-targets on each head (730 / 716 / 742 passed).
+- Workers: none running. Launcher note: ds-agent needs `DEEPSEEK_AGENT_CLAUDE` set to the app's claude.exe (reported to AnyWorkers).
+- Next: Upstream Dev pushes with the user's yes; parked jobs (console, physics engine half, #117 pair, flaky-test fix) wait for the user's batch decision. New PRs follow SEND-CHECKLIST §5 (draft-first).
