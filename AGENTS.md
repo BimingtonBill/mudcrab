@@ -96,6 +96,23 @@ before starting any `phase2/*` branch or moving work between tracks.
 > issue or Discord (the user's yes). Few open PRs: a soft cap of about 5 of ours open at once; stack
 > only when unavoidable, and say so at the top (Merge after / Stack line, stack label).
 
+> **Daily rhythm (TRIAL from 2026-10-03, the user, 2026-10-02: kept if it works, reverted if not).**
+> - **One reporting line.** Dev sessions report hand-offs, status, ETAs and findings to Upstream Dev
+>   and the day log, not to the user. The user can still talk to any dev session directly at any
+>   time, and the session answers normally; it just doesn't push unasked status to the user.
+> - **Morning brief** from Upstream Dev, at the user's first message of the day, about 10 lines:
+>   today's goal per track, who holds the PC for builds, timing runs or conversions and until when,
+>   what the user will be asked in the evening, and anything blocked only on the user.
+> - **Evening decision table**, once all reviews are in: item, what it does in one sentence, state
+>   (done / running / waiting on you / next), checks, and the ask. Small follow-ups (a flaky test,
+>   a suggestion found in passing) are rows in it, not separate questions. Fix pushes under the
+>   standing yes are listed there as done.
+> - **Quiet in between.** Upstream Dev handles hand-offs and logs them without messaging the user,
+>   except for three urgencies: something public is wrong (our PR breaks main, a wrong push, a
+>   maintainer waiting on us); a clash over the shared PC (a timing run against a build, a
+>   conversion's publish); a tool outage blocking every track. Anything the user asks is answered
+>   at once.
+
 The user's standing rule since 2026-09-25: the dev sessions work as one team by default, the way
 they did on the night of 2026-09-24. The tracks stay separate; the people don't.
 **Upstream Dev** (the user's decision, 2026-09-25) owns the upstream side: it watches upstream PRs,
