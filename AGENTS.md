@@ -114,8 +114,11 @@ before starting any `phase2/*` branch or moving work between tracks.
 >   at once.
 > - **Less work coming at the user (added 2026-10-03, same trial).** The evening table holds at most
 >   about 8 decisions, most important first; the rest roll to the next day. Each morning brief
->   proposes at most 2 active tracks for the day; the others pause (finishing round-2 fixes on
->   already-open PRs is allowed). New work found during the day (an idea, a follow-up, a request)
+>   proposes at most 3 goals for the day that need the user's decisions; other goals wait
+>   (finishing round-2 fixes on already-open PRs is allowed). Dev sessions may still run internal
+>   work that reaches the user only as a finished result (an internal build, a demo, research).
+>   "Track" keeps its meaning above (Phase 1, Phase 2, Phase 3, Portal); a goal is not a track
+>   (changed 2026-10-03, the user). New work found during the day (an idea, a follow-up, a request)
 >   goes into the next morning's plan instead of starting the same day, unless the user says
 >   otherwise.
 
