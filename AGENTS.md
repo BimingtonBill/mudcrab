@@ -103,7 +103,8 @@ before starting any `phase2/*` branch or moving work between tracks.
 > - **Morning brief** from Upstream Dev, at the user's first message of the day, about 10 lines:
 >   today's goal per track, who holds the PC for builds, timing runs or conversions and until when,
 >   what the user will be asked in the evening, and anything blocked only on the user.
-> - **Evening decision table**, once all reviews are in: item, what it does in one sentence, state
+> - **Evening decision table** at 20:30 (the user, 2026-10-03; anything still running then rolls to
+>   the next morning's brief): item, what it does in one sentence, state
 >   (done / running / waiting on you / next), checks, and the ask. Small follow-ups (a flaky test,
 >   a suggestion found in passing) are rows in it, not separate questions. Fix pushes under the
 >   standing yes are listed there as done.
