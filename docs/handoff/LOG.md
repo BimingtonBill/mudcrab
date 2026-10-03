@@ -3,6 +3,16 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-03 Upstream Dev (user stopped ~13:40, 3 h 37 min)
+
+- Merged upstream: #98 and #102 (by Chef); #119 squash 506852da (merged by me on the user's explicit permission).
+- Fix pushes under the standing yes: #98 1c087555 (main merge); #114 5a5a7bed, 29d0f95e, 69d63d24 (on #119; CodeRabbit 24-bit pitch, GPU aligned rows, README); #118 a30701ce (4 CodeRabbit census threads). #114 and #118 marked ready (the user's ask). All threads answered and resolved.
+- Posted (the user's yes): #102 review reply; reviews on #119 #136 #137 #139; aligned-24-bit note on #119.
+- The user created the 10 labels from labels.yml. Trial rule changes in AGENTS.md: at most 3 goals a day that need the user's decisions (track = Phase 1/2/3/Portal only); evening table at 20:30.
+- Portal Dev built the experimental demo (tools/experimental_play.ps1, branch experimental/2026-10-03, local only). Queued: #105 into experimental once Chef updates it.
+- Still running at hand-off: Claude impl #968 merging main into #114 (after #119); #118 main merge d2500953 checks in D:/Modding-overflow/wt-targets/up-118. Push both as fast-forwards when green, then they are ready for Chef/Lucas.
+- Next (morning brief): #136 merge after the rename; #127 re-run once #114/#118/#105 are in; #113 SemVer reply draft (onboarding); #138 relative --assets for Phase 2; #143 DX12 flashing (eclepso fixing; use WGPU_BACKEND=vulkan meanwhile); evening-table rows rolled over (fixture-test draft, disk can-go list incl. merged PRs' folders and wkj-docs-workflow, onboarding post, labels.md note + #77, labelling our PRs).
+
 ### 2026-10-02 (evening) - Claude [phase2] Portal Dev: #112 door crossing handed off
 
 Un-parked by the user. `phase2/door-preload` frozen at **e88f9bcc** (main merged through #92) and handed to Upstream
