@@ -144,6 +144,11 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
   other track is handed over with its evidence (shot, screenshot, data path, repro), not done twice.
 - **Research goes to each dev's own workers:** DeepSeek research and websearch workers, their
   findings written to `local/research/` (cited, spot-checked) so the other dev can use them too.
+  **Research index: `local/research/INDEX.md`** (2026-10-04) catalogues all of it, about 300 notes
+  by topic with date, status and keywords. Search it (`rg -i "<term>" local/research/INDEX.md`)
+  before starting any research or brief, put the matching paths in briefs, and add one row whenever
+  you file a new note. Skyrim reverse-engineering sources and the clean-room rules:
+  `local/research/reference/skyrim-re-digest.md`.
 - **Hand over finished work, not only news.** Phase 2 Dev sends Portal Dev merges it has already
   resolved (portal takes `phase2/*`, never the reverse); Portal Dev reports Phase 2 bugs with
   evidence. Ask the other dev to review a change that touches their area before merging it.
