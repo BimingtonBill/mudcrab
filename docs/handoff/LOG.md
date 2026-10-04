@@ -3,6 +3,17 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-04/05 Upstream Dev (rename night; user stopped ~01:10)
+
+- Merged upstream: #114 (Chef, with our fixes), #118 squash cbb4fd48 and #127 rename squash 5579f007 (both on the user's explicit override of the no-self-merge rule for tonight). **Main is renamed to Mudcrab:** every open branch must merge main and re-run `scripts/rename-to-mudcrab.py` (then `check`).
+- #127 before merge: re-run on main after #118, snapshot -4 bytes (shorter collision key), CodeRabbit thread fixed (reader split by rustfmt; self-test 33/33). #118 before merge: main merge with a dummy-content nif.rs conflict (vertex colours + box bodies both kept), snapshot +12 bytes.
+- Posted (the user's yes): #105 review comment (four non-LOD regressions + schema heads-up).
+- The user's 7 drafts updated against renamed main (Claude impl #985, every resolution reviewed by me) and pushed fast-forward: #121 #122 #123 #124 #125 #126 #128. Behaviour change to mention in #121's text: `--io-threads` now refuses bad values like main's other options. #99 not touched: looks superseded by Chef's #142 (same prepass_vertex_alpha.rs); ask the user about closing it.
+- Disk (the user's yes): deleted my merged-PR worktrees and build folders, about 115 GB in total (log in local/team/2026-10-04.md and 2026-10-05.md). `--portable-textures` work kept as local branch `portable-textures-followup` (60fd0a7b). New shared disk/GPU rules with the Film VFX and DAO sessions: D:/VFXEnhance/coordination/RESOURCES.md (GPU lock file, 10 GB floor, ledger for anything >5 GB).
+- Built today: research index (local/research/INDEX.md), Skyrim RE digest, roadmap page, Ghidra MCP install (Tier 3 needs the user's OK per task).
+- The user wants the balance_guard hook removed; I was blocked from editing my own hooks; they will remove it from ~/.claude/settings.json themselves.
+- No workers running. Next (morning brief): #99 close?; --portable-textures draft PR; #113 SemVer reply; #138 relative --assets (Phase 2); fixture-test draft; labels housekeeping; #136 now the rename is in (Chef's thread for eclepso); #105 needs Chef's rework and a schema renumber.
+
 ## 2026-10-03 Upstream Dev (user stopped ~13:40, 3 h 37 min)
 
 - Merged upstream: #98 and #102 (by Chef); #119 squash 506852da (merged by me on the user's explicit permission).
