@@ -396,5 +396,36 @@ class OwnerFileIsNotWork(unittest.TestCase):
         self.assertTrue(dr.is_work_line(" M src/lib.rs"))
         self.assertFalse(dr.is_work_line("   "))
 
+
+class DustSizing(unittest.TestCase):
+    def test_parses_dust_sizes(self):
+        self.assertEqual(dr.parse_dust_size("0B"), 0)
+        self.assertEqual(dr.parse_dust_size("512Mi"), 512 * 1024**2)
+        self.assertEqual(dr.parse_dust_size("14Gi"), 14 * 1024**3)
+        self.assertEqual(dr.parse_dust_size("1.5Ti"), int(1.5 * 1024**4))
+        self.assertIsNone(dr.parse_dust_size("lots"))
+
+    def test_protected_folders_are_not_sized_while_a_converter_runs(self):
+        entry = dr.Entry(path="X", section=dr.NEVER)
+        with mock.patch.object(dr, "find_dust", return_value="dust"), mock.patch.object(
+            dr, "converter_running", return_value=True
+        ), mock.patch.object(dr, "dust_size") as sizer:
+            note = dr.size_protected([entry])
+        sizer.assert_not_called()
+        self.assertIsNone(entry.size)
+        self.assertIn("converter", note)
+
+    def test_only_protected_folders_are_sized(self):
+        never = dr.Entry(path="N", section=dr.NEVER)
+        keep = dr.Entry(path="K", section=dr.KEEP)
+        with mock.patch.object(dr, "find_dust", return_value="dust"), mock.patch.object(
+            dr, "converter_running", return_value=False
+        ), mock.patch.object(dr, "dust_size", return_value=3 * dr.GB):
+            dr.size_protected([never, keep])
+        self.assertEqual(never.size, 3 * dr.GB)
+        self.assertIsNone(keep.size)
+        self.assertIn("3.0 GB, dust", dr.render_never([never])[0])
+
+
 if __name__ == "__main__":
     unittest.main()

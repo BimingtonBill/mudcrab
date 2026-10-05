@@ -60,6 +60,27 @@ SUBPROCESS_TIMEOUT = 120
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 GB = 1024**3
 
+# Free-space levels shared with the other projects on this PC
+# (D:\VFXEnhance\coordination\RESOURCES.md; tools/disk_guard.py uses the same).
+FLOOR_GB = 10.0
+WARN_GB = 15.0
+
+# dust (fast, read-only sizing; counts each hard-linked file once). Used only
+# with --size-protected, for folders this report never walks itself.
+DUST_CANDIDATES = [
+    os.environ.get("DUST", ""),
+    os.path.expandvars(
+        r"%LOCALAPPDATA%\Microsoft\WinGet\Packages"
+        r"\bootandy.dust_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        r"\dust-v1.2.5-x86_64-pc-windows-gnu\dust.exe"
+    ),
+    "dust",
+]
+# Sizing these while a conversion publishes can make the publish fail
+# ("Access is denied"), so --size-protected skips them while one runs.
+CONVERTER_PROCESSES = ["converter.exe", "launcher.exe"]
+DUST_UNITS = {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
 # Report sections.
 CAN_GO = "can_go"
 KEEP = "keep"
@@ -531,6 +552,65 @@ def build_report(roots: list[str], opts: Options) -> list[Entry]:
     return [process_entry(path, opts, pr_lookup) for path in discover(roots)]
 
 
+def find_dust() -> str | None:
+    """Path of a usable dust executable, or None."""
+    for candidate in DUST_CANDIDATES:
+        if not candidate:
+            continue
+        found = shutil.which(candidate) or (candidate if os.path.isfile(candidate) else None)
+        if found:
+            return found
+    return None
+
+
+def parse_dust_size(text: str) -> int | None:
+    """'14Gi' or '512Mi' or '0B' -> bytes."""
+    match = re.fullmatch(r"\s*([0-9.]+)\s*([BKMGT])?i?B?\s*", text)
+    if not match:
+        return None
+    return int(float(match.group(1)) * DUST_UNITS[match.group(2) or "B"])
+
+
+def dust_size(dust: str, path: str) -> int | None:
+    """Total size of one folder from `dust -j -d 0`, or None on any failure."""
+    try:
+        done = subprocess.run(
+            [dust, "-j", "-d", "0", path],
+            capture_output=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT,
+        )
+        return parse_dust_size(json.loads(done.stdout)["size"])
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return None
+
+
+def converter_running() -> bool:
+    """True when a converter or launcher process is running (Windows tasklist)."""
+    try:
+        done = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True, text=True,
+                              timeout=SUBPROCESS_TIMEOUT)  # fmt: skip
+    except (OSError, subprocess.SubprocessError):
+        return True  # unknown: assume one runs, so nothing is sized
+    names = done.stdout.lower()
+    return any(f'"{name}"' in names for name in CONVERTER_PROCESSES)
+
+
+def size_protected(entries: list[Entry]) -> str:
+    """Fill in dust sizes for never-touch and class C entries; return a note."""
+    dust = find_dust()
+    if dust is None:
+        return "Protected folders not sized: dust not found (set DUST to its path)."
+    if converter_running():
+        return "Protected folders not sized: a converter or launcher is running."
+    for entry in entries:
+        if entry.section in (NEVER, CLASS_C) and entry.size is None:
+            entry.size = dust_size(dust, entry.path)
+            if entry.size is not None and entry.reason:
+                entry.reason = entry.reason.replace("not walked or sized", "not walked; size from dust")
+    return "Protected folders sized with dust (read-only; never offered for deletion)."
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -570,8 +650,8 @@ def render_table(entries: list[Entry]) -> list[str]:
 
 
 def render_never(entries: list[Entry]) -> list[str]:
-    """Never-touch folders by name only."""
-    return [f"- {e.path}" for e in entries]
+    """Never-touch folders by name, with a dust size when --size-protected ran."""
+    return [f"- {e.path}" + (f" ({format_size(e)}, dust)" if e.size is not None else "") for e in entries]
 
 
 def drive_summary() -> str:
@@ -580,13 +660,19 @@ def drive_summary() -> str:
     for drive in DRIVES:
         try:
             usage = shutil.disk_usage(drive)
-            parts.append(f"{drive[:2]} {usage.free / GB:.1f} GB free of {usage.total / GB:.1f} GB")
+            free = usage.free / GB
+            level = ""
+            if free < FLOOR_GB:
+                level = f" (BELOW THE {FLOOR_GB:.0f} GB FLOOR)"
+            elif free < WARN_GB:
+                level = f" (below {WARN_GB:.0f} GB: warn the other sessions)"
+            parts.append(f"{drive[:2]} {free:.1f} GB free of {usage.total / GB:.1f} GB{level}")
         except OSError:
             parts.append(f"{drive[:2]} not available")
     return "; ".join(parts)
 
 
-def render_report(entries: list[Entry], now: datetime | None = None) -> str:
+def render_report(entries: list[Entry], now: datetime | None = None, note: str = "") -> str:
     """The whole Markdown report."""
     now = now or datetime.now()
     groups = {key: [e for e in entries if e.section == key] for key, _ in SECTION_TITLES}
@@ -600,6 +686,8 @@ def render_report(entries: list[Entry], now: datetime | None = None) -> str:
         f"Generated {now.strftime('%Y-%m-%d %H:%M')}. Free space: {drive_summary()}.",
         f"Entries: {counts}.",
     ]
+    if note:
+        lines.append(note)
     for key, title in SECTION_TITLES:
         lines += ["", f"## {title}", ""]
         rows = groups[key]
@@ -631,6 +719,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         help="class B grace days after a PR is merged/closed (default 3)")  # fmt: skip
     parser.add_argument("--out", help="also write the report to this file")
     parser.add_argument("--template", action="store_true", help="print an OWNER.txt template")
+    parser.add_argument("--size-protected", action="store_true",
+                        help="size never-touch and class C folders with dust (skipped while a "
+                        "converter or launcher runs)")  # fmt: skip
     return parser.parse_args(argv)
 
 
@@ -644,7 +735,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     opts = Options(time_limit=args.time_limit, grace_days=args.grace_days)
     entries = build_report(args.root or DEFAULT_ROOTS, opts)
-    text = render_report(entries)
+    note = size_protected(entries) if args.size_protected else ""
+    text = render_report(entries, note=note)
     print(text)
     if args.out:
         with open(args.out, "w", encoding="utf-8", newline="\n") as handle:

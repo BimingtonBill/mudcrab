@@ -220,10 +220,13 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
     `--benchmark-only`). A second instance on the GPU spoils their numbers, and so does a cargo
     build or test on the CPU (2026-09-26: a stress p95 of 18.4 ms with builds running beside it,
     11.4-12.1 ms on a quiet machine). A booking holds engines **and** cargo in every session.
+    The GPU is shared with other projects too (see "Disk" below): before a timing run or a
+    RenderDoc/PIX capture, run `python tools/disk_guard.py --gpu`. If a lock is held, message its
+    owner session; Skyrim has priority and it frees the GPU within 5 minutes.
   - **A conversion's publish needs its output and staging folders closed:** publishing renames
     staging over the output folder, and on Windows that fails ("Access is denied") while any
     process holds a handle inside either: an engine reading `skyrim_world.db`, but also a size
-    check (`du`), an indexer, an Explorer window or antivirus. Nothing reads either folder while a
+    check (`du`, dust), an indexer, an Explorer window or antivirus. Nothing reads either folder while a
     conversion reaches Publishing; measure staging only while the converter is stopped. Recover
     with `converter.exe ... --resume-staging <staging dir>`, which re-walks every stage.
   - **Disk for a conversion:** staging grows to about the size of the finished output (67 GB for
@@ -270,8 +273,25 @@ only if the user gives one.
   that PR's worktree, folder and evidence for deletion; at the end of every session, each session
   removes its own throwaway (class A, expired) folders; before a build or conversion, a session
   below ~40 GB free on that drive offers its own expired folders first. Upstream Dev runs
-  `tools/disk_report.py` at the start of each day and gives the user the "can go" list.
+  `python tools/disk_report.py --size-protected` at the start of each day and gives the user the
+  "can go" list, plus the biggest never-touch folders as the user's own decisions.
 - **Log every deletion** in that day's team log: path, size, owner, reason.
+- **The PC is shared with other projects** (the user, 2026-10-05): Film VFX (`D:\VFXEnhance`) and
+  DAO Xbox sessions run beside ours. Shared rules and ledger: `D:\VFXEnhance\coordination\RESOURCES.md`.
+  Keep at least **10 GB free on C: and D:**; a job that would leave less than 15 GB messages the
+  other sessions first; anything that will grow by more than 5 GB gets a ledger line before it
+  starts; no session deletes another project's files; messages only on events.
+- **Pre-flight before every big job:** `python tools/disk_guard.py --drive D: --need <GB>` (add
+  `--ledger "<what and where>"` for jobs over 5 GB). Exit 1 means stop: free space first (owner's
+  yes) or wait. Typical needs: a new build folder 15-20 GB, a coder worktree about 20 GB, a full
+  conversion about 67 GB of staging beside the output. Worker briefs that build say "check
+  `df -h /d` before each build; below 15 GB, stop and report".
+- **Measuring folders:** never Git Bash `du` on big folders (slow on Windows, times out, keeps
+  running after a timeout and once blocked a publish). Use dust (scans 210 GB in about 25 s; path
+  in `tools/disk_report.py`, or set `DUST`; always add `2>/dev/null`), or `python
+  tools/disk_report.py --size-protected`, which also sizes converted data and other never-touch
+  folders with dust and skips that while a converter or launcher runs. WizTree is installed too,
+  but its fast mode needs an admin prompt: only with the user present.
 
 ## At the end of every session
 
