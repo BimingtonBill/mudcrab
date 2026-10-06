@@ -1,6 +1,5 @@
 ---
 source: crates/converter/tests/snapshots.rs
-assertion_line: 215
 expression: manifest
 ---
 {
@@ -62,12 +61,12 @@ expression: manifest
     }
   },
   "complete": true,
-  "configuration_hash": "cca2af2b67310e9bc99f97208cabb4edffbd5d04c007e01fb350fccc011a19a2",
+  "configuration_hash": "5172e075518328b04ce6f27d8f0df98e80640cd58b14343beb23344b30c1831f",
   "entries": {
     "meshes/generated.nif": {
       "output": "meshes/generated.glb",
       "output_hash": "[output_hash]",
-      "output_size": 2320,
+      "output_size": 2572,
       "source_hash": "[source_hash]"
     },
     "scripts/generated.pex": {
@@ -120,5 +119,5 @@ expression: manifest
     "pex": 2
   },
   "pruned_texture_references": {},
-  "schema_version": 24
+  "schema_version": 102401
 }

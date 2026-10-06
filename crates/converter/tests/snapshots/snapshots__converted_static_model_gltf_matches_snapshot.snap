@@ -1,6 +1,5 @@
 ---
 source: crates/converter/tests/snapshots.rs
-assertion_line: 176
 expression: document
 ---
 {
@@ -75,7 +74,8 @@ expression: document
     }
   ],
   "extensionsUsed": [
-    "KHR_materials_specular"
+    "KHR_materials_specular",
+    "OPEN_SKYRIM_material"
   ],
   "images": [
     {
@@ -96,6 +96,23 @@ expression: document
             1.0
           ],
           "specularFactor": 0.0
+        },
+        "OPEN_SKYRIM_material": {
+          "lightingShaderType": "default",
+          "premultipliedAlpha": false,
+          "screenDoorAlphaFade": false,
+          "shaderFamily": "lighting",
+          "shaderFlags1": 0,
+          "shaderFlags2": 0,
+          "textureSlots": [],
+          "uvOffset": [
+            0.0,
+            0.0
+          ],
+          "uvScale": [
+            1.0,
+            1.0
+          ]
         }
       },
       "extras": {
