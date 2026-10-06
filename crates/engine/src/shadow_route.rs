@@ -26,7 +26,7 @@
 //! A view is on exactly one of the two routes, never both, so it never sees the shadowed sun and
 //! the copy together. Geometry is not duplicated; only layer membership is widened. The copy is
 //! kept in step with the source sun every frame by [`sync_unshadowed_suns`], and it exists only
-//! while some routed view asks for shadows off.
+//! while some routed view asks for shadows off and would otherwise draw that sun.
 //!
 //! Limits of the stock route: it removes the reflection's GPU cascade passes, not all CPU cascade
 //! work (Bevy still builds cascade matrices for every active camera), and only the sun is
@@ -45,6 +45,8 @@ use crate::{
 };
 use bevy::{
     camera::visibility::{RenderLayers, VisibilitySystems},
+    ecs::query::QueryData,
+    light::{CascadeShadowConfig, SunDisk, VolumetricLight},
     prelude::*,
     reflect::PartialReflect,
     transform::TransformSystems,
@@ -107,76 +109,146 @@ fn route_view_shadows(mut views: Query<(&ViewPolicy, &ViewShadowRoute, &mut Rend
     }
 }
 
-/// Keeps one [`UnshadowedSun`] per source sun while any routed view wants shadows off, and the
-/// copy's direction, colour, illuminance and enabled state equal to its source's every frame.
+/// Keeps one [`UnshadowedSun`] per source sun that a shadowless view needs, and the copy's
+/// direction, colour, illuminance, cascade configuration, optional markers and enabled state equal
+/// to its source's every frame.
 ///
-/// The copy is the source's [`DirectionalLight`] with every shadow switch cleared. A source that
-/// is a root entity is read through its `Transform` rather than its `GlobalTransform`, because the
-/// sun is moved in `Update` and propagation has not run yet; a source below a parent has only its
-/// propagated pose to give. The copy's visibility mirrors the source's, which is how a sun is
-/// switched off in Bevy.
-#[allow(clippy::type_complexity)]
+/// A source is copied while some routed view whose policy says [`ViewShadows::Off`] would draw it
+/// on its shadowed route, that is, while the source's layers intersect that view's `shadowed`
+/// layers. A source that already has its shadow maps off is copied too, on purpose: the shadowless
+/// view draws only the replica layer, so without a copy it would lose its only sun.
+///
+/// The copy is the source's [`DirectionalLight`] with every shadow switch cleared, the source's
+/// [`CascadeShadowConfig`], and the same [`VolumetricLight`] and [`SunDisk`] the source has. A
+/// source that is a root entity is read through its `Transform` rather than its `GlobalTransform`,
+/// because the sun is moved in `Update` and propagation has not run yet; a source below a parent
+/// has only its propagated pose to give. The copy's visibility mirrors the source's, which is how a
+/// sun is switched off in Bevy.
 fn sync_unshadowed_suns(
     mut commands: Commands,
-    routes: Query<&ViewPolicy, With<ViewShadowRoute>>,
-    sources: Query<
-        (
-            Entity,
-            &DirectionalLight,
-            &Transform,
-            &GlobalTransform,
-            Option<&ChildOf>,
-            &Visibility,
-        ),
-        Without<UnshadowedSun>,
-    >,
-    mut copies: Query<(
-        Entity,
-        &UnshadowedSun,
-        &mut DirectionalLight,
-        &mut Transform,
-        &mut Visibility,
-    )>,
+    routes: Query<(&ViewPolicy, &ViewShadowRoute)>,
+    sources: Query<SunSource, Without<UnshadowedSun>>,
+    mut copies: Query<(Entity, &UnshadowedSun, SunCopy)>,
 ) {
-    let wanted = routes
+    let shadowless_views: Vec<&RenderLayers> = routes
         .iter()
-        .any(|policy| policy.shadows == ViewShadows::Off);
+        .filter(|(policy, _)| policy.shadows == ViewShadows::Off)
+        .map(|(_, route)| &route.shadowed)
+        .collect();
+    let needed = |layers: Option<&RenderLayers>| {
+        let layers = layers.unwrap_or(&DEFAULT_LAYERS);
+        shadowless_views.iter().any(|view| layers.intersects(view))
+    };
+
     let mut followed = Vec::new();
-    for (copy, unshadowed, mut light, mut transform, mut visibility) in &mut copies {
-        let Some((_, source_light, source_transform, source_global, parent, source_visibility)) =
-            wanted
-                .then(|| sources.get(unshadowed.source).ok())
-                .flatten()
+    for (copy, unshadowed, mut components) in &mut copies {
+        let Some(source) = sources
+            .get(unshadowed.source)
+            .ok()
+            .filter(|source| needed(source.layers))
         else {
             commands.entity(copy).despawn();
             continue;
         };
         followed.push(unshadowed.source);
-        let desired = unshadowed_copy_of(source_light);
-        if !light.reflect_partial_eq(&desired).unwrap_or(false) {
-            *light = desired;
+        let desired = unshadowed_copy_of(source.light);
+        if !components
+            .light
+            .reflect_partial_eq(&desired)
+            .unwrap_or(false)
+        {
+            *components.light = desired;
         }
-        transform.set_if_neq(source_pose(source_transform, source_global, parent));
-        visibility.set_if_neq(*source_visibility);
+        if !components
+            .cascades
+            .reflect_partial_eq(source.cascades)
+            .unwrap_or(false)
+        {
+            *components.cascades = source.cascades.clone();
+        }
+        components.transform.set_if_neq(source_pose(
+            source.transform,
+            source.global,
+            source.parent,
+        ));
+        components.visibility.set_if_neq(*source.visibility);
+        if components.volumetric != source.volumetric.is_some() {
+            if source.volumetric.is_some() {
+                commands.entity(copy).insert(VolumetricLight);
+            } else {
+                commands.entity(copy).remove::<VolumetricLight>();
+            }
+        }
+        match (components.disk.as_deref(), source.disk) {
+            (None, Some(disk)) => {
+                commands.entity(copy).insert(disk.clone());
+            }
+            (Some(_), None) => {
+                commands.entity(copy).remove::<SunDisk>();
+            }
+            (Some(have), Some(disk)) if !same_disk(have, disk) => {
+                commands.entity(copy).insert(disk.clone());
+            }
+            _ => {}
+        }
     }
-    if !wanted {
-        return;
-    }
-    for (source, source_light, source_transform, source_global, parent, source_visibility) in
-        &sources
-    {
-        if followed.contains(&source) {
+    for source in &sources {
+        if followed.contains(&source.entity) || !needed(source.layers) {
             continue;
         }
-        commands.spawn((
+        let mut copy = commands.spawn((
             Name::new("Unshadowed sun (shadowless views)"),
-            UnshadowedSun { source },
-            unshadowed_copy_of(source_light),
+            UnshadowedSun {
+                source: source.entity,
+            },
+            unshadowed_copy_of(source.light),
+            source.cascades.clone(),
             RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER),
-            source_pose(source_transform, source_global, parent),
-            *source_visibility,
+            source_pose(source.transform, source.global, source.parent),
+            *source.visibility,
         ));
+        if source.volumetric.is_some() {
+            copy.insert(VolumetricLight);
+        }
+        if let Some(disk) = source.disk {
+            copy.insert(disk.clone());
+        }
     }
+}
+
+/// The layers an entity without a [`RenderLayers`] component is on: Bevy's default, layer 0.
+static DEFAULT_LAYERS: RenderLayers = RenderLayers::layer(0);
+
+/// What [`sync_unshadowed_suns`] reads off a source sun.
+#[derive(QueryData)]
+struct SunSource {
+    entity: Entity,
+    light: &'static DirectionalLight,
+    cascades: &'static CascadeShadowConfig,
+    transform: &'static Transform,
+    global: &'static GlobalTransform,
+    parent: Option<&'static ChildOf>,
+    visibility: &'static Visibility,
+    layers: Option<&'static RenderLayers>,
+    volumetric: Option<&'static VolumetricLight>,
+    disk: Option<&'static SunDisk>,
+}
+
+/// What [`sync_unshadowed_suns`] writes on a copy.
+#[derive(QueryData)]
+#[query_data(mutable)]
+struct SunCopy {
+    light: &'static mut DirectionalLight,
+    cascades: &'static mut CascadeShadowConfig,
+    transform: &'static mut Transform,
+    visibility: &'static mut Visibility,
+    volumetric: Has<VolumetricLight>,
+    disk: Option<&'static mut SunDisk>,
+}
+
+/// `SunDisk` has no equality of its own.
+fn same_disk(left: &SunDisk, right: &SunDisk) -> bool {
+    left.angular_size == right.angular_size && left.intensity == right.intensity
 }
 
 /// The source light with every shadow switch cleared.
@@ -207,8 +279,9 @@ mod tests {
     use super::*;
     use crate::render::{
         LIGHT_LAYERS, MAIN_VIEW_LAYERS, PLACED_OBJECT_LAYER, REFLECTION_VIEW_LAYERS, WATER_LAYER,
-        WORLD_LAYER, light_render_layers, reflectable_world_layers,
+        WORLD_LAYER, reflectable_world_layers,
     };
+    use bevy::light::CascadeShadowConfigBuilder;
 
     fn shadowed_layers() -> RenderLayers {
         RenderLayers::from_layers(REFLECTION_VIEW_LAYERS)
@@ -242,7 +315,6 @@ mod tests {
         fn new(shadows: ViewShadows) -> Self {
             let mut app = App::new();
             app.add_plugins(ShadowRoutePlugin);
-            let (light_layers, propagate_over) = light_render_layers();
             let sun = app
                 .world_mut()
                 .spawn((
@@ -253,8 +325,7 @@ mod tests {
                         contact_shadows_enabled: true,
                         ..default()
                     },
-                    light_layers,
-                    propagate_over,
+                    RenderLayers::from_layers(LIGHT_LAYERS),
                     Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
                 ))
                 .id();
@@ -322,6 +393,10 @@ mod tests {
         let replica = unshadowed_layers();
         assert!(!RenderLayers::from_layers(MAIN_VIEW_LAYERS).intersects(&replica));
         assert!(!RenderLayers::from_layers(LIGHT_LAYERS).intersects(&replica));
+        assert!(
+            RenderLayers::from_layers(crate::render::POINT_LIGHT_LAYERS).intersects(&replica),
+            "a point light must still light the shadowless route"
+        );
         for layer in [WORLD_LAYER, WATER_LAYER, PLACED_OBJECT_LAYER] {
             assert_ne!(layer, UNSHADOWED_REFLECTION_LAYER);
         }
@@ -513,5 +588,77 @@ mod tests {
         harness.app.update();
         assert_eq!(harness.copies().len(), 2);
         assert_eq!(harness.directional_lights(), 4);
+    }
+
+    #[test]
+    fn a_source_with_shadows_off_is_still_copied_so_the_view_keeps_its_sun() {
+        let mut harness = RouteHarness::new(ViewShadows::Off);
+        let sun = harness.sun;
+        harness
+            .app
+            .world_mut()
+            .entity_mut(sun)
+            .get_mut::<DirectionalLight>()
+            .unwrap()
+            .shadow_maps_enabled = false;
+        harness.app.update();
+        harness.app.update();
+        assert_eq!(harness.copies().len(), 1);
+    }
+
+    #[test]
+    fn a_source_no_shadowless_view_would_draw_gets_no_copy() {
+        let mut harness = RouteHarness::new(ViewShadows::Off);
+        let sun = harness.sun;
+        harness
+            .app
+            .world_mut()
+            .entity_mut(sun)
+            .insert(RenderLayers::layer(PLACED_OBJECT_LAYER));
+        harness.app.update();
+        harness.app.update();
+        assert!(harness.copies().is_empty());
+    }
+
+    #[test]
+    fn the_copy_mirrors_the_sources_cascades_volumetric_marker_and_sun_disk() {
+        let mut harness = RouteHarness::new(ViewShadows::Off);
+        let sun = harness.sun;
+        let cascades = CascadeShadowConfigBuilder {
+            num_cascades: 2,
+            maximum_distance: 1234.0,
+            ..default()
+        }
+        .build();
+        harness.app.world_mut().entity_mut(sun).insert((
+            cascades.clone(),
+            VolumetricLight,
+            SunDisk::EARTH,
+        ));
+        harness.app.update();
+        harness.app.update();
+
+        let copy = harness.copies()[0].0;
+        let entity = harness.app.world().entity(copy);
+        assert_eq!(
+            entity.get::<CascadeShadowConfig>().unwrap().bounds,
+            cascades.bounds
+        );
+        assert!(entity.contains::<VolumetricLight>());
+        assert_eq!(
+            entity.get::<SunDisk>().unwrap().angular_size,
+            SunDisk::EARTH.angular_size
+        );
+
+        harness
+            .app
+            .world_mut()
+            .entity_mut(sun)
+            .remove::<(VolumetricLight, SunDisk)>();
+        harness.app.update();
+        harness.app.update();
+        let entity = harness.app.world().entity(copy);
+        assert!(!entity.contains::<VolumetricLight>());
+        assert!(!entity.contains::<SunDisk>());
     }
 }

@@ -238,8 +238,6 @@ Assets and start position:
   --allow-incomplete-assets             run despite a failed manifest or integration-report gate
   --headless                            run without opening a window
   --lights                              place a point light for each streamed LIGH reference
-  --water-reflection-preset <name>      water reflection cost: baseline (full size, every frame, shadowed)
-                                        or water (quarter size, every other frame, shadowless) (default: baseline)
 
 Streaming:
   --ini <file>                        layer Skyrim INI settings; CLI options override files
@@ -272,11 +270,13 @@ Benchmark and profiling:
   --profile-commit <hash>               commit recorded in the profile (default: unknown)
   --profile-dirty-worktree              record uncommitted worktree changes in the profile
   --profile-hardware <text>             hardware recorded in the profile (default: unspecified)
+  --water-reflection-preset <name>      water reflection cost: baseline (full size, every frame, shadowed)
+                                        or water (quarter size, every other frame, shadowless) (default: baseline)
 
 Diagnostics:
   --diagnostic-asset-fallbacks          log every fallback asset substitution
-  --water-reflection <on|off>           measurement switch: off never renders the reflection view, so water
-                                        shows no reflection (its image stays black) (default: on)
+  --water-reflection <on|off>           measurement switch: off never renders the reflection view; the water
+                                        gets darker (a black reflection is blended in), not unreflective (default: on)
   --shadows <on|off>                    measurement switch: off turns off the sun's shadow maps (default: on)
   --material-fixture                    run the material fixture (no world database)
   --terrain-water-fixture               run the terrain-water fixture (no world database)
