@@ -53,7 +53,7 @@ pub const MAX_TARGET_DIMENSION: u32 = 8192;
 /// chosen for the water view.
 pub const BASELINE_TARGET_SIZE: UVec2 = UVec2::new(1024, 576);
 
-/// The design study's water preset target: a quarter of the pixels, 16:9 like the default window so
+/// The water preset target (an unverified starting value): a quarter of the pixels, 16:9 like the default window so
 /// the view's projection keeps the observer's aspect while costing less.
 pub const WATER_TARGET_SIZE: UVec2 = UVec2::new(512, 288);
 
