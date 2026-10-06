@@ -1,10 +1,10 @@
 [CmdletBinding()]
 param(
-    # Which scenes to measure. The default is the five the baseline compares: the synthetic scene
-    # is the one a machine with no converted data can run, the four world scenes are the walk, the
-    # dense grid, the water and the streaming stress. `stability` is left out because it is a soak
+    # Which scenes to measure. The default is the six the baseline compares: the synthetic scene
+    # is the one a machine with no converted data can run, the five world scenes are the walk, the
+    # acceptance dense grid, Riverwood (the real-density case), the water and the streaming stress. `stability` is left out because it is a soak
     # window (30 minutes by default), not a baseline; `all` selects it too.
-    [ValidateSet("all", "synthetic", "rural", "dense", "water", "stress", "stability")]
+    [ValidateSet("all", "synthetic", "rural", "dense", "riverwood", "water", "stress", "stability")]
     [string[]]$Scenarios = @(),
     # The converted legal Skyrim asset set every world scenario loads. Not needed for `synthetic`.
     [string]$Assets,
@@ -25,7 +25,11 @@ param(
     [int]$DenseGridX = 18,
     [int]$DenseGridY = -5,
     [int]$WaterGridX = 7,
-    [int]$WaterGridY = -2
+    [int]$WaterGridY = -2,
+    # Riverwood, the real-density case (about 2,900 references within two cells, against about
+    # 1,500 at the acceptance dense place).
+    [int]$RiverwoodGridX = 3,
+    [int]$RiverwoodGridY = -12
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,14 +45,14 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 # called with are put back afterwards, or a caller's -Assets and -DurationSeconds would be lost.
 $sharedNames = @(
     "Assets", "DurationSeconds", "StabilitySeconds", "Worldspace",
-    "RuralGridX", "RuralGridY", "DenseGridX", "DenseGridY", "WaterGridX", "WaterGridY"
+    "RuralGridX", "RuralGridY", "DenseGridX", "DenseGridY", "WaterGridX", "WaterGridY", "RiverwoodGridX", "RiverwoodGridY"
 )
 $requestedValues = @{}
 foreach ($name in $sharedNames) { $requestedValues[$name] = Get-Variable -Name $name -ValueOnly }
 . (Join-Path $PSScriptRoot "phase2-profile.ps1") -AsLibrary
 foreach ($name in $sharedNames) { Set-Variable -Name $name -Value $requestedValues[$name] }
 
-$defaultScenarios = @("synthetic", "rural", "dense", "water", "stress")
+$defaultScenarios = @("synthetic", "rural", "dense", "riverwood", "water", "stress")
 $requested = if ($Scenarios.Count -eq 0) {
     # Like the profiling campaign, the default without -Assets is the one scene that needs no
     # converted data instead of a request that immediately fails.
@@ -58,9 +62,9 @@ $requested = if ($Scenarios.Count -eq 0) {
     # default it is not narrowed to the scene that needs no converted data: without an asset set it
     # is refused here, naming the missing input, before a campaign is planned.
     if (-not $Assets) {
-        throw "-Scenarios all needs -Assets with a converted legal Skyrim asset set: all six scenarios include the four world scenes. The bare default without -Assets runs 'synthetic' only"
+        throw "-Scenarios all needs -Assets with a converted legal Skyrim asset set: all seven scenarios include the five world scenes. The bare default without -Assets runs 'synthetic' only"
     }
-    @("synthetic", "rural", "dense", "water", "stress", "stability")
+    @("synthetic", "rural", "dense", "riverwood", "water", "stress", "stability")
 } else { $Scenarios }
 if ($Repeats -lt 1) { throw "Repeats must be at least 1" }
 if ($requested.Where({ $_ -ne "synthetic" }).Count -gt 0 -and -not $Assets) {
@@ -704,7 +708,7 @@ foreach ($name in $requested) {
                 -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds `
                 -ResolvedAssets $resolvedAssets -Worldspace $Worldspace `
                 -RuralGridX $RuralGridX -RuralGridY $RuralGridY -DenseGridX $DenseGridX -DenseGridY $DenseGridY `
-                -WaterGridX $WaterGridX -WaterGridY $WaterGridY
+                -WaterGridX $WaterGridX -WaterGridY $WaterGridY -RiverwoodGridX $RiverwoodGridX -RiverwoodGridY $RiverwoodGridY
             if ($null -eq $windowArguments) { $windowArguments = $arguments }
             $report = Invoke-EngineWindow -Engine $engine -Arguments $arguments -RunDirectory $runDirectory `
                 -Label "Baseline run $name/$kind/run-$run" -AsHashtable

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("all", "synthetic", "rural", "dense", "water", "stress", "stability")]
+    [ValidateSet("all", "synthetic", "rural", "dense", "riverwood", "water", "stress", "stability")]
     [string]$Scenario = "all",
     [string]$Assets,
     [string]$Worldspace = "0x3c",
@@ -10,6 +10,8 @@ param(
     [int]$DenseGridY = 0,
     [int]$WaterGridX = 0,
     [int]$WaterGridY = 0,
+    [int]$RiverwoodGridX = 3,
+    [int]$RiverwoodGridY = -12,
     [int]$Repetitions = 3,
     [int]$DurationSeconds = 120,
     [int]$StabilitySeconds = 1800,
@@ -146,7 +148,9 @@ function Get-ScenarioArguments {
         [int]$DenseGridX = 0,
         [int]$DenseGridY = 0,
         [int]$WaterGridX = 0,
-        [int]$WaterGridY = 0
+        [int]$WaterGridY = 0,
+        [int]$RiverwoodGridX = 3,
+        [int]$RiverwoodGridY = -12
     )
     $arguments = @(
         "--benchmark-duration", $(if ($Name -eq "stability") { "$StabilitySeconds" } else { "$DurationSeconds" }),
@@ -168,6 +172,9 @@ function Get-ScenarioArguments {
         $arguments += @("--assets", $ResolvedAssets, "--worldspace", $Worldspace)
         if ($Name -eq "water") {
             $arguments += @("--grid-x", "$WaterGridX", "--grid-y", "$WaterGridY")
+        } elseif ($Name -eq "riverwood") {
+            # The real-density case: Riverwood, about 2,900 references within two cells.
+            $arguments += @("--grid-x", "$RiverwoodGridX", "--grid-y", "$RiverwoodGridY")
         } elseif ($Name -in @("dense", "stability")) {
             $arguments += @("--grid-x", "$DenseGridX", "--grid-y", "$DenseGridY")
         } else {
@@ -345,7 +352,7 @@ foreach ($name in $requested) {
             -RunId "run-$run" -DirtyWorktree:$dirty -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds `
             -ResolvedAssets $resolvedAssets -Worldspace $Worldspace `
             -RuralGridX $RuralGridX -RuralGridY $RuralGridY -DenseGridX $DenseGridX -DenseGridY $DenseGridY `
-            -WaterGridX $WaterGridX -WaterGridY $WaterGridY
+            -WaterGridX $WaterGridX -WaterGridY $WaterGridY -RiverwoodGridX $RiverwoodGridX -RiverwoodGridY $RiverwoodGridY
         $runs += Invoke-EngineWindow -Engine $engine -Arguments $arguments -RunDirectory $runDirectory -Label "Profiling run $name/run-$run"
     }
 

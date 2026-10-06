@@ -300,7 +300,7 @@ the run could not measure it.
 small `baseline.json` and `baseline.md` for it:
 
 ```powershell
-pwsh -File scripts/phase2-baseline.ps1 -Assets D:\SkyrimConverted            # 3 repeats of the five baseline scenes
+pwsh -File scripts/phase2-baseline.ps1 -Assets D:\SkyrimConverted            # 3 repeats of the six baseline scenes
 pwsh -File scripts/phase2-baseline.ps1 -Assets D:\SkyrimConverted -Scenarios stress -Repeats 5 -DurationSeconds 180
 pwsh -File scripts/phase2-baseline.ps1                                       # synthetic only: no -Assets needed
 ```
@@ -308,7 +308,11 @@ pwsh -File scripts/phase2-baseline.ps1                                       # s
 The world scenes default to the standard places of `docs/roadmap/02-acceptance.md` in Tamriel
 (`0x3c`): rural at grid 0,0, dense at 18,-5 and water at 7,-2, so the three measure three different
 places (`-RuralGridX`, `-DenseGridX`, `-WaterGridX` and their `Y` partners override them). The
-profile script's own defaults are 0,0 for all three, which made them one scene.
+profile script's own defaults are 0,0 for all three, which made them one scene. The baseline adds
+a sixth scene, `riverwood` at 3,-12 (`-RiverwoodGridX`/`-RiverwoodGridY`): about 2,900 references
+within two cells against about 1,500 at the acceptance dense place, so it is the real-density
+case. The profiling example above uses dense 12,8, which disagrees with `02-acceptance.md`; the
+baseline follows `02-acceptance.md`.
 
 Both scripts need PowerShell 7 (`pwsh`): they read reports with `ConvertFrom-Json -AsHashtable`.
 The command builds the engine once (`cargo build --release --bin engine`, skipped with `-NoBuild`,
