@@ -117,6 +117,31 @@ pub struct EngineConfig {
     /// every run that does not ask for lights renders exactly as it did before.
     pub lights: bool,
     pub physics_fixture: bool,
+    /// `--water-reflection-preset <baseline|water>`: which [`crate::view_policy::ViewPolicy`] the
+    /// water reflection camera is given. `baseline` is the full-size, every-frame reflection the
+    /// engine has always drawn.
+    pub water_reflection_preset: WaterReflectionPreset,
+}
+
+/// The view policy the water reflection camera is given (`--water-reflection-preset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaterReflectionPreset {
+    /// [`crate::view_policy::ViewPolicy::baseline`]: today's full-size, every-frame reflection.
+    #[default]
+    Baseline,
+    /// [`crate::view_policy::ViewPolicy::water`]: a quarter of the pixels, every other frame, no
+    /// shadows of its own, and a camera without occlusion history or MSAA.
+    Water,
+}
+
+impl WaterReflectionPreset {
+    /// The spelling the command line and run records use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Water => "water",
+        }
+    }
 }
 
 impl Default for EngineConfig {
@@ -176,6 +201,7 @@ impl Default for EngineConfig {
             streaming_fixture: false,
             lights: false,
             physics_fixture: false,
+            water_reflection_preset: WaterReflectionPreset::Baseline,
         }
     }
 }
@@ -201,6 +227,8 @@ Assets and start position:
   --allow-incomplete-assets             run despite a failed manifest or integration-report gate
   --headless                            run without opening a window
   --lights                              place a point light for each streamed LIGH reference
+  --water-reflection-preset <name>      water reflection cost: baseline (full size, every frame, shadowed)
+                                        or water (quarter size, every other frame, shadowless) (default: baseline)
 
 Streaming:
   --ini <file>                        layer Skyrim INI settings; CLI options override files
@@ -670,6 +698,21 @@ impl EngineConfig {
                 "--streaming-fixture" => config.streaming_fixture = true,
                 "--lights" => config.lights = true,
                 "--physics-fixture" => config.physics_fixture = true,
+                "--water-reflection-preset" => {
+                    const EXPECTED: &str = "baseline or water";
+                    let raw = take_raw("--water-reflection-preset", EXPECTED, args.next())?;
+                    config.water_reflection_preset = match raw.as_str() {
+                        "baseline" => WaterReflectionPreset::Baseline,
+                        "water" => WaterReflectionPreset::Water,
+                        _ => {
+                            return Err(ConfigError::invalid_value(
+                                "--water-reflection-preset",
+                                Some(raw),
+                                EXPECTED,
+                            ));
+                        }
+                    };
+                }
                 unknown => return Err(ConfigError::unrecognized(unknown)),
             }
         }
@@ -982,6 +1025,55 @@ mod tests {
         let unlimited = run_config(&["--max-upload-mib-per-frame", "0"]);
         assert_eq!(unlimited.max_upload_mib_per_frame, 0);
         assert_eq!(unlimited.max_upload_bytes_per_frame(), None);
+    }
+
+    #[test]
+    fn the_water_reflection_preset_defaults_to_baseline_and_parses_both_names() {
+        assert_eq!(
+            EngineConfig::default().water_reflection_preset,
+            WaterReflectionPreset::Baseline
+        );
+        assert_eq!(
+            run_config(&[]).water_reflection_preset,
+            WaterReflectionPreset::Baseline
+        );
+        for (name, preset) in [
+            ("baseline", WaterReflectionPreset::Baseline),
+            ("water", WaterReflectionPreset::Water),
+        ] {
+            let config = run_config(&["--water-reflection-preset", name]);
+            assert_eq!(config.water_reflection_preset, preset);
+            assert_eq!(preset.name(), name);
+        }
+    }
+
+    #[test]
+    fn an_unknown_water_reflection_preset_or_a_missing_value_is_refused() {
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset", "fast"]),
+            ConfigError::InvalidValue { option: "--water-reflection-preset", value: Some(ref value), .. }
+                if value == "fast"
+        ));
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset"]),
+            ConfigError::InvalidValue {
+                option: "--water-reflection-preset",
+                value: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset", "--headless"]),
+            ConfigError::InvalidValue {
+                option: "--water-reflection-preset",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn help_documents_the_water_reflection_preset() {
+        assert!(help_names("--water-reflection-preset"));
     }
 
     #[test]
