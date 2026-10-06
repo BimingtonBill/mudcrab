@@ -1476,8 +1476,8 @@ mod tests {
         assert!(camera.contains::<OcclusionCulling>());
         assert_eq!(
             camera.get::<Msaa>(),
-            Some(&Msaa::default()),
-            "the baseline leaves multisampling at Bevy's default"
+            None,
+            "the baseline sets no multisampling of its own: Bevy's default applies"
         );
         assert_eq!(
             camera.get::<RenderLayers>(),

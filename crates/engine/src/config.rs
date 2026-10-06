@@ -160,6 +160,9 @@ pub enum WaterReflectionPreset {
 }
 
 impl WaterReflectionPreset {
+    /// Every preset, in the order the help lists them.
+    pub const ALL: [Self; 2] = [Self::Baseline, Self::Water];
+
     /// The spelling the command line and run records use.
     pub const fn name(self) -> &'static str {
         match self {
@@ -800,17 +803,16 @@ impl EngineConfig {
                 "--water-reflection-preset" => {
                     const EXPECTED: &str = "baseline or water";
                     let raw = take_raw("--water-reflection-preset", EXPECTED, args.next())?;
-                    config.water_reflection_preset = match raw.as_str() {
-                        "baseline" => WaterReflectionPreset::Baseline,
-                        "water" => WaterReflectionPreset::Water,
-                        _ => {
-                            return Err(ConfigError::invalid_value(
+                    config.water_reflection_preset = WaterReflectionPreset::ALL
+                        .into_iter()
+                        .find(|preset| preset.name() == raw)
+                        .ok_or_else(|| {
+                            ConfigError::invalid_value(
                                 "--water-reflection-preset",
                                 Some(raw),
                                 EXPECTED,
-                            ));
-                        }
-                    };
+                            )
+                        })?;
                 }
                 unknown => return Err(ConfigError::unrecognized(unknown)),
             }
@@ -956,10 +958,14 @@ fn take_raw(
 fn take_on_off(option: &'static str, value: Option<String>) -> Result<bool, ConfigError> {
     const EXPECTED: &str = "on or off";
     let raw = take_raw(option, EXPECTED, value)?;
-    match raw.as_str() {
-        "on" => Ok(true),
-        "off" => Ok(false),
-        _ => Err(ConfigError::invalid_value(option, Some(raw), EXPECTED)),
+    // Not a `match` on string literals: the help-drift tests read every `"..." =>` line of this file
+    // as an option arm.
+    if raw == "on" {
+        Ok(true)
+    } else if raw == "off" {
+        Ok(false)
+    } else {
+        Err(ConfigError::invalid_value(option, Some(raw), EXPECTED))
     }
 }
 
