@@ -33,7 +33,7 @@ Some `LAND` quadrants have no base texture (`BTXT` missing; the converter synthe
 `texture_form_id == 0`, `crates/converter/src/esm/cell_cache.rs` around line 245). They render their
 base weight against Bevy's 1x1 white fallback and show as blocky white squares (Tamriel (0,0) quadrant
 1, (4,-21) quadrant 2; see the white patch in
-`C:/Modding/OpenSkyrimProject/local/demo/rural-top.png`, which you can `Read`). The lead's design
+`C:/Modding/MudcrabProject/local/demo/rural-top.png`, which you can `Read`). The lead's design
 decision: such a quadrant **borrows the base texture of a neighbouring quadrant in the same cell** (the
 first of the other three that has one, in quadrant order); if none has one, it uses its own
 highest-weight overlay layer's texture as the base. The terrain material setup is in `render.rs`

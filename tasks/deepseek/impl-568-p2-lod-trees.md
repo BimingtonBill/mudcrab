@@ -6,7 +6,7 @@ their edge.
 # Context
 - Your checkout is cut from `phase2/lod-engine-objects` (steps 3 and 4a: terrain and object LOD
   blocks). Use upstream's commit style (`feat(engine): ...`), with no `[deepseek]` prefix.
-- The design: `C:/Modding/OpenSkyrimProject/local/research-557/DESIGN.md`, section 3 ("Tree
+- The design: `C:/Modding/MudcrabProject/local/research-557/DESIGN.md`, section 3 ("Tree
   billboards"), 4, 5, 6 and 8 ("4b"). Follow it, with these decisions from the lead:
   1. **Geometry:** the converter already publishes one crossed-quad GLB per tree type (`MASK`,
      double-sided); draw those as they are. No new WGSL.

@@ -5,7 +5,7 @@ Track: Phase 2. Read-only analysis; you write only the report file named below. 
 
 ## Background
 
-Three of our branches are open upstream PRs (realfakenerd/wah-krah-jol). Their heads are frozen:
+Three of our branches are open upstream PRs (Mudcrab-Team/mudcrab). Their heads are frozen:
 
 | PR | branch | head |
 |----|--------|------|
@@ -57,6 +57,6 @@ Settle this by reading code; no builds are needed. The git commands above work f
 
 ## Output
 
-Write `docs/pr/coderabbit-triage-29-31.md` in `C:\Modding\OpenSkyrimProject` (a table of the six verdicts
+Write `docs/pr/coderabbit-triage-29-31.md` in `C:\Modding\MudcrabProject` (a table of the six verdicts
 at the top, then one section per finding), and commit only that file with subject
 `[deepseek] review-570: triage CodeRabbit findings on #29-#31`.

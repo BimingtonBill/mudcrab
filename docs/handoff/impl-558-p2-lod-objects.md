@@ -94,7 +94,7 @@ shapes become glTF meshes" (mesh.rs, now also lod.rs).
   of any NIF/glTF plumbing) — together they prove item 3's "0 or 1 segment" boundary and the
   cumulative-offset arithmetic in isolation.
 - Also checked against real shipped data (not part of the suite, run manually with
-  `OPENSKYRIM_LOD_FIXTURE` against the ignored `real_lod_mesh_parses_and_converts` test, output
+  `MUDCRAB_LOD_FIXTURE` against the ignored `real_lod_mesh_parses_and_converts` test, output
   discarded afterward): `tamriel.4.4.-4.bto` from `C:/Modding/SkyrimConverted-upstream15/` has
   two `BSSubIndexTriShape` shapes, `Obj` and `obj-LargeRef`. Both split correctly — `Obj` into 9
   primitives (`lodSegment` 1,2,3,5,9,12,13,14,15) and `obj-LargeRef` into 15 (every index but 4)

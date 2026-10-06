@@ -80,7 +80,7 @@ Logged at `debug`, once per model path: the model, the clip's own name and its l
    the *player* entity is the one line that needs it (that entity is the one this module does not
    itself hold a query on).
 7. **Opt-in real-model test**, `the_wheel_names_its_clip_idle`, `#[ignore]`d and gated on
-   `OPENSKYRIM_CONVERTED_DIR` (ADR-0002) like `door_animation.rs`'s. It reads the converted
+   `MUDCRAB_CONVERTED_DIR` (ADR-0002) like `door_animation.rs`'s. It reads the converted
    `.glb` and asserts the wheel names its one clip `Idle` - the premise of the whole feature. I ran
    it against `C:/Modding/SkyrimConverted` with the path passed literally for one run (the sandbox
    would not let me set the env var) and it passed; an AssetServer load of the real model in a

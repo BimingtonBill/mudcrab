@@ -6,7 +6,7 @@ implement it.
 
 # Context
 - Code: `C:/Modding/wkj-phase2` (branch `phase2/integration-lod-shots`, upstream Phase 2 work,
-  read-only for you) and the demo engine `C:/Modding/OpenSkyrimProject` (branch `portal`). The
+  read-only for you) and the demo engine `C:/Modding/MudcrabProject` (branch `portal`). The
   converter's material publication is in `crates/converter/src/material.rs` and `mesh.rs`; the
   engine's material loading is in `crates/engine/src/render.rs`.
 - The symptom, from `docs/research/look-gaps-2026-09-24.md` item 6: glacier ice is drawn as green

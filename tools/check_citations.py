@@ -4,7 +4,7 @@ Research notes and handoff notes are required to cite evidence, and about half o
 engine-internal claims in advisor reports have been wrong. This catches the mechanical
 half of that: a cited file that does not exist, a line past the end of the file, and an
 address that is not inside any function a disassembly export knows about (only when a
-function table exists under local/ - OpenSkyrim has none yet, so addresses are not checked).
+function table exists under local/ - Mudcrab has none yet, so addresses are not checked).
 
   python tools/check_citations.py docs/research/auto-switch.md
   python tools/check_citations.py --since HEAD~1        # every .md changed since a commit
@@ -145,7 +145,7 @@ def check_path(path, first, last, root=ROOT, index=None):
     if '/' in clean:
         target = root / clean
         # A worker-written note must not make this read files outside the project ("../../x", or an absolute
-        # path, which pathlib's / would take as the whole path): OpenSkyrim audit finding HT-20260924-05.
+        # path, which pathlib's / would take as the whole path): Mudcrab audit finding HT-20260924-05.
         try:
             target.resolve().relative_to(root.resolve())
         except ValueError:

@@ -34,7 +34,7 @@ tests. No new dependencies. No machine-specific paths.
   the `lights` row's radius, colour, flags, falloff and fade; the lit reference's `radius_override`;
   `NULL` for a reference without `XRDS`; no `statics` row for a model-less `LIGH`;
   `schema_info.version == 4`.
-- The ported unit tests pass; the real-plugin test stays `#[ignore]`d behind `OPENSKYRIM_SKYRIM_DATA`.
+- The ported unit tests pass; the real-plugin test stays `#[ignore]`d behind `MUDCRAB_SKYRIM_DATA`.
 - `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test -p converter -p shared -p dummy-content` pass, and `cargo test -p engine --lib` still
   passes with the bumped literal.

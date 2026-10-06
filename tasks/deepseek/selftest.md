@@ -4,7 +4,7 @@ Checks that the worker harness itself still works after a change to the launcher
 the project config or the permission rules. Run it, read the verdict, throw the result away.
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:/Users/Brannock/.claude/skills/deepseek-agents/ds-agent.ps1" -TaskFile "tasks/deepseek/selftest.md" -Dir "C:/Modding/OpenSkyrimProject" -Label selftest -Effort medium -MaxTurns 20 -TimeoutMinutes 6 -Schema "tasks/deepseek/selftest-schema.json"
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:/Users/Brannock/.claude/skills/deepseek-agents/ds-agent.ps1" -TaskFile "tasks/deepseek/selftest.md" -Dir "C:/Modding/MudcrabProject" -Label selftest -Effort medium -MaxTurns 20 -TimeoutMinutes 6 -Schema "tasks/deepseek/selftest-schema.json"
 ```
 
 Do exactly these six checks, in order, and nothing else. Do not run git. Do not read or change

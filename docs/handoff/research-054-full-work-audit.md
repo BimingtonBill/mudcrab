@@ -12,7 +12,7 @@ file this task touched is this note.
   (`MarketplaceTextures.bsa`), the same zero-only rule, plus Creation Club file flags we do not
   have. `git diff HEAD origin/main -- crates/converter/src/archive/bsa.rs` shows our version is a
   strict subset. **Carry no BSA change in any PR.**
-* **The project was rebranded to "Wah Krah Jol"** (`d46a179`, with `LEGAL.md`). PR titles and bodies
+* **The project was rebranded to "Mudcrab"** (`d46a179`, with `LEGAL.md`). PR titles and bodies
   must use the new name.
 * **The complete upstream drift is 11 files, +975 / −65.** Four of them collide with our work:
   `bsa.rs` (dropped), `mesh.rs` +411 and `material.rs` +11 (the material-fidelity PR — rebase by

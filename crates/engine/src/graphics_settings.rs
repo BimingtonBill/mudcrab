@@ -1215,14 +1215,14 @@ pub fn patched_ssao_source(source: &str, radius: f32) -> Option<String> {
         Some(source.replacen(
             SSAO_DEPTH_RADIUS_LINE,
             &format!(
-                "let effect_radius = depth_range_scale_factor * {radius}; // OpenSkyrim: SSAO radius"
+                "let effect_radius = depth_range_scale_factor * {radius}; // Mudcrab: SSAO radius"
             ),
             1,
         ))
     } else if source.contains(SSAO_RADIUS_LINE) {
         Some(source.replacen(
             SSAO_RADIUS_LINE,
-            &format!("let effect_radius = {radius}; // OpenSkyrim: SSAO radius"),
+            &format!("let effect_radius = {radius}; // Mudcrab: SSAO radius"),
             1,
         ))
     } else {

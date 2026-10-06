@@ -1,6 +1,6 @@
 # Context for DeepSeek workers
 
-Project: **OpenSkyrim**, an open-source reimplementation of the engine for *The Elder Scrolls V: Skyrim Special Edition*, written in Rust (2024 edition) on Bevy 0.19. An offline converter turns Bethesda's files (`.esm`, `.bsa`/`.ba2`, `.nif`, `.dds`, `.pex`) into modern formats (SQLite, glTF 2.0, KTX2, Luau), and the engine streams those at runtime. Read `README.md` and `docs/roadmap/README.md` for the goals and current phase, then the docs relevant to your task.
+Project: **Mudcrab**, an open-source reimplementation of the engine for *The Elder Scrolls V: Skyrim Special Edition*, written in Rust (2024 edition) on Bevy 0.19. An offline converter turns Bethesda's files (`.esm`, `.bsa`/`.ba2`, `.nif`, `.dds`, `.pex`) into modern formats (SQLite, glTF 2.0, KTX2, Luau), and the engine streams those at runtime. Read `README.md` and `docs/roadmap/README.md` for the goals and current phase, then the docs relevant to your task.
 
 ## Key documents
 - `docs/roadmap/*.md` - the five phases. Phase 1 (converter) is done; Phase 2 (core engine, Vercidium renderer) is in its acceptance stage: `02-acceptance.md`, `02-completion-plan.md`, `02-profiling.md`, `02-integration-and-acceptance.md`.

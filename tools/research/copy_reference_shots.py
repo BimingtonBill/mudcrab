@@ -18,7 +18,7 @@ import os
 import shutil
 import sys
 
-DEFAULT_SOURCE = r"C:\Modding\OpenSkyrimProject\local\reference\uesp"
+DEFAULT_SOURCE = r"C:\Modding\MudcrabProject\local\reference\uesp"
 DEFAULT_DESTINATION = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "local",

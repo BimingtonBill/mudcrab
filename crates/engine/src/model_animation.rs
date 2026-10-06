@@ -692,15 +692,16 @@ mod tests {
     /// `door_animation.rs` reads the route's door models.
     ///
     /// The converted assets are game data and are never committed, so this test is opt-in: it is
-    /// `#[ignore]`d and skips - printing why - when `OPENSKYRIM_CONVERTED_DIR` does not name a
+    /// `#[ignore]`d and skips - printing why - when `MUDCRAB_CONVERTED_DIR` does not name a
     /// converted asset tree, so CI never needs proprietary data (ADR-0002).
     #[test]
-    #[ignore = "reads the converted Skyrim models (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "reads the converted Skyrim models (MUDCRAB_CONVERTED_DIR)"]
     fn the_wheel_names_its_clip_idle() {
-        let Some(assets) =
-            std::env::var_os("OPENSKYRIM_CONVERTED_DIR").map(std::path::PathBuf::from)
+        let Some(assets) = std::env::var_os("MUDCRAB_CONVERTED_DIR")
+            .or_else(|| std::env::var_os("OPENSKYRIM_CONVERTED_DIR"))
+            .map(std::path::PathBuf::from)
         else {
-            eprintln!("skipping: set OPENSKYRIM_CONVERTED_DIR to a converted asset tree");
+            eprintln!("skipping: set MUDCRAB_CONVERTED_DIR to a converted asset tree");
             return;
         };
         const WHEEL: &str = "meshes/architecture/farmhouse/lumbermill01waterwheel01.glb";

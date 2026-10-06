@@ -23,7 +23,7 @@ An engine-side fix, no Bevy fork: in the **render app**, a system that gives eve
 ## Checks
 
 - A unit test that builds the render-world pieces it can (or tests the pure part: given a `LightEntity::Directional` and a light's layers, the layers the view gets). Be honest about what a unit test can't reach.
-- `cargo build --profile quick --bin engine`, then a short door tour twice, once on the build **without** your change (the lead's `target/quick/engine.exe` in `C:\Modding\OpenSkyrimProject`, if the harness gave you its copy, or `git stash` your change) and once with it:
+- `cargo build --profile quick --bin engine`, then a short door tour twice, once on the build **without** your change (the lead's `target/quick/engine.exe` in `C:\Modding\MudcrabProject`, if the harness gave you its copy, or `git stash` your change) and once with it:
   `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t177-before --tour-doors 2`
   and the same into `local/t177-after`. The tour's survey screenshots inside the first house (`01-*`, taken after crossing in, looking around) include the open door with the daylit exterior seen through it. Compare those images between the two runs and say whether the exterior through the doorway now shows sun shadows (trees and houses casting onto the ground), naming the image files. Both tours must end `tour PASSED after 2 crossings (short tour)`. Read only `local/t177-*` under `local/`.
 - The main view's own shadows are unchanged: compare the exterior screenshots (`00-*`) between the runs.

@@ -4546,15 +4546,16 @@ mod tests {
     /// the assertion is written so that it keeps meaning something on the day they do.
     ///
     /// The converted assets are game data and are never committed, so this test is opt-in: it is
-    /// `#[ignore]`d and skips - printing why - when `OPENSKYRIM_CONVERTED_DIR` does not name a
+    /// `#[ignore]`d and skips - printing why - when `MUDCRAB_CONVERTED_DIR` does not name a
     /// converted asset tree, so CI never needs proprietary data (ADR-0002).
     #[test]
-    #[ignore = "reads the converted Skyrim door models (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "reads the converted Skyrim door models (MUDCRAB_CONVERTED_DIR)"]
     fn the_route_door_models_resolve_to_a_clip_whenever_they_carry_one() {
-        let Some(assets) =
-            std::env::var_os("OPENSKYRIM_CONVERTED_DIR").map(std::path::PathBuf::from)
+        let Some(assets) = std::env::var_os("MUDCRAB_CONVERTED_DIR")
+            .or_else(|| std::env::var_os("OPENSKYRIM_CONVERTED_DIR"))
+            .map(std::path::PathBuf::from)
         else {
-            eprintln!("skipping: set OPENSKYRIM_CONVERTED_DIR to a converted asset tree");
+            eprintln!("skipping: set MUDCRAB_CONVERTED_DIR to a converted asset tree");
             return;
         };
         if !assets.is_dir() {
@@ -4613,15 +4614,16 @@ mod tests {
     /// This is the test the reconversion makes possible - until the door models carried clips there
     /// was nothing to scale - and it is the closest thing to a runtime check of path 2 that does not
     /// need a window: it measures the clip the engine would play, not a fixture that stands in for
-    /// it. Opt-in like the test above, and skipped when `OPENSKYRIM_CONVERTED_DIR` is not set
+    /// it. Opt-in like the test above, and skipped when `MUDCRAB_CONVERTED_DIR` is not set
     /// (ADR-0002).
     #[test]
-    #[ignore = "reads the converted Skyrim door models (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "reads the converted Skyrim door models (MUDCRAB_CONVERTED_DIR)"]
     fn the_route_door_s_own_clip_scales_to_a_doorway() {
-        let Some(assets) =
-            std::env::var_os("OPENSKYRIM_CONVERTED_DIR").map(std::path::PathBuf::from)
+        let Some(assets) = std::env::var_os("MUDCRAB_CONVERTED_DIR")
+            .or_else(|| std::env::var_os("OPENSKYRIM_CONVERTED_DIR"))
+            .map(std::path::PathBuf::from)
         else {
-            eprintln!("skipping: set OPENSKYRIM_CONVERTED_DIR to a converted asset tree");
+            eprintln!("skipping: set MUDCRAB_CONVERTED_DIR to a converted asset tree");
             return;
         };
         if !assets.is_dir() {

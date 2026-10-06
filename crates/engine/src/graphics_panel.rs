@@ -54,7 +54,11 @@ pub const TOGGLE_KEY: KeyCode = KeyCode::KeyG;
 
 /// Set to `1` (or anything but `0`) to start a run with the panel open: the hidden switch for an
 /// automated screenshot of it (with `--show-window`, or the HUD stays hidden).
-pub const OPEN_AT_START_ENV: &str = "OPENSKYRIM_GRAPHICS_PANEL";
+pub const OPEN_AT_START_ENV: &str = "MUDCRAB_GRAPHICS_PANEL";
+
+/// The name [`OPEN_AT_START_ENV`] had before the Mudcrab rename, still accepted. Built in two
+/// halves so `scripts/rename-to-mudcrab.py` leaves it alone.
+const OPEN_AT_START_LEGACY_ENV: &str = concat!("OPEN", "SKYRIM_GRAPHICS_PANEL");
 
 /// The footer's warning about the frame a pipeline change takes to compile.
 pub const FLASH_NOTE: &str =
@@ -617,7 +621,9 @@ pub struct GraphicsPanelPlugin;
 
 impl Plugin for GraphicsPanelPlugin {
     fn build(&self, app: &mut App) {
-        let open = std::env::var(OPEN_AT_START_ENV).is_ok_and(|value| value.trim() != "0");
+        let open = std::env::var(OPEN_AT_START_ENV)
+            .or_else(|_| std::env::var(OPEN_AT_START_LEGACY_ENV))
+            .is_ok_and(|value| value.trim() != "0");
         let mut panel = GraphicsPanel { open, ..default() };
         if let Some(settings) = app.world().get_resource::<GraphicsSettings>() {
             panel.remember(settings);

@@ -5,7 +5,7 @@
     "C:/Modding/SkyrimConverted",
     "D:/Modding-overflow/shared-check-target",
     "C:/Modding/shared-check-phase2",
-    "C:/Modding/OpenSkyrimProject/local/merge"
+    "C:/Modding/MudcrabProject/local/merge"
   ],
   "denyEdit": [
     "crates/**",

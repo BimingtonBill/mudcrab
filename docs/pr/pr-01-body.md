@@ -34,7 +34,7 @@ reciprocal and carry each other's arrival frames, and a truncation/mutation swee
 No game data is involved: every byte is synthesized from the seed, as ADR-0001 requires.
 
 The new preset's author string is plain `"dummy-content"`. The crate's existing one still reads
-`"OpenSkyrim dummy-content"`; renaming it after the move to Wah Krah Jol felt like churn for this
+`"Mudcrab dummy-content"`; renaming it after the move to Mudcrab felt like churn for this
 change, but say the word and it goes in.
 
 ## Checks run locally on the branch

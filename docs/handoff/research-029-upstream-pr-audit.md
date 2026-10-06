@@ -14,7 +14,7 @@ created, no GitHub contact.
 * **Upstream has moved 16 commits** past the fork point (`origin/main` = `0ec2d36`), all of it the
   new `crates/dummy-content` fixture crate, eight ADRs and two new CI jobs (cargo audit, release
   performance budgets). Its rule for real game data is ADR-0002: generated fixtures in CI, opt-in
-  tests behind `OPENSKYRIM_SKYRIM_DATA`/`OPENSKYRIM_*_FIXTURE`, `#[ignore]`d, no defaults.
+  tests behind `MUDCRAB_SKYRIM_DATA`/`MUDCRAB_*_FIXTURE`, `#[ignore]`d, no defaults.
 * **Only one file both sides touched:** `crates/converter/src/archive/bsa.rs`, and only its
   `mod tests` (upstream rewrote the fixture builder to `dummy_content::bsa::v104`). Upstream's
   `esm/binary.rs` change is a new `#[cfg(test)] mod tests` only, so the fork's `exporter.rs` call

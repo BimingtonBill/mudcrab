@@ -9,7 +9,7 @@ rock" - and say precisely where the converter's job ends and what the engine mus
 
 ## Context
 
-- Repo `C:\Modding\OpenSkyrimProject`. Converter `crates/converter/**` (this task's territory).
+- Repo `C:\Modding\MudcrabProject`. Converter `crates/converter/**` (this task's territory).
   Engine `crates/engine/**` belongs to another lead - read it, never edit it. Vendored NIF parser
   `vendor/project-wormhole-nif/**` is read-only for us (a copy of an upstream project).
 - The gap: `docs/research/visual-gaps-spec.md` gap 3. The Alftand ice set is `meshes/dungeons/caves/

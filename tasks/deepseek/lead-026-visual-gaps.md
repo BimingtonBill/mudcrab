@@ -1,12 +1,12 @@
 # Goal
-For each visual gap between OpenSkyrim's renders and real Skyrim screenshots, work out exactly
+For each visual gap between Mudcrab's renders and real Skyrim screenshots, work out exactly
 what data drives the effect in Skyrim, what our converter and engine do with that data today, and
 the smallest correct way to implement it. The result is an implementation spec the lead can turn
 into coding tasks.
 
 # Context
-- OpenSkyrim is a Rust/Bevy 0.19 reimplementation of the Skyrim SE renderer and world streaming.
-  - The workspace is at `C:/Modding/OpenSkyrimProject`, with the crates `converter`, `engine`
+- Mudcrab is a Rust/Bevy 0.19 reimplementation of the Skyrim SE renderer and world streaming.
+  - The workspace is at `C:/Modding/MudcrabProject`, with the crates `converter`, `engine`
     and `shared`.
   - The converter turns Skyrim.esm and the BSA archives into glTF, KTX2 and a SQLite world
     database: `C:/Modding/SkyrimConverted/skyrim_world.db`, read-only. Open it with the URI

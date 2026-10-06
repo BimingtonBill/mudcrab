@@ -3,7 +3,7 @@ Track: Phase 2 (upstream #112 door-crossing draft). Fix the confirmed findings o
 #700, MiMo #701) on branch `phase2/door-preload`. One round; keep each fix small.
 
 # Context
-Base: the commit named in "This run". Own worktree on D: (`git -C C:/Modding/OpenSkyrimProject worktree add
+Base: the commit named in "This run". Own worktree on D: (`git -C C:/Modding/MudcrabProject worktree add
 D:/Modding-overflow/wt-702 <base> --detach`, `CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/impl-702`).
 Upstream style (`fix(engine): ...`), trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`, new
 commits only. Owned: `crates/engine/src/door_crossing.rs`, `doors.rs`, `world/database.rs`, `streaming.rs`

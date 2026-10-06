@@ -318,7 +318,7 @@ pub struct TerrainCollider;
 /// A fixed placement's collision provenance.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaticColliderSource {
-    /// The model's NIF carries authored Havok shapes (`openSkyrimCollision`).
+    /// The model's NIF carries authored Havok shapes (`mudcrabCollision`).
     NifAuthored,
     /// The model has no authored shapes, so its rendered triangles stand in as a proxy.
     RenderProxy,
@@ -3744,7 +3744,7 @@ fn static_proxy_from_hierarchy(
         .map_err(|error| format!("invalid static proxy trimesh: {error}"))
 }
 
-/// The authored `openSkyrimCollision` a converted model publishes in its GLB scene extras, if it
+/// The authored `mudcrabCollision` a converted model publishes in its GLB scene extras, if it
 /// has one.
 fn authored_collision_from_hierarchy(
     root: Entity,

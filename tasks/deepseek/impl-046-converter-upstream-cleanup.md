@@ -14,11 +14,11 @@ conventions and carries nothing private. **Behaviour must not change.**
 
 1. **ADR-0002 real-data tests.** The fork's install-dependent tests read `SKYRIM_DATA_DIR` and
    fall back to hard-coded machine paths (`C:/Games/...`, `C:/Modding/...`). The upstream
-   convention is `OPENSKYRIM_SKYRIM_DATA`: read ADR-0002 for the exact contract. Switch every
+   convention is `MUDCRAB_SKYRIM_DATA`: read ADR-0002 for the exact contract. Switch every
    such test to it, delete the machine-path fallbacks, and keep the tests `#[ignore]`d or skipped
    when the variable is absent, exactly as ADR-0002 says. For tests that read the fork's
    converted output (`C:/Modding/SkyrimConverted/...`, for example the real-plugin lighting test
-   and the door-animation tests), use a second variable, `OPENSKYRIM_CONVERTED_DIR`, with the same
+   and the door-animation tests), use a second variable, `MUDCRAB_CONVERTED_DIR`, with the same
    skip rule. Document it in the test module doc.
 2. **No private names in production code or doc comments.** Remove references to the fork's
    private tooling and process from the owned files:
@@ -37,8 +37,8 @@ conventions and carries nothing private. **Behaviour must not change.**
 
 - The acceptance commands must pass. Test names may change; test count and coverage may not
   shrink.
-- Run `cargo test -p converter --lib -- --include-ignored` with `OPENSKYRIM_SKYRIM_DATA` set to
-  `C:/Games/Steam/steamapps/common/Skyrim Special Edition/Data` and `OPENSKYRIM_CONVERTED_DIR`
+- Run `cargo test -p converter --lib -- --include-ignored` with `MUDCRAB_SKYRIM_DATA` set to
+  `C:/Games/Steam/steamapps/common/Skyrim Special Edition/Data` and `MUDCRAB_CONVERTED_DIR`
   set to `C:/Modding/SkyrimConverted`. The real-data tests must still pass. Report the counts.
 
 ## Scope

@@ -8,13 +8,13 @@ with the render-origin rebase. Nothing collides with them yet: the player half (
 # Context
 - Your checkout is branch `portal-merge-main` (base 0fa97092) with the pacing, sky-dome and terrain-normals ports
   integrated. Commit prefix `[deepseek]`.
-- Main's streamer (source): `C:/Modding/OpenSkyrimProject/local/merge/streaming_main.rs`; what main
+- Main's streamer (source): `C:/Modding/MudcrabProject/local/merge/streaming_main.rs`; what main
   changed: `streaming_base_to_main.diff` (same folder). Recipe:
-  `C:/Modding/OpenSkyrimProject/local/merge/research-275-report.md` (sections 2-5). Second opinion:
-  `C:/Modding/OpenSkyrimProject/local/merge/port-prep-collision.md`.
+  `C:/Modding/MudcrabProject/local/merge/research-275-report.md` (sections 2-5). Second opinion:
+  `C:/Modding/MudcrabProject/local/merge/port-prep-collision.md`.
 - `crates/engine/src/physics.rs` is main's file, compiled but unwired (`world_collision_groups`,
   `PhysicsCorePlugin`); `bevy_rapier3d` is already a dependency; `shared::collision` holds the
-  converted collision format the GLBs now carry (`openSkyrimCollision` extras).
+  converted collision format the GLBs now carry (`mudcrabCollision` extras).
 - Portal's streamer has tiered cells (`CellDetail::{Full, Terrain}`), interiors (`ActiveCell`),
   pre-streamed door destinations (`PrestreamCells`), paced unloads (`Retiring`) and paced model
   arming (`PendingModel`). `crate::portal::isolate_cells` writes each cell root's `CellRole`

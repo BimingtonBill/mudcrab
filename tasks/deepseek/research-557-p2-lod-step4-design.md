@@ -10,7 +10,7 @@ terrain LOD. A design document only, no code.
   - `phase2/lod-engine-terrain`: the engine draws terrain LOD behind `--lod`.
 
   Read them with `git -C C:/Modding/wkj-phase2 log` and `show`. Designs:
-  `C:/Modding/OpenSkyrimProject/docs/design/distant-lod.md` and `distant-lod-step3-brief.md`.
+  `C:/Modding/MudcrabProject/docs/design/distant-lod.md` and `distant-lod-step3-brief.md`.
   Format research: `docs/research/skyrim-lod-formats.md` and `docs/research/tree-lod-layout.md`.
 - Already true:
   - object LOD blocks convert to GLB (`meshes/terrain/<ws>/objects/*.bto`); step 2 records them

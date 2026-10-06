@@ -14,7 +14,7 @@ import os
 import sqlite3
 import sys
 
-DB = os.environ.get("OPENSKYRIM_DB", r"C:\Modding\SkyrimConverted\skyrim_world.db")
+DB = os.environ.get("MUDCRAB_DB", r"C:\Modding\SkyrimConverted\skyrim_world.db")
 
 
 def connect(path):

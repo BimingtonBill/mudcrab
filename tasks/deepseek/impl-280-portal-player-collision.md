@@ -17,8 +17,8 @@ ray-casting the render meshes. Doors keep working exactly as today. Research-275
   (~812-845) ray-casts render meshes; `walk_step` (~433) moves the camera-as-player; door logic
   (`player_door`, `player_auto_doors`, `player_walks_through_doors`, `mesh_is_out_of_the_way` ~976)
   must stay as is.
-- Recipe: `C:/Modding/OpenSkyrimProject/local/merge/research-275-report.md` (sections 1-5); second
-  opinion `C:/Modding/OpenSkyrimProject/local/merge/port-prep-collision.md`.
+- Recipe: `C:/Modding/MudcrabProject/local/merge/research-275-report.md` (sections 1-5); second
+  opinion `C:/Modding/MudcrabProject/local/merge/port-prep-collision.md`.
 
 # Decisions (fixed)
 1. A composite probe behind `CollisionWorld`: rapier ray casts (`ReadRapierContext`, `QueryFilter`

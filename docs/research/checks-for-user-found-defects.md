@@ -35,7 +35,7 @@ Read the code paths behind all five defects (no builds, no engine runs, per the 
 - **Why every check passed.** No test asserted the grid at all before it; the failure mode (sky behind the door) is only visible in a picture, and no tour walks an *exterior* destination from a persistent-cell door in a way that reports it.
 - **Checks.**
   - The fixture unit test now exists (`world/database.rs:1347-1356`: cell 10 says (2, −3), reference 100 stands at x≈0 ⇒ grid must be (0, 0)). Its shape is slightly artificial (a cell (2,−3) cannot hold x≈0); the Riverwood shape — **cell grid (0,0), reference far away, expect the position's grid** — is worth asserting explicitly too, since it is the real case.
-  - **A data-level audit over the real converted database** (new, and cheap): for every door link with an exterior destination, `door_anchor(reference).destination_grid == Some(grid_of(reference.position))` and that grid's cell exists in that worldspace with land. Cost: one SQL pass over ~1,000 exterior links, well under a second; lives as an `#[ignore]`d test gated on `OPENSKYRIM_CONVERTED_DIR`, which is the established pattern (`door_animation.rs:2814`, `model_animation.rs:644`, `crates/converter/src/mesh.rs:1891`), or as a mode in `tools/research/world_db.py` (`tools/research/world_db.py:22 connect()`). No GPU, no engine run.
+  - **A data-level audit over the real converted database** (new, and cheap): for every door link with an exterior destination, `door_anchor(reference).destination_grid == Some(grid_of(reference.position))` and that grid's cell exists in that worldspace with land. Cost: one SQL pass over ~1,000 exterior links, well under a second; lives as an `#[ignore]`d test gated on `MUDCRAB_CONVERTED_DIR`, which is the established pattern (`door_animation.rs:2814`, `model_animation.rs:644`, `crates/converter/src/mesh.rs:1891`), or as a mode in `tools/research/world_db.py` (`tools/research/world_db.py:22 connect()`). No GPU, no engine run.
 
 ### 4. A crossing landed the player inside the closed far door
 
@@ -216,7 +216,7 @@ Absolute thresholds where the defect is gross (a white sheet, a black hearth) an
 | 4 | per-crossing far-door assertion | 4 | ~0 | `demo_tour.rs` |
 | 5 | image metrics `--check` | 5 | 3-15 s after a render | `tools/research/exposure_stats.py` |
 
-Defect 3 is the one gap not covered by a *new* check: the fixture unit test that encodes the invariant already landed with the fix (`world/database.rs:1347-1356`). I still recommend the data-level audit (grid vs the destination reference's own position, over the real DB, `#[ignore]`d on `OPENSKYRIM_CONVERTED_DIR`) because it covers ~1,200 real links instead of one fixture, and because both defect 3 and defect 4 were "the data said one thing, the engine used another" bugs that a single fixture row cannot guard.
+Defect 3 is the one gap not covered by a *new* check: the fixture unit test that encodes the invariant already landed with the fix (`world/database.rs:1347-1356`). I still recommend the data-level audit (grid vs the destination reference's own position, over the real DB, `#[ignore]`d on `MUDCRAB_CONVERTED_DIR`) because it covers ~1,200 real links instead of one fixture, and because both defect 3 and defect 4 were "the data said one thing, the engine used another" bugs that a single fixture row cannot guard.
 
 ## What I could not do, and what I am unsure about
 

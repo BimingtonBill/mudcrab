@@ -7,7 +7,7 @@ of a block that belongs to a loaded cell, as Skyrim does.
 - Your checkout is cut from `phase2/lod-mesh-containers` (distant LOD step 1: the converter reads
   the LOD mesh containers and converts `.btr`/`.bto` to GLB). Use upstream's commit style
   (`feat(converter): ...`), with no `[deepseek]` prefix.
-- How Skyrim hides object LOD (research: `C:/Modding/OpenSkyrimProject/local/research/lod-hiding-under-loaded-cells.md`,
+- How Skyrim hides object LOD (research: `C:/Modding/MudcrabProject/local/research/lod-hiding-under-loaded-cells.md`,
   read its first 80 lines):
   - Every shape of a level-4 `.bto` block is a `BSSubIndexTriShape` whose triangles are split into
     up to 16 segments, one per cell of the 4x4 block. Segment index `i` = `4 * dx + dy`, where

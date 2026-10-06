@@ -1,7 +1,7 @@
 # DeepSeek delegation policy
 
 Carried over on 2026-09-21 from the user's DOA Xbox360 UI project, where it was authorized on
-2026-09-20 after a project review, and adapted to OpenSkyrim. The user asked for the same DeepSeek
+2026-09-20 after a project review, and adapted to Mudcrab. The user asked for the same DeepSeek
 worker setup here.
 
 ## Objective

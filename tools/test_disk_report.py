@@ -287,7 +287,7 @@ class SectionTests(TempCase):
 
     def test_never_touch_names_not_walked(self):
         names = ["SkyrimConverted", "SkyrimConverted-upstream", "skyrimconverted2", "Bethini Pie (x)",
-                 "Modlists", "Wabbajack", "OpenSkyrimProject"]
+                 "Modlists", "Wabbajack", "MudcrabProject"]
         for name in names:
             folder = self.entry_dir(name, owner_text(**{"keep-until": "date:2000-01-01"}))
             write(os.path.join(folder, "big.bin"), size=1000)

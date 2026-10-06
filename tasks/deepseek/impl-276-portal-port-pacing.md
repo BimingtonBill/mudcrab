@@ -8,8 +8,8 @@ a column of cells unloads or a cell's models arrive. Follow the research recipe 
 - Your checkout is branch `portal-merge-main` (portal + current upstream main, merge 386044af, then
   0d426186). Commit prefix `[deepseek]`.
 - Upstream main's streamer (the source to port from) is readable at
-  `C:/Modding/OpenSkyrimProject/local/merge/streaming_main.rs`; what main changed against the common
-  ancestor is `C:/Modding/OpenSkyrimProject/local/merge/streaming_base_to_main.diff`. Line numbers in
+  `C:/Modding/MudcrabProject/local/merge/streaming_main.rs`; what main changed against the common
+  ancestor is `C:/Modding/MudcrabProject/local/merge/streaming_base_to_main.diff`. Line numbers in
   the appendix that say `main:` refer to that file; `portal:` lines refer to your checkout's
   `streaming.rs` at 386044af (close to, but not exactly, your base).
 - The config fields `max_cell_unloads_per_frame` and `max_model_spawns_per_frame` and every

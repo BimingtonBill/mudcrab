@@ -4,14 +4,14 @@ Explain, with file:line evidence, why sun shadows go missing or wrong in the por
 
 # Context
 
-OpenSkyrim is a Rust/Bevy 0.19 reimplementation of Skyrim's engine. On the `portal` branch, looking through an open load door shows the destination cell live: a second camera (the portal camera) renders the destination space into a texture drawn on the doorway. The world is split between the two cameras with `RenderLayers` (the destination's cells are on the portal camera's layer; cells the player can't see are on no layer). Each space has its own lighting (sun, ambient, fog) from `crate::atmosphere`.
+Mudcrab is a Rust/Bevy 0.19 reimplementation of Skyrim's engine. On the `portal` branch, looking through an open load door shows the destination cell live: a second camera (the portal camera) renders the destination space into a texture drawn on the doorway. The world is split between the two cameras with `RenderLayers` (the destination's cells are on the portal camera's layer; cells the player can't see are on no layer). Each space has its own lighting (sun, ambient, fog) from `crate::atmosphere`.
 
 The user's notes from playing the demo (2026-09-25):
 1. **No sun shadows through the doorway:** standing inside a house and looking out through the open door, the exterior shows no sun shadows. It should.
 2. **Shadows break after crossings:** sun shadows sometimes stop rendering correctly after a crossing.
 3. **Performance isn't great:** the doorway view should render only at the doorway's size on screen, and only what the player can actually see through it (occlusion culling, as the Portal games do).
 
-Code to read (all under `C:\Modding\OpenSkyrimProject`):
+Code to read (all under `C:\Modding\MudcrabProject`):
 - `crates/engine/src/portal.rs`: the portal camera, its render target and size, its layers, the doorway quad, its own sun ("the doorway's own sun").
 - `crates/engine/src/atmosphere.rs`: the sun (`DirectionalLight`), cascades and shadow settings, per-space lighting, and what happens on a crossing.
 - `crates/engine/src/transition.rs`: the crossing.

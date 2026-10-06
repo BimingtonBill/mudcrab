@@ -7,8 +7,8 @@ fixed, tests for each. No engine window runs; the lead takes the real-data evide
 - Base: the commit named in "This run" (main merged in, incl. #89/#91 and `rust-toolchain.toml`). The WIP is
   commit "wip(engine): door crossing and fade (parked)": `crates/engine/src/door_crossing.rs`, `ActiveSpace`
   in `streaming.rs`, a `TeleportPlayer` block in `physics.rs`, registration in `app.rs`. Read its design in
-  `C:/Modding/OpenSkyrimProject/tasks/deepseek/impl-693-p2-door-crossing.md`.
-- Own worktree on D:: `git -C C:/Modding/OpenSkyrimProject worktree add D:/Modding-overflow/wt-696 <base>
+  `C:/Modding/MudcrabProject/tasks/deepseek/impl-693-p2-door-crossing.md`.
+- Own worktree on D:: `git -C C:/Modding/MudcrabProject worktree add D:/Modding-overflow/wt-696 <base>
   --detach`, `CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/impl-696`. If rustc crashes with
   STATUS_STACK_BUFFER_OVERRUN, delete the target dir and use `-j 4`.
 - Upstream style: commit subjects like `fix(engine): ...`/`feat(engine): ...`, no `[claude]`; each commit ends

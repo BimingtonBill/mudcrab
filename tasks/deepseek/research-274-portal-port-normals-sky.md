@@ -16,7 +16,7 @@ render and atmosphere code differ from main's:
 Read only. Portal tree: `C:/Modding/wkj-portal-merge` (`crates/engine/src/render.rs`,
 `shaders/terrain.wgsl`, `streaming.rs` (search `TerrainExtension::from_quadrant`, `spawn_cell`),
 `atmosphere.rs`, `portal.rs` (destination atmosphere), `sky.rs` (main's, compiled but not wired),
-`app.rs`). Main's copies and the common ancestor are in `C:/Modding/OpenSkyrimProject/local/merge/`:
+`app.rs`). Main's copies and the common ancestor are in `C:/Modding/MudcrabProject/local/merge/`:
 `main_render.rs`, `main_shaders_terrain.wgsl`, `main_app.rs`, `base_render.rs`,
 `base_shaders_terrain.wgsl`, `base_app.rs`, `render_base_to_main.diff` (what main changed in render.rs
 and terrain.wgsl: read it first), `streaming_main.rs` (main's `spawn_cell` uses `TerrainImages`).

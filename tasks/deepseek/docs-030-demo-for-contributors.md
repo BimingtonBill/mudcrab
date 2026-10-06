@@ -4,7 +4,7 @@ Read `tasks/deepseek/context.md` and `AGENTS.md` first.
 
 ## Goal
 
-Other people working on OpenSkyrim should be able to run the walkable Alftand → Blackreach demo
+Other people working on Mudcrab should be able to run the walkable Alftand → Blackreach demo
 on their own machine from their own copy of Skyrim SE. Prepare everything they need. **Nothing is
 published**: this is local preparation, and the lead decides later what goes where.
 

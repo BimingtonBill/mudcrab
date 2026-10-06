@@ -1,6 +1,6 @@
 # DeepSeek task queue
 
-Briefs for DeepSeek worker agents (headless Claude Code on DeepSeek V4.1 Flash), run with the `deepseek-agents` skill's launcher. The setup is copied from the user's DOA Xbox360 UI project and adapted to OpenSkyrim. Claude or the user can launch them.
+Briefs for DeepSeek worker agents (headless Claude Code on DeepSeek V4.1 Flash), run with the `deepseek-agents` skill's launcher. The setup is copied from the user's DOA Xbox360 UI project and adapted to Mudcrab. Claude or the user can launch them.
 
 **Division of labour (delegation level 4 of 5, set back to 4 by the user on 2026-09-24 after a morning at 3; spend is now capped by a $20 weekly DeepSeek limit, and the generated delegation block governs):** DeepSeek does the research, reviews, analysis of completed runs, assigned documentation and most implementation, including multi-file changes within a crate, each through `tools/ds_impl.ps1` in its own worktree. Claude keeps integration, cross-crate architecture, the `crates/shared/` contracts, dependency changes and the acceptance/sign-off runs. Every worker patch gets an independent review and harness-run acceptance before it is merged; a tuning or calibration task (thresholds, geometry, heuristics fitted to samples) must also pass on examples the worker never saw. Follow `delegation-policy.md` for isolation and scoped permissions. Prioritize saving Claude's tokens, not minimizing DeepSeek cost.
 
@@ -18,7 +18,7 @@ Numbering: `tNN-*` are research, analysis or documentation briefs; `iNN-*` are i
 From PowerShell in the project folder:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:/Users/Brannock/.claude/skills/deepseek-agents/ds-agent.ps1" -TaskFile "tasks/deepseek/<brief>.md" -Dir "C:/Modding/OpenSkyrimProject" -Label <brief>
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:/Users/Brannock/.claude/skills/deepseek-agents/ds-agent.ps1" -TaskFile "tasks/deepseek/<brief>.md" -Dir "C:/Modding/MudcrabProject" -Label <brief>
 ```
 
 `.deepseek-agents.json` in the project root supplies the rest: edit mode, effort max, 400 turns, a 150-minute timeout, the standard allowed-tools line, the read-only reference folders and the write-protected paths. Pass a flag only to override one of them. `-DryRun` prints the whole resolved policy without launching anything.

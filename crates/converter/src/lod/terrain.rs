@@ -408,7 +408,7 @@ fn emit_chunk_glb(
         }
     }
     let json = serde_json::json!({
-        "asset": { "version": "2.0", "generator": "OpenSkyrim LOD terrain compiler" },
+        "asset": { "version": "2.0", "generator": "Mudcrab LOD terrain compiler" },
         "extensionsUsed": ["KHR_texture_basisu"],
         "scene": 0,
         "scenes": [{ "name": chunk_name, "nodes": [0] }],

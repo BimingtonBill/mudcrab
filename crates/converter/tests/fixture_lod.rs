@@ -675,7 +675,7 @@ fn lod_fixture(data: &Path, archived: Option<&LodMetadata>, loose: Option<&LodMe
     fs::write(
         data.join("generated.esm"),
         dummy_content::esm::plugin(&dummy_content::esm::Plugin {
-            author: "OpenSkyrim",
+            author: "Mudcrab",
             worldspace: "Generated",
             cells: &cells,
             model_path: "meshes/generated/quad.nif",
@@ -1006,7 +1006,7 @@ async fn pipeline_prefers_loose_lod_metadata_over_the_archived_copy() {
 /// data, so it is ignored by default:
 ///
 /// ```text
-/// OPENSKYRIM_LOD_FIXTURE="<converted assets>/vfs" \
+/// MUDCRAB_LOD_FIXTURE="<converted assets>/vfs" \
 ///     cargo test -p converter --test fixture_lod -- --ignored real_tree_lod
 /// ```
 ///
@@ -1016,11 +1016,13 @@ async fn pipeline_prefers_loose_lod_metadata_over_the_archived_copy() {
 /// cover `lodsettings` as well. The ignored mesh test above reads the same
 /// variable but expects a single `.btr`/`.bto` file, so run them separately.
 #[test]
-#[ignore = "requires OPENSKYRIM_LOD_FIXTURE pointing at a directory of real .lod/.lst/.btt files"]
+#[ignore = "requires MUDCRAB_LOD_FIXTURE pointing at a directory of real .lod/.lst/.btt files"]
 fn real_tree_lod_decodes() {
-    let sample = std::env::var_os("OPENSKYRIM_LOD_FIXTURE").map(std::path::PathBuf::from);
+    let sample = std::env::var_os("MUDCRAB_LOD_FIXTURE")
+        .or_else(|| std::env::var_os("OPENSKYRIM_LOD_FIXTURE"))
+        .map(std::path::PathBuf::from);
     let Some(root) = sample else {
-        eprintln!("skipping: set OPENSKYRIM_LOD_FIXTURE to a directory of real LOD files");
+        eprintln!("skipping: set MUDCRAB_LOD_FIXTURE to a directory of real LOD files");
         return;
     };
     if root.is_file() && !is_lod_file(&root) {
@@ -1113,7 +1115,7 @@ fn is_lod_file(path: &Path) -> bool {
 /// ignored by default:
 ///
 /// ```text
-/// OPENSKYRIM_LOD_FIXTURE="/path/to/meshes/terrain/tamriel/tamriel.32.32.-96.btr" \
+/// MUDCRAB_LOD_FIXTURE="/path/to/meshes/terrain/tamriel/tamriel.32.32.-96.btr" \
 ///     cargo test -p converter --test fixture_lod -- --ignored real_lod
 /// ```
 ///
@@ -1123,11 +1125,13 @@ fn is_lod_file(path: &Path) -> bool {
 /// it may still report as unparsed; every LOD container and geometry block must
 /// not.
 #[test]
-#[ignore = "requires OPENSKYRIM_LOD_FIXTURE pointing at a real .btr or .bto"]
+#[ignore = "requires MUDCRAB_LOD_FIXTURE pointing at a real .btr or .bto"]
 fn real_lod_mesh_parses_and_converts() {
-    let sample = std::env::var_os("OPENSKYRIM_LOD_FIXTURE").map(std::path::PathBuf::from);
+    let sample = std::env::var_os("MUDCRAB_LOD_FIXTURE")
+        .or_else(|| std::env::var_os("OPENSKYRIM_LOD_FIXTURE"))
+        .map(std::path::PathBuf::from);
     let Some(path) = sample else {
-        eprintln!("skipping: set OPENSKYRIM_LOD_FIXTURE to a real .btr or .bto to run this test");
+        eprintln!("skipping: set MUDCRAB_LOD_FIXTURE to a real .btr or .bto to run this test");
         return;
     };
     let directory = tempfile::tempdir().unwrap();

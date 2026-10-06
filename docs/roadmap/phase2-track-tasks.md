@@ -1,6 +1,6 @@
 # Phase 2 track: task list
 
-Owner: the Phase 2 Dev session. Goal: help upstream (Wah Krah Jol) finish Phase 2, the way its
+Owner: the Phase 2 Dev session. Goal: help upstream (Mudcrab) finish Phase 2, the way its
 README and `docs/roadmap/02-completion-plan.md` describe. Details and rules live in
 [`docs/pr/two-tracks.md`](../pr/two-tracks.md); this file is the short list.
 

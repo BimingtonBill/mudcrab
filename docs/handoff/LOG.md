@@ -287,7 +287,7 @@ after a hard kill; Phase 1 fixed it on `phase1/atomic-writes` 50f421c (one copy 
 Screenshots: `local/research/launcher-merged-*.png`, `launcher-resume-done.png`. Fixture data for launcher
 runs: `D:/Modding-overflow/phase3-scratch/game_data` (run the exe with that folder as working directory).
 
-**Test kit for the user:** `D:\OpenSkyrim-Launcher-Test\` (174 MB: quick launcher + engine from local-only
+**Test kit for the user:** `D:\Mudcrab-Launcher-Test\` (174 MB: quick launcher + engine from local-only
 `phase3/try-launcher` 734982a = L3 + L4, fake Skyrim in `game_data\Data`, Start/Reset/Make-leftover scripts,
 README). Play on the fake data opens a grey engine window: the launcher passes only `--assets`, and the
 fixture needs a worldspace the engine doesn't start in by default.
@@ -534,7 +534,7 @@ busy, so run it by hand when that happens). No workers, no cargo.
 ### 2026-09-25 (morning) - Claude [phase2] Upstream session (PR watch, CodeRabbit fixes)
 
 **New session, set up by the user: "Upstream collaboration and reviews".** It watches
-realfakenerd/wah-krah-jol: PRs, reviews, CI and issues. Phase 2 Dev handed it #29/#30/#31. Memory:
+Mudcrab-Team/mudcrab: PRs, reviews, CI and issues. Phase 2 Dev handed it #29/#30/#31. Memory:
 `upstream-watch-session`. Its worktrees are `C:\Modding\wkj-upstream` (pr31 fixes),
 `wkj-upstream-29` and `wkj-upstream-30`; each has its own `target/` and can be discarded once pushed.
 
@@ -614,7 +614,7 @@ merges later without a reconversion (portal lacks upstream main since #23: expec
 
 **Also open:** distant tree billboards 2-4x too bright and grey; the vanilla DistantTree lighting
 research is websearch-703 (QnA started it; report at
-`C:\Users\Brannock\AppData\Local\Temp\claude\C--Modding-OpenSkyrimProject\d9ee62b9-a4a7-4ec8-af9c-bdc53350c97e\scratchpad\treelod\websearch-703.out`),
+`C:\Users\Brannock\AppData\Local\Temp\claude\C--Modding-MudcrabProject\d9ee62b9-a4a7-4ec8-af9c-bdc53350c97e\scratchpad\treelod\websearch-703.out`),
 unread. QnA is no longer the research desk. **No workers running from this session.**
 
 ### 2026-09-24/25 (night) - Claude [phase2] (look fixes, distant LOD extended, audits, timing)
@@ -896,7 +896,7 @@ tour.
 2. **Animated doors and seamless crossing.** `f6749e2` converter exports Open/Close clips (all 768 door NIFs decode; 171 animated). `50bc0f1` the door state machine (clips found by name; a leaf whose swing is under 45 degrees hides when open). `49f2df5` the seamless crossing: the player's pose is carried through the door instead of snapping. `b535a30` the two wired together, plus the review corrections. Claude's check on the integrated build: **walk tour 4/4 by walking, 0 errors, 0 dark frames in 811 captured frames**; the frames either side of a swap are the same view (`local/demo/walk-swap-fixed.jpg`). The route's Dwemer doors only twitch 5-9 degrees in the real data; their non-load twins swing 86-88. **Open question for the user:** keep the faithful twitch or borrow the twin's swing?
 3. **Demo for contributors.** `cc53baf`: `docs/demo/README.md`, `tools/demo/setup-demo.ps1` (prereqs, build, Skyrim detection, conversion with resume, launcher) and `tools/demo/play-demo.ps1`. Claude ran both dry runs. Nothing published.
 4. **The project as a whole.** Upstream `origin/main` (16 commits: `dummy-content`, ADRs, CI) merged locally (`8c21447`, one test-only conflict). `40e0eb5` extends `dummy-content` with an interior cell and a linked load-door pair, so upstream can test doors and portals without Skyrim. research-028: the streaming fixture never exits without a benchmark window - not a ring bug.
-5. **Audit and PR design.** `docs/pr/upstream-pr-plan.md` (research-029): 9 PRs, fixes first, with exclusion and cleanup lists. Cleanups done: `410ce31` converter (ADR-0002 `OPENSKYRIM_SKYRIM_DATA` / `OPENSKYRIM_CONVERTED_DIR`, no machine paths, no private names), `62c0f7b` + `944250e` engine parts 1-2, part 3 running. Not done: re-cutting the commits into the PR series (the plan's step), which needs the user.
+5. **Audit and PR design.** `docs/pr/upstream-pr-plan.md` (research-029): 9 PRs, fixes first, with exclusion and cleanup lists. Cleanups done: `410ce31` converter (ADR-0002 `MUDCRAB_SKYRIM_DATA` / `MUDCRAB_CONVERTED_DIR`, no machine paths, no private names), `62c0f7b` + `944250e` engine parts 1-2, part 3 running. Not done: re-cutting the commits into the PR series (the plan's step), which needs the user.
 
 **Blocked on the user:** the reconversion (see the entry below). Until it runs, door clips, per-space lighting and snow have no data, and each is inert by design.
 
@@ -923,7 +923,7 @@ tour.
 
 ### 2026-09-22 (late) - Claude (reference screenshots and matched renders)
 
-- **User ask:** collect Skyrim screenshots of the demo's locations, then render the same compositions in OpenSkyrim for comparison.
+- **User ask:** collect Skyrim screenshots of the demo's locations, then render the same compositions in Mudcrab for comparison.
 - **References:** 26 UESP screenshots (CC BY-SA; download approved by the user) in `local/reference/uesp/` (git-ignored, `SOURCES.txt`).
 - **Built:** design `docs/design/reference-shots.md` (the shots-file contract). impl-017 `--shots <file> [--shots-out <dir>]` renders exact poses once streaming settles (`5e53712`, DeepSeek, verified at runtime by Claude). research-018 wrote the first poses, `tools/compare_shots.py` and the mapping/fitting scripts (`adbea02`, `4050696`).
 - **First renders:** `local/reference/cmp1/`. The Ruined Tower matches; most other poses are rough (walls, and some pitch signs flipped).
@@ -970,7 +970,7 @@ tour.
 
 ### 2026-09-21 - Claude (clone, toolchain, DeepSeek harness)
 
-- **Cloned** `realfakenerd/OpenSkyrim` at `8919096` into `C:\Modding\OpenSkyrimProject`.
+- **Cloned** `realfakenerd/Mudcrab` at `8919096` into `C:\Modding\MudcrabProject`.
 - **Toolchain installed** on this machine: Visual Studio 2022 Build Tools (C++ workload) and Rust stable 1.98.1 (MSVC) via rustup. CMake and Ninja were already present.
 - **DeepSeek harness** copied from the DOA Xbox360 UI project and adapted: `.deepseek-agents.json`, `tasks/deepseek/` (context, cookbook, delegation policy, reviewer, run analyst, advisors, self-test, implementation template, result schema), `tools/ds_impl.ps1` (isolated worktree per implementation task, sharing `target/`), `tools/ds_status.ps1`, `tools/run_ds_queue.ps1`, `tools/ds_report.py`, `tools/check_worker_result.py` (now recognises `cargo` commands), `tools/check_citations.py`, and their tests (`python -m unittest discover -s tests`).
 - **Verified:** `cargo check --workspace` passes (5 min cold, only a future-incompat warning from the `proc-macro-error2` dependency). The harness self-test passed 6/6 (`local/agents/runs.csv`).

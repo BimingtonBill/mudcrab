@@ -15,7 +15,7 @@ code.
 
 # Context
 
-The project is OpenSkyrim (`C:\Modding\OpenSkyrimProject`), a Skyrim-to-Bevy engine. 1 Creation unit
+The project is Mudcrab (`C:\Modding\MudcrabProject`), a Skyrim-to-Bevy engine. 1 Creation unit
 = 1 Bevy world unit; a cell is 4096 units; 1 unit is about 1.43 cm. The engine renders one fixed
 day: a `DirectionalLight` sun, a `GlobalAmbientLight`/per-camera `AmbientLight` for the space, and
 converted `LIGH` records as `PointLight`s.

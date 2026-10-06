@@ -4,7 +4,7 @@ Explain, with file:line evidence, why four door behaviours the user reported in 
 
 # Context
 
-OpenSkyrim is a Rust/Bevy 0.19 reimplementation of Skyrim's engine. On the `portal` branch, load doors are "portals": looking through an open load door shows the destination cell live (a second camera renders it), and walking through crosses with no loading screen. The destination cell is pre-streamed. Doors swing with their Open/Close animation clips from the converted model.
+Mudcrab is a Rust/Bevy 0.19 reimplementation of Skyrim's engine. On the `portal` branch, load doors are "portals": looking through an open load door shows the destination cell live (a second camera renders it), and walking through crosses with no loading screen. The destination cell is pre-streamed. Doors swing with their Open/Close animation clips from the converted model.
 
 The user's notes from playing the Riverwood demo (2026-09-25):
 1. **Door side swaps:** the door leaf is on one side of the doorway when seen from inside and on the other side when seen from outside. It should be on the same side from both.
@@ -12,7 +12,7 @@ The user's notes from playing the Riverwood demo (2026-09-25):
 3. **Door opens before the far side is ready:** a door should not open until the world it leads to is fully loaded.
 4. **No auto-close:** a door the player opened and walked away from should play its close animation by itself, and finish closing *before* the far side's cells are unloaded, so the player never sees the unload.
 
-Code to read (all under `C:\Modding\OpenSkyrimProject`):
+Code to read (all under `C:\Modding\MudcrabProject`):
 - `crates/engine/src/doors.rs`: the door contract and state.
 - `crates/engine/src/door_animation.rs`: the door state machine and clips.
 - `crates/engine/src/portal.rs`: doorway rendering, which door is the portal, when the far door is hidden or opened (look for `select_portal_door`, `isolate_cells`, and the far door opened at the swap, impl-152).

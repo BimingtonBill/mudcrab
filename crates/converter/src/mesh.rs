@@ -1861,9 +1861,9 @@ fn actor_root(path: &Path) -> Option<(PathBuf, PathBuf)> {
 /// `#[ignore]`d and opt-in, and they skip - printing why - when the environment
 /// does not name the data, so CI never needs proprietary data (ADR-0002):
 ///
-/// - `OPENSKYRIM_NIF_FIXTURE`, `OPENSKYRIM_STATIC_NIF_FIXTURE`: one NIF file
+/// - `MUDCRAB_NIF_FIXTURE`, `MUDCRAB_STATIC_NIF_FIXTURE`: one NIF file
 ///   from a local Skyrim installation.
-/// - `OPENSKYRIM_CONVERTED_DIR`: a converted asset tree - its `skyrim_world.db`
+/// - `MUDCRAB_CONVERTED_DIR`: a converted asset tree - its `skyrim_world.db`
 ///   and the NIFs it extracted under `vfs/meshes`. The `real_*` tests below read
 ///   the models the converted set was built from.
 #[cfg(test)]
@@ -2462,15 +2462,18 @@ mod tests {
         assert_eq!(model.static_nodes[1].mesh, Some(1));
     }
 
-    /// The converted asset tree named by `OPENSKYRIM_CONVERTED_DIR`, or `None`
+    /// The converted asset tree named by `MUDCRAB_CONVERTED_DIR`, or `None`
     /// with the reason printed.
     ///
     /// Game data is never committed, so the tests that read a converted set are
     /// `#[ignore]`d and skipped, not failed, when the environment does not name
     /// one (ADR-0002).
     fn converted_assets() -> Option<PathBuf> {
-        let Some(root) = std::env::var_os("OPENSKYRIM_CONVERTED_DIR").map(PathBuf::from) else {
-            eprintln!("skipping: set OPENSKYRIM_CONVERTED_DIR to a converted asset tree");
+        let Some(root) = std::env::var_os("MUDCRAB_CONVERTED_DIR")
+            .or_else(|| std::env::var_os("OPENSKYRIM_CONVERTED_DIR"))
+            .map(PathBuf::from)
+        else {
+            eprintln!("skipping: set MUDCRAB_CONVERTED_DIR to a converted asset tree");
             return None;
         };
         if !root.is_dir() {
@@ -2509,7 +2512,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "requires the extracted Skyrim NIFs (MUDCRAB_CONVERTED_DIR)"]
     fn real_ice_pile_publishes_opaque_materials() {
         // The vertex-alpha class (`docs/research/transparent-and-misplaced-meshes.md`):
         // `IcePileM02:1` carries `SLSF1_VERTEX_ALPHA` (shader flags 0x82400309) and
@@ -2540,7 +2543,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "requires the extracted Skyrim NIFs (MUDCRAB_CONVERTED_DIR)"]
     fn real_glow_card_keeps_its_additive_blend_factors() {
         // The additive-blend class (`docs/research/transparent-and-misplaced-meshes.md`):
         // the torch's `GlowAddMesh` is additive (`NiAlphaProperty` flags 0x100D:
@@ -2572,7 +2575,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "requires the extracted Skyrim NIFs (MUDCRAB_CONVERTED_DIR)"]
     fn real_partition_door_exports_without_its_editor_marker() {
         // The editor-marker class (`docs/research/transparent-and-misplaced-meshes.md`):
         // `DwePtnDoor01` is a real object whose fifth shape is the editor marker,
@@ -2607,7 +2610,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "requires the extracted Skyrim NIFs (MUDCRAB_CONVERTED_DIR)"]
     fn real_marker_only_model_converts_to_an_empty_scene() {
         // `dummybook01` is a display placeholder whose only shape is the marker:
         // the converter's existing empty-scene rule covers it, exactly as it does
@@ -2836,7 +2839,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "requires the extracted Skyrim NIFs (MUDCRAB_CONVERTED_DIR)"]
     fn real_dwemer_small_door_exports_open_and_close_animations() {
         let Some((document, glb)) =
             convert_fixture_glb("dungeons/dwemer/door/dwemersmalldoorload01.nif")
@@ -2910,7 +2913,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "requires the extracted Skyrim NIFs (MUDCRAB_CONVERTED_DIR)"]
     fn real_route_door_swings_a_few_degrees_and_never_translates() {
         // The Alftand -> Blackreach route's three real doors are all `DweDoorLarge01Load`. It
         // looked as though their visible motion lived in translation keys rather than the 5-9
@@ -2953,7 +2956,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "requires the extracted Skyrim NIFs (MUDCRAB_CONVERTED_DIR)"]
     fn real_sliding_door_exports_a_translation_channel() {
         // The counter-example to the dwemer doors: `riftenrwthievesguilddoor01.nif` has *no*
         // rotation keys at all - its `Open` is a 95 key translation curve that slides the leaf
@@ -3011,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "requires the extracted Skyrim NIFs (MUDCRAB_CONVERTED_DIR)"]
     fn real_nordic_door_swings_ninety_degrees() {
         // `FarmhouseAnimDoor01` is the calibration model of the layout: its `Door01` swings
         // -1.65806 rad (-95 degrees) over a second, which only a decoded euler curve reproduces.

@@ -4,13 +4,13 @@ Explain why Blackreach's glowing plants render burnt-out white in the portal eng
 
 # Context
 
-Track: portal. Project C:\Modding\OpenSkyrimProject (Rust, Bevy 0.19). Look-gaps item 8 (`docs/research/look-gaps-2026-09-24.md`): on the three Blackreach reference shots our render has up to 17 % "flat white" pixels (bright and unsaturated) where Skyrim keeps the mushroom caps and hanging plants a saturated teal.
+Track: portal. Project C:\Modding\MudcrabProject (Rust, Bevy 0.19). Look-gaps item 8 (`docs/research/look-gaps-2026-09-24.md`): on the three Blackreach reference shots our render has up to 17 % "flat white" pixels (bright and unsaturated) where Skyrim keeps the mushroom caps and hanging plants a saturated teal.
 
 The glow rule lives in `crates/engine/src/render.rs`: `is_deliberate_glow` (a material whose `KHR_materials_emissive_strength` is above 1) gets its emissive multiplied by `EMISSIVE_EXPOSURE` (100, `crates/engine/src/lights.rs`, with a long doc comment on how it was fitted). Effect-shader materials (`shaderFamily` "effect" in the `OPEN_SKYRIM_material` extension) with the greyscale-palette flags now go through `crates/engine/src/effect_palette.rs` instead; the rest still take the x100. The camera has HDR, bloom (`Bloom::NATURAL`) and Bevy's default tonemapper (see `crates/engine/src/app.rs`, search for `Bloom`).
 
 The converted models are in `C:\Modding\SkyrimConverted\meshes\` (read-only GLB files; the JSON chunk is readable text at the start of each file). Blackreach's big mushrooms are `meshes/dungeons/dwemer/blackreach/...` or `meshes/plants/...` - search for names containing `blackreach`, `mushroom`, `glow`. For each glowing material, read its `emissiveFactor`, `emissiveTexture`, `KHR_materials_emissive_strength`, `baseColorTexture` and the `OPEN_SKYRIM_material` extension (`shaderFamily`, `shaderFlags1`, `shaderFlags2`).
 
-Do not read anything under `C:\Modding\OpenSkyrimProject\local\` except `local\reference\look-gaps\pairs-uesp_shots_4x3\` (side-by-side pictures, Skyrim left, ours right: look at the three `SR-place-Blackreach*` / `SR-interior-Blackreach*` files there, whatever their exact names).
+Do not read anything under `C:\Modding\MudcrabProject\local\` except `local\reference\look-gaps\pairs-uesp_shots_4x3\` (side-by-side pictures, Skyrim left, ours right: look at the three `SR-place-Blackreach*` / `SR-interior-Blackreach*` files there, whatever their exact names).
 
 # Done when
 

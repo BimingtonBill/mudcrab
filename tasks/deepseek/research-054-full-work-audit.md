@@ -18,7 +18,7 @@ branches from it without further research.
 2. **Audit as an upstream maintainer would.** Run and cite:
    - `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
      `cargo test --workspace` (report counts; note that some tests are opt-in behind
-     `OPENSKYRIM_SKYRIM_DATA` / `OPENSKYRIM_CONVERTED_DIR`);
+     `MUDCRAB_SKYRIM_DATA` / `MUDCRAB_CONVERTED_DIR`);
    - `git ls-files` for anything that looks like game data or a large file;
    - greps for private names, machine paths, user names and email addresses in **tracked files**
      (the code was cleaned in `410ce31`, `62c0f7b`, `944250e`, `432c152`: verify, and check docs

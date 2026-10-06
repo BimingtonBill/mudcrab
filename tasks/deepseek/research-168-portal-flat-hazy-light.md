@@ -4,7 +4,7 @@ Find which lighting settings make the portal engine's pictures flat and hazy com
 
 # Context
 
-Track: portal. Project: C:\Modding\OpenSkyrimProject (Rust, Bevy 0.19). Our engine renders the same camera poses as 61 Skyrim reference screenshots. Measured over those 61 (median, Skyrim against ours):
+Track: portal. Project: C:\Modding\MudcrabProject (Rust, Bevy 0.19). Our engine renders the same camera poses as 61 Skyrim reference screenshots. Measured over those 61 (median, Skyrim against ours):
 - near-black pixels (relative luminance < 0.05): 36.9 % in Skyrim, 4.7 % in ours. Outdoors: 23 % against 0.2 %.
 - the brightest 5 % starts at 0.54 in Skyrim and 0.39 in ours.
 - saturation is 0.43 in Skyrim and 0.35 in ours.
@@ -13,7 +13,7 @@ Track: portal. Project: C:\Modding\OpenSkyrimProject (Rust, Bevy 0.19). Our engi
 So shadows are lifted and highlights are compressed. Reviewers also saw a grey or blue fog filling some interiors that Skyrim keeps clear (Candlehearth Hall, Honeyside, the Temple of Kynareth, Alftand), and a haze over outdoor views.
 
 The upstream engine (the project we forked) renders the same outdoor views with deep, dark cast shadows. Its lighting is all in one file, a copy of which is at:
-C:\Users\Brannock\AppData\Local\Temp\claude\C--Modding-OpenSkyrimProject\0c2b98e0-89a5-4fa1-b24d-ea1f183613af\scratchpad\upstream-main-engine\app.rs
+C:\Users\Brannock\AppData\Local\Temp\claude\C--Modding-MudcrabProject\0c2b98e0-89a5-4fa1-b24d-ea1f183613af\scratchpad\upstream-main-engine\app.rs
 
 Our lighting code (read these):
 - crates/engine/src/atmosphere.rs: per-space ambient, sun, fog and backdrop (`space_atmosphere`, `ambient_light`, `atmosphere_fog`, `fallback_atmosphere`, `sky_fill_brightness`)
@@ -22,7 +22,7 @@ Our lighting code (read these):
 - crates/engine/src/app.rs: camera setup (tonemapping, exposure, bloom, HDR), sun shadows
 - crates/engine/src/render.rs, if it sets materials' lighting
 
-The pictures (optional; you can view images): side-by-side pairs, Skyrim on the left and ours on the right, in C:\Modding\OpenSkyrimProject\local\reference\look-gaps\pairs-world_shots_4x3\ (for example SR-place-Morthal.jpg, SR-interior-Candlehearth_Hall.jpg) and pairs-riverwood_shots\ (RW-03-trader-front.jpg).
+The pictures (optional; you can view images): side-by-side pairs, Skyrim on the left and ours on the right, in C:\Modding\MudcrabProject\local\reference\look-gaps\pairs-world_shots_4x3\ (for example SR-place-Morthal.jpg, SR-interior-Candlehearth_Hall.jpg) and pairs-riverwood_shots\ (RW-03-trader-front.jpg).
 
 Do not read anything else under local/ (worker worktrees and logs there are not the real tree).
 

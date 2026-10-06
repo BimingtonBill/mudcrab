@@ -114,7 +114,7 @@ Converter (`crates/converter/src/material.rs`, `mod tests`):
 The real-file test was rerun in this session (not just asserted from the brief's decode):
 
 ```
-OPENSKYRIM_HEARTH_FIXTURE="C:/Modding/SkyrimConverted-upstream15/vfs/meshes/clutter/woodfires/fireplacewood01burning.nif" \
+MUDCRAB_HEARTH_FIXTURE="C:/Modding/SkyrimConverted-upstream15/vfs/meshes/clutter/woodfires/fireplacewood01burning.nif" \
 cargo test -p converter --lib real_hearth_flames -- --ignored --nocapture
 ```
 

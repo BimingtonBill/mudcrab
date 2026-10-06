@@ -29,7 +29,7 @@ pub const ATTENUATION_LINE: &str = "let rangeAttenuation = getDistanceAttenuatio
 
 /// What it becomes: Skyrim's curve for a light with `AFFECTS_LIGHTMAPPED_MESH_DIFFUSE` (bit 3)
 /// clear, Bevy's own for the rest. `color_inverse_square_range.w` is `1 / range^2`.
-pub const SKYRIM_ATTENUATION_LINE: &str = "let rangeAttenuation = select(saturate(1.0 - distance_square * (*light).color_inverse_square_range.w), getDistanceAttenuation(distance_square, (*light).color_inverse_square_range.w), ((*light).flags & 8u) != 0u); // OpenSkyrim: Skyrim point-light falloff";
+pub const SKYRIM_ATTENUATION_LINE: &str = "let rangeAttenuation = select(saturate(1.0 - distance_square * (*light).color_inverse_square_range.w), getDistanceAttenuation(distance_square, (*light).color_inverse_square_range.w), ((*light).flags & 8u) != 0u); // Mudcrab: Skyrim point-light falloff";
 
 /// Skyrim's attenuation at a fraction `d/r` of a light's radius.
 pub fn skyrim_attenuation(fraction_of_radius: f32) -> f32 {

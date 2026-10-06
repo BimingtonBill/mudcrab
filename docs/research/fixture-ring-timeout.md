@@ -54,7 +54,7 @@ benchmark window was asked for (`crates/engine/src/metrics.rs:104`). So:
 
 `local/demo/fixture-ring.err` is the run in question: 15129 lines, of which 15121 are the per-frame
 diagnostics. Its 8 other lines are adapter info, two renderer capability lines, the window,
-`OpenSkyrim runtime initialized`, and three gamepad lines - **there is no `ERROR` line, and no
+`Mudcrab runtime initialized`, and three gamepad lines - **there is no `ERROR` line, and no
 `engine` warning at all.** It logs `frame_count` once a second for 378 s (13:28:15.49 to
 13:34:34.17), ending at 23712 frames, about 63 FPS.
 

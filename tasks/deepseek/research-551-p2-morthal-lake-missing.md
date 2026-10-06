@@ -6,7 +6,7 @@ draws a surface. Report the exact cause, with evidence, and the smallest fix. Do
 # Context
 - Project: a Rust/Bevy reimplementation of Skyrim's renderer. Code bases:
   - `C:/Modding/wkj-phase2` (branch `phase2/integration-lod-shots`, read-only for you);
-  - the demo engine, `C:/Modding/OpenSkyrimProject` (branch `portal`).
+  - the demo engine, `C:/Modding/MudcrabProject` (branch `portal`).
 
   They share the converter (`crates/converter`, including the ESM exporter into the world
   database) and the engine's water drawing (search the engine crate for `water`, `WTHR`, `XCWT`,

@@ -583,7 +583,7 @@ pub fn build_tree_billboard_glb(tree: &TreeLodType, texture_uri: &str) -> Result
         binary.extend_from_slice(&index.to_le_bytes());
     }
     let document = json!({
-        "asset": { "version": "2.0", "generator": "OpenSkyrim converter" },
+        "asset": { "version": "2.0", "generator": "Mudcrab converter" },
         "scene": 0,
         "scenes": [{ "nodes": [0] }],
         "nodes": [{ "name": "TreeLodBillboard", "mesh": 0 }],

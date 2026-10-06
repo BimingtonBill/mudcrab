@@ -44,7 +44,7 @@ NEVER_TOUCH_PATTERNS = [
     "Bethini Pie*",
     "Modlists",
     "Wabbajack",
-    "OpenSkyrimProject",  # the main checkout
+    "MudcrabProject",  # the main checkout
     "SkyrimConverted*",  # converted game data; measuring it once blocked a conversion
     ".cargo",  # C:\Modding\.cargo holds the quick build profile for every checkout
     "wkj-contributor-status",  # the user's local-only contributor status tool

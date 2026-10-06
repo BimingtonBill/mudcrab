@@ -21,9 +21,9 @@ exactly 0 or 1 at 128-unit spacing).
 
 **B. Stretched, streaked terrain textures.** In the user's screenshots the ground in places shows long
 parallel streaks, as if a texture were stretched along one axis, and some areas are flat grey. Look
-at: `C:/Modding/OpenSkyrimProject/local/demo/survey1/03-survey-1.png` (AlftandWorld cavern floor, dark, with long streaks),
-`C:/Modding/OpenSkyrimProject/local/demo/survey1/00-door.png` (Tamriel near the Alftand entrance, grey streaks at the bottom), and
-`C:/Modding/OpenSkyrimProject/local/acceptance-shakedown/20260922-003549-*/screenshots/rural.png` (top-down). You can see images:
+at: `C:/Modding/MudcrabProject/local/demo/survey1/03-survey-1.png` (AlftandWorld cavern floor, dark, with long streaks),
+`C:/Modding/MudcrabProject/local/demo/survey1/00-door.png` (Tamriel near the Alftand entrance, grey streaks at the bottom), and
+`C:/Modding/MudcrabProject/local/acceptance-shakedown/20260922-003549-*/screenshots/rural.png` (top-down). You can see images:
 `Read` them. Find the cause in the terrain UV generation (`build_terrain_quadrant_mesh` in
 `streaming.rs`), the layer texture sampling in `terrain.wgsl`, the texture sampler settings (address
 mode, filtering, mipmaps - check the Bevy 0.19 source in the cargo registry for defaults), or missing

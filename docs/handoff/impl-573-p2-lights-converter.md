@@ -35,7 +35,7 @@ out.
     `drops_a_truncated_light_data_without_panicking`,
     `stores_a_reference_radius_override_from_xrds`, plus the opt-in
     `lights_of_the_real_plugin_decode_through_export` (the real-plugin test,
-    `#[ignore]`d, reads `OPENSKYRIM_SKYRIM_DATA`). The portal version's
+    `#[ignore]`d, reads `MUDCRAB_SKYRIM_DATA`). The portal version's
     hard-coded `C:/Games/...` fallback was dropped: no machine-specific paths.
 - `crates/converter/tests/fixture_lights.rs` — impl-572's fixture extended with
   the export half: `generated_light_plugin_exports_a_lights_row_and_a_reference_radius_override`
@@ -68,7 +68,7 @@ out.
   109 passed / 8 ignored; `fixture_lights` 4 passed).
 - `cargo test -p engine --lib`: 42 passed.
 - The opt-in real-plugin test was run against the local install
-  (`OPENSKYRIM_SKYRIM_DATA=<Skyrim SE>/Data`, driven from
+  (`MUDCRAB_SKYRIM_DATA=<Skyrim SE>/Data`, driven from
   `local/run_lights_ignored.py` because the shell refuses the `VAR=value cargo
   test` form): it passed, printing 435 `LIGH` records with a 48-byte `DATA`,
   10,810/12,148 light references with an `XRDS` in the plugin and 228/231 on

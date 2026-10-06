@@ -1,7 +1,7 @@
 # Upstream pull-request plan
 
 **Status:** research note, 2026-09-23 (research-054). Full re-audit of everything this fork has done,
-and the design for presenting it to `realfakenerd/OpenSkyrim` — now **Wah Krah Jol** — without
+and the design for presenting it to `realfakenerd/Mudcrab` — now **Mudcrab** — without
 publishing anything yet. Replaces research-029's plan of the same name, which covered
 `8919096..3ae5541`.
 **Revision audited:** `8919096..449af90` (147 commits; 131 on this branch, 16 brought in by the
@@ -31,7 +31,7 @@ warm `target/`.
    - `8b5bf80` *fix: prune dangling texture URIs from converted GLBs* rewrites 397 lines of
      `crates/converter/src/mesh.rs`, which is our material-fidelity PR's file.
    - `96a730c`/`39070d8` rework `crates/converter/src/pipeline.rs` (skip failed assets, redo list).
-   - `d46a179` **rebrands the project to "Wah Krah Jol"** and adds `LEGAL.md`; `2105bfd` changes
+   - `d46a179` **rebrands the project to "Mudcrab"** and adds `LEGAL.md`; `2105bfd` changes
      `FUNDING.yml`. Every PR body, title and README touch must use the new name, and our README
      edit conflicts with it.
 
@@ -52,7 +52,7 @@ warm `target/`.
    from the rows above (four code files plus a README hunk that is excluded anyway).
 2. **The cleanup landed in the code and is verified — but only in `crates/`.** `git grep` over
    `crates/` finds no `local/`, no `impl-NNN`, no machine path, no `SKYRIM_DATA_DIR`; the two
-   fallbacks ADR-0002 forbids are gone and `OPENSKYRIM_SKYRIM_DATA` / `OPENSKYRIM_CONVERTED_DIR`
+   fallbacks ADR-0002 forbids are gone and `MUDCRAB_SKYRIM_DATA` / `MUDCRAB_CONVERTED_DIR`
    are respected with a printed skip. **`docs/` and `tools/` were not swept** — 22 research scripts
    and 11 research/handoff notes still carry `C:/Modding/SkyrimConverted`, and production doc
    comments now cite `docs/research/*` and `tools/research/*.py` **files that the exclusion list
@@ -146,8 +146,8 @@ brief is counted once, under process), but it sums to the 130 authored commits.
 | **total** | **536** | **507** | **29** |
 
 Every one of the 29 ignored tests is opt-in and says so in its `#[ignore = "…"]` text
-(`requires OPENSKYRIM_SKYRIM_DATA …`, `reads the converted Skyrim door models
-(OPENSKYRIM_CONVERTED_DIR)`, `performance`), and each prints `skipping: set …` and returns when the
+(`requires MUDCRAB_SKYRIM_DATA …`, `reads the converted Skyrim door models
+(MUDCRAB_CONVERTED_DIR)`, `performance`), and each prints `skipping: set …` and returns when the
 variable is absent. **CI runs all of them as skips and is green.** The heaviest files:
 `streaming.rs` 42 tests, `door_animation.rs` 39, `player.rs` 32, `mesh.rs` 21,
 `world/database.rs` 21, `portal.rs` 20, `app.rs` and `render.rs` 18, `exporter.rs` and `shots.rs` 17,
@@ -204,7 +204,7 @@ largest tracked file we added is text: `crates/engine/src/streaming.rs` (245 KB)
 | `deepseek` | none | harness tools + `check_citations.py` | `docs/handoff/**`, `docs/research/{visual-gaps-spec,transparent-and-misplaced-meshes,phase2-status}.md`, `docs/design/animated-doors-and-seamless-crossing.md:3` | `AGENTS.md`, `.deepseek-agents.json`, 42 briefs |
 | `impl-0NN` / `research-0NN` / `docs-0NN` | **none** | none | none | briefs |
 | `local/` | **one**: `crates/engine/src/app.rs:1533` (`local/reference/cmp-s17/SR-place-Alftand_Ruined_Tower.jpg`) | none | none | `AGENTS.md`, this file |
-| `OPENSKYRIM_SKYRIM_DATA` / `OPENSKYRIM_CONVERTED_DIR` | 34 sites, all with a printed skip and no fallback | — | — | — |
+| `MUDCRAB_SKYRIM_DATA` / `MUDCRAB_CONVERTED_DIR` | 34 sites, all with a printed skip and no fallback | — | — | — |
 | `SKYRIM_DATA_DIR` (the old invented name) | **gone** | gone | gone | gone, except as history in this file |
 | `dbg!`, `todo!()`, `unimplemented!()`, `FIXME`, `TODO`, `HACK` | none (the one `XXXX` hit in `esm/extractors.rs:21` is a record-tag comparison and is upstream's file, untouched) | none | none | none |
 
@@ -400,7 +400,7 @@ disappear. Our own `git apply` of PR 3–5 diffs must not include that file (the
   renders were re-fitted afterwards (`6804978`, `9d6d844`).
 * **Surgery before sending:** `tools/research/rotation_convention.py` (1,018 lines) has
   `DB = "C:/Modding/SkyrimConverted/skyrim_world.db"` at module level — parameterise it (argv or
-  `OPENSKYRIM_CONVERTED_DIR`) before shipping it as the proof. Also worth sending:
+  `MUDCRAB_CONVERTED_DIR`) before shipping it as the proof. Also worth sending:
   `docs/research/object-rotation-convention.md` + `docs/research/data/object-rotation-audit.json`,
   which currently cite the same machine path (2 lines).
 * **Reviewer will ask:** *"You flipped four test expectations — did you fix the code or the tests?"*
@@ -451,7 +451,7 @@ disappear. Our own `git apply` of PR 3–5 diffs must not include that file (the
 * **Depends on:** PR 3 (same constant, next value).
 * **Test story:** converter tests cover the `LIGH` record layout; the SQL assertions live in the
   engine (`world/database.rs`, PR 9). The real-plugin test is `#[ignore]`d behind
-  `OPENSKYRIM_SKYRIM_DATA` and skips with a printed message.
+  `MUDCRAB_SKYRIM_DATA` and skips with a printed message.
 * **Runtime evidence:** 504 lights and 15,167 lit references in the real database.
 * **Reviewer will ask:** *"Why a radius override?"* — `XRDS` is in the record and the engine needs a
   forward radius for its nearest-64 budget; *"15,167 references from 504 lights?"* — say how (each
@@ -488,7 +488,7 @@ disappear. Our own `git apply` of PR 3–5 diffs must not include that file (the
   constant from 16 to 17 by itself.
 * **Test story:** `nif_animation.rs` 16 tests, `esm/lighting.rs` 11, `esm/directional_material.rs` 4,
   plus a truncation/mutation sweep; the real-asset tests are `#[ignore]`d behind
-  `OPENSKYRIM_CONVERTED_DIR` and skip with a message. **This is the PR that most needs a
+  `MUDCRAB_CONVERTED_DIR` and skip with a message. **This is the PR that most needs a
   `dummy-content` fixture** (a NIF with one `NiControllerSequence` exporting two clips; a `CELL` with
   an `XCLL`; a `STAT` with a `DNAM`/`MATO`), and the fixture crate can now do NIF and ESM writers.
   Add at least the door-clip one before sending: the alternative is a reviewer taking 2,103 lines of
@@ -716,7 +716,7 @@ disappear. Our own `git apply` of PR 3–5 diffs must not include that file (the
 
 | Path | Why |
 |---|---|
-| `AGENTS.md` (137), `CLAUDE.md` (1) | the working agreement and the handoff log: `C:\Modding\OpenSkyrimProject`, `C:/Users/Brannock`, worker names, task ids, the user's goals in quotes |
+| `AGENTS.md` (137), `CLAUDE.md` (1) | the working agreement and the handoff log: `C:\Modding\MudcrabProject`, `C:/Users/Brannock`, worker names, task ids, the user's goals in quotes |
 | `.deepseek-agents.json` | `readOnlyDirs` names `C:/Users/Brannock/.cargo/registry/src` and `C:/Modding/SkyrimConverted` |
 | `tasks/deepseek/**` (61 files) | briefs, prompt templates, reviewer/analyst/advisor roles, result schemas, `context.md`, `cookbook.md` |
 | `tools/ds_impl.ps1`, `ds_status.ps1`, `run_ds_queue.ps1`, `ds_report.py`, `check_worker_result.py`, `check_citations.py` | the harness: `~/.claude/skills/deepseek-agents`, `local/agents`, `DS_RUN_ID` |

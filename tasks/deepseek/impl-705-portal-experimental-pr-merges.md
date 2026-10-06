@@ -12,7 +12,7 @@ so the workspace builds. Merge resolution only: do not fix or change the PRs the
 - Resolve every conflict by hand so BOTH PRs' intent survives: e.g. #121 changes `configure_io_task_pool()` to
   `configure_io_task_pool(config.io_threads)` while main's newer code added shots lines around the old call; both
   sides add tests or flags at the same spot (keep both, whole functions, valid braces). A helper exists for pure
-  neighbouring additions: `python C:/Modding/OpenSkyrimProject/tools/merge_keep_both.py <file>` (keeps ours then
+  neighbouring additions: `python C:/Modding/MudcrabProject/tools/merge_keep_both.py <file>` (keeps ours then
   theirs verbatim); only use it after reading the hunk. After resolving: `git add <files>` and
   `git -c rerere.enabled=true commit --no-edit` (rerere records the resolution so the rebuild script replays it).
 - If a PR's conflicts turn out deep (a real design clash, not neighbouring edits), `git merge --abort`, skip it,

@@ -1415,7 +1415,7 @@ fn rebuild_glb(document: &Value, bin: &[u8]) -> Result<Vec<u8>> {
 /// Unit tests for the door-clip decoder, plus one opt-in test that walks a real
 /// converted asset tree.
 ///
-/// That test reads the NIFs extracted under `OPENSKYRIM_CONVERTED_DIR`'s
+/// That test reads the NIFs extracted under `MUDCRAB_CONVERTED_DIR`'s
 /// `vfs/meshes`; it is `#[ignore]`d and skips - printing why - when the variable
 /// is unset or the tree is not there, so CI never needs proprietary data
 /// (ADR-0002).
@@ -2008,12 +2008,13 @@ mod tests {
     /// exactly, and one model that stops fitting here means the rule is wrong again. Walking the
     /// tree takes about twenty seconds, so it stays ignored unless the assets are being checked.
     #[test]
-    #[ignore = "walks the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
+    #[ignore = "walks the extracted Skyrim NIFs (MUDCRAB_CONVERTED_DIR)"]
     fn real_every_animated_door_model_decodes() {
-        let Some(converted) =
-            std::env::var_os("OPENSKYRIM_CONVERTED_DIR").map(std::path::PathBuf::from)
+        let Some(converted) = std::env::var_os("MUDCRAB_CONVERTED_DIR")
+            .or_else(|| std::env::var_os("OPENSKYRIM_CONVERTED_DIR"))
+            .map(std::path::PathBuf::from)
         else {
-            eprintln!("skipping: set OPENSKYRIM_CONVERTED_DIR to a converted asset tree");
+            eprintln!("skipping: set MUDCRAB_CONVERTED_DIR to a converted asset tree");
             return;
         };
         let root = converted.join("vfs").join("meshes");

@@ -9,12 +9,12 @@ Skyrim does, and never draw a coarse object block over a finer one.
   (`feat(engine): ...`), with no `[deepseek]` prefix.
 - Read first: `crates/engine/src/lod.rs` (the whole LOD tier: planner `plan_blocks`, spawn,
   readiness `track_lod_readiness`, the terrain clip `update_lod_clip`/`ClipMask`, validator,
-  metrics) and the design `C:/Modding/OpenSkyrimProject/local/research-557/DESIGN.md` sections 2,
+  metrics) and the design `C:/Modding/MudcrabProject/local/research-557/DESIGN.md` sections 2,
   5, 6 and 8 ("4a"). Tonight's decisions override the design where they differ:
   1. **Object blocks hide per owner cell, not per pixel.** The terrain clip (`LodTerrainMaterial`,
      a fragment discard over cells whose full-detail terrain shows) must NOT be used for objects:
      19-47% of object-LOD triangles reach outside their owner cell, so a pixel clip cuts them
-     wrongly. Research: `C:/Modding/OpenSkyrimProject/local/research/lod-hiding-under-loaded-cells.md`.
+     wrongly. Research: `C:/Modding/MudcrabProject/local/research/lod-hiding-under-loaded-cells.md`.
   2. **The converter contract** (being implemented in parallel, task impl-558): in a level-4 object
      GLB, a shape with 2 or more segments is exported as one glTF primitive per segment, each with
      primitive extras `{"openSkyrim": {"lodSegment": i}}`, `i` in 0..15. Segment `i` belongs to

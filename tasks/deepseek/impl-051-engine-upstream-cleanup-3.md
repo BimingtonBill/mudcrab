@@ -22,7 +22,7 @@ evidence lives. Check that each linked doc exists.
 
 Also:
 - tests that read `C:/Modding/SkyrimConverted/...` or other machine paths use
-  `OPENSKYRIM_CONVERTED_DIR` (for converted output) or `OPENSKYRIM_SKYRIM_DATA` (for the game
+  `MUDCRAB_CONVERTED_DIR` (for converted output) or `MUDCRAB_SKYRIM_DATA` (for the game
   install), skip when unset, and keep no machine-path fallback. The converter uses the same
   convention (commit `410ce31`; ADR-0002);
 - keep behaviour byte-identical. Only comments, docs and test plumbing may change.
@@ -30,7 +30,7 @@ Also:
 ## Check
 
 - The acceptance commands must pass. Keep every test: counts may not shrink.
-- With `OPENSKYRIM_CONVERTED_DIR=C:/Modding/SkyrimConverted`, run
+- With `MUDCRAB_CONVERTED_DIR=C:/Modding/SkyrimConverted`, run
   `cargo test -p engine --lib -- --include-ignored` and report what ran.
 - This is the last part. In the report, confirm with a repo-wide grep over `crates/` that no
   private name is left in any Rust file (`impl-0`, `research-0`, `review-0`, `lead-0`,
@@ -39,7 +39,7 @@ Also:
 
 Parts 1 and 2 (commits `62c0f7b`, `944250e`) did the same job on the other engine files: follow its wording choices,
 for example "measured against the UESP reference screenshots (2026-09)" and
-`OPENSKYRIM_CONVERTED_DIR`.
+`MUDCRAB_CONVERTED_DIR`.
 
 ## Scope
 

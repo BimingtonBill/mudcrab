@@ -5,7 +5,7 @@ E through the real input path, save the frames, cross back the same way, exit. T
 clip and reads the crossing's own INFO lines for timing.
 
 # Context
-- Base `af797aeb` (branch phase2/door-preload). Make a LOCAL branch: `git -C C:/Modding/OpenSkyrimProject
+- Base `af797aeb` (branch phase2/door-preload). Make a LOCAL branch: `git -C C:/Modding/MudcrabProject
   worktree add -b local/door-evidence D:/Modding-overflow/wt-697 af797aeb`; target
   `CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/door-evidence` (keep it: the lead runs the binary).
 - Crossing code: `crates/engine/src/door_crossing.rs` (activation = E with the camera ray against the door's

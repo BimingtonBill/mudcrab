@@ -35,10 +35,10 @@ the light sources themselves. Tune against the reference screenshots.
 ## Method
 
 0. **Setup.** Your checkout has no `local/reference/`. The references are in the lead's checkout at
-   `C:/Modding/OpenSkyrimProject/local/reference/uesp/`, which you can read. Copy them into your
+   `C:/Modding/MudcrabProject/local/reference/uesp/`, which you can read. Copy them into your
    checkout's `local/reference/uesp/` with a small script under `tools/research/` (the folder is
    git-ignored; never commit the images). The smoke-interior pose is in
-   `C:/Modding/OpenSkyrimProject/local/reference/smoke_shots.json`.
+   `C:/Modding/MudcrabProject/local/reference/smoke_shots.json`.
    **The poses are rough:** another worker (research-020) is refining them now, and many current
    renders face a wall or the wrong way. So compare **per space**, not per shot. Pool the
    luminance statistics of all references of one space (Alftand01, Alftand02, AlftandWorld,

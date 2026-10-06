@@ -16,7 +16,7 @@ out (rock gravel skirts). Change no code.
 - New observation: rock gravel skirts, e.g. `C:\Modding\SkyrimConverted\vfs\meshes\landscape\rocks\rockpilem01.nif`
   shape `RockPileM01:8` (glTF material MASK, cutoff 0.1333, shaderFlags1 2386559752,
   shaderFlags2 32808, COLOR_0 alpha 0..1 in the source), now end in hard polygon edges. In Skyrim
-  their rim appears to fade into the terrain. Renders: `C:\Modding\OpenSkyrimProject\local\gallery\s26-check\cap-07.png`
+  their rim appears to fade into the terrain. Renders: `C:\Modding\MudcrabProject\local\gallery\s26-check\cap-07.png`
   (now) and `...\s25-check\cap-07.png` (alpha kept; the faded rim shows sky colour because of an
   engine depth-prepass issue, ignore that colour). Look at both.
 - Find the Whiterun wall/roof NIFs with the low vertex alpha yourself: `C:\Modding\SkyrimConverted\skyrim_world.db`

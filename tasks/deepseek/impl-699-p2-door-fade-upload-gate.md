@@ -19,7 +19,7 @@ present with `--max-upload-mib-per-frame 0` (`D:/Modding-overflow/door-evidence-
 
 # Context
 Base: branch `phase2/door-preload` head the lead names in "This run". Own worktree on D:
-(`git -C C:/Modding/OpenSkyrimProject worktree add D:/Modding-overflow/wt-699 <base> --detach`,
+(`git -C C:/Modding/MudcrabProject worktree add D:/Modding-overflow/wt-699 <base> --detach`,
 `CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/impl-699`). Upstream style `fix(engine): ...`, trailer
 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Owned: `crates/engine/src/door_crossing.rs` (and
 `app.rs` only if the budget's configured value must be read from config there). Read-only everything else;

@@ -64,7 +64,7 @@ before starting any `phase2/*` branch or moving work between tracks.
 > All publishing goes through **Upstream Dev**, and **nothing is published without the user's
 > permission**. Publishing is anything other people can see: upstream PRs, issues, comments,
 > reviews and replies (bots included), pushes to an open PR's branch, and pushes to the user's
-> public fork (`BimingtonBill/wah-krah-jol`, `myfork`), including `public/portal`.
+> public fork (`BimingtonBill/mudcrab`, `myfork`), including `public/portal`.
 >
 > - Dev sessions (Phase 1 Dev, Phase 2 Dev, Phase 3 Dev, Portal Dev and any new one) never run `git push`,
 >   `gh pr create`, `gh pr comment`, `gh issue create`, or any `gh api` call that writes to
@@ -166,7 +166,7 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
   subagents to short lookups.
 - **Other worker providers (the user, 2026-09-28):** every dev session may use them beside DeepSeek
   (details in the deepseek-agents skill, "Other providers"). **Meta Muse Spark:** the user opted
-  OpenSkyrim in to its contributor tier (Meta may use what it is sent): `-Provider meta -Tier
+  Mudcrab in to its contributor tier (Meta may use what it is sent): `-Provider meta -Tier
   contributor`, panel `Muse <kind> #nnn: ...`. Since 2026-10-02 (the user, "not super sensitive
   data") it has full access like the other workers (`contributorFullAccess` in providers.json):
   it reads `local/` and `-AddDir` folders; still never captures, screenshots or game data. Use it for code research and analysis, standing audits, map and pitfalls refreshes, and a

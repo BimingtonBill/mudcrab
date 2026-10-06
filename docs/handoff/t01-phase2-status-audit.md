@@ -22,7 +22,7 @@ install was read-only (a directory listing of `Data/`).
 ## Actually run (test evidence, not claims)
 
 - `cargo test -p converter` — all targets pass, exit code 0; 95 tests in the library target, only the
-  environment-gated ones (`OPENSKYRIM_*_FIXTURE`, `OPENSKYRIM_SKYRIM_DATA`) report `ignored`.
+  environment-gated ones (`MUDCRAB_*_FIXTURE`, `MUDCRAB_SKYRIM_DATA`) report `ignored`.
 - `cargo test -p shared` — 6 passed, 0 failed.
 - `cargo test -p engine` — 42 passed, 0 failed in the library target plus 2 in `world-inspect`,
   exit code 0, including all fourteen tests the acceptance robustness block names. Cold debug

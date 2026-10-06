@@ -8,7 +8,7 @@ The converter's `waters` table currently fills its colour columns from the wrong
   Use upstream's commit style (`fix(converter): ...`, `feat(engine): ...`), with no `[deepseek]`
   prefix.
 - Research, measured against Skyrim.esm and Update.esm:
-  `C:/Modding/OpenSkyrimProject/local/research/water.md`. Read its sections 0 and 1 (about lines 1-160).
+  `C:/Modding/MudcrabProject/local/research/water.md`. Read its sections 0 and 1 (about lines 1-160).
   - The bug: `crates/converter/src/esm/exporter.rs` (about lines 200-202 on main) fills
     `waters.shallow_color / deep_color / reflection_color` from `NAM0`/`NAM1`/`NAM2`. In SSE those
     are linear velocity, angular velocity (three f32 each) and the layer-1 noise texture path. The

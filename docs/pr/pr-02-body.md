@@ -1,6 +1,6 @@
 # PR 2 - fix(shared): Creation reference angles turn clockwise
 
-Branch `phase2/refr-rotation` (worktree `wkj-phase2`), commits `b9cdff8`, `0fd260f` on `2105bfd`. Drafted by DeepSeek research-080, edited by Claude (unverified mechanism and OpenMW claims removed). Opened as realfakenerd/wah-krah-jol#25 on 2026-09-23.
+Branch `phase2/refr-rotation` (worktree `wkj-phase2`), commits `b9cdff8`, `0fd260f` on `2105bfd`. Drafted by DeepSeek research-080, edited by Claude (unverified mechanism and OpenMW claims removed). Opened as Mudcrab-Team/mudcrab#25 on 2026-09-23.
 
 ---
 

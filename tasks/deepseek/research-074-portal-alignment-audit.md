@@ -16,7 +16,7 @@ Find out where that could break.
 
 ## Context
 
-`C:\Modding\OpenSkyrimProject` is a Skyrim engine rewrite in Rust on Bevy 0.19. The relevant code:
+`C:\Modding\MudcrabProject` is a Skyrim engine rewrite in Rust on Bevy 0.19. The relevant code:
 
 * `crates/engine/src/portal.rs` - the whole portal: `update_portal`, `select_portal_door`,
   `portal_pose` callers, `doorway_in_frame`, `measured_doorway_box`, `portal_projection`,

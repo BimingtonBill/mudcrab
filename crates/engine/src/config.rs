@@ -1064,7 +1064,7 @@ impl EngineConfig {
 
     /// The window's title: what kind of automated run this is, and its `--run-label`, so a run on
     /// the taskbar says what it is (the user asked, 2026-09-26). An interactive run is plain
-    /// "OpenSkyrim".
+    /// "Mudcrab".
     pub fn window_title(&self) -> String {
         let kind = if self.portal.portal_bench.is_some() {
             Some("portal bench")
@@ -1082,10 +1082,10 @@ impl EngineConfig {
             None
         };
         match (kind, self.run_label.as_deref()) {
-            (Some(kind), Some(label)) => format!("OpenSkyrim - {kind}: {label}"),
-            (Some(kind), None) => format!("OpenSkyrim - {kind}"),
-            (None, Some(label)) => format!("OpenSkyrim - {label}"),
-            (None, None) => "OpenSkyrim".to_string(),
+            (Some(kind), Some(label)) => format!("Mudcrab - {kind}: {label}"),
+            (Some(kind), None) => format!("Mudcrab - {kind}"),
+            (None, Some(label)) => format!("Mudcrab - {label}"),
+            (None, None) => "Mudcrab".to_string(),
         }
     }
 
@@ -2702,21 +2702,18 @@ mod tests {
             "2",
         ]);
         assert!(!bench.window_offscreen(), "a bench is watched");
-        assert_eq!(
-            bench.window_title(),
-            "OpenSkyrim - portal bench: default r1"
-        );
+        assert_eq!(bench.window_title(), "Mudcrab - portal bench: default r1");
         assert_eq!(bench.portal.bench_seconds, Some(2.0));
         assert!(!args(&["--demo-tour", "t", "--tour-bench", "b"]).window_offscreen());
         assert_eq!(
             args(&["--demo-tour", "t"]).window_title(),
-            "OpenSkyrim - demo tour"
+            "Mudcrab - demo tour"
         );
         assert_eq!(
             args(&["--shots", "s.json"]).window_title(),
-            "OpenSkyrim - shots"
+            "Mudcrab - shots"
         );
-        assert_eq!(args(&["--walk"]).window_title(), "OpenSkyrim");
+        assert_eq!(args(&["--walk"]).window_title(), "Mudcrab");
         assert_eq!(
             args(&["--portal-bench", "d", "--bench-seconds", "-1"])
                 .portal

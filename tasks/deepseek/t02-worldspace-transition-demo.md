@@ -7,7 +7,7 @@ Read `tasks/deepseek/context.md` first. This is a **research** task: documentati
 The user wants a showcase demo: start at the Alftand ruin entrance in the Tamriel exterior (the Pale),
 go inside, and arrive in Blackreach - the vanilla underground worldspace in `Skyrim.esm` - with no
 loading screen. In the game this path crosses load doors: Tamriel exterior -> Alftand interior cells
--> Blackreach worldspace. Find out exactly what OpenSkyrim has and lacks for this, and write the
+-> Blackreach worldspace. Find out exactly what Mudcrab has and lacks for this, and write the
 recipe the lead will implement.
 
 The lead's first reading (verify it, do not trust it): the engine takes one `worldspace_id` at start

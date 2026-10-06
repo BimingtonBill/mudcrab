@@ -6,7 +6,7 @@
 # delete or `git clean`, not against the PC failing.
 
 $ErrorActionPreference = 'Stop'
-$source = 'C:\Modding\OpenSkyrimProject\local'
+$source = 'C:\Modding\MudcrabProject\local'
 $backupRoot = 'D:\Modding-overflow\local-backup'
 $folders = @('pr-drafts', 'review', 'team', 'research', 'pr-evidence')
 $keep = 14

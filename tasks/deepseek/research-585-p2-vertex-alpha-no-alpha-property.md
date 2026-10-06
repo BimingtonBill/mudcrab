@@ -14,7 +14,7 @@ vertex alpha as opacity. Change no project code.
   shape `RockPileM01:0` (a dark dirt skirt under the rock): shaderFlags1 2185233161 (bit 3 set),
   shaderFlags2 32801, no NiAlphaProperty, vertex alpha 0..0.55. It renders as a hard dark polygon
   on the terrain; in Skyrim it fades into the ground. Render:
-  `C:\Modding\OpenSkyrimProject\local\gallery\s27-check\cap-07.png` (look at it).
+  `C:\Modding\MudcrabProject\local\gallery\s27-check\cap-07.png` (look at it).
 - History: the upstream converter originally made "Vertex_Alpha (or screen-door fade) without an
   alpha property" a BLEND material. On 2026-09-22 that was removed because 2,632 converted materials
   became see-through (trees and rocks drawn transparent). It is not known how many of those were

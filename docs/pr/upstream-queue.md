@@ -2,7 +2,7 @@
 
 **HOLD (the user, 2026-09-25): no new public PRs until at least 3 of the standing PRs (#29, #30, #31, #34, #36, #38) are merged.** Merged so far: #34, #36, #39 (3 of 3: **the hold is met** 2026-09-26; posts to upstream are separately paused by the user). Review fixes to open PRs (user OK each) and labelled bot replies continue.
 
-Owner: **Upstream Dev**. Upstream is realfakenerd/wah-krah-jol, whose main is 417a262 as of
+Owner: **Upstream Dev**. Upstream is Mudcrab-Team/mudcrab, whose main is 417a262 as of
 2026-09-25. Every new PR or issue, and any text meant for humans, needs the user's OK. Replies to
 bots (CodeRabbit) may be posted by agents, labelled as AI.
 
@@ -43,7 +43,7 @@ The #30 reply promised it. **Written 2026-09-25 night:** `phase2/prune-keeps-fai
 4. ~~History paths~~ decided 2026-09-26 (the user, 3a): when lod-engine-trees or material-publication is sent, send it as one fresh squashed commit (same tree, clean history); nothing existing is rewritten.
 5. ~~public/portal~~ done 2026-09-26: re-exported by Portal Dev with the user's direct yes; head ff96ac2 (portal ae25821).
 
-**POSTS TO UPSTREAM PAUSED (lifted for the 7 bundle PRs by the user's "open all 7", 2026-09-27; everything else still asks first) (the user, 2026-09-26: "hold off on posts to realfakenerd's upstream").** No comments, issues, PRs or bot replies on realfakenerd/wah-krah-jol until the user lifts it. The user's own fork (e.g. public/portal) is not affected. Held: the LOD issue (18), the reference-shots route decision. Pushing review fixes also waits unless the user OKs it.
+**POSTS TO UPSTREAM PAUSED (lifted for the 7 bundle PRs by the user's "open all 7", 2026-09-27; everything else still asks first) (the user, 2026-09-26: "hold off on posts to realfakenerd's upstream").** No comments, issues, PRs or bot replies on Mudcrab-Team/mudcrab until the user lifts it. The user's own fork (e.g. public/portal) is not affected. Held: the LOD issue (18), the reference-shots route decision. Pushing review fixes also waits unless the user OKs it.
 
 ## Bundles (the user, 2026-09-27: fewer, bigger PRs, each with photo/video evidence)
 
@@ -118,7 +118,7 @@ Built locally from main 6f583cd by Upstream Dev (merges of the component branche
 ## Staged branches, in send order
 
 Branch scan of 2026-09-25 against origin/main 417a262 ("fork" means the same commit is on
-BimingtonBill/wah-krah-jol). The "plain" column is the name used on the user's roadmap page
+BimingtonBill/mudcrab). The "plain" column is the name used on the user's roadmap page
 (`local/roadmap/phase2.json`).
 
 | Order | Branch(es) | Plain | Ahead | Merge | Fork | Status |
@@ -214,7 +214,7 @@ From upstream's CONTRIBUTING.md and `two-tracks.md` "Rules for every Phase 2 PR"
    `docs/research/` or `tools/research/`.
 4. `///` doc comments on new functions; commits in upstream's style (`fix(converter): ...`).
 5. The body references the planning doc it serves (`02-completion-plan.md` milestone or a
-   `docs/specs/` file), uses the Wah Krah Jol name, and ends with the attribution line. It is
+   `docs/specs/` file), uses the Mudcrab name, and ends with the attribution line. It is
    written in plain words for the user, with an AI label on kept text.
 6. The user OKs the send. After opening, watch CI and CodeRabbit and answer both.
 

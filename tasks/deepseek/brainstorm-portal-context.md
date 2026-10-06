@@ -4,7 +4,7 @@ Track: portal. The user asked for "intelligent, creative and dynamic ways of dev
 
 ## What the portal is today (2026-09-25)
 
-OpenSkyrim re-implements Skyrim's world in Rust/Bevy 0.19, from converted game data (`C:\Modding\SkyrimConverted`, read-only).
+Mudcrab re-implements Skyrim's world in Rust/Bevy 0.19, from converted game data (`C:\Modding\SkyrimConverted`, read-only).
 
 **The portal feature.** Skyrim's load doors (a house door, a dungeon door) normally teleport the player behind a loading screen. Here they are seamless:
 - The far side (the interior cell, or another worldspace) streams in near the door, on its own render layer (layer 2).

@@ -4,7 +4,7 @@ converted Skyrim SE data) so fixes can be briefed. Read-only.
 
 # Context
 - Screenshots with pose/settings JSON and the user's notes:
-  `C:/Modding/OpenSkyrimProject/local/captures/2026-09-26_11-44-01/` - `09.png` (Whiterun sewer
+  `C:/Modding/MudcrabProject/local/captures/2026-09-26_11-44-01/` - `09.png` (Whiterun sewer
   streams missing: no water), `12.png` (Skyforge: a light-blue hole showing sky through the ground
   under the funeral pyre), `14.png` (water missing under the Dragonsreach bridge). `notes.md` has
   the user's words. These were taken on a fork build, but water and terrain code match `main` here.

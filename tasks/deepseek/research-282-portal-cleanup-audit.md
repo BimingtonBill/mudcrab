@@ -12,7 +12,7 @@ and noisy logs.
 ## Scope
 Read only: `C:/Modding/wkj-portal-merge` (crates/engine, crates/shared, crates/launcher, docs/,
 scripts/, tools/). Do not read `local/`. Reference for what main has and why:
-`C:/Modding/OpenSkyrimProject/local/merge/port-notes.md`.
+`C:/Modding/MudcrabProject/local/merge/port-notes.md`.
 
 Known facts to build on:
 - Kept from portal, not main: `streaming.rs`, `render.rs`, `terrain.wgsl`, `atmosphere.rs`, the portal's

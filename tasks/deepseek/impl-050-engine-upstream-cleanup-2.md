@@ -22,7 +22,7 @@ evidence lives. Check that each linked doc exists.
 
 Also:
 - tests that read `C:/Modding/SkyrimConverted/...` or other machine paths use
-  `OPENSKYRIM_CONVERTED_DIR` (for converted output) or `OPENSKYRIM_SKYRIM_DATA` (for the game
+  `MUDCRAB_CONVERTED_DIR` (for converted output) or `MUDCRAB_SKYRIM_DATA` (for the game
   install), skip when unset, and keep no machine-path fallback. The converter uses the same
   convention (commit `410ce31`; ADR-0002);
 - keep behaviour byte-identical. Only comments, docs and test plumbing may change.
@@ -30,14 +30,14 @@ Also:
 ## Check
 
 - The acceptance commands must pass. Keep every test: counts may not shrink.
-- With `OPENSKYRIM_CONVERTED_DIR=C:/Modding/SkyrimConverted`, run
+- With `MUDCRAB_CONVERTED_DIR=C:/Modding/SkyrimConverted`, run
   `cargo test -p engine --lib -- --include-ignored` and report what ran.
 - In the report, list the remaining private names in `app.rs`, `portal.rs` and
   `world/database.rs`, which another task owns right now, so part 3 can be briefed.
 
 Part 1 (commit `62c0f7b`) did the same job on the other engine files: follow its wording choices,
 for example "measured against the UESP reference screenshots (2026-09)" and
-`OPENSKYRIM_CONVERTED_DIR`.
+`MUDCRAB_CONVERTED_DIR`.
 
 ## Scope
 

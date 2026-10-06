@@ -13,7 +13,7 @@ what you have even if unfinished. Never end without a report.
 
 ## Context
 
-- Repo `C:\Modding\OpenSkyrimProject`. Converter `crates/converter/**` (this task's territory).
+- Repo `C:\Modding\MudcrabProject`. Converter `crates/converter/**` (this task's territory).
   Engine `crates/engine/**` is another lead's - read, never edit. `vendor/project-wormhole-nif/**`
   (the NIF parser) is a vendored copy, read-only for us.
 - The gap: `docs/research/visual-gaps-spec.md` gap 3 (the Alftand ice set under

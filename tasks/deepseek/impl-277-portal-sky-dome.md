@@ -18,8 +18,8 @@ portal's `atmosphere.rs` and the portal camera's destination atmosphere).
   destination space's atmosphere onto the portal camera, which renders only
   `crate::portal::DESTINATION_LAYER` (2) (portal camera spawn ~2287-2320).
 - Two research reports agree on the design; read both (appended paths are readable):
-  `C:/Modding/OpenSkyrimProject/local/merge/port-prep-sky.md` and the sky half of
-  `C:/Modding/OpenSkyrimProject/local/merge/research-274-report.md`.
+  `C:/Modding/MudcrabProject/local/merge/port-prep-sky.md` and the sky half of
+  `C:/Modding/MudcrabProject/local/merge/research-274-report.md`.
 
 # Design (fixed)
 1. Carry `sky_upper`, `sky_fog`, `sky_lower` into `SpaceAtmosphere` (fallback to

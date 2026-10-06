@@ -8,9 +8,9 @@ no converter or schema change. This is PR 2 of the sky series; PR 1 (the sky dom
   `shaders/sky.wgsl`, `docs/specs/engine/sky.md`, the clear colour = Fog Far 116,168,203).
   Upstream commit style (`feat(engine): ...`), no `[deepseek]` prefix, no project-internal
   references (portal, DeepSeek, task numbers) in code or docs.
-- Design: `C:\Modding\OpenSkyrimProject\local\research\sky-design-phase2.md`, section 3 ("Fog:"
+- Design: `C:\Modding\MudcrabProject\local\research\sky-design-phase2.md`, section 3 ("Fog:"
   and "Where the dome meets the fog at the horizon") and row 2 of the PR table in section 4.
-  Measurements: `C:\Modding\OpenSkyrimProject\local\research\sky.md` §3.5 (vanilla fog is
+  Measurements: `C:\Modding\MudcrabProject\local\research\sky.md` §3.5 (vanilla fog is
   `min(Max, t^Power)` with a Near→Far colour lerp; the fitted `FogFalloff::Exponential` density and
   its error table) and §2.6 (SkyrimClear fog values). Read both sections before writing code.
 - Bevy 0.19 `DistanceFog` reaches StandardMaterial meshes automatically, and the terrain and

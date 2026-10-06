@@ -25,7 +25,7 @@ demo. `cargo test`/`clippy`/`fmt` are expected and required.
 
 ## Context
 
-- Repo `C:\Modding\OpenSkyrimProject`; the crate is `crates/converter/`. The published tree at
+- Repo `C:\Modding\MudcrabProject`; the crate is `crates/converter/`. The published tree at
   `C:/Modding/SkyrimConverted` is schema 18 and **complete**, so anything that changes published
   output must bump the schema; this patch does and takes the bump.
 - `CONVERTER_SCHEMA_VERSION` is at `crates/converter/src/cache.rs:11`. There are **two** places that

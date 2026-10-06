@@ -29,7 +29,7 @@ Two engine-only fixes from the spec:
 
 - Build release (`cargo build --release -p engine`), render with the shots mode
   (`docs/design/reference-shots.md`), and measure with `python tools/research/exposure_stats.py`.
-- The references are in the lead's checkout at `C:/Modding/OpenSkyrimProject/local/reference/uesp/`
+- The references are in the lead's checkout at `C:/Modding/MudcrabProject/local/reference/uesp/`
   (read-only). Copy them into your checkout with `python tools/research/copy_reference_shots.py`
   (read it first). The shots files are `tools/reference/uesp_shots_4x3.json` and
   `uesp_shots_blackreach_04.json`. **`SR-place-Blackreach_04` has never been rendered: render it.**

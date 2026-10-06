@@ -7,11 +7,11 @@ second opinion appended below.
 # Context
 - Your checkout is branch `portal-merge-main` (base 6d7434d6) with the pacing port and the sky dome integrated. Commit prefix
   `[deepseek]`.
-- Main's copies (source): `C:/Modding/OpenSkyrimProject/local/merge/main_render.rs`,
+- Main's copies (source): `C:/Modding/MudcrabProject/local/merge/main_render.rs`,
   `main_shaders_terrain.wgsl`, `streaming_main.rs`; what main changed in render.rs + terrain.wgsl:
   `render_base_to_main.diff` (same folder). Research and second opinion:
-  `C:/Modding/OpenSkyrimProject/local/merge/research-274-report.md` (section 1, normals) and
-  `C:/Modding/OpenSkyrimProject/local/merge/port-prep-normals.md`.
+  `C:/Modding/MudcrabProject/local/merge/research-274-report.md` (section 1, normals) and
+  `C:/Modding/MudcrabProject/local/merge/port-prep-normals.md`.
 - The converted data carries landscape normal maps; `AssetCatalog::landscape_normal(form_id)` exists
   (`crates/engine/src/world/database.rs`).
 - Fixed decisions:

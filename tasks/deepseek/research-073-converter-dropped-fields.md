@@ -10,7 +10,7 @@ This is the source material for `docs/research/converter-dropped-fields.md`.
 
 ## Context
 
-- Repo `C:\Modding\OpenSkyrimProject`. The converter is `crates/converter/**`. The NIF parser and the
+- Repo `C:\Modding\MudcrabProject`. The converter is `crates/converter/**`. The NIF parser and the
   GLB vertex serialization live in the vendored crate `vendor/project-wormhole-nif/**` (a copy of an
   upstream project - read it freely, but mark its findings "vendor-side"; it is not ours to change).
 - **Why this audit exists.** Two bugs of exactly this shape had been wrong for every asset since the

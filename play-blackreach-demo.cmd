@@ -1,5 +1,5 @@
 @echo off
-rem OpenSkyrim: walk from the Alftand entrance down to Blackreach, no loading screens.
+rem Mudcrab: walk from the Alftand entrance down to Blackreach, no loading screens.
 rem Mouse to look (click the window first), WASD move, Shift run, Space jump,
 rem E open a load door, F fly, Esc release the mouse. Close the window to quit.
 cd /d "%~dp0"

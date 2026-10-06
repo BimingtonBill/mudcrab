@@ -1,6 +1,6 @@
 # PR #27 vs our staged branches — decision aid
 
-Upstream PR #27 (`realfakenerd/OpenSkyrim`, author TaylorTurnerIT, `fix/white-pines-cutout-alpha`,
+Upstream PR #27 (`realfakenerd/Mudcrab`, author TaylorTurnerIT, `fix/white-pines-cutout-alpha`,
 open, unreviewed, 0 comments from maintainers, mergeable/BLOCKED). Compared against our local
 `phase2/renderable-base-types`, `phase2/vertex-alpha-not-opacity`, `phase2/shared-converter-schema`,
 `phase2/material-publication` (worktree `C:/Modding/wkj-phase2`, all cut from `main`).

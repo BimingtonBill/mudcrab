@@ -2,7 +2,7 @@
 
 This is the contribution guide for the demos the project uses to show what the engine can do. There
 are two, and both are walked end to end with no loading screen anywhere. They are the fastest way to
-get a real, running OpenSkyrim on your machine.
+get a real, running Mudcrab on your machine.
 
 - **Alftand → Blackreach** (`--demo alftand`) — the descent: on foot from the Alftand entrance in
   the Pale, down four load doors, into Blackreach. Pick this one for the underground: interiors, the
@@ -371,7 +371,7 @@ it), then runs `engine.exe --assets <converted> --portal-bench tools/bench/porta
 --bench-out <csv> --run-label "<variant> round <n> of <repeats>"` once per variant per round,
 interleaved (A B, A B), so drift hits every variant alike. Each variant is `name=extra engine
 arguments`; use `-Command`, not `-File`, or the list arrives as one string. The window opens on
-screen, centred, titled `OpenSkyrim - portal bench: <label>`. Results go to
+screen, centred, titled `Mudcrab - portal bench: <label>`. Results go to
 `local/bench/portal-bench-<date-time>/`; `summary.txt` gives each state's mean over the repeats with
 the spread (min..max): a difference inside the spread is noise. One run takes about 2.5 minutes, so
 one variant with two repeats takes about 5 minutes. It is a development tool and is kept quick: add
@@ -541,7 +541,7 @@ A change applies at once. One that needs new render pipelines (anti-aliasing, SS
 the shadow filter, contact shadows) can show one frame drawn without them - a flash - while they
 compile; that is expected, and the panel's footer says so. An automated run hides the panel with
 the rest of the HUD; for a screenshot of it, run with `--show-window` and the environment variable
-`OPENSKYRIM_GRAPHICS_PANEL=1`, which starts the run with the panel open.
+`MUDCRAB_GRAPHICS_PANEL=1`, which starts the run with the panel open.
 
 | Preset | What it is |
 |---|---|

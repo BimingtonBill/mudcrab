@@ -63,7 +63,7 @@ target/release/engine.exe --assets C:\Modding\SkyrimConverted --demo alftand --w
 
 Both must end `tour PASSED` (8 and 4 crossings), no `panicked`. Lighting must be unchanged: compare
 the mean luma of `local/t154-riverwood/NN-arrived.png` for every stage with the same files in the
-lead's pre-refactor run, `C:\Modding\OpenSkyrimProject\local\demo\t103-riverwood\` (same lighting
+lead's pre-refactor run, `C:\Modding\MudcrabProject\local\demo\t103-riverwood\` (same lighting
 code; the tour poses are deterministic, but streaming timing is not, so expect small differences and
 report them all rather than a verdict).
 

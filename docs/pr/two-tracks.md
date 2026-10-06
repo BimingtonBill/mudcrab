@@ -16,11 +16,11 @@ so re-read upstream's roadmap before sending anything more.
 **Priority:** the Phase 2 track comes first. Portal work fills the time Phase 2 PRs spend waiting on
 upstream review.
 
-> **Current state (2026-10-02):** upstream is `Mudcrab-Team/mudcrab` (renamed from realfakenerd/OpenSkyrim); the 2026-09-23 send hold, the schema numbers, the conversion plans and the PR 1-12 list below are **history**. For live rules see AGENTS.md (tracks, publishing, checks, disk), `local/pr-drafts/SEND-CHECKLIST.md` and the send queue `docs/pr/upstream-queue.md`. Portal Dev may build `phase2/*` work for upstream (e.g. the door crossing, #128); it goes upstream through Upstream Dev like any Phase 2 branch.
+> **Current state (2026-10-02):** upstream is `Mudcrab-Team/mudcrab` (renamed from realfakenerd/Mudcrab); the 2026-09-23 send hold, the schema numbers, the conversion plans and the PR 1-12 list below are **history**. For live rules see AGENTS.md (tracks, publishing, checks, disk), `local/pr-drafts/SEND-CHECKLIST.md` and the send queue `docs/pr/upstream-queue.md`. Portal Dev may build `phase2/*` work for upstream (e.g. the door crossing, #128); it goes upstream through Upstream Dev like any Phase 2 branch.
 
 ## Why
 
-Upstream (`realfakenerd/OpenSkyrim`, now **Wah Krah Jol**) counts Phase 2 as implemented and waiting
+Upstream (`realfakenerd/Mudcrab`, now **Mudcrab**) counts Phase 2 as implemented and waiting
 on one thing, the single completion criterion of
 [`02-completion-plan.md`](../roadmap/02-completion-plan.md): a recent, reproducible real-asset
 bundle whose `acceptance-report.json` says exactly `accepted`, with a baseline and a signed visual
@@ -37,9 +37,9 @@ Phase 4 side, so most of the portal feature is not Phase 2 work and must not be 
 |---|---|---|
 | Purpose | contribute to upstream Phase 2, as its README, CONTRIBUTING.md and roadmap describe | the user's seamless-door / portal feature and demos; offered upstream later as a Phase 4 proposal |
 | Branches | `main` (mirror of `origin/main`, never committed to) and `phase2/<topic>`, one per upstream PR, cut from `main` | `portal` (formerly `deepseek-setup`) |
-| Worktree | `C:\Modding\wkj-phase2` | `C:\Modding\OpenSkyrimProject` |
+| Worktree | `C:\Modding\wkj-phase2` | `C:\Modding\MudcrabProject` |
 | Converted assets | `C:\Modding\SkyrimConverted-upstream`, converted by the `phase2` worktree's converter | `C:\Modding\SkyrimConverted` |
-| Push target | `myfork` (`BimingtonBill/wah-krah-jol`), PR to `realfakenerd/OpenSkyrim` `main` | never pushed |
+| Push target | `myfork` (`BimingtonBill/mudcrab`), PR to `realfakenerd/Mudcrab` `main` | never pushed |
 | Commit style | upstream's: conventional commits (`fix(converter): ...`), no `[claude]`/`[deepseek]` prefix, no citations of fork-only files | this repo's: `[claude]` / `[deepseek]` prefixes |
 | Worker task names | `<kind>-<nnn>-p2-<slug>`, numbers 500-599 | `<kind>-<nnn>-portal-<slug>`, numbers 100-199, then 600+ |
 
@@ -239,7 +239,7 @@ From upstream's CONTRIBUTING.md and README, plus what the fork has learnt:
   tests of the touched crates;
 - a test that needs no game data (dummy-content fixtures), since upstream CI has no Skyrim install;
 - the description references the planning doc it serves (`02-completion-plan.md` Marco N, or a
-  `docs/specs/` file), uses the Wah Krah Jol name, and ends with the attribution line;
+  `docs/specs/` file), uses the Mudcrab name, and ends with the attribution line;
 - no machine paths, no private names, no citations of `docs/research/` or `tools/research/`;
 - no Bethesda data in the diff or the description.
 
@@ -251,7 +251,7 @@ From upstream's CONTRIBUTING.md and README, plus what the fork has learnt:
   into a folder an engine is reading) are in AGENTS.md, "While working".
 - Opening issues and PRs upstream is publishing: the user confirms each one.
 
-## Issue: lighting in the Phase 2 visual review (posted as realfakenerd/wah-krah-jol#24, 2026-09-23)
+## Issue: lighting in the Phase 2 visual review (posted as Mudcrab-Team/mudcrab#24, 2026-09-23)
 
 > **Title:** Is static lighting in scope for the Phase 2 visual review?
 >

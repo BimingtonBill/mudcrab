@@ -4,7 +4,7 @@ Read `tasks/deepseek/context.md` and `AGENTS.md` first.
 
 ## Goal
 
-This checkout is a private local fork of `realfakenerd/OpenSkyrim`, cloned at `8919096`. It is on
+This checkout is a private local fork of `realfakenerd/Mudcrab`, cloned at `8919096`. It is on
 branch `deepseek-setup` and has never been pushed. The user wants an **audit of all the work
 since the fork** and a **design** for a reasonable pull request (or a short series of them) to the
 upstream project. Nothing is published tonight: the deliverable is the plan and the evidence. The

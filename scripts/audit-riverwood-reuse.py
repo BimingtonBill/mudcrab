@@ -17,9 +17,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-INVENTORY_FORMAT = "openskyrim-riverwood-reuse-inventory-v1"
-REFERENCE_FORMAT = "openskyrim-riverwood-reuse-reference-v1"
-COMPARISON_FORMAT = "openskyrim-riverwood-reuse-comparison-v1"
+INVENTORY_FORMAT = "mudcrab-riverwood-reuse-inventory-v1"
+REFERENCE_FORMAT = "mudcrab-riverwood-reuse-reference-v1"
+COMPARISON_FORMAT = "mudcrab-riverwood-reuse-comparison-v1"
 ASSET_ROOTS = {
     "meshes": ".glb",
     "textures": ".ktx2",
@@ -251,7 +251,7 @@ def _inspect_glb(data: bytes, description: str) -> tuple[dict[str, Any], bytes, 
     extras = scenes[0].get("extras", MISSING)
     if extras is not MISSING and not isinstance(extras, dict):
         raise AuditError(f"{description}: scenes[0].extras must be an object")
-    collision_keys = [key for key in ("mudcrabCollision", "openSkyrimCollision")
+    collision_keys = [key for key in ("mudcrabCollision", "mudcrabCollision")
                       if isinstance(extras, dict) and key in extras]
     if len(collision_keys) > 1:
         raise AuditError(f"{description}: ambiguous collision extras keys")
@@ -268,7 +268,7 @@ def _inspect_glb(data: bytes, description: str) -> tuple[dict[str, Any], bytes, 
     post_hash = _sha256(post_json)
     normalized_hash = _sha256(normalized_bytes)
     render_digest = hashlib.sha256()
-    render_digest.update(b"OpenSkyrim-GLB-render-identity-v1\0")
+    render_digest.update(b"Mudcrab-GLB-render-identity-v1\0")
     render_digest.update(bytes.fromhex(normalized_hash))
     render_digest.update(struct.pack(">Q", len(post_json)))
     render_digest.update(bytes.fromhex(post_hash))
@@ -380,7 +380,7 @@ def _validate_inventory(
             elif collision_hash is not None:
                 raise AuditError(f"candidate inventory has hash for absent collision field: {path}")
             render_digest = hashlib.sha256()
-            render_digest.update(b"OpenSkyrim-GLB-render-identity-v1\0")
+            render_digest.update(b"Mudcrab-GLB-render-identity-v1\0")
             render_digest.update(bytes.fromhex(normalized_hash))
             render_digest.update(struct.pack(">Q", glb["post_json_size"]))
             render_digest.update(bytes.fromhex(post_hash))
@@ -570,7 +570,7 @@ def compare(
         "format": COMPARISON_FORMAT,
         "passed": False,
         "method": {
-            "glb": "canonical structured JSON after removing only scenes[0].extras.mudcrabCollision (legacy openSkyrimCollision also accepted), plus byte-exact post-JSON data",
+            "glb": "canonical structured JSON after removing only scenes[0].extras.mudcrabCollision (legacy mudcrabCollision also accepted), plus byte-exact post-JSON data",
             "non_glb": "exact file size and SHA-256",
             "collision_annotation": "candidate-only addition is permitted; existing reference values must remain byte-canonical identical",
             "scope": "portable inventory comparison only; collision correctness and collision audit support are unverified",

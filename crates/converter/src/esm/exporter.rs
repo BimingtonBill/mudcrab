@@ -1147,19 +1147,21 @@ pub fn validate_database(conn: &Connection) -> Result<()> {
 ///
 /// Three of them read `Skyrim.esm` from a real installation, which ADR-0002
 /// makes opt-in: they are `#[ignore]`d, name the install through
-/// `OPENSKYRIM_SKYRIM_DATA` (never a default machine path), and skip - printing
+/// `MUDCRAB_SKYRIM_DATA` (never a default machine path), and skip - printing
 /// why - when the variable is unset or the plugin is not there.
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// A plugin file in the Skyrim SE installation that ADR-0002 names through
-    /// `OPENSKYRIM_SKYRIM_DATA`, or `None` with the reason printed. The opt-in
+    /// `MUDCRAB_SKYRIM_DATA`, or `None` with the reason printed. The opt-in
     /// tests below skip on `None` rather than failing, since a check-out has no
     /// game data.
     fn installed_plugin(name: &str) -> Option<std::path::PathBuf> {
-        let Some(data_dir) = std::env::var_os("OPENSKYRIM_SKYRIM_DATA") else {
-            eprintln!("skipping: set OPENSKYRIM_SKYRIM_DATA to the Skyrim Data directory");
+        let Some(data_dir) = std::env::var_os("MUDCRAB_SKYRIM_DATA")
+            .or_else(|| std::env::var_os("OPENSKYRIM_SKYRIM_DATA"))
+        else {
+            eprintln!("skipping: set MUDCRAB_SKYRIM_DATA to the Skyrim Data directory");
             return None;
         };
         let plugin = std::path::Path::new(&data_dir).join(name);
@@ -2864,7 +2866,7 @@ mod tests {
     /// `export_to_db`: a cell whose `LTMP` names a template it inherits from
     /// field by field. The bytes are the ones
     /// `tools/research/space_lighting_dump.py` printed for the two records.
-    /// Reads the game install (`OPENSKYRIM_SKYRIM_DATA`), so it is opt-in and
+    /// Reads the game install (`MUDCRAB_SKYRIM_DATA`), so it is opt-in and
     /// skips without it: `cargo test -p converter --lib -- --ignored`.
     #[test]
     #[ignore = "reads Skyrim.esm from the Skyrim SE install"]
@@ -3032,7 +3034,7 @@ mod tests {
     /// expected values are the ones `tools/research/esm_route.py` printed for
     /// `docs/research/worldspace-transition-demo.md` (section 2.2), which was
     /// measured independently of this code. Reads the game install
-    /// (`OPENSKYRIM_SKYRIM_DATA`), so it is opt-in and skips without it:
+    /// (`MUDCRAB_SKYRIM_DATA`), so it is opt-in and skips without it:
     /// `cargo test -p converter --lib -- --ignored`.
     #[test]
     #[ignore = "reads Skyrim.esm from the Skyrim SE install"]

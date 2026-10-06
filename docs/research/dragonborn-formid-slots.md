@@ -78,7 +78,7 @@ Fix the **consumer** of the tree LODs, not the converter:
 
 ## 7. Scripts (all in the work folder)
 
-`C:\Users\Brannock\AppData\Local\Temp\claude\C--Modding-OpenSkyrimProject\5ae7d30e-755d-4206-af2b-5d4791d54da4\scratchpad\dbwork\`
+`C:\Users\Brannock\AppData\Local\Temp\claude\C--Modding-MudcrabProject\5ae7d30e-755d-4206-af2b-5d4791d54da4\scratchpad\dbwork\`
 
 `NOTES.md` indexes all 25. The load-bearing ones: `09_setcompare.py` (set-exact ESM↔DB comparison), `11_setcompare_all.py` (all plugins), `25_cc_check.py` (CC/light plugins against the 0xFE packing), `18_btt_v3.py` (best `.btt` decoder), `23_validate_trees.py` (the decisive remap/coordinate validation), `13_btt_decode.py` (sha256 provenance of `.btt` vs BSA), `07_probe_ids.py` (the 0x1AAFE boundary).
 

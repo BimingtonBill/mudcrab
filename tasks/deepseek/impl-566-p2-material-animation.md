@@ -46,7 +46,7 @@ controllers are dropped, and every such card is one still frame.
   }
   ```
   `tangents` is present only for QUADRATIC. List the extension in `extensionsUsed` (not
-  `extensionsRequired`), as the other OpenSkyrim extensions are. One channel per float controller
+  `extensionsRequired`), as the other Mudcrab extensions are. One channel per float controller
   in the chain. A controller whose interpolator or data is missing, or has an unknown key type or
   variable, is skipped and counted: never fail the conversion for it.
 - Find where materials are published (`crates/converter/src/material.rs`: the material contract

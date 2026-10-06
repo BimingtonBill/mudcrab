@@ -12,11 +12,11 @@ F to fly) and its own door crossings (`crates/engine/src/transition.rs`).
 ## Scope
 Read only. Portal tree: `C:/Modding/wkj-portal-merge` (`crates/engine/src/physics.rs` is main's,
 compiled but not wired; `player.rs`, `transition.rs`, `portal.rs`, `streaming.rs`, `app.rs`,
-`config.rs`). Main's copies and the common ancestor are in `C:/Modding/OpenSkyrimProject/local/merge/`:
+`config.rs`). Main's copies and the common ancestor are in `C:/Modding/MudcrabProject/local/merge/`:
 `streaming_main.rs` (search `TerrainCollider`, `StaticColliderSource`, `StaticCollisionCache`,
 `collider`, `ColliderDisabled`, `rapier`), `streaming_base_to_main.diff`, `main_app.rs` (search
 `WorldPlayerPlugin`, `interactive_world_physics`, `RapierPhysicsPlugin`, `physics_fixture`),
-`base_app.rs`. The converter now embeds collision in GLB extras (`openSkyrimCollision`,
+`base_app.rs`. The converter now embeds collision in GLB extras (`mudcrabCollision`,
 `crates/shared/src/collision.rs`).
 
 ## Web questions

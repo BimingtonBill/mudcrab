@@ -339,7 +339,7 @@ where pwsh >nul 2>nul || set "PS=powershell"
 
 # ---------------------------------------------------------------- main
 
-Write-Heading "OpenSkyrim demo setup"
+Write-Heading "Mudcrab demo setup"
 Write-Note "repository: $repository"
 if ($DryRun) { Write-Note "-DryRun: printing commands only; nothing will be built, converted or written." }
 

@@ -17,7 +17,7 @@ is different. The two features:
   Resident{root, detail}, Failed{detail}}`, `ActiveCell` (interiors), `PrestreamCells` (door destinations),
   `full_failed`, interior retries, a `pinned` set, and a per-frame commit budget
   (`commit_waits_for_next_frame`). Its unloads are immediate (`plan_cells`'s `streaming.cells.retain`).
-- Main's streamer (the source): `C:/Modding/OpenSkyrimProject/local/merge/streaming_main.rs`. The common
+- Main's streamer (the source): `C:/Modding/MudcrabProject/local/merge/streaming_main.rs`. The common
   ancestor is `local/merge/streaming_base.rs`; `local/merge/streaming_base_to_main.diff` is exactly what
   main changed (read this first: it isolates the two features).
 - The config flags already exist on the portal side: `crates/engine/src/config.rs`

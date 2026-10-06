@@ -227,7 +227,7 @@ Capture invariants:
   streaming work. An engine exit code alone is insufficient evidence.
 - LOD-CV3: reused enriched GLBs preserve their original bytes. Each installed
   GLB must match the verified baseline after removing only the first scene's
-  `openSkyrimCollision` addition and its newly empty extras container. Other
+  `mudcrabCollision` addition and its newly empty extras container. Other
   assets match exactly. Record both raw identities and the comparison method;
   this comparison does not establish collision correctness or authored
   collision support in the runtime.

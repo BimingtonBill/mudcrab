@@ -8,7 +8,7 @@ at the door's XTEL arrival point, and the view fades back in once the landing ce
 # Context
 - Base: branch `phase2/door-preload` at the commit the lead names in "This run" (it carries the door-link
   reader: `crate::doors::LoadDoor` on every spawned load-door reference, links read from the optional
-  `door_links` table). Own worktree on D: (`git -C C:/Modding/OpenSkyrimProject worktree add
+  `door_links` table). Own worktree on D: (`git -C C:/Modding/MudcrabProject worktree add
   D:/Modding-overflow/wt-693 <base> --detach`, `CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/impl-693`).
 - Upstream style: subjects like `feat(engine): go through load doors with a fade`, no `[claude]` prefix,
   each commit ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. No portal code.

@@ -9,7 +9,7 @@ landscape texture hues around Whiterun do not match the game.
   and `cell_cache.rs` reads `VCLR` (~line 22). The engine's terrain is `crates/engine/src/render.rs`
   (TerrainMaterial / TerrainExtension), `crates/engine/src/streaming.rs` (terrain mesh build) and
   `crates/engine/src/shaders/terrain.wgsl`.
-- Screenshots of the problem (read them): `C:/Modding/OpenSkyrimProject/local/captures/2026-09-26_11-44-01/06.png`,
+- Screenshots of the problem (read them): `C:/Modding/MudcrabProject/local/captures/2026-09-26_11-44-01/06.png`,
   `07.png`, `08.png`, with `06.json` etc. (pose/settings) and `notes.md`.
 
 # Questions

@@ -7,7 +7,7 @@ smallest fix. Do not implement it.
 - Project: a Rust/Bevy reimplementation of Skyrim's renderer. Two code bases:
   - the upstream Phase 2 work, `C:/Modding/wkj-phase2` (branch `phase2/integration-lod-shots`,
     read-only for you);
-  - the demo engine, `C:/Modding/OpenSkyrimProject` (branch `portal`).
+  - the demo engine, `C:/Modding/MudcrabProject` (branch `portal`).
   Both share the converter (`crates/converter`), which turns NIF meshes into GLB with
   materials (`crates/converter/src/mesh.rs`, `material.rs`), and the engine's material loading
   (`crates/engine/src/render.rs` and similar).

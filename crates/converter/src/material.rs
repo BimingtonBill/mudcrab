@@ -3949,11 +3949,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires OPENSKYRIM_HEARTH_FIXTURE with the extracted Skyrim hearth NIF"]
+    #[ignore = "requires MUDCRAB_HEARTH_FIXTURE with the extracted Skyrim hearth NIF"]
     fn real_hearth_flames_publish_their_v_offset_controllers() {
         // The extracted `meshes/clutter/woodfires/fireplacewood01burning.nif` of a Skyrim install.
-        let Some(path) = std::env::var_os("OPENSKYRIM_HEARTH_FIXTURE").map(PathBuf::from) else {
-            eprintln!("OPENSKYRIM_HEARTH_FIXTURE is unset; skipping");
+        let Some(path) = std::env::var_os("MUDCRAB_HEARTH_FIXTURE")
+            .or_else(|| std::env::var_os("OPENSKYRIM_HEARTH_FIXTURE"))
+            .map(PathBuf::from)
+        else {
+            eprintln!("MUDCRAB_HEARTH_FIXTURE is unset; skipping");
             return;
         };
         let directory = tempfile::tempdir().unwrap();

@@ -15,7 +15,7 @@ write the report with whatever is finished and name what is missing. Never end w
 
 ## Context
 
-- Repo `C:\Modding\OpenSkyrimProject`. The converter is `crates/converter/**`. The NIF parser and the
+- Repo `C:\Modding\MudcrabProject`. The converter is `crates/converter/**`. The NIF parser and the
   GLB vertex serialization are `vendor/project-wormhole-nif/**` (a vendored copy of an upstream
   project): read it freely, but mark its findings "vendor-side"; it is not ours to change.
 - **Why this audit exists.** Two bugs of this shape had been wrong for every asset since the project
