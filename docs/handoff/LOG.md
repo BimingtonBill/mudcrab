@@ -3,6 +3,16 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-06 Phase 1 Dev (engine foundations, converter side: #188, #185)
+
+All local; no PRs opened (cap). Hand-offs went to Upstream Dev and `local/team/2026-10-06.md`.
+
+- **#188 converter half, ready to send:** `phase1/room-graph-pr` 0f2645b0 (worktree `D:/Modding-overflow/wt/p1-main-ro`, off main 2c11897b). The REFR XPOD/XLRM/LNAM/INAM remap fix stands alone (2b4dd7ca). New `esm/rooms.rs`: room_bounds / room_portals / room_links / reference_rooms (pivot rows at export, `contained = 0` overlap rows from model bounds at integration) and room_graph_stats; spec §15; no schema bump. Reviews: DeepSeek #878 + Sol #878.1, fixes a3cc47c3, delta checks #879 / #879.1 accept. Workspace checks green on d4f8381d (1,100 passed); later commits are docs only. XRMR flags confirmed against Skyrim.esm bytes (0x80 = LNAM lighting template, 0x40 = INAM image space; XLRM = rooms seen together without a portal). Waits for the user's call on the draft.
+- **Real-data run:** metadata rebuild `D:/Modding-overflow/SkyrimConverted-p1rooms` (class C, owner note beside it; assets reused from p2main, no LOD). 292 interiors, 4,246 rooms, 3,097 portals; Ansilvund01 matches the earlier byte scan. Interior list: `D:/Modding-overflow/p1rooms-room-cells.tsv`. Phase 2's room-culling image test reads it.
+- **#185:** design note plus a "Measured" section on `phase1/room-graph` e7328c00 (`docs/research/derived-data-input-keys.md`); probe on the throwaway local branch `phase1/input-key-probe` 864cc0df (never send). Keys cost about 1.7 s CPU for the whole game; Upstream Dev took the recommendation (key per cell; interiors one cell per unit, exteriors grouped on LOD chunks). Parked: following model textures and materials into the key.
+- **Folders:** `wt/p1-keyprobe` and `p1-tmp-keyprobe-target` are class A, keep until 10-09; `p1-rooms-converter` until 10-10. Nothing running.
+- **Next:** CodeRabbit round 2 on #126 when it arrives; #188 fixes after the draft opens.
+
 ## 2026-10-06 Phase 2 Dev (engine foundations: #184, #187, #188, interior shots)
 
 All local branches; no PRs opened (cap). Status and hand-offs went to Upstream Dev and `local/team/2026-10-06.md`.
