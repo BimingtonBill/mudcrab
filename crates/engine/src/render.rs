@@ -56,6 +56,9 @@ pub const DEFAULT_WATER_REFLECTIVITY: f32 = 0.8;
 pub const WORLD_LAYER: Layer = 0;
 pub const WATER_LAYER: Layer = 1;
 pub const PLACED_OBJECT_LAYER: Layer = 2;
+/// The layer only the unshadowed sun copy and a shadowless reflection view are on; see
+/// [`crate::shadow_route`]. No main view and no source light is ever on it.
+pub const UNSHADOWED_REFLECTION_LAYER: Layer = 3;
 
 /// Everything the player's own cameras draw: terrain, water and the placed objects.
 pub const MAIN_VIEW_LAYERS: &[Layer] = &[WORLD_LAYER, WATER_LAYER, PLACED_OBJECT_LAYER];
@@ -70,6 +73,18 @@ pub const MAIN_VIEW_LAYERS: &[Layer] = &[WORLD_LAYER, WATER_LAYER, PLACED_OBJECT
 /// LOD and the sky join [`WORLD_LAYER`] when they land, and a full-detail object stays out of the
 /// reflection because it is on [`PLACED_OBJECT_LAYER`].
 pub const REFLECTION_VIEW_LAYERS: &[Layer] = &[WORLD_LAYER];
+
+/// What the water reflection camera draws while its policy says shadows off: the reflected world
+/// through [`UNSHADOWED_REFLECTION_LAYER`], lit by the unshadowed sun copy instead of the sun. It is
+/// the same content as [`REFLECTION_VIEW_LAYERS`] on the other route.
+pub const UNSHADOWED_REFLECTION_VIEW_LAYERS: &[Layer] = &[UNSHADOWED_REFLECTION_LAYER];
+
+/// The layers an entity the reflection draws belongs to: the world layer, which the main view and
+/// the source sun see, and [`UNSHADOWED_REFLECTION_LAYER`], which the shadowless reflection route
+/// sees. Terrain and the sky carry it; a placed object or water surface never does.
+pub fn reflectable_world_layers() -> RenderLayers {
+    RenderLayers::from_layers(&[WORLD_LAYER, UNSHADOWED_REFLECTION_LAYER])
+}
 
 /// What every scene light belongs to: the sun today, and any point light a cell adds later.
 ///
@@ -122,22 +137,25 @@ impl Plugin for VercidiumRendererPlugin {
         // The policy owns every secondary camera's activity, and this plugin is what spawns the
         // first of them, so the two are registered together: without it the reflection camera would
         // be spawned with a demand and never switched on.
-        app.add_plugins(crate::view_policy::SecondaryViewPolicyPlugin)
-            .add_plugins((
-                MaterialPlugin::<TerrainMaterial>::default(),
-                MaterialPlugin::<WaterMaterial>::default(),
-                crate::prepass_vertex_alpha::PrepassVertexAlphaPlugin,
-            ))
-            .init_resource::<RendererMetrics>()
-            .add_systems(Startup, setup_water_reflection)
-            .add_systems(Update, (animate_water_materials, sync_renderer_metrics))
-            // The reflection is prepared in `PostUpdate` before transform propagation, not in
-            // `Update`: a camera teleported this frame must be mirrored by *this* frame's pose, and
-            // the pose written just before propagation is the one the frame renders with.
-            .add_systems(
-                PostUpdate,
-                prepare_water_reflection.in_set(ViewPolicySystems::Prepare),
-            );
+        app.add_plugins((
+            crate::view_policy::SecondaryViewPolicyPlugin,
+            crate::shadow_route::ShadowRoutePlugin,
+        ))
+        .add_plugins((
+            MaterialPlugin::<TerrainMaterial>::default(),
+            MaterialPlugin::<WaterMaterial>::default(),
+            crate::prepass_vertex_alpha::PrepassVertexAlphaPlugin,
+        ))
+        .init_resource::<RendererMetrics>()
+        .add_systems(Startup, setup_water_reflection)
+        .add_systems(Update, (animate_water_materials, sync_renderer_metrics))
+        // The reflection is prepared in `PostUpdate` before transform propagation, not in
+        // `Update`: a camera teleported this frame must be mirrored by *this* frame's pose, and
+        // the pose written just before propagation is the one the frame renders with.
+        .add_systems(
+            PostUpdate,
+            prepare_water_reflection.in_set(ViewPolicySystems::Prepare),
+        );
 
         add_placed_object_layer_propagation(app);
 
@@ -737,6 +755,11 @@ fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Imag
         DepthPrepass,
         OcclusionCulling,
         RenderLayers::from_layers(REFLECTION_VIEW_LAYERS),
+        // The policy's shadow choice picks one of these two layer sets every frame.
+        crate::shadow_route::ViewShadowRoute {
+            shadowed: RenderLayers::from_layers(REFLECTION_VIEW_LAYERS),
+            unshadowed: RenderLayers::from_layers(UNSHADOWED_REFLECTION_VIEW_LAYERS),
+        },
         // TODO(water-reflection-preset): choose `ViewPolicy::water()` from a config flag once
         // `crates/engine/src/config.rs` gains the switch (a `--water-reflection-preset` with
         // `baseline` and `water` values). This commit may not change what the engine draws until
@@ -1331,6 +1354,57 @@ mod tests {
             camera.is_active,
             "the camera the real setup spawns is managed by the policy and renders with water in view"
         );
+    }
+
+    /// The spawned reflection camera switches between the shadowed and the unshadowed route as its
+    /// policy says, and on neither route reaches the source sun and the copy at once, nor the
+    /// placed objects or the water.
+    #[test]
+    fn the_spawned_reflection_camera_follows_its_policys_shadow_route() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .add_plugins(crate::shadow_route::ShadowRoutePlugin)
+            .add_systems(Startup, setup_water_reflection);
+        app.update();
+        let camera = app
+            .world_mut()
+            .query_filtered::<Entity, With<WaterReflectionCamera>>()
+            .single(app.world())
+            .unwrap();
+        let layers = |app: &App| {
+            app.world()
+                .entity(camera)
+                .get::<RenderLayers>()
+                .cloned()
+                .unwrap()
+        };
+        let source_sun = RenderLayers::from_layers(LIGHT_LAYERS);
+        let replica = RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER);
+
+        assert_eq!(
+            layers(&app),
+            RenderLayers::from_layers(REFLECTION_VIEW_LAYERS),
+            "the baseline policy keeps shadows on"
+        );
+        for shadows in [
+            crate::view_policy::ViewShadows::Off,
+            crate::view_policy::ViewShadows::On,
+        ] {
+            app.world_mut().entity_mut(camera).insert(ViewPolicy {
+                shadows,
+                ..ViewPolicy::baseline()
+            });
+            app.update();
+            let layers = layers(&app);
+            assert_ne!(
+                layers.intersects(&source_sun),
+                layers.intersects(&replica),
+                "{shadows:?}: the camera is on exactly one sun's route"
+            );
+            assert!(!layers.intersects(&RenderLayers::layer(WATER_LAYER)));
+            assert!(!layers.intersects(&PLACED_OBJECT_RENDER_LAYERS));
+            assert!(layers.intersects(&reflectable_world_layers()));
+        }
     }
 
     #[test]

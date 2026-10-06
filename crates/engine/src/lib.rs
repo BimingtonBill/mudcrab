@@ -10,6 +10,7 @@ pub mod prepass_vertex_alpha;
 pub mod profiling;
 pub mod render;
 pub mod render_timing;
+pub mod shadow_route;
 pub mod shots;
 pub mod sky;
 pub mod skyrim_ini;
