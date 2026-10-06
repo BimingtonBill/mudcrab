@@ -98,15 +98,28 @@ pub fn reflectable_world_layers() -> RenderLayers {
 /// while silently removing them from the sun's shadow cascades.
 pub const LIGHT_LAYERS: &[Layer] = &[WORLD_LAYER, PLACED_OBJECT_LAYER];
 
+/// What a point or spot light belongs to: [`LIGHT_LAYERS`] plus [`UNSHADOWED_REFLECTION_LAYER`].
+///
+/// A view's lights are chosen by layer intersection, so a shadowless reflection view, which draws
+/// the replica layer only, would otherwise lose every lamp the shadowed reflection shows. A
+/// converted point light has no cascades, so lighting that view costs nothing extra. The sun must
+/// not carry the replica layer - that is what keeps its cascades out of the shadowless view - so it
+/// keeps [`LIGHT_LAYERS`].
+pub const POINT_LIGHT_LAYERS: &[Layer] = &[
+    WORLD_LAYER,
+    PLACED_OBJECT_LAYER,
+    UNSHADOWED_REFLECTION_LAYER,
+];
+
 /// The render layers for a light spawned below a placed-object reference.
 ///
 /// The reference's [`Propagate`](bevy::app::Propagate) would otherwise copy
 /// [`PLACED_OBJECT_RENDER_LAYERS`] onto the light and drop it from [`WORLD_LAYER`], breaking the
-/// [`LIGHT_LAYERS`] contract. [`PropagateOver`] keeps the propagated value off this entity only
+/// [`POINT_LIGHT_LAYERS`] contract. [`PropagateOver`] keeps the propagated value off this entity only
 /// (`PropagateStop` would still write it here and just stop the walk below).
 pub fn light_render_layers() -> (RenderLayers, PropagateOver<RenderLayers>) {
     (
-        RenderLayers::from_layers(LIGHT_LAYERS),
+        RenderLayers::from_layers(POINT_LIGHT_LAYERS),
         PropagateOver::default(),
     )
 }
@@ -858,6 +871,7 @@ fn prepare_water_reflection(
         for (_, mut demand, _) in &mut reflection_camera {
             demand.request = None;
         }
+        profiler.record_elapsed("render/water_reflection_camera", started);
         return;
     }
     let Ok((observer, observer_pose, projection, exposure)) = main_camera.single() else {
@@ -1474,10 +1488,15 @@ mod tests {
         let camera = app.world().entity(camera);
         assert_eq!(camera.get::<ViewPolicy>(), Some(&ViewPolicy::baseline()));
         assert!(camera.contains::<OcclusionCulling>());
+        // The spawn sets no `Msaa`; it is not the same as "not multisampled". In the shipped app
+        // `CameraPlugin` registers `Msaa` as a required component of `Camera`
+        // (`bevy_render-0.19.1/src/camera.rs:65`), so this camera gets Bevy's default `Sample4`
+        // (`bevy_render-0.19.1/src/view/mod.rs:240-246`) - the design study's known gap that only
+        // the water preset closes with an explicit `Msaa::Off`. A bare test app has no such plugin.
         assert_eq!(
             camera.get::<Msaa>(),
             None,
-            "the baseline sets no multisampling of its own: Bevy's default applies"
+            "the baseline spawn adds no Msaa of its own, and the water preset does"
         );
         assert_eq!(
             camera.get::<RenderLayers>(),
@@ -1996,8 +2015,12 @@ mod tests {
     /// the light.
     #[test]
     fn lights_cover_both_cameras_and_the_placed_objects() {
-        let light = RenderLayers::from_layers(LIGHT_LAYERS);
-        for view in [MAIN_VIEW_LAYERS, REFLECTION_VIEW_LAYERS] {
+        let light = RenderLayers::from_layers(POINT_LIGHT_LAYERS);
+        for view in [
+            MAIN_VIEW_LAYERS,
+            REFLECTION_VIEW_LAYERS,
+            UNSHADOWED_REFLECTION_VIEW_LAYERS,
+        ] {
             assert!(
                 light.intersects(&RenderLayers::from_layers(view)),
                 "a light must reach {view:?}"
@@ -2007,7 +2030,7 @@ mod tests {
     }
 
     /// A point light is a child of its placed-object reference, whose layer propagates down the
-    /// hierarchy; the light must keep [`LIGHT_LAYERS`] anyway, or it stops lighting the terrain
+    /// hierarchy; the light must keep [`POINT_LIGHT_LAYERS`] anyway, or it stops lighting the terrain
     /// and the reflection view.
     #[test]
     fn a_light_below_a_reference_keeps_the_light_layers() {
@@ -2029,7 +2052,7 @@ mod tests {
         );
         assert_eq!(
             app.world().entity(light).get::<RenderLayers>(),
-            Some(&RenderLayers::from_layers(LIGHT_LAYERS)),
+            Some(&RenderLayers::from_layers(POINT_LIGHT_LAYERS)),
             "the propagated placed-object layer must not replace the light's layers"
         );
     }

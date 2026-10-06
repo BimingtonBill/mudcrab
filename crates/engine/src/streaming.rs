@@ -1225,7 +1225,8 @@ fn spawn_cell(
                         cell_id: reference.cell_id,
                     },
                     // Not the reference's propagated placed-object layer: a light keeps
-                    // `LIGHT_LAYERS` so it reaches the world layer and both cameras.
+                    // `POINT_LIGHT_LAYERS` so it reaches the world layer, both cameras and the
+                    // shadowless reflection route.
                     crate::render::light_render_layers(),
                 ));
             }
@@ -6464,7 +6465,9 @@ mod tests {
         // `render::a_light_below_a_reference_keeps_the_light_layers`.
         assert_eq!(
             app.world().entity(light_entity).get::<RenderLayers>(),
-            Some(&RenderLayers::from_layers(crate::render::LIGHT_LAYERS))
+            Some(&RenderLayers::from_layers(
+                crate::render::POINT_LIGHT_LAYERS
+            ))
         );
         assert!(
             app.world()

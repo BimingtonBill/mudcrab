@@ -837,8 +837,17 @@ fn terrain_fixture_image(pixel: [u8; 4]) -> Image {
     image
 }
 
+/// Whether a sun spawned from `config` casts shadows: always, except under `--shadows off`.
+///
+/// Every sun the engine spawns asks this, fixtures included, so the measurement switch means the
+/// same thing in every mode. A run without a configuration keeps the shadows.
+pub(crate) fn sun_shadow_maps_enabled(config: Option<&EngineConfig>) -> bool {
+    config.is_none_or(|config| config.shadows)
+}
+
 fn setup_material_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -931,7 +940,7 @@ fn setup_material_fixture(
     commands.spawn((
         DirectionalLight {
             illuminance: 10_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(LIGHT_LAYERS),
@@ -1081,6 +1090,7 @@ fn terrain_water_fixture_snapshot() -> TerrainSnapshot {
 
 fn setup_terrain_water_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     reflection: Res<WaterReflectionTexture>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
@@ -1175,7 +1185,7 @@ fn setup_terrain_water_fixture(
     commands.spawn((
         DirectionalLight {
             illuminance: 12_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(LIGHT_LAYERS),
@@ -1237,6 +1247,7 @@ struct TransformBoundsFixtureState {
 
 fn setup_transform_bounds_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -1349,7 +1360,7 @@ fn setup_transform_bounds_fixture(
     commands.spawn((
         DirectionalLight {
             illuminance: 12_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(LIGHT_LAYERS),
@@ -1479,6 +1490,7 @@ struct RendererFixtureState {
 
 fn setup_renderer_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -1557,7 +1569,7 @@ fn setup_renderer_fixture(
     commands.spawn((
         DirectionalLight {
             illuminance: 12_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(LIGHT_LAYERS),
@@ -1993,7 +2005,7 @@ fn setup_world(
     commands.spawn((
         DirectionalLight {
             illuminance: 12_000.0,
-            shadow_maps_enabled: config.shadows,
+            shadow_maps_enabled: sun_shadow_maps_enabled(Some(&*config)),
             ..default()
         },
         sun_shadow_cascades(&config),
@@ -3354,6 +3366,46 @@ mod tests {
             .query_filtered::<&DirectionalLight, Without<crate::shadow_route::UnshadowedSun>>();
         let sun = suns.single(world).expect("one source sun");
         assert!(!sun.shadow_maps_enabled);
+    }
+
+    /// `--shadows off` has to mean the same in the fixture scenes, which are the measurement scenes.
+    #[test]
+    fn the_shadows_off_switch_reaches_every_fixture_sun() {
+        for (shadows, expected) in [(false, false), (true, true)] {
+            let mut app = App::new();
+            app.insert_resource(EngineConfig {
+                shadows,
+                ..default()
+            })
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<TerrainMaterial>>()
+            .init_resource::<Assets<WaterMaterial>>()
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .add_systems(
+                Startup,
+                (
+                    setup_material_fixture,
+                    setup_terrain_water_fixture,
+                    setup_transform_bounds_fixture,
+                    setup_renderer_fixture,
+                ),
+            );
+            app.update();
+            let world = app.world_mut();
+            let suns: Vec<_> = world
+                .query::<&DirectionalLight>()
+                .iter(world)
+                .map(|sun| sun.shadow_maps_enabled)
+                .collect();
+            assert_eq!(suns.len(), 4, "each fixture spawns one sun");
+            assert!(
+                suns.iter().all(|enabled| *enabled == expected),
+                "--shadows {}: {suns:?}",
+                if shadows { "on" } else { "off" }
+            );
+        }
     }
 
     /// A placed object is kept out of the reflection pass by its layer, so the streaming camera has
