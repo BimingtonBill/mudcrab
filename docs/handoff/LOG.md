@@ -3,6 +3,14 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-06 (evening) Portal Dev: portal caught up with main, #184 tool, #105 LOD visible
+
+- **Portal = c175eff8..28ce63dc:** origin/main 2c11897b merged (#105 LOD, #118, #127 rename, #142, #136/#176, #170, #178; Claude #714); portal schema 102_401 / world 100_701 (LOD_CONVERTER_SCHEMA_VERSION follows); rename applied to portal's text; portal's converter `lod.rs` is now `portal_lod`. Then #184 perf-baseline 111ca6be (+#122) with 4 portal scenes (portal-door-tour, portal-heavy, lod-far, lod-flythrough; Claude #719). Then #128 386267dc (portal's doors.rs stays the door system; #128's crossing compiled, not registered) with portal's ActiveCell driving ActiveSpace so LOD stops in interiors, and the exterior fog ending at the LOD horizon when LOD data exists (ring kept) (Claude #721).
+- **Data:** C:/Modding/SkyrimConverted-portal-lod (24 GB, class C) from a `--reuse-assets` metadata rebuild of D:/Modding-overflow/SkyrimConverted-portal (101_601): 34 min, LOD chunk stage 27.4 min, 4,639 chunks. Portal-only converter changes: 86265e04 (accept portal-numbered sources, config hash by main version), 5971a599 (regenerate portal tree billboards in the rebuild).
+- **Tested:** door tour (--tour-doors 2) PASSED on the new data and after the LOD fix; far view at defaults shows LOD to the horizon (local/reference/lod-check/after-defaults/); log shows 0 LOD patches inside Sven's house, 32 back outside; fmt/clippy clean, nextest 1887/1887, doctests ok. Notes: local/research/portal-lod-check-2026-10-06.md, portal-lod-data-options-2026-10-06.md.
+- **Decisions (the user):** no distant objects/trees on portal (Chef's #106 / tree phase; Upstream Dev offered our .bto/.lst notes on #106). Deleted (the user's yes, logged): experimental data + cache, wt-targets/experimental, wt-experimental worktree, OpenSkyrimProject-target/debug/incremental.
+- **Next (tomorrow, with the user present):** switch the LOD baseline scenes to portal defaults (keep one ring-off comparison) in scripts/phase2-profile.ps1; release LTO build (disk_guard first); booked quiet window: `pwsh -File scripts/phase2-baseline.ps1 -Assets C:\Modding\SkyrimConverted-portal-lod -Scenarios portal -Repeats 3 -Out D:\Modding-overflowaseline-portal-184` (~30 min + build), report split render thread / main world / GPU passes / per-camera cost, explain the door-tour 40 ms commit. Later: interior doorway views show no distant terrain; C:/Modding/SkyrimConverted (66 GB, old) on tomorrow's can-go list. No worker running.
+
 ## 2026-10-06 Phase 1 Dev (engine foundations, converter side: #188, #185)
 
 All local; no PRs opened (cap). Hand-offs went to Upstream Dev and `local/team/2026-10-06.md`.
