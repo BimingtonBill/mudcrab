@@ -25,10 +25,7 @@ use crate::{
         components::{
             CellRef, ExpectedModelBounds, FormId, InstanceBounds, StreamedCellRoot, StreamingCamera,
         },
-        database::{
-            AssetCatalog, CellKey, MAX_RUNTIME_DATABASE_SCHEMA_VERSION,
-            MIN_RUNTIME_DATABASE_SCHEMA_VERSION, WorldDatabase, supports_runtime_database_schema,
-        },
+        database::{AssetCatalog, CellKey, WorldDatabase},
         lighting::SpaceLightingCatalog,
     },
 };
@@ -65,6 +62,11 @@ use std::{
 #[derive(Resource)]
 struct InitialCameraGroundHeight(f32);
 
+#[derive(Resource)]
+struct AssetDirectoryReadLock {
+    _guard: shared::asset_lock::AssetLock,
+}
+
 pub fn run(mut config: EngineConfig) -> Result<()> {
     validate_fixture_selection(&config)?;
     let remote = RemoteSettings::from_config(&config)?;
@@ -79,6 +81,27 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
         config.assets_dir = fixture.path.clone();
         Some(fixture)
+    } else {
+        None
+    };
+    let reads_asset_tree = config.streaming_fixture
+        || !(config.benchmark_only
+            || config.material_fixture
+            || config.terrain_water_fixture
+            || config.transform_bounds_fixture
+            || config.renderer_fixture
+            || config.physics_fixture);
+    let asset_lock = if reads_asset_tree {
+        Some(
+            shared::asset_lock::AssetLock::acquire_shared(&config.assets_dir).wrap_err_with(
+                || {
+                    format!(
+                        "engine cannot read assets at {}",
+                        config.assets_dir.display()
+                    )
+                },
+            )?,
+        )
     } else {
         None
     };
@@ -145,6 +168,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         None
     };
+    let shots_active = shots.is_some();
     // --start-shot: the shot the run is started at, read here for the same reason the shots file is
     // - a file or a name the run cannot use is fatal before the window exists - and refused beside
     // the flags that pose the camera too (`crate::pose_capture`). A run with no such flag resolves
@@ -205,11 +229,15 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     if let Some(tuning) = movement_tuning {
         app.insert_resource(tuning);
     }
-    if config.times_frames() {
+    if let Some(asset_lock) = asset_lock {
+        app.insert_resource(AssetDirectoryReadLock { _guard: asset_lock });
+    }
+    if config.times_frames() || shots_active {
         // Acceptance runs are commonly left unfocused while the campaign driver
         // advances through its scenarios. Bevy's game default throttles an
         // unfocused window to 60 Hz, which makes a 16.67 ms P95 gate measure the
-        // event-loop sleep instead of renderer performance. A `--tour-bench` run is
+        // event-loop sleep instead of renderer performance. A shots run left behind other windows would likewise starve its settle rule of frames.
+        // A `--tour-bench` run is
         // parked unfocused off screen too, and read 16.67 ms in every state until
         // it ran continuously as well (2026-09-25).
         app.insert_resource(WinitSettings::continuous());
@@ -225,6 +253,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                     file_path: asset_path,
                     ..default()
                 })
+                .set(world_gltf_plugin())
                 .set(WindowPlugin {
                     primary_window: window,
                     ..default()
@@ -247,7 +276,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             ProfilingPlugin,
             RenderDiagnosticsPlugin,
         ))
-        .add_plugins(VercidiumRendererPlugin)
+        .add_plugins((
+            VercidiumRendererPlugin,
+            crate::nif_material::NifMaterialPlugin,
+        ))
+        // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
+        // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
+        .add_plugins(crate::lights::LightsPlugin)
         .add_systems(Update, capture_acceptance_screenshot);
     add_remote_plugins(&mut app, remote);
     let demo_tour = app
@@ -347,9 +382,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             // it is not the portal's - it reads the camera, the space it stands in and the
             // shots-file contract - and it needs the world the streaming plugin has just opened.
             app.add_plugins(PoseCapturePlugin { start: start_shot });
-            // Skyrim's LIGH references as point lights, nearest 64 enabled. Lighting is not the
-            // portal's to add, and this gate is the one it has always had.
-            app.add_plugins(crate::lights::LightsPlugin);
+            // (Skyrim's LIGH references: `LightsPlugin` is registered for every run above.)
             // Light spilling through the doorway the portal draws, both ways
             // (`crate::portal_spill`). Opt-in (`--portal-light-spill`) until it passes on
             // doorways it was not fitted on: it softens the colour seam everywhere but brightens
@@ -402,10 +435,24 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         app.add_systems(Startup, setup_world);
         app.add_systems(Startup, setup_synthetic_benchmark);
     }
-    app.run();
+    let exit = app.run();
     drop(app);
     drop(streaming_fixture_dir);
-    Ok(())
+    finished(&exit)
+}
+
+/// What the process reports after an [`App`] has run.
+///
+/// A shots run that could not write an image, and an acceptance run whose gates did not pass, end
+/// with [`AppExit::Error`]; dropping that would report success to whatever ran the process - the
+/// acceptance script reads the exit code - so the error is handed back to `main` instead.
+fn finished(exit: &AppExit) -> Result<()> {
+    match exit {
+        AppExit::Success => Ok(()),
+        AppExit::Error(code) => Err(color_eyre::eyre::eyre!(
+            "the run failed (exit code {code:?})"
+        )),
+    }
 }
 
 /// Bevy's per-frame render-asset byte budget, seeded from the run's option.
@@ -429,6 +476,15 @@ fn upload_budget(config: &EngineConfig) -> RenderAssetBytesPerFrame {
         } else {
             config.max_upload_bytes_per_frame()
         },
+    }
+}
+
+/// Matches LAND's sampler for shared repeating images before either loader caches them.
+/// Bevy retains authored U/V wrapping and requires linear filters for anisotropy.
+fn world_gltf_plugin() -> bevy::gltf::GltfPlugin {
+    bevy::gltf::GltfPlugin {
+        default_sampler: terrain_layer_sampler(),
+        ..default()
     }
 }
 
@@ -520,10 +576,8 @@ impl StreamingFixtureDirectory {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
-        let path = std::env::temp_dir().join(format!(
-            "openskyrim-streaming-{}-{suffix}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("mudcrab-streaming-{}-{suffix}", std::process::id()));
         fs::create_dir(&path).wrap_err_with(|| format!("failed to create {}", path.display()))?;
         let fixture = Self { path };
         fixture.populate(worldspace_id, start_grid)?;
@@ -537,15 +591,24 @@ impl StreamingFixtureDirectory {
             r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
             INSERT INTO schema_info VALUES({});
             CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
+            CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,editor_id TEXT,parent_world INTEGER,flags INTEGER,lod_origin_x INTEGER,lod_origin_y INTEGER);
             CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
             CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
             CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
             CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
+            CREATE TABLE lod_build(id INTEGER PRIMARY KEY CHECK (id=1),build_identity TEXT NOT NULL);
+            INSERT INTO lod_build VALUES(1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+            CREATE TABLE lod_chunks(worldspace_id INTEGER,tier INTEGER,anchor_x INTEGER,anchor_y INTEGER,payload_path TEXT,content_hash TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,source_cells TEXT,PRIMARY KEY(worldspace_id,tier,anchor_x,anchor_y));
+            CREATE VIRTUAL TABLE lod_chunks_spatial USING rtree(id,minX,maxX,minY,maxY,+worldspace_id,+tier,+anchor_x,+anchor_y);
             CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
             CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
             CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);"#,
             shared::WORLD_DATABASE_SCHEMA_VERSION,
         ))?;
+        connection.execute(
+            "INSERT INTO worldspaces(id,editor_id,parent_world,flags,lod_origin_x,lod_origin_y) VALUES(?1,'Fixture',NULL,0,?2,?3)",
+            params![worldspace_id, start_grid.0, start_grid.1],
+        )?;
         let mut insert = connection
             .prepare("INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(?1,?2,?3,?4)")?;
         let mut cell_id = 1u32;
@@ -862,7 +925,7 @@ fn fixture_image(data: Vec<u8>, srgb: bool) -> Image {
 }
 
 /// A terrain layer image of the synthetic fixture: one flat colour, carried by a sampler that
-/// repeats like the one a streamed layer gets, since the shader tiles every layer `8` times across a
+/// repeats like the one a streamed layer gets, since the shader tiles every layer across a
 /// cell. Bevy's default sampler clamps to the edge, which stretches the outermost texels over the
 /// rest of the tiles.
 fn terrain_fixture_image(pixel: [u8; 4]) -> Image {
@@ -960,6 +1023,7 @@ fn setup_material_fixture(
     }
     commands.spawn((
         Camera3d::default(),
+        crate::color_pipeline::SceneColorPipeline::default(),
         Transform::from_xyz(0.0, 5.0, 18.0).looking_at(Vec3::ZERO, Vec3::Y),
         StreamingCamera,
         Msaa::Off,
@@ -1217,6 +1281,7 @@ fn setup_terrain_water_fixture(
     let target = Vec3::new(CELL_SIZE_HALF, 0.0, -CELL_SIZE_HALF);
     commands.spawn((
         Camera3d::default(),
+        crate::color_pipeline::SceneColorPipeline::default(),
         Transform::from_xyz(CELL_SIZE_HALF, 1800.0, 2600.0).looking_at(target, Vec3::Y),
         StreamingCamera,
         Msaa::Off,
@@ -1385,6 +1450,7 @@ fn setup_transform_bounds_fixture(
         });
     commands.spawn((
         Camera3d::default(),
+        crate::color_pipeline::SceneColorPipeline::default(),
         Transform::from_xyz(2.0, 5.5, 16.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
         StreamingCamera,
         Msaa::Off,
@@ -1591,6 +1657,7 @@ fn setup_renderer_fixture(
     ));
     commands.spawn((
         Camera3d::default(),
+        crate::color_pipeline::SceneColorPipeline::default(),
         Transform::from_xyz(0.0, 1.5, 16.0).looking_at(Vec3::ZERO, Vec3::Y),
         StreamingCamera,
         Msaa::Off,
@@ -1695,6 +1762,10 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
         );
     }
     if config.allow_incomplete_assets {
+        crate::world::database::validate_lod_build_contract(
+            &config.assets_dir,
+            converter_schema_version(),
+        )?;
         return Ok(());
     }
     let manifest_path = config.assets_dir.join("conversion-manifest.json");
@@ -1703,10 +1774,10 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
             .wrap_err_with(|| format!("failed to read {}", manifest_path.display()))?,
     )
     .wrap_err("invalid conversion manifest")?;
-    if !(MIN_RUNTIME_CONVERTER_SCHEMA_VERSION..=converter_schema_version())
+    if !(shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION..=converter_schema_version())
         .contains(&manifest.schema_version)
     {
-        let rejection = if manifest.schema_version < MIN_RUNTIME_CONVERTER_SCHEMA_VERSION {
+        let rejection = if manifest.schema_version < shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION {
             AssetSetRejection::ConverterSchemaOlder {
                 found: manifest.schema_version,
             }
@@ -1736,7 +1807,7 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
             .wrap_err_with(|| format!("failed to read {}", report_path.display()))?,
     )
     .wrap_err("invalid integration report")?;
-    if !supports_runtime_database_schema(report.schema_version) {
+    if !shared::supports_runtime_world_database_schema(report.schema_version) {
         color_eyre::eyre::bail!(
             "{}",
             asset_set_rejection_message(
@@ -1754,6 +1825,15 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
             &config.assets_dir,
             AssetSetRejection::IntegrationReportFailed
         )
+    );
+    let database_schema = crate::world::database::validate_lod_build_contract(
+        &config.assets_dir,
+        converter_schema_version(),
+    )?;
+    color_eyre::eyre::ensure!(
+        database_schema == report.schema_version,
+        "world database schema {database_schema} does not match integration report schema {}",
+        report.schema_version
     );
     Ok(())
 }
@@ -1780,10 +1860,10 @@ enum AssetSetRejection {
 /// Names the failed check, what it found, the range it accepts, and the
 /// command that fixes it.
 fn asset_set_rejection_message(assets_dir: &Path, rejection: AssetSetRejection) -> String {
-    let converter_min = MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
+    let converter_min = shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
     let converter_max = converter_schema_version();
-    let database_min = MIN_RUNTIME_DATABASE_SCHEMA_VERSION;
-    let database_max = MAX_RUNTIME_DATABASE_SCHEMA_VERSION;
+    let database_min = shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION;
+    let database_max = shared::WORLD_DATABASE_SCHEMA_VERSION;
     let manifest = assets_dir.join("conversion-manifest.json");
     let report = assets_dir.join("integration-report.json");
     // The converter's usage string takes the Skyrim Data folder first and the
@@ -1829,14 +1909,9 @@ fn asset_set_rejection_message(assets_dir: &Path, rejection: AssetSetRejection) 
     }
 }
 
-/// The oldest converter manifest schema the runtime accepts. Schema 15 sets were written before
-/// the merge that brought converter schema 16 and world database schema 4, and still load.
-const MIN_RUNTIME_CONVERTER_SCHEMA_VERSION: u32 = 15;
-
 const fn converter_schema_version() -> u32 {
-    // Kept in sync with converter::cache::CONVERTER_SCHEMA_VERSION without
-    // linking the heavy converter crate into the runtime binary.
-    101_601
+    // Shared with the producer without linking the converter into the runtime.
+    shared::LOD_CONVERTER_SCHEMA_VERSION
 }
 
 fn setup_synthetic_benchmark(
@@ -2083,6 +2158,7 @@ fn setup_world(
     let far = camera_far_plane(&config);
     commands.spawn((
         Camera3d::default(),
+        crate::color_pipeline::SceneColorPipeline::default(),
         // The backdrop, per camera. `crate::atmosphere::update_atmosphere` rewrites both this and
         // the `ClearColor` resource as soon as it knows which space the camera is in; the resource
         // is what a view that is not the main camera gets (the water reflection camera renders the
@@ -2151,7 +2227,7 @@ fn setup_world(
         ground_height,
         camera = ?camera_position,
         target = ?target,
-        "OpenSkyrim runtime initialized"
+        "Mudcrab runtime initialized"
     );
 }
 
@@ -2328,7 +2404,11 @@ fn screenshot_assets_ready(
     metrics.pending_asset_instances == 0
         && metrics.pending_surface_instances == 0
         && metrics.loading_cells == 0
+        && metrics.pending_lod_queries == 0
+        && metrics.pending_lod_chunks == 0
         && metrics.failed_cells == 0
+        && metrics.unrecovered_lod_queries == 0
+        && metrics.unrecovered_lod_chunks == 0
         && (!world_streaming_active || metrics.resident_cells > 0)
         && metrics.asset_load_failures == 0
         && metrics.material_validation_failures == 0
@@ -2356,6 +2436,258 @@ mod tests {
     use crate::atmosphere::UNDERGROUND_COLOR;
     use bevy::asset::{AssetApp, AssetPlugin};
     use bevy::world_serialization::WorldSerializationPlugin;
+
+    /// Uses real loaders with a generated external normal image, without game assets or a GPU.
+    fn world_normal_loader_fixture(wrap_s: u32, wrap_t: u32) -> (tempfile::TempDir, App) {
+        use bevy::{
+            image::{CompressedImageFormats, ImageLoader, ImagePlugin},
+            scene::ScenePlugin,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        Image::new_fill(
+            Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[128, 128, 255, 255],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::MAIN_WORLD,
+        )
+        .try_into_dynamic()
+        .unwrap()
+        .save(directory.path().join("shared.png"))
+        .unwrap();
+        fs::write(
+            directory.path().join("road.gltf"),
+            serde_json::to_vec(&serde_json::json!({
+                "asset": {"version": "2.0"},
+                "images": [{"uri": "shared.png"}],
+                "samplers": [{
+                    "wrapS": wrap_s, "wrapT": wrap_t,
+                    "magFilter": 9728, "minFilter": 9984
+                }],
+                "textures": [{"source": 0, "sampler": 0}],
+                "materials": [{"normalTexture": {"index": 0}}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin {
+                file_path: directory.path().to_string_lossy().into_owned(),
+                ..default()
+            },
+            ImagePlugin::default(),
+            ScenePlugin,
+            world_gltf_plugin(),
+        ))
+        .init_asset::<Mesh>()
+        .register_asset_loader(ImageLoader::new(CompressedImageFormats::NONE));
+        app.finish();
+        app.cleanup();
+        (directory, app)
+    }
+
+    /// Waits for dependencies too, so each test controls which consumer finishes loading first.
+    fn wait_for_world_asset<A: Asset>(app: &mut App, handle: &Handle<A>) {
+        use bevy::asset::LoadState;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.update();
+            let server = app.world().resource::<AssetServer>();
+            if let LoadState::Failed(error) = server.load_state(handle.id()) {
+                panic!("fixture load failed: {error}");
+            }
+            if server.is_loaded_with_dependencies(handle.id()) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture load timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn loaded_world_normal(app: &App, handle: &Handle<bevy::gltf::Gltf>) -> Handle<Image> {
+        use bevy::gltf::{Gltf, GltfMaterial};
+
+        let gltf = app.world().resource::<Assets<Gltf>>().get(handle).unwrap();
+        app.world()
+            .resource::<Assets<GltfMaterial>>()
+            .get(&gltf.materials[0])
+            .unwrap()
+            .normal_map_texture
+            .as_ref()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn shared_world_normal_sampler_is_independent_of_first_consumer() {
+        use bevy::{
+            gltf::Gltf,
+            image::{ImageLoaderSettings, ImageSampler},
+        };
+
+        for land_first in [false, true] {
+            let (_directory, mut app) = world_normal_loader_fixture(10497, 10497);
+            let server = app.world().resource::<AssetServer>().clone();
+            let load_land = || {
+                server
+                    .load_builder()
+                    .with_settings(|settings: &mut ImageLoaderSettings| {
+                        settings.is_srgb = false;
+                        settings.sampler = ImageSampler::Descriptor(terrain_layer_sampler());
+                    })
+                    .load::<Image>("shared.png")
+            };
+            let (land, road) = if land_first {
+                let land = load_land();
+                wait_for_world_asset(&mut app, &land);
+                let road = server.load::<Gltf>("road.gltf");
+                wait_for_world_asset(&mut app, &road);
+                (land, road)
+            } else {
+                let road = server.load::<Gltf>("road.gltf");
+                wait_for_world_asset(&mut app, &road);
+                let land = load_land();
+                wait_for_world_asset(&mut app, &land);
+                (land, road)
+            };
+            assert_eq!(loaded_world_normal(&app, &road), land);
+            let image = app.world().resource::<Assets<Image>>().get(&land).unwrap();
+            assert_eq!(image.texture_descriptor.format, TextureFormat::Rgba8Unorm);
+            assert_eq!(
+                image.sampler,
+                ImageSampler::Descriptor(terrain_layer_sampler())
+            );
+        }
+    }
+
+    #[test]
+    fn v15_distinct_wrap_aliases_keep_samplers_in_both_load_orders() {
+        use bevy::{
+            gltf::Gltf,
+            image::{ImageAddressMode, ImageSampler},
+        };
+        for clamp_first in [false, true] {
+            let (directory, mut app) = world_normal_loader_fixture(10497, 10497);
+            fs::copy(
+                directory.path().join("shared.png"),
+                directory.path().join("shared.opensky-wrap0.png"),
+            )
+            .unwrap();
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&fs::read(directory.path().join("road.gltf")).unwrap())
+                    .unwrap();
+            document["images"][0]["uri"] = serde_json::json!("shared.opensky-wrap0.png");
+            document["samplers"][0]["wrapS"] = serde_json::json!(33071);
+            document["samplers"][0]["wrapT"] = serde_json::json!(33071);
+            fs::write(
+                directory.path().join("clamp.gltf"),
+                serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap();
+            let names = if clamp_first {
+                ["clamp.gltf", "road.gltf"]
+            } else {
+                ["road.gltf", "clamp.gltf"]
+            };
+            let mut retained = Vec::new();
+            for name in names {
+                let handle = app.world().resource::<AssetServer>().load::<Gltf>(name);
+                wait_for_world_asset(&mut app, &handle);
+                retained.push((name, handle));
+            }
+            assert_ne!(
+                loaded_world_normal(&app, &retained[0].1),
+                loaded_world_normal(&app, &retained[1].1)
+            );
+            for (name, handle) in &retained {
+                let image_handle = loaded_world_normal(&app, handle);
+                let image = app
+                    .world()
+                    .resource::<Assets<Image>>()
+                    .get(&image_handle)
+                    .unwrap();
+                let ImageSampler::Descriptor(sampler) = &image.sampler else {
+                    panic!("missing sampler")
+                };
+                let expected = if *name == "clamp.gltf" {
+                    ImageAddressMode::ClampToEdge
+                } else {
+                    ImageAddressMode::Repeat
+                };
+                assert_eq!(sampler.address_mode_u, expected);
+                assert_eq!(sampler.address_mode_v, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn world_gltf_sampler_preserves_authored_wrapping_with_linear_anisotropy() {
+        use bevy::{
+            gltf::Gltf,
+            image::{ImageAddressMode, ImageFilterMode, ImageSampler},
+        };
+
+        for (wrap_s, wrap_t, expected_u, expected_v) in [
+            (
+                33071,
+                33648,
+                ImageAddressMode::ClampToEdge,
+                ImageAddressMode::MirrorRepeat,
+            ),
+            (
+                33648,
+                33071,
+                ImageAddressMode::MirrorRepeat,
+                ImageAddressMode::ClampToEdge,
+            ),
+        ] {
+            let (_directory, mut app) = world_normal_loader_fixture(wrap_s, wrap_t);
+            let road = app
+                .world()
+                .resource::<AssetServer>()
+                .load::<Gltf>("road.gltf");
+            wait_for_world_asset(&mut app, &road);
+            let normal = loaded_world_normal(&app, &road);
+            let image = app
+                .world()
+                .resource::<Assets<Image>>()
+                .get(&normal)
+                .unwrap();
+            let ImageSampler::Descriptor(sampler) = &image.sampler else {
+                panic!("glTF image sampler descriptor missing");
+            };
+            let default_sampler = terrain_layer_sampler();
+            assert_eq!(sampler.address_mode_u, expected_u);
+            assert_eq!(sampler.address_mode_v, expected_v);
+            assert_eq!(sampler.anisotropy_clamp, default_sampler.anisotropy_clamp);
+            assert_eq!(sampler.mag_filter, ImageFilterMode::Linear);
+            assert_eq!(sampler.min_filter, ImageFilterMode::Linear);
+            assert_eq!(sampler.mipmap_filter, ImageFilterMode::Linear);
+            assert_eq!(sampler.lod_min_clamp, default_sampler.lod_min_clamp);
+            assert_eq!(sampler.lod_max_clamp, default_sampler.lod_max_clamp);
+        }
+    }
+
+    #[test]
+    fn a_failed_run_is_an_error_and_a_successful_one_is_not() {
+        assert!(finished(&AppExit::Success).is_ok());
+        let message = finished(&AppExit::error())
+            .expect_err("a failed run must not report success")
+            .to_string();
+        assert!(message.contains("exit code"), "{message}");
+    }
 
     /// The streaming fixture's own systems over its own fixture database, with no window, GPU or
     /// game data: the camera crosses exteriors, the fixture loads its interior by id, and the
@@ -2539,6 +2871,26 @@ mod tests {
         ));
     }
 
+    fn write_runtime_asset_database(path: &std::path::Path) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER NOT NULL);
+                 INSERT INTO schema_info VALUES({});
+                 CREATE TABLE lod_chunks(id INTEGER PRIMARY KEY);",
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn runtime_converter_schema_matches_the_actual_producer() {
+        assert_eq!(
+            converter_schema_version(),
+            converter::cache::CONVERTER_SCHEMA_VERSION
+        );
+    }
+
     /// The IO pool's stack has to hold a whole queue of loads nested inside one another, because a
     /// scope opened on a pool thread (bevy_gltf's texture scope) runs the other queued tasks on its
     /// own stack while it waits. This queues `LOADS` tasks behind a blocked single-thread pool,
@@ -2652,9 +3004,46 @@ mod tests {
         settled_metrics.resident_cells = 1;
         assert!(screenshot_assets_ready(&settled_metrics, true, &config));
 
-        let mut failed_metrics = settled_metrics;
+        let mut failed_metrics = settled_metrics.clone();
         failed_metrics.failed_cells = 1;
         assert!(!screenshot_assets_ready(&failed_metrics, true, &config));
+
+        let mut pending_lod = settled_metrics.clone();
+        pending_lod.pending_lod_queries = 1;
+        assert!(!screenshot_assets_ready(&pending_lod, true, &config));
+
+        let mut failed_lod = settled_metrics;
+        failed_lod.failed_lod_chunks = 1;
+        assert!(screenshot_assets_ready(&failed_lod, true, &config));
+        failed_lod.unrecovered_lod_chunks = 1;
+        assert!(!screenshot_assets_ready(&failed_lod, true, &config));
+        failed_lod.unrecovered_lod_chunks = 0;
+        failed_lod.unrecovered_lod_queries = 1;
+        assert!(!screenshot_assets_ready(&failed_lod, true, &config));
+    }
+
+    #[test]
+    fn v1_world_and_visual_fixture_cameras_have_explicit_hdr_output() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<TerrainMaterial>>()
+            .init_resource::<Assets<WaterMaterial>>()
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .add_systems(
+                Startup,
+                (
+                    setup_world,
+                    setup_material_fixture,
+                    setup_terrain_water_fixture,
+                    setup_transform_bounds_fixture,
+                    setup_renderer_fixture,
+                ),
+            );
+        app.update();
+        crate::color_pipeline::assert_scene_camera_output(app.world_mut(), 5);
     }
 
     /// The sun is what has to carry the cascades: without a configuration of its own it gets
@@ -2867,7 +3256,7 @@ mod tests {
 
         for radius in [2, 8, 16, crate::config::MAX_TERRAIN_RADIUS] {
             let config =
-                EngineConfig::from_args(["--terrain-radius".to_owned(), radius.to_string()]);
+                EngineConfig::run_from_args(["--terrain-radius".to_owned(), radius.to_string()]);
             assert_eq!(config.terrain_radius, radius);
             assert_eq!(
                 today_cascades(&config).bounds,
@@ -2876,7 +3265,7 @@ mod tests {
             );
         }
 
-        let wider = today_cascades(&EngineConfig::from_args([
+        let wider = today_cascades(&EngineConfig::run_from_args([
             "--stream-radius".to_owned(),
             "4".to_owned(),
         ]));
@@ -2990,7 +3379,7 @@ mod tests {
     #[test]
     fn rejects_stale_or_incomplete_runtime_assets() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
+        write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
         std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
         std::fs::write(
             directory.path().join("conversion-manifest.json"),
@@ -3014,7 +3403,7 @@ mod tests {
 
     #[test]
     fn older_converter_schema_names_the_accepted_range_and_the_reconvert_command() {
-        let oldest = MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
+        let oldest = shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
         let newest = converter_schema_version();
         let message =
             asset_set_message(AssetSetRejection::ConverterSchemaOlder { found: oldest - 1 });
@@ -3040,7 +3429,7 @@ mod tests {
 
     #[test]
     fn newer_converter_schema_names_the_accepted_range_and_the_engine_rebuild() {
-        let oldest = MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
+        let oldest = shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
         let newest = converter_schema_version();
         let message =
             asset_set_message(AssetSetRejection::ConverterSchemaNewer { found: newest + 1 });
@@ -3082,11 +3471,14 @@ mod tests {
 
     #[test]
     fn incomplete_conversion_names_the_schema_the_manifest_reports() {
-        let oldest = MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
+        let oldest = shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
         assert_ne!(oldest, converter_schema_version());
         let message = runtime_asset_error(
             &format!(r#"{{"schema_version":{oldest},"complete":false}}"#),
-            &format!(r#"{{"schema_version":{MAX_RUNTIME_DATABASE_SCHEMA_VERSION},"passed":true}}"#),
+            &format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ),
         );
         assert!(
             message.contains(&format!("complete=false at converter schema {oldest},")),
@@ -3096,8 +3488,8 @@ mod tests {
 
     #[test]
     fn world_database_schema_mismatch_names_the_accepted_range_and_the_reconvert_command() {
-        let oldest = MIN_RUNTIME_DATABASE_SCHEMA_VERSION;
-        let newest = MAX_RUNTIME_DATABASE_SCHEMA_VERSION;
+        let oldest = shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION;
+        let newest = shared::WORLD_DATABASE_SCHEMA_VERSION;
         let message =
             asset_set_message(AssetSetRejection::WorldDatabaseSchema { found: oldest - 1 });
         assert!(message.contains("world database schema"), "{message}");
@@ -3156,7 +3548,7 @@ mod tests {
             &format!(r#"{{"schema_version":{engine},"complete":true}}"#),
             &format!(
                 r#"{{"schema_version":{},"passed":true}}"#,
-                MIN_RUNTIME_DATABASE_SCHEMA_VERSION - 1
+                shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION - 1
             ),
         );
 
@@ -3182,10 +3574,11 @@ mod tests {
         }
     }
 
+    /// Current, complete assets load, and an integration report newer than the engine is rejected.
     #[test]
     fn accepts_current_complete_runtime_assets() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
+        write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
         std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
         std::fs::write(
             directory.path().join("conversion-manifest.json"),
@@ -3210,14 +3603,20 @@ mod tests {
         validate_runtime_assets(&config).unwrap();
         std::fs::write(
             directory.path().join("integration-report.json"),
-            br#"{"schema_version":5,"passed":true}"#,
+            format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION + 1
+            ),
         )
         .unwrap();
         assert!(
             validate_runtime_assets(&config)
                 .unwrap_err()
                 .to_string()
-                .contains("schema 5 is unsupported")
+                .contains(&format!(
+                    "schema {} is unsupported",
+                    shared::WORLD_DATABASE_SCHEMA_VERSION + 1
+                ))
         );
     }
 
@@ -3227,6 +3626,8 @@ mod tests {
         for required in ["skyrim_world.db", "cell_cache.rkyv"] {
             std::fs::write(directory.path().join(required), []).unwrap();
         }
+        let database = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        database.execute_batch("CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES(4);").unwrap();
         std::fs::write(
             directory.path().join("conversion-manifest.json"),
             format!(
@@ -3254,7 +3655,7 @@ mod tests {
     fn rejects_truncated_manifest_and_integration_report() {
         for truncated_file in ["conversion-manifest.json", "integration-report.json"] {
             let directory = tempfile::tempdir().unwrap();
-            std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
+            write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
             std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
             std::fs::write(
                 directory.path().join("conversion-manifest.json"),

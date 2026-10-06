@@ -115,14 +115,15 @@ pub fn run_conversion_job(game_dir: PathBuf, progress_tx: Sender<ProgressUpdate>
 When conversion finishes (or on subsequent launches):
 
 1. The launcher saves the path configuration to `config.json`.
-2. Clicking **"PLAY MUDCRAB"** spawns the game engine binary (`engine`):
+2. Clicking **"PLAY MUDCRAB"** spawns the game engine binary (`engine`), passing the
+   converted assets directory the configuration holds:
    ```rust
    use std::process::Command;
 
-   pub fn launch_game_engine() {
+   pub fn launch_game_engine(assets: &std::path::Path) {
        Command::new("./engine")
-           .arg("--config")
-           .arg("config.json")
+           .arg("--assets")
+           .arg(assets)
            .spawn()
            .expect("Failed to launch Mudcrab engine binary!");
 
@@ -149,15 +150,19 @@ offered for **Resume** (see below).
 
 ### What the panel shows
 
+Conversion includes terrain LOD before final validation and publication. The
+completion result reports generated chunk count and worldspace warnings; a
+complete conversion does not imply LOD coverage for every worldspace.
+
 | | |
 | :--- | :--- |
 | **Skyrim Data** | Where the game's assets are. Filled at start-up by game detection, or set by dropping a folder. A folder with a `Skyrim.esm` in it, case-insensitively, is a `Data` folder; dropping an installation root uses its `Data` subfolder. **Detect** looks again. |
 | **Output** | Where the converted tree is written, and what the engine is started on. Defaults to `modern_assets`, which is what the engine's `--assets` expects. Drop another folder to change it: an empty one or an earlier conversion (see "The Output folder is replaced"). The default may not exist yet; the first conversion creates it. |
 | **Bar** | Whole-run completion, from the same `converter::ProgressEstimate` the command line's status line prints, so it never moves backwards even when a stage finishes short of its total. |
-| **Stage line** | The stage, its own completion, and the item and byte rates once the run is moving fast enough to measure them. |
-| **Clock line** | Elapsed time, and the estimated time left once three samples and five seconds have passed. |
+| **Stage line** | The stage, its own completion, and the item and byte rates once the run is moving fast enough to measure them. Terrain LOD shows processed/total worldspaces, including skipped worlds, without asset-rate estimates. |
+| **Clock line** | Elapsed time, and the estimated time left once three samples and five seconds have passed. Terrain LOD shows elapsed time only; its timing is not calibrated. |
 | **Asset line** | The asset in flight. |
-| **Notice pane** | Warnings the run emits about single assets, the summary or the error when a run ends, a check's result, and what the launcher itself has to say (the output is ready, the engine started). It keeps the last five lines, except that a check's result is shown whole. It scrolls with the mouse wheel; new notices scroll it to the end, a check's result to its first line. |
+| **Notice pane** | Active notices keep the last five lines. Completed conversion and check results retain all lines and scroll to the summary at the top; conversion results include terrain chunk count and full LOD warnings. Mouse-wheel scrolling reads the rest. A later live notice returns to the five-line view and scrolls to its newest line. |
 | **Play row** | Why Play is or is not available, and the Play button. |
 
 Clicking a disabled button does nothing: the missing `Skyrim.esm` or the empty output is reported in
@@ -240,9 +245,12 @@ press asks again, so a folder that has filled up since it was chosen, or the def
   in it open). It starts `engine` from the launcher's own folder with `--assets <output>`.
 
 "A complete conversion" is the check the launcher makes at start-up, when the Output folder changes
-and when a run ends: `conversion-manifest.json` says `complete` at this converter's schema,
-`skyrim_world.db` and `cell_cache.rkyv` are there, and `integration-report.json` passed for this
-world-database schema. It does not look at every artifact; Check and Full check do.
+and when a run ends: `conversion-manifest.json` says `complete` at a converter schema the engine
+loads (`shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION` through this converter's), `skyrim_world.db`
+and `cell_cache.rkyv` are there, and `integration-report.json` passed at a world-database schema the
+engine reads (`shared::supports_runtime_world_database_schema`). The manifest is read as written, so
+an older output the engine starts on counts as complete; Check still compares it with this
+converter's schema. It does not look at every artifact; Check and Full check do.
 
 ### Dropping things onto the launcher
 

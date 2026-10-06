@@ -1046,15 +1046,16 @@ fn real_tree_lod_decodes() {
             .map(str::to_ascii_lowercase);
         match extension.as_deref() {
             Some("lst") => {
-                let types = converter::lod::parse_lst(&fs::read(&path).unwrap()).unwrap();
+                let types = converter::portal_lod::parse_lst(&fs::read(&path).unwrap()).unwrap();
                 tables += 1;
                 println!("{}: {} billboard types", path.display(), types.len());
             }
             Some("btt") => {
                 let stem = path.file_stem().unwrap().to_str().unwrap();
-                let block = converter::lod::parse_block_stem(stem).expect("a LOD block file name");
+                let block =
+                    converter::portal_lod::parse_block_stem(stem).expect("a LOD block file name");
                 let bytes = fs::read(&path).unwrap();
-                let parsed = converter::lod::parse_btt(&bytes, block.x, block.y).unwrap();
+                let parsed = converter::portal_lod::parse_btt(&bytes, block.x, block.y).unwrap();
                 blocks += 1;
                 instances += parsed
                     .groups
@@ -1073,7 +1074,7 @@ fn real_tree_lod_decodes() {
                 }
             }
             Some("lod") => {
-                let grid = converter::lod::parse_lod_grid(&fs::read(&path).unwrap()).unwrap();
+                let grid = converter::portal_lod::parse_lod_grid(&fs::read(&path).unwrap()).unwrap();
                 grids += 1;
                 println!(
                     "{}: origin {},{} levels {:?}",

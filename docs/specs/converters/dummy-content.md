@@ -4,7 +4,7 @@
 without a local game installation can develop, test, and demo the converter without touching
 copyrighted assets. No game data is read, copied, or required.
 
-Tracks [`issue #2`](https://github.com/realfakenerd/OpenSkyrim/issues/2).
+Tracks [`issue #2`](https://github.com/Mudcrab-Team/mudcrab/issues/2).
 
 ## Quick start
 
@@ -40,7 +40,7 @@ dummy-content gen <output-dir> [--seed <n>] [--formats <list>] [--force]
 ```
 
 - `--seed <n>` — seed for all generated texture content (SplitMix64). The default is stable.
-- `--formats dds,pex,nif,bsa,ba2,esm` — restrict output. The default generates everything.
+- `--formats dds,pex,nif,bsa,ba2,esm,lodsettings` — restrict output. The default generates everything. `lodsettings` requires `esm`.
 - `--force` — allow writing into a non-empty directory. Existing generated files are replaced
   atomically; unrelated files are left untouched. Generation refuses to follow symlinked path
   components.
@@ -71,6 +71,7 @@ The `esm` format has to be included for either.
 | `Skyrim - Meshes.bsa` | SSE `v105` BSA containing the generated NIF. |
 | `Skyrim - Textures.ba2` | Version 1 `GNRL` BA2 with zlib payloads. |
 | `Skyrim.esm` | Worldspace with a 3×3 exterior cell grid, flat LAND terrain, one static and one placement reference per cell. With `--with-interior`, one exterior cell, an interior cell and a reciprocal `DOOR`/`XTEL` pair instead. With `--with-lights`, one exterior cell, one `LIGH` base record and the one `REFR` that places it with an `XRDS` radius override. |
+| `lodsettings/GeneratedWorld.lod` | 16-byte Skyrim sidecar: `i16 X/Y`, then `i32 stride/min-level/max-level`. |
 
 ## Library API
 
@@ -101,7 +102,7 @@ Supported writers:
   (`esm::PRESET_INTERIOR`, `esm::plugin_with_interior`), or with a `LIGH` base record whose
   `DATA` is the 48-byte layout `Skyrim.esm` uses, an `FNAM` fade and one reference carrying an
   `XRDS` radius override (`esm::PRESET_LIGHT`, `esm::plugin_with_lights`). Exports into
-  `skyrim_world.db` (schema 4) and `cell_cache.rkyv`.
+  `skyrim_world.db` (schema 5, `shared::WORLD_DATABASE_SCHEMA_VERSION`) and `cell_cache.rkyv`.
 - `layout`: the `Data/` tree above, with atomic publication and symlink refusal. `layout::generate`
   writes the default tree and `layout::write_plugin` publishes a caller-built `Skyrim.esm` —
   the interior preset included — through the same writer and the same constants
@@ -121,18 +122,14 @@ client would consume; the [ADRs](../../adr/README.md) record the reasoning:
 - `X8R8G8B8` fixtures are 2D only; cube/volume fixtures use block-compressed formats.
 - The generated worldspace is intentionally minimal: flat terrain (no `VNML`/`VCLR`/`VTXT`),
   a single static and one reference per cell.
-- Door references export without a model. The `--with-interior` preset writes each `DOOR` base
-  record with the `MODL` a retail plugin carries, but the exporter fills `statics` from `STAT`,
-  `MSTT` and `FURN` only, so a reference that places a door has no model path in
-  `skyrim_world.db` (`world-inspect` counts it under `references_without_model`) and the door's
-  mesh never reaches the GLB pipeline. Until the exporter handles `DOOR`, the fixture's door pair
-  is a link and cell fixture, not a visible one;
-  `crates/converter/tests/fixture_interior_pipeline.rs` asserts the count of two so a change to
-  either side shows up in a test run.
-- `XTEL` destination FormIDs are not load-order remapped: the converter rewrites only the
-  subrecords `is_form_id_subrecord` recognises as 4-byte FormIDs, and `XTEL` is not one of them.
-  The destination ids are therefore correct only while the fixture is the single plugin at
-  load-order index 0, which is how `dummy-content gen` writes it. Nothing consumes `XTEL` yet.
+- The `--with-interior` preset writes each `DOOR` base record with the `MODL` a retail plugin
+  carries. The existing exporter already includes `DOOR` in `statics`, so the door references
+  resolve to their model paths in `skyrim_world.db`. `crates/converter/tests/fixture_interior_pipeline.rs`
+  verifies that the static and both door references have exported models.
+- `XTEL` destination FormIDs are written as the fixture's own local IDs. The converter's
+  load-order remap rewrites them into load-order numbering like each reference's own FormID,
+  so the door links survive any load-order slot. The single-plugin `dummy-content gen` case
+  occupies index 0, where these values are unchanged. Nothing consumes `XTEL` yet.
 - A light reference's `XRDS` is a single little-endian `f32` rather than a FormID, so the
   load-order remap leaves it alone and a reader gets the value as written. The base record's
   `DATA` puts the radius at bytes 4..8 (`u32`), the colour at 8..11, the flags at 12..16 (`u32`)
@@ -144,10 +141,12 @@ Real-asset checks stay opt-in and never run in CI with proprietary data. Point t
 **unmodded** `Data` directory (for example the Steam install):
 
 ```bash
-export OPENSKYRIM_SKYRIM_DATA="$HOME/.local/share/Steam/steamapps/common/Skyrim Special Edition/Data"
-export OPENSKYRIM_NIF_FIXTURE="/path/to/a/static.nif"
+export MUDCRAB_SKYRIM_DATA="$HOME/.local/share/Steam/steamapps/common/Skyrim Special Edition/Data"
+export MUDCRAB_NIF_FIXTURE="/path/to/a/static.nif"
 cargo test -p converter -- --ignored
 ```
+
+The old `OPENSKYRIM_*` variable names are still accepted as a fallback.
 
 Mod-manager "Stock Game" directories are not suitable: their loose files are often modified.
 
@@ -172,3 +171,8 @@ Property tests (`proptest`, fixed seed, run by the normal test suite) extend tho
 ESM, VMAD, LAND, BSA, BA2, PEX, LIP and NIF parsers must return an error, never panic or abort,
 on arbitrary bytes and on generated fixtures with overwritten bytes, extreme size and count
 words, and truncation. Shared strategies live in `crates/converter/src/test_strategies.rs`.
+
+## Regression invariant
+
+- §B1 (2026-09-28): The LOD sidecar parser and writer referenced a selector missing from `Formats`, which stopped the workspace from compiling.
+- §V1: Every generated format is represented by `Formats`, `Formats::parse`, `Formats::all`, and the output filter; `lodsettings` requires `esm`. The layout tests cover the default tree, sidecar bytes, and invalid dependency.

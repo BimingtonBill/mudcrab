@@ -30,6 +30,15 @@ mod lod_segments;
 
 pub struct MeshConverter;
 
+pub(crate) fn nif_source_hash(path: &Path) -> Result<String> {
+    let mut hash = crate::cache::hash_file(path)?;
+    for dependency in MeshConverter::dependency_paths(path) {
+        hash.push(':');
+        hash.push_str(&crate::cache::hash_file(&dependency)?);
+    }
+    Ok(hash)
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct NifParseDiagnostics {
     pub block_count: usize,
@@ -67,7 +76,7 @@ impl MeshConverter {
             .is_some_and(|extension| {
                 extension.eq_ignore_ascii_case("btr") || extension.eq_ignore_ascii_case("bto")
             });
-        let collision = collision::from_nif(nif_path, &nif)?;
+        let mut collision = collision::from_nif(nif_path, &nif)?;
         let skeleton = if nif.has_skeleton() {
             let skeleton_path = find_skeleton(nif_path).ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -122,6 +131,8 @@ impl MeshConverter {
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
             }
+            // An empty scene has no glTF nodes, so no body can be attached to one.
+            retain_bodies_with_nodes(&mut collision, &[], false);
             return write_glb_atomic(
                 output,
                 &embed_collision(empty_scene_glb(&name), &collision)?,
@@ -190,6 +201,18 @@ impl MeshConverter {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
+        // Check the bodies against the GLB that is actually written, not the source
+        // model: skeletal and effect NIFs lay their nodes out differently from the
+        // static scene, so the two orders can disagree. Vanilla meshes reuse names (a
+        // root and a child both called "Potato"); such a name is trusted at its index
+        // only when the GLB keeps the static scene's node order, which is what the
+        // index was predicted from.
+        let source_order: Vec<String> = model
+            .static_nodes
+            .iter()
+            .map(|node| node.name.clone().unwrap_or_default())
+            .collect();
+        retain_bodies_for_written_glb(&mut collision, &glb, Some(&source_order))?;
         write_glb_atomic(output, &embed_collision(glb, &collision)?)
     }
 
@@ -197,10 +220,17 @@ impl MeshConverter {
     /// This supports upgrading a packaged world without repeating texture conversion.
     pub fn annotate_glb_collision(nif_path: &Path, glb_path: &Path) -> Result<CollisionAsset> {
         let (nif, _, _) = open_nif_resilient(nif_path)?;
-        let collision = collision::from_nif(nif_path, &nif)?;
+        let mut collision = collision::from_nif(nif_path, &nif)?;
         let glb = fs::read(glb_path)?;
+        retain_bodies_for_written_glb(&mut collision, &glb, None)?;
         write_glb_atomic(glb_path, &embed_collision(glb, &collision)?)?;
         Ok(collision)
+    }
+
+    /// The collision a NIF authors, without writing a GLB (used by the physics census example).
+    pub fn extract_collision(nif_path: &Path) -> Result<CollisionAsset> {
+        let (nif, _, _) = open_nif_resilient(nif_path)?;
+        collision::from_nif(nif_path, &nif)
     }
 
     pub fn inspect_nif(path: &Path) -> Result<NifParseDiagnostics> {
@@ -319,7 +349,38 @@ fn prune_dangling_uris_in_glb(
 ) -> Result<Option<PrunedGlb>> {
     let bytes =
         fs::read(glb_path).wrap_err_with(|| format!("failed to read {}", glb_path.display()))?;
-    let mut document = glb_json_from_bytes(&bytes)
+    let Some((pruned, removed_uris)) =
+        prune_glb_texture_bytes_with_sources(root, glb_path, &bytes, source_textures)?
+    else {
+        return Ok(None);
+    };
+    write_glb_atomic(glb_path, &pruned)?;
+    let relative = glb_path
+        .strip_prefix(root)
+        .unwrap_or(glb_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok(Some(PrunedGlb {
+        glb: relative,
+        removed_uris,
+    }))
+}
+
+pub(crate) fn prune_glb_texture_bytes(
+    root: &Path,
+    glb_path: &Path,
+    bytes: &[u8],
+) -> Result<Option<(Vec<u8>, Vec<String>)>> {
+    prune_glb_texture_bytes_with_sources(root, glb_path, bytes, &BTreeSet::new())
+}
+
+fn prune_glb_texture_bytes_with_sources(
+    root: &Path,
+    glb_path: &Path,
+    bytes: &[u8],
+    source_textures: &BTreeSet<String>,
+) -> Result<Option<(Vec<u8>, Vec<String>)>> {
+    let mut document = glb_json_from_bytes(bytes)
         .wrap_err_with(|| format!("failed to inspect textures in {}", glb_path.display()))?;
     let missing: Vec<(usize, String)> = document
         .get("images")
@@ -343,18 +404,12 @@ fn prune_dangling_uris_in_glb(
     }
     let removed: HashSet<usize> = missing.iter().map(|(index, _)| *index).collect();
     prune_document_images(&mut document, &removed);
-    let pruned = rebuild_glb_with_document(&bytes, &document)
+    let pruned = rebuild_glb_with_document(bytes, &document)
         .wrap_err_with(|| format!("failed to rebuild {}", glb_path.display()))?;
-    write_glb_atomic(glb_path, &pruned)?;
-    let relative = glb_path
-        .strip_prefix(root)
-        .unwrap_or(glb_path)
-        .to_string_lossy()
-        .replace('\\', "/");
-    Ok(Some(PrunedGlb {
-        glb: relative,
-        removed_uris: missing.into_iter().map(|(_, uri)| uri).collect(),
-    }))
+    Ok(Some((
+        pruned,
+        missing.into_iter().map(|(_, uri)| uri).collect(),
+    )))
 }
 
 fn texture_uri_resolves(root: &Path, glb_path: &Path, uri: &str) -> bool {
@@ -393,13 +448,9 @@ fn texture_source_exists(
         return false;
     };
     let relative = relative.to_string_lossy().replace('\\', "/");
-    let Some(stem) = relative
-        .strip_suffix(".opensky-srgb.ktx2")
-        .or_else(|| relative.strip_suffix(".ktx2"))
-    else {
+    let Some(source) = crate::asset_path::runtime_texture_source(&relative) else {
         return false;
     };
-    let source = format!("{stem}.dds");
     crate::asset_path::canonical_asset_path(&source, crate::asset_path::AssetKind::Texture, "dds")
         .is_ok_and(|key| source_textures.contains(&key))
 }
@@ -470,28 +521,13 @@ fn prune_document_images(document: &mut serde_json::Value, removed: &HashSet<usi
         for slot in ["normalTexture", "occlusionTexture", "emissiveTexture"] {
             remap_texture_info(object, slot, "index", &texture_remap);
         }
-        // `KHR_materials_specular` carries two texture references of its own. The mask's
-        // `specularFactor` is doubled exactly because a `specularTexture` follows it
-        // (`material.rs::publish_specular`), so a mask that is dropped here has to halve
-        // the factor back: a factor of 2.0 with no mask makes Bevy use `reflectance = 1.0`.
         if let Some(extension) = object
             .get_mut("extensions")
             .and_then(|extensions| extensions.get_mut("KHR_materials_specular"))
-            .and_then(|extension| extension.as_object_mut())
+            .and_then(serde_json::Value::as_object_mut)
         {
-            let had_mask = extension.contains_key("specularTexture");
-            remap_texture_info(extension, "specularTexture", "index", &texture_remap);
-            remap_texture_info(extension, "specularColorTexture", "index", &texture_remap);
-            if had_mask
-                && !extension.contains_key("specularTexture")
-                && let Some(factor) = extension
-                    .get("specularFactor")
-                    .and_then(serde_json::Value::as_f64)
-            {
-                extension.insert(
-                    "specularFactor".to_owned(),
-                    serde_json::Value::from(factor / 2.0),
-                );
+            for slot in ["specularTexture", "specularColorTexture"] {
+                remap_texture_info(extension, slot, "index", &texture_remap);
             }
         }
         if let Some(slots) = object
@@ -568,6 +604,42 @@ fn rebuild_glb_with_document(original: &[u8], document: &serde_json::Value) -> R
     Ok(glb)
 }
 
+/// Keeps only the bodies whose `node` index names, in the exported GLB, the NIF node the body
+/// targets. The collision reader derives the index from the NIF alone; this checks it against
+/// what the exporter really wrote, and moves a body it cannot place to `skipped`. Its shapes
+/// remain as fixed collision.
+///
+/// A body is accepted only when its target name is non-empty and sits at the predicted index
+/// in the node names of the GLB that is actually written, so a reordered export cannot attach
+/// a body to the wrong node. With `require_unique_name` (annotate, or a GLB whose node order
+/// differs from the NIF's static scene) the name must also appear exactly once.
+fn retain_bodies_with_nodes(
+    collision: &mut CollisionAsset,
+    node_names: &[String],
+    require_unique_name: bool,
+) {
+    let bodies = std::mem::take(&mut collision.bodies);
+    for body in bodies {
+        let unambiguous = !require_unique_name
+            || node_names
+                .iter()
+                .filter(|name| **name == body.target)
+                .count()
+                == 1;
+        if !body.target.is_empty()
+            && unambiguous
+            && node_names.get(body.node as usize) == Some(&body.target)
+        {
+            collision.bodies.push(body);
+        } else {
+            collision.skipped.push(format!(
+                "rigid body targeting {:?}: no matching glTF node at index {}",
+                body.target, body.node
+            ));
+        }
+    }
+}
+
 /// Wraps a converted model in the Creation-to-glTF basis. A model a reference places also drops
 /// its root block's transform ([`prepare_for_placement`]); a distant-LOD block is placed by its
 /// grid, not by a reference, and keeps its root as authored.
@@ -616,7 +688,7 @@ fn embed_collision(glb: Vec<u8>, collision: &CollisionAsset) -> Result<Vec<u8>> 
         .and_then(serde_json::Value::as_array_mut)
         .and_then(|scenes| scenes.first_mut())
         .ok_or_else(|| color_eyre::eyre::eyre!("GLB has no scene for collision metadata"))?;
-    scene["extras"]["openSkyrimCollision"] = serde_json::to_value(collision)?;
+    scene["extras"]["mudcrabCollision"] = serde_json::to_value(collision)?;
     rebuild_glb_with_document(&glb, &document)
 }
 
@@ -648,7 +720,7 @@ fn is_deferred_dynamic_mesh(path: &Path) -> bool {
 
 fn empty_scene_glb(name: &str) -> Vec<u8> {
     let mut json = serde_json::to_vec(&serde_json::json!({
-        "asset": { "version": "2.0", "generator": "OpenSkyrim converter" },
+        "asset": { "version": "2.0", "generator": "Mudcrab converter" },
         "scene": 0,
         "scenes": [{ "name": name, "nodes": [] }]
     }))
@@ -687,6 +759,37 @@ pub(crate) fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
         .get(20..json_end)
         .ok_or_else(|| color_eyre::eyre::eyre!("truncated GLB JSON chunk"))?;
     serde_json::from_slice(json).wrap_err("invalid glTF JSON")
+}
+
+/// Checks the bodies against the node names of `glb`, the GLB that is written with them.
+/// `source_order` is the static-scene node order the body indices were predicted from, when
+/// the GLB was built from the same NIF; a reused node name is trusted at its index only when
+/// the GLB starts with exactly that order. Otherwise every target name must be unique.
+fn retain_bodies_for_written_glb(
+    collision: &mut CollisionAsset,
+    glb: &[u8],
+    source_order: Option<&[String]>,
+) -> Result<()> {
+    let node_names = glb_node_names(glb)?;
+    let same_order =
+        source_order.is_some_and(|order| !order.is_empty() && node_names.starts_with(order));
+    retain_bodies_with_nodes(collision, &node_names, !same_order);
+    Ok(())
+}
+
+/// The `name` of every node in a GLB, in node-index order, so a body's predicted index can be
+/// checked against the scene the exporter actually wrote. A node with no name contributes `""`.
+fn glb_node_names(glb: &[u8]) -> Result<Vec<String>> {
+    Ok(glb_json_from_bytes(glb)?
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(|node| node["name"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// Removes editor-only marker geometry (`EditorMarker` shapes) from a converted
@@ -1593,6 +1696,11 @@ fn texture_dependencies(document: &serde_json::Value) -> Vec<TextureDependency> 
                     false,
                 ),
                 (
+                    "/extensions/KHR_materials_specular/specularTexture/index",
+                    TextureSemantic::SpecularGlossiness,
+                    false,
+                ),
+                (
                     "/extensions/KHR_materials_specular/specularColorTexture/index",
                     TextureSemantic::SpecularGlossiness,
                     false,
@@ -1765,6 +1873,125 @@ mod tests {
     use project_wormhole_nif::model::all::{Model, StaticMesh, StaticSceneNode};
     use proptest::prelude::*;
 
+    fn body_at(node: u32, target: &str) -> shared::collision::CollisionBody {
+        use shared::collision::{BodyKind, CollisionBody, HavokBodyInfo};
+        CollisionBody {
+            node,
+            target: target.to_owned(),
+            shapes: vec![0],
+            kind: BodyKind::Fixed,
+            havok: HavokBodyInfo {
+                motion_system: 7,
+                quality_type: 1,
+                deactivator_type: 1,
+                collision_layer: 1,
+            },
+            mass: 0.0,
+            inertia: [0.0; 9],
+            center_of_mass: [0.0; 3],
+            linear_damping: 0.0,
+            angular_damping: 0.0,
+            friction: 0.0,
+            restitution: 0.0,
+            max_linear_velocity: 0.0,
+            max_angular_velocity: 0.0,
+            convex: true,
+        }
+    }
+
+    fn retained(target: &str, node: u32, names: &[&str], unique: bool) -> (usize, usize) {
+        let mut collision = CollisionAsset {
+            version: 2,
+            authored: true,
+            shapes: Vec::new(),
+            skipped: Vec::new(),
+            bodies: vec![body_at(node, target)],
+        };
+        let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+        retain_bodies_with_nodes(&mut collision, &names, unique);
+        (collision.bodies.len(), collision.skipped.len())
+    }
+
+    #[test]
+    fn retain_keeps_a_body_only_at_its_non_empty_named_node() {
+        let names = ["Root", "Shape", "Crate"];
+        for unique in [false, true] {
+            assert_eq!(retained("Crate", 2, &names, unique), (1, 0));
+            // the name at the predicted index differs, or the index is out of range
+            assert_eq!(retained("Crate", 1, &names, unique), (0, 1));
+            assert_eq!(retained("Crate", 9, &names, unique), (0, 1));
+            // an empty name never identifies a node
+            assert_eq!(retained("", 2, &["Root", "Shape", ""], unique), (0, 1));
+        }
+        // A reused name: the conversion path (GLB built from this NIF) trusts the index;
+        // the annotate path (GLB from elsewhere) needs the name to be unique.
+        let reused = ["Potato", "Shape", "Potato"];
+        assert_eq!(retained("Potato", 2, &reused, false), (1, 0));
+        assert_eq!(retained("Potato", 2, &reused, true), (0, 1));
+    }
+
+    #[test]
+    fn bodies_are_checked_against_the_written_glb_node_order() {
+        // The written GLB names the crate at index 1 (a source model order could name the
+        // shape there): a body predicted at 1 is kept, one predicted at 2 is skipped.
+        let glb = glb_bytes(
+            &serde_json::json!({
+                "asset": {"version": "2.0"},
+                "nodes": [{"name": "Root"}, {"name": "Crate"}, {"name": "Shape"}, {}],
+            }),
+            b"",
+        );
+        assert_eq!(
+            glb_node_names(&glb).unwrap(),
+            ["Root", "Crate", "Shape", ""]
+        );
+        let kept = |node: u32, target: &str, glb: &[u8], order: Option<&[String]>| {
+            let mut collision = CollisionAsset {
+                version: 2,
+                authored: true,
+                shapes: Vec::new(),
+                skipped: Vec::new(),
+                bodies: vec![body_at(node, target)],
+            };
+            retain_bodies_for_written_glb(&mut collision, glb, order).unwrap();
+            collision.bodies.len()
+        };
+        assert_eq!(kept(1, "Crate", &glb, None), 1);
+        assert_eq!(kept(2, "Crate", &glb, None), 0);
+    }
+
+    #[test]
+    fn a_reused_node_name_is_trusted_only_when_the_glb_keeps_the_source_order() {
+        let glb = glb_bytes(
+            &serde_json::json!({
+                "asset": {"version": "2.0"},
+                "nodes": [{"name": "Potato"}, {"name": "Shape"}, {"name": "Potato"}, {}],
+            }),
+            b"",
+        );
+        let check = |order: Option<Vec<&str>>| {
+            let order: Option<Vec<String>> =
+                order.map(|names| names.into_iter().map(str::to_owned).collect());
+            let mut collision = CollisionAsset {
+                version: 2,
+                authored: true,
+                shapes: Vec::new(),
+                skipped: Vec::new(),
+                bodies: vec![body_at(2, "Potato")],
+            };
+            retain_bodies_for_written_glb(&mut collision, &glb, order.as_deref()).unwrap();
+            collision.bodies.len()
+        };
+        // Same order as the static scene: the index is reliable, the body is kept.
+        assert_eq!(check(Some(vec!["Potato", "Shape", "Potato"])), 1);
+        // The GLB reordered the nodes: a reused name could be the wrong node, so it is skipped.
+        assert_eq!(check(Some(vec!["Shape", "Potato", "Potato"])), 0);
+        // No source order (annotate): reused names are skipped.
+        assert_eq!(check(None), 0);
+        // An empty static scene (skeletal NIFs) does not vouch for any order.
+        assert_eq!(check(Some(Vec::new())), 0);
+    }
+
     /// A real, minimal `NifFile` with no `BSSubIndexTriShape` blocks: enough
     /// for tests that exercise `rewrite_materials_and_texture_uris` against a
     /// hand-built glTF document rather than the NIF's own conversion, and so
@@ -1796,11 +2023,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires OPENSKYRIM_NIF_FIXTURE with a locally installed Skyrim NIF"]
+    #[ignore = "requires MUDCRAB_NIF_FIXTURE with a locally installed Skyrim NIF"]
     fn converts_installed_non_renderable_nif_to_empty_scene() {
-        let path = std::env::var_os("OPENSKYRIM_NIF_FIXTURE")
+        let path = std::env::var_os("MUDCRAB_NIF_FIXTURE")
+            .or_else(|| std::env::var_os("OPENSKYRIM_NIF_FIXTURE"))
             .map(PathBuf::from)
-            .expect("set OPENSKYRIM_NIF_FIXTURE to a Skyrim NIF");
+            .expect("set MUDCRAB_NIF_FIXTURE to a Skyrim NIF");
         let diagnostics = MeshConverter::inspect_nif(&path).unwrap();
         assert_eq!(diagnostics.geometry_block_count, 0);
         assert!(
@@ -1818,11 +2046,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires OPENSKYRIM_STATIC_NIF_FIXTURE with a locally installed Skyrim NIF"]
+    #[ignore = "requires MUDCRAB_STATIC_NIF_FIXTURE with a locally installed Skyrim NIF"]
     fn static_fallback_converts_installed_nif_fixture() {
-        let path = std::env::var_os("OPENSKYRIM_STATIC_NIF_FIXTURE")
+        let path = std::env::var_os("MUDCRAB_STATIC_NIF_FIXTURE")
+            .or_else(|| std::env::var_os("OPENSKYRIM_STATIC_NIF_FIXTURE"))
             .map(PathBuf::from)
-            .expect("set OPENSKYRIM_STATIC_NIF_FIXTURE to a Skyrim NIF");
+            .expect("set MUDCRAB_STATIC_NIF_FIXTURE to a Skyrim NIF");
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("static-fallback.glb");
         MeshConverter::convert_nif_to_glb(&path, &output).unwrap();
@@ -2920,55 +3149,30 @@ mod tests {
     }
 
     #[test]
-    fn prunes_the_specular_mask_and_undoes_its_doubled_factor() {
-        let document = serde_json::json!({
-            "asset": {"version": "2.0"},
-            "images": [
-                {"uri": "../../textures/keep.ktx2"},
-                {"uri": "../../textures/gone.ktx2"},
-                {"bufferView": 0, "mimeType": "image/png"}
-            ],
-            "textures": [{"source": 0}, {"source": 1}, {"source": 2}],
+    fn v11_prunes_and_remaps_both_specular_textures_without_changing_strength() {
+        let mut document = serde_json::json!({
+            "images": [{"uri":"a.ktx2"},{"uri":"gone.ktx2"},{"uri":"b.ktx2"}],
+            "textures": [{"source":0},{"source":1},{"source":2}],
             "materials": [
-                // The mask survives at a shifted index: the factor keeps its doubled value.
-                {"extensions": {"KHR_materials_specular": {
-                    "specularFactor": 2.0,
-                    "specularTexture": {"index": 2},
-                    "specularColorTexture": {"index": 0}
+                {"normalTexture":{"index":2},"extensions":{"KHR_materials_specular":{
+                    "specularFactor":0.8,"specularTexture":{"index":2},"specularColorTexture":{"index":0}
                 }}},
-                // The mask's own texture is the one pruned: the entry goes, the factor halves.
-                {"extensions": {"KHR_materials_specular": {
-                    "specularFactor": 1.6,
-                    "specularTexture": {"index": 1}
-                }}},
-                // A material that never had a mask keeps the factor it was published with.
-                {"extensions": {"KHR_materials_specular": {"specularFactor": 0.8}}}
+                {"extensions":{"KHR_materials_specular":{
+                    "specularFactor":0.8,"specularTexture":{"index":1},"specularColorTexture":{"index":2}
+                }}}
             ]
         });
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let glb = write_prune_fixture(root, &document);
-
-        let report = MeshConverter::prune_dangling_texture_uris(root).unwrap();
-        assert_eq!(report.len(), 1);
-        assert_eq!(
-            report[0].removed_uris,
-            vec!["../../textures/gone.ktx2".to_owned()]
-        );
-
-        let pruned = glb_json_from_bytes(&fs::read(&glb).unwrap()).unwrap();
-        let remapped = &pruned["materials"][0]["extensions"]["KHR_materials_specular"];
-        assert_eq!(remapped["specularTexture"]["index"], 1);
-        assert_eq!(remapped["specularColorTexture"]["index"], 0);
-        assert_eq!(remapped["specularFactor"], 2.0);
-
-        let dropped = &pruned["materials"][1]["extensions"]["KHR_materials_specular"];
+        prune_document_images(&mut document, &HashSet::from([1]));
+        let retained = &document["materials"][0];
+        let specular = &retained["extensions"]["KHR_materials_specular"];
+        assert_eq!(specular["specularTexture"]["index"], 1);
+        assert_eq!(specular["specularColorTexture"]["index"], 0);
+        assert_eq!(retained["normalTexture"]["index"], 1);
+        assert_eq!(specular["specularFactor"], 0.8);
+        let dropped = &document["materials"][1]["extensions"]["KHR_materials_specular"];
         assert!(dropped.get("specularTexture").is_none());
+        assert_eq!(dropped["specularColorTexture"]["index"], 1);
         assert_eq!(dropped["specularFactor"], 0.8);
-
-        let unmasked = &pruned["materials"][2]["extensions"]["KHR_materials_specular"];
-        assert!(unmasked.get("specularTexture").is_none());
-        assert_eq!(unmasked["specularFactor"], 0.8);
     }
 
     #[test]
@@ -3075,6 +3279,7 @@ mod tests {
                         double_sided: true,
                         uv_offset: [0.0, 0.0],
                         uv_scale: [1.0, 1.0],
+                        texture_clamp_mode: 3,
                         effect_falloff: None,
                         textures: Vec::new(),
                         animation: Vec::new(),
@@ -3200,6 +3405,128 @@ mod tests {
         assert_eq!(
             model.static_meshes[0].colors[0].0.truncate(),
             Vec3::new(1.0, 0.5, 0.25)
+        );
+    }
+
+    #[test]
+    fn v16_only_declared_markers_and_refraction_are_excluded() {
+        use nom_derive::Parse;
+        use project_wormhole_nif::nif_block::{BSXFlags, Fallout4ShaderPropertyFlags1};
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.nif");
+        fs::write(&input, static_nif()).unwrap();
+        for marker_name in [false, true] {
+            for marker_flag in [false, true] {
+                for refraction in [false, true] {
+                    let (mut nif, _, _) = open_nif_resilient(&input).unwrap();
+                    nif.header.strings[0] = SizedString32(
+                        if marker_name {
+                            "EditorMarker"
+                        } else {
+                            "Visible"
+                        }
+                        .into(),
+                    );
+                    nif.blocks.push(NifBlock::BSXFlags(BSXFlags {
+                        ni_extra_data: 0,
+                        integer_data: if marker_flag { 1 << 5 } else { 0 },
+                    }));
+                    let NifBlock::BSLightingShaderProperty(p) = &mut nif.blocks[2] else {
+                        unreachable!()
+                    };
+                    p.shader_flags_1 = Fallout4ShaderPropertyFlags1::parse(
+                        &(if refraction { 1u32 << 16 } else { 0 }).to_le_bytes(),
+                    )
+                    .unwrap()
+                    .1;
+                    let mut animation_skips = NifAnimationSkips::new();
+                    let contract =
+                        build_nif_material_contract(&nif, &input, &mut animation_skips).unwrap();
+                    assert_eq!(
+                        matches!(
+                            &contract[0].disposition,
+                            NifMaterialDisposition::Excluded { .. }
+                        ),
+                        refraction || (marker_name && marker_flag)
+                    );
+                    let mut document = serde_json::json!({"asset":{"version":"2.0"},"meshes":[{"primitives":[{}]}]});
+                    publish_gltf_materials(&mut document, &contract, &[1], Path::new("mesh.glb"))
+                        .unwrap();
+                    if refraction || (marker_name && marker_flag) {
+                        assert_eq!(document["materials"][0]["alphaMode"], "MASK");
+                        assert_eq!(
+                            document["materials"][0]["pbrMetallicRoughness"]["baseColorFactor"][3],
+                            0.0
+                        );
+                        assert!(document["meshes"][0]["primitives"][0]["extras"]["openSkyrim"]["materialExclusion"].as_str().is_some());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v15_source_uv_fields_survive_nif_contract() {
+        use project_wormhole_nif::nif_enum::TexClampMode;
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("uv.nif");
+        fs::write(&input, static_nif()).unwrap();
+        let (mut nif, _, _) = open_nif_resilient(&input).unwrap();
+        let NifBlock::BSLightingShaderProperty(p) = &mut nif.blocks[2] else {
+            unreachable!()
+        };
+        p.uv_offset.0 = project_wormhole_shared::glam::Vec2::new(0.25, -0.125);
+        p.uv_scale.0 = project_wormhole_shared::glam::Vec2::new(2.0, -3.0);
+        p.texture_clamp_mode = TexClampMode::WrapSClampT;
+        let mut animation_skips = NifAnimationSkips::new();
+        let contract = build_nif_material_contract(&nif, &input, &mut animation_skips).unwrap();
+        let NifMaterialDisposition::Validated { material } = &contract[0].disposition else {
+            unreachable!()
+        };
+        assert_eq!(material.uv_offset, [0.25, -0.125]);
+        assert_eq!(material.uv_scale, [2.0, -3.0]);
+        assert_eq!(material.texture_clamp_mode, 2);
+    }
+
+    #[test]
+    fn v14_modern_nif_colors_survive_export_with_authored_alpha() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("colors.nif");
+        let output = directory.path().join("colors.glb");
+        let colors = [[64, 128, 192, 0], [255, 32, 16, 96], [10, 20, 30, 255]];
+        let bytes = dummy_content::nif::static_shape_with_colors(
+            &dummy_content::nif::StaticShape {
+                name: "Colors",
+                positions: &[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]],
+                normals: &[[0., 0., 1.]; 3],
+                uvs: &[[0., 0.], [1., 0.], [0., 1.]],
+                indices: &[[0, 1, 2]],
+                diffuse: "textures/color.dds",
+                normal_texture: "textures/normal.dds",
+            },
+            &colors,
+        )
+        .unwrap();
+        fs::write(&input, bytes).unwrap();
+        MeshConverter::convert_nif_to_glb(&input, &output).unwrap();
+        let bytes = fs::read(output).unwrap();
+        let gltf = gltf::Gltf::from_slice(&bytes).unwrap();
+        let mesh = gltf.meshes().next().unwrap();
+        let primitive = mesh.primitives().next().unwrap();
+        let actual: Vec<_> = primitive
+            .reader(|_| gltf.blob.as_deref())
+            .read_colors(0)
+            .unwrap()
+            .into_rgba_f32()
+            .collect();
+        for (actual, source) in actual.iter().zip(colors) {
+            for (a, b) in actual.iter().zip(source) {
+                assert!((a - f32::from(b) / 255.).abs() < 1e-6);
+            }
+        }
+        assert_eq!(
+            primitive.material().alpha_mode(),
+            gltf::material::AlphaMode::Opaque
         );
     }
 

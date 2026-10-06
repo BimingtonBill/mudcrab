@@ -1218,7 +1218,7 @@ pub(crate) fn switch_space(
     creation_position: Vec3,
     active: &mut ActiveCell,
     origin: &mut RenderOrigin,
-    roots: &mut Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    roots: &mut crate::streaming::CellRootTransforms,
 ) -> Vec3 {
     match target {
         SpaceTarget::Interior(cell_id) => {
@@ -1281,7 +1281,7 @@ fn apply_door_crossings(
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut active: ResMut<ActiveCell>,
     mut origin: ResMut<RenderOrigin>,
-    mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    mut roots: crate::streaming::CellRootTransforms,
     mut crossed: MessageWriter<DoorCrossed>,
     mut openings: MessageWriter<OpenDestinationDoor>,
     mut profiler: ResMut<ProfilingState>,

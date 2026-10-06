@@ -1,5 +1,6 @@
 ---
 source: crates/converter/tests/snapshots.rs
+assertion_line: 176
 expression: document
 ---
 {
@@ -74,15 +75,14 @@ expression: document
     }
   ],
   "extensionsUsed": [
-    "KHR_materials_specular",
-    "OPEN_SKYRIM_material"
+    "KHR_materials_specular"
   ],
   "images": [
     {
-      "uri": "../textures/generated_color.opensky-srgb.ktx2"
+      "uri": "../textures/generated_color.opensky-srgb.opensky-wrap0.ktx2"
     },
     {
-      "uri": "../textures/generated_normal.ktx2"
+      "uri": "../textures/generated_normal.opensky-wrap0.ktx2"
     }
   ],
   "materials": [
@@ -95,33 +95,17 @@ expression: document
             1.0,
             1.0
           ],
-          "specularFactor": 2.0,
-          "specularTexture": {
-            "index": 1,
-            "texCoord": 0
-          }
-        },
-        "OPEN_SKYRIM_material": {
-          "lightingShaderType": "default",
-          "premultipliedAlpha": false,
-          "screenDoorAlphaFade": false,
-          "shaderFamily": "lighting",
-          "shaderFlags1": 0,
-          "shaderFlags2": 0,
-          "textureSlots": [],
-          "uvOffset": [
-            0.0,
-            0.0
-          ],
-          "uvScale": [
-            1.0,
-            1.0
-          ]
+          "specularFactor": 0.0
         }
       },
       "extras": {
         "openSkyrim": {
+          "lightingShaderType": "default",
+          "normalConvention": "directx",
           "shaderBlock": 2,
+          "shaderFamily": "lighting",
+          "shaderFlags1": 0,
+          "shaderFlags2": 0,
           "shapeBlock": 1
         }
       },
@@ -186,15 +170,42 @@ expression: document
       ]
     }
   ],
+  "samplers": [
+    {
+      "magFilter": 9729,
+      "minFilter": 9987,
+      "wrapS": 33071,
+      "wrapT": 33071
+    },
+    {
+      "magFilter": 9729,
+      "minFilter": 9987,
+      "wrapS": 33071,
+      "wrapT": 10497
+    },
+    {
+      "magFilter": 9729,
+      "minFilter": 9987,
+      "wrapS": 10497,
+      "wrapT": 33071
+    },
+    {
+      "magFilter": 9729,
+      "minFilter": 9987,
+      "wrapS": 10497,
+      "wrapT": 10497
+    }
+  ],
   "scene": 0,
   "scenes": [
     {
       "extras": {
-        "openSkyrimCollision": {
+        "mudcrabCollision": {
           "authored": true,
+          "bodies": [],
           "shapes": [],
           "skipped": [],
-          "version": 1
+          "version": 2
         }
       },
       "nodes": [
@@ -204,9 +215,11 @@ expression: document
   ],
   "textures": [
     {
+      "sampler": 0,
       "source": 0
     },
     {
+      "sampler": 0,
       "source": 1
     }
   ]

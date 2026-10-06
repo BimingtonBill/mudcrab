@@ -1472,7 +1472,7 @@ mod tests {
 
     #[test]
     fn the_flags_are_read_from_the_command_line() {
-        let config = EngineConfig::from_args(
+        let config = EngineConfig::run_from_args(
             [
                 "--graphics",
                 "bevy",
@@ -1509,9 +1509,9 @@ mod tests {
         assert_eq!(settings.preset, Preset::Custom);
 
         // No flags: today's look, and no file unless one exists.
-        let config = EngineConfig::from_args(Vec::<String>::new());
+        let config = EngineConfig::run_from_args(Vec::<String>::new());
         assert!(config.portal.graphics_knobs.is_empty());
-        let config = EngineConfig::from_args(["--tonemapper", "nope"].map(str::to_owned));
+        let config = EngineConfig::run_from_args(["--tonemapper", "nope"].map(str::to_owned));
         assert!(
             resolve(None, None, &[], config.portal.tonemapper.as_deref()).is_err(),
             "a bad --tonemapper is still refused"
@@ -2001,7 +2001,7 @@ mod tests {
 
     #[test]
     fn portal_every_comes_from_the_flag_or_the_file_and_is_held_to_its_range() {
-        let config = EngineConfig::from_args(["--portal-every", "2"].map(str::to_owned));
+        let config = EngineConfig::run_from_args(["--portal-every", "2"].map(str::to_owned));
         assert_eq!(
             config.portal.graphics_knobs,
             pairs(&[("portal-every", "2")])

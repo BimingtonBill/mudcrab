@@ -2390,8 +2390,10 @@ dependencies = [
  "ddsfile",
  "dummy-content",
  "flate2",
+ "gltf",
  "image_dds 0.7.2",
  "insta",
+ "intel_tex_2",
  "ktx2",
  "lz4_flex",
  "memmap2",
@@ -2414,6 +2416,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "walkdir",
+ "wgpu",
  "zstd",
 ]
 
@@ -2888,6 +2891,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "shared",
  "tempfile",
  "windows-sys 0.61.2",
@@ -4237,6 +4241,7 @@ dependencies = [
  "bevy",
  "converter",
  "crossbeam-channel",
+ "rusqlite",
  "serde_json",
  "shared",
  "tokio",
@@ -6394,8 +6399,11 @@ dependencies = [
 name = "shared"
 version = "0.1.0"
 dependencies = [
+ "color-eyre",
  "rkyv",
+ "rusqlite",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -7444,12 +7452,14 @@ dependencies = [
  "js-sys",
  "log",
  "naga",
+ "parking_lot",
  "portable-atomic",
  "profiling",
  "raw-window-handle",
  "smallvec",
  "static_assertions",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
  "wgpu-core",
  "wgpu-hal",

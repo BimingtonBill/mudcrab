@@ -548,7 +548,7 @@ fn pose_at_start_shot(
     mut run: Option<ResMut<StartShotRun>>,
     mut active: ResMut<ActiveCell>,
     mut origin: ResMut<RenderOrigin>,
-    mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    mut roots: crate::streaming::CellRootTransforms,
     mut camera: Query<(&mut Transform, &mut Projection), With<StreamingCamera>>,
     windows: Query<&Window, With<PrimaryWindow>>,
 ) {
@@ -1525,7 +1525,7 @@ mod tests {
     }
 
     fn config_with(args: &[&str]) -> EngineConfig {
-        EngineConfig::from_args(args.iter().map(|value| (*value).to_owned()))
+        EngineConfig::run_from_args(args.iter().map(|value| (*value).to_owned()))
     }
 
     /// Several shots files, comma-separated, make one list in their own order; the run starts at

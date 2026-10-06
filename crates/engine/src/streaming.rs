@@ -37,9 +37,12 @@ use bevy::{
 use bevy_rapier3d::prelude::{Collider, ColliderDisabled, RigidBody, WriteRapierContext};
 use serde::{Deserialize, Serialize};
 use shared::collision::{COLLISION_ASSET_VERSION, CollisionAsset, CollisionShape};
+use shared::lod::LodTier;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::time::Instant;
+
+pub(crate) mod lod;
 
 // Wall-clock spans can include a short OS scheduler preemption. Keep the raw maximum in metrics,
 // but require a material overrun before classifying the frame as a commit-budget violation.
@@ -118,6 +121,17 @@ fn commit_waits_for_next_frame(
     over_count || (done.started > 0 && done.elapsed_micros >= config.max_commit_micros_per_frame)
 }
 
+/// Grid cell and quadrant covered by a terrain surface at one LOD tier.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+struct TerrainCoverage {
+    grid: IVec2,
+    quadrant: u8,
+    tier: Option<LodTier>,
+}
+
+#[derive(Component)]
+struct TerrainSurfaceReady;
+
 /// The time since `started` in whole microseconds, saturating at `u64::MAX`.
 fn elapsed_micros(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
@@ -129,6 +143,8 @@ impl Plugin for StreamingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<lod::LodStreaming>()
             .init_resource::<DiagnosticFallbackAssets>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<SceneSpawnBatch>()
@@ -141,18 +157,24 @@ impl Plugin for StreamingPlugin {
             .init_resource::<DirectionalSnowCatalog>()
             .init_resource::<SnowMaterialCache>()
             .add_observer(mark_world_instance_ready)
+            .add_observer(lod::mark_lod_world_instance_ready)
             .add_systems(Startup, load_directional_snow_catalog)
             .add_systems(
                 Update,
                 (
                     plan_cells,
                     despawn_cells,
+                    lod::plan_lod_chunks,
                     collect_cells,
+                    lod::collect_lod_chunks,
                     arm_pending_models,
+                    finish_streaming_commit_budget,
                     track_asset_readiness,
                     apply_directional_snow,
                     apply_effect_palettes,
                     track_surface_readiness,
+                    lod::track_lod_readiness,
+                    lod::update_terrain_lod_visibility,
                     update_render_origin,
                     validate_streaming_lifecycle,
                 )
@@ -458,6 +480,38 @@ impl PrestreamCells {
     }
 }
 
+#[derive(Resource)]
+struct StreamingCommitBudget {
+    frame_started: Instant,
+    remaining: usize,
+    commits: usize,
+    lod_priority: bool,
+    reserved_for_lod: bool,
+}
+
+impl Default for StreamingCommitBudget {
+    fn default() -> Self {
+        Self {
+            frame_started: Instant::now(),
+            remaining: 0,
+            commits: 0,
+            lod_priority: false,
+            reserved_for_lod: false,
+        }
+    }
+}
+
+impl StreamingCommitBudget {
+    fn reserve_for_lod(&mut self, waiting: bool, frame_limit: usize) {
+        self.reserved_for_lod = waiting && (self.lod_priority || frame_limit > 1);
+    }
+
+    fn remaining_for_cells(&self) -> usize {
+        self.remaining
+            .saturating_sub(usize::from(self.reserved_for_lod))
+    }
+}
+
 #[derive(Resource, Reflect, Debug, Clone, Default, Serialize)]
 #[reflect(Resource)]
 pub struct StreamingMetrics {
@@ -532,6 +586,23 @@ pub struct StreamingMetrics {
     pub transform_bounds_fixture_validated: bool,
     pub active_requests: usize,
     pub peak_active_requests: usize,
+    pub lod_queries_submitted: u64,
+    pub lod_query_responses: u64,
+    pub lod_query_submission_failures: u64,
+    pub stale_lod_query_responses: u64,
+    pub failed_lod_queries: u64,
+    pub unrecovered_lod_queries: usize,
+    pub pending_lod_queries: usize,
+    pub lod_chunks_requested: u64,
+    pub lod_chunks_ready: u64,
+    pub failed_lod_chunks: u64,
+    pub unrecovered_lod_chunks: usize,
+    pub resident_lod_chunks: usize,
+    pub pending_lod_chunks: usize,
+    pub ready_lod_terrain_patches: u64,
+    pub visible_lod_terrain_patches: usize,
+    pub total_lod_query_micros: u64,
+    pub max_lod_query_micros: u64,
     pub resident_roots: usize,
     pub duplicate_cell_roots: u64,
     pub orphaned_cell_roots: u64,
@@ -736,6 +807,7 @@ fn plan_cells(
     origin: Res<RenderOrigin>,
     camera: Query<&Transform, With<StreamingCamera>>,
     mut streaming: ResMut<StreamingWorld>,
+    mut commit_budget: ResMut<StreamingCommitBudget>,
     mut continuity: ResMut<TerrainContinuity>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
@@ -744,6 +816,10 @@ fn plan_cells(
     // Recorded before anything else, so `has_failed` reads the interior the camera is in even on
     // a frame the plan stops early.
     streaming.active_interior = active.interior;
+    commit_budget.remaining = config.max_cell_commits_per_frame;
+    commit_budget.commits = 0;
+    commit_budget.lod_priority = !commit_budget.lod_priority;
+    commit_budget.reserved_for_lod = false;
     let Ok(camera) = camera.single() else {
         return;
     };
@@ -1082,6 +1158,9 @@ fn despawn_cells(world: &mut World) {
     for (_, root) in retiring.iter().take(budget) {
         entities = entities.saturating_add(despawn_subtree(world, *root));
     }
+    if budget > 0 {
+        world.resource_mut::<lod::LodStreaming>().visibility_dirty = true;
+    }
     {
         let mut streaming = world.resource_mut::<StreamingWorld>();
         for (key, _) in retiring.iter().take(budget) {
@@ -1152,12 +1231,14 @@ fn despawn_subtree(world: &mut World, root: Entity) -> usize {
 /// The two read-only catalogues a cell commit reads: the landscape and water texture paths
 /// ([`AssetCatalog`]) and the projected snow materials ([`DirectionalSnowCatalog`]).
 ///
-/// They travel as one because a system function takes at most sixteen parameters, and
+/// They travel as one - together with the frame's shared commit budget, which main's commit
+/// pacing spends from - because a system function takes at most sixteen parameters, and
 /// [`collect_cells`] - the commit path - is at that limit.
 #[derive(SystemParam)]
 struct CommitCatalogs<'w> {
     assets: Res<'w, AssetCatalog>,
     snow: Res<'w, DirectionalSnowCatalog>,
+    budget: ResMut<'w, StreamingCommitBudget>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1168,7 +1249,7 @@ fn collect_cells(
     cache: Res<CellCache>,
     origin: Res<RenderOrigin>,
     asset_server: Res<AssetServer>,
-    catalogs: CommitCatalogs,
+    mut catalogs: CommitCatalogs,
     reflection: Res<WaterReflectionTexture>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
@@ -1180,6 +1261,7 @@ fn collect_cells(
     mut deferred: Local<VecDeque<DatabaseResponse>>,
 ) {
     let frame_commit_started = Instant::now();
+    catalogs.budget.frame_started = frame_commit_started;
     // One answer for the whole frame, from the one gate: a walked run's cells carry colliders, and
     // every other run's do not (see [`builds_world_colliders`]).
     let world_physics = builds_world_colliders(&config);
@@ -1213,7 +1295,9 @@ fn collect_cells(
         profiler.record_micros("streaming/db_request_total", response.total_request_micros);
         pending.push_back(response);
     }
-    let mut commits_this_frame = 0u64;
+    // The frame's per-tier commit counts, what [`commit_waits_for_next_frame`] decides the next
+    // answer on; the frame's own report is [`finish_streaming_commit_budget`]'s, off the shared
+    // [`StreamingCommitBudget`] the terrain LOD chunks commit from too.
     let mut commits_started = 0usize;
     let mut full_commits = 0usize;
     let mut terrain_commits = 0usize;
@@ -1243,21 +1327,37 @@ fn collect_cells(
         }
         // What does not fit this frame ([`commit_waits_for_next_frame`]) is held - with everything
         // behind it, keeping the order - for the next frame, rather than re-requested or dropped.
-        if commit_waits_for_next_frame(
-            detail,
-            CommitsThisFrame {
-                started: commits_started,
-                full: full_commits,
-                terrain: terrain_commits,
-                elapsed_micros: elapsed_micros(frame_commit_started),
-            },
-            &config,
-        ) {
+        // A full cell also waits while the frame's shared commit slot is reserved for the terrain
+        // LOD chunks, which commit from the same [`StreamingCommitBudget`] after this system
+        // ([`StreamingCommitBudget::reserve_for_lod`]).
+        let slot_reserved_for_lod =
+            detail == CellDetail::Full && catalogs.budget.remaining_for_cells() == 0;
+        if slot_reserved_for_lod
+            || commit_waits_for_next_frame(
+                detail,
+                CommitsThisFrame {
+                    started: commits_started,
+                    full: full_commits,
+                    terrain: terrain_commits,
+                    elapsed_micros: elapsed_micros(frame_commit_started),
+                },
+                &config,
+            )
+        {
             deferred.push_back(response);
             deferred.extend(pending.drain(..));
             break;
         }
         commits_started += 1;
+        // A full cell is what takes the frame's shared commit slot, the one the terrain LOD chunks
+        // also commit from. A terrain-only ring cell is a fraction of a full commit's work and
+        // keeps its own, larger count ([`MAX_TERRAIN_CELL_COMMITS_PER_FRAME`]) and the frame's time
+        // budget instead, so the ring still fills at the pace it was tuned to. Every commit is
+        // counted in the frame's report ([`finish_streaming_commit_budget`]).
+        if detail == CellDetail::Full {
+            catalogs.budget.remaining -= 1;
+        }
+        catalogs.budget.commits = catalogs.budget.commits.saturating_add(1);
         let commit_started = std::time::Instant::now();
         match response.result {
             Ok(payload) => {
@@ -1389,7 +1489,6 @@ fn collect_cells(
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         metrics.max_commit_micros = metrics.max_commit_micros.max(commit_micros);
-        commits_this_frame = commits_this_frame.saturating_add(1);
         match detail {
             CellDetail::Full => full_commits += 1,
             CellDetail::Terrain => terrain_commits += 1,
@@ -1401,28 +1500,38 @@ fn collect_cells(
             Some(commit_micros as f64 / 1000.0),
         );
     }
-    if commits_this_frame > 0 {
-        let frame_micros = frame_commit_started
-            .elapsed()
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64;
-        metrics.commit_frames = metrics.commit_frames.saturating_add(1);
-        metrics.total_frame_commit_micros = metrics
-            .total_frame_commit_micros
-            .saturating_add(frame_micros);
-        metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
-        metrics.commit_budget_micros = config.max_commit_micros_per_frame;
-        if commit_budget_exceeded(frame_micros, config.max_commit_micros_per_frame) {
-            metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
-            profiler.event(
-                "streaming",
-                "commit_budget_exceeded",
-                Some(frame_micros as f64 / 1_000.0),
-            );
-        }
-        profiler.set_gauge("streaming/commits_this_frame", commits_this_frame as f64);
-        profiler.record_micros("streaming/frame_commit", frame_micros);
+}
+
+fn finish_streaming_commit_budget(
+    config: Res<EngineConfig>,
+    budget: Res<StreamingCommitBudget>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if budget.commits == 0 {
+        return;
     }
+    let frame_micros = budget
+        .frame_started
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    metrics.commit_frames = metrics.commit_frames.saturating_add(1);
+    metrics.total_frame_commit_micros = metrics
+        .total_frame_commit_micros
+        .saturating_add(frame_micros);
+    metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
+    metrics.commit_budget_micros = config.max_commit_micros_per_frame;
+    if commit_budget_exceeded(frame_micros, metrics.commit_budget_micros) {
+        metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
+        profiler.event(
+            "streaming",
+            "commit_budget_exceeded",
+            Some(frame_micros as f64 / 1_000.0),
+        );
+    }
+    profiler.set_gauge("streaming/commits_this_frame", budget.commits as f64);
+    profiler.record_micros("streaming/frame_commit", frame_micros);
 }
 
 /// Marks a cell failed, dropping the root it kept drawn while its replacement was loading.
@@ -1687,6 +1796,10 @@ fn spawn_cell(
     let spawn_started = Instant::now();
     let reference_count = payload.references.len();
     let root_translation = cell_translation(payload.key, origin);
+    let terrain_grid = match payload.key {
+        CellKey::Exterior { grid_x, grid_y, .. } => Some(IVec2::new(grid_x, grid_y)),
+        CellKey::Interior(_) => None,
+    };
     let mut root_commands = commands.spawn((
         Name::new(format!("Cell {:08X}", payload.cell_id)),
         CellRef(payload.cell_id),
@@ -1760,6 +1873,13 @@ fn spawn_cell(
                         normals: images.normal,
                     },
                 ));
+                if let Some(grid) = terrain_grid {
+                    patch.insert(TerrainCoverage {
+                        grid,
+                        quadrant,
+                        tier: None,
+                    });
+                }
                 if let Some(collider) = collider {
                     // Born disabled: only `crate::portal`'s space gate enables a collider, and only
                     // for a cell whose role is Active (decision 4 of the collision brief). Surface
@@ -2735,6 +2855,7 @@ fn track_surface_readiness(
     )>,
     water: Query<(Entity, &PendingWaterProfile)>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+    mut lod_streaming: ResMut<lod::LodStreaming>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -2793,7 +2914,10 @@ fn track_surface_readiness(
                     .images_validated
                     .saturating_add((pending.images.len() + normals_validated) as u64);
                 profiler.increment("terrain/patches_validated", 1);
-                commands.entity(entity).try_insert(Visibility::Inherited);
+                commands
+                    .entity(entity)
+                    .try_insert((Visibility::Inherited, TerrainSurfaceReady));
+                lod_streaming.visibility_dirty = true;
                 commands
                     .entity(entity)
                     .try_remove::<PendingTerrainProfile>();
@@ -3635,10 +3759,14 @@ fn authored_collision_from_hierarchy(
             }
             let value: serde_json::Value = serde_json::from_str(&scene_extras.value)
                 .map_err(|error| format!("invalid GLB scene extras: {error}"))?;
-            if let Some(collision) = value.get("openSkyrimCollision") {
+            if let Some(collision) = value
+                .get("mudcrabCollision")
+                .or_else(|| value.get("openSkyrimCollision"))
+            {
                 let asset: CollisionAsset = serde_json::from_value(collision.clone())
                     .map_err(|error| format!("invalid GLB collision data: {error}"))?;
-                if asset.version != COLLISION_ASSET_VERSION || !asset.authored {
+                if asset.version == 0 || asset.version > COLLISION_ASSET_VERSION || !asset.authored
+                {
                     return Err("unsupported GLB collision contract".to_owned());
                 }
                 return Ok(Some(asset));
@@ -4176,10 +4304,11 @@ fn validate_and_register_terrain_edges(
     Ok(())
 }
 
-/// Recomputes the packed `VNML` bytes of the listed height-field points from the heights around
-/// them, in the converter's own encoding (`crates/converter/src/esm/cell_cache.rs`,
-/// `decode_normals`): `(h(left) - h(right), h(down) - h(up), 2 * step)`, normalized and scaled by
-/// 127. `points` index a complete `width * height` field.
+/// Recomputes packed `VNML` bytes from the welded height field, normalized and scaled to `i8`,
+/// with the converter's stencil (`crates/converter/src/esm/cell_cache.rs`, `decode_normals`):
+/// each axis's height difference is divided by the distance it actually spans, two intervals
+/// inside the field and one at an edge or corner, so a planar slope keeps the same normal
+/// everywhere. `points` index a complete `width * height` field.
 fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
     let width = usize::from(terrain.width);
     let height = usize::from(terrain.height);
@@ -4189,11 +4318,17 @@ fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
     let step = CELL_SIZE / (width - 1) as f32;
     for &index in points {
         let (x, y) = (index % width, index / width);
-        let left = terrain.heights[y * width + x.saturating_sub(1)];
-        let right = terrain.heights[y * width + (x + 1).min(width - 1)];
-        let down = terrain.heights[y.saturating_sub(1) * width + x];
-        let up = terrain.heights[(y + 1).min(height - 1) * width + x];
-        let normal = Vec3::new(left - right, down - up, 2.0 * step).normalize_or(Vec3::Z);
+        let (west, east) = (x.saturating_sub(1), (x + 1).min(width - 1));
+        let (south, north) = (y.saturating_sub(1), (y + 1).min(height - 1));
+        let left = terrain.heights[y * width + west];
+        let right = terrain.heights[y * width + east];
+        let down = terrain.heights[south * width + x];
+        let up = terrain.heights[north * width + x];
+        // `width` and `height` are at least 2, so every span covers at least one interval.
+        let span_x = (east - west) as f32 * step;
+        let span_y = (north - south) as f32 * step;
+        let normal =
+            Vec3::new((left - right) / span_x, (down - up) / span_y, 1.0).normalize_or(Vec3::Z);
         // A height field's own normal always has a positive up component, so the packed bytes can
         // never come out all zero - which is what the validation rejects.
         let byte = |component: f32| (component * 127.0).round().clamp(-127.0, 127.0) as i8;
@@ -4205,14 +4340,38 @@ fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
     }
 }
 
-/// Places every spawned exterior cell root where `origin` says it belongs. Interiors carry no
-/// [`ExteriorCellGrid`] and sit at the origin already, so they are not touched.
-pub(crate) fn reposition_cell_roots(
-    origin: IVec2,
-    roots: &mut Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
-) {
-    for (grid, mut transform) in roots.iter_mut() {
-        transform.translation = grid_translation(grid.0, origin);
+/// Every spawned root the render origin places: an exterior cell root ([`ExteriorCellGrid`]) or a
+/// terrain LOD chunk root ([`lod::LodChunkGridOrigin`]). Interiors carry neither and sit at the
+/// origin already, so they are not touched.
+pub(crate) type CellRootTransforms<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Option<&'static ExteriorCellGrid>,
+        Option<&'static lod::LodChunkGridOrigin>,
+        &'static mut Transform,
+    ),
+    (
+        Or<(With<ExteriorCellGrid>, With<lod::LodChunkGridOrigin>)>,
+        Without<StreamingCamera>,
+    ),
+>;
+
+/// Places every spawned exterior cell root, and every terrain LOD chunk root, where `origin` says
+/// it belongs ([`CellRootTransforms`]).
+pub(crate) fn reposition_cell_roots(origin: IVec2, roots: &mut CellRootTransforms) {
+    for (cell_grid, lod_grid, mut transform) in roots.iter_mut() {
+        let Some(grid) = cell_grid
+            .map(|grid| (i64::from(grid.0.x), i64::from(grid.0.y)))
+            .or_else(|| lod_grid.map(|grid| (grid.grid_x, grid.grid_y)))
+        else {
+            continue;
+        };
+        transform.translation = Vec3::new(
+            (grid.0 - i64::from(origin.x)) as f32 * CELL_SIZE,
+            0.0,
+            -((grid.1 - i64::from(origin.y)) as f32) * CELL_SIZE,
+        );
     }
 }
 
@@ -4221,7 +4380,7 @@ fn update_render_origin(
     active: Res<ActiveCell>,
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
-    mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    mut roots: crate::streaming::CellRootTransforms,
     terrain_colliders: Query<Entity, With<TerrainCollider>>,
     static_colliders: Query<Entity, With<StaticColliderSource>>,
     parents: Query<&ChildOf>,
@@ -5651,6 +5810,7 @@ mod tests {
             .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, (plan_cells, collect_cells).chain());
         app
@@ -5712,6 +5872,7 @@ mod tests {
             .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, plan_cells);
         app.world_mut().spawn((
@@ -5772,6 +5933,8 @@ mod tests {
             .insert_resource(WorldDatabase::open(&path).unwrap())
             .init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<lod::LodStreaming>()
             .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<ProfilingState>()
@@ -6394,6 +6557,7 @@ mod tests {
             .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, plan_cells);
         // The camera cell is (0, 0): the plan wants (0..3) in full and the ring out to 3.
@@ -6564,6 +6728,7 @@ mod tests {
             .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, plan_cells);
         app.world_mut()
@@ -6648,6 +6813,7 @@ mod tests {
             .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, plan_cells);
         app.world_mut()
@@ -6720,6 +6886,7 @@ mod tests {
             .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, plan_cells);
         app.world_mut()
@@ -6850,6 +7017,7 @@ mod tests {
             .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, (plan_cells, validate_streaming_lifecycle).chain());
         app.world_mut()
@@ -7202,6 +7370,7 @@ mod tests {
             .init_resource::<StreamingWorld>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, collect_cells);
         app.world_mut()
@@ -8515,6 +8684,43 @@ mod tests {
         assert_eq!(heights, vec![100.0]);
     }
 
+    /// Welded edge and corner samples have one neighbour per axis, so their stencil spans one
+    /// interval, not two. Dividing by the actual span keeps a planar slope's normal identical at
+    /// the interior, every edge and every corner, matching the converter's `decode_normals`.
+    #[test]
+    fn welded_edge_and_corner_normals_match_the_interior_on_a_planar_slope() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        let width = usize::from(terrain.width);
+        // Rises 40 units per interval eastwards and 20 per interval northwards.
+        for y in 0..width {
+            for x in 0..width {
+                terrain.heights[y * width + x] = 40.0 * x as f32 + 20.0 * y as f32;
+            }
+        }
+        let last = width - 1;
+        let interior = 16 * width + 16;
+        let samples = [
+            interior,
+            16 * width,          // west edge
+            16 * width + last,   // east edge
+            16,                  // south edge
+            last * width + 16,   // north edge
+            0,                   // south-west corner
+            last * width + last, // north-east corner
+        ];
+        recompute_packed_normals(&mut terrain, &samples);
+        let expected = terrain.normals[interior * 3..interior * 3 + 3].to_vec();
+        // (-40/128, -20/128, 1) normalized and scaled by 127.
+        assert_eq!(expected, vec![-37, -19, 120]);
+        for index in samples {
+            assert_eq!(
+                &terrain.normals[index * 3..index * 3 + 3],
+                expected.as_slice(),
+                "sample {index} disagrees with the interior normal"
+            );
+        }
+    }
+
     #[test]
     fn rejects_more_than_six_layers_per_quadrant() {
         let mut terrain = terrain_fixture(1, 0.0);
@@ -9134,6 +9340,7 @@ mod tests {
         .insert_resource(EngineConfig::default())
         .init_resource::<StreamingMetrics>()
         .init_resource::<StreamingWorld>()
+        .init_resource::<lod::LodStreaming>()
         .init_resource::<TerrainContinuity>()
         .init_resource::<ProfilingState>()
         .init_resource::<DiagnosticFallbackAssets>()
@@ -9768,5 +9975,124 @@ mod tests {
             "unexpected failure reason: {:?}",
             failure.dependency_chain
         );
+    }
+
+    #[test]
+    fn one_commit_budget_alternates_priority_without_starving_cells_or_lod() {
+        let mut budget = StreamingCommitBudget {
+            remaining: 1,
+            ..Default::default()
+        };
+        budget.reserve_for_lod(true, 1);
+        assert_eq!(budget.remaining_for_cells(), 1);
+        budget.lod_priority = true;
+        budget.reserve_for_lod(true, 1);
+        assert_eq!(budget.remaining_for_cells(), 0);
+        budget.reserve_for_lod(false, 1);
+        assert_eq!(budget.remaining_for_cells(), 1);
+        budget.remaining = 2;
+        budget.lod_priority = false;
+        budget.reserve_for_lod(true, 2);
+        assert_eq!(budget.remaining_for_cells(), 1);
+        budget.remaining -= 1;
+        assert_eq!(
+            budget.remaining_for_cells(),
+            0,
+            "reservation survives a near-cell commit"
+        );
+        budget.remaining = 0;
+        assert_eq!(budget.remaining_for_cells(), 0);
+    }
+
+    #[test]
+    fn collision_authored_under_the_pre_rename_key_still_loads() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        let root = app.world_mut().spawn_empty().id();
+        // Built from JSON rather than a struct literal, so a field added to `CollisionAsset`
+        // with a serde default does not break this test.
+        let mut asset: CollisionAsset = serde_json::from_value(serde_json::json!({
+            "version": COLLISION_ASSET_VERSION,
+            "authored": true,
+            "shapes": [],
+            "skipped": [],
+        }))
+        .unwrap();
+        asset.shapes.push(CollisionShape::Box {
+            center: [0.0, 5.0, 0.0],
+            half_extents: [10.0, 5.0, 10.0],
+        });
+        // The key is built in two halves so scripts/rename-to-mudcrab.py leaves it alone.
+        let old_key = ["openSkyrim", "Collision"].concat();
+        app.world_mut().spawn((
+            GltfSceneExtras {
+                value: serde_json::json!({ old_key: asset }).to_string(),
+            },
+            ChildOf(root),
+        ));
+        let decision = app
+            .world_mut()
+            .run_system_once(
+                move |children: Query<&Children>,
+                      scene_extras: Query<&GltfSceneExtras>,
+                      transforms: SpawnedNodeQuery,
+                      primitives: RenderPrimitiveQuery,
+                      meshes: Res<Assets<Mesh>>,
+                      materials: Res<Assets<StandardMaterial>>| {
+                    static_collision_from_hierarchy(
+                        Some("STAT"),
+                        "meshes/architecture/farmhouse/inn01.glb",
+                        root,
+                        &children,
+                        &scene_extras,
+                        &transforms,
+                        &primitives,
+                        &meshes,
+                        &materials,
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(decision, StaticCollisionDecision::Authored(_, _)));
+    }
+
+    /// Welded edge and corner samples have one neighbour per axis, so their stencil spans one
+    /// interval, not two. Dividing by the actual span keeps a planar slope's normal identical at
+    /// the interior, every edge and every corner, matching the converter's `decode_normals`.
+    #[test]
+    fn welded_edge_and_corner_normals_match_the_interior_on_a_planar_slope() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        let width = usize::from(terrain.width);
+        // Rises 40 units per interval eastwards and 20 per interval northwards.
+        for y in 0..width {
+            for x in 0..width {
+                terrain.heights[y * width + x] = 40.0 * x as f32 + 20.0 * y as f32;
+            }
+        }
+        let last = width - 1;
+        let interior = 16 * width + 16;
+        let samples = [
+            interior,
+            16 * width,          // west edge
+            16 * width + last,   // east edge
+            16,                  // south edge
+            last * width + 16,   // north edge
+            0,                   // south-west corner
+            last * width + last, // north-east corner
+        ];
+        recompute_packed_normals(&mut terrain, &samples);
+        let expected = terrain.normals[interior * 3..interior * 3 + 3].to_vec();
+        // (-40/128, -20/128, 1) normalized and scaled by 127.
+        assert_eq!(expected, vec![-37, -19, 120]);
+        for index in samples {
+            assert_eq!(
+                &terrain.normals[index * 3..index * 3 + 3],
+                expected.as_slice(),
+                "sample {index} disagrees with the interior normal"
+            );
+        }
     }
 }

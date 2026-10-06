@@ -917,7 +917,7 @@ fn run_shots(
     mut run: ResMut<ShotsRun>,
     mut active: ResMut<ActiveCell>,
     mut origin: ResMut<RenderOrigin>,
-    mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    mut roots: crate::streaming::CellRootTransforms,
     mut camera: Query<(&mut Transform, &mut Projection), With<StreamingCamera>>,
     streaming: Option<Res<StreamingWorld>>,
     metrics: Option<Res<StreamingMetrics>>,
@@ -1298,7 +1298,7 @@ fn place_camera(
     target: SpaceTarget,
     active: &mut ActiveCell,
     origin: &mut RenderOrigin,
-    roots: &mut Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    roots: &mut crate::streaming::CellRootTransforms,
     transform: &mut Transform,
     projection: &mut Projection,
 ) {
@@ -2032,7 +2032,7 @@ mod tests {
         let mut world = World::new();
         world.spawn((ExteriorCellGrid(IVec2::new(18, 18)), Transform::default()));
         let mut state = SystemState::<
-            Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+            crate::streaming::CellRootTransforms,
         >::new(&mut world);
         let mut roots = state.get_mut(&mut world).unwrap();
 
@@ -2082,7 +2082,7 @@ mod tests {
             Transform::from_xyz(1.0, 0.0, 1.0),
         ));
         let mut state = SystemState::<
-            Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+            crate::streaming::CellRootTransforms,
         >::new(&mut world);
         let mut roots = state.get_mut(&mut world).unwrap();
 

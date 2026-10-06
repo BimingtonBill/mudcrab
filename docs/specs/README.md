@@ -1,6 +1,6 @@
-# OpenSkyrim Technical Specifications (`docs/specs/`)
+# Mudcrab Technical Specifications (`docs/specs/`)
 
-Comprehensive technical architecture specifications, asset converter pipelines, rendering optimizations, and modding subsystem designs for **OpenSkyrim**.
+Comprehensive technical architecture specifications, asset converter pipelines, rendering optimizations, and modding subsystem designs for **Mudcrab**.
 
 ---
 
@@ -50,6 +50,7 @@ Offline asset transpilation specs handled by the `converter` crate:
 
 Core runtime specifications handled by the `engine` and `scripting` crates:
 
+- **[`landscape-texture-scale.md`](engine/landscape-texture-scale.md)** — Shared default LAND texture frequency, evidence, and terrain LOD agreement.
 - 📄 **[`architecture.md`](engine/architecture.md)** — 4-crate Cargo workspace structure, Bevy ECS setup, and `crates/scripting` isolation.
 - 📄 **[`vercidium-optimizations.md`](engine/vercidium-optimizations.md)** — GPU instanced indirect rendering (`DrawMeshInstancedIndirect`) and GPU culling.
 - 📄 **[`bevy-examples.md`](engine/bevy-examples.md)** — Code examples mapping Bevy 0.19 patterns to engine subsystems.
@@ -66,6 +67,6 @@ Scripting, type definitions, UI, and launcher specifications:
 
 Project domain glossary and system benchmarks:
 
-- 📄 **[`context.md`](meta/context.md)** — OpenSkyrim canonical terms and domain glossary.
+- 📄 **[`context.md`](meta/context.md)** — Mudcrab canonical terms and domain glossary.
 - 📄 **[`platforms.md`](meta/platforms.md)** — Cross-platform target matrix (Windows, Linux, macOS, Android ARM64, WASM).
-- 📄 **[`requirements.md`](meta/requirements.md)** — Official Skyrim SE vs OpenSkyrim hardware system specs comparison.
+- 📄 **[`requirements.md`](meta/requirements.md)** — Official Skyrim SE vs Mudcrab hardware system specs comparison.

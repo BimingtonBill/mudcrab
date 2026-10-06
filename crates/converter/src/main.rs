@@ -3,7 +3,7 @@ use color_eyre::{
     eyre::{WrapErr, bail},
 };
 use converter::{
-    AssetPipeline, PipelineConfig, PipelineReport, ProgressEvent, ProgressStage,
+    AssetPipeline, PipelineConfig, PipelineReport, ProgressEvent, ProgressStage, TextureEncoder,
     pipeline::{Cancellation, Interrupted, PipelineFailure},
     progress::{ProgressRenderer, format_bytes, format_elapsed},
 };
@@ -23,12 +23,15 @@ struct Cli {
     data: PathBuf,
     output: PathBuf,
     resume_staging: Option<PathBuf>,
+    reuse_assets: Option<PathBuf>,
     report_json: Option<PathBuf>,
     cpu_jobs: Option<usize>,
     io_jobs: Option<usize>,
+    texture_encoder: TextureEncoder,
     fail_fast: bool,
     invalidate_cache: bool,
     verify_cache: bool,
+    no_lod: bool,
     verbose: bool,
 }
 
@@ -132,6 +135,7 @@ impl RunWatch {
     }
 }
 
+/// Parses the command line, runs the conversion (or `check`) and reports its progress and result.
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -149,11 +153,14 @@ async fn main() -> Result<()> {
         Command::Convert(cli) => cli,
         Command::Check(check) => std::process::exit(run_check(&check)),
     };
+    validate_metadata_report_path(&cli)?;
     let mut config = PipelineConfig::new(cli.data.clone(), cli.output.clone());
     config.resume_staging = cli.resume_staging.clone();
     config.fail_fast = cli.fail_fast;
     config.invalidate_cache = cli.invalidate_cache;
     config.verify_cache = cli.verify_cache;
+    config.no_lod = cli.no_lod;
+    config.texture_encoder = cli.texture_encoder;
     if let Some(cpu_jobs) = cli.cpu_jobs {
         config.cpu_jobs = cpu_jobs;
     }
@@ -198,16 +205,20 @@ async fn main() -> Result<()> {
         }
         watch
     });
-
     // Ctrl+C stops the run at the next safe point and keeps the staging folder; a second one ends
     // the process where it stands.
     let cancellation = Cancellation::new();
     let interrupt = cancellation.clone();
+    let metadata_rebuild = cli.reuse_assets.is_some();
     tokio::spawn(async move {
         let mut received = 0;
         while tokio::signal::ctrl_c().await.is_ok() {
             received += 1;
-            if received == 1 {
+            if received == 1 && metadata_rebuild {
+                eprintln!(
+                    "\nMetadata rebuild continues: it cannot cooperatively stop or resume. Press Ctrl+C again to force exit; its staging directory will require manual cleanup."
+                );
+            } else if received == 1 {
                 eprintln!(
                     "\nInterrupted: finishing the work in flight, then stopping. The staging folder is kept, so the run can be resumed."
                 );
@@ -219,8 +230,17 @@ async fn main() -> Result<()> {
         }
     });
 
-    let pipeline_result =
-        AssetPipeline::run_async_with_cancel(config, tx, cancellation.clone()).await;
+    let pipeline_result = if let Some(source) = &cli.reuse_assets {
+        eprintln!(
+            "Reusing manifest-verified package assets from {}. Retained models, textures and scripts are not refreshed from Data; use normal conversion after source asset changes.",
+            source.display()
+        );
+        AssetPipeline::rebuild_metadata_async(config, source, tx)
+            .await
+            .map_err(converter::PipelineFailure::from)
+    } else {
+        AssetPipeline::run_async_with_cancel(config, tx, cancellation.clone()).await
+    };
     let watch = printer.await?;
     let report = match pipeline_result {
         Ok(report) => report,
@@ -247,11 +267,7 @@ async fn main() -> Result<()> {
         );
     }
     if !report.complete {
-        let skipped = report.warnings.len();
-        eprintln!(
-            "Conversion incomplete: {skipped} input(s) were skipped. The output was published anyway; the manifest lists what is missing: {}",
-            cli.output.join("conversion-manifest.json").display()
-        );
+        eprintln!("{}", incomplete_summary(&report, &cli.output));
         for warning in report.warnings.iter().take(RunWatch::NAMED_FAILURES) {
             eprintln!("    {warning}");
         }
@@ -260,9 +276,34 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Reports failures and skipped inputs separately: an asset-integration failure is a failure
+/// without a skipped input, and its details live in `integration-report.json`, not the manifest.
+fn incomplete_summary(report: &PipelineReport, output: &Path) -> String {
+    let mut summary = format!(
+        "Conversion incomplete: {} failure(s), {} input(s) skipped. The output was published anyway; the manifest lists what is missing: {}",
+        report.warnings.len(),
+        report.skipped,
+        output.join("conversion-manifest.json").display()
+    );
+    if report
+        .integration
+        .as_ref()
+        .is_some_and(|integration| !integration.passed)
+    {
+        summary.push_str(&format!(
+            "; asset integration details: {}",
+            output.join("integration-report.json").display()
+        ));
+    }
+    summary
+}
+
 /// The summary a finished run prints: what it produced, how long it took, and where to look.
 fn print_summary(cli: &Cli, report: &PipelineReport, clock: &StageClock) {
     println!("{}", summary_headline(report));
+    for notice in &report.notices {
+        println!("  note: {notice}");
+    }
     let (bytes, files) = artifact_size(&cli.output, &report.artifacts);
     println!(
         "  output: {} in {} artifacts ({})",
@@ -285,8 +326,11 @@ fn print_summary(cli: &Cli, report: &PipelineReport, clock: &StageClock) {
 fn summary_headline(report: &PipelineReport) -> String {
     let elapsed = format_elapsed(report.elapsed_ms as f64 / 1000.0);
     let counts = format!(
-        "converted {}, reused {}, failed {}",
-        report.converted, report.cache_hits, report.skipped
+        "converted {}, reused {}, failed {}, skipped {}",
+        report.converted,
+        report.cache_hits,
+        report.warnings.len(),
+        report.skipped
     );
     if report.complete {
         format!("Conversion complete in {elapsed}: {counts}")
@@ -388,12 +432,23 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
     } else {
         program.to_owned()
     };
-    format!(
+    let mut command = format!(
         "{program} \"{}\" \"{}\" --resume-staging \"{}\"",
         cli.data.display(),
         cli.output.display(),
         staging.display()
-    )
+    );
+    // A resumed run must keep the texture encoder: GPU-encoded textures are cached under their
+    // own label, so resuming on the CPU would convert them again.
+    if let TextureEncoder::Gpu { quality, batch_mb } = cli.texture_encoder {
+        command.push_str(&format!(
+            " --texture-encoder gpu --gpu-quality {quality} --gpu-batch-mb {batch_mb}"
+        ));
+    }
+    if cli.no_lod {
+        command.push_str(" --no-lod");
+    }
+    command
 }
 
 fn write_status(text: &str) {
@@ -455,6 +510,22 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     }
     if backup.exists() {
         fs::remove_file(backup)?;
+    }
+    Ok(())
+}
+
+fn validate_metadata_report_path(cli: &Cli) -> Result<()> {
+    let (Some(source), Some(report)) = (&cli.reuse_assets, &cli.report_json) else {
+        return Ok(());
+    };
+    let report = shared::asset_lock::resolve_asset_path(report)
+        .wrap_err_with(|| format!("failed to resolve metadata report {}", report.display()))?;
+    for root in [source, &cli.data, &cli.output] {
+        let root = shared::asset_lock::resolve_asset_path(root)?;
+        color_eyre::eyre::ensure!(
+            !report.starts_with(root),
+            "metadata report must be outside source, Data, and output directories"
+        );
     }
     Ok(())
 }
@@ -575,15 +646,21 @@ fn parse_check(args: impl Iterator<Item = OsString>) -> Result<CheckCli> {
     })
 }
 
+/// Parses the arguments of a conversion run.
 fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut positional = Vec::new();
     let mut report_json = None;
     let mut resume_staging = None;
+    let mut reuse_assets = None;
     let mut cpu_jobs = None;
     let mut io_jobs = None;
+    let mut use_gpu = false;
+    let mut gpu_quality = None;
+    let mut gpu_batch_mb = None;
     let mut fail_fast = false;
     let mut invalidate_cache = false;
     let mut verify_cache = true;
+    let mut no_lod = false;
     let mut verbose = false;
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
@@ -593,6 +670,9 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
             }
             Some("--resume-staging") => {
                 resume_staging = Some(PathBuf::from(next_value(&mut args, "--resume-staging")?))
+            }
+            Some("--reuse-assets") => {
+                reuse_assets = Some(PathBuf::from(next_value(&mut args, "--reuse-assets")?))
             }
             Some("--cpu-jobs") => {
                 cpu_jobs = Some(parse_jobs(
@@ -606,9 +686,30 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
                     "--io-jobs",
                 )?)
             }
+            Some("--texture-encoder") => {
+                let value = next_value(&mut args, "--texture-encoder")?;
+                use_gpu = match value.to_str() {
+                    Some("cpu") => false,
+                    Some("gpu") => true,
+                    _ => bail!("--texture-encoder must be cpu or gpu"),
+                };
+            }
+            Some("--gpu-quality") => {
+                gpu_quality = Some(parse_u32(
+                    next_value(&mut args, "--gpu-quality")?,
+                    "--gpu-quality",
+                )?);
+            }
+            Some("--gpu-batch-mb") => {
+                gpu_batch_mb = Some(parse_u64(
+                    next_value(&mut args, "--gpu-batch-mb")?,
+                    "--gpu-batch-mb",
+                )?);
+            }
             Some("--fail-fast") => fail_fast = true,
             Some("--invalidate-cache") => invalidate_cache = true,
             Some("--no-verify-cache") => verify_cache = false,
+            Some("--no-lod") => no_lod = true,
             Some("--verbose") => verbose = true,
             Some("--help" | "-h") => bail!(usage()),
             Some(flag) if flag.starts_with('-') => bail!("unknown option {flag}\n{}", usage()),
@@ -618,18 +719,32 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     if positional.is_empty() || positional.len() > 2 {
         bail!(usage());
     }
+    let texture_encoder = if use_gpu {
+        TextureEncoder::Gpu {
+            quality: gpu_quality.unwrap_or(converter::texture_gpu::DEFAULT_QUALITY),
+            batch_mb: gpu_batch_mb.unwrap_or(converter::texture_gpu::DEFAULT_BATCH_MB),
+        }
+    } else {
+        if gpu_quality.is_some() || gpu_batch_mb.is_some() {
+            bail!("--gpu-quality and --gpu-batch-mb require --texture-encoder gpu");
+        }
+        TextureEncoder::Cpu
+    };
     Ok(Cli {
         data: positional.remove(0),
         output: positional
             .pop()
             .unwrap_or_else(|| PathBuf::from("modern_assets")),
         resume_staging,
+        reuse_assets,
         report_json,
         cpu_jobs,
         io_jobs,
+        texture_encoder,
         fail_fast,
         invalidate_cache,
         verify_cache,
+        no_lod,
         verbose,
     })
 }
@@ -647,13 +762,36 @@ fn parse_jobs(value: OsString, option: &str) -> Result<usize> {
         .wrap_err_with(|| format!("{option} requires a positive integer"))
 }
 
+/// Parses the value of an option that takes a non-negative integer.
+fn parse_u32(value: OsString, option: &str) -> Result<u32> {
+    value
+        .to_str()
+        .ok_or_else(|| color_eyre::eyre::eyre!("{option} value is not valid UTF-8"))?
+        .parse()
+        .wrap_err_with(|| format!("{option} requires a nonnegative integer"))
+}
+
+/// Parses the value of an option that takes a positive integer.
+fn parse_u64(value: OsString, option: &str) -> Result<u64> {
+    value
+        .to_str()
+        .ok_or_else(|| color_eyre::eyre::eyre!("{option} value is not valid UTF-8"))?
+        .parse()
+        .wrap_err_with(|| format!("{option} requires a positive integer"))
+}
+
+/// The help text printed for `--help` and after a usage error.
 fn usage() -> &'static str {
     "usage: converter <Skyrim Data> [output directory] [--cpu-jobs N] [--io-jobs N] [--fail-fast]
+                 [--texture-encoder cpu|gpu] [--gpu-quality N] [--gpu-batch-mb N]
                  [--invalidate-cache] [--no-verify-cache] [--resume-staging DIR]
-                 [--report-json FILE] [--verbose]
+                 [--report-json FILE] [--verbose] [--reuse-assets DIR] [--no-lod]
        converter check <output directory> [--full]
 
 Converts a Skyrim Data directory into runtime assets.
+
+--no-lod skips terrain LOD compilation in conversion and metadata rebuilds. Full-detail
+terrain and ordinary assets remain available. Omit it on a later run to build LOD.
 
 While it runs, one status line is redrawn on the terminal, four times a second at most:
 
@@ -667,12 +805,84 @@ resumes where it stopped is printed when the run stops. A second Ctrl+C exits im
 
 converter check compares a converted output with its conversion-manifest.json without converting:
 the existence and size of every file, and with --full their hashes too. Exit code 0: all good,
-1: problems found, 2: no readable manifest."
+1: problems found, 2: no readable manifest.
+
+--reuse-assets rebuilds metadata while preserving manifest-verified assets from an existing
+package. Data supplies matching plugins, LOD settings and terrain diffuse inputs; retained
+models, textures and scripts are not refreshed from Data. Use normal conversion after
+changing those source assets. This route cannot resume or cooperatively cancel."
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_metadata_rebuild_source() {
+        let cli = parse_cli(
+            ["Data", "derived", "--reuse-assets", "original"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(cli.reuse_assets, Some(PathBuf::from("original")));
+    }
+
+    #[test]
+    fn metadata_reports_cannot_overwrite_source_data_or_generated_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        let source = directory.path().join("source");
+        let output = directory.path().join("derived");
+        for path in [&data, &source, &output] {
+            fs::create_dir(path).unwrap();
+        }
+        for root in [&source, &data, &output] {
+            let cli = parse_cli(vec![
+                data.clone().into_os_string(),
+                output.clone().into_os_string(),
+                OsString::from("--reuse-assets"),
+                source.clone().into_os_string(),
+                OsString::from("--report-json"),
+                root.join("new/nested/metadata.json").into_os_string(),
+            ])
+            .unwrap();
+            assert!(validate_metadata_report_path(&cli).is_err());
+        }
+    }
+
+    #[test]
+    fn metadata_reports_accept_missing_disjoint_parent_without_creating_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        let source = directory.path().join("source");
+        fs::create_dir(&data).unwrap();
+        fs::create_dir(&source).unwrap();
+        let reports = directory.path().join("new/nested");
+        let cli = parse_cli(vec![
+            data.into_os_string(),
+            directory.path().join("derived").into_os_string(),
+            OsString::from("--reuse-assets"),
+            source.into_os_string(),
+            OsString::from("--report-json"),
+            reports.join("metadata.json").into_os_string(),
+        ])
+        .unwrap();
+        validate_metadata_report_path(&cli).unwrap();
+        assert!(!reports.exists());
+    }
+
+    #[test]
+    fn formats_elapsed_time_for_log_lines() {
+        assert_eq!(format_elapsed(0.0), "0:00:00.0");
+        assert_eq!(format_elapsed(62.25), "0:01:02.3");
+        assert_eq!(
+            format_elapsed(5.0 * 3600.0 + 7.0 * 60.0 + 9.94),
+            "5:07:09.9"
+        );
+        assert_eq!(format_elapsed(59.96), "0:01:00.0");
+    }
 
     #[test]
     fn stage_clock_keeps_first_and_last_event_of_overlapping_stages() {
@@ -814,18 +1024,22 @@ mod tests {
         );
     }
 
+    /// The resume command repeats the paths, quotes them, and keeps the GPU encoder flags.
     #[test]
     fn names_the_exact_command_that_resumes_a_kept_staging_folder() {
         let cli = Cli {
             data: PathBuf::from("C:/Games/Skyrim/Data"),
             output: PathBuf::from("C:/Modding/SkyrimConverted"),
             resume_staging: None,
+            reuse_assets: None,
             report_json: None,
             cpu_jobs: None,
             io_jobs: None,
+            texture_encoder: TextureEncoder::Cpu,
             fail_fast: false,
             invalidate_cache: false,
             verify_cache: true,
+            no_lod: false,
             verbose: false,
         };
         let staging = Path::new("C:/Modding/SkyrimConverted.staging-1-2");
@@ -840,6 +1054,57 @@ mod tests {
         );
         // The test binary itself stands in for the running converter.
         assert!(!program_name().is_empty());
+        let no_lod = parse_cli(vec!["Data".into(), "--no-lod".into()]).unwrap();
+        assert!(no_lod.no_lod);
+        assert!(resume_command("converter", &no_lod, staging).ends_with(" --no-lod"));
+        // A GPU run resumes on the GPU.
+        let gpu = Cli {
+            texture_encoder: TextureEncoder::Gpu {
+                quality: 2,
+                batch_mb: 256,
+            },
+            ..cli
+        };
+        assert!(
+            resume_command("converter.exe", &gpu, staging)
+                .ends_with(" --texture-encoder gpu --gpu-quality 2 --gpu-batch-mb 256")
+        );
+    }
+
+    /// Integration failures count as failures without skipped inputs and point to the
+    /// integration report; advisory notices are never counted.
+    #[test]
+    fn incomplete_summary_counts_integration_warnings_but_not_notices() {
+        let mut report = PipelineReport {
+            warnings: vec!["asset integration failed: 1 missing models".into()],
+            notices: vec!["nested plugins ignored".into(), "another advisory".into()],
+            integration: Some(converter::IntegrationReport {
+                passed: false,
+                ..Default::default()
+            }),
+            ..PipelineReport::default()
+        };
+        assert_eq!(report.skipped, 0);
+        let summary = incomplete_summary(&report, Path::new("modern"));
+        assert!(
+            summary.starts_with("Conversion incomplete: 1 failure(s), 0 input(s) skipped."),
+            "{summary}"
+        );
+        assert!(summary.contains("integration-report.json"), "{summary}");
+
+        // A skipped input with a passing integration does not mention the integration report.
+        report.integration = Some(converter::IntegrationReport {
+            passed: true,
+            ..Default::default()
+        });
+        report.warnings = vec!["textures/bad.dds: not a DDS".into()];
+        report.skipped = 1;
+        let summary = incomplete_summary(&report, Path::new("modern"));
+        assert!(
+            summary.starts_with("Conversion incomplete: 1 failure(s), 1 input(s) skipped."),
+            "{summary}"
+        );
+        assert!(!summary.contains("integration-report.json"), "{summary}");
     }
 
     #[test]
@@ -854,15 +1119,32 @@ mod tests {
         };
         assert_eq!(
             summary_headline(&report),
-            "Conversion complete in 0:01:02.3: converted 10, reused 4, failed 0"
+            "Conversion complete in 0:01:02.3: converted 10, reused 4, failed 0, skipped 0"
         );
 
         report.skipped = 2;
+        report.warnings = vec!["bad mesh".into(), "bad texture".into()];
         report.complete = false;
         assert_eq!(
             summary_headline(&report),
-            "Conversion finished in 0:01:02.3, incomplete: converted 10, reused 4, failed 2"
+            "Conversion finished in 0:01:02.3, incomplete: converted 10, reused 4, failed 2, skipped 2"
         );
+    }
+
+    /// The headline counts integration failures even when no input was skipped, excluding notices.
+    #[test]
+    fn summary_headline_counts_integration_failures_without_skipped_inputs() {
+        let report = PipelineReport {
+            warnings: vec!["asset integration failed: 1 missing models".into()],
+            notices: vec!["nested plugins ignored".into()],
+            integration: Some(converter::IntegrationReport {
+                passed: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(report.skipped, 0);
+        assert!(summary_headline(&report).ends_with("failed 1, skipped 0"));
     }
 
     #[test]
@@ -928,6 +1210,42 @@ mod tests {
             stop_cause(&failure(color_eyre::eyre::eyre!("disk full"))).as_deref(),
             Some("disk full")
         );
+    }
+
+    /// The GPU encoder flags reach the parsed configuration.
+    #[test]
+    fn parses_gpu_texture_options() {
+        let cli = parse_cli(
+            [
+                "Data",
+                "--texture-encoder",
+                "gpu",
+                "--gpu-quality",
+                "3",
+                "--gpu-batch-mb",
+                "128",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            cli.texture_encoder,
+            TextureEncoder::Gpu {
+                quality: 3,
+                batch_mb: 128
+            }
+        );
+        // GPU settings without the GPU encoder are a mistake, not a no-op.
+        let error = parse_cli(
+            ["Data", "--gpu-quality", "3"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--texture-encoder gpu"));
     }
 
     #[test]

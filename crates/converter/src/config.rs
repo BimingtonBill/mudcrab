@@ -1,6 +1,26 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Path, PathBuf},
+};
+
+/// Which encoder turns DDS textures into UASTC KTX2.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextureEncoder {
+    /// Basis Universal on the CPU (UASTC level `texture_uastc_level`).
+    #[default]
+    Cpu,
+    /// wgpu compute shader, batched across textures (`texture_gpu`).
+    /// Falls back to the CPU encoder when no GPU is available.
+    Gpu {
+        /// Endpoint refinement passes (0 = fastest).
+        quality: u32,
+        /// Texel megabytes packed into one GPU dispatch.
+        batch_mb: u64,
+    },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
@@ -13,6 +33,16 @@ pub struct PipelineConfig {
     #[serde(skip)]
     pub cache_dir: Option<PathBuf>,
     pub plugins_file: Option<PathBuf>,
+    /// Explicit per-worldspace LOD origins for custom worlds, keyed by
+    /// worldspace editor id: `[grid_x, grid_y]`. Installed worlds read
+    /// `lodsettings/<WorldspaceEDID>.lod` instead; a world with neither gets
+    /// no LOD, never an assumed origin of zero (GEOM-02).
+    #[serde(default)]
+    pub lod_origins: BTreeMap<String, [i32; 2]>,
+    /// Skip generated terrain LOD in both conversion routes. Asset byte contracts
+    /// are unchanged; generated database/LOD outputs are rebuilt on every run.
+    #[serde(default)]
+    pub no_lod: bool,
     pub cpu_jobs: usize,
     pub io_jobs: usize,
     pub enable_ba2: bool,
@@ -28,6 +58,8 @@ pub struct PipelineConfig {
     /// Zstandard level for per-mip KTX2 supercompression (0 = off).
     #[serde(default = "default_texture_zstd_level")]
     pub texture_zstd_level: i32,
+    #[serde(default)]
+    pub texture_encoder: TextureEncoder,
     pub script_abi_version: u32,
 }
 
@@ -36,6 +68,7 @@ fn default_texture_zstd_level() -> i32 {
 }
 
 impl PipelineConfig {
+    /// A configuration with the default settings for converting `data_dir` into `output_dir`.
     pub fn new(data_dir: impl Into<PathBuf>, output_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
@@ -43,6 +76,8 @@ impl PipelineConfig {
             resume_staging: None,
             cache_dir: None,
             plugins_file: None,
+            lod_origins: BTreeMap::new(),
+            no_lod: false,
             cpu_jobs: std::thread::available_parallelism().map_or(1, usize::from),
             io_jobs: 2,
             enable_ba2: true,
@@ -52,6 +87,7 @@ impl PipelineConfig {
             texture_fallback_quality: 192,
             texture_uastc_level: 2,
             texture_zstd_level: default_texture_zstd_level(),
+            texture_encoder: TextureEncoder::Cpu,
             script_abi_version: 1,
         }
     }
@@ -70,6 +106,7 @@ impl PipelineConfig {
             .with_file_name(format!("{file_name}.assets-cache"))
     }
 
+    /// Checks that the directories and settings can be used for a run.
     pub(crate) fn validate(&self) -> color_eyre::Result<()> {
         color_eyre::eyre::ensure!(
             self.data_dir.is_dir(),
@@ -86,6 +123,13 @@ impl PipelineConfig {
             self.texture_uastc_level <= 4,
             "texture_uastc_level must be between 0 and 4"
         );
+        if let TextureEncoder::Gpu { quality, batch_mb } = self.texture_encoder {
+            color_eyre::eyre::ensure!(quality <= 8, "GPU quality must be between 0 and 8");
+            color_eyre::eyre::ensure!(
+                (1..=4096).contains(&batch_mb),
+                "GPU batch size must be between 1 and 4096 MiB"
+            );
+        }
         color_eyre::eyre::ensure!(
             (0..=22).contains(&self.texture_zstd_level),
             "texture_zstd_level must be between 0 and 22"
@@ -328,6 +372,35 @@ fn parent_or_cwd(path: &Path) -> &Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_v90_accepts_legacy_configs_without_inventing_lod_origins() {
+        let mut legacy = serde_json::json!({
+            "data_dir": "Data",
+            "output_dir": "modern_assets",
+            "plugins_file": null,
+            "cpu_jobs": 2,
+            "io_jobs": 2,
+            "enable_ba2": true,
+            "fail_fast": false,
+            "invalidate_cache": false,
+            "verify_cache": true,
+            "texture_etc1s_quality": 192,
+            "texture_uastc_level": 2,
+            "texture_zstd_level": 6,
+            "script_abi_version": 1
+        });
+        let config: PipelineConfig = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(config.lod_origins.is_empty());
+        assert!(!config.no_lod);
+        assert_eq!(config.texture_encoder, TextureEncoder::Cpu);
+        assert_eq!(config.data_dir, PathBuf::from("Data"));
+        assert_eq!(config.cpu_jobs, 2);
+
+        legacy["lod_origins"] = serde_json::json!({"GeneratedWorld": [-4, 12]});
+        let explicit: PipelineConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(explicit.lod_origins["GeneratedWorld"], [-4, 12]);
+    }
 
     #[test]
     fn finds_the_newest_staging_folder_beside_the_output() {

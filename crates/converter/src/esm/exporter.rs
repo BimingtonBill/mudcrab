@@ -1,6 +1,7 @@
 use crate::esm::{
     directional_material::{directional_material, static_directional_material},
     extractors::{SubrecordView, extract_cell_info, extract_land_data, serialize_subrecords},
+    load_order::LoadOrder,
     lighting::{
         Climate, GROUP_AMBIENT, GROUP_FOG_FAR, GROUP_FOG_NEAR, GROUP_SKY_LOWER, GROUP_SKY_UPPER,
         GROUP_SUN, GROUP_SUNLIGHT, Lighting, Weather, cell_lighting, packed_luma, parse_climate,
@@ -91,6 +92,7 @@ fn optional_race_movement_link(
     Ok((value != 0).then_some(value))
 }
 
+/// Creates any missing world-database tables and stamps an empty database with the current schema.
 pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"PRAGMA foreign_keys = ON;
@@ -105,7 +107,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_records_type ON records(record_type);
          CREATE INDEX IF NOT EXISTS idx_records_cell_id ON records(cell_id) WHERE cell_id IS NOT NULL;
          CREATE TABLE IF NOT EXISTS worldspaces (
-             id INTEGER PRIMARY KEY, editor_id TEXT NOT NULL, parent_world INTEGER, flags INTEGER NOT NULL
+             id INTEGER PRIMARY KEY, editor_id TEXT NOT NULL, parent_world INTEGER, flags INTEGER NOT NULL,
+             lod_origin_x INTEGER, lod_origin_y INTEGER
          );
          CREATE TABLE IF NOT EXISTS cells (
              id INTEGER PRIMARY KEY, worldspace_id INTEGER, grid_x INTEGER, grid_y INTEGER,
@@ -118,7 +121,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
              local_x REAL, local_y REAL, rot_x REAL NOT NULL, rot_y REAL NOT NULL,
              rot_z REAL NOT NULL, scale REAL NOT NULL DEFAULT 1.0,
-             radius_override REAL, data BLOB
+             radius_override REAL, header_flags INTEGER NOT NULL DEFAULT 0,
+             enable_parent_id INTEGER, enable_parent_flags INTEGER, data BLOB
          );
          CREATE INDEX IF NOT EXISTS idx_references_cell ON "references"(cell_id);
          CREATE VIRTUAL TABLE IF NOT EXISTS exterior_spatial USING rtree(
@@ -226,6 +230,21 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              cell_id INTEGER NOT NULL, lod_level INTEGER NOT NULL, mesh_data BLOB NOT NULL,
              PRIMARY KEY (cell_id, lod_level)
          );
+         CREATE TABLE IF NOT EXISTS lod_chunks (
+             worldspace_id INTEGER NOT NULL, tier INTEGER NOT NULL,
+             anchor_x INTEGER NOT NULL, anchor_y INTEGER NOT NULL,
+             payload_path TEXT NOT NULL, content_hash TEXT NOT NULL,
+             bounds_min_x REAL NOT NULL, bounds_min_y REAL NOT NULL, bounds_min_z REAL NOT NULL,
+             bounds_max_x REAL NOT NULL, bounds_max_y REAL NOT NULL, bounds_max_z REAL NOT NULL,
+             source_cells TEXT NOT NULL DEFAULT '',
+             PRIMARY KEY (worldspace_id, tier, anchor_x, anchor_y)
+         );
+         CREATE VIRTUAL TABLE IF NOT EXISTS lod_chunks_spatial USING rtree(
+             id, minX, maxX, minY, maxY, +worldspace_id, +tier, +anchor_x, +anchor_y
+         );
+         CREATE TABLE IF NOT EXISTS lod_build (
+             id INTEGER PRIMARY KEY CHECK (id = 1), build_identity TEXT NOT NULL
+         );
          CREATE INDEX IF NOT EXISTS idx_lod_tree_block ON lod_tree_instance(worldspace_id, block_x, block_y);
          CREATE TABLE IF NOT EXISTS waters (
              id INTEGER PRIMARY KEY, editor_id TEXT, opacity INTEGER, flags INTEGER NOT NULL,
@@ -241,6 +260,17 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS landscape_textures (
              id INTEGER PRIMARY KEY, editor_id TEXT, texture_set_id INTEGER,
              material_type INTEGER, friction REAL, restitution REAL
+         );
+         CREATE TABLE IF NOT EXISTS grass_types (
+             id INTEGER PRIMARY KEY, editor_id TEXT, model_path TEXT,
+             density INTEGER, min_slope INTEGER, max_slope INTEGER,
+             units_from_water INTEGER, water_comparison INTEGER,
+             position_range REAL, height_range REAL, color_range REAL,
+             wave_period REAL, flags INTEGER, load_order INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS landscape_texture_grasses (
+             ltex_id INTEGER NOT NULL, gras_id INTEGER NOT NULL,
+             PRIMARY KEY (ltex_id, gras_id)
          );
          CREATE TABLE IF NOT EXISTS scripts (
              form_id INTEGER NOT NULL, script_name TEXT NOT NULL,
@@ -291,11 +321,48 @@ fn add_column_if_missing(
 
 type CellMetadata = (Option<i32>, Option<i32>, Option<u32>);
 
+/// Export selected records without changing existing provenance. Grass records
+/// outside this subset are preserved; movement projections are rebuilt from it.
+/// Synthetic records without a source load order have no formid_map entry.
 pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Result<()> {
+    export_records(conn, master, None)
+}
+
+/// Export a complete effective load order, replacing both grass projections.
+/// Record stable owning-plugin/local-ID pairs separately from the winning
+/// override priority in records.load_order.
+pub fn export_to_db_with_load_order(
+    conn: &Connection,
+    master: &HashMap<u32, RawRecord>,
+    order: &LoadOrder,
+) -> Result<()> {
+    export_records(conn, master, Some(order))
+}
+
+/// Writes every merged record; with a load order, also records each record's
+/// owning plugin and plugin-local ID in `formid_map`.
+fn export_records(
+    conn: &Connection,
+    master: &HashMap<u32, RawRecord>,
+    order: Option<&LoadOrder>,
+) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM movement_types", [])?;
     tx.execute("DELETE FROM movement_game_settings", [])?;
     tx.execute("DELETE FROM race_movement_links", [])?;
+    // Only the load-order export owns a complete snapshot. The movement
+    // annotator uses export_to_db with a subset and must retain unrelated grass
+    // and the database's existing schema stamp.
+    if order.is_some() {
+        // A reused older database gains the current tables in create_tables;
+        // stamp it inside this transaction so a failed export keeps the old one.
+        tx.execute(
+            "UPDATE schema_info SET version=?1",
+            [shared::WORLD_DATABASE_SCHEMA_VERSION],
+        )?;
+        tx.execute("DELETE FROM landscape_texture_grasses", [])?;
+        tx.execute("DELETE FROM grass_types", [])?;
+    }
     let mut cells: HashMap<u32, CellMetadata> = HashMap::new();
 
     for (&form_id, record) in master
@@ -328,10 +395,18 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
             "INSERT OR REPLACE INTO records(form_id, record_type, cell_id, worldspace_id, load_order, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![form_id, type_str, record.cell_form_id, record.worldspace_form_id, record.load_order, blob],
         )?;
-        tx.execute(
-            "INSERT OR REPLACE INTO formid_map(form_id, plugin_name, internal_id, record_type) VALUES (?1, 'merged', ?1, ?2)",
-            params![form_id, type_str],
-        )?;
+        if let Some(order) = order {
+            let identity = order.identity(form_id).map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("record {form_id:08X}: {error}"),
+                )))
+            })?;
+            tx.execute(
+                "INSERT OR REPLACE INTO formid_map(form_id, plugin_name, internal_id, record_type) VALUES (?1, ?2, ?3, ?4)",
+                params![form_id, identity.plugin, identity.local_id, type_str],
+            )?;
+        }
 
         let view = SubrecordView::new(&record.subrecords);
         if let Some(vmad_bytes) = view.find(b"VMAD")
@@ -348,6 +423,9 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
         }
 
         match type_str {
+            "GRAS" => {
+                insert_grass(&tx, form_id, &view, record.load_order)?;
+            }
             "WRLD" => {
                 let view = SubrecordView::new(&record.subrecords);
                 let editor_id = view
@@ -365,6 +443,7 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
                     form_id,
                     cell_id,
                     cells.get(&cell_id).copied(),
+                    record.flags,
                     &record.subrecords,
                 )?;
             }
@@ -474,10 +553,12 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
             }
             "GMST" => {
                 let editor_id = view.get_string(b"EDID");
-                if matches!(
-                    editor_id.as_deref(),
-                    Some("fMoveCharWalkBase" | "fJumpHeightMin")
-                ) {
+                let movement_name = editor_id.as_deref().and_then(|name| {
+                    ["fMoveCharWalkBase", "fJumpHeightMin"]
+                        .into_iter()
+                        .find(|known| known.eq_ignore_ascii_case(name))
+                });
+                if let Some(editor_id) = movement_name {
                     let value = decode_movement_setting(&view, form_id)?;
                     tx.execute(
                         "INSERT OR REPLACE INTO movement_game_settings(id, editor_id, value, load_order) VALUES (?1, ?2, ?3, ?4)",
@@ -535,6 +616,23 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
                     "INSERT OR REPLACE INTO landscape_textures(id,editor_id,texture_set_id,material_type,friction,restitution) VALUES (?1,?2,?3,?4,?5,?6)",
                     params![form_id, view.get_string(b"EDID"), view.get_form_id(b"TNAM"), view.get_form_id(b"MNAM"), friction, restitution],
                 )?;
+                // An included LTEX always replaces its own list, including an
+                // empty list, even when other records are outside this export.
+                tx.execute(
+                    "DELETE FROM landscape_texture_grasses WHERE ltex_id=?1",
+                    [form_id],
+                )?;
+                for (_, data) in record.subrecords.iter().filter(|(tag, _)| tag == b"GNAM") {
+                    if let Ok(bytes) = <[u8; 4]>::try_from(data.as_slice()) {
+                        let grass_id = u32::from_le_bytes(bytes);
+                        if grass_id != 0 {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO landscape_texture_grasses(ltex_id, gras_id) VALUES (?1, ?2)",
+                                params![form_id, grass_id],
+                            )?;
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -553,6 +651,47 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
         [],
     )?;
     tx.commit()
+}
+
+/// Projects xEdit's TES5 GRAS/DATA layout without inventing missing fields.
+/// The complete payload is 32 bytes; unknown padding stays in records.data.
+/// See the primary definitions linked in the database schema specification.
+fn insert_grass(
+    tx: &Transaction<'_>,
+    form_id: u32,
+    view: &SubrecordView<'_>,
+    load_order: u32,
+) -> Result<()> {
+    let data = view.find(b"DATA").unwrap_or_default();
+    let float = |offset| {
+        data.get(offset..offset + 4)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(f32::from_le_bytes)
+            .filter(|value| value.is_finite())
+    };
+    let model = view
+        .get_string(b"MODL")
+        .and_then(|path| canonical_asset_path(&path, AssetKind::Mesh, "glb").ok());
+    tx.execute(
+        "INSERT OR REPLACE INTO grass_types(id, editor_id, model_path, density, min_slope, max_slope, units_from_water, water_comparison, position_range, height_range, color_range, wave_period, flags, load_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            form_id,
+            view.get_string(b"EDID"),
+            model,
+            data.first().copied(),
+            data.get(1).copied(),
+            data.get(2).copied(),
+            data.get(4..6).and_then(|bytes| <[u8; 2]>::try_from(bytes).ok()).map(u16::from_le_bytes),
+            data.get(8..12).and_then(|bytes| <[u8; 4]>::try_from(bytes).ok()).map(u32::from_le_bytes),
+            float(12),
+            float(16),
+            float(20),
+            float(24),
+            data.get(28).copied(),
+            load_order,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Publishes one resolved `space_lighting` row per interior cell and per
@@ -894,6 +1033,7 @@ pub fn insert_reference(
     form_id: u32,
     cell_id: u32,
     cell: Option<CellMetadata>,
+    header_flags: u32,
     subs: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<()> {
     let view = SubrecordView::new(subs);
@@ -933,11 +1073,21 @@ pub fn insert_reference(
         .find(b"XRDS")
         .filter(|bytes| bytes.len() >= 4)
         .map(|bytes| f32::from_le_bytes(bytes[..4].try_into().expect("four-byte XRDS radius")));
+    let (enable_parent_id, enable_parent_flags) = view
+        .find(b"XESP")
+        .filter(|bytes| bytes.len() >= 8)
+        .map(|bytes| {
+            (
+                u32::from_le_bytes(bytes[..4].try_into().expect("four-byte XESP parent")),
+                u32::from_le_bytes(bytes[4..8].try_into().expect("four-byte XESP flags")),
+            )
+        })
+        .unzip();
 
     tx.execute(
-        "INSERT OR REPLACE INTO \"references\"(id, cell_id, worldspace_id, base_form_id, is_exterior, pos_x, pos_y, pos_z, local_x, local_y, rot_x, rot_y, rot_z, scale, radius_override, data)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-        params![form_id, cell_id, worldspace_id, base_form_id, is_exterior, pos[0], pos[1], pos[2], local_x, local_y, rot[0], rot[1], rot[2], scale, radius_override, blob],
+        "INSERT OR REPLACE INTO \"references\"(id, cell_id, worldspace_id, base_form_id, is_exterior, pos_x, pos_y, pos_z, local_x, local_y, rot_x, rot_y, rot_z, scale, radius_override, header_flags, enable_parent_id, enable_parent_flags, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        params![form_id, cell_id, worldspace_id, base_form_id, is_exterior, pos[0], pos[1], pos[2], local_x, local_y, rot[0], rot[1], rot[2], scale, radius_override, header_flags, enable_parent_id, enable_parent_flags, blob],
     )?;
     if is_exterior {
         tx.execute("INSERT OR REPLACE INTO exterior_spatial(id, minX, maxX, minY, maxY, minZ, maxZ, cell_id, worldspace_id) VALUES (?1, ?2, ?2, ?3, ?3, ?4, ?4, ?5, ?6)", params![form_id, pos[0], pos[1], pos[2], cell_id, worldspace_id])?;
@@ -1020,6 +1170,7 @@ mod tests {
         Some(plugin)
     }
 
+    /// The schema has the interior index, the exterior spatial table and every projection table.
     #[test]
     fn creates_hybrid_spatial_schema() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1055,6 +1206,8 @@ mod tests {
             "waters",
             "texture_sets",
             "landscape_textures",
+            "grass_types",
+            "landscape_texture_grasses",
             "matos",
             "space_lighting",
             "lod_grid",
@@ -1419,6 +1572,7 @@ mod tests {
             0xE7F,
             1,
             Some((None, None, Some(0x3C))),
+            0,
             &[(b"DATA".to_vec(), data)],
         )
         .unwrap();
@@ -2038,12 +2192,13 @@ mod tests {
     /// Reads the game install, so it is opt-in:
     /// `cargo test -p converter --lib -- --ignored`.
     #[test]
-    #[ignore = "requires OPENSKYRIM_SKYRIM_DATA with locally installed game assets"]
+    #[ignore = "requires MUDCRAB_SKYRIM_DATA with locally installed game assets"]
     fn lights_of_the_real_plugin_decode_through_export() {
         use std::collections::HashSet;
-        let data_dir = std::env::var_os("OPENSKYRIM_SKYRIM_DATA")
+        let data_dir = std::env::var_os("MUDCRAB_SKYRIM_DATA")
+            .or_else(|| std::env::var_os("OPENSKYRIM_SKYRIM_DATA"))
             .map(std::path::PathBuf::from)
-            .expect("set OPENSKYRIM_SKYRIM_DATA to the Skyrim Data directory");
+            .expect("set MUDCRAB_SKYRIM_DATA to the Skyrim Data directory");
         let plugin = data_dir.join("Skyrim.esm");
         assert!(plugin.is_file(), "no Skyrim.esm at {}", plugin.display());
         let records = crate::esm::binary::parse_plugin_file(&plugin).unwrap();

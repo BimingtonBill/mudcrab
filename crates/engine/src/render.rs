@@ -1,4 +1,5 @@
 use crate::{
+    color_pipeline::{DEFAULT_SCENE_EV100, SceneColorPipeline},
     lights::EMISSIVE_EXPOSURE,
     profiling::ProfilingState,
     world::{
@@ -7,11 +8,12 @@ use crate::{
     },
 };
 use bevy::{
+    app::{HierarchyPropagatePlugin, PropagateOver, PropagateSet},
     asset::{LoadContext, embedded_asset},
     camera::{
-        RenderTarget,
+        Exposure, RenderTarget,
         primitives::{Aabb, Frustum},
-        visibility::RenderLayers,
+        visibility::{RenderLayers, VisibilitySystems},
     },
     core_pipeline::{mip_generation::experimental::depth::ViewDepthPyramid, prepass::DepthPrepass},
     gltf::{
@@ -33,6 +35,7 @@ use bevy::{
     shader::ShaderRef,
 };
 use serde::Serialize;
+use shared::LAND_TEXTURE_REPEATS_PER_CELL;
 use std::{
     collections::BTreeSet,
     sync::{
@@ -289,6 +292,43 @@ fn default_linear_sampler() -> ImageSamplerDescriptor {
     ImageSamplerDescriptor::linear()
 }
 
+/// A render layer index.
+pub type Layer = usize;
+
+/// The layer of the world: terrain, and (here) the placed objects too.
+pub const WORLD_LAYER: Layer = 0;
+
+/// experimental: main separates placed objects from the terrain on their own layer so the water
+/// reflection can leave them out. The portal assigns layers itself (a destination space is drawn
+/// on [`crate::portal::DESTINATION_LAYER`], which is layer 2), so placed objects stay on the world
+/// layer here and the reflection keeps drawing them.
+pub const PLACED_OBJECT_LAYER: Layer = WORLD_LAYER;
+
+/// What every scene light belongs to, as a layer list (see [`LIGHT_LAYERS`]).
+pub const REFLECTION_VIEW_LAYERS: &[Layer] = &[WORLD_LAYER];
+
+/// The value main's placed-object propagation copies onto the meshes below a reference.
+pub const PLACED_OBJECT_RENDER_LAYERS: RenderLayers = RenderLayers::layer(PLACED_OBJECT_LAYER);
+
+/// The render layers for a light spawned below a placed-object reference (main's contract: the
+/// propagated layer must not replace the light's own).
+pub fn light_render_layers() -> (RenderLayers, PropagateOver<RenderLayers>) {
+    (
+        RenderLayers::from_layers(&LIGHT_LAYERS),
+        PropagateOver::default(),
+    )
+}
+
+/// Main's propagation of [`PLACED_OBJECT_RENDER_LAYERS`] down reference hierarchies. Not added by
+/// the portal's wiring (see [`PLACED_OBJECT_LAYER`]); kept so main's code and tests compile.
+pub fn add_placed_object_layer_propagation(app: &mut App) {
+    app.add_plugins(HierarchyPropagatePlugin::<RenderLayers>::new(PostUpdate))
+        .configure_sets(
+            PostUpdate,
+            PropagateSet::<RenderLayers>::default().before(VisibilitySystems::CheckVisibility),
+        );
+}
+
 /// The render layer of water planes. The world, its placed objects and the doorway frames sit on
 /// layer 0; the destination space of a portal is [`crate::portal::DESTINATION_LAYER`].
 pub const WATER_LAYER: usize = 1;
@@ -299,16 +339,19 @@ pub const MAIN_VIEW_LAYERS: [usize; 2] = [0, WATER_LAYER];
 /// The layers a light of the active space shines on.
 pub const LIGHT_LAYERS: [usize; 2] = [0, WATER_LAYER];
 
-/// The sampler a terrain layer texture needs: the shader tiles each layer `tiling` times across
-/// the cell (`uv * 8`), so the address mode must repeat. Bevy's default sampler clamps to the
-/// edge, which stretches the texture's last texel column, row and corner across most of a cell -
-/// long streaks where the edge column is stretched, and one flat colour where the corner texel
-/// covers everything past the first tile.
+/// The sampler a terrain layer texture needs: the shader tiles every layer `tiling` times across a
+/// cell (`uv * LAND_TEXTURE_REPEATS_PER_CELL`), so the address mode must repeat.
+/// Bevy's default sampler clamps to the edge,
+/// which stretches a texture's last texel column, row and corner across everything past the first
+/// tile - long streaks where the edge column is stretched, and one flat colour where the corner
+/// texel covers the rest. A terrain texture that is not loaded through the asset server - the
+/// synthetic fixtures build theirs in memory - has to be given the same sampler by hand.
 pub(crate) fn terrain_layer_sampler() -> ImageSamplerDescriptor {
     ImageSamplerDescriptor {
         address_mode_u: ImageAddressMode::Repeat,
         address_mode_v: ImageAddressMode::Repeat,
         address_mode_w: ImageAddressMode::Repeat,
+        anisotropy_clamp: 16,
         ..default_linear_sampler()
     }
 }
@@ -347,7 +390,12 @@ impl TerrainSettings {
     /// interpolates itself, so the weights reach the fragment stage exactly as LAND records them.
     fn for_quadrant(quadrant: u8, layers: usize, overlay_weights: &[Vec<f32>]) -> Self {
         Self {
-            tiling_and_layer_count: Vec4::new(8.0, 8.0, layers as f32, 0.0),
+            tiling_and_layer_count: Vec4::new(
+                LAND_TEXTURE_REPEATS_PER_CELL,
+                LAND_TEXTURE_REPEATS_PER_CELL,
+                layers as f32,
+                0.0,
+            ),
             quadrant_origin: Vec4::new(f32::from(quadrant % 2), f32::from(quadrant / 2), 0.0, 0.0),
             fallback_weights_0: Vec4::X,
             fallback_weights_1: Vec4::ZERO,
@@ -364,7 +412,12 @@ impl TerrainSettings {
     /// rendered; no streamed quadrant uses it.
     fn vertex_weights_only(layers: f32) -> Self {
         Self {
-            tiling_and_layer_count: Vec4::new(8.0, 8.0, layers, 0.0),
+            tiling_and_layer_count: Vec4::new(
+                LAND_TEXTURE_REPEATS_PER_CELL,
+                LAND_TEXTURE_REPEATS_PER_CELL,
+                layers,
+                0.0,
+            ),
             quadrant_origin: Vec4::ZERO,
             fallback_weights_0: Vec4::X,
             fallback_weights_1: Vec4::ZERO,
@@ -537,6 +590,42 @@ impl TerrainExtension {
             normal_4: None,
             normal_5: None,
         }
+    }
+
+    /// Main's fixture builder: the same stand-in material, but built for one quadrant of a richer
+    /// fixture terrain, so the quadrant's own overlay weights reach the weight field. The caller
+    /// supplies the layer textures; no asset server is involved.
+    #[cfg(test)]
+    pub(crate) fn fixture_with_quadrant(
+        terrain: &TerrainSnapshot,
+        quadrant: u8,
+        textures: [Handle<Image>; 6],
+    ) -> Result<Self, String> {
+        let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
+        let overlay_weights = crate::streaming::quadrant_overlay_weights(terrain, quadrant)?;
+        Ok(Self {
+            layer_0: Some(textures[0].clone()),
+            layer_1: Some(textures[1].clone()),
+            layer_2: Some(textures[2].clone()),
+            layer_3: Some(textures[3].clone()),
+            layer_4: Some(textures[4].clone()),
+            layer_5: Some(textures[5].clone()),
+            settings: TerrainSettings::for_quadrant(quadrant, layers.len(), &overlay_weights),
+            normal_0: None,
+            normal_1: None,
+            normal_2: None,
+            normal_3: None,
+            normal_4: None,
+            normal_5: None,
+        })
+    }
+
+    /// Whether the shader reads this material's overlay weights from its uniform weight field rather
+    /// than from the weights the mesh packs into its vertex attributes. False only for a material
+    /// with no overlays to read: a quadrant whose sole layer is its base, or a stand-in terrain.
+    #[cfg(test)]
+    pub(crate) fn reads_weight_field(&self) -> bool {
+        self.settings.weight_source.x > 0.5
     }
 
     /// Unbinds every layer's normal map, so the quadrant is lit by its geometric normal as a
@@ -713,12 +802,13 @@ fn setup_water_reflection(
     let image = images.add(Image::new_target_texture(
         width,
         height,
-        bevy::render::render_resource::TextureFormat::Rgba8Unorm,
-        Some(bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb),
+        bevy::render::render_resource::TextureFormat::Rgba16Float,
+        None,
     ));
     commands.insert_resource(WaterReflectionTexture(image.clone()));
     let mut camera = commands.spawn((
         Camera3d::default(),
+        SceneColorPipeline::reflection(),
         Camera {
             order: -1,
             // The camera is placed below the water looking up, not mirrored, so its triangles keep
@@ -859,6 +949,7 @@ type WaterReflectionObserverView = (
     &'static GlobalTransform,
     Option<&'static Frustum>,
     Option<&'static Projection>,
+    Option<&'static Exposure>,
     Option<&'static RenderLayers>,
 );
 
@@ -878,18 +969,32 @@ type PortalCameraFilter = (
 );
 
 fn update_water_reflection_camera(
+    mut commands: Commands,
     main_camera: Query<WaterReflectionObserverView, WaterReflectionObserver>,
     water: Query<WaterSurfaceView, With<crate::world::components::WaterSurface>>,
     portal_cameras: Query<&Camera, PortalCameraFilter>,
-    mut reflection_camera: Query<(&mut Transform, &mut Camera), With<WaterReflectionCamera>>,
+    mut reflection_camera: Query<
+        (Entity, &mut Transform, &mut Camera, Option<&mut Exposure>),
+        With<WaterReflectionCamera>,
+    >,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = std::time::Instant::now();
-    let (Ok((main, frustum, projection, main_layers)), Ok((mut reflection, mut camera))) =
-        (main_camera.single(), reflection_camera.single_mut())
+    let (
+        Ok((main, frustum, projection, exposure, main_layers)),
+        Ok((entity, mut reflection, mut camera, reflection_exposure)),
+    ) = (main_camera.single(), reflection_camera.single_mut())
     else {
         return;
     };
+    // PBR lighting is already exposure-scaled when the reflection is sampled by water.
+    // Keep both views in the same domain, including explicit diagnostic exposure changes.
+    let ev100 = exposure.map_or(DEFAULT_SCENE_EV100, |value| value.ev100);
+    if let Some(mut reflection_exposure) = reflection_exposure {
+        reflection_exposure.ev100 = ev100;
+    } else {
+        commands.entity(entity).insert(Exposure { ev100 });
+    }
     let main_layers = main_layers.cloned().unwrap_or_default();
     let portal_drawn = portal_cameras.iter().any(|camera| camera.is_active);
     // The surface nearest the main camera fixes the mirror plane; a further surface would put the
@@ -1398,6 +1503,7 @@ mod tests {
     use super::*;
     use crate::world::cache::TerrainLayerSnapshot;
     use crate::world::components::{StreamingCamera, WaterSurface};
+    use bevy::app::Propagate;
     use bevy::camera::{primitives::CascadesFrusta, visibility::ViewVisibility};
     use bevy::image::ImageFilterMode;
     use bevy::light::update_directional_light_frusta;
@@ -1411,7 +1517,7 @@ mod tests {
     fn spawned_reflection_camera(args: &[&str]) -> (App, Entity) {
         let mut app = App::new();
         app.init_resource::<Assets<Image>>()
-            .insert_resource(crate::config::EngineConfig::from_args(
+            .insert_resource(crate::config::EngineConfig::run_from_args(
                 args.iter().map(|arg| (*arg).to_owned()),
             ))
             .add_systems(Startup, setup_water_reflection);
@@ -1502,7 +1608,7 @@ mod tests {
     impl CascadeLimitApp {
         fn new(args: &[&str]) -> Self {
             let mut app = App::new();
-            app.insert_resource(crate::config::EngineConfig::from_args(
+            app.insert_resource(crate::config::EngineConfig::run_from_args(
                 args.iter().map(|arg| (*arg).to_owned()),
             ));
             add_configured_water_reflection_cascade_limit(&mut app);
@@ -1756,6 +1862,103 @@ mod tests {
     }
 
     #[test]
+    fn reflection_target_preserves_linear_hdr_until_the_main_view() {
+        use bevy::camera::Hdr;
+        use bevy::core_pipeline::tonemapping::Tonemapping;
+        use bevy::render::render_resource::TextureFormat;
+
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .add_systems(Startup, setup_water_reflection);
+        app.update();
+        let target = &app.world().resource::<WaterReflectionTexture>().0;
+        let image = app.world().resource::<Assets<Image>>().get(target).unwrap();
+        assert_eq!(image.texture_descriptor.format, TextureFormat::Rgba16Float);
+        assert!(image.texture_view_descriptor.is_none());
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<(&Hdr, &Tonemapping, &Exposure), With<WaterReflectionCamera>>();
+        let (_, tonemapping, exposure) = cameras.single(app.world()).unwrap();
+        assert_eq!(*tonemapping, Tonemapping::None);
+        assert_eq!(exposure.ev100, 9.7);
+    }
+
+    #[test]
+    fn reflection_tracks_exposure_changes_even_while_not_visible() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        for ev100 in [7.0, 12.0, 9.7] {
+            harness
+                .app
+                .world_mut()
+                .entity_mut(harness.main_camera)
+                .insert(Exposure { ev100 });
+            assert!(!harness.frame().active);
+            assert_eq!(
+                harness
+                    .app
+                    .world()
+                    .get::<Exposure>(harness.reflection_camera)
+                    .unwrap()
+                    .ev100,
+                ev100
+            );
+        }
+        harness
+            .app
+            .world_mut()
+            .entity_mut(harness.main_camera)
+            .remove::<Exposure>();
+        harness.frame();
+        assert_eq!(
+            harness
+                .app
+                .world()
+                .get::<Exposure>(harness.reflection_camera)
+                .unwrap()
+                .ev100,
+            9.7
+        );
+    }
+
+    #[test]
+    fn v2_reflection_restores_missing_exposure_and_updates_its_pose() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        harness.spawn_water(Vec3::new(0.0, 40.0, -800.0), CELL_WATER_HALF_EXTENTS);
+        for exposure in [Some(Exposure { ev100: 7.0 }), None] {
+            harness
+                .app
+                .world_mut()
+                .entity_mut(harness.reflection_camera)
+                .remove::<Exposure>();
+            if let Some(exposure) = exposure {
+                harness
+                    .app
+                    .world_mut()
+                    .entity_mut(harness.main_camera)
+                    .insert(exposure);
+            } else {
+                harness
+                    .app
+                    .world_mut()
+                    .entity_mut(harness.main_camera)
+                    .remove::<Exposure>();
+            }
+            let frame = harness.frame();
+            assert!(frame.active);
+            assert_eq!(frame.transform.translation.y, -40.0);
+            assert_eq!(
+                harness
+                    .app
+                    .world()
+                    .get::<Exposure>(harness.reflection_camera)
+                    .unwrap()
+                    .ev100,
+                exposure.map_or(9.7, |value| value.ev100)
+            );
+        }
+    }
+
+    #[test]
     fn reflection_camera_renders_while_a_water_plane_is_in_view() {
         let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
         harness.spawn_water(Vec3::new(0.0, 40.0, -800.0), CELL_WATER_HALF_EXTENTS);
@@ -1872,79 +2075,6 @@ mod tests {
             WaterSurface,
         ));
         assert!(harness.frame().active);
-    }
-
-    #[test]
-    fn reflects_camera_above_and_below_the_water_plane() {
-        let above = GlobalTransform::from(
-            Transform::from_xyz(2.0, 10.0, 4.0).looking_to(Vec3::new(0.0, -0.5, -1.0), Vec3::Y),
-        );
-        let reflected = reflected_camera_transform(&above, 3.0);
-        assert!((reflected.translation.y + 4.0).abs() < 1.0e-5);
-        assert!(reflected.forward().y > 0.0);
-
-        let below = GlobalTransform::from(
-            Transform::from_xyz(2.0, -4.0, 4.0).looking_to(Vec3::new(0.0, 0.5, -1.0), Vec3::Y),
-        );
-        let reflected = reflected_camera_transform(&below, 3.0);
-        assert!((reflected.translation.y - 10.0).abs() < 1.0e-5);
-        assert!(reflected.forward().y < 0.0);
-    }
-
-    #[test]
-    fn animated_water_advances_the_shader_phase() {
-        let mut app = App::new();
-        app.init_resource::<Time>()
-            .init_resource::<Assets<WaterMaterial>>()
-            .init_resource::<ProfilingState>()
-            .add_systems(Update, animate_water_materials);
-        let handle = app
-            .world_mut()
-            .resource_mut::<Assets<WaterMaterial>>()
-            .add(WaterMaterial {
-                base: StandardMaterial::default(),
-                extension: WaterExtension::default(),
-            });
-        app.world_mut()
-            .resource_mut::<Time>()
-            .advance_by(std::time::Duration::from_secs(2));
-        app.update();
-        let material = app
-            .world()
-            .resource::<Assets<WaterMaterial>>()
-            .get(&handle)
-            .unwrap();
-        assert_eq!(material.extension.settings.wave_scale_speed_strength.w, 2.0);
-    }
-
-    #[test]
-    fn final_renderer_requires_every_gpu_path_signal() {
-        let complete = RendererMetrics {
-            gpu_preprocessing_active: true,
-            gpu_culling_active: true,
-            indirect_drawing_active: true,
-            occlusion_culling_views: 1,
-            hzb_views: 1,
-            indirect_phase_buffers: 1,
-            indirect_batch_sets: 1,
-            proof_frames: 1,
-            ..default()
-        };
-        assert!(complete.final_path_active());
-        assert!(
-            !RendererMetrics {
-                hzb_views: 0,
-                ..complete.clone()
-            }
-            .final_path_active()
-        );
-        assert!(
-            !RendererMetrics {
-                renderer_validation_failures: 1,
-                ..complete
-            }
-            .final_path_active()
-        );
     }
 
     /// A cell whose four quadrants each carry a base layer and one overlay with the same `VTXT`
@@ -2229,6 +2359,387 @@ mod tests {
         value
     }
 
+    #[test]
+    fn reflects_camera_above_and_below_the_water_plane() {
+        let above = GlobalTransform::from(
+            Transform::from_xyz(2.0, 10.0, 4.0).looking_to(Vec3::new(0.0, -0.5, -1.0), Vec3::Y),
+        );
+        let reflected = reflected_camera_transform(&above, 3.0);
+        assert!((reflected.translation.y + 4.0).abs() < 1.0e-5);
+        assert!(reflected.forward().y > 0.0);
+
+        let below = GlobalTransform::from(
+            Transform::from_xyz(2.0, -4.0, 4.0).looking_to(Vec3::new(0.0, 0.5, -1.0), Vec3::Y),
+        );
+        let reflected = reflected_camera_transform(&below, 3.0);
+        assert!((reflected.translation.y - 10.0).abs() < 1.0e-5);
+        assert!(reflected.forward().y < 0.0);
+    }
+
+    /// The reflection pass is what costs 1.72 ms of a 4.41 ms frame at the rural cell, because it
+    /// redraws every placed object; the camera must be spawned on the world layer alone. Asserting
+    /// on the spawned camera rather than on the constant keeps the two from drifting apart.
+    #[test]
+    fn the_reflection_camera_renders_the_world_layer_only() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .add_systems(Startup, setup_water_reflection);
+        app.update();
+
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&RenderLayers, With<WaterReflectionCamera>>();
+        let layers = cameras
+            .single(app.world())
+            .expect("the reflection camera must be spawned");
+        assert!(layers.intersects(&RenderLayers::layer(WORLD_LAYER)));
+        assert!(!layers.intersects(&RenderLayers::layer(WATER_LAYER)));
+        assert!(!layers.intersects(&PLACED_OBJECT_RENDER_LAYERS));
+    }
+
+    /// The other half of the contract: the main camera is what still draws the placed objects and
+    /// the water, so a new layer has to be added to its list and not only taken out of the
+    /// reflection camera's.
+    #[test]
+    fn the_main_view_renders_every_layer() {
+        let main_view = RenderLayers::from_layers(&MAIN_VIEW_LAYERS);
+        assert!(main_view.intersects(&RenderLayers::layer(WORLD_LAYER)));
+        assert!(main_view.intersects(&RenderLayers::layer(WATER_LAYER)));
+        assert!(main_view.intersects(&PLACED_OBJECT_RENDER_LAYERS));
+        assert!(
+            !RenderLayers::from_layers(REFLECTION_VIEW_LAYERS)
+                .intersects(&PLACED_OBJECT_RENDER_LAYERS),
+            "a placed object must never be drawn into the reflection texture"
+        );
+    }
+
+    /// A light needs the world layer for both cameras and the placed-object layer for its shadow
+    /// cascades: `check_dir_light_mesh_visibility` only collects casters that share a layer with
+    /// the light.
+    #[test]
+    fn lights_cover_both_cameras_and_the_placed_objects() {
+        let light = RenderLayers::from_layers(&LIGHT_LAYERS);
+        for view in [MAIN_VIEW_LAYERS.as_slice(), REFLECTION_VIEW_LAYERS] {
+            assert!(
+                light.intersects(&RenderLayers::from_layers(view)),
+                "a light must reach {view:?}"
+            );
+        }
+        assert!(light.intersects(&PLACED_OBJECT_RENDER_LAYERS));
+    }
+
+    /// A point light is a child of its placed-object reference, whose layer propagates down the
+    /// hierarchy; the light must keep [`LIGHT_LAYERS`] anyway, or it stops lighting the terrain
+    /// and the reflection view.
+    #[test]
+    fn a_light_below_a_reference_keeps_the_light_layers() {
+        let mut app = App::new();
+        add_placed_object_layer_propagation(&mut app);
+        let reference = app
+            .world_mut()
+            .spawn(Propagate(PLACED_OBJECT_RENDER_LAYERS))
+            .id();
+        let light = app
+            .world_mut()
+            .spawn((light_render_layers(), ChildOf(reference)))
+            .id();
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world().entity(reference).get::<RenderLayers>(),
+            Some(&PLACED_OBJECT_RENDER_LAYERS)
+        );
+        assert_eq!(
+            app.world().entity(light).get::<RenderLayers>(),
+            Some(&RenderLayers::from_layers(&LIGHT_LAYERS)),
+            "the propagated placed-object layer must not replace the light's layers"
+        );
+    }
+
+    /// The propagation has to be in place before visibility compares layers, and the meshes it
+    /// carries arrive from the glb spawner in `SpawnScene` - between `Update` and `PostUpdate`. A
+    /// descendant spawned after its reference must still inherit the layer in that same frame.
+    #[test]
+    fn a_descendant_spawned_after_its_reference_inherits_the_placed_object_layer() {
+        let mut app = App::new();
+        add_placed_object_layer_propagation(&mut app);
+        let reference = app
+            .world_mut()
+            .spawn(Propagate(PLACED_OBJECT_RENDER_LAYERS))
+            .id();
+        app.update();
+        // The glb is spawned frames after the reference: a scene root with the mesh primitives
+        // below it.
+        let scene_root = app.world_mut().spawn(ChildOf(reference)).id();
+        let mesh = app
+            .world_mut()
+            .spawn((Mesh3d(Handle::default()), ChildOf(scene_root)))
+            .id();
+
+        app.update();
+
+        for entity in [reference, scene_root, mesh] {
+            assert_eq!(
+                app.world().entity(entity).get::<RenderLayers>(),
+                Some(&PLACED_OBJECT_RENDER_LAYERS),
+                "a reference and everything below it must carry the placed-object layer"
+            );
+        }
+    }
+
+    #[test]
+    fn animated_water_advances_the_shader_phase() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<Assets<WaterMaterial>>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, animate_water_materials);
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<WaterMaterial>>()
+            .add(WaterMaterial {
+                base: StandardMaterial::default(),
+                extension: WaterExtension::default(),
+            });
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(2));
+        app.update();
+        let material = app
+            .world()
+            .resource::<Assets<WaterMaterial>>()
+            .get(&handle)
+            .unwrap();
+        assert_eq!(material.extension.settings.wave_scale_speed_strength.w, 2.0);
+    }
+
+    #[test]
+    fn final_renderer_requires_every_gpu_path_signal() {
+        let complete = RendererMetrics {
+            gpu_preprocessing_active: true,
+            gpu_culling_active: true,
+            indirect_drawing_active: true,
+            occlusion_culling_views: 1,
+            hzb_views: 1,
+            indirect_phase_buffers: 1,
+            indirect_batch_sets: 1,
+            proof_frames: 1,
+            ..default()
+        };
+        assert!(complete.final_path_active());
+        assert!(
+            !RendererMetrics {
+                hzb_views: 0,
+                ..complete.clone()
+            }
+            .final_path_active()
+        );
+        assert!(
+            !RendererMetrics {
+                renderer_validation_failures: 1,
+                ..complete
+            }
+            .final_path_active()
+        );
+    }
+
+    /// The shader tiles every layer by the shared LAND repeats per cell, so the layer textures
+    /// must be sampled with a repeating address mode. Bevy's default clamps to the edge, which
+    /// stretched the textures in the frames: everything past the first tile read the edge texels.
+    #[test]
+    fn dropping_normal_maps_unbinds_them_and_clears_their_flags() {
+        let mut extension = TerrainExtension::default();
+        let normals: [Option<Handle<Image>>; 6] =
+            std::array::from_fn(|index| (index % 2 == 0).then(Handle::default));
+        extension.settings.set_normal_layers(&normals);
+        [extension.normal_0, extension.normal_2, extension.normal_4] =
+            [normals[0].clone(), normals[2].clone(), normals[4].clone()];
+        assert!(extension.has_normal_maps());
+
+        extension.drop_normal_maps();
+
+        assert!(!extension.has_normal_maps());
+        assert!(
+            [
+                &extension.normal_0,
+                &extension.normal_1,
+                &extension.normal_2,
+                &extension.normal_3,
+                &extension.normal_4,
+                &extension.normal_5,
+            ]
+            .iter()
+            .all(|normal| normal.is_none())
+        );
+    }
+
+    #[test]
+    fn tiled_terrain_layers_are_sampled_with_a_repeating_sampler() {
+        let sampler = terrain_layer_sampler();
+        assert_eq!(sampler.address_mode_u, ImageAddressMode::Repeat);
+        assert_eq!(sampler.address_mode_v, ImageAddressMode::Repeat);
+        assert_eq!(sampler.address_mode_w, ImageAddressMode::Repeat);
+        // Repeat and 16x anisotropy retain linear filtering and the default mip range.
+        let default_sampler = ImageSamplerDescriptor::linear();
+        assert_eq!(sampler.mag_filter, default_sampler.mag_filter);
+        assert_eq!(sampler.min_filter, default_sampler.min_filter);
+        assert_eq!(sampler.mipmap_filter, default_sampler.mipmap_filter);
+        assert_eq!(sampler.lod_min_clamp, default_sampler.lod_min_clamp);
+        assert_eq!(sampler.lod_max_clamp, default_sampler.lod_max_clamp);
+        assert_eq!(sampler.anisotropy_clamp, 16);
+        assert_eq!(sampler.compare, default_sampler.compare);
+        assert_eq!(sampler.mag_filter, ImageFilterMode::Linear);
+        assert_eq!(
+            default_sampler.address_mode_u,
+            ImageAddressMode::ClampToEdge
+        );
+        assert_eq!(
+            default_sampler.address_mode_v,
+            ImageAddressMode::ClampToEdge
+        );
+        assert!(
+            TerrainSettings::vertex_weights_only(1.0)
+                .tiling_and_layer_count
+                .x
+                > 1.0,
+            "layers only need a repeating sampler because the shader tiles them"
+        );
+    }
+
+    /// The weight field is the quadrant's own `17x17` grids, one per overlay, in the order
+    /// `quadrant_layers` returns them: an overlay's `VTXT` list reaches the fragment stage at the
+    /// samples it names, and every sample it does not name reads as opacity 0.
+    #[test]
+    fn weight_field_carries_every_overlay_grid_from_the_layer_list() {
+        let terrain = terrain_fixture_with_overlays(
+            0x0001_2345,
+            &[
+                vec![(0, 1.0), (17 + 1, 0.5), (16 * 17 + 16, 0.25)],
+                vec![(17 * 8 + 8, 0.75)],
+            ],
+        );
+        let grids = crate::streaming::quadrant_overlay_weights(&terrain, 0).unwrap();
+        assert_eq!(grids.len(), 2, "one grid per overlay, base excluded");
+        assert_eq!(
+            grids[0].len(),
+            QUADRANT_WEIGHT_SAMPLES * QUADRANT_WEIGHT_SAMPLES,
+            "a grid covers the quadrant's whole sample square"
+        );
+        let settings = TerrainSettings::for_quadrant(0, 3, &grids);
+        assert_eq!(
+            settings.tiling_and_layer_count,
+            Vec4::new(24.0, 24.0, 3.0, 0.0)
+        );
+        assert_eq!(settings.quadrant_origin.xy(), Vec2::ZERO);
+        assert_eq!(
+            settings.weight_source.x, 1.0,
+            "the material carries the weight field"
+        );
+
+        let sample = |overlay: usize, x: usize, y: usize| -> f32 {
+            let index = y * QUADRANT_WEIGHT_SAMPLES + x;
+            settings.weights[overlay * OVERLAY_WEIGHT_WORDS + index / 4][index % 4]
+        };
+        assert_eq!(sample(0, 0, 0), 1.0);
+        assert_eq!(sample(0, 1, 1), 0.5);
+        assert_eq!(sample(0, 16, 16), 0.25);
+        assert_eq!(sample(0, 5, 5), 0.0, "an unnamed sample is opacity 0");
+        assert_eq!(sample(1, 8, 8), 0.75, "the second overlay's own grid");
+        assert_eq!(
+            sample(1, 0, 0),
+            0.0,
+            "the two grids do not bleed into each other"
+        );
+        for overlay in 2..OVERLAY_WEIGHT_SLOTS {
+            assert_eq!(
+                sample(overlay, 8, 8),
+                0.0,
+                "an overlay the quadrant does not use leaves its slot empty"
+            );
+        }
+        assert_eq!(
+            settings.weights[OVERLAY_WEIGHT_WORDS - 1].w,
+            0.0,
+            "the padding word after the last sample stays zero"
+        );
+    }
+
+    /// Each quadrant reads its own origin out of the cell, so the same cell uv addresses the same
+    /// ground in every quadrant.
+    #[test]
+    fn quadrant_origin_places_each_quadrant_inside_the_cell() {
+        let origins: Vec<[f32; 2]> = (0..4)
+            .map(|quadrant| {
+                let settings = TerrainSettings::for_quadrant(quadrant, 2, &[]);
+                assert_eq!(
+                    settings.quadrant_origin.z, 0.0,
+                    "only xy carries the origin"
+                );
+                [settings.quadrant_origin.x, settings.quadrant_origin.y]
+            })
+            .collect();
+        assert_eq!(
+            origins,
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            "the mesh's quadrants in the same order: west/east then south/north"
+        );
+    }
+
+    /// The weight field is only worth reading where there are overlays to read. A quadrant whose only
+    /// layer is its base has none, and the packed vertex attributes carry none either, so the shader
+    /// is told to skip the field's five lookups altogether.
+    #[test]
+    fn weight_source_is_set_only_for_quadrants_with_overlays() {
+        let grid = vec![1.0; QUADRANT_WEIGHT_SAMPLES * QUADRANT_WEIGHT_SAMPLES];
+        assert_eq!(
+            TerrainSettings::for_quadrant(0, 2, &[grid]).weight_source,
+            Vec4::X
+        );
+        assert_eq!(
+            TerrainSettings::for_quadrant(0, 1, &[]).weight_source,
+            Vec4::ZERO,
+            "a base-only quadrant has no overlay to read"
+        );
+        assert_eq!(
+            TerrainSettings::vertex_weights_only(6.0).weight_source,
+            Vec4::ZERO,
+            "a material with no weight field reads the packed attributes"
+        );
+    }
+
+    /// A fixture material carries the quadrant's own weight field, so the no-game-data scene draws
+    /// its overlays through the interpolation the streamed path uses instead of the packed tangent.
+    #[test]
+    fn fixture_materials_carry_the_quadrants_weight_field() {
+        let sample = QUADRANT_WEIGHT_SAMPLES * 8 + 8;
+        let terrain =
+            terrain_fixture_with_overlays(0x0001_2345, &[vec![(0, 1.0), (sample as u16, 0.5)]]);
+        for quadrant in 0..4u8 {
+            let extension = TerrainExtension::fixture_with_quadrant(
+                &terrain,
+                quadrant,
+                std::array::from_fn(|_| Handle::<Image>::default()),
+            )
+            .expect("the fixture material must build");
+            assert!(
+                extension.reads_weight_field(),
+                "quadrant {quadrant} must render its overlay through the weight field"
+            );
+            assert_eq!(
+                extension.settings.quadrant_origin.xy(),
+                Vec2::new(f32::from(quadrant % 2), f32::from(quadrant / 2)),
+                "each quadrant reads its own origin"
+            );
+            assert_eq!(extension.settings.weights[0][0], 1.0);
+            assert_eq!(
+                extension.settings.weights[sample / 4][sample % 4],
+                0.5,
+                "the fixture's own VTXT opacity reaches the field"
+            );
+        }
+    }
+
     /// Defect A. The overlay weight field is the quadrant's own 17x17 sample grid. A layer that is
     /// full strength on one sample and absent on the next must reach the fragment as the linear
     /// interpolation of the two - `0.5` halfway between them, `0.25`/`0.75` at the quarter points -
@@ -2469,34 +2980,6 @@ mod tests {
         assert!(
             (inside - 0.5).abs() < 0.01,
             "half a sample inside the edge the weight ramps to 0.5: {inside}"
-        );
-    }
-
-    /// Defect B. The shader tiles every layer `tiling` times across a cell (`uv * 8`), so the layer
-    /// textures must be sampled with a repeating address mode. Bevy's own default sampler clamps
-    /// to the edge, which is what stretched the textures in the user's frames.
-    #[test]
-    fn tiled_terrain_layers_are_sampled_with_a_repeating_sampler() {
-        let sampler = terrain_layer_sampler();
-        assert_eq!(sampler.address_mode_u, ImageAddressMode::Repeat);
-        assert_eq!(sampler.address_mode_v, ImageAddressMode::Repeat);
-        assert_eq!(sampler.address_mode_w, ImageAddressMode::Repeat);
-        assert_eq!(sampler.mag_filter, ImageFilterMode::Linear);
-        assert_eq!(sampler.min_filter, ImageFilterMode::Linear);
-        assert_eq!(sampler.mipmap_filter, ImageFilterMode::Linear);
-        assert_eq!(sampler.lod_min_clamp, 0.0);
-        assert_eq!(sampler.lod_max_clamp, 32.0);
-        assert_eq!(
-            default_linear_sampler().address_mode_u,
-            ImageAddressMode::ClampToEdge
-        );
-        assert!(
-            TerrainExtension::default()
-                .settings
-                .tiling_and_layer_count
-                .x
-                > 1.0,
-            "layers only need a repeating sampler because the shader tiles them"
         );
     }
 
@@ -2873,36 +3356,6 @@ mod tests {
         );
     }
 
-    /// A normal map that fails to load must not leave the material pointing at it: the flags that
-    /// make the shader read the six maps are cleared with them, so the quadrant falls back to its
-    /// geometric normal instead of sampling a stand-in white image as a steep tilt.
-    #[test]
-    fn dropping_normal_maps_unbinds_them_and_clears_their_flags() {
-        let mut extension = TerrainExtension::default();
-        let normals: [Option<Handle<Image>>; 6] =
-            std::array::from_fn(|index| (index % 2 == 0).then(Handle::default));
-        extension.settings.set_normal_layers(&normals);
-        [extension.normal_0, extension.normal_2, extension.normal_4] =
-            [normals[0].clone(), normals[2].clone(), normals[4].clone()];
-        assert!(extension.has_normal_maps());
-
-        extension.drop_normal_maps();
-
-        assert!(!extension.has_normal_maps());
-        assert!(
-            [
-                &extension.normal_0,
-                &extension.normal_1,
-                &extension.normal_2,
-                &extension.normal_3,
-                &extension.normal_4,
-                &extension.normal_5,
-            ]
-            .iter()
-            .all(|normal| normal.is_none())
-        );
-    }
-
     /// A cell whose four quadrants carry exactly the layers given, in quadrant order.
     fn layer_fixture(cell_id: u32, quadrants: [Vec<TerrainLayerSnapshot>; 4]) -> TerrainSnapshot {
         TerrainSnapshot {
@@ -3193,5 +3646,85 @@ mod tests {
         assert_eq!(extension.settings.normal_layers_0, Vec4::ZERO);
         assert_eq!(extension.settings.normal_layers_1, Vec4::ZERO);
         assert_eq!(extension.normal_0, None);
+    }
+
+    #[test]
+    fn terrain_sampler_repeats_with_linear_mips_and_16x_anisotropy() {
+        let sampler = terrain_layer_sampler();
+        assert_eq!(sampler.address_mode_u, ImageAddressMode::Repeat);
+        assert_eq!(sampler.address_mode_v, ImageAddressMode::Repeat);
+        assert_eq!(sampler.mag_filter, bevy::image::ImageFilterMode::Linear);
+        assert_eq!(sampler.min_filter, bevy::image::ImageFilterMode::Linear);
+        assert_eq!(sampler.mipmap_filter, bevy::image::ImageFilterMode::Linear);
+        assert_eq!(sampler.anisotropy_clamp, 16);
+    }
+
+    #[test]
+    fn landscape_uvs_repeat_twelve_times_per_quadrant_without_scaling_weights() {
+        let terrain = terrain_fixture_with_overlays(0x12345, &[vec![(0, 1.0)]]);
+        for quadrant in 0..4 {
+            let mesh = crate::streaming::build_terrain_quadrant_mesh(&terrain, quadrant).unwrap();
+            let VertexAttributeValues::Float32x2(uvs) =
+                mesh.attribute(Mesh::ATTRIBUTE_UV_0).unwrap()
+            else {
+                panic!("UVs missing")
+            };
+            let grids = crate::streaming::quadrant_overlay_weights(&terrain, quadrant).unwrap();
+            let settings = TerrainSettings::for_quadrant(quadrant, 2, &grids);
+            let tiling = settings.tiling_and_layer_count.xy();
+            let origin = Vec2::from(uvs[0]);
+            assert_eq!(
+                (Vec2::from(uvs[16]) - origin) * tiling,
+                Vec2::new(12.0, 0.0)
+            );
+            assert_eq!(
+                (Vec2::from(uvs[272]) - origin) * tiling,
+                Vec2::new(0.0, 12.0)
+            );
+            // Blend coordinates still address the original 17x17 LAND samples.
+            let last = (Vec2::from(uvs[288]) * 2.0 - settings.quadrant_origin.xy()) * 16.0;
+            assert_eq!(last, Vec2::splat(16.0));
+        }
+    }
+
+
+    /// A cell whose four quadrants each carry a base layer plus the given overlays, in the order the
+    /// `VTXT` lists are given, so a weight field built from it can be read back against the lists
+    /// that produced it.
+    fn terrain_fixture_with_overlays(
+        cell_id: u32,
+        overlays: &[Vec<(u16, f32)>],
+    ) -> TerrainSnapshot {
+        let mut layers = Vec::new();
+        for quadrant in 0..4u8 {
+            layers.push(TerrainLayerSnapshot {
+                texture_form_id: 1,
+                quadrant,
+                layer: 0,
+                is_base: true,
+                weights: Vec::new(),
+            });
+            for (slot, weights) in overlays.iter().enumerate() {
+                let layer = u16::try_from(slot + 1).expect("fixture overlay count fits a u16");
+                layers.push(TerrainLayerSnapshot {
+                    texture_form_id: u32::from(layer) + 6,
+                    quadrant,
+                    layer,
+                    is_base: false,
+                    weights: weights.clone(),
+                });
+            }
+        }
+        TerrainSnapshot {
+            cell_id,
+            width: 33,
+            height: 33,
+            heights: vec![0.0; 33 * 33],
+            normals: [0, 0, 127].repeat(33 * 33),
+            vertex_colors: vec![255; 33 * 33 * 3],
+            layers,
+            water_height: None,
+            water_type_form_id: None,
+        }
     }
 }

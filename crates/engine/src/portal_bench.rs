@@ -789,7 +789,7 @@ fn run_portal_bench(
     diagnostics: Option<Res<DiagnosticsStore>>,
     mut active: ResMut<ActiveCell>,
     mut origin: ResMut<RenderOrigin>,
-    mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    mut roots: crate::streaming::CellRootTransforms,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     doors: Query<(Entity, &GlobalTransform, &LoadDoor, Option<&DoorState>)>,
     cameras: Query<(&Camera, &RenderTarget)>,

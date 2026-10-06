@@ -78,26 +78,108 @@ pub struct StaticShape<'a> {
     pub normal_texture: &'a str,
 }
 
+/// A Havok box rigid body attached to its own `NiNode` under the root, written as a
+/// `bhkCollisionObject` -> `bhkRigidBody` (or `bhkRigidBodyT`) -> `bhkBoxShape` chain.
+/// Every value is stored raw, in Havok units (a Creation unit is 1/70 of one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoxBody<'a> {
+    /// Name of the `NiNode` the collision object targets.
+    pub node_name: &'a str,
+    /// Box half extents (`bhkBoxShape` dimensions).
+    pub half_extents: [f32; 3],
+    /// `Some((translation, rotation xyzw))` writes a `bhkRigidBodyT`, else a `bhkRigidBody`.
+    pub transform: Option<([f32; 3], [f32; 4])>,
+    pub collision_layer: u8,
+    /// Raw `hkMotionType`, `hkDeactivatorType` and `hkQualityType` values (nif.xml).
+    pub motion_system: u8,
+    pub deactivator_type: u8,
+    pub quality_type: u8,
+    pub mass: f32,
+    /// Row-major inertia tensor.
+    pub inertia: [f32; 9],
+    pub center_of_mass: [f32; 3],
+    pub linear_damping: f32,
+    pub angular_damping: f32,
+    pub friction: f32,
+    pub restitution: f32,
+    pub max_linear_velocity: f32,
+    pub max_angular_velocity: f32,
+}
+
 /// Generates a minimal static NIF containing one triangle mesh.
 pub fn static_shape(shape: &StaticShape<'_>) -> Result<Vec<u8>> {
+    static_shape_with_colors(shape, &[])
+}
+
+/// Generates a static NIF with authored RGBA vertex data and both color flags enabled.
+pub fn static_shape_with_colors(shape: &StaticShape<'_>, colors: &[[u8; 4]]) -> Result<Vec<u8>> {
+    build_static_shape(shape, colors, &[])
+}
+
+/// Like [`static_shape`], plus one collision body per entry. Each body hangs off its own
+/// `NiNode` child of the root, so the converter's glTF node order is root, shape, then the
+/// body nodes in order.
+pub fn static_shape_with_bodies(
+    shape: &StaticShape<'_>,
+    bodies: &[BoxBody<'_>],
+) -> Result<Vec<u8>> {
+    build_static_shape(shape, &[], bodies)
+}
+
+fn build_static_shape(
+    shape: &StaticShape<'_>,
+    colors: &[[u8; 4]],
+    bodies: &[BoxBody<'_>],
+) -> Result<Vec<u8>> {
     validate(shape)?;
-    let strings = [shape.name];
-    let blocks = [
-        fade_node(),
-        write_shape_block(&geometry(shape), STATIC_SHADER_BLOCK)?,
-        lighting_shader_property(STATIC_TEXTURE_SET_BLOCK),
+    ensure!(
+        colors.is_empty() || colors.len() == shape.positions.len(),
+        "vertex color count mismatch"
+    );
+    for body in bodies {
+        validate_body(body)?;
+    }
+    let mut strings = vec![shape.name];
+    strings.extend(bodies.iter().map(|body| body.node_name));
+    let first_body_block = 4_u32;
+    let mut children = vec![1_u32];
+    children.extend((0..bodies.len()).map(|i| first_body_block + 4 * i as u32));
+    let mut blocks = vec![
+        fade_node_with_children(&children),
+        write_shape_block(&geometry(shape, colors), STATIC_SHADER_BLOCK)?,
+        lighting_shader_property(STATIC_TEXTURE_SET_BLOCK, !colors.is_empty()),
         texture_set(shape.diffuse, shape.normal_texture)?,
     ];
-    write_nif(
-        &[
-            "BSFadeNode",
-            "BSTriShape",
-            "BSLightingShaderProperty",
-            "BSShaderTextureSet",
-        ],
-        &blocks,
-        &strings,
-    )
+    let mut block_types = vec![
+        "BSFadeNode",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet",
+    ];
+    for (index, body) in bodies.iter().enumerate() {
+        let node_block = first_body_block + 4 * index as u32;
+        let mut node = Vec::new();
+        push_av_object_with(&mut node, 1 + index as u32, node_block + 1);
+        push_u32(&mut node, 0); // children
+        push_u32(&mut node, 0); // effects
+        blocks.push(node);
+        block_types.push("NiNode");
+        let mut object = Vec::new();
+        push_u32(&mut object, node_block); // target
+        push_u16(&mut object, 1); // flags
+        push_u32(&mut object, node_block + 2); // body
+        blocks.push(object);
+        block_types.push("bhkCollisionObject");
+        blocks.push(rigid_body(body, node_block + 3));
+        block_types.push(if body.transform.is_some() {
+            "bhkRigidBodyT"
+        } else {
+            "bhkRigidBody"
+        });
+        blocks.push(box_shape(body));
+        block_types.push("bhkBoxShape");
+    }
+    write_nif(&block_types, &blocks, &strings)
 }
 
 /// Geometry shared by the static and LOD shape writers.
@@ -145,7 +227,7 @@ pub fn terrain_lod(shape: &LodShape<'_>) -> Result<Vec<u8>> {
     let blocks = [
         multi_bound_node(TERRAIN_ROOT_STRING, 1, TERRAIN_BOUND_BLOCK, CULLING_MODE),
         write_lod_shape_block(&lod_geometry(shape), TERRAIN_SHADER_BLOCK)?,
-        lighting_shader_property(TERRAIN_TEXTURE_SET_BLOCK),
+        lighting_shader_property(TERRAIN_TEXTURE_SET_BLOCK, false),
         texture_set(shape.diffuse, shape.normal_texture)?,
         multi_bound(TERRAIN_AABB_BLOCK),
         multi_bound_aabb(center, extent),
@@ -175,7 +257,7 @@ pub fn object_lod(shape: &LodShape<'_>) -> Result<Vec<u8>> {
         child_node(OBJECT_ROOT_STRING, 1),
         multi_bound_node(OBJECT_BOUND_STRING, 2, OBJECT_BOUND_BLOCK, CULLING_MODE),
         sub_index_tri_shape(&lod_geometry(shape), OBJECT_SHADER_BLOCK)?,
-        lighting_shader_property(OBJECT_TEXTURE_SET_BLOCK),
+        lighting_shader_property(OBJECT_TEXTURE_SET_BLOCK, false),
         texture_set(shape.diffuse, shape.normal_texture)?,
         multi_bound(OBJECT_AABB_BLOCK),
         multi_bound_aabb(center, extent),
@@ -229,7 +311,7 @@ pub fn object_lod_segmented(shape: &LodShape<'_>, segment_counts: &[u32]) -> Res
             OBJECT_SHADER_BLOCK,
             segment_counts,
         )?,
-        lighting_shader_property(OBJECT_TEXTURE_SET_BLOCK),
+        lighting_shader_property(OBJECT_TEXTURE_SET_BLOCK, false),
         texture_set(shape.diffuse, shape.normal_texture)?,
         multi_bound(OBJECT_AABB_BLOCK),
         multi_bound_aabb(center, extent),
@@ -451,7 +533,7 @@ fn controller_block_index(index: usize) -> u32 {
 /// reference, on top of the shared [`write_shape_block`] writer rather than
 /// duplicating it.
 fn triangle_shape_with_shader(shape: &StaticShape<'_>, shader_property: u32) -> Result<Vec<u8>> {
-    write_shape_block(&geometry(shape), shader_property)
+    write_shape_block(&geometry(shape, &[]), shader_property)
 }
 
 /// Serializes a NIF container around already-encoded blocks.
@@ -472,7 +554,7 @@ fn write_nif(block_types: &[&str], blocks: &[Vec<u8>], strings: &[&str]) -> Resu
         u32::try_from(blocks.len()).map_err(|_| eyre!("NIF block count overflow"))?,
     );
     push_u32(&mut bytes, BETHESDA_VERSION);
-    push_string8(&mut bytes, "OpenSkyrim dummy-content");
+    push_string8(&mut bytes, "Mudcrab dummy-content");
     push_string8(&mut bytes, "");
     push_string8(&mut bytes, "");
     push_u16(
@@ -524,7 +606,7 @@ fn validate(shape: &StaticShape<'_>) -> Result<()> {
         "NIF shape name is not printable ASCII: {:?}",
         shape.name
     );
-    validate_geometry(&geometry(shape))?;
+    validate_geometry(&geometry(shape, &[]))?;
     ensure!(
         !shape.diffuse.is_empty(),
         "NIF shape needs a diffuse texture"
@@ -538,13 +620,14 @@ fn validate(shape: &StaticShape<'_>) -> Result<()> {
     Ok(())
 }
 
-fn geometry<'a>(shape: &StaticShape<'a>) -> Geometry<'a> {
+fn geometry<'a>(shape: &StaticShape<'a>, colors: &'a [[u8; 4]]) -> Geometry<'a> {
     Geometry {
         positions: shape.positions,
         normals: shape.normals,
         uvs: shape.uvs,
         indices: shape.indices,
-        colors: None,
+        // An empty slice means the caller authored no vertex colours.
+        colors: (!colors.is_empty()).then_some(colors),
     }
 }
 
@@ -606,12 +689,123 @@ fn validate_geometry(geometry: &Geometry<'_>) -> Result<()> {
 }
 
 fn fade_node() -> Vec<u8> {
+    fade_node_with_children(&[1])
+}
+
+fn fade_node_with_children(children: &[u32]) -> Vec<u8> {
     let mut block = Vec::with_capacity(84);
     push_av_object(&mut block, NULL_REF);
-    push_u32(&mut block, 1);
-    push_u32(&mut block, 1);
+    push_u32(&mut block, children.len() as u32);
+    for child in children {
+        push_u32(&mut block, *child);
+    }
     push_u32(&mut block, 0);
     block
+}
+
+fn validate_body(body: &BoxBody<'_>) -> Result<()> {
+    ensure!(
+        !body.node_name.is_empty()
+            && body
+                .node_name
+                .bytes()
+                .all(|byte| (0x20..0x7f).contains(&byte)),
+        "NIF body node name must be printable ASCII"
+    );
+    ensure!(
+        body.half_extents.iter().all(|v| v.is_finite() && *v > 0.0),
+        "NIF box body needs positive half extents"
+    );
+    let finite = body
+        .inertia
+        .iter()
+        .chain(&body.center_of_mass)
+        .all(|v| v.is_finite())
+        && [
+            body.mass,
+            body.linear_damping,
+            body.angular_damping,
+            body.friction,
+            body.restitution,
+            body.max_linear_velocity,
+            body.max_angular_velocity,
+        ]
+        .iter()
+        .all(|v| v.is_finite());
+    ensure!(finite, "NIF body contains a non-finite value");
+    Ok(())
+}
+
+/// `bhkRigidBody` block: `bhkWorldObject`, `bhkEntityCInfo`, then `bhkRigidBodyCInfo2010`
+/// (nif.xml, Skyrim), then constraints and body flags.
+fn rigid_body(body: &BoxBody<'_>, shape: u32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(250);
+    push_u32(&mut b, shape);
+    b.extend_from_slice(&[body.collision_layer, 0, 0, 0]); // havok filter
+    b.extend_from_slice(&[0; 20]); // world object info
+    b.extend_from_slice(&[1, 0, 0xff, 0xff]); // entity info
+    b.extend_from_slice(&[0; 4]); // unused
+    b.extend_from_slice(&[body.collision_layer, 0, 0, 0]); // havok filter
+    b.extend_from_slice(&[0; 4]); // unused
+    push_u32(&mut b, 0); // unknown int
+    b.extend_from_slice(&[1, 0, 0xff, 0xff]); // response, unused, callback delay
+    let (translation, rotation) = body.transform.unwrap_or(([0.0; 3], [0.0, 0.0, 0.0, 1.0]));
+    for value in translation.into_iter().chain([0.0]) {
+        push_f32(&mut b, value);
+    }
+    for value in rotation {
+        push_f32(&mut b, value);
+    }
+    b.extend_from_slice(&[0; 32]); // linear and angular velocity
+    for row in body.inertia.chunks(3) {
+        for value in row.iter().copied().chain([0.0]) {
+            push_f32(&mut b, value);
+        }
+    }
+    for value in body.center_of_mass.into_iter().chain([0.0]) {
+        push_f32(&mut b, value);
+    }
+    for value in [
+        body.mass,
+        body.linear_damping,
+        body.angular_damping,
+        1.0, // time factor
+        1.0, // gravity factor
+        body.friction,
+        0.0, // rolling friction multiplier
+        body.restitution,
+        body.max_linear_velocity,
+        body.max_angular_velocity,
+        0.15, // penetration depth
+    ] {
+        push_f32(&mut b, value);
+    }
+    b.extend_from_slice(&[
+        body.motion_system,
+        body.deactivator_type,
+        1, // solver deactivation off
+        body.quality_type,
+        0, // auto remove level
+        0, // response modifier flags
+        3, // shape keys in contact point
+        0, // force collided onto PPU
+    ]);
+    b.extend_from_slice(&[0; 12]);
+    push_u32(&mut b, 0); // constraints
+    push_u16(&mut b, 0); // body flags
+    b
+}
+
+fn box_shape(body: &BoxBody<'_>) -> Vec<u8> {
+    let mut b = Vec::with_capacity(32);
+    push_u32(&mut b, 0); // material
+    push_f32(&mut b, 0.0); // radius
+    b.extend_from_slice(&[0; 8]);
+    for value in body.half_extents {
+        push_f32(&mut b, value);
+    }
+    push_f32(&mut b, 0.0);
+    b
 }
 
 /// Writes an `NiNode` with the given string index and one child.
@@ -798,7 +992,10 @@ fn write_shape_block(geometry: &Geometry<'_>, shader_property: u32) -> Result<Ve
     Ok(block)
 }
 
-fn lighting_shader_property(texture_set: u32) -> Vec<u8> {
+/// Writes a `BSLightingShaderProperty` naming `texture_set` and, when the shape
+/// carries authored vertex colours, the two shader flags that tell the runtime
+/// to read them.
+fn lighting_shader_property(texture_set: u32, colors: bool) -> Vec<u8> {
     let mut block = Vec::with_capacity(100);
     push_u32(&mut block, SHADER_TYPE_DEFAULT);
     push_u32(&mut block, NULL_REF);
@@ -825,6 +1022,10 @@ fn lighting_shader_property(texture_set: u32) -> Vec<u8> {
     push_f32(&mut block, 1.0);
     push_f32(&mut block, 0.3);
     push_f32(&mut block, 2.0);
+    if colors {
+        block[16..20].copy_from_slice(&(1u32 << 3).to_le_bytes());
+        block[20..24].copy_from_slice(&(1u32 << 5).to_le_bytes());
+    }
     debug_assert_eq!(block.len(), 100);
     block
 }
@@ -988,6 +1189,10 @@ fn texture_set(diffuse: &str, normal_texture: &str) -> Result<Vec<u8>> {
 }
 
 fn push_av_object(out: &mut Vec<u8>, name: u32) {
+    push_av_object_with(out, name, NULL_REF);
+}
+
+fn push_av_object_with(out: &mut Vec<u8>, name: u32, collision_object: u32) {
     push_u32(out, name);
     push_u32(out, NULL_REF);
     push_u32(out, NULL_REF);
@@ -999,7 +1204,7 @@ fn push_av_object(out: &mut Vec<u8>, name: u32) {
         out.extend_from_slice(&value.to_le_bytes());
     }
     out.extend_from_slice(&1.0f32.to_le_bytes());
-    push_u32(out, NULL_REF);
+    push_u32(out, collision_object);
 }
 
 fn push_f32(out: &mut Vec<u8>, value: f32) {

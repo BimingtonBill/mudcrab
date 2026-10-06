@@ -38,6 +38,11 @@ The converted `atmosphere.glb` keeps no vertex colours, so the engine builds the
 
 ## What the engine does
 
+Scene cameras now compose sky, background and fog with surfaces in HDR, then apply one shared
+display transform. See [L1 color pipeline](color-pipeline.md) for domains, tests and remaining
+parity gaps. Existing encoded weather mixing and fog equations remain provisional pending retail
+comparison; the output correction does not validate those assumptions.
+
 > **On the `portal` branch** this section describes main's wiring (`SkyPlugin`, the global
 > `SkyPalette`, `apply_fog` in `sky.rs`), which the portal does not add. There the dome is
 > `sky_dome.rs` (one per camera, coloured from the `SpaceAtmosphere` rows) and the fog is
