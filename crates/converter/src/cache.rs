@@ -305,16 +305,20 @@ pub fn configuration_hash_for_schema(
     config: &crate::config::PipelineConfig,
     schema: u32,
 ) -> Result<String> {
+    // portal: the hashed "schema" field keeps the raw number (a portal-built output recorded its own
+    // portal number there), but which fields exist depends on the main version it is built on; a
+    // raw 101_601 would otherwise pass every `>= 22` gate and hash fields that converter never had.
+    let main = main_schema_version(schema);
     let mut relevant = serde_json::json!({
         "schema": schema,
         "texture_etc1s_quality": config.texture_fallback_quality,
         "texture_uastc_level": config.texture_uastc_level,
         "script_abi_version": config.script_abi_version,
     });
-    if schema >= 16 {
+    if main >= 16 {
         relevant["texture_zstd_level"] = serde_json::json!(config.texture_zstd_level);
     }
-    if schema >= 22 {
+    if main >= 22 {
         // CPU native-BC output and GPU UASTC output have different contracts;
         // quality changes bytes, while GPU batch size only changes scheduling.
         relevant["texture_encoder"] = match config.texture_encoder {
@@ -441,7 +445,8 @@ pub(crate) fn retained_configuration_matches(
     if recorded == configuration_hash_for_schema(config, schema)? {
         return Ok(true);
     }
-    if schema != 16 {
+    // portal: a portal-numbered 16 (101_601) takes the same native route as main's 16.
+    if main_schema_version(schema) != 16 {
         return Ok(false);
     }
     let native = serde_json::json!({

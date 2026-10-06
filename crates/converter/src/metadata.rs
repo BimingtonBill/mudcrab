@@ -10,7 +10,7 @@ use crate::{
     asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
     cache::{
         CONVERTER_SCHEMA_VERSION, ConversionManifest, configuration_hash, hash_bytes, hash_file,
-        retained_configuration_matches,
+        main_schema_version, retained_configuration_matches,
     },
     esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database},
     integration::finalize_world_database,
@@ -36,6 +36,14 @@ use std::{
 };
 use tokio::sync::mpsc::Sender;
 use walkdir::WalkDir;
+
+/// Whether a source converter schema is one the metadata rebuild can verify and reuse.
+///
+/// portal: a portal-numbered source (`100_000 + main * 100 + revision`, e.g. 101_601) is judged by
+/// the main version it was built on, exactly like a main-numbered source of that version.
+fn supported_source_schema(schema: u32) -> bool {
+    matches!(main_schema_version(schema), 15 | 16 | 19..=23)
+}
 
 #[derive(Serialize)]
 struct MetadataProvenance {
@@ -75,7 +83,9 @@ impl AssetPipeline {
         // GLBs during schema migration, which this explicit route verifies instead.
         let mut manifest: ConversionManifest = serde_json::from_slice(&source_manifest)?;
         ensure!(
-            (matches!(manifest.schema_version, 15 | 16 | 19 | 20 | 21 | 22 | 23)
+            // portal: a portal-numbered source (101_601 = main 16) is handled as its main number;
+            // the raw number is only recorded as provenance.
+            (supported_source_schema(manifest.schema_version)
                 || manifest.schema_version == CONVERTER_SCHEMA_VERSION)
                 && manifest.complete
                 && manifest.failures.is_empty(),
@@ -90,9 +100,8 @@ impl AssetPipeline {
             .retained_mesh_schema_version
             .unwrap_or(manifest.schema_version);
         ensure!(
-            (matches!(mesh_schema, 15 | 16 | 19 | 20 | 21 | 22 | 23)
-                || mesh_schema == CONVERTER_SCHEMA_VERSION)
-                && mesh_schema <= manifest.schema_version,
+            (supported_source_schema(mesh_schema) || mesh_schema == CONVERTER_SCHEMA_VERSION)
+                && main_schema_version(mesh_schema) <= main_schema_version(manifest.schema_version),
             "unsupported retained mesh cache contract"
         );
         ensure!(
@@ -604,6 +613,40 @@ async fn progress_event(progress: &Sender<ProgressEvent>, stage: ProgressStage, 
 mod tests {
     use super::*;
     use crate::cache::CacheEntry;
+
+    #[test]
+    fn portal_numbered_sources_pass_the_schema_gate_as_their_main_version() {
+        // portal: 101_601 is the portal converter built on main schema 16.
+        assert!(supported_source_schema(101_601));
+        assert!(supported_source_schema(16));
+        assert!(supported_source_schema(102_301));
+        // Unknown numbers still fail: no such main version, or a main this route never handled.
+        for schema in [99, 100_099, 103_001, 102_499, 101_701, 14] {
+            assert!(!supported_source_schema(schema), "{schema}");
+        }
+        // The current schema is accepted by its own equality check, not by this list.
+        assert!(!supported_source_schema(CONVERTER_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn portal_101_601_configuration_hash_matches_what_that_converter_recorded() {
+        // The 101_601 converter hashed its raw schema number and the fields main 16 had (no
+        // texture_encoder, which arrived with main 22).
+        let directory = tempfile::tempdir().unwrap();
+        let config =
+            crate::config::PipelineConfig::new(directory.path(), directory.path().join("output"));
+        let recorded = hash_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "schema": 101_601,
+                "texture_etc1s_quality": config.texture_fallback_quality,
+                "texture_uastc_level": config.texture_uastc_level,
+                "script_abi_version": config.script_abi_version,
+                "texture_zstd_level": config.texture_zstd_level,
+            }))
+            .unwrap(),
+        );
+        assert!(retained_configuration_matches(&config, 101_601, &recorded).unwrap());
+    }
 
     #[test]
     fn retained_sampler_aliases_require_exact_source_bytes() {
