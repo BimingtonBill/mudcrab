@@ -83,13 +83,24 @@ use std::{
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct RoomCullingView;
 
-/// A doorway closer than this to the camera is treated as fully open: a camera standing in a
-/// doorway has the doorway at or behind its near plane, where a projected rectangle means nothing.
+/// A doorway closer than this to the camera counts as fully open, in Creation units (about 70 per
+/// metre, so 8 is roughly 11 cm).
+///
+/// The camera has Bevy's default 0.1 near plane, so a doorway further than that from the camera
+/// still projects to something meaningful and the clipping in [`project_portal`] handles it. The
+/// margin is for the camera standing in or touching the doorway, where the rectangle is edge-on or
+/// straddles the lens and a projected rectangle is numerically unreliable. It is also a few units
+/// of slack for marker placement. Too large a value only draws more (the walk stays conservative);
+/// 8 covers the player's body leaning into a doorway without opening doorways the player is
+/// clearly beside. The image comparison against a real interior is where to retune it.
 const PORTAL_OPEN_DISTANCE: f32 = 8.0;
 
 /// Smallest clip-space `w` kept when clipping a doorway against the camera; anything nearer is
 /// behind the lens.
 const CLIP_W_EPSILON: f32 = 1.0e-3;
+
+/// The owner cache is emptied past this many entries, which drops the despawned meshes in it.
+const OWNER_CACHE_LIMIT: usize = 100_000;
 
 /// A room may widen its visible region this many times before it is given the whole screen, which
 /// bounds the walk on cyclic portal graphs.
@@ -207,7 +218,12 @@ pub struct RoomGraph {
     pub portals: Vec<Portal>,
     /// `room_links` as undirected edges between room indices.
     pub links: Vec<(usize, usize)>,
-    /// Membership by reference FormID (`reference_rooms.reference_id`).
+    /// Membership by placed-reference id. The key is one number under three names: the `FormId`
+    /// component of a spawned reference (`streaming::spawn_cell` inserts `FormId(reference.form_id)`),
+    /// `ReferenceRow::form_id`, which the world database loader fills from `references.id`
+    /// (`world::database::REFERENCE_COLUMNS` starts with `r.id`), and `reference_rooms.reference_id`.
+    /// It is the placement's id, not the base object's `base_form_id`. A test proves the chain
+    /// through the real loader (`the_membership_key_is_the_reference_id_the_loader_delivers`).
     pub membership: HashMap<u32, Membership>,
 }
 
@@ -539,9 +555,10 @@ impl RoomCullingState {
         self.enabled && self.probe != TableProbe::Absent
     }
 
-    /// Registers a graph for a loaded cell root. Used by the loader and by tests.
+    /// Registers a graph for a loaded cell root. Tests only: the loader goes through
+    /// `collect_loaded_graphs`, which also records what the probe found.
+    #[cfg(test)]
     pub fn insert_graph(&mut self, cell_id: u32, root: Entity, graph: RoomGraph) {
-        self.probe = TableProbe::Present;
         self.graphs.insert(cell_id, LoadedGraph { root, graph });
     }
 }
@@ -713,6 +730,7 @@ pub fn cull_room_views(
     >,
     parents: Query<&ChildOf>,
     ids: Query<&FormId>,
+    mut owners: Local<HashMap<Entity, u32>>,
 ) {
     state.culled_last_frame = 0;
     if !state.enabled || state.graphs.is_empty() {
@@ -745,9 +763,24 @@ pub fn cull_room_views(
             };
             let list = visible.get_mut(TypeId::of::<Mesh3d>());
             let before = list.len();
-            list.retain(|&entity| match owner_form_id(entity, &parents, &ids) {
-                Some(form_id) => loaded.graph.is_drawn(form_id, &reached),
-                None => true,
+            // The owner of a mesh does not change while it lives, so a found owner is remembered
+            // (entity ids carry a generation, so a recycled slot is a different key). A mesh with
+            // no owner is not cached: its hierarchy may still be being built.
+            if owners.len() > OWNER_CACHE_LIMIT {
+                owners.clear();
+            }
+            list.retain(|&entity| {
+                let owner = match owners.get(&entity) {
+                    Some(&form_id) => Some(form_id),
+                    None => {
+                        let found = owner_form_id(entity, &parents, &ids);
+                        if let Some(form_id) = found {
+                            owners.insert(entity, form_id);
+                        }
+                        found
+                    }
+                };
+                owner.is_none_or(|form_id| loaded.graph.is_drawn(form_id, &reached))
             });
             culled += before - list.len();
             // One cell holds the camera; the rest cannot also contain it.
@@ -772,9 +805,18 @@ fn owner_form_id(entity: Entity, parents: &Query<&ChildOf>, ids: &Query<&FormId>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::database::{CellKey, DatabaseRequest, WorldDatabase};
     use bevy::{
-        camera::visibility::{CubemapVisibleEntities, VisibleMeshEntities},
+        asset::AssetPlugin,
+        camera::{
+            primitives::{Aabb, Frustum},
+            visibility::{
+                CubemapVisibleEntities, ViewVisibility, VisibilityPlugin, VisibleMeshEntities,
+            },
+        },
         ecs::system::RunSystemOnce,
+        math::primitives::ViewFrustum,
+        transform::TransformPlugin,
     };
 
     /// The section 15 tables, as the converter writes them.
@@ -1096,6 +1138,19 @@ mod tests {
     /// A camera in room A of a two-room cell whose only doorway points away from it, so room B's
     /// objects are culled. `near` is in A, `far` in B and `loose` has no FormId at all.
     fn scene(enabled: bool) -> Scene {
+        scene_with(
+            enabled,
+            GlobalTransform::IDENTITY,
+            GlobalTransform::IDENTITY,
+        )
+    }
+
+    /// [`scene`] with the cell root at `root_transform` and the camera at `camera_transform`.
+    fn scene_with(
+        enabled: bool,
+        root_transform: GlobalTransform,
+        camera_transform: GlobalTransform,
+    ) -> Scene {
         let mut app = App::new();
         app.add_plugins(RoomCullingPlugin {
             enabled,
@@ -1103,7 +1158,7 @@ mod tests {
         });
         let root = app
             .world_mut()
-            .spawn((StreamedCellRoot, CellRef(7), GlobalTransform::IDENTITY))
+            .spawn((StreamedCellRoot, CellRef(7), root_transform))
             .id();
         let mut graph = RoomGraph {
             rooms: vec![
@@ -1148,7 +1203,7 @@ mod tests {
             .world_mut()
             .spawn((
                 StreamingCamera,
-                GlobalTransform::IDENTITY,
+                camera_transform,
                 Projection::Perspective(PerspectiveProjection {
                     fov: std::f32::consts::FRAC_PI_3,
                     aspect_ratio: 1.0,
@@ -1296,5 +1351,261 @@ mod tests {
         scene.app.update();
         let state = scene.app.world().resource::<RoomCullingState>();
         assert!(state.pending.is_empty());
+    }
+
+    // --- Round-1 review: the real paths -------------------------------------------------------
+
+    /// A file named like the engine's own, holding the section 15 tables beside the tables the
+    /// loader reads. Reference 500 sits on base object 20; reference 501 sits on base object 500,
+    /// which is another placement's id, so a lookup by the base id would pick the wrong room.
+    fn write_world_fixture(directory: &std::path::Path) -> PathBuf {
+        let path = directory.join("skyrim_world.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER NOT NULL);
+                 INSERT INTO schema_info VALUES({});
+                 CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
+                 CREATE TABLE \"references\"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
+                 INSERT INTO statics VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1);
+                 INSERT INTO statics VALUES(500,'architecture/floor.nif',-1,-2,-3,1,2,3,1);
+                 INSERT INTO \"references\" VALUES(500,7,20,0,0,0,0,0,0,1);
+                 INSERT INTO \"references\" VALUES(501,7,500,1000,0,0,0,0,0,1);",
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        // Rooms 1 and 2 side by side, no doorway and no link: from room 1 only room 1 is reached.
+        insert_room(&connection, 1, 7, [0.0, 0.0, 0.0]);
+        insert_room(&connection, 2, 7, [1000.0, 0.0, 0.0]);
+        connection
+            .execute("INSERT INTO reference_rooms VALUES (500,1,1),(501,2,1)", [])
+            .unwrap();
+        path
+    }
+
+    /// The whole key chain through the real loader: `WorldDatabase` delivers `references.id` as
+    /// `ReferenceRow::form_id` (which `streaming::spawn_cell` puts on the entity as `FormId`), and
+    /// `reference_rooms.reference_id` is that same number.
+    #[test]
+    fn the_membership_key_is_the_reference_id_the_loader_delivers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_world_fixture(directory.path());
+        let database = WorldDatabase::open(&path).unwrap();
+        database
+            .request(DatabaseRequest::Load {
+                generation: 1,
+                key: CellKey::Interior(7),
+                queued_at: std::time::Instant::now(),
+            })
+            .unwrap();
+        let response = loop {
+            if let Some(response) = database.try_response() {
+                break response;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let mut references = response.result.expect("the cell loads").references;
+        references.sort_by_key(|reference| reference.form_id);
+        let keys: Vec<(u32, u32)> = references
+            .iter()
+            .map(|reference| (reference.form_id, reference.base_form_id))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![(500, 20), (501, 500)],
+            "form_id is references.id"
+        );
+
+        let graph = read_graph(&path, 7).unwrap().expect("the tables are there");
+        assert_eq!(graph.rooms_containing(Vec3::ZERO), vec![0]);
+        let reached = graph
+            .reached_rooms(Vec3::ZERO, clip_from_local())
+            .expect("the camera is in room 1");
+        assert_eq!(reached, vec![true, false]);
+        for reference in &references {
+            // The key the engine uses is the delivered form_id; the base id would hit the wrong row.
+            assert_eq!(
+                graph.is_drawn(reference.form_id, &reached),
+                reference.form_id == 500
+            );
+        }
+        assert!(
+            graph.is_drawn(references[1].base_form_id, &reached),
+            "base id 500 would have made reference 501 look like reference 500"
+        );
+    }
+
+    /// The production read path, from a file: the path the plugin opens is the one the engine opens
+    /// (`app.rs`: `config.assets_dir.join("skyrim_world.db")`, lines 96 and 113 at this commit), the
+    /// tables read back, and a file without them is `None` rather than an error.
+    #[test]
+    fn a_world_database_file_is_read_through_the_production_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_world_fixture(directory.path());
+        let config = EngineConfig {
+            assets_dir: directory.path().to_path_buf(),
+            ..default()
+        };
+        let plugin = RoomCullingPlugin::from_config(&config);
+        assert_eq!(plugin.database_path, path);
+        let graph = read_graph(&plugin.database_path, 7).unwrap().unwrap();
+        assert_eq!((graph.rooms.len(), graph.membership.len()), (2, 2));
+
+        let bare = directory.path().join("bare.db");
+        Connection::open(&bare)
+            .unwrap()
+            .execute_batch("CREATE TABLE schema_info(version INTEGER);")
+            .unwrap();
+        assert!(read_graph(&bare, 7).unwrap().is_none());
+    }
+
+    /// Bevy's own visibility plugin, the real plugin and `app.update()`: the system has to run in
+    /// `CheckVisibility` after `check_visibility_cpu_culling`, or Bevy's refill puts the culled mesh
+    /// back. Room C has no doorway, so its mesh is in the frustum but must leave the camera's list
+    /// while its `ViewVisibility`, which shadow passes read, stays set.
+    #[test]
+    fn the_real_visibility_schedule_culls_after_bevys_own_check() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            TransformPlugin,
+            VisibilityPlugin,
+        ))
+        .init_asset::<Mesh>()
+        .init_asset::<bevy::mesh::skinning::SkinnedMeshInverseBindposes>()
+        .add_plugins(RoomCullingPlugin {
+            enabled: true,
+            database_path: PathBuf::from("does-not-exist.db"),
+        });
+        let root = app
+            .world_mut()
+            .spawn((
+                StreamedCellRoot,
+                CellRef(7),
+                Transform::IDENTITY,
+                Visibility::default(),
+            ))
+            .id();
+        let graph = RoomGraph {
+            rooms: vec![
+                room(1, Vec3::ZERO, 10.0),
+                room(2, Vec3::new(0.0, 0.0, -20.0), 10.0),
+                room(3, Vec3::new(0.0, 0.0, -40.0), 10.0),
+            ],
+            portals: vec![doorway(10, Vec3::new(0.0, 0.0, -10.0), 3.0, [0, 1])],
+            links: vec![],
+            membership: (0..3)
+                .map(|room| {
+                    (
+                        room as u32 + 1,
+                        Membership {
+                            contained: vec![room],
+                            overlapping: vec![],
+                        },
+                    )
+                })
+                .collect(),
+        };
+        app.world_mut()
+            .resource_mut::<RoomCullingState>()
+            .insert_graph(7, root, graph);
+        let mesh_in = |app: &mut App, form_id: u32, z: f32| {
+            let reference = app
+                .world_mut()
+                .spawn((FormId(form_id), Visibility::default(), ChildOf(root)))
+                .id();
+            app.world_mut()
+                .spawn((
+                    Mesh3d(Handle::default()),
+                    Aabb::from_min_max(Vec3::splat(-1.0), Vec3::splat(1.0)),
+                    Transform::from_xyz(0.0, 0.0, z),
+                    ChildOf(reference),
+                ))
+                .id()
+        };
+        let (a, b, c) = (
+            mesh_in(&mut app, 1, -3.0),
+            mesh_in(&mut app, 2, -20.0),
+            mesh_in(&mut app, 3, -40.0),
+        );
+        let projection = Projection::Perspective(PerspectiveProjection {
+            fov: std::f32::consts::FRAC_PI_3,
+            aspect_ratio: 1.0,
+            ..default()
+        });
+        let frustum = Frustum(ViewFrustum::from_clip_from_world(
+            &projection.get_clip_from_view(),
+        ));
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera::default(),
+                StreamingCamera,
+                Transform::IDENTITY,
+                projection,
+                frustum,
+            ))
+            .id();
+        app.update();
+        let visible = mesh_list(&app, camera);
+        assert!(visible.contains(&a) && visible.contains(&b));
+        assert!(
+            !visible.contains(&c),
+            "room C's mesh is in the frustum but unreached, so it leaves the main view"
+        );
+        assert!(
+            app.world().get::<ViewVisibility>(c).unwrap().get(),
+            "Bevy's own check still marks it visible, which is what shadow passes use"
+        );
+        assert_eq!(
+            app.world().resource::<RoomCullingState>().culled_last_frame,
+            1
+        );
+    }
+
+    /// The A-B-C cull again with the cell root rotated and moved: the graph is root-local, so a
+    /// camera at the same place in the root's frame gets the same answer, and a camera that is not
+    /// in the root's frame is in no room.
+    #[test]
+    fn a_rotated_and_moved_cell_root_gives_the_same_answer() {
+        let root = GlobalTransform::from(Transform {
+            translation: Vec3::new(100.0, 5.0, -30.0),
+            rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            ..default()
+        });
+        let mut inside = scene_with(true, root, root);
+        run_cull(&mut inside.app);
+        assert_eq!(
+            mesh_list(&inside.app, inside.camera),
+            vec![inside.near, inside.loose]
+        );
+        let mut outside = scene_with(true, root, GlobalTransform::IDENTITY);
+        run_cull(&mut outside.app);
+        assert_eq!(
+            mesh_list(&outside.app, outside.camera),
+            vec![outside.near, outside.far, outside.loose],
+            "the world origin is not inside any room of this root"
+        );
+    }
+
+    /// A doorway the camera is next to counts as open even when it points away from the view; one
+    /// just beyond `PORTAL_OPEN_DISTANCE` does not.
+    #[test]
+    fn a_doorway_next_to_the_camera_is_open_but_one_further_away_is_not() {
+        let graph = chain(doorway(11, Vec3::new(0.0, 0.0, -30.0), 3.0, [1, 2]));
+        // The camera looks along +Z (away from the doorway at z = -10).
+        let clip_for = |position: Vec3| {
+            clip_from_local()
+                * Mat4::from_rotation_y(std::f32::consts::PI)
+                * Mat4::from_translation(-position)
+        };
+        let near = Vec3::new(0.0, 0.0, -10.0 + PORTAL_OPEN_DISTANCE - 1.0);
+        let reached = graph.reached_rooms(near, clip_for(near)).unwrap();
+        assert!(reached[1], "within the open distance the doorway is taken");
+        let far = Vec3::new(0.0, 0.0, -10.0 + PORTAL_OPEN_DISTANCE + 1.0);
+        let reached = graph.reached_rooms(far, clip_for(far)).unwrap();
+        assert!(!reached[1], "beyond it, a doorway behind the camera is not");
     }
 }
