@@ -3,6 +3,14 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-03..06 Portal Dev (experimental demo; LOD rebuild parked)
+
+- **Experimental demo (10-03, Upstream Dev's hand-out), done:** local-only branch `experimental/2026-10-03` = origin/main b5d317f3 + 15 open PRs + portal e6a0bd38, head 07df8a37, worktree `D:/Modding-overflow/wt-experimental`, build `D:/Modding-overflow/wt-targets/experimental`, data `D:/Modding-overflow/SkyrimConverted-experimental` (converter 101_801, world 100_401; class C). Play: `powershell -NoProfile -ExecutionPolicy Bypass -File tools/experimental_play.ps1`. 2-door tour passed; workspace checks: 1740/1743 tests (3 snapshot tests expected), clippy one unused helper, fmt differences. Portal's doors.rs drives doors; #128's crossing compiled but not registered.
+- **Scripts on portal:** `tools/experimental_build.ps1` (rebuild from scratch; rerere + reuse of the previous build's identical merges, pinned heads with -NoFetch/-PortalRef, staged fixups in `tools/experimental/fixups/`; a from-scratch replay matched 07df8a37 exactly), `tools/experimental_convert.cmd`, `tools/experimental_play.ps1`, `tools/merge_keep_both.py`.
+- **#105 LOD rebuild (10-04), PARKED 10-06 by Upstream Dev:** `experimental/2026-10-04` (#105 64316271 + newer heads + #142 #152 + portal) compiles at 4559e5bb, converter 101_901 / world 100_501, portal's converter lod.rs renamed portal_lod; 49 engine lib tests fail (merge semantics), engine examples don't compile; never reconverted or played. Measurements for Chef dropped (#105 merged 10-05; LOD cost comes from Phase 2's #184 baseline). Lessons: workers in hand-made worktrees need `ds-agent -OwnedFiles` (AnyWorkers added it 10-04; never edit .deepseek-agents.json); replay a reviewed portal merge with `git cherry-pick -m 1 --no-commit <old merge>` onto the new tree instead of re-merging.
+- **Open:** `D:/Modding-overflow/wt-experimental/target` (15 GB, stray duplicate build, class A) on Upstream Dev's "can go" list, waiting for the user's yes. Two project-config asks still waiting for the user: narrow implAllowTools `Bash(python *)`; drop the missing `C:/Modding/shared-check-phase2` from readOnlyDirs. No worker running.
+- **Also:** Discord digest on Open Render Graph's "nanite" idea: `local/research/discord-2026-10-04-org-nanite.md` (idea only).
+
 ## 2026-10-04/05 Upstream Dev (rename night; user stopped ~01:10)
 
 - Merged upstream: #114 (Chef, with our fixes), #118 squash cbb4fd48 and #127 rename squash 5579f007 (both on the user's explicit override of the no-self-merge rule for tonight). **Main is renamed to Mudcrab:** every open branch must merge main and re-run `scripts/rename-to-mudcrab.py` (then `check`).
