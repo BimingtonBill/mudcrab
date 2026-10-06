@@ -43,6 +43,18 @@
 //!   them. The engine does not use `NoCpuCulling` today; room culling needs a GPU-side input first
 //!   if that changes.
 //!
+//! # Rooms whose boxes overlap or touch are one space
+//!
+//! Skyrim's open caves place room markers side by side with no portal and no `XLRM` link, and
+//! their boxes overlap or abut: in effect one space. When a cell's graph is built, every pair of
+//! rooms whose oriented boxes overlap, or lie within [`OVERLAP_TOLERANCE`] Creation units of each
+//! other, gets an implicit open edge ([`overlap_links`]), walked like an `XLRM` link: the region is
+//! unchanged, so it can only draw more. The test is a separating-axis test on the two oriented
+//! boxes. Rooms further apart than the tolerance, such as two rooms with a wall between them, need
+//! a portal or a link. Orientation comes from the shared Creation-to-runtime function, so it is the
+//! converter's convention (verified on real data: it puts 99.2% of portal centres inside both of
+//! their rooms, the opposite yaw sign 72%).
+//!
 //! # What is never culled by its room
 //!
 //! The converter records room membership for every placed record, actors included, but a room is
@@ -247,6 +259,68 @@ impl Portal {
         let dn = offset.dot(normal).abs();
         Vec3::new(dx, dy, dn).length()
     }
+}
+
+/// Two room boxes closer than this many Creation units (touching or overlapping included) count
+/// as one space.
+pub const OVERLAP_TOLERANCE: f32 = 4.0;
+
+/// Whether two room boxes overlap or lie within [`OVERLAP_TOLERANCE`] of each other: the
+/// separating-axis test on two oriented boxes (their six face axes and the nine edge cross
+/// products).
+pub fn rooms_overlap(a: &Room, b: &Room) -> bool {
+    if !(a.center.is_finite() && b.center.is_finite() && a.half.is_finite() && b.half.is_finite()) {
+        return false;
+    }
+    let axes_a = [
+        a.rotation * Vec3::X,
+        a.rotation * Vec3::Y,
+        a.rotation * Vec3::Z,
+    ];
+    let axes_b = [
+        b.rotation * Vec3::X,
+        b.rotation * Vec3::Y,
+        b.rotation * Vec3::Z,
+    ];
+    let offset = b.center - a.center;
+    let separated = |axis: Vec3| {
+        let radius = |half: Vec3, axes: &[Vec3; 3]| {
+            (0..3)
+                .map(|i| half[i] * axes[i].dot(axis).abs())
+                .sum::<f32>()
+        };
+        offset.dot(axis).abs()
+            > radius(a.half, &axes_a) + radius(b.half, &axes_b) + OVERLAP_TOLERANCE
+    };
+    for axis in axes_a.into_iter().chain(axes_b) {
+        if separated(axis) {
+            return false;
+        }
+    }
+    for edge_a in axes_a {
+        for edge_b in axes_b {
+            let axis = edge_a.cross(edge_b);
+            // Parallel edges give no new axis.
+            if axis.length_squared() > 1.0e-6 && separated(axis.normalize()) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The implicit open edges of a set of rooms: every pair of room indices whose boxes overlap.
+/// O(rooms squared), done once when a cell's graph is built.
+pub fn overlap_links(rooms: &[Room]) -> Vec<(usize, usize)> {
+    let mut links = Vec::new();
+    for (i, a) in rooms.iter().enumerate() {
+        for (j, b) in rooms.iter().enumerate().skip(i + 1) {
+            if rooms_overlap(a, b) {
+                links.push((i, j));
+            }
+        }
+    }
+    links
 }
 
 /// Which rooms an object belongs to, as indices into [`RoomGraph::rooms`].
@@ -522,6 +596,17 @@ pub fn load_room_graph(connection: &Connection, cell_id: u32) -> rusqlite::Resul
             }
         }
     }
+    let implicit: Vec<(usize, usize)> = overlap_links(&graph.rooms)
+        .into_iter()
+        .filter(|&(a, b)| !graph.links.contains(&(a, b)) && !graph.links.contains(&(b, a)))
+        .collect();
+    if !implicit.is_empty() {
+        info!(
+            "room culling: cell {cell_id:08X} has {} implicit links between touching or overlapping rooms",
+            implicit.len()
+        );
+    }
+    graph.links.extend(implicit);
     {
         let mut statement = connection.prepare_cached(
             "SELECT m.reference_id,m.room_ref,m.contained FROM reference_rooms m \
@@ -1753,5 +1838,127 @@ mod tests {
             assert!(!exempt_record_type(Some(culled)), "{culled}");
         }
         assert!(!exempt_record_type(None));
+    }
+
+    fn rotated_room(ref_id: u32, center: Vec3, half: f32, yaw: f32) -> Room {
+        Room {
+            rotation: Quat::from_rotation_y(yaw),
+            ..room(ref_id, center, half)
+        }
+    }
+
+    /// Rooms A (camera) and B overlap with no doorway and no link; C sits behind B, joined to B by
+    /// a doorway. The overlap is the only way from A to B.
+    #[test]
+    fn overlapping_rooms_with_no_portal_are_one_space() {
+        let rooms = vec![
+            room(1, Vec3::ZERO, 10.0),
+            room(2, Vec3::new(0.0, 0.0, -15.0), 10.0),
+            room(3, Vec3::new(0.0, 0.0, -40.0), 10.0),
+        ];
+        let mut graph = RoomGraph {
+            portals: vec![doorway(11, Vec3::new(0.0, 0.0, -27.0), 3.0, [1, 2])],
+            links: vec![],
+            membership: HashMap::new(),
+            rooms: rooms.clone(),
+        };
+        let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
+        assert_eq!(reached, vec![true, false, false], "no link yet: culled");
+        assert_eq!(overlap_links(&rooms), vec![(0, 1)]);
+        graph.links = overlap_links(&rooms);
+        let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
+        assert_eq!(reached, vec![true, true, true]);
+    }
+
+    /// The decision (the lead's epsilon of 4 units): boxes that touch, or lie within the tolerance,
+    /// are one space; boxes further apart are not.
+    #[test]
+    fn rooms_that_touch_or_nearly_touch_are_joined() {
+        let a = room(1, Vec3::ZERO, 10.0);
+        let touching = room(2, Vec3::new(0.0, 0.0, -20.0), 10.0);
+        let near = room(
+            3,
+            Vec3::new(0.0, 0.0, -20.0 - OVERLAP_TOLERANCE * 0.9),
+            10.0,
+        );
+        let deeper = room(4, Vec3::new(0.0, 0.0, -18.0), 10.0);
+        let apart = room(
+            5,
+            Vec3::new(0.0, 0.0, -20.0 - OVERLAP_TOLERANCE * 1.1),
+            10.0,
+        );
+        assert!(rooms_overlap(&a, &touching));
+        assert!(rooms_overlap(&a, &near));
+        assert!(rooms_overlap(&a, &deeper));
+        assert!(!rooms_overlap(&a, &apart));
+    }
+
+    /// A diamond (a box turned 45 degrees) beside a square: the corners do not meet, and moving the
+    /// diamond in makes them overlap.
+    #[test]
+    fn overlap_uses_the_oriented_boxes() {
+        let square = room(1, Vec3::ZERO, 10.0);
+        let turned = std::f32::consts::FRAC_PI_4;
+        let beside = rotated_room(2, Vec3::new(30.0, 0.0, 12.0), 10.0, turned);
+        assert!(!rooms_overlap(&square, &beside), "the corners do not meet");
+        assert!(!rooms_overlap(&beside, &square), "and it is symmetric");
+        let nearer = rotated_room(3, Vec3::new(22.0, 0.0, 0.0), 10.0, turned);
+        assert!(
+            rooms_overlap(&square, &nearer),
+            "the diamond's tip is inside"
+        );
+        assert!(rooms_overlap(&nearer, &square));
+        // A small turned box inside the square.
+        let inner = rotated_room(4, Vec3::new(1.0, 0.0, 1.0), 3.0, 0.3);
+        assert!(rooms_overlap(&square, &inner));
+        assert!(rooms_overlap(&inner, &square));
+    }
+
+    /// A portal-only chain whose rooms are well apart (walls between them) has no implicit edges,
+    /// so the portal walk is exactly what it was.
+    #[test]
+    fn a_portal_only_chain_has_no_implicit_edges() {
+        let mut graph = chain(side_doorway(11, Vec3::new(10.0, 0.0, -12.0), 1.5, [1, 2]));
+        // Open a wall's thickness between the rooms.
+        for (index, room) in graph.rooms.iter_mut().enumerate() {
+            room.center.z -= 8.0 * index as f32;
+        }
+        assert!(overlap_links(&graph.rooms).is_empty());
+        let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
+        assert_eq!(reached, vec![true, true, false]);
+    }
+
+    /// Real data, Ansilvund01: yaw-rotated room 252467 (rot_z 5.4978 rad = -45 degrees) and a point
+    /// of room 252468 that a wrong yaw sign puts inside it. Built the way the loader builds rooms,
+    /// from Creation values through the shared conversion; the point must be OUTSIDE, and the two
+    /// rooms (about 117 units apart) are not one space.
+    #[test]
+    fn a_yaw_rotated_room_uses_the_converters_rotation_sign() {
+        let rotated = Room::from_creation(
+            252467,
+            [1352.5667, 1928.5657, -935.5759],
+            [0.0, 0.0, 5.497_787_5],
+            [528.0, 1088.0, 640.0],
+        );
+        let point = Vec3::from_array(shared::coordinates::creation_to_runtime_vector([
+            560.0, 944.0, -336.0,
+        ]));
+        assert!(!rotated.contains(point), "560, 944, -336 is outside 252467");
+        let neighbour = Room::from_creation(
+            252468,
+            [560.0, 944.0, -336.0],
+            [0.0, 0.0, 0.0],
+            [400.0, 464.0, 432.0],
+        );
+        assert!(neighbour.contains(point));
+        assert!(!rooms_overlap(&rotated, &neighbour));
+        // The opposite sign would put them together.
+        let mirrored = Room::from_creation(
+            252467,
+            [1352.5667, 1928.5657, -935.5759],
+            [0.0, 0.0, -5.497_787_5],
+            [528.0, 1088.0, 640.0],
+        );
+        assert!(rooms_overlap(&mirrored, &neighbour));
     }
 }
