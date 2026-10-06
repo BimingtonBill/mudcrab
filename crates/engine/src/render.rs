@@ -793,8 +793,8 @@ fn setup_water_reflection(
             shadowed: RenderLayers::from_layers(REFLECTION_VIEW_LAYERS),
             unshadowed: RenderLayers::from_layers(UNSHADOWED_REFLECTION_VIEW_LAYERS),
         },
-        // TODO(run-fingerprint): record the chosen preset in the run fingerprint once
-        // `crates/engine/src/fingerprint.rs` exists on this branch.
+        // The chosen preset is not yet part of a run's recorded settings; a benchmark comparing
+        // presets has to name the preset it ran with.
         policy,
         ViewDemand::default(),
         crate::view_policy::ViewPolicyState::default(),
@@ -1491,7 +1491,7 @@ mod tests {
         // The spawn sets no `Msaa`; it is not the same as "not multisampled". In the shipped app
         // `CameraPlugin` registers `Msaa` as a required component of `Camera`
         // (`bevy_render-0.19.1/src/camera.rs:65`), so this camera gets Bevy's default `Sample4`
-        // (`bevy_render-0.19.1/src/view/mod.rs:240-246`) - the design study's known gap that only
+        // (`bevy_render-0.19.1/src/view/mod.rs:240-246`) - a known cost that only
         // the water preset closes with an explicit `Msaa::Off`. A bare test app has no such plugin.
         assert_eq!(
             camera.get::<Msaa>(),

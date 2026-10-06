@@ -138,7 +138,7 @@ impl ViewPolicy {
         }
     }
 
-    /// The design study's starting settings for the water reflection: a quarter of the pixels,
+    /// Starting settings for the water reflection: a quarter of the pixels,
     /// every other frame, low priority, no shadow cascades of its own, with a hundred milliseconds
     /// and 256 units or ten degrees of staleness allowed before the view is forced.
     ///
