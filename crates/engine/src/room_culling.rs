@@ -43,6 +43,21 @@
 //!   them. The engine does not use `NoCpuCulling` today; room culling needs a GPU-side input first
 //!   if that changes.
 //!
+//! # What is never culled by its room
+//!
+//! The converter records room membership for every placed record, actors included, but a room is
+//! where something *was placed*, not where it is. These are treated as in no room and stay drawn:
+//!
+//! - a reference carrying [`RoomCullExempt`], which `streaming::spawn_cell` inserts when the base
+//!   record type is an actor, a door, an activator or a movable inventory item
+//!   ([`exempt_record_type`]). **Future actor spawning hooks in here:** whatever spawns an actor
+//!   or an animated door outside `spawn_cell` inserts `RoomCullExempt` on the reference entity;
+//! - a mesh whose own entity, or whose reference, has a `RigidBody` that moves
+//!   (`Dynamic`, `KinematicPositionBased` or `KinematicVelocityBased`). `Fixed` bodies, which is
+//!   what static collision uses, are culled normally.
+//!
+//! This branch spawns no actors or doors yet; the rule is in place for when it does.
+//!
 //! # Views
 //!
 //! The main camera ([`StreamingCamera`]) is culled when the setting is on. Another camera, such as
@@ -72,12 +87,44 @@ use bevy::{
     prelude::*,
     tasks::{AsyncComputeTaskPool, Task, futures_lite::future},
 };
+use bevy_rapier3d::prelude::RigidBody;
 use rusqlite::{Connection, OpenFlags};
 use std::{
     any::TypeId,
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
+
+/// Marks a placed reference that room culling must never hide: an actor, a door, or anything that
+/// can move. See the module documentation.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct RoomCullExempt;
+
+/// Whether a base record type (the `records.record_type` of a reference's base object) is one
+/// room culling must not hide: actors and their leveled lists, doors, activators, and the
+/// inventory records that become loose, physics-driven objects when placed.
+pub fn exempt_record_type(record_type: Option<&str>) -> bool {
+    matches!(
+        record_type,
+        Some(
+            "NPC_"
+                | "LVLN"
+                | "CREA"
+                | "DOOR"
+                | "ACTI"
+                | "MISC"
+                | "ALCH"
+                | "AMMO"
+                | "ARMO"
+                | "BOOK"
+                | "INGR"
+                | "KEYM"
+                | "SCRL"
+                | "SLGM"
+                | "WEAP"
+        )
+    )
+}
 
 /// Opt-in marker for a camera, other than the main one, that culls by room (a portal view).
 #[derive(Component, Debug, Clone, Copy, Default)]
@@ -730,7 +777,8 @@ pub fn cull_room_views(
     >,
     parents: Query<&ChildOf>,
     ids: Query<&FormId>,
-    mut owners: Local<HashMap<Entity, u32>>,
+    exemptions: Query<(Option<&RigidBody>, Has<RoomCullExempt>)>,
+    mut owners: Local<HashMap<Entity, (u32, Entity)>>,
 ) {
     state.culled_last_frame = 0;
     if !state.enabled || state.graphs.is_empty() {
@@ -771,16 +819,28 @@ pub fn cull_room_views(
             }
             list.retain(|&entity| {
                 let owner = match owners.get(&entity) {
-                    Some(&form_id) => Some(form_id),
+                    Some(&owner) => Some(owner),
                     None => {
                         let found = owner_form_id(entity, &parents, &ids);
-                        if let Some(form_id) = found {
-                            owners.insert(entity, form_id);
+                        if let Some(owner) = found {
+                            owners.insert(entity, owner);
                         }
                         found
                     }
                 };
-                owner.is_none_or(|form_id| loaded.graph.is_drawn(form_id, &reached))
+                let Some((form_id, reference)) = owner else {
+                    return true;
+                };
+                // Re-read every frame: a body can be added after the mesh spawns.
+                let exempted = |entity| {
+                    exemptions
+                        .get(entity)
+                        .is_ok_and(|(body, marked)| marked || body.is_some_and(|b| body_moves(*b)))
+                };
+                if exempted(reference) || exempted(entity) {
+                    return true;
+                }
+                loaded.graph.is_drawn(form_id, &reached)
             });
             culled += before - list.len();
             // One cell holds the camera; the rest cannot also contain it.
@@ -790,12 +850,22 @@ pub fn cull_room_views(
     state.culled_last_frame = culled;
 }
 
-/// The FormID of the placed reference a mesh entity belongs to: its own, or its nearest ancestor's.
-fn owner_form_id(entity: Entity, parents: &Query<&ChildOf>, ids: &Query<&FormId>) -> Option<u32> {
+/// Whether a rigid body can move, as opposed to the `Fixed` bodies static collision uses.
+fn body_moves(body: RigidBody) -> bool {
+    !matches!(body, RigidBody::Fixed)
+}
+
+/// The FormID of the placed reference a mesh entity belongs to, and that reference's entity: the
+/// entity's own, or its nearest ancestor's.
+fn owner_form_id(
+    entity: Entity,
+    parents: &Query<&ChildOf>,
+    ids: &Query<&FormId>,
+) -> Option<(u32, Entity)> {
     let mut current = entity;
     for _ in 0..32 {
         if let Ok(id) = ids.get(current) {
-            return Some(id.0);
+            return Some((id.0, current));
         }
         current = parents.get(current).ok()?.parent();
     }
@@ -1607,5 +1677,81 @@ mod tests {
         let far = Vec3::new(0.0, 0.0, -10.0 + PORTAL_OPEN_DISTANCE + 1.0);
         let reached = graph.reached_rooms(far, clip_for(far)).unwrap();
         assert!(!reached[1], "beyond it, a doorway behind the camera is not");
+    }
+
+    #[test]
+    fn actors_doors_and_moving_bodies_are_never_culled_by_their_room() {
+        let mut scene = scene(true);
+        let root = scene
+            .app
+            .world_mut()
+            .query_filtered::<Entity, With<StreamedCellRoot>>()
+            .single(scene.app.world())
+            .unwrap();
+        // References 3..=6 are all placed in room B, which the camera cannot reach.
+        let add = |app: &mut App, form_id: u32, reference: &dyn Fn(&mut EntityWorldMut)| {
+            let mut reference_entity = app.world_mut().spawn((FormId(form_id), ChildOf(root)));
+            reference(&mut reference_entity);
+            let reference_entity = reference_entity.id();
+            let mesh = app.world_mut().spawn(ChildOf(reference_entity)).id();
+            app.world_mut()
+                .resource_mut::<RoomCullingState>()
+                .graphs
+                .get_mut(&7)
+                .unwrap()
+                .graph
+                .membership
+                .insert(
+                    form_id,
+                    Membership {
+                        contained: vec![1],
+                        overlapping: vec![],
+                    },
+                );
+            mesh
+        };
+        let actor = add(&mut scene.app, 3, &|entity| {
+            entity.insert(RoomCullExempt);
+        });
+        let dynamic = add(&mut scene.app, 4, &|_| {});
+        scene
+            .app
+            .world_mut()
+            .entity_mut(dynamic)
+            .insert(RigidBody::Dynamic);
+        let door = add(&mut scene.app, 5, &|entity| {
+            entity.insert(RigidBody::KinematicPositionBased);
+        });
+        let fixed = add(&mut scene.app, 6, &|entity| {
+            entity.insert(RigidBody::Fixed);
+        });
+        scene
+            .app
+            .world_mut()
+            .get_mut::<VisibleEntities>(scene.camera)
+            .unwrap()
+            .get_mut(TypeId::of::<Mesh3d>())
+            .extend([actor, dynamic, door, fixed]);
+        run_cull(&mut scene.app);
+        let visible = mesh_list(&scene.app, scene.camera);
+        for kept in [actor, dynamic, door] {
+            assert!(visible.contains(&kept), "{kept:?} must stay drawn");
+        }
+        assert!(
+            !visible.contains(&fixed),
+            "a fixed object in room B is culled"
+        );
+        assert!(!visible.contains(&scene.far), "so is the plain static");
+    }
+
+    #[test]
+    fn actor_door_and_loose_item_records_are_exempt_and_statics_are_not() {
+        for kept in ["NPC_", "LVLN", "DOOR", "ACTI", "MISC", "WEAP"] {
+            assert!(exempt_record_type(Some(kept)), "{kept}");
+        }
+        for culled in ["STAT", "TREE", "FURN", "LIGH"] {
+            assert!(!exempt_record_type(Some(culled)), "{culled}");
+        }
+        assert!(!exempt_record_type(None));
     }
 }
