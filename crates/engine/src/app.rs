@@ -673,13 +673,18 @@ fn drive_streaming_fixture(
     camera.translation.z -= y as f32 * crate::world::components::CELL_SIZE;
     state.total_x += x;
     state.total_y += y;
-    // The destination pose is committed above, so this is where a door or a teleport reports the
-    // discontinuity: a secondary view must refresh on this frame rather than the next one its own
-    // cadence allows for.
-    invalidations.write(InvalidateSecondaryViews {
-        reason: ViewInvalidationReason::Teleport,
-        target: None,
-    });
+    // Only a move the fixture labels "teleport" is a discontinuity no pose comparison is meant to
+    // catch: the destination pose is committed above, so a secondary view must refresh on this
+    // frame rather than the next one its own cadence allows for. The "rapid_traversal" and
+    // "return_to_origin" moves are fast travel, not a teleport, and the policy's own pose-jump
+    // detection already refreshes a view that moved that far, so they report nothing and keep
+    // exercising that path.
+    if label == "teleport" {
+        invalidations.write(InvalidateSecondaryViews {
+            reason: ViewInvalidationReason::Teleport,
+            target: None,
+        });
+    }
     profiler.event("streaming-fixture", label, None);
 }
 
