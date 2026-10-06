@@ -111,8 +111,10 @@ CREATE TABLE IF NOT EXISTS room_graph_stats (  -- conversion report counters
 
 Why this shape:
 
-- **Facts, not policy.** `reference_rooms` has one row per room containing the object's pivot. No
-  row means "in no room", several rows mean "in several". The engine decides what to draw; per
+- **Facts, not policy.** `reference_rooms` has a `contained = 1` row per room containing the
+  object's pivot, and a `contained = 0` row per further room its placed bounds overlap. No
+  `contained = 1` row means "in no room", several mean "in several" (the pivot-only counters
+  count these). The engine decides what to draw; per
   #188, both cases stay drawn. Nothing is lost if the engine later uses "visible if any of its
   rooms is visible" instead.
 - **Small.** About 3.4k + 2.5k + 2k rows for the graph, and roughly 300k membership rows (about

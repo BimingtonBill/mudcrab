@@ -465,7 +465,7 @@ doorways between them with `PortalMarker` references (base `0x20`). The converte
 and records which room boxes each placed object belongs to. The tables hold facts only: which
 objects to draw is the engine's policy (design: `docs/research/interior-room-graph-converter.md`,
 upstream issue #188). Only interior cells and only box rooms (`XPRM` shape 1) are written;
-exterior markers are skipped silently, and rooms of other shapes or with non-finite sizes are skipped and counted in the conversion report.
+exterior markers are skipped silently, and rooms of other shapes, and rooms or portals with a non-finite size or transform, are skipped and counted in the conversion report.
 All FormIDs are in load-order numbering, like `references.id`.
 
 ```sql
@@ -537,7 +537,7 @@ Columns and rules:
   as `contained = 0`.
 - **`room_graph_stats`**: the counters the conversion report shows in `integration-report.json`
   under `room_graph`: `rooms`, `portals`, `links`, `portals_with_missing_side`,
-  `non_box_rooms_skipped`, `portals_without_size_skipped`, `invalid_markers_skipped` (rooms and portals with non-finite half-extents), `objects_in_no_room` and
+  `non_box_rooms_skipped`, `portals_without_size_skipped`, `invalid_markers_skipped` (rooms and portals with a non-finite size or transform), `objects_in_no_room` and
   `objects_in_several_rooms` (both by pivot), and `overlap_rows`.
 
 The tables are derived data: a full load-order export clears and rebuilds them from the winning

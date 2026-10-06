@@ -66,7 +66,7 @@ pub struct RoomGraphReport {
     pub non_box_rooms_skipped: u64,
     /// Portal markers without an `XPRM` (no size); they get no row.
     pub portals_without_size_skipped: u64,
-    /// Room or portal markers whose half-extents are not finite; they get no row.
+    /// Room or portal markers with a non-finite size, position or rotation; they get no row.
     pub invalid_markers_skipped: u64,
     /// Objects in a cell with rooms whose pivot is in no room box.
     pub objects_in_no_room: u64,
