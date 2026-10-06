@@ -48,8 +48,10 @@
 //! Skyrim's open caves place room markers side by side with no portal and no `XLRM` link, and
 //! their boxes overlap or abut: in effect one space. When a cell's graph is built, every pair of
 //! rooms whose oriented boxes overlap, or lie within [`OVERLAP_TOLERANCE`] Creation units of each
-//! other, gets an implicit open edge ([`overlap_links`]), walked like an `XLRM` link: the region is
-//! unchanged, so it can only draw more. The test is a separating-axis test on the two oriented
+//! other, gets an implicit edge ([`overlap_links`]). Unlike an `XLRM` link it is not open: the walk
+//! enters the neighbour only when the neighbour's box, projected with the doorway clipping, is on
+//! screen inside the current region (otherwise the edges chain through a whole cave and nothing is
+//! ever culled). The region is passed on unchanged, so objects reaching past their box stay in. The test is a separating-axis test on the two oriented
 //! boxes. Rooms further apart than the tolerance, such as two rooms with a wall between them, need
 //! a portal or a link. Orientation comes from the shared Creation-to-runtime function, so it is the
 //! converter's convention (verified on real data: it puts 99.2% of portal centres inside both of
@@ -341,6 +343,9 @@ pub struct RoomGraph {
     pub portals: Vec<Portal>,
     /// `room_links` as undirected edges between room indices.
     pub links: Vec<(usize, usize)>,
+    /// Implicit edges between rooms whose boxes overlap or touch ([`overlap_links`]). Unlike a link,
+    /// an overlap is walked only into a room whose box is on screen in the current region.
+    pub overlaps: Vec<(usize, usize)>,
     /// Membership by placed-reference id. The key is one number under three names: the `FormId`
     /// component of a spawned reference (`streaming::spawn_cell` inserts `FormId(reference.form_id)`),
     /// `ReferenceRow::form_id`, which the world database loader fills from `references.id`
@@ -414,6 +419,49 @@ fn project_portal(corners: &[Vec3; 4], clip_from_local: Mat4) -> Option<Rect> {
     (min.is_finite() && max.is_finite()).then_some(Rect { min, max })
 }
 
+/// The screen rectangle a room's box covers, with its edges clipped against the camera like a
+/// doorway's: `None` when the whole box is behind the lens.
+fn project_box(room: &Room, clip_from_local: Mat4) -> Option<Rect> {
+    let corner = |index: usize| {
+        let sign = |bit: usize| if index & bit == 0 { -1.0 } else { 1.0 };
+        let local = Vec3::new(
+            sign(1) * room.half.x,
+            sign(2) * room.half.y,
+            sign(4) * room.half.z,
+        );
+        clip_from_local * (room.center + room.rotation * local).extend(1.0)
+    };
+    let corners: Vec<Vec4> = (0..8).map(corner).collect();
+    let mut points: Vec<Vec4> = Vec::with_capacity(20);
+    for (index, &current) in corners.iter().enumerate() {
+        if current.w >= CLIP_W_EPSILON {
+            points.push(current);
+        }
+        // Each of the 12 edges once: from a corner to the one with a higher bit set.
+        for bit in [1, 2, 4] {
+            if index & bit != 0 {
+                continue;
+            }
+            let next = corners[index | bit];
+            if (current.w >= CLIP_W_EPSILON) != (next.w >= CLIP_W_EPSILON) {
+                let t = (CLIP_W_EPSILON - current.w) / (next.w - current.w);
+                points.push(current + (next - current) * t);
+            }
+        }
+    }
+    if points.is_empty() {
+        return None;
+    }
+    let mut min = Vec2::splat(f32::INFINITY);
+    let mut max = Vec2::splat(f32::NEG_INFINITY);
+    for point in points {
+        let ndc = Vec2::new(point.x, point.y) / point.w;
+        min = min.min(ndc);
+        max = max.max(ndc);
+    }
+    (min.is_finite() && max.is_finite()).then_some(Rect { min, max })
+}
+
 impl RoomGraph {
     /// Indices of the rooms whose box holds a cell-local point, in table order.
     pub fn rooms_containing(&self, point: Vec3) -> Vec<usize> {
@@ -452,6 +500,13 @@ impl RoomGraph {
                 linked[b].push(a);
             }
         }
+        let mut overlapping: Vec<Vec<usize>> = vec![Vec::new(); self.rooms.len()];
+        for &(a, b) in &self.overlaps {
+            if a != b && a < overlapping.len() && b < overlapping.len() {
+                overlapping[a].push(b);
+                overlapping[b].push(a);
+            }
+        }
         let mut region: Vec<Option<Rect>> = vec![None; self.rooms.len()];
         let mut widenings = vec![0u8; self.rooms.len()];
         let mut pending: Vec<(usize, Rect)> =
@@ -488,6 +543,15 @@ impl RoomGraph {
             }
             for &other in &linked[room] {
                 pending.push((other, seen));
+            }
+            // An overlap is walked only into a room whose box is on screen inside the region the walk
+            // arrived with, and the region is passed on unchanged (objects reach past their box).
+            for &other in &overlapping[room] {
+                if project_box(&self.rooms[other], clip_from_local)
+                    .is_some_and(|screen| screen.intersect(seen).is_some())
+                {
+                    pending.push((other, seen));
+                }
             }
         }
         Some(region.iter().map(Option::is_some).collect())
@@ -604,11 +668,11 @@ pub fn load_room_graph(connection: &Connection, cell_id: u32) -> rusqlite::Resul
         .collect();
     if !implicit.is_empty() {
         info!(
-            "room culling: cell {cell_id:08X} has {} implicit links between touching or overlapping rooms",
+            "room culling: cell {cell_id:08X} has {} implicit overlap edges between touching or overlapping rooms",
             implicit.len()
         );
     }
-    graph.links.extend(implicit);
+    graph.overlaps = implicit;
     {
         let mut statement = connection.prepare_cached(
             "SELECT m.reference_id,m.room_ref,m.contained FROM reference_rooms m \
@@ -1156,6 +1220,7 @@ mod tests {
                 far_door,
             ],
             links: vec![],
+            overlaps: vec![],
             membership: HashMap::new(),
         }
     }
@@ -1324,6 +1389,7 @@ mod tests {
             ],
             portals: vec![doorway(10, Vec3::new(0.0, 0.0, 10.0), 3.0, [0, 1])],
             links: vec![],
+            overlaps: vec![],
             membership: HashMap::new(),
         };
         graph.membership.insert(
@@ -1653,6 +1719,7 @@ mod tests {
             ],
             portals: vec![doorway(10, Vec3::new(0.0, 0.0, -10.0), 3.0, [0, 1])],
             links: vec![],
+            overlaps: vec![],
             membership: (0..3)
                 .map(|room| {
                     (
@@ -1856,18 +1923,19 @@ mod tests {
         let rooms = vec![
             room(1, Vec3::ZERO, 10.0),
             room(2, Vec3::new(0.0, 0.0, -15.0), 10.0),
-            room(3, Vec3::new(0.0, 0.0, -40.0), 10.0),
+            room(3, Vec3::new(0.0, 0.0, -45.0), 10.0),
         ];
         let mut graph = RoomGraph {
-            portals: vec![doorway(11, Vec3::new(0.0, 0.0, -27.0), 3.0, [1, 2])],
+            portals: vec![doorway(11, Vec3::new(0.0, 0.0, -30.0), 3.0, [1, 2])],
             links: vec![],
+            overlaps: vec![],
             membership: HashMap::new(),
             rooms: rooms.clone(),
         };
         let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
         assert_eq!(reached, vec![true, false, false], "no link yet: culled");
         assert_eq!(overlap_links(&rooms), vec![(0, 1)]);
-        graph.links = overlap_links(&rooms);
+        graph.overlaps = overlap_links(&rooms);
         let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
         assert_eq!(reached, vec![true, true, true]);
     }
@@ -1901,7 +1969,7 @@ mod tests {
     fn overlap_uses_the_oriented_boxes() {
         let square = room(1, Vec3::ZERO, 10.0);
         let turned = std::f32::consts::FRAC_PI_4;
-        let beside = rotated_room(2, Vec3::new(30.0, 0.0, 12.0), 10.0, turned);
+        let beside = rotated_room(2, Vec3::new(40.0, 0.0, 20.0), 10.0, turned);
         assert!(!rooms_overlap(&square, &beside), "the corners do not meet");
         assert!(!rooms_overlap(&beside, &square), "and it is symmetric");
         let nearer = rotated_room(3, Vec3::new(22.0, 0.0, 0.0), 10.0, turned);
@@ -1921,9 +1989,9 @@ mod tests {
     #[test]
     fn a_portal_only_chain_has_no_implicit_edges() {
         let mut graph = chain(side_doorway(11, Vec3::new(10.0, 0.0, -12.0), 1.5, [1, 2]));
-        // Open a wall's thickness between the rooms.
+        // Move the rooms clearly further apart than the tolerance.
         for (index, room) in graph.rooms.iter_mut().enumerate() {
-            room.center.z -= 8.0 * index as f32;
+            room.center.z -= 2.0 * OVERLAP_TOLERANCE * index as f32;
         }
         assert!(overlap_links(&graph.rooms).is_empty());
         let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
@@ -1962,5 +2030,55 @@ mod tests {
             [528.0, 1088.0, 640.0],
         );
         assert!(rooms_overlap(&mirrored, &neighbour));
+    }
+
+    /// A (camera) sees B through a narrow doorway; C overlaps B. The overlap is walked only when C's
+    /// box is on screen inside the region the doorway leaves.
+    fn overlap_scene(c_center: Vec3) -> RoomGraph {
+        let rooms = vec![
+            room(1, Vec3::ZERO, 10.0),
+            room(2, Vec3::new(0.0, 0.0, -30.0), 10.0),
+            room(3, c_center, 12.0),
+        ];
+        RoomGraph {
+            portals: vec![doorway(10, Vec3::new(0.0, 0.0, -10.0), 1.0, [0, 1])],
+            links: vec![],
+            overlaps: overlap_links(&rooms),
+            membership: HashMap::new(),
+            rooms,
+        }
+    }
+
+    #[test]
+    fn an_overlapping_room_outside_the_region_is_not_reached() {
+        // C is beside B and overlaps it, but lies wholly to the right of what the doorway shows.
+        let graph = overlap_scene(Vec3::new(22.0, 0.0, -34.0));
+        assert!(graph.overlaps.contains(&(1, 2)), "B and C overlap");
+        let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
+        assert_eq!(reached, vec![true, true, false]);
+    }
+
+    #[test]
+    fn an_overlapping_room_partly_inside_the_region_is_reached() {
+        let graph = overlap_scene(Vec3::new(4.0, 0.0, -34.0));
+        assert!(graph.overlaps.contains(&(1, 2)));
+        let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
+        assert_eq!(reached, vec![true, true, true]);
+    }
+
+    #[test]
+    fn an_overlapping_room_behind_the_camera_is_not_reached() {
+        let rooms = vec![
+            room(1, Vec3::ZERO, 10.0),
+            room(2, Vec3::new(0.0, 0.0, 15.0), 10.0),
+        ];
+        let graph = RoomGraph {
+            overlaps: overlap_links(&rooms),
+            rooms,
+            ..Default::default()
+        };
+        let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
+        // Room 2 spans z 5..25, behind a camera that looks down -Z.
+        assert_eq!(reached, vec![true, false]);
     }
 }
