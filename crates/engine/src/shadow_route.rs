@@ -30,8 +30,8 @@
 //!
 //! Limits of the stock route: it removes the reflection's GPU cascade passes, not all CPU cascade
 //! work (Bevy still builds cascade matrices for every active camera), and only the sun is
-//! replicated. A point or spot light that later joins the reflected content has to be routed the
-//! same way by its own adapter.
+//! replicated. Point and spot lights need no copy: they cast no cascades, so they carry the replica
+//! layer themselves (`POINT_LIGHT_LAYERS` in `render.rs`) and light both routes.
 //!
 //! # Swapping it out
 //!
