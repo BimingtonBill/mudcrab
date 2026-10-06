@@ -323,6 +323,8 @@ pub struct ViewPolicyState {
     pub demand_open: bool,
     /// The error the policy last failed [`ViewPolicy::validate`] with, or `None` while it is valid.
     pub invalid: Option<ViewPolicyError>,
+    /// Whether the missing-[`SecondaryViewTarget`] warning has been logged for this view.
+    pub warned_missing_target: bool,
 }
 
 /// A discontinuity the policy cannot see in the values it compares.
@@ -433,6 +435,9 @@ pub fn apply_view_policies(
                 state.invalid = Some(error);
             }
             camera.is_active = false;
+            // Demand seen during an invalid period still counts, so demand that reappears once the
+            // policy is valid again reopens the view and forces a refresh.
+            state.demand_open = demand.is_some_and(|demand| demand.request.is_some());
             continue;
         }
         state.invalid = None;
@@ -471,6 +476,13 @@ pub fn apply_view_policies(
             dirty.demand_reopened |= !state.demand_open;
         }
 
+        if target.is_none() && !state.warned_missing_target {
+            warn!(
+                view = ?entity,
+                "a managed view has no SecondaryViewTarget, so its target is never resized"
+            );
+            state.warned_missing_target = true;
+        }
         if let Some(mut target) = target
             && images
                 .get(&target.image)
@@ -1272,6 +1284,49 @@ mod tests {
             !rewrites[1] && !rewrites[2],
             "an unchanged request does not rewrite the projection: {rewrites:?}"
         );
+    }
+
+    #[test]
+    fn demand_that_reappears_after_an_invalid_period_forces_a_refresh() {
+        let mut policy = ViewPolicy::baseline();
+        policy.update_rate = ViewUpdateRate::OnDemand;
+        policy.max_staleness = Duration::MAX;
+        let mut harness = ViewHarness::new(policy);
+        let observer = Transform::from_xyz(0.0, 100.0, 0.0);
+        harness.demand(Some(still(observer)));
+        harness.frame();
+        harness.demand(Some(still(observer)));
+        assert!(!harness.frame().active, "nothing forces an on-demand view");
+
+        let mut broken = policy;
+        broken.target_size = UVec2::new(0, 576);
+        harness.set_policy(broken);
+        harness.demand(None);
+        assert!(!harness.frame().active);
+
+        harness.set_policy(policy);
+        harness.demand(Some(still(observer)));
+        let frame = harness.frame();
+        assert!(frame.active);
+        assert!(frame.last_forced.demand_reopened);
+    }
+
+    #[test]
+    fn a_managed_view_without_a_target_warns_once() {
+        let mut harness = ViewHarness::new(ViewPolicy::baseline());
+        harness
+            .app
+            .world_mut()
+            .entity_mut(harness.camera)
+            .remove::<SecondaryViewTarget>();
+        harness.demand(Some(still(Transform::from_xyz(0.0, 100.0, 0.0))));
+        harness.app.update();
+        let state = harness
+            .app
+            .world()
+            .get::<ViewPolicyState>(harness.camera)
+            .unwrap();
+        assert!(state.warned_missing_target);
     }
 
     #[test]
