@@ -848,8 +848,18 @@ fn prepare_water_reflection(
     >,
     transforms: TransformHelper,
     mut profiler: ResMut<ProfilingState>,
+    config: Option<Res<crate::config::EngineConfig>>,
 ) {
     let started = std::time::Instant::now();
+    // `--water-reflection off`, a measurement switch: no demand, so the policy never admits the
+    // camera and the reflection image keeps the texels it was created with (black), which the
+    // water shader blends in at its Fresnel weight as no reflection at all.
+    if config.is_some_and(|config| !config.water_reflection) {
+        for (_, mut demand, _) in &mut reflection_camera {
+            demand.request = None;
+        }
+        return;
+    }
     let Ok((observer, observer_pose, projection, exposure)) = main_camera.single() else {
         for (_, mut demand, _) in &mut reflection_camera {
             demand.request = None;
@@ -1502,6 +1512,49 @@ mod tests {
             image.texture_descriptor.size.width,
             crate::view_policy::WATER_TARGET_SIZE.x
         );
+    }
+
+    #[test]
+    fn the_reflection_off_switch_never_activates_the_camera() {
+        let mut app = App::new();
+        app.init_resource::<ProfilingState>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Time>()
+            .insert_resource(crate::config::EngineConfig {
+                water_reflection: false,
+                ..default()
+            })
+            .insert_resource(crate::streaming::RenderOrigin(IVec2::ZERO))
+            .insert_resource(crate::sky::CameraSpace::Exterior)
+            .add_plugins(crate::view_policy::SecondaryViewPolicyPlugin)
+            .add_systems(Startup, setup_water_reflection)
+            .add_systems(
+                PostUpdate,
+                prepare_water_reflection.in_set(ViewPolicySystems::Prepare),
+            );
+        let observer = Transform::from_xyz(0.0, 120.0, 0.0);
+        app.world_mut().spawn((
+            observer,
+            GlobalTransform::from(observer),
+            main_camera_projection(),
+            StreamingCamera,
+        ));
+        let water = Vec3::new(0.0, 40.0, -800.0);
+        app.world_mut().spawn((
+            Transform::from_translation(water),
+            GlobalTransform::from_translation(water),
+            water_bounds(CELL_WATER_HALF_EXTENTS),
+            WaterSurface,
+        ));
+        for _ in 0..5 {
+            app.update();
+            let world = app.world_mut();
+            let mut cameras = world.query_filtered::<&Camera, With<WaterReflectionCamera>>();
+            assert!(
+                !cameras.single(world).unwrap().is_active,
+                "water is in view, but the reflection was switched off"
+            );
+        }
     }
 
     #[test]

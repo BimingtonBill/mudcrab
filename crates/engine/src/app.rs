@@ -1936,7 +1936,7 @@ fn setup_world(
     commands.spawn((
         DirectionalLight {
             illuminance: 12_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: config.shadows,
             ..default()
         },
         sun_shadow_cascades(&config),
@@ -2961,6 +2961,24 @@ mod tests {
         // two ways this test can fail.
         let shadow_map = world.resource::<DirectionalLightShadowMap>();
         assert_eq!(shadow_map.size, SUN_SHADOW_MAP_SIZE);
+    }
+
+    /// `--shadows off` is a measurement switch for the sun's shadow maps.
+    #[test]
+    fn the_shadows_off_switch_turns_off_the_source_suns_shadow_maps() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            shadows: false,
+            ..default()
+        })
+        .add_systems(Startup, setup_world);
+        app.update();
+
+        let world = app.world_mut();
+        let mut suns = world
+            .query_filtered::<&DirectionalLight, Without<crate::shadow_route::UnshadowedSun>>();
+        let sun = suns.single(world).expect("one source sun");
+        assert!(!sun.shadow_maps_enabled);
     }
 
     /// A placed object is kept out of the reflection pass by its layer, so the streaming camera has

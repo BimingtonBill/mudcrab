@@ -121,6 +121,12 @@ pub struct EngineConfig {
     /// water reflection camera is given. `baseline` is the full-size, every-frame reflection the
     /// engine has always drawn.
     pub water_reflection_preset: WaterReflectionPreset,
+    /// `--water-reflection <on|off>`: whether the water reflection view is drawn at all. A
+    /// measurement switch; see [`HELP_TEXT`].
+    pub water_reflection: bool,
+    /// `--shadows <on|off>`: whether the sun casts shadows. A measurement switch; see
+    /// [`HELP_TEXT`].
+    pub shadows: bool,
 }
 
 /// The view policy the water reflection camera is given (`--water-reflection-preset`).
@@ -202,6 +208,8 @@ impl Default for EngineConfig {
             lights: false,
             physics_fixture: false,
             water_reflection_preset: WaterReflectionPreset::Baseline,
+            water_reflection: true,
+            shadows: true,
         }
     }
 }
@@ -264,6 +272,9 @@ Benchmark and profiling:
 
 Diagnostics:
   --diagnostic-asset-fallbacks          log every fallback asset substitution
+  --water-reflection <on|off>           measurement switch: off never renders the reflection view, so water
+                                        shows no reflection (its image stays black) (default: on)
+  --shadows <on|off>                    measurement switch: off turns off the sun's shadow maps (default: on)
   --material-fixture                    run the material fixture (no world database)
   --terrain-water-fixture               run the terrain-water fixture (no world database)
   --transform-bounds-fixture            run the transform-bounds fixture (no world database)
@@ -698,6 +709,10 @@ impl EngineConfig {
                 "--streaming-fixture" => config.streaming_fixture = true,
                 "--lights" => config.lights = true,
                 "--physics-fixture" => config.physics_fixture = true,
+                "--water-reflection" => {
+                    config.water_reflection = take_on_off("--water-reflection", args.next())?;
+                }
+                "--shadows" => config.shadows = take_on_off("--shadows", args.next())?,
                 "--water-reflection-preset" => {
                     const EXPECTED: &str = "baseline or water";
                     let raw = take_raw("--water-reflection-preset", EXPECTED, args.next())?;
@@ -777,6 +792,17 @@ fn take_raw(
         // Only `--` marks an option: a path or a negative number may start
         // with a single dash.
         other => Err(ConfigError::invalid_value(option, other, expected)),
+    }
+}
+
+/// An `on` or `off` value, for the measurement switches.
+fn take_on_off(option: &'static str, value: Option<String>) -> Result<bool, ConfigError> {
+    const EXPECTED: &str = "on or off";
+    let raw = take_raw(option, EXPECTED, value)?;
+    match raw.as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(ConfigError::invalid_value(option, Some(raw), EXPECTED)),
     }
 }
 
@@ -1069,6 +1095,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn the_measurement_switches_default_on_and_take_on_or_off() {
+        let config = run_config(&[]);
+        assert!(config.water_reflection);
+        assert!(config.shadows);
+
+        let config = run_config(&["--water-reflection", "off", "--shadows", "off"]);
+        assert!(!config.water_reflection);
+        assert!(!config.shadows);
+
+        let config = run_config(&["--water-reflection", "off", "--water-reflection", "on"]);
+        assert!(config.water_reflection, "the last value wins");
+        assert!(run_config(&["--shadows", "on"]).shadows);
+    }
+
+    #[test]
+    fn a_measurement_switch_refuses_any_other_value() {
+        for option in ["--water-reflection", "--shadows"] {
+            for value in ["no", "true", "0", "OFF"] {
+                assert!(
+                    matches!(
+                        parse_error(&[option, value]),
+                        ConfigError::InvalidValue { value: Some(ref given), .. } if given == value
+                    ),
+                    "{option} accepted {value}"
+                );
+            }
+            assert!(matches!(
+                parse_error(&[option]),
+                ConfigError::InvalidValue { value: None, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn help_documents_the_measurement_switches_as_such() {
+        assert!(help_names("--water-reflection"));
+        assert!(help_names("--shadows"));
+        let rows: Vec<_> = HELP_TEXT
+            .lines()
+            .filter(|line| {
+                line.trim_start().starts_with("--water-reflection <")
+                    || line.trim_start().starts_with("--shadows <")
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|row| row.contains("measurement switch")),
+            "the A/B switches are for measurement and the help says so"
+        );
     }
 
     #[test]
