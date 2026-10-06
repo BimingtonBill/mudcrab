@@ -111,7 +111,8 @@ pub const POINT_LIGHT_LAYERS: &[Layer] = &[
     UNSHADOWED_REFLECTION_LAYER,
 ];
 
-/// The render layers for a light spawned below a placed-object reference.
+/// The render layers for a point or spot light spawned below a placed-object reference (the sun
+/// uses [`LIGHT_LAYERS`] instead).
 ///
 /// The reference's [`Propagate`](bevy::app::Propagate) would otherwise copy
 /// [`PLACED_OBJECT_RENDER_LAYERS`] onto the light and drop it from [`WORLD_LAYER`], breaking the
@@ -878,6 +879,7 @@ fn prepare_water_reflection(
         for (_, mut demand, _) in &mut reflection_camera {
             demand.request = None;
         }
+        profiler.record_elapsed("render/water_reflection_camera", started);
         return;
     };
     let observer_pose = current_global_transform(&transforms, observer, observer_pose);
@@ -2027,6 +2029,19 @@ mod tests {
             );
         }
         assert!(light.intersects(&PLACED_OBJECT_RENDER_LAYERS));
+        // The sun keeps its own contract: both shadowed views and the placed objects it shadows,
+        // and never the replica layer, which is what keeps its cascades out of the shadowless view.
+        let sun = RenderLayers::from_layers(LIGHT_LAYERS);
+        for view in [MAIN_VIEW_LAYERS, REFLECTION_VIEW_LAYERS] {
+            assert!(
+                sun.intersects(&RenderLayers::from_layers(view)),
+                "the sun must reach {view:?}"
+            );
+        }
+        assert!(sun.intersects(&PLACED_OBJECT_RENDER_LAYERS));
+        assert!(!sun.intersects(&RenderLayers::from_layers(
+            UNSHADOWED_REFLECTION_VIEW_LAYERS
+        )));
     }
 
     /// A point light is a child of its placed-object reference, whose layer propagates down the
