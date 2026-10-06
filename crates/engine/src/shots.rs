@@ -34,7 +34,7 @@
 //! [`arrival_camera_rotation`]: crate::transition::arrival_camera_rotation
 
 use crate::{
-    config::grid_of,
+    config::{EngineConfig, grid_of},
     doors::{DoorAnchor, DoorState, LoadDoor},
     portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, PortalTexture},
     streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld},
@@ -797,6 +797,8 @@ pub struct ShotsRun {
     log: String,
     written: bool,
     failed: bool,
+    /// Whether a benchmark run is holding the first shot's view (see [`run_shots`]'s settle).
+    holding: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -832,6 +834,7 @@ impl ShotsRun {
             log: String::new(),
             written: false,
             failed: false,
+            holding: false,
         }
     }
 
@@ -911,6 +914,7 @@ impl ShotsRun {
 fn run_shots(
     mut commands: Commands,
     time: Res<Time>,
+    config: Res<EngineConfig>,
     mut run: ResMut<ShotsRun>,
     mut active: ResMut<ActiveCell>,
     mut origin: ResMut<RenderOrigin>,
@@ -1106,7 +1110,25 @@ fn run_shots(
             } else {
                 0
             };
-            if settled || run.timer >= SETTLE_TIMEOUT_SECONDS {
+            if (settled || run.timer >= SETTLE_TIMEOUT_SECONDS) && config.is_benchmark_run() {
+                // A `--shots` run that is also a benchmark (`--benchmark-duration`, the phase 2
+                // baseline's portal scenes) holds this shot's view instead of photographing it: the
+                // benchmark times the settled view, and its own end exits the run. Nothing is
+                // written, and the pose is re-asserted above every frame. Without a benchmark
+                // flag the shot is photographed as it always was.
+                if !run.holding {
+                    run.holding = true;
+                    run.note(format!(
+                        "shot \"{}\" holding its view for the benchmark{}",
+                        shot.name,
+                        if settled {
+                            ""
+                        } else {
+                            " (the view had not settled)"
+                        }
+                    ));
+                }
+            } else if settled || run.timer >= SETTLE_TIMEOUT_SECONDS {
                 run.timed_out = !settled;
                 run.settle_seconds = run.timer;
                 run.resident_meshes = meshes.iter().count();

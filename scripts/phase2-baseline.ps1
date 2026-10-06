@@ -4,7 +4,14 @@ param(
     # is the one a machine with no converted data can run, the four world scenes are the walk, the
     # dense place (Riverwood), the water and the streaming stress. `stability` is left out because it is a soak
     # window (30 minutes by default), not a baseline; `all` selects it too.
-    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability")]
+    #
+    # The portal branch adds four scenes, none of them in the default set: `portal-door-tour` (the
+    # Riverwood door tour, two crossings), `portal-heavy` (standing at Sven's House door with the
+    # portal view open), `lod-far` (a high vantage where terrain LOD reaches the horizon) and
+    # `lod-flythrough` (a fly-through from LOD into full detail). `portal` selects the four. They
+    # load the portal's converted assets, so -Assets must name those. Their poses and arguments are in
+    # phase2-profile.ps1 (Get-PortalSceneArguments).
+    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability", "portal", "portal-door-tour", "portal-heavy", "lod-far", "lod-flythrough")]
     [string[]]$Scenarios = @(),
     # The converted legal Skyrim asset set every world scenario loads. Not needed for `synthetic`.
     [string]$Assets,
@@ -12,6 +19,9 @@ param(
     # Every window runs this long, except `stability`, which uses -StabilitySeconds.
     [int]$DurationSeconds = 120,
     [int]$StabilitySeconds = 1800,
+    # The portal-door-tour window, in seconds: the scripted tour of Sven's House (in and out) takes
+    # about this long; see phase2-profile.ps1.
+    [int]$PortalTourSeconds = 40,
     [string]$Out,
     [switch]$NoBuild,
     # A previous baseline.json to compare against. Without it, an existing `baseline.json` in -Out
@@ -44,7 +54,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 # names here (-Assets, the window lengths, -Worldspace and the grids). The values this command was
 # called with are put back afterwards, or a caller's -Assets and -DurationSeconds would be lost.
 $sharedNames = @(
-    "Assets", "DurationSeconds", "StabilitySeconds", "Worldspace",
+    "Assets", "DurationSeconds", "StabilitySeconds", "PortalTourSeconds", "Worldspace",
     "RuralGridX", "RuralGridY", "DenseGridX", "DenseGridY", "DenseLegacyGridX", "DenseLegacyGridY", "WaterGridX", "WaterGridY"
 )
 $requestedValues = @{}
@@ -53,6 +63,10 @@ foreach ($name in $sharedNames) { $requestedValues[$name] = Get-Variable -Name $
 foreach ($name in $sharedNames) { Set-Variable -Name $name -Value $requestedValues[$name] }
 
 $defaultScenarios = @("synthetic", "rural", "dense", "water", "stress")
+$portalScenarios = @("portal-door-tour", "portal-heavy", "lod-far", "lod-flythrough")
+if ($Scenarios -contains "portal") {
+    $Scenarios = @($Scenarios | Where-Object { $_ -ne "portal" }) + $portalScenarios | Select-Object -Unique
+}
 $requested = if ($Scenarios.Count -eq 0) {
     # Like the profiling campaign, the default without -Assets is the one scene that needs no
     # converted data instead of a request that immediately fails.
@@ -83,8 +97,7 @@ $env:TMP = $testTemp
 $resolvedAssets = Resolve-ConvertedAssetSet -Assets $Assets
 
 function Get-WindowDuration([string]$Name) {
-    if ($Name -eq "stability") { return $StabilitySeconds }
-    return $DurationSeconds
+    return Get-SceneDuration -Name $Name -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds -PortalTourSeconds $PortalTourSeconds
 }
 
 # A metric's spread across the repeats: the median the baseline compares on, and the smallest and
@@ -240,12 +253,23 @@ function Get-ScenarioInputs($Arguments, $Report, [int]$DurationSeconds) {
     $gridY = Get-ArgumentValue $Arguments "--grid-y"
     $flySpeed = Get-ArgumentValue $Arguments "--auto-fly-speed"
     $syntheticInstances = Get-ArgumentValue $Arguments "--synthetic-instances"
+    # The portal scenes' own inputs (null for every other scene): the terrain ring, the demo, the
+    # pose file or start position, and the tour's length. A window of one of them is only
+    # comparable with another that was started the same way.
+    $terrainRadius = Get-ArgumentValue $Arguments "--terrain-radius"
+    $shotsFile = Get-ArgumentValue $Arguments "--shots"
+    $startIndex = [Array]::IndexOf($Arguments, "--start-position")
     return [ordered]@{
         worldspace = $worldspace
         grid = if ($null -eq $gridX -and $null -eq $gridY) { $null } else { [ordered]@{ x = [int]$gridX; y = [int]$gridY } }
         fly_speed = if ($null -eq $flySpeed) { $null } else { [int]$flySpeed }
         synthetic_instances = if ($null -eq $syntheticInstances) { $null } else { [int]$syntheticInstances }
         assets = Get-ArgumentValue $Arguments "--assets"
+        terrain_radius = if ($null -eq $terrainRadius) { $null } else { [int]$terrainRadius }
+        demo = Get-ArgumentValue $Arguments "--demo"
+        tour_doors = Get-ArgumentValue $Arguments "--tour-doors"
+        shots_file = if ($null -eq $shotsFile) { $null } else { Split-Path -Leaf $shotsFile }
+        start_position = if ($startIndex -lt 0) { $null } else { ($Arguments[($startIndex + 1)..($startIndex + 3)] -join ",") }
         stream_radius = $Report.fingerprint.graphics.stream_radius
         duration_seconds = $DurationSeconds
         warmup_frames = $Report.warmup_frames
@@ -705,14 +729,14 @@ foreach ($name in $requested) {
             $arguments = Get-ScenarioArguments -Name $name -RunDirectory $runDirectory -Commit $identity.commit `
                 -Hardware $hardware -RunId "run-$run" -RunLabel $label -DirtyWorktree:$identity.dirty `
                 -StandingStill:($kind -eq "standing_still") `
-                -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds `
+                -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds -PortalTourSeconds $PortalTourSeconds `
                 -ResolvedAssets $resolvedAssets -Worldspace $Worldspace `
                 -RuralGridX $RuralGridX -RuralGridY $RuralGridY -DenseGridX $DenseGridX -DenseGridY $DenseGridY `
                 -DenseLegacyGridX $DenseLegacyGridX -DenseLegacyGridY $DenseLegacyGridY `
                 -WaterGridX $WaterGridX -WaterGridY $WaterGridY
             if ($null -eq $windowArguments) { $windowArguments = $arguments }
             $report = Invoke-EngineWindow -Engine $engine -Arguments $arguments -RunDirectory $runDirectory `
-                -Label "Baseline run $name/$kind/run-$run" -AsHashtable
+                -Label "Baseline run $name/$kind/run-$run" -AsHashtable -AllowGateFailure
             if ($null -eq $report.fingerprint) {
                 throw "$reportLabel recorded no run fingerprint in $runDirectory, so the window cannot be shown to be comparable with the others"
             }
@@ -777,6 +801,7 @@ $baselineReport = [ordered]@{
     repeats = $Repeats
     duration_seconds = $DurationSeconds
     stability_seconds = $StabilitySeconds
+    portal_tour_seconds = $PortalTourSeconds
     # Where this campaign's own report bundles are, so a window's raw evidence can be found again
     # after a later campaign has written to the same -Out.
     run_directory = $campaignRoot
