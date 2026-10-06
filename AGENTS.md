@@ -32,7 +32,7 @@ Every task belongs to one track; name it in the brief, the commit and the handof
 - **Phase 2** (the priority): contributions to upstream Phase 2 as its README, CONTRIBUTING.md and
   `docs/roadmap/02-completion-plan.md` describe. Worktree `C:\Modding\wkj-phase2`, branches
   `phase2/<topic>` cut from `main` (a mirror of `origin/main`), assets
-  `C:\Modding\SkyrimConverted-upstream`, upstream's commit style, worker tasks `<kind>-<nnn>-p2-<slug>` numbered 500-599.
+  `D:\Modding-overflow\SkyrimConverted-p2main` (since 2026-10-02; the old `C:\Modding\SkyrimConverted-upstream` was retired 2026-10-06), upstream's commit style, worker tasks `<kind>-<nnn>-p2-<slug>` numbered 500-599.
 - **Portal** (parked 2026-09-28; **ACTIVE again since 2026-10-01** (the user): catch up with main and
   build a showcase of where the project and the portals are now): the user's seamless-door feature and demos. This checkout, branch `portal`, assets
   `C:\Modding\SkyrimConverted`, `[claude]`/`[deepseek]` prefixes, worker tasks `<kind>-<nnn>-portal-<slug>` numbered 100-199 (then 600+).
@@ -93,7 +93,7 @@ before starting any `phase2/*` branch or moving work between tracks.
 
 > **Before building and before sending (the user, 2026-09-30).** Announce first: before building
 > anything that touches another contributor's area or open PR, Upstream Dev posts one line on the
-> issue or Discord (the user's yes). Few open PRs: a soft cap of about 5 of ours open at once; stack
+> issue or Discord (the user's yes). Few open PRs: a soft cap of 5-6 of ours open as ready PRs plus 7-8 open drafts (the user, 2026-10-06; was about 5 in all); stack
 > only when unavoidable, and say so at the top (Merge after / Stack line, stack label).
 
 > **Daily rhythm (TRIAL from 2026-10-03, the user, 2026-10-02: kept if it works, reverted if not).**
