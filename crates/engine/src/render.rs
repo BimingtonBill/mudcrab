@@ -1,7 +1,10 @@
 use crate::{
     color_pipeline::{DEFAULT_SCENE_EV100, SceneColorPipeline},
+    config::WaterReflectionPreset,
     profiling::ProfilingState,
-    view_policy::{SecondaryViewTarget, ViewDemand, ViewPolicy, ViewPolicySystems, ViewRequest},
+    view_policy::{
+        SecondaryViewTarget, ViewDemand, ViewPolicy, ViewPolicySystems, ViewRequest, ViewShadows,
+    },
     world::{cache::TerrainSnapshot, database::AssetCatalog},
 };
 use bevy::{
@@ -730,8 +733,26 @@ const WATER_REFLECTION_FRUSTUM_MARGIN: f32 = 512.0;
 /// The camera is managed by the [`ViewPolicy`] it carries: [`prepare_water_reflection`] fills its
 /// demand and [`apply_view_policies`](crate::view_policy::apply_view_policies) decides each frame
 /// whether it renders, keeping this image alive across the frames it does not.
-fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
-    let policy = ViewPolicy::baseline();
+///
+/// The policy is the one `--water-reflection-preset` chose ([`water_reflection_policy`]; baseline
+/// when there is no configuration). The baseline camera keeps the components it has always had,
+/// including [`OcclusionCulling`]. The water preset throttles the camera, and a throttled camera
+/// must not keep occlusion history or multisampling: it is spawned without [`OcclusionCulling`] and
+/// with [`Msaa::Off`].
+fn setup_water_reflection(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    config: Option<Res<crate::config::EngineConfig>>,
+) {
+    let preset = config.map_or(WaterReflectionPreset::Baseline, |config| {
+        config.water_reflection_preset
+    });
+    let policy = water_reflection_policy(preset);
+    let layers = if policy.shadows == ViewShadows::On {
+        REFLECTION_VIEW_LAYERS
+    } else {
+        UNSHADOWED_REFLECTION_VIEW_LAYERS
+    };
     let image = images.add(Image::new_target_texture(
         policy.target_size.x,
         policy.target_size.y,
@@ -739,7 +760,7 @@ fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Imag
         None,
     ));
     commands.insert_resource(WaterReflectionTexture(image.clone()));
-    commands.spawn((
+    let mut camera = commands.spawn((
         Camera3d::default(),
         SceneColorPipeline::reflection(),
         Camera {
@@ -753,17 +774,14 @@ fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Imag
         RenderTarget::Image(image.clone().into()),
         Transform::default(),
         DepthPrepass,
-        OcclusionCulling,
-        RenderLayers::from_layers(REFLECTION_VIEW_LAYERS),
+        RenderLayers::from_layers(layers),
         // The policy's shadow choice picks one of these two layer sets every frame.
         crate::shadow_route::ViewShadowRoute {
             shadowed: RenderLayers::from_layers(REFLECTION_VIEW_LAYERS),
             unshadowed: RenderLayers::from_layers(UNSHADOWED_REFLECTION_VIEW_LAYERS),
         },
-        // TODO(water-reflection-preset): choose `ViewPolicy::water()` from a config flag once
-        // `crates/engine/src/config.rs` gains the switch (a `--water-reflection-preset` with
-        // `baseline` and `water` values). This commit may not change what the engine draws until
-        // that preset is chosen, so the water view keeps today's full-size, every-frame cost.
+        // TODO(run-fingerprint): record the chosen preset in the run fingerprint once
+        // `crates/engine/src/fingerprint.rs` exists on this branch.
         policy,
         ViewDemand::default(),
         crate::view_policy::ViewPolicyState::default(),
@@ -773,6 +791,22 @@ fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Imag
         },
         WaterReflectionCamera,
     ));
+    match preset {
+        WaterReflectionPreset::Baseline => {
+            camera.insert(OcclusionCulling);
+        }
+        WaterReflectionPreset::Water => {
+            camera.insert(Msaa::Off);
+        }
+    }
+}
+
+/// The [`ViewPolicy`] a `--water-reflection-preset` stands for.
+pub fn water_reflection_policy(preset: WaterReflectionPreset) -> ViewPolicy {
+    match preset {
+        WaterReflectionPreset::Baseline => ViewPolicy::baseline(),
+        WaterReflectionPreset::Water => ViewPolicy::water(),
+    }
 }
 
 /// The streamed world camera, never the reflection camera.
@@ -1405,6 +1439,69 @@ mod tests {
             assert!(!layers.intersects(&PLACED_OBJECT_RENDER_LAYERS));
             assert!(layers.intersects(&reflectable_world_layers()));
         }
+    }
+
+    fn spawned_reflection_camera(preset: WaterReflectionPreset) -> (App, Entity) {
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .insert_resource(crate::config::EngineConfig {
+                water_reflection_preset: preset,
+                ..default()
+            })
+            .add_systems(Startup, setup_water_reflection);
+        app.update();
+        let camera = app
+            .world_mut()
+            .query_filtered::<Entity, With<WaterReflectionCamera>>()
+            .single(app.world())
+            .unwrap();
+        (app, camera)
+    }
+
+    #[test]
+    fn the_baseline_preset_keeps_todays_reflection_camera() {
+        let (app, camera) = spawned_reflection_camera(WaterReflectionPreset::Baseline);
+        let camera = app.world().entity(camera);
+        assert_eq!(camera.get::<ViewPolicy>(), Some(&ViewPolicy::baseline()));
+        assert!(camera.contains::<OcclusionCulling>());
+        assert_eq!(
+            camera.get::<Msaa>(),
+            Some(&Msaa::default()),
+            "the baseline leaves multisampling at Bevy's default"
+        );
+        assert_eq!(
+            camera.get::<RenderLayers>(),
+            Some(&RenderLayers::from_layers(REFLECTION_VIEW_LAYERS))
+        );
+    }
+
+    #[test]
+    fn the_water_preset_drops_occlusion_history_and_multisampling() {
+        let (app, camera) = spawned_reflection_camera(WaterReflectionPreset::Water);
+        let camera = app.world().entity(camera);
+        assert_eq!(camera.get::<ViewPolicy>(), Some(&ViewPolicy::water()));
+        assert!(
+            !camera.contains::<OcclusionCulling>(),
+            "a throttled camera must not keep occlusion history"
+        );
+        assert_eq!(camera.get::<Msaa>(), Some(&Msaa::Off));
+        assert_eq!(
+            camera.get::<RenderLayers>(),
+            Some(&RenderLayers::from_layers(
+                UNSHADOWED_REFLECTION_VIEW_LAYERS
+            )),
+            "the water preset starts on the shadowless route"
+        );
+        let target = app.world().resource::<WaterReflectionTexture>().0.clone();
+        let image = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&target)
+            .unwrap();
+        assert_eq!(
+            image.texture_descriptor.size.width,
+            crate::view_policy::WATER_TARGET_SIZE.x
+        );
     }
 
     #[test]
