@@ -151,7 +151,7 @@ Run every scenario with converted assets and coordinates selected during integra
 
 ```powershell
 ./scripts/phase2-profile.ps1 -Scenario all -Assets D:\SkyrimConverted `
-  -RuralGridX 0 -RuralGridY 0 -DenseGridX 12 -DenseGridY 8 `
+  -RuralGridX 0 -RuralGridY 0 -DenseGridX 3 -DenseGridY -12 `
   -WaterGridX 7 -WaterGridY -2 -Repetitions 3
 ```
 
@@ -305,14 +305,17 @@ pwsh -File scripts/phase2-baseline.ps1 -Assets D:\SkyrimConverted -Scenarios str
 pwsh -File scripts/phase2-baseline.ps1                                       # synthetic only: no -Assets needed
 ```
 
-The world scenes default to the standard places of `docs/roadmap/02-acceptance.md` in Tamriel
-(`0x3c`): rural at grid 0,0, dense at 18,-5 and water at 7,-2, so the three measure three different
-places (`-RuralGridX`, `-DenseGridX`, `-WaterGridX` and their `Y` partners override them). The
-profile script's own defaults are 0,0 for all three, which made them one scene. The baseline adds
-a sixth scene, `riverwood` at 3,-12 (`-RiverwoodGridX`/`-RiverwoodGridY`): about 2,900 references
-within two cells against about 1,500 at the acceptance dense place, so it is the real-density
-case. The profiling example above uses dense 12,8, which disagrees with `02-acceptance.md`; the
-baseline follows `02-acceptance.md`.
+The world scenes use the same places as `docs/roadmap/02-acceptance.md` in Tamriel (`0x3c`), with
+the references within two cells of each: rural at grid 0,0 (about 1,050), dense at 3,-12 (Riverwood,
+about 2,900, the densest cell neighbourhood in Tamriel) and water at 7,-2 (about 1,580).
+`-RuralGridX`, `-DenseGridX`, `-WaterGridX` and their `Y` partners override them. Both scripts and
+the acceptance runner agree on these places.
+
+`dense-legacy` is the old dense place, 18,-5 (about 1,530 references; `-DenseLegacyGridX`/`Y`). It
+is accepted by every script but is not in `-Scenario all` or the default sets, and is kept for one
+release so older baselines can still be compared, then removed. Baselines and
+`profiling-baseline.json` results made before this change are not comparable for `dense`, which is
+now a different, about twice as dense place: compare old results with `dense-legacy`.
 
 Both scripts need PowerShell 7 (`pwsh`): they read reports with `ConvertFrom-Json -AsHashtable`.
 The command builds the engine once (`cargo build --release --bin engine`, skipped with `-NoBuild`,
