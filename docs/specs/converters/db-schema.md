@@ -535,6 +535,12 @@ Columns and rules:
   frame, as an axis-aligned box against the half-extents), so it can report an overlap that does
   not exist, which only makes the engine draw more. A `contained = 1` row is never also written
   as `contained = 0`.
+  Overlap rows need a base with bounds in `statics`, which holds every base type with a world
+  model (`STAT`, `MSTT`, `FURN`, `TREE`, `FLOR`, `CONT`, `DOOR`, `ACTI`, placed items and armour,
+  and `LIGH` with a model). Placed references of other base types get pivot rows only: actors
+  (`NPC_`, which move and stay ordinary entities), lights without a model (their reach is a
+  lighting question, not geometry), decals (`TXST`), and bases with no geometry (`IDLM`, `SOUN`,
+  `ASPC`). In the all-plugins conversion these are 22,251 of 364,262 pivot rows.
 - **`room_graph_stats`**: the counters the conversion report shows in `integration-report.json`
   under `room_graph`: `rooms`, `portals`, `links`, `portals_with_missing_side`,
   `non_box_rooms_skipped`, `portals_without_size_skipped`, `invalid_markers_skipped` (rooms and portals with a non-finite size or transform), `objects_in_no_room` and
