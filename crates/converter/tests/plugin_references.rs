@@ -791,6 +791,10 @@ fn every_covered_reference_and_cell_field_is_remapped_at_its_offsets() {
         (b"CELL", b"XCAS", 4, &[0]),
         (b"CELL", b"XCCM", 4, &[0]),
         (b"CELL", b"XCLR", 12, &[0, 4, 8]),
+        (b"REFR", b"XPOD", 8, &[0, 4]),
+        (b"REFR", b"XLRM", 4, &[0]),
+        (b"REFR", b"LNAM", 4, &[0]),
+        (b"REFR", b"INAM", 4, &[0]),
     ];
     for &(record_type, tag, len, offsets) in fields {
         let label = format!(
@@ -825,6 +829,58 @@ fn every_covered_reference_and_cell_field_is_remapped_at_its_offsets() {
             expected[offset..offset + 4].copy_from_slice(&(0x0200_0900 + i as u32).to_le_bytes());
         }
         assert_eq!(data, &expected, "{label}");
+    }
+}
+
+/// `LNAM` and `INAM` are FormIDs only on room marker references. On other record types the
+/// same tags keep their old handling: `NPC_` `INAM` was always a FormID, and the room marker
+/// layouts must not touch `ACHR` or `CELL` fields.
+#[test]
+fn room_marker_tags_on_other_record_types_keep_their_handling() {
+    let cases: &[(&[u8; 4], &[u8; 4], bool)] = &[
+        (b"NPC_", b"INAM", true),
+        (b"ACHR", b"LNAM", false),
+        (b"ACHR", b"INAM", false),
+        (b"ACHR", b"XLRM", false),
+        (b"CELL", b"LNAM", false),
+        (b"CELL", b"INAM", false),
+        (b"CELL", b"XLRM", false),
+    ];
+    for &(record_type, tag, remapped) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+        let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+        let patch = plugin(
+            dir.path(),
+            "Patch.esm",
+            &["Base.esm"],
+            1,
+            record(
+                record_type,
+                0x0100_0800,
+                0,
+                sub(tag, &0x0100_0900u32.to_le_bytes()),
+            ),
+        );
+        let merged = EsmParser::merge_plugins(&[base, filler, patch]).unwrap();
+        let data = &merged[&0x0200_0800]
+            .subrecords
+            .iter()
+            .find(|(name, _)| name.as_slice() == tag)
+            .unwrap()
+            .1;
+        let expected = if remapped {
+            0x0200_0900u32
+        } else {
+            0x0100_0900
+        };
+        assert_eq!(
+            u32::from_le_bytes(data[..4].try_into().unwrap()),
+            expected,
+            "{} {}",
+            String::from_utf8_lossy(record_type),
+            String::from_utf8_lossy(tag)
+        );
     }
 }
 

@@ -382,6 +382,11 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         // Image space, music, acoustic space, and the region a cell takes its sky and weather
         // from (`XCCM` names a REGN, not a climate).
         b"XCIM" | b"XCMO" | b"XCAS" | b"XCCM" if record_type == b"CELL" => Fixed(SINGLE),
+        // Room marker references (REFR only; `LNAM` and `INAM` mean other things on other
+        // record types): the two rooms a portal joins, links between rooms, and a room's
+        // own lighting template and image space.
+        b"XPOD" if record_type == b"REFR" => Fixed(&[(8, &[0, 4])]),
+        b"XLRM" | b"LNAM" | b"INAM" if record_type == b"REFR" => Fixed(SINGLE),
         // Regions.
         b"XCLR" if record_type == b"CELL" => Array { stride: 4 },
         _ => return None,
