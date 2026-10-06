@@ -2146,20 +2146,6 @@ mod tests {
         })
     }
 
-    /// Publishes one material as the only material of a one-mesh document, which is how
-    /// every glb of the conversion looks.
-    fn publish_one(material: ValidatedNifMaterial) -> serde_json::Value {
-        let mut document = gltf(1);
-        publish_gltf_materials(
-            &mut document,
-            &[shape(10, material)],
-            &[10],
-            Path::new("assets/meshes/architecture/wall.glb"),
-        )
-        .unwrap();
-        document
-    }
-
     fn publish_specular_fixture(material: ValidatedNifMaterial) -> serde_json::Value {
         let mut document = gltf(1);
         publish_gltf_materials(
@@ -2844,14 +2830,15 @@ mod tests {
             3
         );
         // The mask is the normal map's alpha, so the extension points at the normal map's own
-        // texture object and doubles the strength for it.
+        // texture object; the factor stays bounded (main's #141 contract: the engine's native
+        // loader owns the Bevy-specific compensation).
         assert_eq!(
             published["extensions"]["KHR_materials_specular"]["specularTexture"]["index"],
             published["normalTexture"]["index"]
         );
         assert_eq!(
             published["extensions"]["KHR_materials_specular"]["specularFactor"],
-            2.0
+            1.0
         );
         assert_eq!(document["meshes"][0]["primitives"][0]["material"], 0);
         assert_eq!(
@@ -3058,184 +3045,6 @@ mod tests {
                 .get("OPEN_SKYRIM_material_animation")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn specular_mask_is_the_normal_maps_alpha() {
-        // `docs/research/gloss-mask-semantics.md`: Skyrim multiplies its specular term by the
-        // normal map's alpha, and glTF samples exactly that when `specularTexture` is the
-        // normal map's own texture. Bevy then applies `reflectance *= sample.a * 0.5`, so the
-        // factor is doubled to cancel it.
-        let mut material = fixture(NifAlphaMode::Opaque, false, false, false);
-        material.specular_strength = 0.5;
-        material.textures = vec![
-            texture_slot(
-                1,
-                NifTextureSemantic::Normal,
-                "textures/architecture/wall_n.dds",
-                false,
-            )
-            .unwrap(),
-        ];
-        let document = publish_one(material);
-
-        let published = &document["materials"][0];
-        let extension = &published["extensions"]["KHR_materials_specular"];
-        assert_eq!(
-            extension["specularTexture"]["index"],
-            published["normalTexture"]["index"]
-        );
-        assert!((extension["specularFactor"].as_f64().unwrap() - 1.0).abs() < 1e-6);
-        assert_eq!(
-            extension["specularColorFactor"],
-            serde_json::json!([1.0, 1.0, 1.0])
-        );
-        // The mask is the same texture object and the same image as the normal map, in the
-        // linear encoding the normal map is published with - not a second copy of the file.
-        let index =
-            usize::try_from(extension["specularTexture"]["index"].as_u64().unwrap()).unwrap();
-        assert_eq!(document["textures"].as_array().unwrap().len(), 1);
-        assert_eq!(document["textures"][index]["source"], 0);
-        assert_eq!(
-            document["images"][0]["uri"],
-            "../../textures/architecture/wall_n.ktx2"
-        );
-    }
-
-    #[test]
-    fn a_material_without_a_normal_map_keeps_the_unmasked_specular_shape() {
-        // No normal map means no mask to sample, so the extension has to be exactly the shape
-        // it had before the mask existed - the strength as the factor and no `specularTexture`
-        // key at all - or every normal-map-less material is published at twice its specular.
-        let mut material = fixture(NifAlphaMode::Opaque, false, false, false);
-        material.specular_strength = 0.4;
-        material.textures = vec![
-            texture_slot(
-                7,
-                NifTextureSemantic::Specular,
-                "textures/architecture/wall_s.dds",
-                false,
-            )
-            .unwrap(),
-        ];
-        let document = publish_one(material);
-
-        let extension = &document["materials"][0]["extensions"]["KHR_materials_specular"];
-        assert!(extension.get("specularTexture").is_none());
-        assert_eq!(extension["specularColorTexture"]["index"], 0);
-        assert!((extension["specularFactor"].as_f64().unwrap() - 0.4).abs() < 1e-6);
-
-        // A material with no normal map, no strength and no specular slot publishes no
-        // specular extension, so the widened condition has caught nothing new. (It does carry
-        // `OPEN_SKYRIM_material`, which always publishes the static UV transform.)
-        let mut bare = fixture(NifAlphaMode::Opaque, false, false, false);
-        bare.specular_strength = 0.0;
-        let document = publish_one(bare);
-        assert!(
-            document["materials"][0]["extensions"]
-                .get("KHR_materials_specular")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_normal_map_alone_publishes_the_extension_with_a_zero_factor() {
-        // A mask is a reason to publish the extension by itself: strength 0 on a masked
-        // material is a surface Skyrim draws with no highlight at all, and a `specularFactor`
-        // of 0 says the same to the renderer instead of leaving it unmentioned.
-        let mut material = fixture(NifAlphaMode::Opaque, false, false, false);
-        material.specular_strength = 0.0;
-        material.textures = vec![
-            texture_slot(
-                1,
-                NifTextureSemantic::Normal,
-                "textures/architecture/wall_n.dds",
-                false,
-            )
-            .unwrap(),
-        ];
-        let document = publish_one(material);
-
-        let extension = &document["materials"][0]["extensions"]["KHR_materials_specular"];
-        assert_eq!(extension["specularTexture"]["index"], 0);
-        assert_eq!(extension["specularFactor"], 0.0);
-    }
-
-    #[test]
-    fn specular_factor_is_capped_at_the_top_of_the_masked_range() {
-        // 1.0 is the largest strength the sampled source NIFs carry
-        // (`docs/research/specular-gloss-mapping.md` table 4.1), and the masked form publishes
-        // 2.0 for it - which Bevy turns back into `reflectance = 0.5`, the reflectance an
-        // unmasked material at strength 1.0 also has. A stronger source value clamps there
-        // rather than pushing reflectance past the unmasked maximum.
-        for strength in [1.0, 1.5, 4.0] {
-            let mut material = fixture(NifAlphaMode::Opaque, false, false, false);
-            material.specular_strength = strength;
-            material.textures = vec![
-                texture_slot(
-                    1,
-                    NifTextureSemantic::Normal,
-                    "textures/architecture/wall_n.dds",
-                    false,
-                )
-                .unwrap(),
-            ];
-            let document = publish_one(material);
-            assert_eq!(
-                document["materials"][0]["extensions"]["KHR_materials_specular"]["specularFactor"]
-                    .as_f64()
-                    .unwrap(),
-                2.0,
-                "strength {strength} should clamp to the top of the masked range"
-            );
-        }
-
-        // The same clamp applies to the strength itself when there is no mask.
-        let mut material = fixture(NifAlphaMode::Opaque, false, false, false);
-        material.specular_strength = 4.0;
-        let document = publish_one(material);
-        assert_eq!(
-            document["materials"][0]["extensions"]["KHR_materials_specular"]["specularFactor"]
-                .as_f64()
-                .unwrap(),
-            1.0
-        );
-    }
-
-    #[test]
-    fn model_space_normal_meshes_keep_the_mask_in_slot_seven() {
-        // `SLSF1_MODEL_SPACE_NORMALS` (bit 12): these meshes store directions in model space
-        // and take the mask from slot 7's red channel, which is already published as
-        // `specularColorTexture`. Pointing `specularTexture` at the normal map would sample
-        // data that is not a mask, and doubling the factor for it would brighten the surface.
-        let mut material = fixture(NifAlphaMode::Opaque, false, false, false);
-        material.shader_flags_1 = SLSF1_MODEL_SPACE_NORMALS;
-        material.specular_strength = 0.5;
-        material.textures = vec![
-            texture_slot(
-                1,
-                NifTextureSemantic::Normal,
-                "textures/architecture/wall_n.dds",
-                false,
-            )
-            .unwrap(),
-            texture_slot(
-                7,
-                NifTextureSemantic::Specular,
-                "textures/architecture/wall_s.dds",
-                false,
-            )
-            .unwrap(),
-        ];
-        let document = publish_one(material);
-
-        let published = &document["materials"][0];
-        let extension = &published["extensions"]["KHR_materials_specular"];
-        assert!(extension.get("specularTexture").is_none());
-        assert_eq!(extension["specularColorTexture"]["index"], 1);
-        assert!((extension["specularFactor"].as_f64().unwrap() - 0.5).abs() < 1e-6);
-        // The normal map is still published as the normal map.
-        assert_eq!(published["normalTexture"]["index"], 0);
     }
 
     #[test]

@@ -3629,6 +3629,8 @@ mod tests {
             .init_asset::<StandardMaterial>()
             .init_asset::<TerrainMaterial>()
             .init_asset::<WaterMaterial>()
+            // The terrain LOD readiness check (#105) reads converted scenes even when none is loaded.
+            .init_asset::<bevy::world_serialization::WorldAsset>()
             .insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::new(2, -3)))
             .insert_resource(ActiveCell {
@@ -4070,6 +4072,8 @@ mod tests {
             .init_asset::<StandardMaterial>()
             .init_asset::<TerrainMaterial>()
             .init_asset::<WaterMaterial>()
+            // The terrain LOD readiness check (#105) reads converted scenes even when none is loaded.
+            .init_asset::<bevy::world_serialization::WorldAsset>()
             .insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::new(2, -3)))
             .insert_resource(ActiveCell {

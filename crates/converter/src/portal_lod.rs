@@ -930,7 +930,9 @@ fn record_grid(
             )?;
             report.grids += 1;
         }
-        Err(failure) => error(
+        // A diagnostic, not a blocking defect: #105's terrain LOD reports the same header as a
+        // LOD warning and the conversion completes without that worldspace's grid.
+        Err(failure) => issue(
             report,
             format!("unusable LOD grid {}: {failure:#}", path.display()),
         ),

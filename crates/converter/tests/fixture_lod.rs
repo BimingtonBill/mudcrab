@@ -294,17 +294,20 @@ fn fixture_terrain_lod_converts_with_vertex_colours_and_texture_uris() {
     assert!(primitive["attributes"].get("TEXCOORD_0").is_some());
     assert!(primitive["attributes"].get("NORMAL").is_some());
 
+    // The fixture's shader writes texture clamp mode 0, so main's clamp aliases (#142) name both
+    // textures with their `opensky-wrap0` suffix.
     let uris = MeshConverter::glb_texture_uris(&output).unwrap();
     assert_eq!(uris.len(), 2, "{uris:?}");
     assert!(
-        uris.iter().any(
-            |uri| uri.ends_with("textures/terrain/generated/generated.4.0.0.opensky-srgb.ktx2")
-        ),
+        uris.iter().any(|uri| uri.ends_with(
+            "textures/terrain/generated/generated.4.0.0.opensky-srgb.opensky-wrap0.ktx2",
+        )),
         "{uris:?}"
     );
     assert!(
         uris.iter()
-            .any(|uri| uri.ends_with("textures/terrain/generated/generated.4.0.0_n.ktx2")),
+            .any(|uri| uri
+                .ends_with("textures/terrain/generated/generated.4.0.0_n.opensky-wrap0.ktx2")),
         "{uris:?}"
     );
 

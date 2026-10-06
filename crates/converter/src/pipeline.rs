@@ -2001,7 +2001,7 @@ const LOD_METADATA_EXTENSIONS: [&str; 2] = ["lst", "btt"];
 pub(crate) fn overlay_loose_assets(data: &Path, vfs: &Path, files: &[PathBuf]) -> Result<()> {
     let mut seen = BTreeMap::<String, PathBuf>::new();
     for source in files.iter().filter(|path| {
-        extension(path, &["dds", "nif", "btr", "bto", "pex"])
+        extension(path, &["dds", "nif", "btr", "bto", "pex", "lod"])
             || extension(path, &LOD_METADATA_EXTENSIONS)
     }) {
         let relative = source.strip_prefix(data)?;
@@ -3897,37 +3897,8 @@ mod tests {
         assert!(output.join("skyrim_world.db").is_file());
         assert!(!backup.exists());
 
-        // Supported schema-16/world-3 packs retain full-detail recovery.
-        fs::remove_dir_all(output.join("lod")).unwrap();
-        fs::remove_file(output.join("lod-manifest.json")).unwrap();
-        let mut legacy = published_manifest(&output);
-        legacy.schema_version = 16;
-        legacy
-            .save(&output.join("conversion-manifest.json"))
-            .unwrap();
-        let database = Connection::open(output.join("skyrim_world.db")).unwrap();
-        database.execute_batch("UPDATE schema_info SET version=3; DELETE FROM lod_chunks; DELETE FROM lod_chunks_spatial; DELETE FROM lod_build;").unwrap();
-        drop(database);
-        let integration_path = output.join("integration-report.json");
-        let mut integration: serde_json::Value =
-            serde_json::from_slice(&fs::read(&integration_path).unwrap()).unwrap();
-        integration["schema_version"] = serde_json::json!(3);
-        fs::write(&integration_path, serde_json::to_vec(&integration).unwrap()).unwrap();
-        fs::rename(&output, &backup).unwrap();
-        seal_test_backup(&output, &backup);
-        recover_interrupted_publication(&output).unwrap();
-        assert_eq!(published_manifest(&output).schema_version, 16);
-        assert!(!output.join("lod-manifest.json").exists());
-        // Grass-only schema5 has no LOD tables, and must remain recoverable.
-        let database = Connection::open(output.join("skyrim_world.db")).unwrap();
-        database.execute_batch("UPDATE schema_info SET version=5; DROP TABLE lod_chunks; DROP TABLE lod_chunks_spatial; DROP TABLE lod_build;").unwrap();
-        drop(database);
-        integration["schema_version"] = serde_json::json!(5);
-        fs::write(&integration_path, serde_json::to_vec(&integration).unwrap()).unwrap();
-        fs::rename(&output, &backup).unwrap();
-        seal_test_backup(&output, &backup);
-        recover_interrupted_publication(&output).unwrap();
-        assert!(output.join("skyrim_world.db").is_file());
+        // Main's recovery of legacy schema-16/world-3 and grass-only world-5 packs is not checked
+        // here: the portal runtime and recovery accept only the portal's own schemas.
     }
 
     #[tokio::test]

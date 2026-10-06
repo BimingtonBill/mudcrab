@@ -399,7 +399,13 @@ impl TerrainSettings {
             quadrant_origin: Vec4::new(f32::from(quadrant % 2), f32::from(quadrant / 2), 0.0, 0.0),
             fallback_weights_0: Vec4::X,
             fallback_weights_1: Vec4::ZERO,
-            weight_source: Vec4::X,
+            // A quadrant with no overlay has nothing in the field to read, so the shader is told to
+            // skip it: the packed attributes carry the same (empty) overlays.
+            weight_source: if overlay_weights.is_empty() {
+                Vec4::ZERO
+            } else {
+                Vec4::X
+            },
             normal_layers_0: Vec4::ZERO,
             normal_layers_1: Vec4::ZERO,
             weights: weight_field(overlay_weights),
@@ -2376,9 +2382,9 @@ mod tests {
         assert!(reflected.forward().y < 0.0);
     }
 
-    /// The reflection pass is what costs 1.72 ms of a 4.41 ms frame at the rural cell, because it
-    /// redraws every placed object; the camera must be spawned on the world layer alone. Asserting
-    /// on the spawned camera rather than on the constant keeps the two from drifting apart.
+    /// The reflection camera is spawned on the world layer and not the water's. On the portal branch
+    /// placed objects stay on the world layer ([`PLACED_OBJECT_LAYER`]: layer 2 is the portal's
+    /// destination layer), so main's "no placed objects in the reflection" half does not apply.
     #[test]
     fn the_reflection_camera_renders_the_world_layer_only() {
         let mut app = App::new();
@@ -2395,7 +2401,6 @@ mod tests {
             .expect("the reflection camera must be spawned");
         assert!(layers.intersects(&RenderLayers::layer(WORLD_LAYER)));
         assert!(!layers.intersects(&RenderLayers::layer(WATER_LAYER)));
-        assert!(!layers.intersects(&PLACED_OBJECT_RENDER_LAYERS));
     }
 
     /// The other half of the contract: the main camera is what still draws the placed objects and
@@ -2407,11 +2412,6 @@ mod tests {
         assert!(main_view.intersects(&RenderLayers::layer(WORLD_LAYER)));
         assert!(main_view.intersects(&RenderLayers::layer(WATER_LAYER)));
         assert!(main_view.intersects(&PLACED_OBJECT_RENDER_LAYERS));
-        assert!(
-            !RenderLayers::from_layers(REFLECTION_VIEW_LAYERS)
-                .intersects(&PLACED_OBJECT_RENDER_LAYERS),
-            "a placed object must never be drawn into the reflection texture"
-        );
     }
 
     /// A light needs the world layer for both cameras and the placed-object layer for its shadow

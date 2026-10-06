@@ -985,6 +985,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "portal: written for main's legacy world schemas 3-5 and raw 7; the portal accepts only its own"]
     fn readiness_validates_database_report_and_current_lod_identity() {
         let output = complete_output("db-lod-contract");
         for version in [3, 4, 5] {
@@ -1148,8 +1149,26 @@ pub(crate) mod tests {
     #[test]
     fn readiness_accepts_the_same_schema_ranges_as_the_runtime() {
         let output = complete_output("lod-schema-range");
-        for converter_schema in 14..=converter::cache::CONVERTER_SCHEMA_VERSION + 1 {
-            for world_schema in 2..=shared::WORLD_DATABASE_SCHEMA_VERSION + 1 {
+        // The edges of each range and a value past them on both sides. Walking every number
+        // between them is not possible on the portal branch, whose schemas start at 100_000.
+        let edges = |oldest: u32, newest: u32, floor: u32| {
+            let mut values = vec![floor, oldest - 1, oldest, newest, newest + 1];
+            values.sort_unstable();
+            values.dedup();
+            values
+        };
+        let converter_schemas = edges(
+            shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION,
+            converter::cache::CONVERTER_SCHEMA_VERSION,
+            14,
+        );
+        let world_schemas = edges(
+            shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION,
+            shared::WORLD_DATABASE_SCHEMA_VERSION,
+            2,
+        );
+        for &converter_schema in &converter_schemas {
+            for &world_schema in &world_schemas {
                 set_schemas(&output, converter_schema, world_schema);
                 assert_eq!(
                     output_is_complete(&output),

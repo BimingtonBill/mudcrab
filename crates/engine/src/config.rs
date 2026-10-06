@@ -266,6 +266,7 @@ Streaming:
   --max-model-spawns-per-frame <count>  models spawned per frame; 0 spawns all at once (default: 4)
   --max-upload-mib-per-frame <mib>      render-asset upload budget per frame; 0 is unlimited (default: 16)
   --auto-fly-speed <units/s>            fly the camera forward at this speed; 0 holds it still
+  --terrain-radius <cells>              terrain-only ring around the streamed cells (default: 8)
 
 Benchmark and profiling:
   --benchmark-only                      run the synthetic benchmark; opens no world database
@@ -298,6 +299,38 @@ Diagnostics:
   --renderer-fixture                    run the renderer fixture (no world database)
   --physics-fixture                     run the physics fixture (no world database)
   --streaming-fixture                   stream the fixture world instead of the full asset set
+
+Remote:
+  --remote                              serve the Bevy Remote Protocol on 127.0.0.1 (needs the remote feature)
+  --remote-port <port>                  port for --remote (default: 15702); implies --remote
+
+Portal (this branch's doors, demos and tools):
+  --walk                                walk as a first-person player; E opens load doors
+  --show-window                         keep an automated run's window on screen
+  --portal-depth-composite              composite the portal by depth (the default)
+  --portal-depth-composite=on           the same as --portal-depth-composite
+  --portal-depth-composite=off          draw the portal without depth compositing
+  --demo <alftand|blackreach|riverwood> start at a named demo position
+  --start-position <x> <y> <z>          start at a Creation-unit position
+  --start-yaw <radians>                 start heading, with --start-position
+  --start-shot <file> <name>            start at a shot's pose, in its space
+  --demo-tour <dir>                     walk the scripted door tour, writing frames and a log here
+  --tour-doors <count>                  walk only the first doors of the tour
+  --tour-repeat <count>                 walk the tour's doors this many times
+  --tour-dwell <seconds>                wait only this long after a crossing
+  --tour-clip                           keep a clip's worth of frames around each crossing
+  --tour-bench <file>                   time the tour and write the report here
+  --portal-bench <file>                 time the portal at the doors in this file
+  --bench-out <file>                    where --portal-bench writes its report
+  --bench-seconds <seconds>             timing window per door for --portal-bench
+  --captures-dir <dir>                  where pose and field-note captures go
+  --field-notes-test                    field notes test mode
+  --portal-light-spill                  spill light through the doorway the portal draws
+  --dark-sun-shadows                    sun shadows in the dark spaces too
+  --tonemapper <name>                   tonemapper to start with
+  --graphics <preset>                   graphics preset
+  --graphics-file <file>                graphics settings file
+  --graphics-cycle <seconds>            step the anti-aliasing through every setting
 
 Help:
   -h, --help                            print this message and exit
@@ -740,6 +773,10 @@ impl EngineConfig {
         }
         // Benchmark and acceptance runs measure the full-detail grid the Phase 2 gates were set
         // for, so the terrain ring is off there unless a run asks for it by name.
+        // `--shots` and `--shots-out` are main's options (parsed above, with main's checks); the
+        // portal's shots run reads them from its own options.
+        config.portal.shots = config.shots.clone();
+        config.portal.shots_out = config.shots_out.clone();
         if !terrain_radius_given
             && (config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some())
         {
@@ -951,9 +988,8 @@ impl PortalOptions {
         match argument {
             "--walk" => config.portal.walk = true,
             "--show-window" => config.portal.show_window = true,
-            "--portal-depth-composite" | "--portal-depth-composite=on" => {
-                config.portal.depth_composite = true;
-            }
+            "--portal-depth-composite" => config.portal.depth_composite = true,
+            "--portal-depth-composite=on" => config.portal.depth_composite = true,
             "--portal-depth-composite=off" => config.portal.depth_composite = false,
             "--demo-tour" => config.portal.demo_tour = args.next().map(PathBuf::from),
             "--tour-doors" => {
@@ -975,8 +1011,6 @@ impl PortalOptions {
                     .and_then(|value| value.parse().ok())
                     .filter(|seconds: &f32| *seconds > 0.0);
             }
-            "--shots" => config.portal.shots = args.next().map(PathBuf::from),
-            "--shots-out" => config.portal.shots_out = args.next().map(PathBuf::from),
             // Both of the flag's arguments are taken, and either may be missing: what a request
             // that names no file, or no shot, is told is `pose_capture::start_shot_run`'s, which
             // is the first place that can say so with a message.
@@ -1590,7 +1624,9 @@ mod tests {
             .filter_map(|line| {
                 let (option, rest) = leading_quoted(line)?;
                 // The bare `--` arm is a no-op marker, not an option to document.
-                (rest.trim_start().starts_with("=>") && option != "--").then_some(option)
+                // Only option literals: the portal's demo-name arms (`"alftand" =>`) are values.
+                (rest.trim_start().starts_with("=>") && option.starts_with('-') && option != "--")
+                    .then_some(option)
             })
             .collect()
     }
@@ -3038,9 +3074,13 @@ mod tests {
     /// `from_args` is the parse the run uses (`from_env`, `main`): a bad value has to stop it with
     /// the message, not hand back a configuration that quietly differs from the one asked for.
     #[test]
-    #[should_panic(expected = "--reflection-cascades \"5\": 0 to 4 (Bevy 0.19's limit), or all")]
     fn from_args_stops_the_run_on_a_bad_reflection_value() {
-        EngineConfig::run_from_args(["--reflection-cascades", "5"].map(str::to_owned));
+        let error = EngineConfig::from_args(["--reflection-cascades", "5"].map(str::to_owned))
+            .expect_err("a bad reflection value stops the run");
+        assert_eq!(
+            error.to_string(),
+            "--reflection-cascades \"5\": 0 to 4 (Bevy 0.19's limit), or all"
+        );
     }
 
     #[test]

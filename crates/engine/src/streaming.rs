@@ -8565,9 +8565,9 @@ mod tests {
         .unwrap();
         assert_eq!(metrics.terrain_seam_points_welded, 33);
 
-        // (h(left) - h(right), h(down) - h(up), 2 * 128) at (x, y) = (9, 0) is (0, -24, 256):
-        // normalized and scaled by 127 that is (0, -12, 126).
-        assert_eq!(arriving.normals[9 * 3..9 * 3 + 3], [0, -12, 126]);
+        // At (x, y) = (9, 0), on the south edge, the y stencil spans one 128-unit interval (main's
+        // span-divided stencil): (0, -24 / 128, 1) normalized and scaled by 127 is (0, -23, 125).
+        assert_eq!(arriving.normals[9 * 3..9 * 3 + 3], [0, -23, 125]);
         assert_eq!(
             arriving.normals[(33 + 9) * 3..(33 + 9) * 3 + 3],
             [0, 0, 127],

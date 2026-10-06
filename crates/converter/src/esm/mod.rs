@@ -862,6 +862,9 @@ mod tests {
         for value in [947.038f32, 3958.835, 591.917, 0.0, 0.0, 2.96989] {
             xtel.extend_from_slice(&value.to_le_bytes());
         }
+        // Skyrim's `XTEL` ends in a u32 of flags: 32 bytes in all, the only length the
+        // load-order remap accepts (`form_id_layout`).
+        xtel.extend_from_slice(&0u32.to_le_bytes());
         let original = xtel.clone();
         let mut refr = RawRecord {
             form_id: 0x00000001,
@@ -883,7 +886,7 @@ mod tests {
         .unwrap();
 
         let data = &refr.subrecords[0].1;
-        assert_eq!(data.len(), 28);
+        assert_eq!(data.len(), 32);
         assert_eq!(
             u32::from_le_bytes(data[..4].try_into().unwrap()),
             0x0200_0020,

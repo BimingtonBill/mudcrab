@@ -1580,12 +1580,13 @@ mod tests {
         .unwrap();
         let connection = Connection::open(path).unwrap();
         connection
-            .execute_batch(
+            .execute_batch(&format!(
                 "CREATE TABLE schema_info(version INTEGER NOT NULL);
-                 INSERT INTO schema_info VALUES(7);
+                 INSERT INTO schema_info VALUES({});
                  CREATE TABLE lod_chunks(id INTEGER PRIMARY KEY);
                  CREATE TABLE lod_build(id INTEGER PRIMARY KEY,build_identity TEXT NOT NULL);",
-            )
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
             .unwrap();
         for id in 0..chunks {
             connection
@@ -1601,6 +1602,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "portal: the runtime loads only the portal's own world database schema"]
     fn legacy_databases_render_without_lod_but_cannot_advertise_lod() {
         for version in [3, 4, 5] {
             let directory = tempfile::tempdir().unwrap();
@@ -1626,9 +1628,12 @@ mod tests {
     fn current_database_requires_lod_tables_even_without_manifest() {
         let directory = tempfile::tempdir().unwrap();
         let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
-        connection.execute_batch(
-            "CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES(7);"
-        ).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES({});",
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
         assert!(load_lod_chunks(&connection, lod_query([0.0, 0.0], [1.0, 1.0])).is_err());
         assert!(validate_lod_build_contract(directory.path(), 20).is_err());
     }
@@ -1675,12 +1680,17 @@ mod tests {
         }
         Connection::open(&database)
             .unwrap()
-            .execute("UPDATE schema_info SET version=7", [])
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
             .unwrap();
         std::fs::write(
             directory.path().join("lod-manifest.json"),
             serde_json::to_vec(&serde_json::json!({
-                "build_identity": identity, "converter_schema": 24, "world_database_schema": 7,
+                "build_identity": identity,
+                "converter_schema": shared::LOD_CONVERTER_SCHEMA_VERSION,
+                "world_database_schema": shared::WORLD_DATABASE_SCHEMA_VERSION,
                 "chunks": 1, "land_texture_repeats_per_cell": shared::LAND_TEXTURE_REPEATS_PER_CELL,
             }))
             .unwrap(),

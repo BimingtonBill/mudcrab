@@ -32,7 +32,6 @@ use crate::{
 use bevy::{
     asset::{AssetPlugin, RenderAssetUsages},
     camera::ClearColorConfig,
-    camera::Hdr,
     camera::primitives::MeshAabb,
     camera::visibility::RenderLayers,
     core_pipeline::prepass::DepthPrepass,
@@ -2197,8 +2196,8 @@ fn setup_world(
         //
         // The bloom itself, the tonemapper, the exposure and the rest are the graphics settings'
         // (`crate::graphics_settings`, whose `current` preset is `Bloom::NATURAL` and Bevy's
-        // defaults): they are written to this camera in the frame it appears.
-        Hdr,
+        // defaults): they are written to this camera in the frame it appears. `Hdr` itself comes
+        // with main's `SceneColorPipeline` above.
     ));
     // The sun's shadows. `shadow_maps_enabled` was never the missing piece - the cascades were:
     // without a configuration of its own the sun gets Bevy's, which covers the two metres in front
@@ -3471,8 +3470,9 @@ mod tests {
 
     #[test]
     fn incomplete_conversion_names_the_schema_the_manifest_reports() {
+        // On the portal branch the oldest accepted converter schema is the current one: the
+        // portal runtime loads only its own output.
         let oldest = shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
-        assert_ne!(oldest, converter_schema_version());
         let message = runtime_asset_error(
             &format!(r#"{{"schema_version":{oldest},"complete":false}}"#),
             &format!(
@@ -3626,8 +3626,8 @@ mod tests {
         for required in ["skyrim_world.db", "cell_cache.rkyv"] {
             std::fs::write(directory.path().join(required), []).unwrap();
         }
-        let database = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
-        database.execute_batch("CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES(4);").unwrap();
+        // The current schema with its (empty) LOD tables, as the converter writes it.
+        write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
         std::fs::write(
             directory.path().join("conversion-manifest.json"),
             format!(
