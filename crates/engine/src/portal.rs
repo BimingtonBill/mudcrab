@@ -2567,10 +2567,13 @@ fn update_destination_atmosphere(
         *applied = Some(destination);
         camera.clear_color = ClearColorConfig::Custom(atmosphere.backdrop);
         *ambient = crate::atmosphere::ambient_light(&atmosphere);
+        // No LOD reach: distant terrain is not streamed while the player is in an interior, which is
+        // when a doorway shows an exterior, so the ring's own fog is what hides its edge.
         *fog = crate::atmosphere::atmosphere_fog(
             &atmosphere,
             config.stream_radius,
             config.terrain_radius,
+            None,
         );
         // And the colours the doorway's own dome is drawn with, from the same destination: this
         // camera draws the space behind the door and nothing of the room the player stands in, so

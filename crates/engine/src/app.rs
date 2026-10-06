@@ -1974,16 +1974,35 @@ pub(crate) fn camera_far_plane(config: &EngineConfig) -> f32 {
 ///
 /// With no ring - a `terrain_radius` at or below `stream_radius`, which is the engine before the
 /// ring existed - there is nothing beyond the full-detail grid to fade, and the fog is off.
-pub(crate) fn exterior_fog(stream_radius: i32, terrain_radius: i32, color: Color) -> DistanceFog {
-    if terrain_radius <= stream_radius {
+///
+/// `lod_reach` is how far distant terrain reaches ([`crate::streaming::LodHorizon`]) when the
+/// world has LOD data, and `None` when it has none. The terrain LOD draws beyond the ring, under
+/// the ring's own cells where those are ready and past them where they are not, so fog that is
+/// opaque at the ring's edge would hide all of it as sky colour. With LOD the fog is still clear
+/// up to the full-detail grid but ends where the LOD does, ring or no ring: the horizon fades into
+/// the sky instead of ending in a cliff, and the ring keeps what it is for, full-detail landscape
+/// close in. The end is never nearer than the ring's own.
+pub(crate) fn exterior_fog(
+    stream_radius: i32,
+    terrain_radius: i32,
+    lod_reach: Option<f32>,
+    color: Color,
+) -> DistanceFog {
+    let cell = crate::world::components::CELL_SIZE;
+    let start = cell * (stream_radius.max(0) + 1) as f32;
+    let ring_end =
+        (terrain_radius > stream_radius).then(|| cell * (terrain_radius.max(0) + 1) as f32);
+    let end = match (lod_reach, ring_end) {
+        (Some(reach), ring) => reach.max(ring.unwrap_or(0.0)),
+        (None, Some(ring)) => ring,
+        (None, None) => return fog_off(color),
+    };
+    if !end.is_finite() || end <= start {
         return fog_off(color);
     }
     DistanceFog {
         color,
-        falloff: FogFalloff::Linear {
-            start: crate::world::components::CELL_SIZE * (stream_radius.max(0) + 1) as f32,
-            end: crate::world::components::CELL_SIZE * (terrain_radius.max(0) + 1) as f32,
-        },
+        falloff: FogFalloff::Linear { start, end },
         directional_light_color: Color::NONE,
         directional_light_exponent: 8.0,
     }
@@ -3213,7 +3232,7 @@ mod tests {
             falloff: FogFalloff::Linear { start, end },
             color,
             ..
-        } = exterior_fog(config.stream_radius, config.terrain_radius, SKY_COLOR)
+        } = exterior_fog(config.stream_radius, config.terrain_radius, None, SKY_COLOR)
         else {
             panic!("an exterior with a ring fogs linearly");
         };
@@ -3259,7 +3278,7 @@ mod tests {
         let DistanceFog {
             falloff: FogFalloff::Linear { start, .. },
             ..
-        } = exterior_fog(2, 2, SKY_COLOR)
+        } = exterior_fog(2, 2, None, SKY_COLOR)
         else {
             panic!("the falloff is linear whether the fog is on or off");
         };
@@ -3267,6 +3286,65 @@ mod tests {
             start > far,
             "with no ring the fog starts past the far plane, so nothing is ever fogged"
         );
+    }
+
+    /// With the world's LOD data the fog still starts where the full-detail grid ends but reaches
+    /// out to the LOD's horizon, so distant terrain beyond the ring is drawn and not fogged out as
+    /// sky colour at the ring's edge; without LOD data it is the ring's, as before.
+    #[test]
+    fn the_exterior_fog_reaches_the_lod_horizon_when_the_world_has_lod() {
+        let cell = crate::world::components::CELL_SIZE;
+        let linear = |fog: DistanceFog| {
+            let DistanceFog {
+                falloff: FogFalloff::Linear { start, end },
+                ..
+            } = fog
+            else {
+                panic!("the exterior fog is linear");
+            };
+            (start, end)
+        };
+        let defaults = EngineConfig::default();
+        let horizon = cell * 91.0;
+
+        assert_eq!(
+            linear(exterior_fog(
+                defaults.stream_radius,
+                defaults.terrain_radius,
+                None,
+                SKY_COLOR
+            )),
+            (cell * 3.0, cell * (defaults.terrain_radius + 1) as f32),
+            "no LOD data: the ring's own fog"
+        );
+        assert_eq!(
+            linear(exterior_fog(
+                defaults.stream_radius,
+                defaults.terrain_radius,
+                Some(horizon),
+                SKY_COLOR
+            )),
+            (cell * 3.0, horizon),
+            "LOD data: clear up to the grid's edge, opaque at the LOD's horizon"
+        );
+        assert_eq!(
+            linear(exterior_fog(
+                defaults.stream_radius,
+                defaults.terrain_radius,
+                Some(cell * 2.0),
+                SKY_COLOR
+            ))
+            .1,
+            cell * (defaults.terrain_radius + 1) as f32,
+            "a horizon nearer than the ring never pulls the fog in over the ring"
+        );
+        // No ring, but LOD: the horizon is what there is to fade, so it is fogged too; a LOD
+        // horizon inside the grid has nothing to fade and the fog stays off.
+        assert_eq!(
+            linear(exterior_fog(2, 2, Some(horizon), SKY_COLOR)).1,
+            horizon
+        );
+        assert!(linear(exterior_fog(2, 2, Some(cell), SKY_COLOR)).0 > camera_far_plane(&defaults));
     }
 
     /// The sun's cascades as the demo's look (`current`) asks for them.

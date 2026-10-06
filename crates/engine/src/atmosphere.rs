@@ -20,7 +20,7 @@ use crate::{
     // the weather's Sky-Upper, Sky-Lower and Fog Far are read.
     sky::SkyPalette,
     sky_dome::CameraSky,
-    streaming::ActiveCell,
+    streaming::{ActiveCell, LodHorizon},
     world::{
         components::StreamingCamera,
         lighting::{
@@ -614,10 +614,14 @@ pub(crate) fn ambient_light(atmosphere: &SpaceAtmosphere) -> AmbientLight {
 /// behind it is. The fog always fades into [`SpaceAtmosphere::backdrop`], which is also the
 /// camera's clear colour: the ring and the sky behind it are then the same colour and the world
 /// does not end in a band of something else.
+///
+/// `lod_reach` is the reach of the exterior's distant terrain when the world has any
+/// ([`exterior_fog`] says what it changes); an interior's own fog is not touched by it.
 pub(crate) fn atmosphere_fog(
     atmosphere: &SpaceAtmosphere,
     stream_radius: i32,
     terrain_radius: i32,
+    lod_reach: Option<f32>,
 ) -> DistanceFog {
     match atmosphere.fog {
         SpaceFog::Own { near, far } => DistanceFog {
@@ -629,7 +633,12 @@ pub(crate) fn atmosphere_fog(
             directional_light_color: Color::NONE,
             directional_light_exponent: 8.0,
         },
-        SpaceFog::Ring => exterior_fog(stream_radius, terrain_radius, atmosphere.backdrop),
+        SpaceFog::Ring => exterior_fog(
+            stream_radius,
+            terrain_radius,
+            lod_reach,
+            atmosphere.backdrop,
+        ),
         SpaceFog::Unreachable => fog_off(atmosphere.backdrop),
     }
 }
@@ -659,6 +668,9 @@ fn update_atmosphere(
     // does not stream cells has none, and the lighting has nothing to apply: the check that used to
     // be a `run_if(resource_exists::<ActiveCell>)` at the registration is this one.
     active: Option<Res<ActiveCell>>,
+    // How far distant terrain reaches, once the world is known to have any. Absent in a run that
+    // does not stream, and unset in a world converted without LOD.
+    horizon: Option<Res<LodHorizon>>,
     catalog: Option<Res<SpaceLightingCatalog>>,
     mut clear: ResMut<ClearColor>,
     ambient: Option<ResMut<GlobalAmbientLight>>,
@@ -674,7 +686,10 @@ fn update_atmosphere(
     }
     // Apply on the first frame that has a camera, then on every change of place. Starting inside
     // (--demo blackreach) never changes ActiveCell, so a change-only check left it in daylight.
-    if *applied && !active.is_changed() {
+    if *applied
+        && !active.is_changed()
+        && !horizon.as_ref().is_some_and(|horizon| horizon.is_changed())
+    {
         return;
     }
     *applied = true;
@@ -688,7 +703,15 @@ fn update_atmosphere(
     // takes the resource, the main camera takes the component below, and the portal camera takes
     // the destination's own (`crate::portal`).
     clear.0 = atmosphere.backdrop;
-    let fog = atmosphere_fog(&atmosphere, config.stream_radius, config.terrain_radius);
+    let lod_reach = horizon
+        .as_ref()
+        .and_then(|horizon| horizon.reach_in(active.worldspace_id));
+    let fog = atmosphere_fog(
+        &atmosphere,
+        config.stream_radius,
+        config.terrain_radius,
+        lod_reach,
+    );
     for (entity, mut camera) in &mut cameras {
         camera.clear_color = ClearColorConfig::Custom(atmosphere.backdrop);
         commands
@@ -889,8 +912,8 @@ mod tests {
             assert_eq!(blackreach.sun, SunLight::OFF);
             assert!(!blackreach.has_sky);
             assert_eq!(
-                fog_parts(&atmosphere_fog(&blackreach, 2, 8)),
-                fog_parts(&exterior_fog(2, 8, UNDERGROUND_COLOR))
+                fog_parts(&atmosphere_fog(&blackreach, 2, 8, None)),
+                fog_parts(&exterior_fog(2, 8, None, UNDERGROUND_COLOR))
             );
         }
     }
@@ -1002,10 +1025,12 @@ mod tests {
             &tamriel,
             config.stream_radius,
             config.terrain_radius,
+            None,
         ));
         let (was_start, was_end, _) = fog_parts(&exterior_fog(
             config.stream_radius,
             config.terrain_radius,
+            None,
             SKY_COLOR,
         ));
         assert_eq!(
@@ -1027,7 +1052,7 @@ mod tests {
 
         // With no ring there is nothing beyond the grid to fade, and the fog still cannot be
         // reached - whatever colour it is.
-        let (start, _, color) = fog_parts(&atmosphere_fog(&tamriel, 2, 2));
+        let (start, _, color) = fog_parts(&atmosphere_fog(&tamriel, 2, 2, None));
         assert!(start > camera_far_plane(&config));
         assert_eq!(color, Color::srgb_u8(139, 175, 194));
     }
@@ -1414,8 +1439,12 @@ mod tests {
         let (_directory, catalog) = real_spaces();
         let far = camera_far_plane(&EngineConfig::default());
 
-        let (start, end, color) =
-            fog_parts(&atmosphere_fog(&interior_of(&catalog, ALFTAND01), 2, 2));
+        let (start, end, color) = fog_parts(&atmosphere_fog(
+            &interior_of(&catalog, ALFTAND01),
+            2,
+            2,
+            None,
+        ));
         assert_eq!((start, end), (1100.0, 9000.0));
         assert!(
             start < far && end < far,
@@ -1428,6 +1457,7 @@ mod tests {
             &space_atmosphere(None, space_key(TAMRIEL, Some(ALFTAND01))),
             2,
             2,
+            None,
         ));
         assert!(start > far);
 
@@ -1442,7 +1472,7 @@ mod tests {
         );
         let backwards = space_atmosphere(Some(&catalog), space_key(TAMRIEL, Some(4323)));
         assert_eq!(backwards.fog, SpaceFog::Unreachable);
-        let (start, _, _) = fog_parts(&atmosphere_fog(&backwards, 2, 2));
+        let (start, _, _) = fog_parts(&atmosphere_fog(&backwards, 2, 2, None));
         assert!(start > far);
 
         // A row whose every colour column is NULL - a plugin's cell the converter had nothing to
@@ -1577,6 +1607,73 @@ mod tests {
                 .palette,
             None,
             "an interior has no sky for a dome to draw"
+        );
+    }
+
+    /// The wiring of the LOD horizon: once the world is known to have distant terrain the exterior
+    /// fog on the main camera ends at its horizon, an interior keeps its own fog, a worldspace
+    /// with no LOD data keeps the ring's, and no horizon at all is the ring's.
+    #[test]
+    fn the_atmosphere_system_fogs_to_the_lod_horizon_in_an_exterior_with_lod() {
+        let (_directory, catalog) = real_spaces();
+        let config = EngineConfig::default();
+        let cell = crate::world::components::CELL_SIZE;
+        let mut app = App::new();
+        app.insert_resource(config.clone())
+            .insert_resource(ClearColor(SKY_COLOR))
+            .insert_resource(catalog)
+            .init_resource::<ActiveCell>()
+            .init_resource::<LodHorizon>();
+        let camera = app
+            .world_mut()
+            .spawn((Camera3d::default(), Transform::default(), StreamingCamera))
+            .id();
+        app.add_systems(Update, update_atmosphere);
+        let fog_end = |app: &App| {
+            fog_parts(
+                app.world()
+                    .entity(camera)
+                    .get::<DistanceFog>()
+                    .expect("the fog was applied"),
+            )
+            .1
+        };
+        let worldspace = app.world().resource::<ActiveCell>().worldspace_id;
+        let ring_end = cell * (config.terrain_radius + 1) as f32;
+        let horizon = cell * 91.0;
+
+        app.update();
+        assert_eq!(fog_end(&app), ring_end, "no LOD data yet: the ring's fog");
+
+        app.world_mut()
+            .resource_mut::<LodHorizon>()
+            .set(worldspace, horizon);
+        app.update();
+        assert_eq!(
+            fog_end(&app),
+            horizon,
+            "the first LOD answer lengthens the fog"
+        );
+
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(ALFTAND01);
+        app.update();
+        assert_eq!(fog_end(&app), 9000.0, "an interior keeps its own fog");
+        app.world_mut().resource_mut::<ActiveCell>().interior = None;
+        app.update();
+        assert_eq!(
+            fog_end(&app),
+            horizon,
+            "back outside the horizon is still known"
+        );
+
+        app.world_mut()
+            .resource_mut::<LodHorizon>()
+            .set(worldspace + 1, horizon);
+        app.update();
+        assert_eq!(
+            fog_end(&app),
+            ring_end,
+            "a worldspace the LOD answer was not for keeps the ring's fog"
         );
     }
 
