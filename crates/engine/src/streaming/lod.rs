@@ -1,6 +1,6 @@
 use super::{
-    ActiveSpace, RenderOrigin, StreamingCommitBudget, StreamingMetrics, TerrainCoverage,
-    TerrainSurfaceReady,
+    ActiveSpace, LodHorizon, RenderOrigin, StreamingCommitBudget, StreamingMetrics,
+    TerrainCoverage, TerrainSurfaceReady,
 };
 use crate::{
     config::{EngineConfig, TerrainLodDistances},
@@ -35,6 +35,11 @@ const LOD_CHUNK_MAX_RETRIES: u8 = 3;
 const LOD_CHUNK_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const LOD_CHUNK_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
 
+/// How far distant terrain reaches, in Creation units: where the farthest tier stops drawing.
+fn lod_horizon(distances: &TerrainLodDistances) -> f32 {
+    CELL_SIZE * distances.max_reach_cells().max(0) as f32
+}
+
 /// A far plane that keeps every cell within `reach_cells` of the camera's cell.
 fn lod_camera_far(reach_cells: i32) -> f32 {
     CELL_SIZE * (reach_cells as f32 + 0.5) * std::f32::consts::SQRT_2
@@ -56,6 +61,39 @@ pub(super) struct LodStreaming {
     pub(super) visibility_dirty: bool,
     visibility_camera_grid: Option<IVec2>,
     visibility_stream_radius: Option<i32>,
+    /// Whether LOD is stopped because the active space has no distant terrain (an interior), so
+    /// the change is logged once each way and not every frame.
+    stopped: bool,
+    /// Whether any LOD patch was drawn at the last visibility pass, logged on each change.
+    any_visible_logged: Option<bool>,
+}
+
+#[cfg(test)]
+impl LodStreaming {
+    /// A ready chunk of `worldspace_id` drawn by `root`, at the camera's own anchor.
+    pub(super) fn insert_ready_chunk_for_test(&mut self, worldspace_id: u32, root: Entity) {
+        let key = ChunkKey::new(
+            worldspace_id,
+            LodTier::Tier16,
+            shared::lod::ChunkAnchor::new(0, 0),
+        );
+        self.chunks.insert(
+            key,
+            LodChunkStatus::Ready {
+                root,
+                origin: LodOrigin::new(0, 0),
+            },
+        );
+    }
+
+    pub(super) fn resident_chunks_for_test(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// The worldspace distant terrain is being streamed for, `None` while it is stopped.
+    pub(super) fn streamed_worldspace_for_test(&self) -> Option<u32> {
+        self.worldspace_id
+    }
 }
 
 impl LodStreaming {
@@ -221,7 +259,11 @@ pub(super) fn mark_lod_world_instance_ready(
 /// The worldspace whose distant terrain should be streamed, or `None` for none at all: a negative
 /// stream radius turns LOD off, and an interior has no distant terrain. Otherwise LOD follows the
 /// exterior the player is in, which a door may have changed from the configured one.
-fn lod_worldspace(stream_radius: i32, space: Option<&ActiveSpace>, configured: u32) -> Option<u32> {
+pub(super) fn lod_worldspace(
+    stream_radius: i32,
+    space: Option<&ActiveSpace>,
+    configured: u32,
+) -> Option<u32> {
     if stream_radius < 0 || space.is_some_and(|space| space.interior.is_some()) {
         return None;
     }
@@ -266,6 +308,10 @@ pub(super) fn plan_lod_chunks(
     let Some(worldspace_id) =
         lod_worldspace(config.stream_radius, space.as_deref(), config.worldspace_id)
     else {
+        if !streaming.stopped {
+            streaming.stopped = true;
+            info!("terrain LOD stopped: the active space has no distant terrain");
+        }
         if streaming.center.take().is_some() {
             streaming.generation = streaming.generation.wrapping_add(1);
         }
@@ -291,6 +337,10 @@ pub(super) fn plan_lod_chunks(
         return;
     };
 
+    if streaming.stopped {
+        streaming.stopped = false;
+        info!(worldspace_id, "terrain LOD resumed in the active exterior");
+    }
     let center = streaming_center(config.acceptance_screenshot.is_some(), origin.0, camera);
     if streaming.center != Some(center) || streaming.worldspace_id != Some(worldspace_id) {
         streaming.move_center(center, worldspace_id, &config.terrain_lod);
@@ -368,6 +418,7 @@ pub(super) fn collect_lod_chunks(
     origin: Res<RenderOrigin>,
     mut camera_projection: Query<&mut Projection, With<StreamingCamera>>,
     mut streaming: ResMut<LodStreaming>,
+    mut horizon: ResMut<LodHorizon>,
     mut budget: ResMut<StreamingCommitBudget>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
@@ -414,6 +465,15 @@ pub(super) fn collect_lod_chunks(
                     perspective.far = perspective
                         .far
                         .max(lod_camera_far(config.terrain_lod.max_reach_cells()));
+                }
+                if !chunks.is_empty() {
+                    // The exterior fog reaches this far instead of ending at the ring's edge
+                    // (`crate::app::exterior_fog`), or the LOD behind the ring would be fogged
+                    // out as sky colour.
+                    horizon.set(
+                        response.query.worldspace_id,
+                        lod_horizon(&config.terrain_lod),
+                    );
                 }
                 streaming.pending_chunks.extend(
                     chunks
@@ -779,6 +839,17 @@ pub(super) fn update_terrain_lod_visibility(
         }
     }
     metrics.visible_lod_terrain_patches = visible_patches;
+    {
+        let any_visible = visible_patches > 0;
+        let mut state = streaming.p1();
+        if state.any_visible_logged != Some(any_visible) {
+            state.any_visible_logged = Some(any_visible);
+            info!(
+                visible_patches,
+                ready_patches, "terrain LOD patches drawn: {any_visible}"
+            );
+        }
+    }
     profiler.set_gauge("lod/ready_terrain_patches", ready_patches as f64);
     profiler.set_gauge("lod/visible_terrain_patches", visible_patches as f64);
     profiler.record_elapsed("lod/visibility", started);

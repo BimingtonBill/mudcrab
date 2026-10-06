@@ -149,6 +149,7 @@ impl Plugin for StreamingPlugin {
             .init_resource::<TerrainContinuity>()
             .init_resource::<SceneSpawnBatch>()
             .init_resource::<ActiveSpace>()
+            .init_resource::<LodHorizon>()
             .init_resource::<StaticCollisionCache>()
             .init_resource::<crate::pacing::PacingTracker>()
             .init_resource::<ActiveCell>()
@@ -164,6 +165,8 @@ impl Plugin for StreamingPlugin {
             .add_systems(
                 Update,
                 (
+                    // First, so the LOD planner two systems down reads this frame's space.
+                    sync_active_space,
                     plan_cells,
                     despawn_cells,
                     lod::plan_lod_chunks,
@@ -885,10 +888,16 @@ impl StreamingWorld {
     }
 }
 
-/// The space the player is in. The planner streams only this space: the active interior when
-/// there is one, otherwise the exterior cells around the camera in the active worldspace. A load
-/// door crossing (`crate::door_crossing`) changes it; nothing else does, so the default (no
-/// interior, the configured worldspace) is the behaviour before doors existed.
+/// The space the player is in, as main's streamer and its distant terrain see it: the active
+/// interior when there is one, otherwise the exterior of the active worldspace.
+///
+/// On portal this is not a second source of truth. [`ActiveCell`] is: it is what portal's doors
+/// switch at a crossing ([`crate::transition`]), and [`sync_active_space`] copies it here every
+/// frame, before anything that reads this resource runs. What reads it is main's terrain LOD
+/// ([`lod::plan_lod_chunks`]): distant terrain follows the exterior the player is in and is
+/// unloaded in an interior. main's own crossing (`crate::door_crossing`, #128) is compiled but not
+/// registered, so nothing else writes it; main's planner gating on it is not carried over because
+/// portal's [`plan_cells`] already streams from [`ActiveCell`].
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ActiveSpace {
     /// `None` means the worldspace the engine was configured with.
@@ -900,6 +909,59 @@ pub struct ActiveSpace {
 impl ActiveSpace {
     pub fn exterior_worldspace(&self, configured: u32) -> u32 {
         self.worldspace_id.unwrap_or(configured)
+    }
+}
+
+impl From<&ActiveCell> for ActiveSpace {
+    fn from(active: &ActiveCell) -> Self {
+        Self {
+            worldspace_id: Some(active.worldspace_id),
+            interior: active.interior,
+        }
+    }
+}
+
+/// Mirrors portal's [`ActiveCell`] into [`ActiveSpace`], the one place the two meet: the space
+/// switch a portal door makes is what turns terrain LOD off in an interior and back on at an
+/// exterior arrival. Written only on a change, so what reads the space through change detection
+/// is not woken every frame.
+pub(crate) fn sync_active_space(active: Res<ActiveCell>, mut space: ResMut<ActiveSpace>) {
+    let wanted = ActiveSpace::from(&*active);
+    if *space != wanted {
+        *space = wanted;
+    }
+}
+
+/// How far distant terrain reaches, once a worldspace is known to have any: the horizon the
+/// exterior fog has to reach for the LOD beyond the full-detail ring to be seen, and not fade to
+/// sky colour at the ring's edge.
+///
+/// Set by [`lod::collect_lod_chunks`] on the first current answer that holds chunks, so a world
+/// converted without LOD data never sets it and its fog stays the ring's. It is per worldspace and
+/// is kept through an interior: the player coming back out of a house finds the same horizon the
+/// moment the exterior returns, with no frame of ring fog while the first query is answered again.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq)]
+pub struct LodHorizon {
+    worldspace_id: Option<u32>,
+    reach: f32,
+}
+
+impl LodHorizon {
+    /// The horizon of `worldspace_id`, in Creation units, or `None` when it has no LOD data.
+    pub fn reach_in(&self, worldspace_id: u32) -> Option<f32> {
+        (self.worldspace_id == Some(worldspace_id) && self.reach > 0.0).then_some(self.reach)
+    }
+
+    /// Records that `worldspace_id` has LOD data reaching `reach` units. A no-op (and no change
+    /// for change detection) when it is already known.
+    pub(crate) fn set(&mut self, worldspace_id: u32, reach: f32) {
+        let wanted = Self {
+            worldspace_id: Some(worldspace_id),
+            reach,
+        };
+        if *self != wanted {
+            *self = wanted;
+        }
     }
 }
 
@@ -6070,6 +6132,152 @@ mod tests {
             .keys()
             .copied()
             .collect()
+    }
+
+    #[test]
+    fn the_active_space_mirrors_the_active_cell() {
+        let mut app = App::new();
+        app.init_resource::<ActiveSpace>()
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .add_systems(Update, sync_active_space);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<ActiveSpace>(),
+            ActiveSpace {
+                worldspace_id: Some(60),
+                interior: None
+            }
+        );
+
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(99);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<ActiveSpace>(),
+            ActiveSpace {
+                worldspace_id: Some(60),
+                interior: Some(99)
+            }
+        );
+
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 61,
+            interior: None,
+        };
+        app.update();
+        assert_eq!(
+            *app.world().resource::<ActiveSpace>(),
+            ActiveSpace {
+                worldspace_id: Some(61),
+                interior: None
+            }
+        );
+    }
+
+    /// The write is on a change only: a frame that changes nothing leaves the resource unflagged.
+    #[test]
+    fn the_active_space_is_not_rewritten_when_the_cell_did_not_change() {
+        let mut app = App::new();
+        app.init_resource::<ActiveSpace>()
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .add_systems(Update, sync_active_space);
+        app.update();
+        app.world_mut().clear_trackers();
+        app.update();
+        assert!(!app.world().resource_ref::<ActiveSpace>().is_changed());
+    }
+
+    #[test]
+    fn the_lod_horizon_is_known_per_worldspace() {
+        let mut horizon = LodHorizon::default();
+        assert_eq!(horizon.reach_in(60), None, "nothing known before an answer");
+        horizon.set(60, 372_000.0);
+        assert_eq!(horizon.reach_in(60), Some(372_000.0));
+        assert_eq!(
+            horizon.reach_in(61),
+            None,
+            "another worldspace has not answered"
+        );
+    }
+
+    /// The connection end to end: a portal door that switches `ActiveCell` into an interior takes
+    /// distant terrain with it - its chunks are despawned and nothing streams - and an exterior
+    /// arrival brings it back. Nothing but `ActiveCell` is written in the test.
+    #[test]
+    fn distant_terrain_follows_the_portal_active_cell_into_and_out_of_an_interior() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let config = EngineConfig::default();
+        let worldspace = config.worldspace_id;
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: worldspace,
+                interior: None,
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<ActiveSpace>()
+            .init_resource::<lod::LodStreaming>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, (sync_active_space, lod::plan_lod_chunks).chain());
+        app.world_mut().spawn((
+            Transform::from_translation(Vec3::new(100.0, 40.0, -200.0)),
+            StreamingCamera,
+        ));
+        let chunk_root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<lod::LodStreaming>()
+            .insert_ready_chunk_for_test(worldspace, chunk_root);
+
+        app.update();
+        let lod = |app: &App| {
+            let lod = app.world().resource::<lod::LodStreaming>();
+            (
+                lod.streamed_worldspace_for_test(),
+                lod.resident_chunks_for_test(),
+            )
+        };
+        assert_eq!(
+            lod(&app),
+            (Some(worldspace), 1),
+            "outside, distant terrain streams for the active worldspace and keeps its chunk"
+        );
+        assert!(app.world().get_entity(chunk_root).is_ok());
+
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(99);
+        app.update();
+        assert_eq!(
+            lod(&app),
+            (None, 0),
+            "inside an interior nothing is streamed and no chunk stays resident"
+        );
+        assert!(
+            app.world().get_entity(chunk_root).is_err(),
+            "the chunk's entities are despawned, so nothing of it can show through the interior"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .resident_lod_chunks,
+            0
+        );
+
+        app.world_mut().resource_mut::<ActiveCell>().interior = None;
+        app.update();
+        assert_eq!(
+            lod(&app).0,
+            Some(worldspace),
+            "an exterior arrival streams distant terrain again"
+        );
     }
 
     #[test]
