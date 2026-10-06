@@ -694,13 +694,13 @@ struct WaterReflectionCamera;
 /// Slack added to a water plane's bounds before the main camera frustum test, in world units (4096
 /// to a cell).
 ///
-/// The frustum carried by the main camera was built at the end of the previous frame, so a fast
-/// turn brings water into a view the gate has already closed for, and the frame that renders it
-/// shows the reflection of the frame before. A plane this far outside the frustum still keeps the
-/// reflection camera on: seen from one cell away, it buys about seven degrees of extra turn per
-/// frame - a flick past 400 degrees a second - or, when the camera moves instead of turning, 512
-/// units of travel between two frames. A plane that far off the edge of a 45 degree view is a
-/// sliver of the frame, so little of the saving is given back.
+/// The frustum is built from the observer's current pose each frame, so the margin is not there to
+/// absorb a stale frustum. It keeps the reflection camera on for a plane just outside the view, so
+/// that a turn or a move between two frames cannot bring water in before the reflection has
+/// rendered once: seen from one cell away, it buys about seven degrees of extra turn per frame - a
+/// flick past 400 degrees a second - or, when the camera moves instead of turning, 512 units of
+/// travel between two frames. A plane that far off the edge of a 45 degree view is a sliver of the
+/// frame, so little of the saving is given back.
 const WATER_REFLECTION_FRUSTUM_MARGIN: f32 = 512.0;
 
 /// Spawns the camera that fills [`WaterReflectionTexture`], and the texture it renders into.
@@ -876,7 +876,8 @@ fn current_global_transform(
 /// axis, from its bounds projected onto that axis.
 ///
 /// Missing pieces mean the test cannot run - a plane whose mesh has not produced an [`Aabb`] yet,
-/// or a main camera without a [`Frustum`] - and the plane then counts as visible, keeping the
+/// or an observer without a [`Projection`] to build the frustum from - and the plane then counts as
+/// visible, keeping the
 /// reflection camera on rather than risk a stale reflection.
 fn water_plane_in_view(
     main: &GlobalTransform,
@@ -1293,6 +1294,44 @@ mod tests {
         let frame = harness.frame();
         assert!(frame.active);
         assert!((frame.transform.translation.y + 120.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn the_spawned_reflection_camera_activates_when_water_is_in_view() {
+        let mut app = App::new();
+        app.init_resource::<ProfilingState>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Time>()
+            .insert_resource(crate::streaming::RenderOrigin(IVec2::ZERO))
+            .insert_resource(crate::sky::CameraSpace::Exterior)
+            .add_plugins(crate::view_policy::SecondaryViewPolicyPlugin)
+            .add_systems(Startup, setup_water_reflection)
+            .add_systems(
+                PostUpdate,
+                prepare_water_reflection.in_set(ViewPolicySystems::Prepare),
+            );
+        let observer = Transform::from_xyz(0.0, 120.0, 0.0);
+        app.world_mut().spawn((
+            observer,
+            GlobalTransform::from(observer),
+            main_camera_projection(),
+            StreamingCamera,
+        ));
+        let water = Vec3::new(0.0, 40.0, -800.0);
+        app.world_mut().spawn((
+            Transform::from_translation(water),
+            GlobalTransform::from_translation(water),
+            water_bounds(CELL_WATER_HALF_EXTENTS),
+            WaterSurface,
+        ));
+        app.update();
+        let world = app.world_mut();
+        let mut cameras = world.query_filtered::<&Camera, With<WaterReflectionCamera>>();
+        let camera = cameras.single(world).unwrap();
+        assert!(
+            camera.is_active,
+            "the camera the real setup spawns is managed by the policy and renders with water in view"
+        );
     }
 
     #[test]
