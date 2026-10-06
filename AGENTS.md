@@ -108,6 +108,9 @@ before starting any `phase2/*` branch or moving work between tracks.
 >   (done / running / waiting on you / next), checks, and the ask. Small follow-ups (a flaky test,
 >   a suggestion found in passing) are rows in it, not separate questions. Fix pushes under the
 >   standing yes are listed there as done.
+>   **No unattended runs (the user, 2026-10-06):** the PC and the sessions work only while the user is
+>   present (late evenings included). Never plan builds, conversions, timing runs or workers for while
+>   the user is away or asleep; before they sign off, finish or stop running jobs, commit and log.
 > - **Quiet in between.** Upstream Dev handles hand-offs and logs them without messaging the user,
 >   except for three urgencies: something public is wrong (our PR breaks main, a wrong push, a
 >   maintainer waiting on us); a clash over the shared PC (a timing run against a build, a
