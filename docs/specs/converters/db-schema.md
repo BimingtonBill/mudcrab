@@ -541,16 +541,16 @@ The tables are derived data: a full load-order export clears and rebuilds them f
 records on every conversion, like the grass tables, and the subset export used by movement
 annotation leaves them alone. `create_tables` adds them to an older reused database.
 
-**These tables are optional and did not bump `shared::WORLD_DATABASE_SCHEMA_VERSION`.** The engine
-probes for them before reading, as it does for `lights` and the additive `waters` columns, and a
-database without them behaves as before.
+**These tables are optional and did not bump `shared::WORLD_DATABASE_SCHEMA_VERSION`.** No engine code reads
+them yet; a reader must probe for them first, as the engine does for `lights` and the additive
+`waters` columns, so a database without them behaves as before.
 
 | Case | Converter writes | Engine |
 |---|---|---|
 | Interior without room markers | no rows | draw everything, as today |
 | Old database, tables absent | n/a | feature off, no error |
 | Portal side 0, missing or not a room | `room_a`/`room_b` NULL | ignore that edge |
-| Object in no room / several | no row / several rows | always drawn |
+| Object in no room / several | no `contained = 1` row / several | always drawn |
 | Camera outside every room | n/a | draw everything |
 | Non-box room shape | skipped, counted | its objects are in no room, so drawn |
 | Exterior markers | not written | out of scope (#106) |
