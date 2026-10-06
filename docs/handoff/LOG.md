@@ -3,6 +3,17 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-06 Upstream Dev (engine foundations, portal catch-up, publishing)
+
+- **Published (the user's yes each):** issues #183 (tracking) and #184-#188 (baseline, derived-data contract, static-rendering experiment, secondary views, interior room visibility); a comment on Chef's #106 offering our .lst/.btt/.bto LOD notes. Under the standing yes: CodeRabbit round-2 fix pushes #121 -> 2167650d, #124 -> 1fd11141, #125 -> 3734ee9e, bot threads answered.
+- **Hand-outs:** Phase 2 Dev: #184 baseline (main: rural 195 fps, render-thread bound; scenes fixed, dense = Riverwood), #187 view policy (slices 1+2, ca9fd9ca green), #188 engine half (fdf2a9b1, off by default), interior shots on #128 (01b2a732). Phase 1 Dev: #188 converter (phase1/room-graph-pr 0f2645b0, real data 4,246 rooms), #185 key-cost probe. Portal Dev: catch-up with main (portal = main 2c11897b + portal), LOD data at 102_401/100_701, #184 + portal scenes, LOD visible at defaults (#128 merged into portal; fog to LOD horizon).
+- **Queued, local (docs/pr/upstream-queue.md):** #188 converter draft (previewed; the user: not yet), #187 draft (preview next), #184 + scene set (after #122), #188 engine (after image test). #185 comment held by the user (local/pr-drafts/engine-foundations/185-comment-input-keys.md, contract 185-contract-v1.md).
+- **Research filed + indexed:** #993-#997, #999 (baseline design), #1008 (Bevy 0.20 gaps: none fully fixed), analysis #1009 (CPU breakdown).
+- **Rules added (AGENTS.md / memory):** PR cap 5-6 ready + 7-8 drafts; check Bevy 0.20 before building around a 0.19 gap; acceptance tests may change; name GitHub items with what they are; no unattended runs.
+- **Disk:** ~220 GB freed with the user's yes (logged); throwaway C:/Modding/tmp-up-drafts-check-target (12 GB) kept, awaiting the user's yes. Parked worktree D:/Modding-overflow/wt/up-doorlinks (phase1/door-links-export) holds uncommitted WIP for #112's door_links export: keep until a decision.
+- **Crash + PC restart** handled; all sessions resumed with their state.
+- **Next:** morning brief from local/team/2026-10-06-evening-table.md (unanswered items 1-4 and 8, plus the roll-over list); portal "before" baseline booked for the morning; #187 draft preview.
+
 ## 2026-10-06 (evening) Portal Dev: portal caught up with main, #184 tool, #105 LOD visible
 
 - **Portal = c175eff8..28ce63dc:** origin/main 2c11897b merged (#105 LOD, #118, #127 rename, #142, #136/#176, #170, #178; Claude #714); portal schema 102_401 / world 100_701 (LOD_CONVERTER_SCHEMA_VERSION follows); rename applied to portal's text; portal's converter `lod.rs` is now `portal_lod`. Then #184 perf-baseline 111ca6be (+#122) with 4 portal scenes (portal-door-tour, portal-heavy, lod-far, lod-flythrough; Claude #719). Then #128 386267dc (portal's doors.rs stays the door system; #128's crossing compiled, not registered) with portal's ActiveCell driving ActiveSpace so LOD stops in interiors, and the exterior fog ending at the LOD horizon when LOD data exists (ring kept) (Claude #721).
