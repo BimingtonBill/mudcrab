@@ -48,10 +48,12 @@
 //! Skyrim's open caves place room markers side by side with no portal and no `XLRM` link, and
 //! their boxes overlap or abut: in effect one space. When a cell's graph is built, every pair of
 //! rooms whose oriented boxes overlap, or lie within [`OVERLAP_TOLERANCE`] Creation units of each
-//! other, gets an implicit edge ([`overlap_links`]). Unlike an `XLRM` link it is not open: the walk
-//! enters the neighbour only when the neighbour's box, projected with the doorway clipping, is on
-//! screen inside the current region (otherwise the edges chain through a whole cave and nothing is
-//! ever culled). The region is passed on unchanged, so objects reaching past their box stay in. The test is a separating-axis test on the two oriented
+//! other, gets an implicit edge ([`overlap_links`]). Unlike an `XLRM` link it is not open: it is a
+//! thick portal. Whatever is seen from room A into overlapping room B passes through their shared
+//! volume, which lies inside both boxes, so crossing the edge narrows the region to
+//! `region` intersected with A's screen rectangle and B's (boxes projected with the doorway
+//! clipping; a box holding the camera is the whole screen), and B is entered only if that is
+//! non-empty. Without the narrowing the edges chain through a whole cave and nothing is culled. The test is a separating-axis test on the two oriented
 //! boxes. Rooms further apart than the tolerance, such as two rooms with a wall between them, need
 //! a portal or a link. Orientation comes from the shared Creation-to-runtime function, so it is the
 //! converter's convention (verified on real data: it puts 99.2% of portal centres inside both of
@@ -544,13 +546,26 @@ impl RoomGraph {
             for &other in &linked[room] {
                 pending.push((other, seen));
             }
-            // An overlap is walked only into a room whose box is on screen inside the region the walk
-            // arrived with, and the region is passed on unchanged (objects reach past their box).
-            for &other in &overlapping[room] {
-                if project_box(&self.rooms[other], clip_from_local)
-                    .is_some_and(|screen| screen.intersect(seen).is_some())
-                {
-                    pending.push((other, seen));
+            // An overlap is a thick portal: whatever is seen from this room into the neighbour
+            // passes through their shared volume, which lies inside both boxes, so the region
+            // narrows to both boxes' screen rectangles. A box that holds the camera covers the
+            // whole screen.
+            if !overlapping[room].is_empty() {
+                let screen_of = |index: usize| {
+                    if self.rooms[index].contains(camera) {
+                        Some(Rect::FULL)
+                    } else {
+                        project_box(&self.rooms[index], clip_from_local)
+                    }
+                };
+                if let Some(here) = screen_of(room).and_then(|screen| screen.intersect(seen)) {
+                    for &other in &overlapping[room] {
+                        if let Some(through) =
+                            screen_of(other).and_then(|screen| screen.intersect(here))
+                        {
+                            pending.push((other, through));
+                        }
+                    }
                 }
             }
         }
@@ -2080,5 +2095,48 @@ mod tests {
         let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
         // Room 2 spans z 5..25, behind a camera that looks down -Z.
         assert_eq!(reached, vec![true, false]);
+    }
+
+    /// Rooms from a list as a graph whose only edges are the implicit overlaps.
+    fn overlap_only(rooms: Vec<Room>) -> RoomGraph {
+        RoomGraph {
+            overlaps: overlap_links(&rooms),
+            rooms,
+            ..Default::default()
+        }
+    }
+
+    fn small(ref_id: u32, center: Vec3, half: f32) -> Room {
+        room(ref_id, center, half)
+    }
+
+    /// A (camera) overlaps B; C lies 6 units beside B, so B and C are joined, but C's box on screen
+    /// is wholly outside B's. Crossing A-B narrows the region to B's rectangle, so C is not reached
+    /// through B.
+    #[test]
+    fn a_thick_portal_narrows_the_region_to_both_boxes() {
+        let graph = overlap_only(vec![
+            small(1, Vec3::ZERO, 6.0),
+            small(2, Vec3::new(0.0, 0.0, -18.0), 5.0),
+            small(3, Vec3::new(16.0, 0.0, -22.0), 5.0),
+        ]);
+        assert!(graph.overlaps.contains(&(0, 1)) && graph.overlaps.contains(&(1, 2)));
+        assert!(!graph.overlaps.contains(&(0, 2)));
+        let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
+        assert_eq!(reached, vec![true, true, false]);
+    }
+
+    /// The real-data pillar case: the far room C is seen through the space it shares with B, so it
+    /// is reached.
+    #[test]
+    fn a_room_seen_through_the_shared_volume_is_reached() {
+        let graph = overlap_only(vec![
+            small(1, Vec3::ZERO, 6.0),
+            small(2, Vec3::new(0.0, 0.0, -18.0), 5.0),
+            small(3, Vec3::new(8.0, 0.0, -22.0), 5.0),
+        ]);
+        assert!(graph.overlaps.contains(&(1, 2)));
+        let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
+        assert_eq!(reached, vec![true, true, true]);
     }
 }
