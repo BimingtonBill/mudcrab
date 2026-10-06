@@ -93,7 +93,7 @@ before starting any `phase2/*` branch or moving work between tracks.
 
 > **Before building and before sending (the user, 2026-09-30).** Announce first: before building
 > anything that touches another contributor's area or open PR, Upstream Dev posts one line on the
-> issue or Discord (the user's yes). Few open PRs: a soft cap of about 5 of ours open at once; stack
+> issue or Discord (the user's yes). Few open PRs: a soft cap of 5-6 of ours open as ready PRs plus 7-8 open drafts (the user, 2026-10-06; was about 5 in all); stack
 > only when unavoidable, and say so at the top (Merge after / Stack line, stack label).
 
 > **Daily rhythm (TRIAL from 2026-10-03, the user, 2026-10-02: kept if it works, reverted if not).**
