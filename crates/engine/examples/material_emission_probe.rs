@@ -111,8 +111,6 @@ fn fixtures(output: &std::path::Path, legacy: bool) -> PathBuf {
                 emissive_color: *color,
                 emissive_multiple: *multiple,
                 double_sided: false,
-                uv_offset: [0.0, 0.0],
-                uv_scale: [1.0, 1.0],
                 effect_falloff: None,
                 textures: if *glow || *name == "own_emit_atlas" {
                     vec![NifTextureSlot {

@@ -120,8 +120,6 @@ fn fixtures(output: &std::path::Path, legacy: bool) -> PathBuf {
                 emissive_color: [0.0; 3],
                 emissive_multiple: 0.0,
                 double_sided: false,
-                uv_offset: [0.0, 0.0],
-                uv_scale: [1.0, 1.0],
                 effect_falloff: None,
                 textures: if mask.is_some() {
                     vec![NifTextureSlot {

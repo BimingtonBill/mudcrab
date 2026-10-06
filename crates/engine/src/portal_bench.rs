@@ -56,10 +56,7 @@ use crate::{
         ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, camera_grid, creation_to_bevy,
     },
     transition::{OpenDoor, SpaceTarget, switch_space},
-    world::{
-        components::{ExteriorCellGrid, StreamingCamera},
-        database::CellKey,
-    },
+    world::{components::StreamingCamera, database::CellKey},
 };
 use bevy::{
     camera::RenderTarget, diagnostic::DiagnosticsStore, platform::time::Instant, prelude::*,

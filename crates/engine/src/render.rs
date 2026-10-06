@@ -3687,7 +3687,6 @@ mod tests {
         }
     }
 
-
     /// A cell whose four quadrants each carry a base layer plus the given overlays, in the order the
     /// `VTXT` lists are given, so a weight field built from it can be read back against the lists
     /// that produced it.

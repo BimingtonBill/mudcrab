@@ -1074,7 +1074,8 @@ fn real_tree_lod_decodes() {
                 }
             }
             Some("lod") => {
-                let grid = converter::portal_lod::parse_lod_grid(&fs::read(&path).unwrap()).unwrap();
+                let grid =
+                    converter::portal_lod::parse_lod_grid(&fs::read(&path).unwrap()).unwrap();
                 grids += 1;
                 println!(
                     "{}: origin {},{} levels {:?}",

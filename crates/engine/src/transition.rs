@@ -70,10 +70,7 @@ use crate::{
         camera_grid, creation_rotation_to_bevy, creation_to_bevy, render_position,
         reposition_cell_roots,
     },
-    world::{
-        components::{ExteriorCellGrid, StreamingCamera},
-        database::CellKey,
-    },
+    world::{components::StreamingCamera, database::CellKey},
 };
 use bevy::prelude::*;
 use std::collections::HashMap;
@@ -1412,6 +1409,7 @@ fn apply_door_crossings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::components::ExteriorCellGrid;
     use crate::{
         doors::DoorDestination,
         portal_graph::PortalEdge,

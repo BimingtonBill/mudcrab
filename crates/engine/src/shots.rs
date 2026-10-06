@@ -42,10 +42,7 @@ use crate::{
         OpenDoor, SpaceTarget, destination_is_resident, distance_in_front_of_door, door_is_open,
         heading_to_rotation, source_doorway_centre, source_doorway_frame, switch_space,
     },
-    world::{
-        components::{ExteriorCellGrid, StreamingCamera},
-        database::CellKey,
-    },
+    world::{components::StreamingCamera, database::CellKey},
 };
 use bevy::{
     animation::graph::AnimationGraphHandle,
@@ -1342,6 +1339,7 @@ pub(crate) fn settle_counts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::components::ExteriorCellGrid;
     use crate::{transition::arrival_camera_rotation, world::components::CELL_SIZE};
     use bevy::ecs::system::SystemState;
     use shared::coordinates::runtime_to_creation_vector;
@@ -2031,9 +2029,7 @@ mod tests {
         let mut origin = RenderOrigin(IVec2::new(18, 18));
         let mut world = World::new();
         world.spawn((ExteriorCellGrid(IVec2::new(18, 18)), Transform::default()));
-        let mut state = SystemState::<
-            crate::streaming::CellRootTransforms,
-        >::new(&mut world);
+        let mut state = SystemState::<crate::streaming::CellRootTransforms>::new(&mut world);
         let mut roots = state.get_mut(&mut world).unwrap();
 
         let translation = switch_space(
@@ -2057,7 +2053,7 @@ mod tests {
         );
         let placed: Vec<_> = roots
             .iter()
-            .map(|(grid, transform)| (grid.0, transform.translation))
+            .filter_map(|(grid, _, transform)| Some((grid?.0, transform.translation)))
             .collect();
         assert_eq!(
             placed,
@@ -2081,9 +2077,7 @@ mod tests {
             ExteriorCellGrid(IVec2::new(18, 18)),
             Transform::from_xyz(1.0, 0.0, 1.0),
         ));
-        let mut state = SystemState::<
-            crate::streaming::CellRootTransforms,
-        >::new(&mut world);
+        let mut state = SystemState::<crate::streaming::CellRootTransforms>::new(&mut world);
         let mut roots = state.get_mut(&mut world).unwrap();
 
         let translation = switch_space(
@@ -2121,7 +2115,7 @@ mod tests {
         );
         let placed: Vec<_> = roots
             .iter()
-            .map(|(grid, transform)| (grid.0, transform.translation))
+            .filter_map(|(grid, _, transform)| Some((grid?.0, transform.translation)))
             .collect();
         assert_eq!(
             placed,

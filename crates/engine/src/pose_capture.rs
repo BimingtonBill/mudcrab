@@ -47,7 +47,7 @@ use crate::{
     },
     streaming::{ActiveCell, RenderOrigin, absolute_render_position},
     transition::switch_space,
-    world::components::{ExteriorCellGrid, StreamingCamera},
+    world::components::StreamingCamera,
 };
 use bevy::{prelude::*, window::PrimaryWindow};
 use serde::{Deserialize, Serialize};

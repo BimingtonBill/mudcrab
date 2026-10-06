@@ -2455,7 +2455,6 @@ mod tests {
         value.parse::<f64>().is_ok_and(f64::is_finite)
     }
 
-
     #[test]
     fn the_doorway_depth_composite_is_on_unless_turned_off() {
         let parse = |args: &[&str]| {
@@ -2517,7 +2516,8 @@ mod tests {
             MAX_TERRAIN_RADIUS
         );
         assert_eq!(
-            EngineConfig::run_from_args(["--terrain-radius", "-4"].map(str::to_owned)).terrain_radius,
+            EngineConfig::run_from_args(["--terrain-radius", "-4"].map(str::to_owned))
+                .terrain_radius,
             0
         );
         assert_eq!(
@@ -2644,7 +2644,8 @@ mod tests {
 
     #[test]
     fn a_start_shot_run_is_looked_at_and_driven_by_the_player() {
-        let config = EngineConfig::run_from_args(["--start-shot", "a.json", "shot"].map(str::to_owned));
+        let config =
+            EngineConfig::run_from_args(["--start-shot", "a.json", "shot"].map(str::to_owned));
         assert!(
             config.interactive(),
             "a start-shot run gets the lighting and the portal"
@@ -2671,8 +2672,9 @@ mod tests {
 
     #[test]
     fn automated_runs_open_their_window_off_screen_unless_asked_not_to() {
-        let args =
-            |list: &[&str]| EngineConfig::run_from_args(list.iter().map(|value| (*value).to_owned()));
+        let args = |list: &[&str]| {
+            EngineConfig::run_from_args(list.iter().map(|value| (*value).to_owned()))
+        };
         assert!(args(&["--demo-tour", "local/tour"]).window_offscreen());
         assert!(args(&["--shots", "shots.json"]).window_offscreen());
         assert!(!args(&["--demo-tour", "local/tour", "--show-window"]).window_offscreen());
@@ -2688,8 +2690,9 @@ mod tests {
 
     #[test]
     fn a_timing_run_opens_on_screen_and_its_title_says_what_it_is() {
-        let args =
-            |list: &[&str]| EngineConfig::run_from_args(list.iter().map(|value| (*value).to_owned()));
+        let args = |list: &[&str]| {
+            EngineConfig::run_from_args(list.iter().map(|value| (*value).to_owned()))
+        };
         let bench = args(&[
             "--portal-bench",
             "doors.json",

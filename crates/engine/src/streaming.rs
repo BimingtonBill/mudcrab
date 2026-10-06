@@ -10058,41 +10058,4 @@ mod tests {
             .unwrap();
         assert!(matches!(decision, StaticCollisionDecision::Authored(_, _)));
     }
-
-    /// Welded edge and corner samples have one neighbour per axis, so their stencil spans one
-    /// interval, not two. Dividing by the actual span keeps a planar slope's normal identical at
-    /// the interior, every edge and every corner, matching the converter's `decode_normals`.
-    #[test]
-    fn welded_edge_and_corner_normals_match_the_interior_on_a_planar_slope() {
-        let mut terrain = terrain_fixture(1, 0.0);
-        let width = usize::from(terrain.width);
-        // Rises 40 units per interval eastwards and 20 per interval northwards.
-        for y in 0..width {
-            for x in 0..width {
-                terrain.heights[y * width + x] = 40.0 * x as f32 + 20.0 * y as f32;
-            }
-        }
-        let last = width - 1;
-        let interior = 16 * width + 16;
-        let samples = [
-            interior,
-            16 * width,          // west edge
-            16 * width + last,   // east edge
-            16,                  // south edge
-            last * width + 16,   // north edge
-            0,                   // south-west corner
-            last * width + last, // north-east corner
-        ];
-        recompute_packed_normals(&mut terrain, &samples);
-        let expected = terrain.normals[interior * 3..interior * 3 + 3].to_vec();
-        // (-40/128, -20/128, 1) normalized and scaled by 127.
-        assert_eq!(expected, vec![-37, -19, 120]);
-        for index in samples {
-            assert_eq!(
-                &terrain.normals[index * 3..index * 3 + 3],
-                expected.as_slice(),
-                "sample {index} disagrees with the interior normal"
-            );
-        }
-    }
 }

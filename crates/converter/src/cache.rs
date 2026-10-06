@@ -776,7 +776,9 @@ mod tests {
 
     #[test]
     fn recent_schema_migrations_reuse_only_unchanged_asset_kinds() {
-        for schema_version in [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 101_601, 101_901] {
+        for schema_version in [
+            12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 101_601, 101_901,
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");
             let mut manifest = ConversionManifest {
