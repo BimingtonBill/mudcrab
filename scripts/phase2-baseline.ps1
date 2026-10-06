@@ -18,12 +18,14 @@ param(
     # is used. The comparison is refused when the two runs' renderer backend or adapter differ.
     [string]$CompareTo,
     [string]$Worldspace = "0x3c",
+    # The standard places of docs/roadmap/02-acceptance.md, so the three world scenes measure three
+    # different places by default: the phase2-profile.ps1 defaults are 0,0 for all three.
     [int]$RuralGridX = 0,
     [int]$RuralGridY = 0,
-    [int]$DenseGridX = 0,
-    [int]$DenseGridY = 0,
-    [int]$WaterGridX = 0,
-    [int]$WaterGridY = 0
+    [int]$DenseGridX = 18,
+    [int]$DenseGridY = -5,
+    [int]$WaterGridX = 7,
+    [int]$WaterGridY = -2
 )
 
 $ErrorActionPreference = "Stop"
