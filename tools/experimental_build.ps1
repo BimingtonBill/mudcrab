@@ -22,7 +22,7 @@ Play it with tools/experimental_play.ps1.
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/experimental_build.ps1
 #>
 param(
-    [string]$Branch = "experimental/2026-10-03",
+    [string]$Branch = "experimental/$(Get-Date -Format yyyy-MM-dd)",
     [string]$Worktree = "D:/Modding-overflow/wt-experimental",
     [string]$TargetDir = "D:/Modding-overflow/wt-targets/experimental",
     [switch]$Resume,          # continue merging from the current branch head instead of resetting
@@ -36,12 +36,12 @@ param(
 $ErrorActionPreference = "Continue"  # git writes progress to stderr; failures are checked by exit code
 $repo = Split-Path -Parent $PSScriptRoot
 
-# Merge order: dependencies first (#119 before #114, #118 before #126/#125, #123 before #124).
-$prs = @(99, 119, 114, 118, 126, 125, 123, 124, 128, 121, 122, 136, 137, 139, 141)
+# Merge order: dependencies first (#118 before #126/#125, #123 before #124, #141 before #142).
+# #105 (LOD) goes early: it is the largest and merges clean onto main. #119 merged into main 2026-10-04.
+$prs = @(99, 105, 114, 118, 126, 125, 123, 124, 128, 121, 122, 136, 137, 139, 141, 142, 152)
 
 # Left out on purpose, with the reason (update when a PR merges, closes or is fixed):
 $skipped = [ordered]@{
-    105 = "LOD (Chef): conflicts with main itself in 10 files (converter cache/schema, database, launcher); its owner rebases"
     127 = "Mudcrab rename: a mechanical text rename that conflicts with everything; lands after the others"
 }
 
@@ -56,7 +56,7 @@ if (-not $NoFetch) {
 if (-not (Test-Path $Worktree)) { & git -C $repo worktree add -q $Worktree -B $Branch origin/main }
 $dirty = & git -C $Worktree status --porcelain --untracked-files=no
 if ($dirty) { throw "worktree $Worktree has uncommitted changes; finish or remove them first" }
-& git -C $Worktree checkout -q $Branch
+& git -C $Worktree checkout -q -B $Branch
 if (-not $Resume) {
     # Keep the previous build reachable: its merges are reused below when nothing changed.
     & git -C $Worktree update-ref refs/exp/previous HEAD
