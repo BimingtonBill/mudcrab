@@ -11,7 +11,8 @@ All local; no PRs opened (cap). Hand-offs went to Upstream Dev and `local/team/2
 - **Real-data run:** metadata rebuild `D:/Modding-overflow/SkyrimConverted-p1rooms` (class C, owner note beside it; assets reused from p2main, no LOD). 292 interiors, 4,246 rooms, 3,097 portals; Ansilvund01 matches the earlier byte scan. Interior list: `D:/Modding-overflow/p1rooms-room-cells.tsv`. Phase 2's room-culling image test reads it.
 - **#185:** design note plus a "Measured" section on `phase1/room-graph` e7328c00 (`docs/research/derived-data-input-keys.md`); probe on the throwaway local branch `phase1/input-key-probe` 864cc0df (never send). Keys cost about 1.7 s CPU for the whole game; Upstream Dev took the recommendation (key per cell; interiors one cell per unit, exteriors grouped on LOD chunks). Parked: following model textures and materials into the key.
 - **Folders:** `wt/p1-keyprobe` and `p1-tmp-keyprobe-target` are class A, keep until 10-09; `p1-rooms-converter` until 10-10. Nothing running.
-- **Next:** CodeRabbit round 2 on #126 when it arrives; #188 fixes after the draft opens.
+- **Evening (room culling cross-check for Phase 2):** p1rooms has 1,536 overlapping room pairs with no portal or link (about a third of all overlaps). The converter's yaw convention is confirmed by the data: portal centres sit inside both of their rooms 99.2% of the time, against 72% with the opposite sign. Tolerance agreed with Phase 2: separation of 8 Creation units or less along the separating axis (engine 8b3e3bbc). Scripts are in `local/research/rooms/`.
+- **Next:** CodeRabbit round 2 on #126 when it arrives; #188 fixes after the draft opens; the `overlapping_room_pairs_without_edge` counter (eps 8, same definition) if the morning plan hands it out.
 
 ## 2026-10-06 Phase 2 Dev (engine foundations: #184, #187, #188, interior shots)
 
