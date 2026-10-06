@@ -1312,3 +1312,122 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links() {
         }
     }
 }
+
+/// The load-order export writes the room graph, with the marker FormIDs in load-order
+/// numbering: the plugin's own records sit in slot 2 here, its masters only name Base.esm.
+#[test]
+fn load_order_export_writes_the_room_graph_with_remapped_marker_ids() {
+    use rusqlite::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let floats =
+        |values: [f32; 6]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let xprm = |half: [f32; 3], shape: u32| -> Vec<u8> {
+        let mut bytes: Vec<u8> = half.iter().flat_map(|v| v.to_le_bytes()).collect();
+        bytes.extend([0u8; 12]);
+        bytes.extend(0.2f32.to_le_bytes());
+        bytes.extend(shape.to_le_bytes());
+        bytes
+    };
+    let word = |value: u32| value.to_le_bytes().to_vec();
+    let marker = |id: u32, base: u32, position: [f32; 3], extra: Vec<u8>| {
+        record(
+            b"REFR",
+            id,
+            0,
+            [
+                sub(b"NAME", &word(base)),
+                sub(
+                    b"DATA",
+                    &floats([position[0], position[1], position[2], 0.0, 0.0, 0.0]),
+                ),
+                extra,
+            ]
+            .concat(),
+        )
+    };
+    let cell = 0x0100_0900;
+    let patch = plugin(
+        dir.path(),
+        "Patch.esm",
+        &["Base.esm"],
+        1,
+        [
+            // No XCLC and no worldspace: an interior cell.
+            record(b"CELL", cell, 0, sub(b"DATA", &[1, 0])),
+            group(
+                6,
+                cell,
+                group(
+                    9,
+                    cell,
+                    [
+                        marker(
+                            0x0100_0801,
+                            0x1F,
+                            [0.0; 3],
+                            sub(b"XPRM", &xprm([100.0; 3], 1)),
+                        ),
+                        marker(
+                            0x0100_0802,
+                            0x1F,
+                            [500.0, 0.0, 0.0],
+                            [
+                                sub(b"XPRM", &xprm([100.0; 3], 1)),
+                                sub(b"LNAM", &word(0x0100_0A00)),
+                                sub(b"INAM", &word(0x0100_0A01)),
+                                sub(b"XLRM", &word(0x0100_0801)),
+                            ]
+                            .concat(),
+                        ),
+                        marker(
+                            0x0100_0803,
+                            0x20,
+                            [250.0, 0.0, 0.0],
+                            [
+                                sub(b"XPRM", &xprm([40.0, 1.0, 60.0], 3)),
+                                sub(b"XPOD", &[word(0x0100_0801), word(0x0100_0802)].concat()),
+                            ]
+                            .concat(),
+                        ),
+                        marker(0x0100_0804, 0x99, [10.0, 20.0, 30.0], Vec::new()),
+                    ]
+                    .concat(),
+                ),
+            ),
+        ]
+        .concat(),
+    );
+    let db = dir.path().join("world.db");
+    EsmParser::convert_plugins(&[base, filler, patch], &db).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let ids = |sql: &str| -> Vec<(u32, u32)> {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        ids("SELECT ref_id, cell_id FROM room_bounds ORDER BY ref_id"),
+        vec![(0x0200_0801, 0x0200_0900), (0x0200_0802, 0x0200_0900)]
+    );
+    assert_eq!(
+        ids("SELECT lighting_template_id, image_space_id FROM room_bounds WHERE ref_id=0x02000802"),
+        vec![(0x0200_0A00, 0x0200_0A01)]
+    );
+    assert_eq!(
+        ids("SELECT room_a, room_b FROM room_portals"),
+        vec![(0x0200_0801, 0x0200_0802)]
+    );
+    assert_eq!(
+        ids("SELECT room_ref, linked_ref FROM room_links"),
+        vec![(0x0200_0802, 0x0200_0801)]
+    );
+    assert_eq!(
+        ids("SELECT reference_id, room_ref FROM reference_rooms WHERE contained=1"),
+        vec![(0x0200_0804, 0x0200_0801)]
+    );
+}
