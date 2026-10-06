@@ -14,6 +14,7 @@ pub mod render;
 pub mod render_timing;
 mod renderer_init;
 pub mod schedule_timing;
+pub mod shadow_route;
 pub mod shots;
 pub mod sky;
 pub mod skyrim_ini;

@@ -1067,6 +1067,8 @@ fn spawn_cell(
                     MeshMaterial3d(material),
                     Transform::default(),
                     TerrainPatch,
+                    // The reflection draws the terrain on either shadow route.
+                    crate::render::reflectable_world_layers(),
                     Visibility::Hidden,
                     PendingTerrainProfile {
                         cell_id: terrain.cell_id,
@@ -5353,6 +5355,12 @@ mod tests {
             assert!(
                 layers.intersects(&RenderLayers::layer(crate::render::WORLD_LAYER)),
                 "terrain is what the reflection pass draws"
+            );
+            assert!(
+                layers.intersects(&RenderLayers::layer(
+                    crate::render::UNSHADOWED_REFLECTION_LAYER
+                )),
+                "and the shadowless route draws it too"
             );
             assert!(
                 !layers.intersects(&PLACED_OBJECT_RENDER_LAYERS),

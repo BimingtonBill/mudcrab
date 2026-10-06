@@ -1138,6 +1138,7 @@ fn setup_terrain_water_fixture(
                 }),
             ),
             TerrainWaterFixtureTerrain,
+            crate::render::reflectable_world_layers(),
         ));
     }
     commands.spawn((
@@ -3317,7 +3318,11 @@ mod tests {
         app.update();
 
         let world = app.world_mut();
-        let mut suns = world.query::<(&DirectionalLight, &CascadeShadowConfig)>();
+        // The source sun, not the unshadowed copy a shadowless view may add.
+        let mut suns = world.query_filtered::<
+            (&DirectionalLight, &CascadeShadowConfig),
+            Without<crate::shadow_route::UnshadowedSun>,
+        >();
         let Ok((light, cascades)) = suns.single(world) else {
             panic!("setup_world spawns one shadow-casting directional light");
         };
@@ -3358,6 +3363,31 @@ mod tests {
                 "the streaming camera must render layer {layer}"
             );
         }
+    }
+
+    /// The shadowless reflection route only works while nothing the player sees, and nothing that
+    /// lights the player's world, is on the replica layer.
+    #[test]
+    fn the_main_camera_and_the_source_sun_never_share_the_replica_layer() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .add_systems(Startup, setup_world);
+        app.update();
+
+        let replica = RenderLayers::layer(crate::render::UNSHADOWED_REFLECTION_LAYER);
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&RenderLayers, With<StreamingCamera>>();
+        let camera = cameras.single(app.world()).expect("the streaming camera");
+        assert!(!camera.intersects(&replica));
+
+        let mut suns = app.world_mut().query_filtered::<&RenderLayers, (
+            With<DirectionalLight>,
+            Without<crate::shadow_route::UnshadowedSun>,
+        )>();
+        let suns: Vec<_> = suns.iter(app.world()).collect();
+        assert_eq!(suns.len(), 1, "setup_world spawns one source sun");
+        assert!(!suns[0].intersects(&replica));
     }
 
     #[test]

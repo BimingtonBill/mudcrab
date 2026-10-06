@@ -85,6 +85,21 @@ pub enum ViewUpdateRate {
     OnDemand,
 }
 
+/// Whether a managed view renders the sun's directional shadow cascades of its own.
+///
+/// A view's shadows are not shared with the main view's: Bevy builds and renders a separate set of
+/// cascades for every active camera, so a secondary view that keeps them on pays for a second
+/// shadow pass over the same sun. The policy only *states* the choice; the route that realises it
+/// is [`crate::shadow_route`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewShadows {
+    /// The view is lit by the shadowed sun, as every view is by default.
+    #[default]
+    On,
+    /// The view is lit by an unshadowed copy of the sun and renders no cascades of its own.
+    Off,
+}
+
 /// What a managed view is allowed to cost.
 ///
 /// The preset a view is given decides everything about its cost; see [`ViewPolicy::baseline`] and
@@ -105,6 +120,8 @@ pub struct ViewPolicy {
     pub jump_distance: f32,
     /// How far the consumer may turn from the view's last scheduled pose before the view is forced.
     pub jump_angle_radians: f32,
+    /// Whether the view renders the sun's shadow cascades of its own.
+    pub shadows: ViewShadows,
 }
 
 impl ViewPolicy {
@@ -117,12 +134,13 @@ impl ViewPolicy {
             max_staleness: DEFAULT_MAX_STALENESS,
             jump_distance: DEFAULT_JUMP_DISTANCE,
             jump_angle_radians: DEFAULT_JUMP_ANGLE_RADIANS,
+            shadows: ViewShadows::On,
         }
     }
 
     /// The design study's starting settings for the water reflection: a quarter of the pixels,
-    /// every other frame, low priority, with a hundred milliseconds and 256 units or ten degrees of
-    /// staleness allowed before the view is forced.
+    /// every other frame, low priority, no shadow cascades of its own, with a hundred milliseconds
+    /// and 256 units or ten degrees of staleness allowed before the view is forced.
     ///
     /// These are unverified quality settings, not measured optima. They exist to be compared with
     /// [`ViewPolicy::baseline`] on the same scene.
@@ -131,6 +149,7 @@ impl ViewPolicy {
             target_size: WATER_TARGET_SIZE,
             update_rate: ViewUpdateRate::EveryOtherFrame,
             priority: WATER_PRIORITY,
+            shadows: ViewShadows::Off,
             ..Self::baseline()
         }
     }
