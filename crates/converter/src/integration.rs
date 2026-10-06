@@ -496,4 +496,89 @@ mod tests {
             3
         );
     }
+
+    /// A room turned 0.6 rad with an asymmetric box, and a model turned with it: an object placed
+    /// along the room's long axis overlaps, its mirror image across the X axis does not. The
+    /// forward matrix, or the opposite turn, would swap the two.
+    #[test]
+    fn overlap_rows_follow_a_rotated_room_and_rotated_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("skyrim_world.db");
+        let connection = Connection::open(&database).unwrap();
+        crate::esm::exporter::create_tables(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO statics(id,model_path,flags) VALUES(0x500,'architecture/wall.nif',0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO room_bounds(ref_id,cell_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,half_x,half_y,half_z)
+                 VALUES(0x1001,0x100,0,0,0,0,0,0.6,200,20,50)",
+                [],
+            )
+            .unwrap();
+        let (sin, cos) = 0.6f32.sin_cos();
+        // 240 along the room's long axis (local +X is (cos, -sin) in world), turned with it, so
+        // the model's 100-long side lies along the axis and spans 190..290, past the end at 200.
+        for (id, y_sign) in [(0x2001u32, -1.0f32), (0x2002, 1.0)] {
+            connection
+                .execute(
+                    "INSERT INTO \"references\"(id,cell_id,base_form_id,is_exterior,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,scale)
+                     VALUES(?1,0x100,0x500,0,?2,?3,0,0,0,0.6,1)",
+                    rusqlite::params![id, 240.0 * cos, y_sign * 240.0 * sin],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        write_box_glb(
+            &directory.path().join("meshes/architecture/wall.glb"),
+            [-50.0, -5.0, -10.0],
+            [50.0, 5.0, 10.0],
+        );
+        empty_cache(directory.path());
+        finalize_world_database(directory.path()).unwrap().unwrap();
+        let connection = Connection::open(database).unwrap();
+        let rows: Vec<(u32, i64)> = connection
+            .prepare("SELECT reference_id,contained FROM reference_rooms ORDER BY reference_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![(0x2001, 0)]);
+    }
+
+    /// A reused older database whose `statics` has no bounds columns finalises, and the overlap
+    /// pass leaves it alone even when it holds rooms.
+    #[test]
+    fn finalises_a_legacy_database_without_bounds_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("skyrim_world.db");
+        let connection = Connection::open(&database).unwrap();
+        crate::esm::exporter::create_tables(&connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE statics;
+                 CREATE TABLE statics(id INTEGER PRIMARY KEY, editor_id TEXT, model_path TEXT, flags INTEGER NOT NULL);",
+            )
+            .unwrap();
+        drop(connection);
+        empty_cache(directory.path());
+        assert!(finalize_world_database(directory.path()).unwrap().is_some());
+
+        let mut connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO room_bounds(ref_id,cell_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,half_x,half_y,half_z)
+                 VALUES(1,1,0,0,0,0,0,0,1,1,1)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            crate::esm::rooms::add_overlap_rows(&mut connection).unwrap(),
+            0
+        );
+    }
 }

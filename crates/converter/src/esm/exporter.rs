@@ -1910,4 +1910,79 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
     }
+
+    #[test]
+    fn skips_markers_with_non_finite_sizes() {
+        let (conn, report) = export_rooms(vec![
+            interior_cell(0x100),
+            room(
+                0x1001,
+                0x100,
+                [0.0; 3],
+                [0.0; 3],
+                [f32::NAN, 1.0, 1.0],
+                vec![],
+            ),
+            room(
+                0x1002,
+                0x100,
+                [0.0; 3],
+                [0.0; 3],
+                [f32::INFINITY, 1.0, 1.0],
+                vec![],
+            ),
+            room(0x1003, 0x100, [0.0; 3], [0.0; 3], [10.0; 3], vec![]),
+            marker(
+                0x3001,
+                0x100,
+                PORTAL_MARKER_BASE,
+                [0.0; 3],
+                [0.0; 3],
+                vec![(b"XPRM", xprm([f32::NAN, 1.0, 60.0], 3))],
+            ),
+            portal(0x3002, 0x100, Some((0x1003, 0))),
+        ]);
+        assert_eq!(report.rooms, 1);
+        assert_eq!(report.portals, 1);
+        assert_eq!(report.invalid_markers_skipped, 3);
+        let read = rooms::RoomGraphReport::read(&conn).unwrap();
+        assert_eq!(read.invalid_markers_skipped, 3);
+    }
+
+    /// A room turned 0.6 rad about Z with an asymmetric box: probe points on its long axis are
+    /// inside only under the right inverse. The forward matrix, or the opposite turn, puts the
+    /// same points outside.
+    #[test]
+    fn a_room_turned_by_an_arbitrary_yaw_uses_the_inverse_rotation() {
+        let (sin, cos) = 0.6f32.sin_cos();
+        // Local +X in world space is (cos, -sin) for a Creation yaw of +0.6 (clockwise).
+        let along = |distance: f32| [distance * cos, -distance * sin, 0.0];
+        let mirrored = |distance: f32| [distance * cos, distance * sin, 0.0];
+        let beside = {
+            let on_axis = along(100.0);
+            // 30 from the axis across the narrow side (half 20).
+            [on_axis[0] + 30.0 * sin, on_axis[1] + 30.0 * cos, 0.0]
+        };
+        let (conn, _) = export_rooms(vec![
+            interior_cell(0x100),
+            room(
+                0x1001,
+                0x100,
+                [0.0; 3],
+                [0.0, 0.0, 0.6],
+                [200.0, 20.0, 50.0],
+                vec![],
+            ),
+            reference(0x2001, 0x100, 0x500, along(150.0), [0.0; 3]),
+            reference(0x2002, 0x100, 0x500, along(190.0), [0.0; 3]),
+            reference(0x2003, 0x100, 0x500, along(210.0), [0.0; 3]),
+            reference(0x2004, 0x100, 0x500, mirrored(150.0), [0.0; 3]),
+            reference(0x2005, 0x100, 0x500, beside, [0.0; 3]),
+        ]);
+        assert_eq!(rooms_of(&conn, 0x2001), vec![(0x1001, 1)]);
+        assert_eq!(rooms_of(&conn, 0x2002), vec![(0x1001, 1)]);
+        assert_eq!(rooms_of(&conn, 0x2003), vec![]);
+        assert_eq!(rooms_of(&conn, 0x2004), vec![]);
+        assert_eq!(rooms_of(&conn, 0x2005), vec![]);
+    }
 }

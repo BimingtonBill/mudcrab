@@ -269,6 +269,9 @@ reference and cell fields, validated against their expected sizes:
 | `XCIM`, `XCMO`, `XCAS` | CELL | image space, music type, acoustic space |
 | `XCCM` | CELL | region the cell takes its sky and weather from |
 | `XCLR` | CELL | regions (array) |
+| `XPOD` | REFR | the two rooms a portal marker joins (two FormIDs) |
+| `XLRM` | REFR | linked room of a room marker |
+| `LNAM`, `INAM` | REFR | room marker lighting template, image space (other record types keep their own handling) |
 
 For blob remapping, placed references are REFR, ACHR, ACRE, PGRE, PMIS, PHZD,
 PARW, PBAR, PBEA, PCON and PFLA. This does not expand the record types exported
@@ -276,7 +279,7 @@ to the `references` table; the six newly covered types retain their blobs in
 `records` without adding `references` rows.
 Fields not covered may still hold plugin-local FormIDs. In particular, do not
 consume `WRLD.RNAM` large-reference lists, `XLOC` lock keys, `XPWR` water
-reflections, or `XPOD`/`XLRM` room and portal links as resolved IDs. Other
+reflections as resolved IDs. Other
 unconverted fields include `XLIB`, `XMBR`, `XATR`, `XTNM`, `PDTO`, `CELL.XILL`
 and `WRLD.ZNAM`. Check the converter's field-specific handling before using
 these payloads; this list is not exhaustive.
@@ -455,14 +458,14 @@ preserves the existing database version; it does not perform a full reconversion
 
 ---
 
-### 15. Interior Room Graph (`room_bounds`, `room_portals`, `room_links`, `reference_rooms`)
+### 15. Interior Room Graph (`room_bounds`, `room_portals`, `room_links`, `reference_rooms`, `room_graph_stats`)
 
 Skyrim marks the rooms of an interior with `RoomMarker` references (base `0x1F`) and the
 doorways between them with `PortalMarker` references (base `0x20`). The converter decodes both
 and records which room boxes each placed object belongs to. The tables hold facts only: which
 objects to draw is the engine's policy (design: `docs/research/interior-room-graph-converter.md`,
 upstream issue #188). Only interior cells and only box rooms (`XPRM` shape 1) are written;
-exterior markers and rooms of other shapes are skipped and counted in the conversion report.
+exterior markers are skipped silently, and rooms of other shapes or with non-finite sizes are skipped and counted in the conversion report.
 All FormIDs are in load-order numbering, like `references.id`.
 
 ```sql
@@ -534,7 +537,7 @@ Columns and rules:
   as `contained = 0`.
 - **`room_graph_stats`**: the counters the conversion report shows in `integration-report.json`
   under `room_graph`: `rooms`, `portals`, `links`, `portals_with_missing_side`,
-  `non_box_rooms_skipped`, `portals_without_size_skipped`, `objects_in_no_room` and
+  `non_box_rooms_skipped`, `portals_without_size_skipped`, `invalid_markers_skipped` (rooms and portals with non-finite half-extents), `objects_in_no_room` and
   `objects_in_several_rooms` (both by pivot), and `overlap_rows`.
 
 The tables are derived data: a full load-order export clears and rebuilds them from the winning

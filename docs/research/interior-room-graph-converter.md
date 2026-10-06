@@ -1,6 +1,6 @@
 # Interior room graph: converter design (#188, converter half)
 
-Status: design note, 2026-10-06. Nothing is built yet. The engine half (culling) is Phase 2's and
+Status: implemented on branch `phase1/room-graph` (2026-10-06); this note is the design it follows. The engine half (culling) is Phase 2's and
 is only sketched here where the table shape depends on it.
 
 ## Summary
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS room_portals (      -- one row per interior PortalMar
     pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
     rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
     half_x REAL NOT NULL, half_z REAL NOT NULL, -- doorway half-width and half-height
-    room_a INTEGER,                            -- XPOD[0]; NULL when 0, absent or not a room_bounds row
+    room_a INTEGER,                            -- XPOD[0]; NULL when 0, absent or not a room_bounds row of the same cell
     room_b INTEGER                             -- XPOD[1]; same
 );
 CREATE INDEX IF NOT EXISTS idx_room_portals_cell ON room_portals(cell_id);
@@ -95,12 +95,18 @@ CREATE TABLE IF NOT EXISTS room_links (        -- XLRM: rooms seen together with
     PRIMARY KEY (room_ref, linked_ref)
 );
 
-CREATE TABLE IF NOT EXISTS reference_rooms (   -- pivot-in-box membership, interiors with rooms only
+CREATE TABLE IF NOT EXISTS reference_rooms (   -- room membership, interiors with rooms only
     reference_id INTEGER NOT NULL,             -- references.id
     room_ref INTEGER NOT NULL,                 -- room_bounds.ref_id
+    contained INTEGER NOT NULL,                -- 1: pivot inside the box; 0: pivot outside, bounds overlap it
     PRIMARY KEY (reference_id, room_ref)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_reference_rooms_room ON reference_rooms(room_ref);
+
+CREATE TABLE IF NOT EXISTS room_graph_stats (  -- conversion report counters
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
 ```
 
 Why this shape:
@@ -169,7 +175,8 @@ require them, and would then go in the same change that raises the engine's maxi
 
 1. The pivot rule's source is a search snippet; the page itself should be read before the engine
    half relies on it. The measured coverage supports it either way.
-2. Large objects whose pivot sits in one room but whose mesh reaches into another can vanish too
+2. (Answered: the `contained = 0` overlap rows, written after integration from `statics.bounds_*`.)
+   Large objects whose pivot sits in one room but whose mesh reaches into another can vanish too
    early. Skyrim has the same behaviour. A guard (always draw objects whose bounds are larger than
    their room) is possible later, using `statics.bounds_*`, which exist after integration.
 3. The `XRMR` `u16` and the unknown `XPRM` float stay unexplained; both are kept raw or ignored.

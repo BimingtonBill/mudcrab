@@ -48,6 +48,7 @@ expression: report
     "passed": true,
     "references_total": 9,
     "room_graph": {
+      "invalid_markers_skipped": 0,
       "links": 0,
       "non_box_rooms_skipped": 0,
       "objects_in_no_room": 0,

@@ -1431,3 +1431,103 @@ fn load_order_export_writes_the_room_graph_with_remapped_marker_ids() {
         vec![(0x0200_0804, 0x0200_0801)]
     );
 }
+
+/// Exterior cells are told apart in the real export by a grid position or a worldspace; markers
+/// in them write no room rows.
+#[test]
+fn load_order_export_ignores_markers_in_exterior_cells() {
+    use rusqlite::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let word = |value: u32| value.to_le_bytes().to_vec();
+    let xprm = |half: [f32; 3], shape: u32| -> Vec<u8> {
+        let mut bytes: Vec<u8> = half.iter().flat_map(|v| v.to_le_bytes()).collect();
+        bytes.extend([0u8; 12]);
+        bytes.extend(0.2f32.to_le_bytes());
+        bytes.extend(shape.to_le_bytes());
+        bytes
+    };
+    let marker = |id: u32, base: u32, extra: Vec<u8>| {
+        record(
+            b"REFR",
+            id,
+            0,
+            [sub(b"NAME", &word(base)), sub(b"DATA", &[0u8; 24]), extra].concat(),
+        )
+    };
+    // A cell with its children: one room marker, one portal marker and one object.
+    let cell_with_markers = |cell: u32, first: u32, cell_subs: Vec<u8>| {
+        [
+            record(b"CELL", cell, 0, cell_subs),
+            group(
+                6,
+                cell,
+                group(
+                    9,
+                    cell,
+                    [
+                        marker(first, 0x1F, sub(b"XPRM", &xprm([100.0; 3], 1))),
+                        marker(
+                            first + 1,
+                            0x20,
+                            [
+                                sub(b"XPRM", &xprm([40.0, 1.0, 60.0], 3)),
+                                sub(b"XPOD", &[word(first), word(first)].concat()),
+                            ]
+                            .concat(),
+                        ),
+                        marker(first + 2, 0x99, Vec::new()),
+                    ]
+                    .concat(),
+                ),
+            ),
+        ]
+        .concat()
+    };
+    let grid = sub(b"XCLC", &[0u8; 8]);
+    let patch = plugin(
+        dir.path(),
+        "Patch.esm",
+        &["Base.esm"],
+        1,
+        [
+            // A grid position, with no worldspace group.
+            cell_with_markers(0x0100_0900, 0x0100_0800, grid.clone()),
+            // A worldspace's persistent cell (a worldspace, no grid), and a gridded one.
+            record(b"WRLD", 0x0100_0A00, 0, Vec::new()),
+            group(
+                1,
+                0x0100_0A00,
+                [
+                    cell_with_markers(0x0100_0910, 0x0100_0810, Vec::new()),
+                    cell_with_markers(0x0100_0920, 0x0100_0820, grid),
+                ]
+                .concat(),
+            ),
+        ]
+        .concat(),
+    );
+    let db = dir.path().join("world.db");
+    EsmParser::convert_plugins(&[base, filler, patch], &db).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+    // The markers were parsed as references of those cells...
+    assert_eq!(
+        count("SELECT count(*) FROM \"references\" WHERE base_form_id IN (31, 32)"),
+        6
+    );
+    // ...and none of them became room data.
+    for table in [
+        "room_bounds",
+        "room_portals",
+        "room_links",
+        "reference_rooms",
+    ] {
+        assert_eq!(
+            count(&format!("SELECT count(*) FROM {table}")),
+            0,
+            "{table}"
+        );
+    }
+}

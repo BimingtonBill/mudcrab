@@ -66,6 +66,8 @@ pub struct RoomGraphReport {
     pub non_box_rooms_skipped: u64,
     /// Portal markers without an `XPRM` (no size); they get no row.
     pub portals_without_size_skipped: u64,
+    /// Room or portal markers whose half-extents are not finite; they get no row.
+    pub invalid_markers_skipped: u64,
     /// Objects in a cell with rooms whose pivot is in no room box.
     pub objects_in_no_room: u64,
     /// Objects in a cell with rooms whose pivot is in more than one room box.
@@ -74,20 +76,21 @@ pub struct RoomGraphReport {
     pub overlap_rows: u64,
 }
 
-const STAT_NAMES: [&str; 9] = [
+const STAT_NAMES: [&str; 10] = [
     "rooms",
     "portals",
     "links",
     "portals_with_missing_side",
     "non_box_rooms_skipped",
     "portals_without_size_skipped",
+    "invalid_markers_skipped",
     "objects_in_no_room",
     "objects_in_several_rooms",
     "overlap_rows",
 ];
 
 impl RoomGraphReport {
-    fn values(&self) -> [u64; 9] {
+    fn values(&self) -> [u64; 10] {
         [
             self.rooms,
             self.portals,
@@ -95,6 +98,7 @@ impl RoomGraphReport {
             self.portals_with_missing_side,
             self.non_box_rooms_skipped,
             self.portals_without_size_skipped,
+            self.invalid_markers_skipped,
             self.objects_in_no_room,
             self.objects_in_several_rooms,
             self.overlap_rows,
@@ -138,6 +142,7 @@ impl RoomGraphReport {
                 "portals_with_missing_side" => report.portals_with_missing_side = value,
                 "non_box_rooms_skipped" => report.non_box_rooms_skipped = value,
                 "portals_without_size_skipped" => report.portals_without_size_skipped = value,
+                "invalid_markers_skipped" => report.invalid_markers_skipped = value,
                 "objects_in_no_room" => report.objects_in_no_room = value,
                 "objects_in_several_rooms" => report.objects_in_several_rooms = value,
                 "overlap_rows" => report.overlap_rows = value,
@@ -375,6 +380,15 @@ pub fn export_room_graph(
             f32_at(xprm, 4).unwrap_or(0.0),
             f32_at(xprm, 8).unwrap_or(0.0),
         ];
+        if !half
+            .iter()
+            .chain(&position)
+            .chain(&rotation)
+            .all(|v| v.is_finite())
+        {
+            report.invalid_markers_skipped += 1;
+            continue;
+        }
         let flags = view
             .find(b"XRMR")
             .filter(|data| data.len() >= 4)
@@ -426,6 +440,15 @@ pub fn export_room_graph(
         let (position, rotation) = transform_of(&view);
         let half_x = f32_at(xprm, 0).unwrap_or(0.0);
         let half_z = f32_at(xprm, 8).unwrap_or(0.0);
+        if ![half_x, half_z]
+            .iter()
+            .chain(&position)
+            .chain(&rotation)
+            .all(|v| v.is_finite())
+        {
+            report.invalid_markers_skipped += 1;
+            continue;
+        }
         let side = |offset: usize| {
             view.find(b"XPOD")
                 .filter(|data| data.len() >= 8)
@@ -507,6 +530,19 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
 /// every `contained = 0` row. Returns the number of rows written.
 pub fn add_overlap_rows(conn: &mut Connection) -> Result<u64> {
     if !table_exists(conn, "room_bounds")? || !table_exists(conn, "reference_rooms")? {
+        return Ok(0);
+    }
+    // A reused older database may lack the bounds columns; with no rooms there is nothing to do.
+    let has_rooms: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM room_bounds)", [], |row| {
+            row.get(0)
+        })?;
+    let has_bounds: bool = conn.query_row(
+        "SELECT count(*) = 2 FROM pragma_table_info('statics') WHERE name IN ('bounds_valid', 'bounds_min_x')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_rooms || !has_bounds {
         return Ok(0);
     }
     let mut rooms_by_cell: BTreeMap<u32, Vec<Room>> = BTreeMap::new();
