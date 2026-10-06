@@ -513,13 +513,10 @@ pub fn apply_view_policies(
                 if *transform != request.pose {
                     *transform = request.pose;
                 }
-                // Writing the projection marks it changed, which makes Bevy recompute the camera's
-                // aspect from its own target - so the comparison that matters is between the
-                // *requested* projections, kept in the scheduled state, not against the camera's.
-                if projection_changed(Some(&projection), request.projection.as_ref())
-                    && let Some(requested) = &request.projection
-                {
-                    *projection = requested.clone();
+                // Writing the projection marks it changed, so only write when the parts the policy
+                // carries differ: the camera's own `far` and aspect stay its own.
+                if let Some(requested) = &request.projection {
+                    apply_projection(&mut projection, requested);
                 }
                 camera.is_active = true;
                 state.last_forced = dirty;
@@ -543,18 +540,47 @@ pub fn apply_view_policies(
     }
 }
 
-/// Whether two projections would draw different clip space.
+/// Whether two projections differ in what a managed view takes from its observer.
 ///
-/// [`Projection`] is not `PartialEq`, but its clip-from-view matrix is, and it is built from
-/// exactly the fields that decide the image: field of view, aspect, near and far, and for an
-/// orthographic projection its scale and viewport origin. `None` means the adapter asked for no
-/// projection at all, so only a change between `Some` and `None` counts.
+/// For a perspective projection that is the field of view and the near plane. The aspect belongs
+/// to the view's own target (Bevy recomputes it from the target), and `far` bounds what the view
+/// culls and draws, so neither is carried over and a difference in either alone is not a change.
+/// Other projections are compared by their clip-from-view matrix. `None` means the adapter asked
+/// for no projection at all, so only a change between `Some` and `None` counts.
 fn projection_changed(current: Option<&Projection>, requested: Option<&Projection>) -> bool {
     match (current, requested) {
+        (Some(Projection::Perspective(current)), Some(Projection::Perspective(requested))) => {
+            current.fov != requested.fov || current.near != requested.near
+        }
         (Some(current), Some(requested)) => {
             current.get_clip_from_view() != requested.get_clip_from_view()
         }
         (current, requested) => current.is_some() != requested.is_some(),
+    }
+}
+
+/// Gives `camera` the observer's projection without its `far` or aspect, writing only on a change.
+///
+/// Carrying the observer's `far` over would make the secondary view cull and draw as far as the
+/// observer does, which is exactly the cost a [`ViewPolicy`] exists to bound.
+fn apply_projection(camera: &mut Mut<Projection>, requested: &Projection) {
+    if !projection_changed(Some(camera.as_ref()), Some(requested)) {
+        return;
+    }
+    match (&mut **camera, requested) {
+        (Projection::Perspective(current), Projection::Perspective(requested)) => {
+            current.fov = requested.fov;
+            current.near = requested.near;
+        }
+        (current, requested) => {
+            let far = current.far();
+            *current = requested.clone();
+            match current {
+                Projection::Perspective(projection) => projection.far = far,
+                Projection::Orthographic(projection) => projection.far = far,
+                Projection::Custom(_) => {}
+            }
+        }
     }
 }
 
@@ -1185,6 +1211,66 @@ mod tests {
                 .unwrap()
                 .invalid,
             Some(ViewPolicyError::EmptyTargetSize)
+        );
+    }
+
+    #[test]
+    fn the_observer_far_and_aspect_never_reach_the_view() {
+        #[derive(Resource, Default)]
+        struct Rewrites(Vec<bool>);
+
+        fn record(projection: Query<Ref<Projection>, With<ViewPolicy>>, mut out: ResMut<Rewrites>) {
+            out.0.push(projection.single().unwrap().is_changed());
+        }
+
+        let mut harness = ViewHarness::new(ViewPolicy::baseline());
+        harness
+            .app
+            .init_resource::<Rewrites>()
+            .add_systems(PostUpdate, record.after(ViewPolicySystems::Apply));
+        let own_far = match harness
+            .app
+            .world()
+            .get::<Projection>(harness.camera)
+            .unwrap()
+        {
+            Projection::Perspective(projection) => projection.far,
+            _ => panic!("the harness camera is perspective"),
+        };
+        let observer_projection = Projection::Perspective(PerspectiveProjection {
+            fov: 0.7,
+            aspect_ratio: 2.5,
+            far: 90_000.0,
+            ..default()
+        });
+        let observer = Transform::from_xyz(0.0, 100.0, 0.0);
+        let demand = ViewRequest {
+            projection: Some(observer_projection),
+            ..still(observer)
+        };
+        for _ in 0..3 {
+            harness.demand(Some(demand.clone()));
+            harness.frame();
+        }
+        let Projection::Perspective(applied) = harness
+            .app
+            .world()
+            .get::<Projection>(harness.camera)
+            .unwrap()
+            .clone()
+        else {
+            panic!("still perspective");
+        };
+        assert_eq!(applied.far, own_far, "the view keeps its own far");
+        assert_eq!(applied.fov, 0.7, "the observer's field of view is applied");
+        assert_ne!(
+            applied.aspect_ratio, 2.5,
+            "the aspect stays the target's own"
+        );
+        let rewrites = &harness.app.world().resource::<Rewrites>().0;
+        assert!(
+            !rewrites[1] && !rewrites[2],
+            "an unchanged request does not rewrite the projection: {rewrites:?}"
         );
     }
 
