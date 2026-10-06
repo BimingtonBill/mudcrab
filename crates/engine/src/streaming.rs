@@ -149,6 +149,7 @@ impl Plugin for StreamingPlugin {
             .init_resource::<TerrainContinuity>()
             .init_resource::<SceneSpawnBatch>()
             .init_resource::<StaticCollisionCache>()
+            .init_resource::<crate::pacing::PacingTracker>()
             .init_resource::<ActiveCell>()
             .init_resource::<PrestreamCells>()
             // Empty until the startup system reads the database, and empty for every run whose
@@ -195,6 +196,18 @@ impl Plugin for StreamingPlugin {
                     end_scene_spawn_batch.after(SceneSpawnerSystems::WorldInstanceSpawn),
                 ),
             );
+        // The world-ready scan walks the whole stream window every frame and only feeds the pacing
+        // report, so an ordinary play session installs none of it.
+        if app
+            .world()
+            .get_resource::<crate::config::EngineConfig>()
+            .is_some_and(crate::config::EngineConfig::measures_pacing)
+        {
+            app.add_systems(
+                Update,
+                crate::pacing::track_world_ready.after(validate_streaming_lifecycle),
+            );
+        }
     }
 }
 
@@ -294,6 +307,39 @@ impl StreamingWorld {
                     detail: CellDetail::Full
                 })
             ) && !retry_failed_interior(key, self.active_interior, self))
+    }
+
+    /// The number of cells in the stream window of `radius` around `center`, how many of them are
+    /// resident at full detail ([`StreamingWorld::is_resident`]: a retiring cell inside the window
+    /// is revived by the planner before this is read, so it counts as resident), and how many
+    /// failed their full request ([`StreamingWorld::has_failed`]). A failed cell (map edge,
+    /// missing data) never becomes resident and is not retried, so the world-ready predicate
+    /// counts it as settled rather than waiting for it forever.
+    pub(crate) fn window_residency(
+        &self,
+        worldspace_id: u32,
+        center: IVec2,
+        radius: i32,
+    ) -> (usize, usize, usize) {
+        let radius = radius.max(0);
+        let side = 2 * radius as usize + 1;
+        let mut resident = 0;
+        let mut failed = 0;
+        for y in -radius..=radius {
+            for x in -radius..=radius {
+                let key = CellKey::Exterior {
+                    worldspace_id,
+                    grid_x: center.x + x,
+                    grid_y: center.y + y,
+                };
+                if self.is_resident(&key) {
+                    resident += 1;
+                } else if self.has_failed(&key) {
+                    failed += 1;
+                }
+            }
+        }
+        (side * side, resident, failed)
     }
 }
 
@@ -1363,15 +1409,20 @@ fn collect_cells(
             Ok(payload) => {
                 let mut terrain = cache.terrain(payload.cell_id);
                 if let Some(terrain) = terrain.as_mut() {
-                    let validation =
-                        validate_terrain_snapshot(terrain, &catalogs.assets).and_then(|()| {
-                            validate_and_register_terrain_edges(
-                                payload.key,
-                                terrain,
-                                &mut continuity,
-                                &mut metrics,
-                            )
-                        });
+                    let validation_started = Instant::now();
+                    let validation = validate_terrain_snapshot(terrain, &catalogs.assets);
+                    profiler.record_elapsed("streaming/terrain_validation", validation_started);
+                    let validation = validation.and_then(|()| {
+                        let weld_started = Instant::now();
+                        let welded = validate_and_register_terrain_edges(
+                            payload.key,
+                            terrain,
+                            &mut continuity,
+                            &mut metrics,
+                        );
+                        profiler.record_elapsed("streaming/terrain_seam_weld", weld_started);
+                        welded
+                    });
                     if let Err(reason) = validation {
                         if detail == CellDetail::Terrain {
                             // A ring cell whose landscape does not validate either is empty space
@@ -1982,6 +2033,8 @@ fn spawn_cell(
         // lit, walked through or opened. Its terrain and water plane above are built by the same
         // code the full path uses, so the two tiers meet with the same mesh and the same materials.
         if detail == CellDetail::Full {
+            let references_started = Instant::now();
+            let mut model_loads = 0u64;
             for reference in payload.references {
                 let creation_position = Vec3::from_array(reference.position);
                 let world_position = WorldPosition::from_creation_units(creation_position);
@@ -2057,6 +2110,7 @@ fn spawn_cell(
                     ));
                 }
                 if let Some(path) = reference.model_path.and_then(converted_model_path) {
+                    model_loads += 1;
                     let sequence = *model_sequence;
                     *model_sequence = model_sequence.saturating_add(1);
                     entity.insert((
@@ -2079,6 +2133,14 @@ fn spawn_cell(
                     ));
                 }
             }
+            profiler.record_elapsed("streaming/spawn_references", references_started);
+            // Per committed cell: what it carried and what it asked the loaders for; the cell's
+            // whole commit time follows in the "committed" event.
+            profiler.event(
+                format!("{:?}", payload.key),
+                format!("spawned references={reference_count} model_loads={model_loads}"),
+                Some(references_started.elapsed().as_secs_f64() * 1000.0),
+            );
         }
     });
     profiler.increment("streaming/references_spawned", reference_count as u64);
@@ -2255,6 +2317,14 @@ type CellRootsQuery<'world, 'state> = Query<
     (Entity, &'static CellRef, Option<&'static ExteriorCellGrid>),
     Or<(With<StreamedCellRoot>, With<DistantTerrainRoot>)>,
 >;
+
+/// The mesh and material stores, the camera and the pacing tracker the readiness scan also uses.
+type ReadinessExtras<'world, 'state> = (
+    ResMut<'world, Assets<Mesh>>,
+    ResMut<'world, Assets<StandardMaterial>>,
+    Query<'world, 'state, &'static Transform, With<StreamingCamera>>,
+    ResMut<'world, crate::pacing::PacingTracker>,
+);
 
 type PendingAssetQuery<'world, 'state> = Query<
     'world,
@@ -2450,12 +2520,19 @@ fn track_asset_readiness(
     images: Res<Assets<Image>>,
     mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
     mut static_cache: ResMut<StaticCollisionCache>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    (mut meshes, mut materials, camera, mut pacing): ReadinessExtras,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = Instant::now();
+    // While flying, how far from the camera each model is when it finishes loading: the number
+    // that says how far behind loading falls at speed. The camera is a root entity, so its
+    // `Transform` is its world position; `GlobalTransform` only updates in PostUpdate, after
+    // `fly_camera` moved the camera in Update, and would lag a frame.
+    let fly_camera = config
+        .records_fly_lag()
+        .then(|| camera.single().ok().map(|camera| camera.translation))
+        .flatten();
     // A model still waiting in the arming queue has no scene yet, so the scan below cannot see it;
     // count it here so the readiness gates keep waiting for every queued model.
     metrics.pending_asset_instances = pending.iter().count() + unarmed.iter().count();
@@ -2651,6 +2728,12 @@ fn track_asset_readiness(
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64;
             metrics.assets_ready = metrics.assets_ready.saturating_add(1);
+            if let Some(camera) = fly_camera {
+                pacing.record_model_ready(crate::pacing::horizontal_distance(
+                    global.translation(),
+                    camera,
+                ));
+            }
             metrics.meshes_validated = metrics
                 .meshes_validated
                 .saturating_add(summary.meshes as u64);
@@ -3548,6 +3631,12 @@ pub(crate) fn render_position(creation_position: Vec3, origin: IVec2) -> Vec3 {
 /// grid offset, so for an interior pass the zero origin, which leaves the point as it is.
 pub(crate) fn absolute_render_position(render_position: Vec3, origin: IVec2) -> Vec3 {
     render_position + grid_translation(origin, IVec2::ZERO)
+}
+
+/// The centre of the stream window: the exterior grid the camera is over, which is what
+/// [`plan_cells`] streams around. The pacing report's world-ready scan reads the same square.
+pub(crate) fn window_center(_config: &EngineConfig, translation: Vec3, origin: IVec2) -> IVec2 {
+    camera_grid(translation, origin)
 }
 
 /// The exterior grid a render-space point stands in while `origin` is the render origin: the cell
@@ -9194,6 +9283,7 @@ mod tests {
         .init_resource::<ProfilingState>()
         .init_resource::<DiagnosticFallbackAssets>()
         .init_resource::<StaticCollisionCache>()
+        .init_resource::<crate::pacing::PacingTracker>()
         .add_observer(mark_world_instance_ready)
         .add_systems(Update, track_asset_readiness);
         let handle = app
@@ -9345,6 +9435,7 @@ mod tests {
         .init_resource::<ProfilingState>()
         .init_resource::<DiagnosticFallbackAssets>()
         .init_resource::<StaticCollisionCache>()
+        .init_resource::<crate::pacing::PacingTracker>()
         .init_resource::<SceneSpawnBatch>()
         // The converted scene holds entities, and the spawner reads each of their components out
         // of the type registry.
