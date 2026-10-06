@@ -14,6 +14,7 @@ use crate::{
         AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, StreamingWorld,
         build_terrain_quadrant_mesh, streaming_center, validate_standard_material,
     },
+    view_policy::{InvalidateSecondaryViews, ViewInvalidationReason},
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
@@ -590,6 +591,7 @@ fn setup_streaming_fixture_visual(
 fn drive_streaming_fixture(
     mut state: ResMut<StreamingFixtureState>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    mut invalidations: MessageWriter<InvalidateSecondaryViews>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     if state.finished {
@@ -614,6 +616,13 @@ fn drive_streaming_fixture(
     camera.translation.z -= y as f32 * crate::world::components::CELL_SIZE;
     state.total_x += x;
     state.total_y += y;
+    // The destination pose is committed above, so this is where a door or a teleport reports the
+    // discontinuity: a secondary view must refresh on this frame rather than the next one its own
+    // cadence allows for.
+    invalidations.write(InvalidateSecondaryViews {
+        reason: ViewInvalidationReason::Teleport,
+        target: None,
+    });
     profiler.event("streaming-fixture", label, None);
 }
 
@@ -2438,6 +2447,9 @@ mod tests {
         .insert_resource(WaterReflectionTexture(Handle::<Image>::default()))
         .init_resource::<ProfilingState>()
         .init_resource::<StreamingFixtureState>()
+        // No render plugin runs here, so the fixture's invalidation message has no policy reader;
+        // the message itself still has to be registered for the fixture to be able to send it.
+        .add_message::<InvalidateSecondaryViews>()
         .add_plugins(StreamingPlugin)
         .add_systems(
             PreUpdate,
