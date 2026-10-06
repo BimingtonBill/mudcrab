@@ -148,6 +148,7 @@ impl Plugin for StreamingPlugin {
             .init_resource::<DiagnosticFallbackAssets>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<SceneSpawnBatch>()
+            .init_resource::<ActiveSpace>()
             .init_resource::<StaticCollisionCache>()
             .init_resource::<crate::pacing::PacingTracker>()
             .init_resource::<ActiveCell>()
@@ -702,7 +703,7 @@ struct DiagnosticFallbackAssets {
 }
 
 #[derive(Resource, Default)]
-struct TerrainContinuity {
+pub(crate) struct TerrainContinuity {
     edges: HashMap<CellKey, TerrainEdges>,
 }
 
@@ -842,6 +843,97 @@ enum CellStatus {
 #[derive(Resource, Reflect, Debug, Clone, Copy)]
 #[reflect(Resource)]
 pub struct RenderOrigin(pub IVec2);
+
+impl StreamingWorld {
+    /// The root entity of `key` while it is resident.
+    pub(crate) fn resident_root(&self, key: CellKey) -> Option<Entity> {
+        match self.cells.get(&key) {
+            Some(CellStatus::Resident { root, .. }) => Some(*root),
+            _ => None,
+        }
+    }
+
+    /// Whether the load of `key` failed.
+    pub(crate) fn is_failed(&self, key: CellKey) -> bool {
+        matches!(self.cells.get(&key), Some(CellStatus::Failed { .. }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_resident_for_test(&mut self, key: CellKey, root: Entity) {
+        self.cells.insert(
+            key,
+            CellStatus::Resident {
+                root,
+                detail: CellDetail::Full,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_failed_for_test(&mut self, key: CellKey) {
+        self.cells.insert(
+            key,
+            CellStatus::Failed {
+                detail: CellDetail::Full,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cell_count_for_test(&self) -> usize {
+        self.cells.len()
+    }
+}
+
+/// The space the player is in. The planner streams only this space: the active interior when
+/// there is one, otherwise the exterior cells around the camera in the active worldspace. A load
+/// door crossing (`crate::door_crossing`) changes it; nothing else does, so the default (no
+/// interior, the configured worldspace) is the behaviour before doors existed.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActiveSpace {
+    /// `None` means the worldspace the engine was configured with.
+    pub worldspace_id: Option<u32>,
+    /// `Some(cell_id)` while the player is inside that interior cell.
+    pub interior: Option<u32>,
+}
+
+impl ActiveSpace {
+    pub fn exterior_worldspace(&self, configured: u32) -> u32 {
+        self.worldspace_id.unwrap_or(configured)
+    }
+}
+
+/// Unloads every cell at once, unpaced: the space the player left must not be drawn or collide
+/// for another frame. Entries still loading are dropped, so their responses turn stale.
+pub(crate) fn unload_all_cells_now(world: &mut World) -> usize {
+    let started = Instant::now();
+    let cells: Vec<(CellKey, CellStatus)> = world
+        .resource_mut::<StreamingWorld>()
+        .cells
+        .drain()
+        .collect();
+    let mut entities = 0usize;
+    let mut unloaded = 0u64;
+    for (key, status) in &cells {
+        if let CellStatus::Resident { root, .. } | CellStatus::Retiring { root, .. } = status {
+            entities = entities.saturating_add(despawn_subtree(world, *root));
+            unloaded += 1;
+        }
+        world.resource_mut::<TerrainContinuity>().edges.remove(key);
+    }
+    {
+        let mut metrics = world.resource_mut::<StreamingMetrics>();
+        metrics.unloaded_cells = metrics.unloaded_cells.saturating_add(unloaded);
+        metrics.despawned_entities = metrics.despawned_entities.saturating_add(entities as u64);
+        metrics.resident_cells = 0;
+        metrics.loading_cells = 0;
+        metrics.retiring_cells = 0;
+    }
+    let mut profiler = world.resource_mut::<ProfilingState>();
+    profiler.record_elapsed("streaming/space_switch_unload", started);
+    profiler.increment("streaming/despawned_cells", unloaded);
+    cells.len()
+}
 
 #[allow(clippy::too_many_arguments)]
 fn plan_cells(
@@ -2250,6 +2342,47 @@ struct PendingTerrainProfile {
 struct PendingWaterProfile {
     cell_id: u32,
     flow_normal: Option<Handle<Image>>,
+}
+
+/// Counts the streamer's unfinished-work markers under one cell root: a model not yet armed or
+/// instantiated, and terrain or water whose textures are still loading. Unlike the global
+/// [`StreamingMetrics`] counts these cover only that cell, which is what a load door waits for.
+#[derive(bevy::ecs::system::SystemParam)]
+#[allow(clippy::type_complexity)]
+pub(crate) struct PendingUnder<'w, 's> {
+    children: Query<'w, 's, &'static Children>,
+    pending: Query<
+        'w,
+        's,
+        (),
+        Or<(
+            With<PendingModel>,
+            With<PendingAssetProfile>,
+            With<PendingTerrainProfile>,
+            With<PendingWaterProfile>,
+        )>,
+    >,
+}
+
+impl PendingUnder<'_, '_> {
+    /// How many entities at or under `root` still carry an unfinished-work marker.
+    pub(crate) fn count(&self, root: Entity) -> usize {
+        std::iter::once(root)
+            .chain(self.children.iter_descendants(root))
+            .filter(|entity| self.pending.contains(*entity))
+            .count()
+    }
+}
+
+/// A pending-work marker for tests in other modules: terrain whose textures are still loading.
+#[cfg(test)]
+pub(crate) fn pending_marker_for_test() -> impl Bundle {
+    PendingTerrainProfile {
+        cell_id: 0,
+        quadrant: 0,
+        images: Vec::new(),
+        normals: Vec::new(),
+    }
 }
 
 type RenderPrimitiveQuery<'world, 'state> = Query<
@@ -6026,6 +6159,7 @@ mod tests {
             .init_resource::<lod::LodStreaming>()
             .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
+            .init_resource::<ActiveSpace>()
             .init_resource::<ProfilingState>()
             .add_systems(
                 Update,
@@ -9432,6 +9566,7 @@ mod tests {
         .init_resource::<StreamingWorld>()
         .init_resource::<lod::LodStreaming>()
         .init_resource::<TerrainContinuity>()
+        .init_resource::<ActiveSpace>()
         .init_resource::<ProfilingState>()
         .init_resource::<DiagnosticFallbackAssets>()
         .init_resource::<StaticCollisionCache>()

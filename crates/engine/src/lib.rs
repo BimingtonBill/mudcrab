@@ -6,6 +6,7 @@ pub mod config;
 pub mod demo_hud;
 pub mod demo_tour;
 pub mod door_animation;
+pub mod door_crossing;
 pub mod door_layer;
 pub mod doors;
 pub mod effect_palette;

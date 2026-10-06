@@ -407,6 +407,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         }
         app.add_systems(Startup, setup_world);
         if interactive_world_physics {
+            // main's own door crossing (`crate::door_crossing`, #128) is compiled but not
+            // registered: portal's doors (`crate::doors`, `crate::transition`) are the door
+            // system, and a second `E` handler would cross twice.
             app.add_plugins(WorldPlayerPlugin);
         }
         if app.world().resource::<EngineConfig>().streaming_fixture {
@@ -673,8 +676,8 @@ struct StreamingFixtureState {
 /// way a door crossing will load one; the camera then carries on over exteriors far outside the
 /// unload radius and comes back. The contract is that the interior never exists twice and its
 /// references match its root. Today it also stays loaded throughout (an interior has no grid
-/// square, so [`cell_within_unload_radius`](crate::streaming) keeps it, and no runtime path unloads
-/// one); that is current behaviour, not part of the contract.
+/// square, so [`cell_within_unload_radius`](crate::streaming) keeps it, and only a space switch
+/// unloads one); that is current behaviour, not part of the contract.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 struct InteriorCrossing {
     requested_frame: Option<u32>,
