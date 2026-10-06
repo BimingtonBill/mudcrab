@@ -1,7 +1,7 @@
 # Interior room graph: converter design (#188, converter half)
 
-Status: implemented on branch `phase1/room-graph` (2026-10-06); this note is the design it follows. The engine half (culling) is Phase 2's and
-is only sketched here where the table shape depends on it.
+Status: implemented in the converter (2026-10-06); this note is the design it follows. The engine
+half (culling) is a later PR and is only sketched here where the table shape depends on it.
 
 ## Summary
 
@@ -40,7 +40,7 @@ Checked against bytes:
 - The `XRMR` count equals the number of `XLRM` on every one of the 1,991 rooms.
 - The flags match the public names exactly: `0x80` with `LNAM` on 537 + 81 rooms, `0x40` with
   `INAM` on 5 + 81, never one without the other. So rooms can carry their own lighting template
-  and image space (618 and 86 rooms). That is lighting data, worth passing to Chef's lighting plan
+  and image space (618 and 86 rooms). That is lighting data, worth passing to the lighting plan
   (#129-#135); the converter can keep it at no cost.
 - The `u16` is 1 on 667 rooms and 0 on 1,324; no public source names it. Kept raw, not used.
 - `XLRM` links: all 1,965 point to a room in the same cell, 1,950 are mirrored by a link back, and
@@ -49,11 +49,12 @@ Checked against bytes:
   treat a link as an open edge: if one room is visible, so is the other, with no narrowing.
 - Room membership is not stored on objects. The Creation Kit wiki gives the rule as the bound
   "in which its pivot point is contained" (ck.uesp.net, Room Bounds and Portal Basics; seen only
-  through a search snippet, as the page refused our fetcher). The September study measured that
-  rule: 90.6% and 99.8% of references fall in at least one room in two large interiors, 13.2% and
-  1.2% in more than one (`local/research/interior-room-culling-design.md` §1.4).
+  through a search snippet, as the page refused automated fetching). An earlier byte scan of
+  Skyrim.esm measured that rule: in Ansilvund01 and KilkreathRuins03, 90.6% and 99.8% of
+  references fall in at least one room, and 13.2% and 1.2% in more than one.
 - `XPRM` holds half-extents. A portal's `XPRM.y` is always 1.0 (a thickness placeholder), and its
-  doorway is the marker's local X-Z rectangle (normal along local +Y), from the September study.
+  doorway is the marker's local X-Z rectangle (normal along local +Y), from the same
+  earlier byte scan.
 
 Coverage: 246 of 590 interiors in Skyrim.esm have room markers, 94 have 16 or more. In the
 all-plugins conversion, 4,246 room markers and 3,098 portals sit in interiors; 159 rooms and 133
@@ -148,11 +149,11 @@ membership pass (inside, outside, two rooms, rotated room); `plugin_references.r
 
 ## Fallbacks (conservative)
 
-| Case | Converter writes | Engine (Phase 2's half) |
+| Case | Converter writes | Engine (the engine half, a later PR) |
 |---|---|---|
 | Interior without room markers | no rows | draw everything, as today |
 | Old database, tables absent | n/a | feature off, no error |
-| Portal side 0, missing or not a room | `room_a`/`room_b` NULL | ignore that edge; the September study suggests a geometric fallback |
+| Portal side 0, missing or not a room | `room_a`/`room_b` NULL | ignore that edge, or fall back to the rooms whose box contains the portal's centre |
 | Object in no room / several | no row / several rows | always drawn |
 | Camera outside every room | n/a | draw everything |
 | Non-box room shape | skipped, counted | its objects are in no room, so drawn |
