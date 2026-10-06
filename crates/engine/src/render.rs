@@ -877,8 +877,7 @@ fn current_global_transform(
 ///
 /// Missing pieces mean the test cannot run - a plane whose mesh has not produced an [`Aabb`] yet,
 /// or an observer without a [`Projection`] to build the frustum from - and the plane then counts as
-/// visible, keeping the
-/// reflection camera on rather than risk a stale reflection.
+/// visible, keeping the reflection camera on rather than risk a stale reflection.
 fn water_plane_in_view(
     main: &GlobalTransform,
     frustum: Option<&Frustum>,

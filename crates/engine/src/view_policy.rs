@@ -262,6 +262,8 @@ pub struct DirtyReasons {
     pub stale: bool,
     /// Its image was resized, so its texels are cropped rather than fresh.
     pub target_resized: bool,
+    /// Its policy was invalid and is valid again, so what it holds was made under other rules.
+    pub revalidated: bool,
 }
 
 impl DirtyReasons {
@@ -440,11 +442,12 @@ pub fn apply_view_policies(
             state.demand_open = demand.is_some_and(|demand| demand.request.is_some());
             continue;
         }
-        state.invalid = None;
+        let revalidated = state.invalid.take().is_some();
 
         let request = demand.and_then(|demand| demand.request.as_ref());
         let demanded = request.is_some();
         let mut dirty = state.dirty;
+        dirty.revalidated |= revalidated;
 
         // Causes the policy can see whether or not the view is demanded, so that a view hidden
         // when the world jumps is still refreshed the frame it is needed again.
@@ -476,7 +479,9 @@ pub fn apply_view_policies(
             dirty.demand_reopened |= !state.demand_open;
         }
 
-        if target.is_none() && !state.warned_missing_target {
+        if target.is_some() {
+            state.warned_missing_target = false;
+        } else if !state.warned_missing_target {
             warn!(
                 view = ?entity,
                 "a managed view has no SecondaryViewTarget, so its target is never resized"
@@ -557,21 +562,38 @@ pub fn apply_view_policies(
 /// For a perspective projection that is the field of view and the near plane. The aspect belongs
 /// to the view's own target (Bevy recomputes it from the target), and `far` bounds what the view
 /// culls and draws, so neither is carried over and a difference in either alone is not a change.
-/// Other projections are compared by their clip-from-view matrix. `None` means the adapter asked
+/// Other projections are compared by their clip-from-view matrix, with the camera's own far
+/// substituted into the request so a view that keeps its far does not read as changed every frame. `None` means the adapter asked
 /// for no projection at all, so only a change between `Some` and `None` counts.
 fn projection_changed(current: Option<&Projection>, requested: Option<&Projection>) -> bool {
     match (current, requested) {
         (Some(Projection::Perspective(current)), Some(Projection::Perspective(requested))) => {
             current.fov != requested.fov || current.near != requested.near
         }
+        // The camera keeps its own far, so the request is compared as it would be once written.
         (Some(current), Some(requested)) => {
-            current.get_clip_from_view() != requested.get_clip_from_view()
+            current.get_clip_from_view() != with_far(requested, current.far()).get_clip_from_view()
         }
         (current, requested) => current.is_some() != requested.is_some(),
     }
 }
 
+/// `projection` with its far replaced by `far`; a custom projection has none and is returned as is.
+fn with_far(projection: &Projection, far: f32) -> Projection {
+    let mut projection = projection.clone();
+    match &mut projection {
+        Projection::Perspective(projection) => projection.far = far,
+        Projection::Orthographic(projection) => projection.far = far,
+        Projection::Custom(_) => {}
+    }
+    projection
+}
+
 /// Gives `camera` the observer's projection without its `far` or aspect, writing only on a change.
+///
+/// A perspective projection takes the field of view and near plane. Any other kind is replaced
+/// whole with the camera's far kept, except [`Projection::Custom`], which has no far to keep and is
+/// taken as requested.
 ///
 /// Carrying the observer's `far` over would make the secondary view cull and draw as far as the
 /// observer does, which is exactly the cost a [`ViewPolicy`] exists to bound.
@@ -585,13 +607,7 @@ fn apply_projection(camera: &mut Mut<Projection>, requested: &Projection) {
             current.near = requested.near;
         }
         (current, requested) => {
-            let far = current.far();
-            *current = requested.clone();
-            match current {
-                Projection::Perspective(projection) => projection.far = far,
-                Projection::Orthographic(projection) => projection.far = far,
-                Projection::Custom(_) => {}
-            }
+            *current = with_far(requested, current.far());
         }
     }
 }
@@ -1283,6 +1299,61 @@ mod tests {
         assert!(
             !rewrites[1] && !rewrites[2],
             "an unchanged request does not rewrite the projection: {rewrites:?}"
+        );
+    }
+
+    #[test]
+    fn demand_held_through_an_invalid_period_forces_a_refresh_on_return() {
+        let mut policy = ViewPolicy::baseline();
+        policy.update_rate = ViewUpdateRate::OnDemand;
+        policy.max_staleness = Duration::MAX;
+        let mut harness = ViewHarness::new(policy);
+        let observer = Transform::from_xyz(0.0, 100.0, 0.0);
+        harness.demand(Some(still(observer)));
+        harness.frame();
+
+        let mut broken = policy;
+        broken.target_size = UVec2::new(0, 576);
+        harness.set_policy(broken);
+        harness.demand(Some(still(observer)));
+        assert!(!harness.frame().active);
+
+        harness.set_policy(policy);
+        harness.demand(Some(still(observer)));
+        let frame = harness.frame();
+        assert!(frame.active);
+        assert!(frame.last_forced.revalidated);
+    }
+
+    #[test]
+    fn an_orthographic_request_is_written_once() {
+        #[derive(Resource, Default)]
+        struct Rewrites(Vec<bool>);
+
+        fn record(projection: Query<Ref<Projection>, With<ViewPolicy>>, mut out: ResMut<Rewrites>) {
+            out.0.push(projection.single().unwrap().is_changed());
+        }
+
+        let mut harness = ViewHarness::new(ViewPolicy::baseline());
+        harness
+            .app
+            .init_resource::<Rewrites>()
+            .add_systems(PostUpdate, record.after(ViewPolicySystems::Apply));
+        let demand = ViewRequest {
+            projection: Some(Projection::Orthographic(OrthographicProjection {
+                far: 77_000.0,
+                ..OrthographicProjection::default_3d()
+            })),
+            ..still(Transform::from_xyz(0.0, 100.0, 0.0))
+        };
+        for _ in 0..3 {
+            harness.demand(Some(demand.clone()));
+            harness.frame();
+        }
+        let rewrites = &harness.app.world().resource::<Rewrites>().0;
+        assert!(
+            !rewrites[1] && !rewrites[2],
+            "an unchanged non-perspective request does not rewrite: {rewrites:?}"
         );
     }
 
