@@ -730,6 +730,49 @@ pub struct LodInventoryReport {
     pub issues: Vec<String>,
 }
 
+/// Whether `relative` (a runtime-asset path such as
+/// `meshes/terrain/tamriel/trees/tamriel.tree.3.glb`) is a tree billboard that
+/// [`record_lod_inventory`] publishes.
+///
+/// These meshes are generated from the `.lst` table, not converted from a NIF,
+/// so a conversion manifest never carries provenance for them. A metadata
+/// rebuild regenerates them instead of retaining them.
+pub fn is_tree_billboard_output(relative: &str) -> bool {
+    let parts: Vec<&str> = relative.split('/').collect();
+    let [meshes, terrain, worldspace, trees, file] = parts.as_slice() else {
+        return false;
+    };
+    if *meshes != "meshes" || *terrain != "terrain" || *trees != "trees" || worldspace.is_empty() {
+        return false;
+    }
+    file.strip_prefix(*worldspace)
+        .and_then(|rest| rest.strip_prefix(".tree."))
+        .and_then(|rest| rest.strip_suffix(".glb"))
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether an archive or loose-data path (any case) is a source file
+/// [`record_lod_inventory`] reads from the vfs: terrain and object block
+/// meshes, tree tables and tree blocks under `meshes/terrain/`, and the tree
+/// atlas `textures/terrain/<worldspace>/trees/*.dds`.
+pub fn is_inventory_input(relative: &Path) -> bool {
+    let lowered = relative
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let parts: Vec<&str> = lowered.split('/').collect();
+    fn extension(name: &str) -> Option<&str> {
+        name.rsplit_once('.').map(|(_, extension)| extension)
+    }
+    match parts.as_slice() {
+        ["meshes", "terrain", .., file] => {
+            parts.len() >= 4 && matches!(extension(file), Some("btr" | "bto" | "btt" | "lst"))
+        }
+        ["textures", "terrain", _, "trees", file] => extension(file) == Some("dds"),
+        _ => false,
+    }
+}
+
 /// Records the distant-LOD inventory of one converted asset set.
 ///
 /// Reads `lodsettings/<worldspace>.lod`, the block meshes under
@@ -2161,6 +2204,51 @@ mod tests {
         assert_eq!(report.worldspaces, 0);
         assert_eq!(report.issues.len(), 1);
         assert!(report.issues[0].contains("unknown"), "{:?}", report.issues);
+    }
+
+    #[test]
+    fn recognises_only_generated_tree_billboard_paths() {
+        for yes in [
+            "meshes/terrain/tamriel/trees/tamriel.tree.0.glb",
+            "meshes/terrain/dlc2solstheimworld/trees/dlc2solstheimworld.tree.35.glb",
+        ] {
+            assert!(is_tree_billboard_output(yes), "{yes}");
+        }
+        for no in [
+            "meshes/terrain/tamriel/trees/tamriel.tree.glb",
+            "meshes/terrain/tamriel/trees/tamriel.tree.x.glb",
+            "meshes/terrain/tamriel/trees/sovngarde.tree.0.glb",
+            "meshes/terrain/tamriel/tamriel.tree.0.glb",
+            "meshes/terrain/tamriel/trees/tamriel.4.0.0.glb",
+            "meshes/terrain/tamriel/trees/sub/tamriel.tree.0.glb",
+            "meshes/trees/tamriel/trees/tamriel.tree.0.glb",
+            "textures/terrain/tamriel/trees/tamriel.tree.0.glb",
+        ] {
+            assert!(!is_tree_billboard_output(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn recognises_the_files_the_inventory_reads_in_any_case() {
+        for yes in [
+            "Meshes/Terrain/Tamriel/Tamriel.4.0.0.btr",
+            "meshes/terrain/tamriel/objects/tamriel.4.0.0.bto",
+            r"Meshes\Terrain\Tamriel\Trees\Tamriel.lst",
+            "meshes/terrain/tamriel/trees/tamriel.4.0.0.btt",
+            "textures/terrain/tamriel/trees/tamrieltreelod.dds",
+        ] {
+            assert!(is_inventory_input(Path::new(yes)), "{yes}");
+        }
+        for no in [
+            "meshes/rock.nif",
+            "meshes/terrain/tamriel.btr",
+            "meshes/terrain/tamriel/readme.txt",
+            "textures/terrain/tamriel/tamriel.4.0.0.dds",
+            "textures/terrain/tamriel/trees/sub/atlas.dds",
+            "lodsettings/tamriel.lod",
+        ] {
+            assert!(!is_inventory_input(Path::new(no)), "{no}");
+        }
     }
 
     #[test]

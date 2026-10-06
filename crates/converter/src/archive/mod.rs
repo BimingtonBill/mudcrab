@@ -181,6 +181,20 @@ impl ArchiveExtractor {
         extract_selected_reporting(archive_path, output_root, is_lod_setting, None, None)
     }
 
+    /// portal: extracts the files the distant-LOD inventory reads, and nothing else.
+    pub(crate) fn extract_lod_inventory_inputs(
+        archive_path: &Path,
+        output_root: &Path,
+    ) -> Result<Vec<ExtractedFile>> {
+        extract_selected_reporting(
+            archive_path,
+            output_root,
+            crate::portal_lod::is_inventory_input,
+            None,
+            None,
+        )
+    }
+
     pub(crate) fn extract_paths(
         archive_path: &Path,
         output_root: &Path,
