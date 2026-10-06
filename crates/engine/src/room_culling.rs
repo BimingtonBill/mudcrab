@@ -48,12 +48,18 @@
 //! Skyrim's open caves place room markers side by side with no portal and no `XLRM` link, and
 //! their boxes overlap or abut: in effect one space. When a cell's graph is built, every pair of
 //! rooms whose oriented boxes overlap, or lie within [`OVERLAP_TOLERANCE`] Creation units of each
-//! other, gets an implicit edge ([`overlap_links`]). Unlike an `XLRM` link it is not open: it is a
-//! thick portal. Whatever is seen from room A into overlapping room B passes through their shared
-//! volume, which lies inside both boxes, so crossing the edge narrows the region to
-//! `region` intersected with A's screen rectangle and B's (boxes projected with the doorway
-//! clipping; a box holding the camera is the whole screen), and B is entered only if that is
-//! non-empty. Without the narrowing the edges chain through a whole cave and nothing is culled. The test is a separating-axis test on the two oriented
+//! other, gets an implicit edge ([`overlap_links`]), unless a doorway already joins the pair (the
+//! doorway's narrowing is kept). Unlike an `XLRM` link it is not open: it is a thick portal into
+//! the neighbour, so crossing the edge narrows the region to `region` intersected with the
+//! neighbour's screen rectangle (the box projected with the doorway clipping; a box holding the
+//! camera is the whole screen), and the neighbour is entered only if that is non-empty. The
+//! source room's rectangle is not applied: a ray can reach the neighbour without crossing the
+//! source's box. Without the narrowing the edges chain through a whole cave and nothing is
+//! culled. The walk assumes the room boxes cover every visible ray's sequence of rooms: a ray that
+//! leaves one box, crosses space no box covers and lands in a far room (review #1028's constructed
+//! S/A/B/C case) is not followed. The region a room is entered with is already inside that room's
+//! rectangle, so applying the source room's rectangle again would change nothing. The test is a
+//! separating-axis test on the two oriented
 //! boxes. Rooms further apart than the tolerance, such as two rooms with a wall between them, need
 //! a portal or a link. Orientation comes from the shared Creation-to-runtime function, so it is the
 //! converter's convention (verified on real data: it puts 99.2% of portal centres inside both of
@@ -278,6 +284,9 @@ pub fn rooms_overlap(a: &Room, b: &Room) -> bool {
     if !(a.center.is_finite() && b.center.is_finite() && a.half.is_finite() && b.half.is_finite()) {
         return false;
     }
+    // The tolerance is in units only if the rotations are unit quaternions, which
+    // `Room::from_creation` guarantees.
+    debug_assert!(a.rotation.is_normalized() && b.rotation.is_normalized());
     let axes_a = [
         a.rotation * Vec3::X,
         a.rotation * Vec3::Y,
@@ -546,26 +555,18 @@ impl RoomGraph {
             for &other in &linked[room] {
                 pending.push((other, seen));
             }
-            // An overlap is a thick portal: whatever is seen from this room into the neighbour
-            // passes through their shared volume, which lies inside both boxes, so the region
-            // narrows to both boxes' screen rectangles. A box that holds the camera covers the
-            // whole screen.
-            if !overlapping[room].is_empty() {
-                let screen_of = |index: usize| {
-                    if self.rooms[index].contains(camera) {
-                        Some(Rect::FULL)
-                    } else {
-                        project_box(&self.rooms[index], clip_from_local)
-                    }
+            // An overlap is a thick portal into the neighbour: the region narrows to the
+            // neighbour's screen rectangle (a box holding the camera is the whole screen). It does
+            // not narrow to this room's rectangle: a ray can reach the neighbour without crossing
+            // this room's box.
+            for &other in &overlapping[room] {
+                let screen = if self.rooms[other].contains(camera) {
+                    Some(Rect::FULL)
+                } else {
+                    project_box(&self.rooms[other], clip_from_local)
                 };
-                if let Some(here) = screen_of(room).and_then(|screen| screen.intersect(seen)) {
-                    for &other in &overlapping[room] {
-                        if let Some(through) =
-                            screen_of(other).and_then(|screen| screen.intersect(here))
-                        {
-                            pending.push((other, through));
-                        }
-                    }
+                if let Some(through) = screen.and_then(|screen| screen.intersect(seen)) {
+                    pending.push((other, through));
                 }
             }
         }
@@ -679,7 +680,14 @@ pub fn load_room_graph(connection: &Connection, cell_id: u32) -> rusqlite::Resul
     }
     let implicit: Vec<(usize, usize)> = overlap_links(&graph.rooms)
         .into_iter()
-        .filter(|&(a, b)| !graph.links.contains(&(a, b)) && !graph.links.contains(&(b, a)))
+        .filter(|&(a, b)| {
+            let joined = |&(x, y): &(usize, usize)| (x, y) == (a, b) || (x, y) == (b, a);
+            !graph.links.iter().any(joined)
+                && !graph
+                    .portals
+                    .iter()
+                    .any(|portal| matches!(portal.rooms, [Some(x), Some(y)] if joined(&(x, y))))
+        })
         .collect();
     if !implicit.is_empty() {
         info!(
@@ -2138,5 +2146,39 @@ mod tests {
         assert!(graph.overlaps.contains(&(1, 2)));
         let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
         assert_eq!(reached, vec![true, true, true]);
+    }
+
+    /// A touching pair that a doorway joins keeps the doorway's narrowing: no overlap edge is added.
+    #[test]
+    fn a_pair_joined_by_a_doorway_gets_no_overlap_edge() {
+        let connection = database();
+        insert_room(&connection, 1, 7, [0.0, 0.0, 0.0]);
+        // Touching room 1 along creation X (half_x is 10).
+        insert_room(&connection, 2, 7, [20.0, 0.0, 0.0]);
+        insert_room(&connection, 3, 7, [40.0, 0.0, 0.0]);
+        connection
+            .execute(
+                "INSERT INTO room_portals VALUES (10,7,10,0,0,0,0,0,4,4,1,2)",
+                [],
+            )
+            .unwrap();
+        let graph = load_room_graph(&connection, 7).unwrap();
+        // 1-2 has a doorway, 2-3 touches with none.
+        assert_eq!(graph.overlaps, vec![(1, 2)]);
+        // Through the doorway a narrow rectangle shows; the pair keeps that narrowing.
+        let rooms = vec![
+            room(1, Vec3::ZERO, 10.0),
+            room(2, Vec3::new(0.0, 0.0, -20.0), 10.0),
+        ];
+        let mut doorwayed = RoomGraph {
+            portals: vec![doorway(10, Vec3::new(0.0, 0.0, -10.0), 1.0, [0, 1])],
+            rooms,
+            ..Default::default()
+        };
+        doorwayed.overlaps = vec![];
+        let reached = doorwayed
+            .reached_rooms(Vec3::ZERO, clip_from_local())
+            .unwrap();
+        assert_eq!(reached, vec![true, true]);
     }
 }
