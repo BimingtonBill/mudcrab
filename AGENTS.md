@@ -101,7 +101,7 @@ Every task belongs to one track; name it in the brief, the commit and the handof
 - **Phase 1** (added 2026-09-27, the user's new Phase 1 Dev session): improvements to upstream's
   finished converter (`docs/roadmap/01-asset-pipeline.md`), sent upstream like Phase 2. Worktree
   `C:\Modding\Mudcrab\worktrees\phase1`, branches `phase1/<topic>` cut from `main`, upstream's commit style, build
-  targets and conversion output on D:, worker tasks `<kind>-<nnn>-p1-<slug>` numbered 800-899. It owns
+  targets and conversion output on D:, worker tasks `<kind>-<nnn>-p1-<slug>` numbered 800-899, then 1900-1999 (since 2026-10-08). It owns
   `crates/converter/**` and `crates/dummy-content/**`; `crates/shared/**` changes are agreed by message.
   Starting brief: `local/handover/phase1-dev.md`.
 - **Phase 3** (added 2026-09-28, the user's Phase 3 Dev session; **PARKED for new work by the user,
