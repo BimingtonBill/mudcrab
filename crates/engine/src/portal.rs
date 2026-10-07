@@ -180,10 +180,10 @@ use crate::{
     // The doorway's own dome: the marker that gives its camera one, and the destination's colours.
     sky::SkyCamera,
     sky_dome::CameraSky,
-    streaming::{ActiveCell, RenderOrigin, StreamingWorld, camera_grid},
+    streaming::{ActiveCell, PrestreamCells, RenderOrigin, StreamingWorld, camera_grid},
     transition::{
-        CrossingHeld, DOOR_PRESTREAM_RADIUS, DoorMap, destination_is_resident, destination_keys,
-        distance_in_front_of_door, door_map,
+        CrossingHeld, DOOR_PRESTREAM_RADIUS, DoorMap, destination_is_loaded,
+        destination_is_resident, destination_keys, distance_in_front_of_door, door_map,
     },
     world::{
         components::{
@@ -201,7 +201,7 @@ use bevy::{
     asset::embedded_asset,
     camera::primitives::Aabb,
     camera::{
-        CameraUpdateSystems, ClearColorConfig, Hdr, RenderTarget, SubCameraView,
+        CameraUpdateSystems, ClearColorConfig, Hdr, RenderTarget, SubCameraView, Viewport,
         primitives::Frustum,
         visibility::{RenderLayers, VisibilitySystems},
     },
@@ -498,6 +498,10 @@ impl Plugin for PortalPlugin {
         add_cell_layer_isolation(app);
         app.add_plugins(MaterialPlugin::<PortalMaterial>::default())
             .init_resource::<PortalState>()
+            // The prestream window's destination pre-warm (impl-286). The demo tour's
+            // `Phase::Prestream` reads it to hold the wait while its work runs behind it; a run
+            // without the portal never has it and never warms.
+            .init_resource::<PortalPrewarm>()
             // The streaming commit reads this to stamp a cell's nodes at birth
             // (`spawn_layer_stamp`); a run without the portal never has it and never stamps.
             .init_resource::<StreamedCellLayerStamps>()
@@ -515,6 +519,10 @@ impl Plugin for PortalPlugin {
                     // which is what the roles would otherwise need the next frame for. It also
                     // measures the rectangle of the screen the doorway covers.
                     update_portal,
+                    // After it, in the same frame: the destination behind the prestream window is
+                    // drawn by the warm view while the wait is open (impl-286), on exactly the
+                    // frames `update_portal` left the camera off and the quad hidden.
+                    prewarm_destination_view,
                     // After it, in the same frame: a doorway on screen but behind a wall is not
                     // rendered either (impl-201).
                     skip_occluded_doorway,
@@ -1934,7 +1942,7 @@ fn measure_leaf_openings(
 /// What makes `Closed` different is that nothing is drawn over the doorway any more: the window
 /// stands in the only opening a door has, so a `Closed` door would put the destination image behind
 /// its own closed leaf. A door with no [`DoorState`] at all counts as closed, like everywhere else.
-fn portal_shows_through(state: Option<&DoorState>) -> bool {
+pub(crate) fn portal_shows_through(state: Option<&DoorState>) -> bool {
     state.is_some_and(|state| {
         matches!(
             state,
@@ -3915,6 +3923,302 @@ fn apply_collider_role(
         }
     }
     true
+}
+
+/// Frames the render pipeline cache's created count must hold flat, with nothing left waiting in
+/// it, before a warm view calls the destination's specialization done ([`PortalPrewarm`]).
+///
+/// Two: the count rises while `specialize_material_meshes` keeps queueing the destination's
+/// pipelines (bevy_pbr `material.rs:986-1093` - one render frame can queue several), and a queue
+/// that has stopped growing with an empty waiting set is the cache saying there is nothing left to
+/// compile. A fixed frame count would neither cover a burst that outlasts it nor end a warm-up
+/// that had nothing to do; readiness, not a number of frames, is what bounds the warm view.
+const PREWARM_SETTLE_FRAMES: u32 = 2;
+
+/// The destination pre-warm's phase.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum PrewarmPhase {
+    /// Nothing is outstanding: no destination still streaming in behind the window, no warm view
+    /// running.
+    #[default]
+    Idle,
+    /// The destination behind the window's door is still streaming in. There is nothing to
+    /// specialize yet, and the prestream wait - the tour's `Phase::Prestream`, which holds while
+    /// [`PortalPrewarm::settled`] is false - lasts until the loads land, so their finalization
+    /// lands behind the wait instead of on the crossing frame (Stage A §2: the PreUpdate flush is
+    /// per-frame and view-independent; the only hold is the load itself).
+    WaitingLoad,
+    /// The portal camera is active on the destination's layer, spending the wait's frames on the
+    /// specialization and upload burst the crossing frame would otherwise carry.
+    Warming,
+}
+
+/// What a windowed door's destination still needs from the pre-warm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrewarmNeed {
+    /// Its cells are still streaming in.
+    Load,
+    /// Its landing cell is resident: there is something to draw.
+    Warm,
+}
+
+/// The destination pre-warm (impl-286): while the prestream window is open
+/// (`transition::plan_door_prestream`'s keys, which the tour's `Phase::Prestream` and a walked
+/// approach alike already provide), the portal camera - spawned inactive on
+/// [`DESTINATION_LAYER`] - is activated behind the wait, so the destination's first view
+/// specializes its pipelines and runs its paced uploads while the player walks up, instead of on
+/// the crossing frame.
+///
+/// Stage A (`local/research/t286-prestream-prewarm-mechanism-2026-10-08.md`): specialization is the
+/// only view-gated piece of the crossing burst (bevy_pbr `material.rs:915/943`, bevy_camera
+/// `visibility/mod.rs:780-811` - no active view intersects layer 2 while a door is closed), while
+/// asset finalization and `RenderAssetBytesPerFrame` uploads are event-driven and
+/// view-independent. So activating the existing camera is the whole mechanism: the uploads keep
+/// their pacing budget untouched (`app.rs` `upload_budget`, left as the run configures it - tours
+/// run it unpaced today and this changes nothing about that), and the destination sun stays off
+/// (its illuminance is 0 while [`update_destination_atmosphere`] has no open doorway to read, so
+/// the warm view casts no shadow cascades). What the warm view costs is one full extra 3D view -
+/// ~+1.6-2.5 ms of render CPU per frame *while the wait is open* (Stage A §4a) - bounded by
+/// readiness, never by frame counts.
+#[derive(Resource, Default, Debug)]
+pub(crate) struct PortalPrewarm {
+    phase: PrewarmPhase,
+    /// The door whose destination the phase is about; `None` while idle.
+    door: Option<Entity>,
+    /// Destination cells whose materials have already been drawn against this run - by the warm
+    /// view or by the portal itself. Pipelines are cached run-wide, so a second approach to the
+    /// same door warms nothing.
+    warmed: HashSet<CellKey>,
+    /// The pipeline cache's created count at the last observation, and how many frames it has
+    /// held.
+    created: u32,
+    stable: u32,
+}
+
+impl PortalPrewarm {
+    /// Whether nothing is outstanding behind the prestream wait: no destination still loading, no
+    /// warm view running. The demo tour's `Phase::Prestream` holds while this is false, which is
+    /// what makes that wait adaptive instead of a flat six seconds.
+    pub(crate) fn settled(&self) -> bool {
+        self.phase == PrewarmPhase::Idle
+    }
+
+    /// What the wait is being held for, for the tour's log.
+    pub(crate) fn describe(&self) -> &'static str {
+        match self.phase {
+            PrewarmPhase::Idle => "nothing outstanding",
+            PrewarmPhase::WaitingLoad => "the destination is still streaming in",
+            PrewarmPhase::Warming => "the destination's warm view is running",
+        }
+    }
+
+    fn go_idle(&mut self) {
+        self.phase = PrewarmPhase::Idle;
+        self.door = None;
+    }
+}
+
+/// Pre-warms the destination behind the prestream window: picks the nearest door of the active
+/// space whose destination the window is streaming and that still has something to warm, holds
+/// while that destination loads ([`PrewarmPhase::WaitingLoad`]), then activates the portal camera
+/// for the destination's own view ([`PrewarmPhase::Warming`]) until the pipeline cache settles
+/// ([`PREWARM_SETTLE_FRAMES`]) - and goes off again the frame it has.
+///
+/// The camera is placed exactly where [`update_portal`] places it for a door it draws through
+/// (`door_map`'s pose, projected through the destination doorway's clip plane), so the variants
+/// warmed are the ones the doorway renders. The quad and the published doorway stay exactly what
+/// `update_portal` left them: the warm view draws the destination and nothing else, and nothing
+/// samples its target until a real doorway stands open.
+#[allow(clippy::too_many_arguments)]
+fn prewarm_destination_view(
+    mut state: ResMut<PortalState>,
+    active: Option<Res<ActiveCell>>,
+    config: Option<Res<EngineConfig>>,
+    origin: Option<Res<RenderOrigin>>,
+    streaming: Option<Res<StreamingWorld>>,
+    prestream: Option<Res<PrestreamCells>>,
+    counts: Option<Res<PipelineCounts>>,
+    mut prewarm: ResMut<PortalPrewarm>,
+    main: MainCameraQuery,
+    doors: LoadDoorQuery,
+    parents: Query<&ChildOf>,
+    mut portal_camera: PortalCameraQuery,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let started = Instant::now();
+    // The guards mirror `update_portal`'s: a frame any of them fails on is a frame with no
+    // window to warm, and the phase is set down at once so the wait cannot be held by a stale
+    // one.
+    let (Some(_), Some(_), Some(origin)) = (active, config, origin) else {
+        prewarm.go_idle();
+        profiler.record_elapsed("portal/prewarm", started);
+        return;
+    };
+    let Ok((main_transform, main_projection, _)) = main.single() else {
+        prewarm.go_idle();
+        profiler.record_elapsed("portal/prewarm", started);
+        return;
+    };
+    let Ok((mut camera_transform, mut camera_projection, mut camera)) = portal_camera.single_mut()
+    else {
+        prewarm.go_idle();
+        profiler.record_elapsed("portal/prewarm", started);
+        return;
+    };
+    let Some(prestream) = prestream else {
+        prewarm.go_idle();
+        profiler.record_elapsed("portal/prewarm", started);
+        return;
+    };
+    let camera_position = main_transform.translation;
+    let camera_rotation = main_transform.rotation;
+
+    // The portal is drawing a doorway for real: its destination is being rendered this very
+    // frame, which warms it better than a warm view would. A doorway `update_portal` picked but
+    // left off screen has an inactive camera and is warmed like any other.
+    if let Some(door) = state.open_door
+        && camera.is_active
+        && let Ok((_, _, _, door_row, _, _, _, anchor)) = doors.get(door)
+    {
+        prewarm.warmed.extend(
+            destination_keys(&door_row.destination, anchor)
+                .into_iter()
+                .filter(|key| prestream.contains(key)),
+        );
+        prewarm.go_idle();
+        profiler.record_elapsed("portal/prewarm", started);
+        return;
+    }
+
+    // The window itself: with nothing being streamed for the doors ahead there is nothing to
+    // warm, and the run behaves exactly as it did without the pre-warm.
+    if prestream.keys().next().is_none() {
+        prewarm.go_idle();
+        profiler.record_elapsed("portal/prewarm", started);
+        return;
+    }
+
+    // The nearest door of the active space whose destination the window is streaming and that
+    // still has cells to warm. The window is the walk's, not the tour's: any run approaching a
+    // door prestreams it, so any run gets the warm view.
+    let mut candidates: Vec<(f32, Entity, Vec<CellKey>, PrewarmNeed)> = Vec::new();
+    for (entity, global, local, door, _, _, _, anchor) in &doors {
+        if state
+            .roles
+            .get(&parents.get(entity).map(ChildOf::parent).unwrap_or(entity))
+            != Some(&CellRole::Active)
+        {
+            continue;
+        }
+        // What this door's destination still needs: the cells the window is streaming that no
+        // warm view and no open doorway has drawn yet.
+        let wanted: Vec<CellKey> = destination_keys(&door.destination, anchor)
+            .into_iter()
+            .filter(|key| prestream.contains(key) && !prewarm.warmed.contains(key))
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let need = if !destination_is_loaded(&door.destination, anchor, streaming.as_deref()) {
+            PrewarmNeed::Load
+        } else if streaming
+            .is_none_or(|streaming| destination_is_resident(&door.destination, anchor, streaming))
+        {
+            // The view must be on the door's front for its pose to face the destination;
+            // anything else is re-tested the frame the walk comes around.
+            let map = door_map(
+                global.translation(),
+                global.rotation(),
+                local.scale,
+                door,
+                anchor,
+                origin.0,
+            );
+            if distance_in_front_of_door(map.pivot, map.frame, camera_position)
+                < MIN_PORTAL_DOOR_DISTANCE
+            {
+                continue;
+            }
+            PrewarmNeed::Warm
+        } else {
+            // Every cell settled and none of them resident: the destination failed for good
+            // (`destination_is_loaded` counts a failed cell as settled). Nothing will ever be
+            // drawn, so it is warmed by fiat and never waited on again.
+            prewarm.warmed.extend(wanted);
+            continue;
+        };
+        candidates.push((
+            global.translation().distance(camera_position),
+            entity,
+            wanted,
+            need,
+        ));
+    }
+    candidates.sort_by(|(near, ..), (far, ..)| near.total_cmp(far));
+    let Some((_, entity, wanted, need)) = candidates.into_iter().next() else {
+        prewarm.go_idle();
+        profiler.record_elapsed("portal/prewarm", started);
+        return;
+    };
+    if prewarm.door != Some(entity) {
+        // A new target restarts the readiness clock on this frame's cache.
+        prewarm.door = Some(entity);
+        prewarm.created = counts.as_ref().map_or(0, |counts| counts.read().0);
+        prewarm.stable = 0;
+    }
+    if need == PrewarmNeed::Load {
+        prewarm.phase = PrewarmPhase::WaitingLoad;
+        profiler.record_elapsed("portal/prewarm", started);
+        return;
+    }
+
+    // Warm: the destination's own view, placed where the doorway's render would place it.
+    let Ok((_, global, local, door, _, _, _, anchor)) = doors.get(entity) else {
+        prewarm.go_idle();
+        profiler.record_elapsed("portal/prewarm", started);
+        return;
+    };
+    let map = door_map(
+        global.translation(),
+        global.rotation(),
+        local.scale,
+        door,
+        anchor,
+        origin.0,
+    );
+    let (portal_position, portal_rotation) = map.pose(camera_position, camera_rotation);
+    let (destination_point, destination_normal) = map.destination_plane();
+    let clip_plane = doorway_clip_plane(
+        portal_position,
+        portal_rotation,
+        destination_point,
+        destination_normal,
+    );
+    camera_transform.translation = portal_position;
+    camera_transform.rotation = portal_rotation;
+    *camera_projection = portal_projection(main_projection, clip_plane, -clip_plane.w);
+    // A full view: no doorway is measured this frame, and a stale sub-view of the last shown
+    // doorway would clip the warm view down to it.
+    camera.sub_camera_view = None;
+    camera.is_active = true;
+    prewarm.phase = PrewarmPhase::Warming;
+
+    // Readiness: the warm view stays up until the pipeline cache has stopped growing with
+    // nothing left waiting in it, then goes off the same frame. Cells that commit later in the
+    // window re-open the count and warm themselves the same way.
+    let (created, waiting) = counts.map(|counts| counts.read()).unwrap_or((0, 0));
+    if created != prewarm.created {
+        prewarm.created = created;
+        prewarm.stable = 0;
+    } else {
+        prewarm.stable += 1;
+    }
+    if prewarm.stable >= PREWARM_SETTLE_FRAMES && waiting == 0 {
+        prewarm.warmed.extend(wanted);
+        prewarm.go_idle();
+        camera.is_active = false;
+    }
+    profiler.record_elapsed("portal/prewarm", started);
 }
 
 /// Places the portal camera in the destination of the nearest usable door and puts the doorway quad
@@ -8270,6 +8574,180 @@ mod tests {
             !on_main_camera(&app, active_mesh),
             "and the cell left is not"
         );
+    }
+
+    /// The portal camera, as [`setup_portal_camera`] spawns it but headless: born inactive on the
+    /// destination's layer, with the projection the pre-warm rewrites.
+    fn spawn_portal_camera(app: &mut App) -> Entity {
+        app.world_mut()
+            .spawn((
+                PortalCamera,
+                Camera {
+                    order: PORTAL_CAMERA_ORDER,
+                    is_active: false,
+                    ..default()
+                },
+                Projection::Perspective(PerspectiveProjection::default()),
+                Transform::default(),
+                RenderLayers::layer(DESTINATION_LAYER),
+            ))
+            .id()
+    }
+
+    /// The camera the walk is seen from, with the projection the pre-warm reads
+    /// ([`MainCameraQuery`] asks for one).
+    fn spawn_prewarm_main_camera(app: &mut App, position: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                StreamingCamera,
+                Transform::from_translation(position),
+                GlobalTransform::from_translation(position),
+                Projection::Perspective(PerspectiveProjection::default()),
+            ))
+            .id()
+    }
+
+    /// A closed load door of the active space whose destination is `cell_id`: the approach state
+    /// the pre-warm exists for.
+    fn spawn_windowed_door(app: &mut App, cell_id: u32) -> Entity {
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<PortalState>()
+            .roles
+            .insert(root, CellRole::Active);
+        app.world_mut()
+            .spawn((
+                Transform::default(),
+                GlobalTransform::default(),
+                interior_door(cell_id),
+                ChildOf(root),
+            ))
+            .id()
+    }
+
+    /// Everything [`prewarm_destination_view`] reads that [`portal_app`] does not already have:
+    /// the pipeline counts and a window streaming `cell_id`'s destination.
+    fn prewarm_app(app: &mut App, cell_id: u32) {
+        app.insert_resource(PipelineCounts::default());
+        let mut prestream = PrestreamCells::default();
+        prestream.request_interior(cell_id);
+        app.insert_resource(prestream);
+        app.add_systems(Update, prewarm_destination_view);
+    }
+
+    #[test]
+    fn the_prewarm_draws_the_destination_behind_the_prestream_wait() {
+        let mut app = portal_app();
+        prewarm_app(&mut app, PRESTREAMED_CELL);
+        spawn_prewarm_main_camera(&mut app, Vec3::new(0.0, 0.0, -400.0));
+        let camera = spawn_portal_camera(&mut app);
+        spawn_windowed_door(&mut app, PRESTREAMED_CELL);
+
+        // The approach: the door is closed, no doorway is drawn, and yet the destination's own
+        // view runs - the frame the crossing burst is spent in instead of on.
+        app.update();
+        let camera_state = app.world().get::<Camera>(camera).unwrap().clone();
+        assert!(
+            camera_state.is_active,
+            "the warm view runs behind the wait while the door is closed"
+        );
+        assert!(
+            camera_state.sub_camera_view.is_none(),
+            "a full view: no doorway has been measured"
+        );
+        assert_ne!(
+            app.world().get::<Transform>(camera).unwrap().translation,
+            Vec3::ZERO,
+            "the camera stands in the destination, not where it was born"
+        );
+        assert!(
+            !app.world().resource::<PortalPrewarm>().settled(),
+            "the warm view is still running"
+        );
+        assert_eq!(
+            app.world().resource::<PortalState>().open_door,
+            None,
+            "the warm view publishes no doorway of its own"
+        );
+
+        // Readiness, not a frame count: the cache has settled, so the view goes off the same
+        // frame and the warmed destination is never warmed again while the window stays open.
+        app.update();
+        let prewarm = app.world().resource::<PortalPrewarm>();
+        assert!(prewarm.settled(), "the settled cache ends the warm view");
+        assert!(
+            prewarm
+                .warmed
+                .contains(&CellKey::Interior(PRESTREAMED_CELL))
+        );
+        assert!(
+            !app.world().get::<Camera>(camera).unwrap().is_active,
+            "deactivated the frame it was ready"
+        );
+        app.update();
+        assert!(
+            !app.world().get::<Camera>(camera).unwrap().is_active,
+            "and the open window does not re-warm a warmed destination"
+        );
+    }
+
+    #[test]
+    fn the_prewarm_holds_the_prestream_wait_while_the_destination_loads() {
+        let mut app = portal_app();
+        prewarm_app(&mut app, PRESTREAMED_CELL);
+        // An empty streaming world: nothing is resident, so the destination is still streaming
+        // in - the state the adaptive wait exists to hold for.
+        app.insert_resource(StreamingWorld::default());
+        spawn_prewarm_main_camera(&mut app, Vec3::new(0.0, 0.0, -400.0));
+        let camera = spawn_portal_camera(&mut app);
+        spawn_windowed_door(&mut app, PRESTREAMED_CELL);
+
+        app.update();
+        app.update();
+        assert!(
+            !app.world().resource::<PortalPrewarm>().settled(),
+            "the destination is still streaming in: the wait holds"
+        );
+        assert!(
+            !app.world().get::<Camera>(camera).unwrap().is_active,
+            "and there is nothing to draw yet"
+        );
+
+        // The loads land (a run without a streaming world has everything loaded): the warm view
+        // runs, then ends on readiness.
+        app.world_mut().remove_resource::<StreamingWorld>();
+        app.update();
+        assert!(app.world().get::<Camera>(camera).unwrap().is_active);
+        app.update();
+        assert!(app.world().resource::<PortalPrewarm>().settled());
+        assert!(!app.world().get::<Camera>(camera).unwrap().is_active);
+    }
+
+    #[test]
+    fn a_run_without_a_prestream_window_is_never_warmed() {
+        // The window is what opens the warm view: with it empty - no door in reach - the run
+        // behaves exactly as it did without the pre-warm, camera left off and nothing awaited.
+        let mut app = portal_app();
+        app.insert_resource(PipelineCounts::default());
+        app.insert_resource(PrestreamCells::default());
+        app.add_systems(Update, prewarm_destination_view);
+        spawn_prewarm_main_camera(&mut app, Vec3::new(0.0, 0.0, -400.0));
+        let camera = spawn_portal_camera(&mut app);
+        spawn_windowed_door(&mut app, PRESTREAMED_CELL);
+        for _ in 0..3 {
+            app.update();
+        }
+        assert!(!app.world().get::<Camera>(camera).unwrap().is_active);
+        assert!(app.world().resource::<PortalPrewarm>().settled());
+
+        // And a run without a portal camera at all - a run without the portal - drives the same
+        // system to idle and nothing else: nothing is spawned for it, nothing panics.
+        let mut app = portal_app();
+        prewarm_app(&mut app, PRESTREAMED_CELL);
+        spawn_prewarm_main_camera(&mut app, Vec3::new(0.0, 0.0, -400.0));
+        spawn_windowed_door(&mut app, PRESTREAMED_CELL);
+        app.update();
+        assert!(app.world().resource::<PortalPrewarm>().settled());
     }
 
     #[test]

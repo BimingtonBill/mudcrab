@@ -204,7 +204,16 @@ const LOOK_AROUND_SECONDS: f32 = 1.0;
 /// Seconds to let the last screenshot reach the disk before the run exits (`P2`).
 const DONE_SECONDS: f32 = 1.0;
 /// Seconds to wait in front of a door so its destination pre-streams.
+///
+/// The floor. The wait is also adaptive (impl-286): it is held past this while the destination
+/// pre-warm ([`crate::portal::PortalPrewarm`]) still has work - the destination still streaming
+/// in, or its warm view still specializing the doorway's pipelines - so the first-visit burst
+/// lands behind the wait instead of on the crossing frame.
 const PRESTREAM_SECONDS: f32 = 6.0;
+/// The longest [`Phase::Prestream`] holds past [`PRESTREAM_SECONDS`] for the pre-warm: a
+/// destination whose loads never land is crossed anyway, and the log says the wait was capped -
+/// the same reading [`SETTLE_SECONDS`] takes in `Phase::Settle`.
+const PRESTREAM_WAIT_MAX_SECONDS: f32 = 20.0;
 /// Seconds to look for a door that has not spawned yet before giving up.
 const DOOR_SEARCH_SECONDS: f32 = 40.0;
 /// Where the camera stands in front of a door: distance and eye height.
@@ -1309,7 +1318,11 @@ fn run_demo_tour(
     active: Option<Res<ActiveCell>>,
     origin: Option<Res<RenderOrigin>>,
     // Grouped: a system takes at most sixteen parameters.
-    (real_time, mut open_door): (Res<Time<Real>>, MessageWriter<OpenDoor>),
+    (real_time, mut open_door, prewarm): (
+        Res<Time<Real>>,
+        MessageWriter<OpenDoor>,
+        Option<Res<crate::portal::PortalPrewarm>>,
+    ),
 ) {
     tour.frame += 1;
     tour.timer += time.delta_secs();
@@ -1490,7 +1503,26 @@ fn run_demo_tour(
             }
         }
         Phase::Prestream => {
-            if tour.timer >= PRESTREAM_SECONDS {
+            // The wait is adaptive (impl-286): the floor above is kept - the pose, the screenshots
+            // and the bench all read a settled run - but held past it while the pre-warm still
+            // has work, so the destination's loads and its first specialization both land behind
+            // the wait.
+            let prewarm = prewarm.as_deref();
+            let settled = prewarm.is_none_or(|prewarm| prewarm.settled());
+            if tour.timer >= PRESTREAM_SECONDS
+                && (settled || tour.timer >= PRESTREAM_WAIT_MAX_SECONDS)
+            {
+                let held = tour.timer - PRESTREAM_SECONDS;
+                if held > 1.0 {
+                    let line = format!(
+                        "stage {}: prestream wait held {held:.1} s past the floor ({})",
+                        tour.stage,
+                        prewarm.map_or("the pre-warm ended late".to_string(), |prewarm| {
+                            prewarm.describe().to_string()
+                        }),
+                    );
+                    tour.note(line);
+                }
                 let name = format!("{:02}-door", tour.stage);
                 shoot(&mut commands, &mut tour, &name);
                 // A screenshot is taken on a later frame; crossing now would photograph the far side.
