@@ -3,6 +3,34 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Portal Dev (timing window after the isolation rewrite; stopped at wrap-up)
+
+Track: Portal. Nothing pushed. Jobs from Upstream Dev (the user's plan for 10-08) and the user's own "match vanilla" decision (10-07 night).
+
+- **Release build** of portal through the gate (C:/Modding/Mudcrab/builds/portal-release-target, full rebuild after the folder move, 7 min).
+- **Timing window** 00:52-01:12, hold "timing" set and cleared, announced to all sessions. 5 portal scenes x3 + portal bench on
+  portal-rooms. Results: `local/reference/baseline-2026-10-08/RESULTS.md` (raw D:/Mudcrab/evidence/baseline-portal-2026-10-08, OWNER.txt, class B).
+  Isolation rewrite works (portal/isolate max 0.4 ms); door tour p99 49.9 -> 42.4 ms, p99.9 75.9 -> 67.7 ms; but the two crossing frames
+  still take 318-358 ms (now real time, no longer capped at 250), with only ~2 ms in spanned main-world systems. portal/propagate peaks at
+  37.7 ms once. Render thread owns the over-budget frames everywhere. Not a clean A/B: the data changed too.
+  Two false starts: a pre-hold cargo check overlapped (restarted; the gate now has `hold set ... --drain`), and `-CompareTo` refuses a
+  baseline on different assets (dropped; compared by hand).
+- **portal-bench.ps1** default assets -> portal-rooms (911210b3).
+- **Water merge 8acbdb7c: NOT done** (Upstream Dev: morning item). Conflicts were resolved, recorded with `git rerere`, then the merge
+  was aborted; a re-run of `git merge --no-ff 8acbdb7c` re-applies them. Copy of the resolution:
+  `local/plans/portal-water-merge-resolution-2026-10-08.patch`. Choices: app.rs test conflict = portal's side (main's #172 legacy-schema
+  tests use main's schema numbers); render.rs = portal's layer block (moved lower in portal) + the water branch's TEMPORARY 12 h wrap
+  period + both embedded shaders. Then build, clippy, nextest engine, commit.
+- **impl-190 (terrain ring off where the worldspace has LOD, "match vanilla")**: DeepSeek coder hit max turns (121) in 8 min with an
+  unbuilt, unreviewed change in 5 files (app, atmosphere, config, streaming, world/database; +379/-69) in
+  `local/impl/impl-190-portal-ring-off-with-lod` (session e7d3a720-6e04-4728-80ac-f645aab2893d). Its gated acceptance was stopped
+  (no runs while the user is away). Next: resume it with a narrow "finish and report" or split the brief (database check + resolver first,
+  then the readers), then review and accept.
+- Nothing of mine is running: no worker, build, engine, timing run.
+
+Next (morning): water merge + checks; impl-190 resume/split + review; analysis worker on the 300 ms crossing frame and the 37 ms
+propagate frame (door tour frame-series.csv, frames 895 and 2666).
+
 ## 2026-10-08 Phase 2 Dev (GLM 5.3 coder trial, stopped at wrap-up)
 
 Track: Phase 2. Nothing pushed. Job from Upstream Dev (the user's yes, 2026-10-08).
