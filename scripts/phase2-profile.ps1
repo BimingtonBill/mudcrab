@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability", "portal-door-tour", "portal-heavy", "lod-far", "lod-flythrough")]
+    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability", "portal-door-tour", "portal-heavy", "lod-far", "lod-far-ring-off", "lod-flythrough")]
     [string]$Scenario = "all",
     [string]$Assets,
     [string]$Worldspace = "0x3c",
@@ -146,11 +146,11 @@ function Get-SceneDuration {
 # pose is written in its comment below.
 #
 # The terrain ring: a benchmark run turns the ring off unless `--terrain-radius` names it
-# (config.rs), so every portal scene says which it wants. The door and portal scenes keep portal's
-# default ring; the two LOD scenes use 2, because the default ring's fog hides the native terrain
-# LOD (checked 2026-10-06 from 20500,-45500,6000 in Tamriel).
+# (config.rs), so every portal scene says which it wants. Every portal scene keeps portal's
+# default ring (since 28ce63dc the exterior fog ends at the LOD horizon, so the ring no longer hides
+# the native terrain LOD), except `lod-far-ring-off`, the comparison: the same pose with the ring
+# off, so the two windows show what the ring costs at the LOD vantage.
 $script:portalTerrainRadius = 8
-$script:lodTerrainRadius = 2
 
 # The engine arguments that make up one portal scene beyond the benchmark and profile arguments
 # every scene shares. `$RunDirectory` is where the run writes (the tour's frames go under it).
@@ -191,7 +191,15 @@ function Get-PortalSceneArguments {
         # shot of local/reference/lod-check/lod-check.json, held for the window).
         "lod-far" {
             return @(
-                "--terrain-radius", "$($script:lodTerrainRadius)",
+                "--terrain-radius", "$($script:portalTerrainRadius)",
+                "--shots", (Join-Path (Get-ProfilingRepository) "tools\reference\baseline_lod_far.json"),
+                "--shots-out", (Join-Path $RunDirectory "shots")
+            )
+        }
+        # The ring-off comparison: lod-far's pose and shot with no `--terrain-radius`, so the
+        # benchmark's default turns the terrain ring off (terrain only within the streamed cells).
+        "lod-far-ring-off" {
+            return @(
                 "--shots", (Join-Path (Get-ProfilingRepository) "tools\reference\baseline_lod_far.json"),
                 "--shots-out", (Join-Path $RunDirectory "shots")
             )
@@ -203,7 +211,7 @@ function Get-PortalSceneArguments {
         # scene is the start pose with no flight.
         "lod-flythrough" {
             $arguments = @(
-                "--terrain-radius", "$($script:lodTerrainRadius)",
+                "--terrain-radius", "$($script:portalTerrainRadius)",
                 "--start-position", "20500", "-45500", "6000", "--start-yaw", "0"
             )
             if (-not $StandingStill) { $arguments += @("--auto-fly-speed", "1500") }
@@ -260,7 +268,7 @@ function Get-ScenarioArguments {
         $arguments += @("--benchmark-only", "--synthetic-instances", "250000")
     } else {
         $arguments += @("--assets", $ResolvedAssets, "--worldspace", $Worldspace)
-        if ($Name -in @("portal-door-tour", "portal-heavy", "lod-far", "lod-flythrough")) {
+        if ($Name -in @("portal-door-tour", "portal-heavy", "lod-far", "lod-far-ring-off", "lod-flythrough")) {
             $arguments += Get-PortalSceneArguments -Name $Name -RunDirectory $RunDirectory -StandingStill:$StandingStill
         } elseif ($Name -eq "water") {
             $arguments += @("--grid-x", "$WaterGridX", "--grid-y", "$WaterGridY")

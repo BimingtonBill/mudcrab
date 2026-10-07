@@ -5,13 +5,14 @@ param(
     # dense place (Riverwood), the water and the streaming stress. `stability` is left out because it is a soak
     # window (30 minutes by default), not a baseline; `all` selects it too.
     #
-    # The portal branch adds four scenes, none of them in the default set: `portal-door-tour` (the
+    # The portal branch adds five scenes, none of them in the default set: `portal-door-tour` (the
     # Riverwood door tour, two crossings), `portal-heavy` (standing at Sven's House door with the
-    # portal view open), `lod-far` (a high vantage where terrain LOD reaches the horizon) and
-    # `lod-flythrough` (a fly-through from LOD into full detail). `portal` selects the four. They
+    # portal view open), `lod-far` (a high vantage where terrain LOD reaches the horizon),
+    # `lod-far-ring-off` (the same view with the terrain ring off, for comparison) and
+    # `lod-flythrough` (a fly-through from LOD into full detail). `portal` selects the five. They
     # load the portal's converted assets, so -Assets must name those. Their poses and arguments are in
     # phase2-profile.ps1 (Get-PortalSceneArguments).
-    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability", "portal", "portal-door-tour", "portal-heavy", "lod-far", "lod-flythrough")]
+    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability", "portal", "portal-door-tour", "portal-heavy", "lod-far", "lod-far-ring-off", "lod-flythrough")]
     [string[]]$Scenarios = @(),
     # The converted legal Skyrim asset set every world scenario loads. Not needed for `synthetic`.
     [string]$Assets,
@@ -63,7 +64,7 @@ foreach ($name in $sharedNames) { $requestedValues[$name] = Get-Variable -Name $
 foreach ($name in $sharedNames) { Set-Variable -Name $name -Value $requestedValues[$name] }
 
 $defaultScenarios = @("synthetic", "rural", "dense", "water", "stress")
-$portalScenarios = @("portal-door-tour", "portal-heavy", "lod-far", "lod-flythrough")
+$portalScenarios = @("portal-door-tour", "portal-heavy", "lod-far", "lod-far-ring-off", "lod-flythrough")
 if ($Scenarios -contains "portal") {
     $Scenarios = @($Scenarios | Where-Object { $_ -ne "portal" }) + $portalScenarios | Select-Object -Unique
 }
