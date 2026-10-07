@@ -248,6 +248,10 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
   measured, a build when the binary is current), and say the expected duration when starting it.
   Benchmarks open their window on screen and centred; every automated run's window title says what
   it is (`--run-label`).
+  **Launched consoles (the user, 2026-10-07):** every console a session starts (conversion, bench,
+  timing run, long script) opens visible and titled, and closes itself when the job ends, success or
+  failure: no `-NoExit`, `cmd /k` or `pause`. Its output is teed to a log file and its exit code written
+  to an exit file, so nothing is lost. Launch from PowerShell `Start-Process`, not Git Bash `start`.
 - **Non-measured engine builds use `cargo build --profile quick --bin engine`** (`target/quick/`):
   release without link-time optimisation, incremental. Defined in the untracked
   `C:\Modding\.cargo\config.toml`, so it never reaches upstream. Measured 2026-09-24: a one-file
