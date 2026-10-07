@@ -3,6 +3,65 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Portal Dev, Hermes (impl-285 implemented: crossing-frame attribution)
+
+Track: Portal. Nothing pushed. Job: Upstream Dev's brief
+`tasks/deepseek/impl-285-portal-crossing-frame-attribution.md` (84fd7f29), handed to this
+session in the group chat. Implemented directly (not delegated): bounded, two owned files.
+
+- **Done.** Branch `impl-285-portal-crossing-frame-attribution`, commit **9cb1fc80**, worktree
+  `D:\Mudcrab\worktrees\portal-impl-285` (OWNER.txt), cut from portal (84fd7f29). Measurement
+  only; no behaviour change.
+- **`frame/remainder`** (`render_timing.rs:69` const, window in `end_main`:480 /
+  `start_main`:465, `remainder_ms`:635): an `Instant` lap opened at the end of `Last`, closed
+  at the next `First`, reported **minus the extract and the wait when both ran inside the
+  window** (they are accumulated while the window is open, in `extracted`/`handed_over`), never
+  negative. Written into `CycleSides.remainder_ms` and sampled as `frame/remainder` while
+  recording. Gated on `track_cycles` (benchmark runs); zero cost otherwise.
+- **Per-cycle render phases** (`CycleSides`: the six new phase fields; `lap`:510 writes each
+  phase into the cycle the render frame belongs to via `phase_writer`:641): the seven phases are
+  one value per cycle each. `render-cycles.csv` (`profiling.rs:531 render_cycles_csv`, written
+  in `write_bundle`:830 beside `frame-series.csv`, bounded `MAX_RENDER_CYCLE_ROWS` = 100 000),
+  header, in order:
+  `cycle,main_world,extract,wait_for_render_thread,frame/remainder,render_thread,render/extract_commands_and_assets,render/specialize_and_views,render/queue,render/prepare,render/graph_and_present,render/cleanup,render/swapchain_acquire`
+  **Join:** `render-cycles.csv` row `n` ↔ `frame-series.csv` frame `n` (same number). Row `n`'s
+  `render_thread`/phases are the render schedule that ran *during* cycle `n` — fed by extract
+  `n−1` when pipelined (the n → n+1 offset) — so a crossing frame's render time is explained by
+  its own row's phases. `frame-series.csv` is byte-for-byte unchanged.
+- **Row plumbing:** `RenderTimings` mirrors each cycle write into `cycle_rows` (retention keeps
+  only cycles that can still be written); `take_completed_cycles`:387 hands over completed rows
+  once (watermark so a late write cannot duplicate); a new `drain_render_cycles` system
+  (`profiling.rs:261`, installed only when the run profiles, ordered after
+  `start_main_world`, which became `pub(crate)`) moves them into `ProfilingState`.
+  The run's last cycle or two have no row: their remainder window never closed.
+- **Tests** (all new, `render_timing.rs` unless noted): `the_remainder_excludes_the_extract_and_wait_that_ran_inside_the_window` (pure),
+  `the_cycle_remainder_excludes_the_extract_and_wait_that_ran_in_its_window` (record),
+  `the_cycle_sides_account_for_the_whole_cycle` (identity, sleep-based),
+  `the_remainder_is_kept_only_when_cycles_are_tracked`, `laps_write_their_phase_into_the_cycle_record` (both pipelined settings),
+  `completed_cycle_rows_are_handed_over_once_once_they_are_complete`,
+  `the_render_cycles_csv_names_every_column` and
+  `the_render_cycles_series_keeps_its_most_recent_rows` (`profiling.rs`);
+  `writes_complete_profile_bundle` now also asserts `render-cycles.csv`.
+- **Checks** (own build folder `C:/Modding/Mudcrab/builds/portal-impl-285-target`, OWNER.txt):
+  `cargo fmt --all -- --check` clean; gated `cargo clippy -p engine --all-targets
+  --all-features -- -D warnings` clean; gated `cargo nextest run -p engine --all-targets`
+  **1131 passed / 4 skipped**.
+- **Deviations from the brief:** `write_cycle`'s writer changed `FnOnce`→`Fn` (it now writes two
+  records); the rows drain runs in `First` after the main frame's start (a row is complete only
+  once the next `First` closed its remainder) instead of inside the ledger's take — the ledger's
+  records are untouched; the remainder is sampled into `cpu-spans.json` as `frame/remainder` on
+  top of the CSV column (distribution for free, same gate).
+- **Foundations check:** no shortcuts (measurement only, nothing hidden, no behaviour change);
+  foundationally optimised (zero cost when not tracking/profiling, bounded stores); flexible
+  (no worldspace/scene assumptions — the window is measured for any route); moddable (nothing
+  vanilla-specific); aligned (the 160 fps goal's measurement prerequisite — the ~80 ms crossing
+  remainder becomes attributable, and the per-cycle phases make the pipeline-activity frames
+  comparable, which will price the prestream pre-warm's buy-back). Shortcut question: the only
+  thing this takes short is the run's final row (window never closes) — documented, and it
+  cannot hide a crossing (crossings are mid-run).
+- Nothing running; no timing run (the verifying re-profile is a booked window after this lands
+  together with the prestream pre-warm).
+
 ## 2026-10-08 Portal Dev, Hermes (impl-190 merged into portal)
 
 Track: Portal. Nothing pushed. Job: the user's "keep working on 160 fps in portal demo,
