@@ -41,7 +41,7 @@ use shared::collision::{COLLISION_ASSET_VERSION, CollisionAsset, CollisionShape}
 use shared::lod::LodTier;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub(crate) mod lod;
 
@@ -70,6 +70,20 @@ const MAX_TERRAIN_CELL_COMMITS_PER_FRAME: usize = 16;
 /// transient failure - a busy worker, a database hiccup - its chances, and is small enough that a
 /// cell the database really does not have is not re-requested every frame.
 const INTERIOR_FAILED_RETRIES: u32 = 3;
+
+/// Total load attempts a failing cell gets before the streamer gives up on it for this visit of
+/// the camera: the first try plus two retries. The failures that retry at all are transient (a
+/// database or IO error; a load-order race can heal), and two retries spread over a 1 s then 2 s
+/// backoff outlast any such race, while a cell that fails for a real reason is not re-queried -
+/// or re-logged - forever. A cell that leaves the unload radius is forgotten, so its next visit
+/// starts this budget fresh.
+const MAX_CELL_LOAD_ATTEMPTS: u32 = 3;
+
+/// How long the streamer waits before the first retry of a failed cell. Every further failure
+/// doubles the wait, so the budget of [`MAX_CELL_LOAD_ATTEMPTS`] waits 1 s and then 2 s. The wait
+/// is wall-clock time (the clock the request queue and commit budget already measure with), never
+/// a frame count: a retry every frame would re-query a busy database once per frame.
+const CELL_RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
 
 fn commit_budget_exceeded(elapsed_micros: u64, budget_micros: u64) -> bool {
     elapsed_micros > budget_micros.saturating_add(COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS)
@@ -232,6 +246,31 @@ fn load_directional_snow_catalog(
     *catalog = DirectionalSnowCatalog::open(&config.assets_dir.join("skyrim_world.db"));
 }
 
+/// One exterior cell's failed full request, kept for as long as the cell stays planned
+/// ([`StreamingWorld::full_failed`]).
+///
+/// `attempts` is how many full loads of the cell have failed since it was last wanted from
+/// nothing, `reason` is why the last one failed, and `retry_at` is the earliest time the plan may
+/// ask for the cell in full again. `retry_at` is `None` once the cell is given up on - its data is
+/// invalid, or the [`MAX_CELL_LOAD_ATTEMPTS`] budget is spent - and a given-up cell is downgraded
+/// to terrain-only until it leaves the plan.
+#[derive(Debug, Clone)]
+struct FullFailure {
+    attempts: u32,
+    reason: String,
+    retry_at: Option<Instant>,
+}
+
+impl FullFailure {
+    /// Whether the plan may ask for the cell in full again now: its backoff has passed and its
+    /// attempt budget is not spent. A `retry_at` in the future is the wait between two attempts;
+    /// `None` is a cell given up on, which is never asked again while the entry lives.
+    fn retryable(&self, now: Instant) -> bool {
+        matches!(self.retry_at, Some(retry_at) if now >= retry_at)
+            && self.attempts < MAX_CELL_LOAD_ATTEMPTS
+    }
+}
+
 #[derive(Resource, Default)]
 pub struct StreamingWorld {
     generation: u64,
@@ -239,12 +278,16 @@ pub struct StreamingWorld {
     /// oldest first whatever order the queries iterate in.
     next_model_sequence: u64,
     cells: HashMap<CellKey, CellStatus>,
-    /// Exterior cells whose full request failed, while they stay planned. The plan asks for them
-    /// as terrain-only instead, wherever they are: a cell the camera stands in whose references
-    /// failed still has a landscape to draw, and asking for it in full again would fail again (the
-    /// data does not change) and drop that landscape every time. Forgotten when the cell leaves
-    /// the plan, so a cell the camera comes back to is asked for in full once more.
-    full_failed: HashSet<CellKey>,
+    /// Exterior cells whose full request failed, while they stay planned, with the failure record
+    /// the retry decision reads. The plan asks for these cells as terrain-only instead, wherever
+    /// they are: a cell the camera stands in whose references failed still has a landscape to
+    /// draw, and asking for it in full again would fail again (the data does not change) and drop
+    /// that landscape every time. An entry whose backoff has passed and whose attempt budget
+    /// ([`MAX_CELL_LOAD_ATTEMPTS`]) is not spent is the one exception: the plan asks for the cell
+    /// in full again ([`plan_cells`]), and the terrain root it holds keeps drawing it meanwhile.
+    /// Forgotten when the cell leaves the plan, so a cell the camera comes back to is asked for in
+    /// full once more, with a fresh record.
+    full_failed: HashMap<CellKey, FullFailure>,
     /// How much of [`INTERIOR_FAILED_RETRIES`] each failed cell has spent. A budget belongs to one
     /// stay in the plan: it is dropped with the cell, so a cell the camera comes back to is asked
     /// for in full again with its budget whole.
@@ -290,11 +333,15 @@ impl StreamingWorld {
         )
     }
 
-    /// Whether the request for `key` in full failed and will not be repeated: the cell is never
-    /// going to become resident, so a caller waiting for it (a `--shots` pose) stops waiting.
+    /// Whether the request for `key` in full failed and will not be repeated for now: the cell is
+    /// never going to become resident while this answers `true`, so a caller waiting for it (a
+    /// `--shots` pose) stops waiting.
     ///
     /// An exterior cell whose full request failed is drawn as terrain-only afterwards, so it is
-    /// failed by this test whatever its terrain-only status is.
+    /// failed by this test whatever its terrain-only status is. The plan may still ask for the
+    /// cell in full again once its backoff passes ([`plan_cells`]), but a caller that settled on
+    /// the failure has already stopped waiting, and the terrain the cell is drawn by does not
+    /// depend on the answer.
     ///
     /// The interior the camera stands in is the one cell whose failed full request *is* repeated:
     /// the plan asks for it again up to [`INTERIOR_FAILED_RETRIES`] times
@@ -305,11 +352,12 @@ impl StreamingWorld {
     /// the plan is about to ask for again. An interior that is not the one the camera stands in is
     /// never retried, so its first failure is final, exactly as an exterior's is.
     pub fn has_failed(&self, key: &CellKey) -> bool {
-        self.full_failed.contains(key)
+        self.full_failed.contains_key(key)
             || (matches!(
                 self.cells.get(key),
                 Some(CellStatus::Failed {
-                    detail: CellDetail::Full
+                    detail: CellDetail::Full,
+                    ..
                 })
             ) && !retry_failed_interior(key, self.active_interior, self))
     }
@@ -317,9 +365,10 @@ impl StreamingWorld {
     /// The number of cells the planner wants for `space` (the stream window of `radius` around
     /// `center` outside, the one active cell inside an interior), how many of them are resident (at
     /// full detail: a retiring cell inside the window is revived by the planner before this is
-    /// read, so it counts as resident), and how many ended in [`CellStatus::Failed`]. A failed cell
-    /// (map edge, missing data) never becomes resident and is never retried, so the world-ready
-    /// predicate counts it as settled rather than waiting for it forever.
+    /// read, so it counts as resident), and how many are failed or given up on. A failed cell (map
+    /// edge, missing data) never becomes resident - a transient failure is retried on the plan's
+    /// own clock, with its terrain rescue drawn meanwhile - so the world-ready predicate counts it
+    /// as settled rather than waiting for it forever.
     pub(crate) fn window_residency(
         &self,
         space: &ActiveSpace,
@@ -580,6 +629,12 @@ pub struct StreamingMetrics {
     pub responses_received: u64,
     pub stale_responses: u64,
     pub failed_cells: u64,
+    /// Failed cells the planner has asked for again once their backoff passed, so a retried cell
+    /// that fails again is visible as one failure and one retry rather than as a new cell.
+    pub failed_cell_retries: u64,
+    /// Cells given up on - invalid data, or a spent [`MAX_CELL_LOAD_ATTEMPTS`] budget - which will
+    /// not be requested again while they stay inside the unload radius.
+    pub failed_cells_given_up: u64,
     pub unloaded_cells: u64,
     pub resident_cells: usize,
     pub loading_cells: usize,
@@ -846,11 +901,28 @@ enum CellStatus {
         root: Entity,
         detail: CellDetail,
     },
-    /// The request failed and is not repeated at this detail. The detail it failed at is kept: a
-    /// cell that held nothing as terrain-only is asked for again in full when the camera reaches
-    /// it, because the full request asks a different question (see [`plan_cells`]).
+    /// The request failed. The detail it failed at is kept: a cell that held nothing as
+    /// terrain-only is asked for again in full when the camera reaches it, because the full
+    /// request asks a different question (see [`plan_cells`]).
+    ///
+    /// `attempts` is how many loads of this cell have failed since it was last wanted from
+    /// nothing, `reason` is why the last one failed, and `retry_at` is the earliest time the plan
+    /// may ask for the cell again at this detail. `retry_at` is `None` once the cell is given up
+    /// on - its data is invalid, or the [`MAX_CELL_LOAD_ATTEMPTS`] budget is spent - and a
+    /// given-up cell is not requested again until it leaves the unload radius and is wanted from
+    /// nothing again.
+    ///
+    /// `replaced` is the root the cell is still drawn by while it is failed: the terrain root a
+    /// full request was upgrading from, kept drawn so a failed full load never opens a hole in the
+    /// ground. An interior's failed load has no landscape of its own and carries `None`. The plan's
+    /// unload paths treat it exactly like a [`CellStatus::Loading`] `replaced`: a space change
+    /// despawns it, and a fall out by distance retires the cell onto it.
     Failed {
         detail: CellDetail,
+        attempts: u32,
+        reason: String,
+        retry_at: Option<Instant>,
+        replaced: Option<Entity>,
     },
 }
 
@@ -889,6 +961,10 @@ impl StreamingWorld {
             key,
             CellStatus::Failed {
                 detail: CellDetail::Full,
+                attempts: 1,
+                reason: "failed for test".to_owned(),
+                retry_at: None,
+                replaced: None,
             },
         );
     }
@@ -992,6 +1068,15 @@ pub(crate) fn unload_all_cells_now(world: &mut World) -> usize {
             entities = entities.saturating_add(despawn_subtree(world, *root));
             unloaded += 1;
         }
+        // A failed cell that kept its terrain rescue root loses it here: the space it belonged to
+        // is gone, and nothing else references the root once the cell table is drained.
+        if let CellStatus::Failed {
+            replaced: Some(root),
+            ..
+        } = status
+        {
+            entities = entities.saturating_add(despawn_subtree(world, *root));
+        }
         world.resource_mut::<TerrainContinuity>().edges.remove(key);
     }
     {
@@ -1049,10 +1134,23 @@ fn plan_cells(
         &prestream,
     );
     for (key, detail) in wanted {
+        // Whether this frame re-asks a failed cell for the full load that failed: the failure
+        // record's backoff has passed and its attempt budget is not spent. The re-ask goes through
+        // the ordinary full path below, so a cell that can succeed on a retry comes back with the
+        // terrain root it holds riding along as `replaced` - the ground never disappears.
+        let full_retry = detail == CellDetail::Full
+            && streaming
+                .full_failed
+                .get(&key)
+                .is_some_and(|failure| failure.retryable(Instant::now()));
         // A cell whose full request failed is not asked for in full again while it stays planned:
         // its landscape is asked for instead, so a cell the camera stands in is never a hole in the
-        // ground because its references failed (see `fail_cell`).
-        let detail = if detail == CellDetail::Full && streaming.full_failed.contains(&key) {
+        // ground because its references failed (see `fail_cell`) - unless this frame re-asks it,
+        // which is the bounded retry above.
+        let detail = if detail == CellDetail::Full
+            && streaming.full_failed.contains_key(&key)
+            && !full_retry
+        {
             CellDetail::Terrain
         } else {
             detail
@@ -1072,12 +1170,19 @@ fn plan_cells(
             // be complete; a full request that failed may have failed on its references, and the
             // ring can still draw that cell's landscape. Each tier is tried once - except the
             // interior the camera stands in, which is the one cell whose failure leaves it nowhere
-            // to be, and which is retried while its budget lasts.
-            Some(CellStatus::Failed { detail: failed }) => {
-                if *failed == detail && !retrying {
+            // to be, and which is retried while its budget lasts, and the exterior full failure
+            // whose backoff has passed, which this frame re-asks in full (`full_retry`). A failed
+            // cell that still draws its terrain rescue hands that root to the replacement below,
+            // so the ground keeps being drawn while it is asked for again.
+            Some(CellStatus::Failed {
+                detail: failed,
+                replaced,
+                ..
+            }) => {
+                if *failed == detail && !retrying && !full_retry {
                     continue;
                 }
-                (None, None)
+                (None, *replaced)
             }
             Some(CellStatus::Loading {
                 detail, replaced, ..
@@ -1112,6 +1217,26 @@ fn plan_cells(
             // A retry is spent once the queue takes it: a request the full queue refused costs
             // nothing, and the cell is asked for again next frame on the same budget.
             *streaming.failed_retries.entry(key).or_default() += 1;
+        }
+        if full_retry {
+            // Say what is being asked for again, and why it failed last time: the record the
+            // attempt budget is spent against.
+            let last = match streaming.cells.get(&key) {
+                Some(CellStatus::Failed {
+                    attempts, reason, ..
+                }) => Some((*attempts, reason.clone())),
+                // The rescue committed while the record waited: the failure record still says
+                // what the last full load died of.
+                _ => streaming
+                    .full_failed
+                    .get(&key)
+                    .map(|failure| (failure.attempts, failure.reason.clone())),
+            };
+            let (attempts, reason) = last.unwrap_or((0, String::new()));
+            debug!(?key, attempts, %reason, "asking for the failed cell in full again");
+            // The same for an exterior's full retry: counted once the queue takes the re-ask.
+            metrics.failed_cell_retries = metrics.failed_cell_retries.saturating_add(1);
+            profiler.event(format!("{key:?}"), "full_retry_requested", None);
         }
         match (held, detail) {
             (Some(CellDetail::Terrain), CellDetail::Full) => {
@@ -1178,9 +1303,15 @@ fn plan_cells(
                 }
                 // Already waiting for its turn in the budget.
                 CellStatus::Retiring { .. } => return true,
-                // A cell loading a replacement still draws the root it is replacing, at the tier
-                // that root was committed at ([`other_detail`]).
+                // A cell loading a replacement - or failed while it still drew one - keeps the
+                // root it is drawn by, at the tier that root was committed at
+                // ([`other_detail`]).
                 CellStatus::Loading {
+                    replaced: Some(root),
+                    detail,
+                    ..
+                }
+                | CellStatus::Failed {
                     replaced: Some(root),
                     detail,
                     ..
@@ -1192,8 +1323,11 @@ fn plan_cells(
                     return true;
                 }
                 // Nothing was spawned, so there is no subtree to pace: drop the entry now and let
-                // the in-flight response turn into a stale one.
-                CellStatus::Loading { replaced: None, .. } | CellStatus::Failed { .. } => {
+                // the in-flight response turn into a stale one. A failed or given-up cell is
+                // dropped here too, so coming back into range starts its attempt budget from
+                // nothing again.
+                CellStatus::Loading { replaced: None, .. }
+                | CellStatus::Failed { replaced: None, .. } => {
                     metrics.unloaded_cells += 1;
                     continuity.edges.remove(key);
                     profiler.event(format!("{key:?}"), "unload_dropped", None);
@@ -1205,16 +1339,16 @@ fn plan_cells(
         continuity.edges.remove(key);
         profiler.event(format!("{key:?}"), "unloaded", None);
         // A loading cell that still draws the root it is replacing loses that root too: it is
-        // the only root the cell has.
+        // the only root the cell has. A failed cell that kept its terrain rescue root loses it
+        // the same way - nothing else references it once the entry is gone.
         match status {
             CellStatus::Resident { root, .. } => commands.entity(*root).try_despawn(),
             CellStatus::Retiring { root, .. } => commands.entity(*root).try_despawn(),
-            CellStatus::Loading { replaced, .. } => {
+            CellStatus::Loading { replaced, .. } | CellStatus::Failed { replaced, .. } => {
                 if let Some(root) = replaced {
                     commands.entity(*root).try_despawn();
                 }
             }
-            CellStatus::Failed { .. } => {}
         }
         false
     });
@@ -1229,7 +1363,7 @@ fn plan_cells(
         failed_retries,
         ..
     } = &mut *streaming;
-    full_failed.retain(|key| cells.contains_key(key));
+    full_failed.retain(|key, _| cells.contains_key(key));
     // A retry budget is spent on one stay in the plan: a cell that leaves it - which is how the
     // camera leaves a failed interior, and comes back to it - starts with the whole budget again.
     failed_retries.retain(|key, _| cells.contains_key(key));
@@ -1623,26 +1757,40 @@ fn collect_cells(
                             );
                             metrics.ring_cells_empty = metrics.ring_cells_empty.saturating_add(1);
                             profiler.increment("streaming/ring_cells_invalid_terrain", 1);
-                        } else {
-                            error!(cell = format_args!("{:08X}", payload.cell_id), %reason, "LAND failed strict validation");
-                            metrics.failed_cells = metrics.failed_cells.saturating_add(1);
-                            metrics.terrain_validation_failures =
-                                metrics.terrain_validation_failures.saturating_add(1);
-                            metrics.asset_failures.push(AssetFailure {
-                                model_path: format!("terrain/{:08X}", payload.cell_id),
-                                reference_form_id: 0,
-                                base_form_id: 0,
-                                cell_id: payload.cell_id,
-                                dependency_chain: vec![reason],
-                            });
-                            profiler.increment("terrain/validation_failures", 1);
+                            fail_cell(
+                                &mut commands,
+                                &mut streaming,
+                                response.key,
+                                detail,
+                                reason,
+                                replaced,
+                            );
+                            continue;
                         }
-                        fail_cell(
-                            &mut commands,
+                        metrics.terrain_validation_failures =
+                            metrics.terrain_validation_failures.saturating_add(1);
+                        metrics.asset_failures.push(AssetFailure {
+                            model_path: format!("terrain/{:08X}", payload.cell_id),
+                            reference_form_id: 0,
+                            base_form_id: 0,
+                            cell_id: payload.cell_id,
+                            dependency_chain: vec![reason.clone()],
+                        });
+                        profiler.increment("terrain/validation_failures", 1);
+                        // The data itself is invalid: a retry re-reads the same rows from the same
+                        // read-only database (and the same fixed neighbour grids, for an edge
+                        // rejection), so it can only fail the same way. Not retried.
+                        let attempt = next_full_attempt(&streaming, &response.key);
+                        record_failed_cell(
                             &mut streaming,
                             response.key,
+                            Some(payload.cell_id),
                             detail,
+                            attempt,
+                            reason,
+                            true,
                             replaced,
+                            &mut metrics,
                         );
                         continue;
                     }
@@ -1664,6 +1812,7 @@ fn collect_cells(
                         &mut streaming,
                         response.key,
                         detail,
+                        "terrain-only cell has no landscape in the cell cache".to_owned(),
                         replaced,
                     );
                     continue;
@@ -1719,6 +1868,13 @@ fn collect_cells(
                 streaming
                     .cells
                     .insert(response.key, CellStatus::Resident { root, detail });
+                // A full commit of a previously failed cell ends its failure record: the rescue is
+                // over, the plan asks for the cell in full again the way it asks for any resident,
+                // and a later failure starts its attempt budget from this success.
+                if detail == CellDetail::Full {
+                    streaming.full_failed.remove(&response.key);
+                    streaming.failed_retries.remove(&response.key);
+                }
             }
             Err(error) => {
                 // A terrain-only request that fails is empty space, not a failure: the ring covers
@@ -1731,18 +1887,31 @@ fn collect_cells(
                     debug!(?response.key, %error, "the ring holds nothing at this grid");
                     metrics.ring_cells_empty = metrics.ring_cells_empty.saturating_add(1);
                     profiler.increment("streaming/ring_cells_without_a_cell", 1);
+                    fail_cell(
+                        &mut commands,
+                        &mut streaming,
+                        response.key,
+                        detail,
+                        error,
+                        replaced,
+                    );
                 } else {
-                    debug!(?response.key, %error, "cell could not be streamed");
-                    metrics.failed_cells += 1;
+                    // A database or IO error: the read failed, not the data, so the cell retries
+                    // once its backoff passes ([`record_failed_cell`]).
                     profiler.increment("streaming/failed_cells", 1);
+                    let attempt = next_full_attempt(&streaming, &response.key);
+                    record_failed_cell(
+                        &mut streaming,
+                        response.key,
+                        None,
+                        detail,
+                        attempt,
+                        error,
+                        false,
+                        replaced,
+                        &mut metrics,
+                    );
                 }
-                fail_cell(
-                    &mut commands,
-                    &mut streaming,
-                    response.key,
-                    detail,
-                    replaced,
-                );
             }
         }
         let commit_micros = commit_started
@@ -1795,37 +1964,138 @@ fn finish_streaming_commit_budget(
     profiler.record_micros("streaming/frame_commit", frame_micros);
 }
 
-/// Marks a cell failed, dropping the root it kept drawn while its replacement was loading.
+/// Marks a terrain-only request failed, dropping the root it kept drawn while it loaded.
 ///
-/// A failed replacement tears the cell's old root down with it: what is drawn would no longer be
-/// what the cell claims to be - a full cell's references and lights were the reason for the
-/// request, and a cell that has left the ring must not keep them - and a root nothing tracks is
-/// exactly what the lifecycle check reports as orphaned.
-///
-/// A failed full request of an exterior cell is remembered in [`StreamingWorld::full_failed`]:
-/// the plan then asks for the cell's landscape on its own, through the ordinary terrain-only
-/// request and commit, so a cell the camera stands in whose full request failed is drawn again as
-/// terrain a few frames later instead of staying a hole until the camera leaves it. The terrain
-/// root it was upgrading from is not kept instead: its seam edges were unregistered when the
-/// answer arrived, and a fresh terrain-only commit registers and validates them the one way every
-/// other cell does.
+/// Terrain-detail failures are the ring's empty space - a grid the worldspace does not reach, a
+/// cell the cache has no landscape for, a landscape that does not validate - and are counted where
+/// the caller counts them, never here. A failed replacement tears the cell's old root down with
+/// it: what is drawn would no longer be what the cell claims to be. The failure itself is not
+/// retried and carries no retry bookkeeping: the full request that follows the camera into the
+/// cell asks a different question, and that is where a real failure is reported
+/// ([`record_failed_cell`]).
 fn fail_cell(
     commands: &mut Commands,
     streaming: &mut StreamingWorld,
     key: CellKey,
     detail: CellDetail,
+    reason: String,
     replaced: Option<Entity>,
 ) {
+    debug_assert!(
+        detail == CellDetail::Terrain,
+        "full-detail failures go through record_failed_cell"
+    );
     if let Some(replaced) = replaced {
         commands.entity(replaced).try_despawn();
     }
-    // Only an exterior: this set is the *terrain* rescue, and an interior has no landscape of its
-    // own to be drawn by instead. A failed interior - the one failure that leaves the camera with
-    // nowhere to be - is retried rather than demoted ([`retry_failed_interior`]).
-    if detail == CellDetail::Full && matches!(key, CellKey::Exterior { .. }) {
-        streaming.full_failed.insert(key);
+    streaming.cells.insert(
+        key,
+        CellStatus::Failed {
+            detail,
+            attempts: 1,
+            reason,
+            retry_at: None,
+            replaced: None,
+        },
+    );
+}
+
+/// Which attempt the next full-detail failure of `key` would be: one more than the failures the
+/// failure records already hold. An exterior counts the attempts its [`StreamingWorld::full_failed`]
+/// entry carries; an interior counts the retries its `failed_retries` budget has submitted, which
+/// is the same count one off ([`INTERIOR_FAILED_RETRIES`]).
+fn next_full_attempt(streaming: &StreamingWorld, key: &CellKey) -> u32 {
+    match key {
+        CellKey::Exterior { .. } => streaming
+            .full_failed
+            .get(key)
+            .map_or(1, |failure| failure.attempts + 1),
+        CellKey::Interior(_) => streaming.failed_retries.get(key).copied().unwrap_or(0) + 1,
     }
-    streaming.cells.insert(key, CellStatus::Failed { detail });
+}
+
+/// Records one failed full-detail load of a wanted cell, the state a rejected response leaves it
+/// in.
+///
+/// Every failure is logged once, with the cell key, the cell id (when the response carried one),
+/// the attempt number and the reason; nothing is swallowed and no failure is counted as a
+/// success. A failure whose cause is the data itself (`deterministic`) cannot succeed on a retry,
+/// and neither can one that has spent [`MAX_CELL_LOAD_ATTEMPTS`] loads, so both go straight to
+/// the given-up state with one `error!` and are not requested again while the camera stays near.
+/// Anything else gets a doubling backoff, after which the plan pass asks for the cell again.
+///
+/// The `replaced` root - the terrain root a full request was upgrading from - is kept drawn: a
+/// failed full load must not open a hole in the ground, and the plan's downgrade-to-terrain or
+/// the next full retry takes the root over the way any tier change does.
+#[allow(clippy::too_many_arguments)]
+fn record_failed_cell(
+    streaming: &mut StreamingWorld,
+    key: CellKey,
+    cell_id: Option<u32>,
+    detail: CellDetail,
+    attempt: u32,
+    reason: String,
+    deterministic: bool,
+    replaced: Option<Entity>,
+    metrics: &mut StreamingMetrics,
+) {
+    metrics.failed_cells = metrics.failed_cells.saturating_add(1);
+    match cell_id {
+        Some(cell_id) => warn!(
+            cell = format_args!("{cell_id:08X}"),
+            ?key,
+            attempt,
+            %reason,
+            "cell load failed"
+        ),
+        None => warn!(?key, attempt, %reason, "cell load failed"),
+    }
+    let retry_at = if deterministic || attempt >= MAX_CELL_LOAD_ATTEMPTS {
+        match cell_id {
+            Some(cell_id) => error!(
+                cell = format_args!("{cell_id:08X}"),
+                ?key,
+                attempts = attempt,
+                %reason,
+                "cell load given up; not requested again while the camera stays near"
+            ),
+            None => error!(
+                ?key,
+                attempts = attempt,
+                %reason,
+                "cell load given up; not requested again while the camera stays near"
+            ),
+        }
+        metrics.failed_cells_given_up = metrics.failed_cells_given_up.saturating_add(1);
+        None
+    } else {
+        // The wait doubles per failure: 1 s after the first, 2 s after the second.
+        Some(Instant::now() + CELL_RETRY_BACKOFF_BASE * (1u32 << (attempt - 1)))
+    };
+    // An exterior's failed full request is remembered so the plan draws the cell's landscape on
+    // its own, and so it knows when - and whether - to ask for the cell in full again. An
+    // interior has no landscape to fall back to and is retried through its own budget
+    // ([`retry_failed_interior`]).
+    if detail == CellDetail::Full && matches!(key, CellKey::Exterior { .. }) {
+        streaming.full_failed.insert(
+            key,
+            FullFailure {
+                attempts: attempt,
+                reason: reason.clone(),
+                retry_at,
+            },
+        );
+    }
+    streaming.cells.insert(
+        key,
+        CellStatus::Failed {
+            detail,
+            attempts: attempt,
+            reason,
+            retry_at,
+            replaced,
+        },
+    );
 }
 
 /// Whether the plan asks again for `key`, which failed at exactly the tier it is asking for.
@@ -1846,6 +2116,10 @@ fn fail_cell(
 /// not waited on forever either way, and the moment the camera crosses into it, it is the active
 /// interior and this answers `true` for it.
 ///
+/// A retry also waits for the failed answer's backoff to pass, the same wall-clock wait an
+/// exterior's full retry pays: a failure just recorded is not re-asked the frame after it. A cell
+/// given up on (`retry_at` of `None`) is not asked for again at all, whatever its budget says.
+///
 /// `active_interior` is [`ActiveCell::interior`]: the plan passes the one it is planning for, and
 /// [`StreamingWorld::has_failed`] the one the plan last saw, so the two answer the same question
 /// the same way.
@@ -1857,14 +2131,18 @@ fn retry_failed_interior(
     let CellKey::Interior(cell_id) = *key else {
         return false;
     };
-    if active_interior != Some(cell_id)
-        || !matches!(
-            streaming.cells.get(key),
-            Some(CellStatus::Failed {
-                detail: CellDetail::Full
-            })
-        )
-    {
+    if active_interior != Some(cell_id) {
+        return false;
+    }
+    let Some(CellStatus::Failed {
+        detail: CellDetail::Full,
+        retry_at: Some(retry_at),
+        ..
+    }) = streaming.cells.get(key)
+    else {
+        return false;
+    };
+    if Instant::now() < *retry_at {
         return false;
     }
     streaming.failed_retries.get(key).copied().unwrap_or(0) < INTERIOR_FAILED_RETRIES
@@ -4840,10 +5118,10 @@ fn validate_streaming_lifecycle(
         .filter_map(|status| match status {
             CellStatus::Resident { root, .. } => Some(*root),
             CellStatus::Retiring { root, .. } => Some(*root),
-            // A cell loading at another detail still draws the root it is replacing: it is a root
-            // the plan accounts for, not an orphan.
-            CellStatus::Loading { replaced, .. } => *replaced,
-            CellStatus::Failed { .. } => None,
+            // A cell loading at another detail still draws the root it is replacing, and a failed
+            // cell keeps the terrain root it failed upgrading from: roots the plan accounts for,
+            // not orphans.
+            CellStatus::Loading { replaced, .. } | CellStatus::Failed { replaced, .. } => *replaced,
         })
         .collect();
     let root_entries: Vec<_> = roots.iter().collect();
@@ -6270,6 +6548,62 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
+    /// A retry test's app: the terrain fixture's app over a database whose `references` table is
+    /// missing, which makes the cell's full request fail - a database error, the transient case -
+    /// while its terrain-only request never reads the table and commits.
+    fn failed_full_app(database_path: &std::path::Path, cache_path: &std::path::Path) -> App {
+        rusqlite::Connection::open(database_path)
+            .unwrap()
+            .execute_batch(r#"DROP TABLE "references";"#)
+            .unwrap();
+        terrain_streaming_app(database_path, cache_path)
+    }
+
+    /// Undoes [`failed_full_app`]'s drop: the transient cause heals, and the next full request the
+    /// plan asks for succeeds.
+    fn restore_references_table(database_path: &std::path::Path) {
+        rusqlite::Connection::open(database_path)
+            .unwrap()
+            .execute_batch(
+                r#"CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER NOT NULL,worldspace_id INTEGER,base_form_id INTEGER NOT NULL,
+                    is_exterior INTEGER NOT NULL,pos_x REAL NOT NULL,pos_y REAL NOT NULL,pos_z REAL NOT NULL,local_x REAL,local_y REAL,
+                    rot_x REAL NOT NULL,rot_y REAL NOT NULL,rot_z REAL NOT NULL,scale REAL NOT NULL DEFAULT 1.0);"#,
+            )
+            .unwrap();
+    }
+
+    /// A cell cache holding no landscape at all: the fixture's cell resolves, so its terrain-only
+    /// request commits nothing and leaves the cell failed, and no rescue root is ever drawn.
+    fn write_empty_cell_cache(path: &std::path::Path) {
+        let cache = shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: Vec::new(),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cache).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Pretends every backoff the failed cell's records carry has elapsed - the wait the real clock
+    /// pays between plan passes while the camera stays near - so the next plan pass may ask again.
+    fn elapse_backoff(app: &mut App, key: CellKey) {
+        let past = Instant::now() - Duration::from_millis(1);
+        let mut streaming = app.world_mut().resource_mut::<StreamingWorld>();
+        if let Some(CellStatus::Failed {
+            retry_at: Some(retry_at),
+            ..
+        }) = streaming.cells.get_mut(&key)
+        {
+            *retry_at = past;
+        }
+        if let Some(failure) = streaming
+            .full_failed
+            .get_mut(&key)
+            .filter(|failure| failure.retry_at.is_some())
+        {
+            failure.retry_at = Some(past);
+        }
+    }
+
     /// The cell roots that draw one cell, counted by the cell id they carry. References carry a
     /// `CellRef` too, so only roots are counted.
     fn roots_of(app: &mut App, cell_id: u32) -> usize {
@@ -7336,7 +7670,16 @@ mod tests {
             app.world_mut()
                 .resource_mut::<StreamingWorld>()
                 .cells
-                .insert(key, CellStatus::Failed { detail });
+                .insert(
+                    key,
+                    CellStatus::Failed {
+                        detail,
+                        attempts: 1,
+                        reason: "failed for test".to_owned(),
+                        retry_at: None,
+                        replaced: None,
+                    },
+                );
         }
         app.update();
 
@@ -7349,7 +7692,7 @@ mod tests {
             Some(CellStatus::Loading { detail, .. }) => format!("loading {detail:?}"),
             Some(CellStatus::Resident { detail, .. }) => format!("resident {detail:?}"),
             Some(CellStatus::Retiring { detail, .. }) => format!("retiring {detail:?}"),
-            Some(CellStatus::Failed { detail }) => format!("failed {detail:?}"),
+            Some(CellStatus::Failed { detail, .. }) => format!("failed {detail:?}"),
             None => "gone".to_owned(),
         };
         assert_eq!(
@@ -7415,10 +7758,12 @@ mod tests {
             Some(CellStatus::Loading { detail, .. }) => format!("loading {detail:?}"),
             Some(CellStatus::Resident { detail, .. }) => format!("resident {detail:?}"),
             Some(CellStatus::Retiring { detail, .. }) => format!("retiring {detail:?}"),
-            Some(CellStatus::Failed { detail }) => format!("failed {detail:?}"),
+            Some(CellStatus::Failed { detail, .. }) => format!("failed {detail:?}"),
             None => "gone".to_owned(),
         };
-        // What `fail_cell` leaves behind when the answer comes back an error.
+        // What a failed answer leaves behind: the record `record_failed_cell` writes for a
+        // transient database error, with the backoff already paid so the next plan pass may ask
+        // again.
         let answer_failed = |app: &mut App| {
             app.world_mut()
                 .resource_mut::<StreamingWorld>()
@@ -7427,6 +7772,10 @@ mod tests {
                     CellKey::Interior(INTERIOR_CELL),
                     CellStatus::Failed {
                         detail: CellDetail::Full,
+                        attempts: 1,
+                        reason: "the interior could not be streamed".to_owned(),
+                        retry_at: Some(Instant::now()),
+                        replaced: None,
                     },
                 );
         };
@@ -7481,7 +7830,9 @@ mod tests {
             .spawn((Transform::default(), StreamingCamera));
         let key = CellKey::Interior(INTERIOR_CELL);
         let has_failed = |app: &App| app.world().resource::<StreamingWorld>().has_failed(&key);
-        // What `fail_cell` leaves behind when the answer comes back an error.
+        // What a failed answer leaves behind: the record `record_failed_cell` writes for a
+        // transient database error, with the backoff already paid so the next plan pass may ask
+        // again.
         let answer_failed = |app: &mut App| {
             app.world_mut()
                 .resource_mut::<StreamingWorld>()
@@ -7490,6 +7841,10 @@ mod tests {
                     key,
                     CellStatus::Failed {
                         detail: CellDetail::Full,
+                        attempts: 1,
+                        reason: "the interior could not be streamed".to_owned(),
+                        retry_at: Some(Instant::now()),
+                        replaced: None,
                     },
                 );
         };
@@ -7532,7 +7887,7 @@ mod tests {
         );
     }
 
-    /// An exterior's failed full request reads as failed at once, as it always has: it is never
+    /// An exterior's failed full request reads as failed at once, as it always has: it is not
     /// asked for in full again while it stays planned, and is drawn as terrain-only instead.
     #[test]
     fn an_exterior_full_failure_is_failed_at_once() {
@@ -7545,14 +7900,29 @@ mod tests {
             key,
             CellStatus::Failed {
                 detail: CellDetail::Full,
+                attempts: 1,
+                reason: "the cell could not be streamed".to_owned(),
+                retry_at: Some(Instant::now() + Duration::from_secs(1)),
+                replaced: None,
             },
         );
         assert!(streaming.has_failed(&key), "failed in full");
-        streaming.full_failed.insert(key);
+        streaming.full_failed.insert(
+            key,
+            FullFailure {
+                attempts: 1,
+                reason: "the cell could not be streamed".to_owned(),
+                retry_at: Some(Instant::now() + Duration::from_secs(1)),
+            },
+        );
         streaming.cells.insert(
             key,
             CellStatus::Failed {
                 detail: CellDetail::Terrain,
+                attempts: 1,
+                reason: "the ring holds nothing at this grid".to_owned(),
+                retry_at: None,
+                replaced: None,
             },
         );
         assert!(
@@ -7792,7 +8162,8 @@ mod tests {
         assert!(matches!(
             app.world().resource::<StreamingWorld>().cells.get(&key),
             Some(CellStatus::Failed {
-                detail: CellDetail::Terrain
+                detail: CellDetail::Terrain,
+                ..
             })
         ));
         {
@@ -7818,7 +8189,8 @@ mod tests {
         assert!(matches!(
             app.world().resource::<StreamingWorld>().cells.get(&key),
             Some(CellStatus::Failed {
-                detail: CellDetail::Full
+                detail: CellDetail::Full,
+                ..
             })
         ));
         let metrics = app.world().resource::<StreamingMetrics>();
@@ -7916,6 +8288,497 @@ mod tests {
             failed_before + 1,
             "and so it does not fail again"
         );
+    }
+
+    /// A cell whose first full load fails transiently - the database cannot answer the reference
+    /// query - is asked for again in full once its backoff passes, with the terrain root its
+    /// rescue committed riding along as `replaced`, and the retry commits: the cell ends resident
+    /// in full, its failure record is gone, and the retry is counted as one.
+    #[test]
+    fn a_failed_full_load_is_retried_after_its_backoff_and_becomes_resident() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_terrain_cache(&cache_path, 1);
+        let mut app = failed_full_app(&database_path, &cache_path);
+        let key = exterior_cell(2, -3);
+        // The camera stands in the cell, so it is wanted in full - and that request fails.
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+
+        run_until(&mut app, "the full request's failure", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Failed {
+                    attempts: 1,
+                    retry_at: Some(_),
+                    ..
+                })
+            )
+        });
+        {
+            let metrics = app.world().resource::<StreamingMetrics>();
+            assert_eq!(metrics.failed_cells, 1);
+            assert_eq!(metrics.failed_cell_retries, 0);
+            assert_eq!(metrics.failed_cells_given_up, 0);
+        }
+        {
+            let streaming = app.world().resource::<StreamingWorld>();
+            let failure = streaming
+                .full_failed
+                .get(&key)
+                .expect("the failure is recorded");
+            assert_eq!(failure.attempts, 1);
+            assert!(!failure.reason.is_empty(), "the failure keeps its reason");
+            assert!(
+                failure
+                    .retry_at
+                    .is_some_and(|retry_at| retry_at > Instant::now()),
+                "the retry must not be immediate"
+            );
+        }
+
+        // The landscape is drawn while the cell waits: the plan asks for the cell's terrain on its
+        // own, and that commits.
+        run_until(&mut app, "the cell's terrain rescue", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Resident {
+                    detail: CellDetail::Terrain,
+                    ..
+                })
+            )
+        });
+        let rescue_root = match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Resident {
+                root,
+                detail: CellDetail::Terrain,
+            }) => *root,
+            other => panic!("the cell is not resident as terrain: {other:?}"),
+        };
+        let requests_quiet = app
+            .world()
+            .resource::<StreamingMetrics>()
+            .requests_submitted;
+        for _ in 0..5 {
+            app.update();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .requests_submitted,
+            requests_quiet,
+            "a cell inside its backoff is not asked for again"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingWorld>()
+                .full_failed
+                .get(&key)
+                .expect("still failed")
+                .attempts,
+            1,
+            "the quiet frames asked for nothing"
+        );
+        assert!(
+            app.world().get_entity(rescue_root).is_ok(),
+            "the rescue keeps drawing the cell"
+        );
+
+        // The transient cause heals and the backoff passes: the plan asks for the cell in full
+        // again, the rescue root rides along, and the retry commits.
+        restore_references_table(&database_path);
+        elapse_backoff(&mut app, key);
+        run_until(&mut app, "the retried full cell", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Resident {
+                    detail: CellDetail::Full,
+                    ..
+                })
+            )
+        });
+        assert!(
+            app.world().get_entity(rescue_root).is_err(),
+            "the rescue root is swapped out by the commit, the way a tier change does"
+        );
+        let streaming = app.world().resource::<StreamingWorld>();
+        assert!(
+            !streaming.full_failed.contains_key(&key),
+            "a cell that committed in full has no failure record"
+        );
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.failed_cells, 1, "the retry committed, not failed");
+        assert_eq!(metrics.failed_cell_retries, 1);
+        assert_eq!(metrics.failed_cells_given_up, 0);
+    }
+
+    /// A cell that keeps failing is asked for at most [`MAX_CELL_LOAD_ATTEMPTS`] times and then
+    /// given up on: the record keeps the last failure's reason and no retry time, the plan never
+    /// asks for it in full again while it stays in the window, and the terrain its rescue drew
+    /// keeps being drawn - giving up never takes the ground away.
+    #[test]
+    fn a_cell_that_keeps_failing_stops_after_the_attempt_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_terrain_cache(&cache_path, 1);
+        let mut app = failed_full_app(&database_path, &cache_path);
+        let key = exterior_cell(2, -3);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+
+        run_until(&mut app, "the first failure", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Failed {
+                    attempts: 1,
+                    retry_at: Some(_),
+                    ..
+                })
+            )
+        });
+        // While the first backoff waits, the plan draws the cell's landscape on its own: the
+        // rescue commits, and the first retry rides in on it.
+        run_until(&mut app, "the first rescue", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Resident {
+                    detail: CellDetail::Terrain,
+                    ..
+                })
+            )
+        });
+        let mut rescue_root = match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Resident {
+                root,
+                detail: CellDetail::Terrain,
+            }) => *root,
+            other => panic!("the cell is not resident as terrain: {other:?}"),
+        };
+        // Each retry asks for the cell in full while it is drawn by its rescue, and a failure
+        // keeps that root drawn. Between two permitted retries the downgrade commits a fresh
+        // rescue; the last failure is the one that spends the budget.
+        let mut kept_root = None;
+        for attempt in 2..=MAX_CELL_LOAD_ATTEMPTS {
+            elapse_backoff(&mut app, key);
+            run_until(&mut app, &format!("attempt {attempt}'s failure"), |app| {
+                matches!(
+                    app.world().resource::<StreamingWorld>().cells.get(&key),
+                    Some(CellStatus::Failed { attempts, .. }) if *attempts == attempt
+                )
+            });
+            kept_root = match app.world().resource::<StreamingWorld>().cells.get(&key) {
+                Some(CellStatus::Failed {
+                    replaced: Some(root),
+                    ..
+                }) => Some(*root),
+                _ => None,
+            };
+            assert_eq!(
+                kept_root,
+                Some(rescue_root),
+                "attempt {attempt} failed while the cell was drawn by the rescue it rode in on, \
+                 and that root stayed kept"
+            );
+            if attempt < MAX_CELL_LOAD_ATTEMPTS {
+                run_until(&mut app, "the next rescue", |app| {
+                    matches!(
+                        app.world().resource::<StreamingWorld>().cells.get(&key),
+                        Some(CellStatus::Resident {
+                            detail: CellDetail::Terrain,
+                            ..
+                        })
+                    )
+                });
+                rescue_root = match app.world().resource::<StreamingWorld>().cells.get(&key) {
+                    Some(CellStatus::Resident {
+                        root,
+                        detail: CellDetail::Terrain,
+                    }) => *root,
+                    other => panic!("the cell is not resident as terrain: {other:?}"),
+                };
+            }
+        }
+        let CellStatus::Failed {
+            attempts,
+            reason,
+            retry_at,
+            replaced,
+            ..
+        } = app
+            .world()
+            .resource::<StreamingWorld>()
+            .cells
+            .get(&key)
+            .unwrap()
+        else {
+            unreachable!("checked above");
+        };
+        assert_eq!(*attempts, MAX_CELL_LOAD_ATTEMPTS);
+        assert!(!reason.is_empty(), "the given-up cell keeps its reason");
+        assert!(retry_at.is_none(), "a given-up cell is never retried");
+        assert_eq!(
+            *replaced, kept_root,
+            "the failed retry kept the root the cell is drawn by"
+        );
+        {
+            let streaming = app.world().resource::<StreamingWorld>();
+            let failure = streaming.full_failed.get(&key).unwrap();
+            assert_eq!(failure.attempts, MAX_CELL_LOAD_ATTEMPTS);
+            assert!(failure.retry_at.is_none());
+        }
+        {
+            let metrics = app.world().resource::<StreamingMetrics>();
+            assert_eq!(metrics.failed_cells, u64::from(MAX_CELL_LOAD_ATTEMPTS));
+            assert_eq!(
+                metrics.failed_cell_retries,
+                u64::from(MAX_CELL_LOAD_ATTEMPTS - 1)
+            );
+            assert_eq!(metrics.failed_cells_given_up, 1);
+        }
+        assert!(
+            app.world().get_entity(rescue_root).is_ok(),
+            "the rescue is never taken away by giving up"
+        );
+
+        // The rescue keeps drawing the cell however long the camera stays, and no plan pass asks
+        // for the cell in full again.
+        run_until(&mut app, "the rescue drawn again", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Resident {
+                    detail: CellDetail::Terrain,
+                    ..
+                })
+            )
+        });
+        let requests_quiet = app
+            .world()
+            .resource::<StreamingMetrics>()
+            .requests_submitted;
+        let failures_quiet = app.world().resource::<StreamingMetrics>().failed_cells;
+        for _ in 0..10 {
+            app.update();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.requests_submitted, requests_quiet);
+        assert_eq!(metrics.failed_cells, failures_quiet);
+        assert!(matches!(
+            app.world().resource::<StreamingWorld>().cells.get(&key),
+            Some(CellStatus::Resident {
+                detail: CellDetail::Terrain,
+                ..
+            })
+        ));
+    }
+
+    /// A deterministic failure - the LAND data itself is invalid, so a retry would re-read the
+    /// same rows from the same read-only database - is given up on at the first attempt, with no
+    /// retry scheduled at all.
+    #[test]
+    fn invalid_terrain_data_is_not_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_invalid_terrain_cache(&cache_path, 1);
+        let mut app = terrain_streaming_app(&database_path, &cache_path);
+        let key = exterior_cell(2, -3);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+
+        run_until(&mut app, "the full request's failure", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Failed {
+                    attempts: 1,
+                    retry_at: None,
+                    ..
+                })
+            )
+        });
+        let CellStatus::Failed { reason, .. } = app
+            .world()
+            .resource::<StreamingWorld>()
+            .cells
+            .get(&key)
+            .unwrap()
+        else {
+            unreachable!("checked above");
+        };
+        assert!(
+            reason.contains("normal"),
+            "the reason names the invalid data: {reason}"
+        );
+        {
+            let streaming = app.world().resource::<StreamingWorld>();
+            let failure = streaming.full_failed.get(&key).unwrap();
+            assert_eq!(failure.attempts, 1);
+            assert!(failure.retry_at.is_none(), "no retry is scheduled");
+        }
+        {
+            let metrics = app.world().resource::<StreamingMetrics>();
+            assert_eq!(metrics.failed_cells, 1);
+            assert_eq!(metrics.failed_cell_retries, 0, "no retry was scheduled");
+            assert_eq!(metrics.failed_cells_given_up, 1);
+            assert_eq!(metrics.terrain_validation_failures, 1);
+            assert_eq!(metrics.asset_failures.len(), 1);
+        }
+
+        // The plan still draws the cell's landscape on its own, which the same data fails too -
+        // ring noise, not a failure - and then everything is quiet.
+        run_until(&mut app, "the rescue's answer", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Failed {
+                    detail: CellDetail::Terrain,
+                    ..
+                })
+            )
+        });
+        let requests_quiet = app
+            .world()
+            .resource::<StreamingMetrics>()
+            .requests_submitted;
+        for _ in 0..10 {
+            app.update();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .requests_submitted,
+            requests_quiet,
+            "a cell with invalid data is not re-queried"
+        );
+    }
+
+    /// A given-up cell that leaves the plan is forgotten: when the camera comes back the cell is
+    /// asked for again from nothing, with a fresh attempt count and a fresh failure record.
+    #[test]
+    fn a_given_up_cell_outside_the_window_starts_fresh_when_it_returns() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_empty_cell_cache(&cache_path);
+        let mut app = failed_full_app(&database_path, &cache_path);
+        let key = exterior_cell(2, -3);
+        // No landscape in the cache: the rescue commits nothing, so the failed cell keeps no root
+        // and a fall out by distance drops the entry the frame it happens.
+        let camera = app
+            .world_mut()
+            .spawn((Transform::default(), StreamingCamera))
+            .id();
+
+        run_until(&mut app, "the first failure", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Failed {
+                    attempts: 1,
+                    retry_at: Some(_),
+                    ..
+                })
+            )
+        });
+        elapse_backoff(&mut app, key);
+        run_until(&mut app, "the second failure", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Failed {
+                    attempts: 2,
+                    retry_at: Some(_),
+                    ..
+                })
+            )
+        });
+        elapse_backoff(&mut app, key);
+        run_until(&mut app, "the budget running out", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Failed {
+                    attempts: 3,
+                    retry_at: None,
+                    ..
+                })
+            )
+        });
+
+        // Five cells west is outside the keep radius - the outer of the unload radius (1) and the
+        // ring's (terrain_radius 2 plus one), three here - and past the ring (2), so nothing wants
+        // the cell again while the camera is there. The drop waits for a plan pass that does not
+        // break early on a full request queue.
+        let failures_before_moving = app.world().resource::<StreamingMetrics>().failed_cells;
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation
+            .x -= 5.0 * CELL_SIZE;
+        for _ in 0..40 {
+            app.update();
+            if !app
+                .world()
+                .resource::<StreamingWorld>()
+                .cells
+                .contains_key(&key)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let streaming = app.world().resource::<StreamingWorld>();
+            assert!(
+                !streaming.cells.contains_key(&key),
+                "a failed cell outside the window is forgotten"
+            );
+            assert!(
+                !streaming.full_failed.contains_key(&key),
+                "and so is its failure record"
+            );
+        }
+
+        // Back in range, the cell is wanted from nothing again: a fresh request, a fresh count.
+        // The cell the camera stood on while away failed once on its own - a transient database
+        // error, with nothing else wanting that grid - so two more failures are on the counter.
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation
+            .x += 5.0 * CELL_SIZE;
+        run_until(&mut app, "the fresh failure", |app| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Failed {
+                    attempts: 1,
+                    retry_at: Some(_),
+                    ..
+                })
+            )
+        });
+        assert_eq!(
+            app.world()
+                .resource::<StreamingWorld>()
+                .full_failed
+                .get(&key)
+                .expect("a fresh failure record")
+                .attempts,
+            1
+        );
+        let metrics = app.world().resource::<StreamingMetrics>();
+        // The total failure count now also carries whatever the cell the camera stood on while
+        // away recorded - a race on the worker's answer, not something this test pins down. What
+        // it pins down is the fresh record above, and that no new retry or give-up was spent.
+        assert!(metrics.failed_cells > failures_before_moving);
+        assert_eq!(metrics.failed_cell_retries, 2);
+        assert_eq!(metrics.failed_cells_given_up, 1);
     }
 
     /// The terrain-only request end to end: the planner asks for it, the worker answers it from the
