@@ -78,7 +78,10 @@ a conversion's build pause, a review wait) or is about to go idle, it checks:
   hold (`... hold set conversion --owner <session> --reason <what> --until HH:MM`) and clear it when done;
   this replaces per-session gate files and "no cargo" messages (still announce the job). Source:
   `tools/build_gate.py` (the copy in the gate folder is what everyone runs; Upstream Dev updates it). Workers
-  launched from this checkout can no longer run heavy cargo directly (`.deepseek-agents.json`).
+  launched from this checkout can no longer run heavy cargo directly (`.deepseek-agents.json`); the gate folder
+  is in its `readOnlyDirs`, which `ds_impl` copies into every new coder worktree (workers started before
+  2026-10-07 17:00 lack it: their lead runs their builds through the gate). Coder briefs write acceptance
+  commands in the gated form, since `ds_impl` allows each brief command as written.
 Upstream Dev runs this check across all sessions at least once an hour while the user is working, and at every
 hold and unhold, and messages any session that is idle without a reason.
 
