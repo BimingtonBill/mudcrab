@@ -35,7 +35,7 @@ Claude (Claude Code) leads the work on this checkout and delegates bounded tasks
 Every task belongs to one track; name it in the brief, the commit and the handoff entry.
 
 - **Phase 2** (the priority): contributions to upstream Phase 2 as its README, CONTRIBUTING.md and
-  `docs/roadmap/02-completion-plan.md` describe. Worktree `C:\Modding\wkj-phase2`, branches
+  `docs/roadmap/02-completion-plan.md` describe. Worktrees under `C:\Modding\worktrees\p2-*` and `D:\Modding-overflow\wt\p2-*` (one per branch), branches
   `phase2/<topic>` cut from `main` (a mirror of `origin/main`), assets
   `D:\Modding-overflow\SkyrimConverted-p2main` (since 2026-10-02; the old `C:\Modding\SkyrimConverted-upstream` was retired 2026-10-06), upstream's commit style, worker tasks `<kind>-<nnn>-p2-<slug>` numbered 500-599.
 - **Portal** (parked 2026-09-28; **ACTIVE again since 2026-10-01** (the user): catch up with main and
@@ -45,14 +45,14 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   main 24/7); a main bump merged into portal moves the hundreds and resets the revision; never take main's raw numbers.
 - **Phase 1** (added 2026-09-27, the user's new Phase 1 Dev session): improvements to upstream's
   finished converter (`docs/roadmap/01-asset-pipeline.md`), sent upstream like Phase 2. Worktree
-  `C:\Modding\wkj-phase1`, branches `phase1/<topic>` cut from `main`, upstream's commit style, build
+  `C:\Modding\worktrees\phase1`, branches `phase1/<topic>` cut from `main`, upstream's commit style, build
   targets and conversion output on D:, worker tasks `<kind>-<nnn>-p1-<slug>` numbered 800-899. It owns
   `crates/converter/**` and `crates/dummy-content/**`; `crates/shared/**` changes are agreed by message.
   Starting brief: `local/handover/phase1-dev.md`.
 - **Phase 3** (added 2026-09-28, the user's Phase 3 Dev session; **PARKED for new work by the user,
   2026-10-01**: finish, package and send the launcher work already built, start nothing new): the launcher (upstream Phase 3
   item 3.4, `docs/roadmap/03-luau-and-ui.md`), sent upstream like Phase 2. Worktree
-  `C:\Modding\wkj-phase3`, branches `phase3/<topic>` cut from `main`, upstream's commit style
+  `C:\Modding\worktrees\phase3-safety`, branches `phase3/<topic>` cut from `main`, upstream's commit style
   (`feat(launcher): ...`), build targets on D:, worker tasks `<kind>-<nnn>-p3-<slug>` numbered
   900-999. It owns `crates/launcher/**` and `crates/converter-gui/**` (being folded into the
   launcher; the crate is then deleted); converter API changes go through Phase 1 Dev by message.
@@ -289,6 +289,9 @@ only if the user gives one.
 - **One build folder per session**, never shared between sessions; combined or branch-vs-main
   checks use a throwaway folder deleted afterwards. A shared folder mixed worktrees on 2026-10-02
   (an engine built against another branch's `shared` crate).
+- **C:\Modding layout (the user, 2026-10-07):** top level holds only the main checkout, `.cargo`, the converted
+  data (`SkyrimConverted*`) and the user's tools; every agent worktree or work repo goes in
+  `C:\Modding\worktrees\<name>` and every build folder in `C:\Moddinguilds\<name>` (no `wkj-` prefix for new ones).
 - **Layout and naming (2026-10-07):** `local/LAYOUT.md` says where things go in `local/` (handover/,
   logs/, archive/, bin/) and how new files and folders are named (`<track>-<subject>-<YYYY-MM-DD>`, existing
   task ids unchanged); paths moved in the 2026-10-07 sweep are mapped in `local/disk/moves-2026-10-07.tsv`.
