@@ -1219,18 +1219,33 @@ mod walk_tests {
 
     /// A headless app with [`PhysicsCorePlugin`] and an [`EngineConfig`] that profiles — or, with
     /// `None`, one that does not — stepped by one fixed timestep per update.
+    ///
+    /// The plugin set is the one `headless::fixture_app` uses, and for its reason: rapier's fixed
+    /// schedule includes Bevy's transform propagation, which reads `RemovedComponents<ChildOf>` and
+    /// therefore needs `TransformPlugin` and the message resources it registers to exist. Every real
+    /// run has them (`DefaultPlugins` adds `TransformPlugin`); this app is the smallest one that can
+    /// hold a physics step at all.
     fn step_span_app(profile_output: Option<std::path::PathBuf>) -> App {
         let mut app = App::new();
-        app.add_plugins(MinimalPlugins)
-            .insert_resource(EngineConfig {
-                profile_output_dir: profile_output,
-                ..Default::default()
-            })
-            .init_resource::<ProfilingState>()
-            .add_plugins(PhysicsCorePlugin)
-            .insert_resource(TimeUpdateStrategy::ManualDuration(
-                std::time::Duration::from_secs_f32(PHYSICS_TIMESTEP),
-            ));
+        app.add_plugins((
+            MinimalPlugins,
+            TransformPlugin,
+            bevy::input::InputPlugin,
+            AssetPlugin::default(),
+            bevy::mesh::MeshPlugin,
+            MaterialPlugin::<StandardMaterial>::default(),
+        ))
+        .init_asset::<Mesh>()
+        .insert_resource(EngineConfig {
+            profile_output_dir: profile_output,
+            ..Default::default()
+        })
+        .init_resource::<ProfilingState>()
+        .init_resource::<StreamingMetrics>()
+        .add_plugins(PhysicsCorePlugin)
+        .insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_secs_f32(PHYSICS_TIMESTEP),
+        ));
         app.finish();
         app
     }
@@ -1241,19 +1256,22 @@ mod walk_tests {
     fn the_physics_step_span_exists_only_for_a_profiled_run() {
         let directory = tempfile::tempdir().unwrap();
         let mut profiled = step_span_app(Some(directory.path().to_owned()));
-        profiled.update();
+        let mut plain = step_span_app(None);
+        // A fixed step runs only once the fixed clock's accumulator holds a whole timestep, which
+        // takes more than the first frame (the manual step and the schedule's own timestep are not
+        // the same float). Both apps get the same frames, so the difference is the gate alone.
+        for _ in 0..3 {
+            profiled.update();
+            plain.update();
+        }
         let samples = profiled
             .world()
             .resource::<ProfilingState>()
             .span_samples("physics/step");
-        assert_eq!(samples.len(), 1, "one fixed step, one span");
         assert!(
-            samples[0] > 0.0,
-            "the span is measured around the step, not a zero: {samples:?}"
+            !samples.is_empty() && samples.iter().all(|value| *value > 0.0),
+            "the profiled run measures its fixed steps, not zeroes: {samples:?}"
         );
-
-        let mut plain = step_span_app(None);
-        plain.update();
         assert!(
             plain
                 .world()
