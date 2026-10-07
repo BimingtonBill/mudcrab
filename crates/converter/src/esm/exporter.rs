@@ -751,7 +751,7 @@ pub fn insert_reference(
                 )?;
             }
             None => eprintln!(
-                "warning: XTEL of reference {form_id:08X} ({} bytes) is shorter than 28 bytes or holds a non-finite value; door link dropped",
+                "warning: XTEL of reference {form_id:08X} ({} bytes) is not 32 bytes or holds a non-finite value; door link dropped",
                 bytes.len()
             ),
         }
@@ -773,11 +773,12 @@ struct DoorLink {
 
 /// Reads an `XTEL` subrecord: a 4-byte destination FormID followed by the
 /// arrival position and rotation as six little-endian `f32`s (the trailing
-/// flags word is not read). Anything shorter than 28 bytes, or with a NaN or
+/// flags word is not read). Anything but exactly 32 bytes (the only length the
+/// FormID remap accepts, `esm/mod.rs` `form_id_layout`), or a NaN or
 /// infinite value (SQLite would store NaN as NULL in a NOT NULL column and
 /// abort the export), yields `None`.
 fn door_link(bytes: &[u8]) -> Option<DoorLink> {
-    if bytes.len() < 28 {
+    if bytes.len() != 32 {
         return None;
     }
     let mut values = [0.0f32; 6];
@@ -1620,13 +1621,20 @@ mod tests {
     }
 
     #[test]
-    fn ignores_xtel_shorter_than_28_bytes_without_panicking() {
+    fn ignores_xtel_that_is_not_32_bytes_without_panicking() {
         let conn = Connection::open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let mut master = HashMap::new();
-        for (form_id, length) in [(0x1000u32, 27usize), (0x2000, 12), (0x4000, 4)] {
+        // 28-31 bytes would hold a destination and arrival, but the FormID remap
+        // only rewrites a 32-byte XTEL, so the destination would be plugin-local.
+        for (form_id, length) in [
+            (0x1000u32, 31usize),
+            (0x2000, 28),
+            (0x4000, 12),
+            (0x5000, 36),
+        ] {
             let mut bytes = xtel(0xDEAD_BEEF, [1.0, 2.0, 3.0], [0.0; 3]);
-            bytes.truncate(length);
+            bytes.resize(length, 0);
             master.insert(form_id, door_reference(form_id, 0x100, [0.0; 3], bytes));
         }
         master.insert(
@@ -1644,7 +1652,7 @@ mod tests {
         let links: i64 = conn
             .query_row("SELECT count(*) FROM door_links", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(links, 1, "exactly the full-length XTEL carries a link");
+        assert_eq!(links, 1, "exactly the 32-byte XTEL carries a link");
         assert_eq!(door_link_row(&conn, 0x3000).0, 0x2000);
     }
 
