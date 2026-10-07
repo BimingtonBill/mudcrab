@@ -2,6 +2,8 @@
 
 ## Waiting to send (2026-10-06; the user: soft cap 5-6 ready PRs + 7-8 drafts; now 5 ready + 2 drafts: room for about 5 drafts)
 
+> **Gate (the user, 2026-10-07):** a foundation row is offered for sending only after it runs in the portal demo and the user has seen it ("Seen in portal" column). See local/plans/foundations-to-portal.md.
+
 | Branch | Head | Issue | Checks | Next | Portal-ready |
 |---|---|---|---|---|---|
 | phase1/room-graph-pr (wt/p1-main-ro) | 0f2645b0 on main 2c11897b (= d4f8381d + spec note, #185 notes removed) | #188 converter half | workspace clippy/nextest 1,100 passed/doctests green 17:31; DeepSeek+Sol #878/#879 accept | real data (p1rooms 19:35): 4,246 rooms, 3,097 portals, 292 interiors, 2,444 links, 364,262 pivot + 63,684 overlap rows, 37 portals missing a side; Upstream Dev full diff read; 2b4dd7ca (marker FormID remap) can go alone first; decide whether docs/research notes go in the PR; no schema bump, no engine reader yet | yes (d4f8381d; needs a portal reconversion to show) |
