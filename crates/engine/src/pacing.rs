@@ -5,10 +5,10 @@
 //!
 //! * **World ready** ([`WorldReadyInputs::is_ready`]): every cell of the stream window resident
 //!   (inside an interior, the one interior cell), no cell loading, no database request in flight,
-//!   the model arming queue empty, and no model or terrain/water surface still pending. [`PacingTracker`] requires that predicate to hold on two
-//!   consecutive frames (a cell that just committed is resident while its references are still
-//!   being created, so the first of the two can be early) and records the time and frame count
-//!   from the first frame to the first of them.
+//!   the model arming queue empty, and no model or terrain/water surface still pending.
+//!   [`PacingTracker`] requires that predicate to hold on two consecutive frames (a cell that just
+//!   committed is resident while its references are still being created, so the first of the two
+//!   can be early) and records the time and frame count from the first frame to the first of them.
 //! * **Jump** (`--benchmark-jump`): once the world is first ready the camera moves to the centre of
 //!   another cell, and the time to be ready again is recorded the same way.
 //! * **Lag at speed** (`--auto-fly-speed`): the horizontal distance from the camera at which each
