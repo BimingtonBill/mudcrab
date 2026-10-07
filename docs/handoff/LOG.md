@@ -3,6 +3,21 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 (night) Phase 1 Dev: GLM coder trial started, terrain wiring written
+
+All local, nothing published. Phase 1 task numbers continue at 1900-1999.
+
+- **GLM trial (Upstream Dev's job, the user's yes):** GLM impl #1900, the KTX2 mip-order fix (`tasks/deepseek/impl-1900-p1-ktx2-mip-order.md`), stopped at the user's wrap-up. Worktree `local/impl/impl-1900-p1-ktx2-mip-order`: texture.rs +338/-64, uncommitted, never built. Resume with ds_impl/ds-agent `-Resume aadb9cee-afaf-41b8-9c8d-3289c942d737`, then DeepSeek review #1901 (brief ready), then cut `phase1/ktx2-mip-order`. Progress so far: `local/review/p1-glm-trial-1900-2026-10-08.md` (30 min, about 22 of them waiting at the gate for Portal's timing hold; 133 steps; at most $0.51).
+- **#186 terrain wiring:** DeepSeek #896.1 committed 9b013eb7 on 20ac4831 (detached, worktree `local/impl/impl-896.1-p1-terrain-pipeline-wiring`, +1269 lines: terrain_pipeline.rs, the `--merged-terrain` and `--terrain-default-texture` options, a fixture test, key tests including the load-order shift). Written but unbuilt (gate hold). Next: run gated clippy and the terrain tests in that worktree, then rerun DeepSeek review #1902 (`tasks/deepseek/review-1902-p1-terrain-wiring.md`; stopped before it reported). Fixes I already want:
+  - the metadata-rebuild route (`--reuse-assets`) ignores `--merged-terrain` silently;
+  - progress reuses `ProgressStage::LodChunks`;
+  - the merged record map is held through the texture stage (memory);
+  - the stage may block the async runtime.
+  After that: merge into `phase1/terrain-merge`, image-diff evidence, workspace checks.
+- **Gate:** a gated build that took its slot 21 s before Portal's timing hold kept running into it. I killed mine. Upstream Dev added `hold set --drain`.
+- **Still pending from yesterday:** the d4793105 port and the glb_bounds-skips-excluded-geometry drafts (the user's yes, batched with the schema bump); tell Upstream Dev if `SkyrimConverted-p1rooms` can go; the load bench full run.
+- No worker running.
+
 ## 2026-10-08 Upstream Dev (night: folder move finished, GLM trial started, build gate fixes)
 
 Track: all (Upstream Dev). Day logs: `local/team/2026-10-07.md`, `local/team/2026-10-08.md`.
