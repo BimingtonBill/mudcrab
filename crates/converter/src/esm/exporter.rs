@@ -736,7 +736,10 @@ pub fn insert_reference(
     }
     // A reference re-exported without a usable XTEL (a subset export over an
     // existing database) must not keep the door row from before.
-    tx.execute("DELETE FROM door_links WHERE ref_id=?1", [form_id])?;
+    // Cached: this runs once per placed reference, about a million on a full
+    // conversion.
+    tx.prepare_cached("DELETE FROM door_links WHERE ref_id=?1")?
+        .execute([form_id])?;
     if let Some(bytes) = view.find(b"XTEL") {
         // The destination's cell and worldspace are resolved once every
         // reference is in, at the end of the export.
