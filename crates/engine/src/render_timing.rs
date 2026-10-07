@@ -31,6 +31,16 @@
 //!   measures. With pipelined rendering the render schedule that follows the extract of main frame
 //!   `n` runs during cycle `n + 1` (alongside main frame `n + 1`), so it is filed under `n + 1`;
 //!   without it the render schedule runs inside cycle `n`. See [`CycleSides`].
+//!
+//! * `frame/remainder`: the main-thread time of a cycle that none of the sides above own — the
+//!   window from the end of `Last` to the start of the next `First`, less the extract and the wait
+//!   for the render thread when both ran inside it (pipelined rendering runs them there). This is
+//!   the region the 2026-10-08 door-tour baseline found unaccounted on the door-crossing frames
+//!   (`local/research/portal-crossing-frames-895-2666-2026-10-08.md`). Kept only while cycles are
+//!   tracked (a benchmark run); on top of that it is sampled as `frame/remainder` while recording.
+//!   The per-cycle records are also handed over as rows for the profile bundle's
+//!   `render-cycles.csv` (see `profiling`), which joins a `frame-series.csv` row with the same
+//!   frame number under the `n → n + 1` offset described above.
 
 use bevy::{
     app::{First, Last},
@@ -56,6 +66,16 @@ pub const WAIT_FOR_RENDER_THREAD: &str = "wait_for_render_thread";
 pub const EXTRACT: &str = "extract";
 pub const RENDER_THREAD: &str = "render_thread";
 pub const SWAPCHAIN_ACQUIRE: &str = "render/swapchain_acquire";
+pub const REMAINDER: &str = "frame/remainder";
+/// The render schedule's phases, as span names; the per-cycle record keeps one value each (the
+/// distributions live in the samples). Shared with the per-cycle CSV's column list, so the two
+/// cannot drift apart.
+pub const EXTRACT_COMMANDS_AND_ASSETS: &str = "render/extract_commands_and_assets";
+pub const SPECIALIZE_AND_VIEWS: &str = "render/specialize_and_views";
+pub const QUEUE: &str = "render/queue";
+pub const PREPARE: &str = "render/prepare";
+pub const GRAPH_AND_PRESENT: &str = "render/graph_and_present";
+pub const CLEANUP: &str = "render/cleanup";
 
 /// Measures the render side of each frame; shared by the main world, the render world and the
 /// extract wrappers.
@@ -118,23 +138,19 @@ fn add_render_marks(render_app: &mut SubApp, samples_pipelines: bool) {
         Render,
         (
             start_render_frame.before(Set::ExtractCommands),
-            lap("render/extract_commands_and_assets")
+            lap(EXTRACT_COMMANDS_AND_ASSETS)
                 .after(Set::PrepareMeshes)
                 .before(Set::CreateViews),
-            lap("render/specialize_and_views")
+            lap(SPECIALIZE_AND_VIEWS)
                 .after(Set::PrepareViews)
                 .before(Set::Queue),
-            lap("render/queue")
-                .after(Set::PhaseSort)
-                .before(Set::Prepare),
-            lap("render/prepare")
-                .after(Set::Prepare)
-                .before(Set::Render),
-            lap("render/graph_and_present")
+            lap(QUEUE).after(Set::PhaseSort).before(Set::Prepare),
+            lap(PREPARE).after(Set::Prepare).before(Set::Render),
+            lap(GRAPH_AND_PRESENT)
                 .after(Set::Render)
                 .before(Set::Cleanup),
             (
-                lap("render/cleanup"),
+                lap(CLEANUP),
                 sample_pipelines.run_if(move || samples_pipelines),
                 end_render_frame,
             )
@@ -182,6 +198,20 @@ struct State {
     /// The cycle the render frame in progress belongs to.
     render_cycle: Option<u64>,
     cycles: BTreeMap<u64, CycleSides>,
+    /// A mirror of `cycles` for the per-cycle series: rows stay here until they are complete and
+    /// handed over, where the ledger's takes remove records as it reads them. Bounded by keeping
+    /// only the cycles that can still be written or handed over.
+    cycle_rows: BTreeMap<u64, CycleSides>,
+    /// The newest cycle [`RenderTimings::take_completed_cycles`] has handed over, so a late write
+    /// to an already-handed-over cycle cannot be handed over twice.
+    cycle_rows_flushed_through: u64,
+    /// The `Last`→`First` window of the cycle just ended, opened in `Last` when cycles are
+    /// tracked, closed at the next `First`.
+    remainder_started: Option<Instant>,
+    /// The extract and the wait that ran inside the open window; they are subtracted from it, so
+    /// the remainder is the main-thread time they do not own.
+    remainder_extract_ms: f64,
+    remainder_wait_ms: f64,
 }
 
 /// What ran in one main-thread cycle, in milliseconds; `None` is "not measured in this cycle".
@@ -200,6 +230,18 @@ pub struct CycleSides {
     /// it could extract (pipelined rendering only). A diagnostic: it says whether the main thread
     /// was blocked on the render thread in this cycle, and is not a side of its own.
     pub wait_ms: Option<f64>,
+    /// The main-thread time of this cycle that none of the sides above own: the window from the
+    /// end of `Last` to the start of the next `First`, less the extract and the wait when both
+    /// ran inside it. `None` until the next `First` closed the window.
+    pub remainder_ms: Option<f64>,
+    /// The render schedule's phases that ran in this cycle, one value each. The swapchain wait
+    /// (`acquire_ms`) sits inside the prepare phase.
+    pub extract_commands_and_assets_ms: Option<f64>,
+    pub specialize_and_views_ms: Option<f64>,
+    pub queue_ms: Option<f64>,
+    pub prepare_ms: Option<f64>,
+    pub graph_and_present_ms: Option<f64>,
+    pub cleanup_ms: Option<f64>,
 }
 
 /// Pipelines (render and compute) in one render frame. Bevy's `PipelineCache` holds both, so these
@@ -335,12 +377,42 @@ impl RenderTimings {
         sides
     }
 
-    /// Writes into the record of `cycle`, when cycles are tracked and the cycle is known.
-    fn write_cycle(state: &mut State, cycle: Option<u64>, write: impl FnOnce(&mut CycleSides)) {
+    /// The completed per-cycle rows not handed over yet, oldest first: the cycles at least one
+    /// before the one in progress. A row is complete once the cycle after it has begun — its
+    /// remainder window closed at that cycle's `First`, and the render schedule it owns ended
+    /// before the hand-over that ended its own cycle (the render thread must finish for the main
+    /// thread's next hand-over to extract into the render world). Taking drops the rows, and a
+    /// row is never handed over twice, so a late write cannot duplicate it. The records behind
+    /// the ledger's [`RenderTimings::take_previous_cycle`] are untouched.
+    pub fn take_completed_cycles(&self) -> Vec<(u64, CycleSides)> {
+        let mut state = self.state();
+        let upto = state.cycle.saturating_sub(1);
+        if upto <= state.cycle_rows_flushed_through {
+            return Vec::new();
+        }
+        let drained: Vec<(u64, CycleSides)> = state
+            .cycle_rows
+            .range(state.cycle_rows_flushed_through + 1..=upto)
+            .map(|(cycle, sides)| (*cycle, *sides))
+            .collect();
+        for (cycle, _) in &drained {
+            state.cycle_rows.remove(cycle);
+        }
+        state.cycle_rows_flushed_through = upto;
+        drained
+    }
+
+    /// Writes into the record of `cycle`, when cycles are tracked and the cycle is known. The
+    /// mirror for the per-cycle series gets the same write; rows that can no longer be written or
+    /// handed over are dropped, so a run that keeps no per-cycle series does not grow it.
+    fn write_cycle(state: &mut State, cycle: Option<u64>, write: impl Fn(&mut CycleSides)) {
         if state.track_cycles
             && let Some(cycle) = cycle
         {
             write(state.cycles.entry(cycle).or_default());
+            write(state.cycle_rows.entry(cycle).or_default());
+            let keep_from = state.cycle.saturating_sub(2);
+            state.cycle_rows.retain(|kept, _| *kept >= keep_from);
         }
     }
 
@@ -359,12 +431,16 @@ impl RenderTimings {
     }
 
     fn extracted(&self, elapsed: Duration) {
+        let extract_ms = elapsed.as_secs_f64() * 1000.0;
         let mut state = self.state();
         state.last_extract = Some(elapsed);
         let cycle = state.cycle;
         state.last_extract_cycle = Some(cycle);
+        if state.remainder_started.is_some() {
+            state.remainder_extract_ms += extract_ms;
+        }
         Self::write_cycle(&mut state, Some(cycle), |sides| {
-            sides.extract_ms = Some(elapsed.as_secs_f64() * 1000.0);
+            sides.extract_ms = Some(extract_ms);
         });
         self.record(&mut state, EXTRACT, elapsed);
     }
@@ -374,9 +450,13 @@ impl RenderTimings {
         let mut state = self.state();
         if let Some(extract) = state.last_extract.take() {
             let wait = elapsed.saturating_sub(extract);
+            let wait_ms = wait.as_secs_f64() * 1000.0;
             let cycle = state.cycle;
+            if state.remainder_started.is_some() {
+                state.remainder_wait_ms += wait_ms;
+            }
             Self::write_cycle(&mut state, Some(cycle), |sides| {
-                sides.wait_ms = Some(wait.as_secs_f64() * 1000.0);
+                sides.wait_ms = Some(wait_ms);
             });
             self.record(&mut state, WAIT_FOR_RENDER_THREAD, wait);
         }
@@ -384,6 +464,15 @@ impl RenderTimings {
 
     fn start_main(&self) {
         let mut state = self.state();
+        if let Some(started) = state.remainder_started.take() {
+            let raw_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let ms = remainder_ms(raw_ms, state.remainder_extract_ms, state.remainder_wait_ms);
+            let cycle = state.cycle;
+            Self::write_cycle(&mut state, Some(cycle), |sides| {
+                sides.remainder_ms = Some(ms);
+            });
+            self.record(&mut state, REMAINDER, Duration::from_secs_f64(ms / 1000.0));
+        }
         state.main_started = Some(Instant::now());
         state.cycle += 1;
     }
@@ -393,6 +482,11 @@ impl RenderTimings {
         if let Some(started) = state.main_started.take() {
             let elapsed = started.elapsed();
             let cycle = state.cycle;
+            if state.track_cycles {
+                state.remainder_started = Some(Instant::now());
+                state.remainder_extract_ms = 0.0;
+                state.remainder_wait_ms = 0.0;
+            }
             Self::write_cycle(&mut state, Some(cycle), |sides| {
                 sides.main_ms = Some(elapsed.as_secs_f64() * 1000.0);
             });
@@ -417,7 +511,13 @@ impl RenderTimings {
         let now = Instant::now();
         let mut state = self.state();
         if let Some(mark) = state.render_mark.replace(now) {
-            self.record(&mut state, name, now - mark);
+            let elapsed = now - mark;
+            self.record(&mut state, name, elapsed);
+            if let Some(set) = phase_writer(name) {
+                let ms = elapsed.as_secs_f64() * 1000.0;
+                let render_cycle = state.render_cycle;
+                Self::write_cycle(&mut state, render_cycle, |sides| set(sides, ms));
+            }
         }
     }
 
@@ -460,7 +560,10 @@ impl RenderTimings {
     }
 }
 
-fn start_main_world(timings: Res<RenderTimings>) {
+/// Opens the main world's sample. `pub(crate)` so the per-cycle series' drain can order itself
+/// after the main frame has begun (a cycle's row is complete only once the next `First` has
+/// closed its remainder window).
+pub(crate) fn start_main_world(timings: Res<RenderTimings>) {
     timings.start_main();
 }
 
@@ -524,6 +627,29 @@ fn end_swapchain_acquire(timings: Res<RenderTimings>) {
 
 fn lap(name: &'static str) -> impl FnMut(Res<RenderTimings>) {
     move |timings: Res<RenderTimings>| timings.lap(name)
+}
+
+/// The main thread's time outside `main_world`, the extract and the wait in one cycle: the raw
+/// `Last`→`First` window less the extract and the wait when both ran inside it (pipelined
+/// rendering runs them there), never negative.
+fn remainder_ms(raw_ms: f64, extract_ms: f64, wait_ms: f64) -> f64 {
+    (raw_ms - extract_ms - wait_ms).max(0.0)
+}
+
+/// The cycle-record field a render-phase lap writes, by the lap's span name. The swapchain wait
+/// is not a lap; [`RenderTimings::end_acquire`] writes it.
+fn phase_writer(name: &str) -> Option<fn(&mut CycleSides, f64)> {
+    match name {
+        EXTRACT_COMMANDS_AND_ASSETS => {
+            Some(|sides, ms| sides.extract_commands_and_assets_ms = Some(ms))
+        }
+        SPECIALIZE_AND_VIEWS => Some(|sides, ms| sides.specialize_and_views_ms = Some(ms)),
+        QUEUE => Some(|sides, ms| sides.queue_ms = Some(ms)),
+        PREPARE => Some(|sides, ms| sides.prepare_ms = Some(ms)),
+        GRAPH_AND_PRESENT => Some(|sides, ms| sides.graph_and_present_ms = Some(ms)),
+        CLEANUP => Some(|sides, ms| sides.cleanup_ms = Some(ms)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -757,5 +883,203 @@ mod tests {
             vec![7.0],
             "a hand-over without a new extract is not counted"
         );
+    }
+
+    /// The remainder is the raw `Last`→`First` window less the extract and the wait when both ran
+    /// inside it, and never negative.
+    #[test]
+    fn the_remainder_excludes_the_extract_and_wait_that_ran_inside_the_window() {
+        assert_eq!(remainder_ms(20.0, 3.0, 7.0), 10.0);
+        assert_eq!(
+            remainder_ms(10.0, 3.0, 7.0),
+            0.0,
+            "the window was extract and wait and nothing else"
+        );
+        assert_eq!(
+            remainder_ms(5.0, 3.0, 7.0),
+            0.0,
+            "the measured sides can exceed the window by less than a timer tick"
+        );
+        assert_eq!(
+            remainder_ms(20.0, 0.0, 0.0),
+            20.0,
+            "nothing ran in the window but the remainder"
+        );
+    }
+
+    /// The same, driven through the record: the window held nothing but the extract and the wait,
+    /// so the cycle's remainder is zero.
+    #[test]
+    fn the_cycle_remainder_excludes_the_extract_and_wait_that_ran_in_its_window() {
+        let timings = RenderTimings::default();
+        timings.set_cycle_tracking(true, true);
+        timings.start_main();
+        timings.end_main();
+        timings.extracted(Duration::from_millis(3));
+        timings.handed_over(Duration::from_millis(10));
+        timings.start_main();
+        let cycle = timings.take_previous_cycle().expect("cycle 1");
+        assert_eq!(cycle.extract_ms, Some(3.0));
+        assert_eq!(cycle.wait_ms, Some(7.0));
+        assert_eq!(
+            cycle.remainder_ms,
+            Some(0.0),
+            "the window was extract and wait and nothing else"
+        );
+    }
+
+    /// The identity that makes the next re-profile trustworthy: `main_world + extract + wait +
+    /// remainder` is the whole cycle, the wall time from one main frame's start to the next's.
+    #[test]
+    fn the_cycle_sides_account_for_the_whole_cycle() {
+        let timings = RenderTimings::default();
+        timings.set_cycle_tracking(true, true);
+        timings.start_main();
+        std::thread::sleep(Duration::from_millis(4));
+        timings.end_main();
+        let window = Instant::now();
+        std::thread::sleep(Duration::from_millis(16));
+        timings.extracted(Duration::from_millis(1));
+        timings.handed_over(Duration::from_millis(9)); // 1 ms of extract, 8 of wait
+        timings.start_main();
+        let cycle = timings.take_previous_cycle().expect("cycle 1");
+        let main_ms = cycle.main_ms.expect("the main schedule ran");
+        let window_ms = window.elapsed().as_secs_f64() * 1000.0;
+        let accounted =
+            cycle.extract_ms.unwrap() + cycle.wait_ms.unwrap() + cycle.remainder_ms.unwrap();
+        assert!(
+            (accounted - window_ms).abs() < 2.0,
+            "extract + wait + remainder must be the raw window: {accounted} vs {window_ms}"
+        );
+        assert!(
+            main_ms >= 4.0,
+            "the main schedule's sample covers its sleep"
+        );
+        assert!(
+            cycle.remainder_ms.unwrap() >= 6.0,
+            "the window held sleep on top of the extract and the wait"
+        );
+    }
+
+    /// Without cycle tracking no window opens, so no remainder is written into a record or
+    /// sampled, whatever the recording state.
+    #[test]
+    fn the_remainder_is_kept_only_when_cycles_are_tracked() {
+        let timings = RenderTimings::default();
+        timings.set_recording(true);
+        timings.start_main();
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.handed_over(Duration::from_millis(5));
+        timings.start_main();
+        let samples = timings.take_samples();
+        assert!(
+            !samples.contains_key(REMAINDER),
+            "no tracked cycle, no remainder window"
+        );
+        assert!(
+            samples.contains_key(EXTRACT),
+            "the extract is still sampled"
+        );
+        assert!(timings.take_completed_cycles().is_empty());
+    }
+
+    /// The render phases land in the cycle the render frame belongs to: inside cycle 1 without
+    /// pipelining, under cycle 2 with it (the render schedule of extract 1 runs alongside main
+    /// frame 2), and they sum to the render schedule they are phases of.
+    #[test]
+    fn laps_write_their_phase_into_the_cycle_record() {
+        for pipelined in [true, false] {
+            let timings = RenderTimings::default();
+            timings.set_cycle_tracking(true, pipelined);
+            timings.start_main();
+            timings.end_main();
+            timings.extracted(Duration::from_millis(1));
+            timings.start_render();
+            timings.lap(EXTRACT_COMMANDS_AND_ASSETS);
+            timings.lap(SPECIALIZE_AND_VIEWS);
+            timings.lap(QUEUE);
+            timings.lap(PREPARE);
+            timings.lap(GRAPH_AND_PRESENT);
+            timings.lap(CLEANUP);
+            timings.end_render();
+            timings.start_main();
+            let first = timings.take_previous_cycle().expect("cycle 1");
+            let (has_phases, has_render) = (
+                first.extract_commands_and_assets_ms.is_some(),
+                first.render_ms.is_some(),
+            );
+            assert_eq!(
+                (has_phases, has_render),
+                (!pipelined, !pipelined),
+                "pipelined files the render frame under cycle 2"
+            );
+            if pipelined {
+                timings.end_main();
+                timings.extracted(Duration::from_millis(1));
+                timings.start_main();
+            }
+            let second = if pipelined {
+                timings.take_previous_cycle().expect("cycle 2")
+            } else {
+                first
+            };
+            let phases = [
+                second.extract_commands_and_assets_ms,
+                second.specialize_and_views_ms,
+                second.queue_ms,
+                second.prepare_ms,
+                second.graph_and_present_ms,
+                second.cleanup_ms,
+            ];
+            assert!(
+                phases.iter().all(Option::is_some),
+                "every lapped phase is in the cycle's record"
+            );
+            assert!(
+                second.acquire_ms.is_none()
+                    || second.acquire_ms.unwrap() <= second.render_ms.unwrap(),
+                "the swapchain wait sits inside the render schedule"
+            );
+            let sum: f64 = phases.into_iter().flatten().sum();
+            assert!(
+                sum <= second.render_ms.unwrap() + 0.1,
+                "the phases are parts of the render schedule: {sum} vs {}",
+                second.render_ms.unwrap()
+            );
+        }
+    }
+
+    /// Completed rows are handed over once, oldest first, complete (main, remainder); the
+    /// ledger's takes do not touch them, and a second take is empty.
+    #[test]
+    fn completed_cycle_rows_are_handed_over_once_once_they_are_complete() {
+        let timings = RenderTimings::default();
+        timings.set_cycle_tracking(true, true);
+        for _ in 0..3 {
+            timings.start_main();
+            timings.end_main();
+        }
+        // Cycles 1 and 2 are complete (the cycle after each has begun); cycle 3 is the one in
+        // progress and stays out.
+        let rows = timings.take_completed_cycles();
+        assert_eq!(
+            rows.iter().map(|(cycle, _)| *cycle).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        for (_, sides) in &rows {
+            assert!(sides.main_ms.is_some());
+            assert!(sides.remainder_ms.is_some(), "the window closed");
+        }
+        timings.start_main(); // cycle 4 begins: cycle 3's remainder window closed
+        let rows = timings.take_completed_cycles();
+        assert_eq!(
+            rows.iter().map(|(cycle, _)| *cycle).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert!(rows[0].1.main_ms.is_some() && rows[0].1.remainder_ms.is_some());
+        // The ledger still finds its record; the rows are not handed over twice.
+        assert!(timings.take_previous_cycle().is_some());
+        assert!(timings.take_completed_cycles().is_empty());
     }
 }
