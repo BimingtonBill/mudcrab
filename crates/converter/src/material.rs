@@ -239,7 +239,10 @@ pub fn is_editor_marker_shape(shape_name: Option<&str>) -> bool {
 /// `BSXFlags` decides it: only a set marker bit excludes the shape - a shape whose name
 /// merely reads `EditorMarker` while the flags clear the bit is kept
 /// (`v16_only_declared_markers_and_refraction_are_excluded`).
-fn declares_editor_marker(nif: &NifFile) -> bool {
+///
+/// `mesh::drop_editor_marker_geometry` reads the same predicate, so a mesh is only
+/// deleted from the export when the material contract also excludes it.
+pub(crate) fn declares_editor_marker(nif: &NifFile) -> bool {
     nif.blocks
         .iter()
         .find_map(|block| match block {
