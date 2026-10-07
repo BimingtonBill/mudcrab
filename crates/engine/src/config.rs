@@ -73,7 +73,18 @@ pub struct EngineConfig {
     /// A value at or below `stream_radius` leaves the ring empty, which is the engine without a
     /// ring (`--stream-radius 2` with the default) and what a benchmark run that wants the old
     /// numbers passes. Interior cells are never terrain-only.
+    ///
+    /// This is the ring an explicit `--terrain-radius` asks for, or [`DEFAULT_TERRAIN_RADIUS`]; the
+    /// ring a run actually draws is [`EngineConfig::effective_terrain_radius`]'s answer, which
+    /// leaves the ring off where the worldspace draws its own terrain LOD ([`Self::terrain_radius_given`]).
     pub terrain_radius: i32,
+    /// Whether `--terrain-radius` named the ring. A named ring is drawn as given, in every
+    /// worldspace; an unnamed one is the engine's own choice: [`DEFAULT_TERRAIN_RADIUS`] where the
+    /// worldspace has no terrain LOD data, and no ring (LOD covers that distance) where it has,
+    /// the way the game's own terrain LOD does not sit under a second copy of the same landscape.
+    /// The benchmark rule below writes [`Self::terrain_radius`] without setting this, so a
+    /// benchmark still measures the ring it always did.
+    pub terrain_radius_given: bool,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
     /// Cells outside the unload radius a frame may despawn. `0` despawns every one at once, which
@@ -161,6 +172,12 @@ pub struct EngineConfig {
 /// The default reach of the terrain-only ring, in cells: eight cells is 32,768 units of landscape
 /// beyond the full-detail grid, drawn from 264 cells.
 ///
+/// The default only where the worldspace has no terrain LOD data of its own. Where it has - the
+/// game's own worlds do - a run that did not name a ring draws no ring at all: the LOD already
+/// covers that distance, and the ring is a second copy of landscape the game itself draws only as
+/// LOD (`--terrain-radius` restores it for a comparison). Vanilla's view is therefore the default
+/// one: full detail around the camera, the LOD beyond it, and no ring in between.
+///
 /// Chosen by measurement, on a `--shots` camera pose over the Pale from the Alftand ruins
 /// (`far-pale-yaw40`), release build, one run each, warm:
 ///
@@ -195,6 +212,7 @@ impl Default for EngineConfig {
             unload_radius: 3,
             terrain_lod: TerrainLodDistances::default(),
             terrain_radius: DEFAULT_TERRAIN_RADIUS,
+            terrain_radius_given: false,
             max_cell_commits_per_frame: 1,
             max_commit_micros_per_frame: 16_670,
             max_cell_unloads_per_frame: 2,
@@ -287,7 +305,8 @@ Streaming:
   --max-model-spawns-per-frame <count>  models spawned per frame; 0 spawns all at once (default: 4)
   --max-upload-mib-per-frame <mib>      render-asset upload budget per frame; 0 is unlimited (default: 16)
   --auto-fly-speed <units/s>            fly the camera forward at this speed; 0 holds it still
-  --terrain-radius <cells>              terrain-only ring around the streamed cells (default: 8)
+  --terrain-radius <cells>              terrain-only ring around the streamed cells (default: 8, off
+                                        where the worldspace has terrain LOD data; vanilla's view)
   --route <file>                        follow a route file's waypoints at its speed (a JSON file; see scripts/routes)
 
 Benchmark and profiling:
@@ -487,6 +506,28 @@ impl EngineConfig {
             .then(|| self.max_upload_mib_per_frame.saturating_mul(1024 * 1024))
     }
 
+    /// The ring a run draws in a worldspace that has (`has_lod`) or lacks terrain LOD data: the one
+    /// resolver for [`Self::terrain_radius`], and the one place the three rules live.
+    ///
+    /// 1. A ring `--terrain-radius` named wins as given, in every worldspace.
+    /// 2. Otherwise a worldspace with LOD data draws no ring: [`Self::stream_radius`], which leaves
+    ///    the ring empty (see [`Self::terrain_radius`]). The LOD draws everything beyond the
+    ///    full-detail grid, which is what the game does - its own terrain LOD has no full-detail
+    ///    ring under it - and the ring is a second copy of that ground at 264 extra cells' cost.
+    /// 3. Otherwise - no LOD data, so nothing would draw beyond the full-detail grid -
+    ///    [`DEFAULT_TERRAIN_RADIUS`] keeps the world from ending in a cliff.
+    ///
+    /// `has_lod` is the caller's answer for the worldspace it is asking about
+    /// ([`WorldDatabase::has_lod_for`](crate::world::database::WorldDatabase::has_lod_for)), so the
+    /// answer is per worldspace and follows a door into another one.
+    pub fn effective_terrain_radius(&self, has_lod: bool) -> i32 {
+        if self.terrain_radius_given || !has_lod {
+            self.terrain_radius
+        } else {
+            self.stream_radius
+        }
+    }
+
     /// Interactive exterior play owns the mouse/controller; automated camera paths keep their
     /// existing movement and framing. A `--benchmark-jump` run is one of those even without a frame
     /// limit: the jump moves only the camera, and in WALK the camera follow would put it straight
@@ -566,7 +607,6 @@ impl EngineConfig {
             }
         }
         ini.apply(&mut config);
-        let mut terrain_radius_given = false;
         let mut args = args.into_iter().peekable();
 
         while let Some(argument) = args.next() {
@@ -639,7 +679,9 @@ impl EngineConfig {
                 "--terrain-radius" => {
                     if let Some(value) = args.next().and_then(|value| value.parse::<i32>().ok()) {
                         config.terrain_radius = value.clamp(0, MAX_TERRAIN_RADIUS);
-                        terrain_radius_given = true;
+                        // A value the run named - even one the default would have chosen - is
+                        // drawn as given in every worldspace (`effective_terrain_radius`).
+                        config.terrain_radius_given = true;
                     }
                 }
                 "--headless" => config.headless = true,
@@ -862,7 +904,7 @@ impl EngineConfig {
         // portal's shots run reads them from its own options.
         config.portal.shots = config.shots.clone();
         config.portal.shots_out = config.shots_out.clone();
-        if !terrain_radius_given
+        if !config.terrain_radius_given
             && (config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some())
         {
             config.terrain_radius = config.stream_radius;
@@ -2950,6 +2992,52 @@ mod tests {
             ["--benchmark-frames", "100", "--terrain-radius", "8"].map(str::to_owned),
         );
         assert_eq!(asked.terrain_radius, 8);
+    }
+
+    /// The one resolver: a named ring wins; an unnamed one is off where the worldspace draws its
+    /// own terrain LOD and stays [`DEFAULT_TERRAIN_RADIUS`] where it does not.
+    #[test]
+    fn an_unnamed_ring_is_off_where_the_worldspace_has_lod_data() {
+        let plain = EngineConfig::default();
+        assert!(!plain.terrain_radius_given, "nothing named a ring");
+        assert_eq!(
+            plain.effective_terrain_radius(true),
+            plain.stream_radius,
+            "LOD draws everything beyond the full-detail grid, so no ring is drawn"
+        );
+        assert_eq!(
+            plain.effective_terrain_radius(false),
+            DEFAULT_TERRAIN_RADIUS,
+            "with no LOD data the ring is what keeps the world from ending in a cliff"
+        );
+
+        // A named ring is drawn as given whatever the worldspace holds - including one that names
+        // the default, and one that names a ring the auto rule would have turned off.
+        let named = EngineConfig::run_from_args(["--terrain-radius", "8"].map(str::to_owned));
+        assert!(named.terrain_radius_given);
+        assert_eq!(named.effective_terrain_radius(true), 8);
+        assert_eq!(named.effective_terrain_radius(false), 8);
+        let named_off = EngineConfig::run_from_args(["--terrain-radius", "2"].map(str::to_owned));
+        assert_eq!(
+            named_off.effective_terrain_radius(false),
+            2,
+            "a named empty ring is drawn (nothing) even where there is no LOD"
+        );
+
+        // A benchmark run's ring is written without naming it, so the rule above still decides:
+        // both answers are the empty ring it has always measured.
+        let bench = EngineConfig::run_from_args(["--benchmark-frames", "100"].map(str::to_owned));
+        assert!(!bench.terrain_radius_given);
+        assert_eq!(bench.effective_terrain_radius(true), bench.stream_radius);
+        assert_eq!(bench.effective_terrain_radius(false), bench.stream_radius);
+
+        // A value that does not parse named nothing: the default and the auto choice stand.
+        let typo =
+            EngineConfig::run_from_args(["--terrain-radius", "not-a-number"].map(str::to_owned));
+        assert!(!typo.terrain_radius_given);
+        assert_eq!(typo.terrain_radius, DEFAULT_TERRAIN_RADIUS);
+        assert_eq!(typo.effective_terrain_radius(true), typo.stream_radius);
+        assert_eq!(typo.effective_terrain_radius(false), DEFAULT_TERRAIN_RADIUS);
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::{
     streaming::{ActiveCell, LodHorizon},
     world::{
         components::StreamingCamera,
+        database::WorldDatabase,
         lighting::{
             AmbientBases, DAY_ILLUMINANCE_REFERENCE, SpaceAtmosphere, SpaceFog, SpaceKey,
             SpaceLighting, SpaceLightingCatalog, SunLight, luma, packed_luma, scale_to_luma,
@@ -65,8 +66,16 @@ impl Plugin for AtmospherePlugin {
 /// draws the terrain ring, which without the fog would end in a cliff of terrain against whatever
 /// colour the frame was cleared with. A measured run therefore asks for the ring by name
 /// (`--terrain-radius`) and takes the fog with it.
-pub(crate) fn atmosphere_applies(interactive: bool, config: &EngineConfig) -> bool {
-    interactive || config.terrain_radius > config.stream_radius
+///
+/// `terrain_radius` is the ring the run draws in its worldspace, not the configured one: an
+/// unnamed ring is off where the world has its own terrain LOD, and a run that draws no ring keeps
+/// the flat lighting its numbers were taken with (`EngineConfig::effective_terrain_radius`).
+pub(crate) fn atmosphere_applies(
+    interactive: bool,
+    terrain_radius: i32,
+    stream_radius: i32,
+) -> bool {
+    interactive || terrain_radius > stream_radius
 }
 
 pub(crate) const SKY_COLOR: Color = Color::srgb(0.52, 0.64, 0.80);
@@ -671,6 +680,11 @@ fn update_atmosphere(
     // How far distant terrain reaches, once the world is known to have any. Absent in a run that
     // does not stream, and unset in a world converted without LOD.
     horizon: Option<Res<LodHorizon>>,
+    // Read for the active worldspace's LOD data, which decides the ring the fog is measured from:
+    // an unnamed ring is off where the exterior draws its own terrain LOD
+    // (`EngineConfig::effective_terrain_radius`). Absent in a run that opens no world database, and
+    // every worldspace of one keeps the configured ring.
+    database: Option<Res<WorldDatabase>>,
     catalog: Option<Res<SpaceLightingCatalog>>,
     mut clear: ResMut<ClearColor>,
     ambient: Option<ResMut<GlobalAmbientLight>>,
@@ -706,10 +720,13 @@ fn update_atmosphere(
     let lod_reach = horizon
         .as_ref()
         .and_then(|horizon| horizon.reach_in(active.worldspace_id));
+    let has_lod = database
+        .as_ref()
+        .is_some_and(|database| database.has_lod_for(active.worldspace_id));
     let fog = atmosphere_fog(
         &atmosphere,
         config.stream_radius,
-        config.terrain_radius,
+        config.effective_terrain_radius(has_lod),
         lod_reach,
     );
     for (entity, mut camera) in &mut cameras {
@@ -764,17 +781,22 @@ mod tests {
     use rusqlite::Connection;
 
     /// Which runs get the sky and the fog: the ones that are looked at, and a measured run that
-    /// draws the ring by name. A benchmark run with the ring off - which is what the Phase 2 gates
-    /// are taken with - keeps the flat lighting its numbers were measured under.
+    /// draws the ring. A benchmark run with the ring off - which is what the Phase 2 gates are
+    /// taken with, and what an unnamed ring is wherever the world has its own terrain LOD - keeps
+    /// the flat lighting its numbers were measured under.
     #[test]
     fn the_atmosphere_follows_the_interactive_runs_and_the_ring() {
         let ring = EngineConfig {
             terrain_radius: 8,
             ..EngineConfig::default()
         };
-        assert!(atmosphere_applies(true, &ring));
+        assert!(atmosphere_applies(
+            true,
+            ring.effective_terrain_radius(false),
+            2
+        ));
         assert!(
-            atmosphere_applies(false, &ring),
+            atmosphere_applies(false, ring.effective_terrain_radius(false), 2),
             "a ring fades into the sky"
         );
 
@@ -782,11 +804,29 @@ mod tests {
             terrain_radius: 2,
             ..EngineConfig::default()
         };
-        assert!(atmosphere_applies(true, &no_ring));
+        assert!(atmosphere_applies(
+            true,
+            no_ring.effective_terrain_radius(true),
+            2
+        ));
         assert!(
-            !atmosphere_applies(false, &no_ring),
-            "a measured run with no ring keeps the lighting the acceptance numbers were taken with"
+            !atmosphere_applies(false, no_ring.effective_terrain_radius(true), 2),
+            "a measured run with no ring - which is what an unnamed ring is with LOD - keeps the \
+             lighting the acceptance numbers were taken with"
         );
+
+        // The auto ring: the default ring where the world has no LOD data, no ring where it has.
+        let auto = EngineConfig::default();
+        assert!(atmosphere_applies(
+            false,
+            auto.effective_terrain_radius(false),
+            auto.stream_radius
+        ));
+        assert!(!atmosphere_applies(
+            false,
+            auto.effective_terrain_radius(true),
+            auto.stream_radius
+        ));
     }
 
     // ---- per-space lighting, fog and sky ----
@@ -1048,12 +1088,12 @@ mod tests {
             color, SKY_COLOR,
             "the engine's own sky colour is the fallback"
         );
-        assert!(end < camera_far_plane(&config));
+        assert!(end < camera_far_plane(config.stream_radius, config.terrain_radius));
 
         // With no ring there is nothing beyond the grid to fade, and the fog still cannot be
         // reached - whatever colour it is.
         let (start, _, color) = fog_parts(&atmosphere_fog(&tamriel, 2, 2, None));
-        assert!(start > camera_far_plane(&config));
+        assert!(start > camera_far_plane(2, 2));
         assert_eq!(color, Color::srgb_u8(139, 175, 194));
     }
 
@@ -1437,7 +1477,13 @@ mod tests {
     #[test]
     fn an_interiors_row_fog_reaches_its_geometry_where_before_it_could_not() {
         let (_directory, catalog) = real_spaces();
-        let far = camera_far_plane(&EngineConfig::default());
+        let defaults = EngineConfig::default();
+        // An interior is entered from some exterior, and this is the widest far plane one of these
+        // runs starts with: the default ring where the exterior has no LOD data.
+        let far = camera_far_plane(
+            defaults.stream_radius,
+            defaults.effective_terrain_radius(false),
+        );
 
         let (start, end, color) = fog_parts(&atmosphere_fog(
             &interior_of(&catalog, ALFTAND01),

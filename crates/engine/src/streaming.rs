@@ -1034,10 +1034,16 @@ fn plan_cells(
         return;
     };
     let center = camera_grid(camera.translation, origin.0);
+    // The ring of the worldspace the camera is in, resolved this frame: a run that did not name one
+    // draws none where the world has its own terrain LOD, and keeps it where it has none
+    // ([`EngineConfig::effective_terrain_radius`]). Resolved here rather than read from a resource
+    // so the plan cannot run on a ring from the space the camera was in last frame.
+    let terrain_radius =
+        config.effective_terrain_radius(database.has_lod_for(active.worldspace_id));
     let wanted = wanted_cells(
         &active,
         config.stream_radius,
-        config.terrain_radius,
+        terrain_radius,
         center,
         &prestream,
     );
@@ -1140,7 +1146,7 @@ fn plan_cells(
                 &active,
                 center,
                 config.unload_radius,
-                config.terrain_radius,
+                terrain_radius,
                 &prestream,
             );
         if keep {
@@ -4748,6 +4754,7 @@ fn update_render_origin(
 #[allow(clippy::too_many_arguments)]
 fn validate_streaming_lifecycle(
     config: Res<EngineConfig>,
+    database: Option<Res<WorldDatabase>>,
     active: Res<ActiveCell>,
     prestream: Res<PrestreamCells>,
     origin: Res<RenderOrigin>,
@@ -4799,11 +4806,16 @@ fn validate_streaming_lifecycle(
     let out_of_range_roots = if active.interior.is_some() {
         0
     } else {
+        // The same ring the plan keeps cells by this frame, resolved the same way: a check that
+        // read the configured ring where the plan drew none would accept a cell the plan has
+        // stopped wanting (`EngineConfig::effective_terrain_radius`).
+        let has_lod = database
+            .as_ref()
+            .is_some_and(|database| database.has_lod_for(active.worldspace_id));
+        let terrain_radius = config.effective_terrain_radius(has_lod);
         camera.single().map_or(0, |camera| {
             let center = camera_grid(camera.translation, origin.0);
-            let limit = config
-                .unload_radius
-                .max(config.terrain_radius.saturating_add(1));
+            let limit = config.unload_radius.max(terrain_radius.saturating_add(1));
             streaming
                 .cells
                 .iter()

@@ -1,12 +1,12 @@
 use crate::doors::DoorwayPlacement;
 use crate::world::is_safe_relative_asset_path;
-use bevy::prelude::{Reflect, Resource};
+use bevy::prelude::{Reflect, Resource, warn};
 use color_eyre::{Result, eyre::WrapErr};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use rusqlite::{Connection, OpenFlags, params};
 use shared::lod::{ChunkAnchor, ChunkKey, LodOrigin, LodTier, chunk_payload_path};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     f32::consts::{PI, TAU},
     path::Path,
     sync::{
@@ -254,6 +254,15 @@ pub struct WorldDatabase {
     lod_responses: Receiver<LodChunkResponse>,
     worker: Option<thread::JoinHandle<()>>,
     worker_stopped: Arc<AtomicBool>,
+    /// The worldspaces whose `lod_chunks` hold at least one chunk, read once in
+    /// [`WorldDatabase::open`]. Empty for a database without the table, or with no chunks compiled.
+    ///
+    /// [`WorldDatabase::has_lod_for`] answers from this, so the terrain ring's resolution
+    /// ([`EngineConfig::effective_terrain_radius`](crate::config::EngineConfig::effective_terrain_radius))
+    /// costs a set lookup rather than a query on every frame. The database is opened read-only and
+    /// the conversion never writes it while a run holds it (`--reuse-assets` builds elsewhere), so
+    /// the answer cannot go stale within a run.
+    lod_worldspaces: HashSet<u32>,
     /// The receiving end [`WorldDatabase::saturated_queue`] keeps open so its one request slot
     /// fills. `None` in every run: a real database's worker owns the receiving end. See
     /// [`Drop`], which releases it before the shutdown request.
@@ -414,6 +423,10 @@ impl WorldDatabase {
     pub fn open(path: &Path) -> Result<Self> {
         validate(path)?;
         let path = path.to_owned();
+        // Before the worker takes the file: which worldspaces draw their own terrain LOD. Read here
+        // rather than in the worker because a run resolves the ring on the frame the space changes
+        // and cannot wait for a query to come back (`EngineConfig::effective_terrain_radius`).
+        let lod_worldspaces = lod_worldspaces(&path);
         let (request_tx, request_rx) = bounded(128);
         // Responses must not block shutdown if the main world stops polling.
         let (response_tx, response_rx) = unbounded();
@@ -433,9 +446,23 @@ impl WorldDatabase {
             lod_responses: lod_response_rx,
             worker: Some(worker),
             worker_stopped,
+            lod_worldspaces,
             #[cfg(test)]
             held_receiver: None,
         })
+    }
+
+    /// Whether the database holds at least one terrain LOD chunk for `worldspace_id`, which is what
+    /// decides that the worldspace draws its own distant terrain (see
+    /// [`EngineConfig::effective_terrain_radius`](crate::config::EngineConfig::effective_terrain_radius)):
+    /// the terrain ring is left off where the LOD covers that distance and kept where it does not.
+    ///
+    /// A database without a `lod_chunks` table - one converted before LOD existed - answers false
+    /// for every worldspace, and so does a worldspace the conversion compiled no chunks for. Both
+    /// keep the ring, which is what they drew before LOD was a thing. The answer is read once in
+    /// [`Self::open`] and cached for the run.
+    pub fn has_lod_for(&self, worldspace_id: u32) -> bool {
+        self.lod_worldspaces.contains(&worldspace_id)
     }
 
     pub fn request(&self, request: DatabaseRequest) -> Result<()> {
@@ -470,6 +497,9 @@ impl WorldDatabase {
             lod_responses,
             worker: None,
             worker_stopped: Arc::new(AtomicBool::new(true)),
+            // No database behind this one, so it holds no LOD data either; every worldspace gets
+            // the ring (`EngineConfig::effective_terrain_radius`).
+            lod_worldspaces: HashSet::new(),
             // Held open and never read, so the one slot fills: dropping the receiver instead would
             // refuse requests as `Disconnected`, which is the stopped-worker case rather than a
             // full queue.
@@ -723,12 +753,47 @@ fn load_lod_chunks(connection: &Connection, query: LodChunkQuery) -> Result<Vec<
     .collect()
 }
 
-fn has_lod_table(connection: &Connection) -> Result<bool> {
-    Ok(connection.query_row(
+fn has_lod_table(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='lod_chunks')",
         [],
         |row| row.get(0),
-    )?)
+    )
+}
+
+/// The worldspaces [`WorldDatabase::has_lod_for`] answers true for: the ones with at least one
+/// `lod_chunks` row, from the database at `path`.
+///
+/// The question is per worldspace and the answer is a property of the converted database, which a
+/// run cannot write, so it is read once - one `DISTINCT` over the whole table rather than an
+/// `EXISTS` per worldspace - and kept. A database without the table (converted before LOD existed)
+/// has none, silently: that is a database this engine renders, and every worldspace of it keeps the
+/// ring. A `lod_chunks` table that is there and cannot be read is a fault of its own and is
+/// reported, and every worldspace keeps the ring rather than the run refusing to open over a table
+/// it may never query; the LOD streamer fails loudly on the same table when it does query it
+/// (`load_lod_chunks`).
+fn lod_worldspaces(path: &Path) -> HashSet<u32> {
+    match read_lod_worldspaces(path) {
+        Ok(worldspaces) => worldspaces,
+        Err(error) => {
+            warn!(
+                %error,
+                "world database's LOD worldspace list is unreadable: every worldspace keeps its \
+                 terrain ring"
+            );
+            HashSet::new()
+        }
+    }
+}
+
+fn read_lod_worldspaces(path: &Path) -> rusqlite::Result<HashSet<u32>> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    if !has_lod_table(&connection)? {
+        return Ok(HashSet::new());
+    }
+    let mut statement = connection.prepare("SELECT DISTINCT worldspace_id FROM lod_chunks")?;
+    let rows = statement.query_map([], |row| row.get::<_, u32>(0))?;
+    rows.collect()
 }
 
 fn validate_lod_query(query: LodChunkQuery) -> Result<()> {
@@ -2226,6 +2291,52 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// The ring's question, asked once per run: which worldspaces draw their own terrain LOD.
+    /// Read from `lod_chunks` when the database opens; false - so the ring stays - where the
+    /// table or the rows are missing.
+    #[test]
+    fn has_lod_for_answers_from_the_lod_chunks_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!(
+                r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
+                INSERT INTO schema_info VALUES({version});
+                CREATE TABLE lod_chunks(
+                    worldspace_id INTEGER NOT NULL,tier INTEGER NOT NULL,anchor_x INTEGER NOT NULL,anchor_y INTEGER NOT NULL,
+                    payload_path TEXT NOT NULL,content_hash TEXT NOT NULL,
+                    bounds_min_x REAL NOT NULL,bounds_min_y REAL NOT NULL,bounds_min_z REAL NOT NULL,
+                    bounds_max_x REAL NOT NULL,bounds_max_y REAL NOT NULL,bounds_max_z REAL NOT NULL,
+                    source_cells TEXT NOT NULL,PRIMARY KEY(worldspace_id,tier,anchor_x,anchor_y));
+                INSERT INTO lod_chunks VALUES(60,4,0,0,'lod/0000003c/4/cell_0_0.glb','hash',
+                 0.0,0.0,0.0,1.0,1.0,1.0,'');"#,
+                version = shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+        let database = WorldDatabase::open(&path).unwrap();
+        assert!(
+            database.has_lod_for(60),
+            "the worldspace the conversion compiled chunks for"
+        );
+        assert!(
+            !database.has_lod_for(614),
+            "a worldspace with no chunk of its own keeps the ring"
+        );
+
+        // A database converted before LOD existed has no table at all, and every worldspace of it
+        // keeps the ring rather than the run refusing to open.
+        let legacy_path = directory.path().join("legacy.db");
+        Connection::open(&legacy_path)
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES({});",
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+        assert!(!WorldDatabase::open(&legacy_path).unwrap().has_lod_for(60));
     }
 
     #[test]
