@@ -3,6 +3,42 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-07 Portal Dev (portal baseline, portal-rooms data, foundations merged, isolation rewrite)
+
+Track: Portal. All local; nothing pushed. Hand-offs to Upstream Dev and `local/team/2026-10-07.md`.
+
+- **Portal "before" baseline** (#184 demo): 5 portal scenes, release, 11:12-11:31. Results and the
+  first 160 fps gap list: `local/reference/baseline-2026-10-07/RESULTS.md`. The render-thread CPU owns
+  every frame (the GPU is nearly idle); the terrain ring doubles the render thread (lod-far vs
+  lod-far-ring-off). Door tour: entering an interior costs one frame of about 340 ms (the CSV capped it
+  at 250, a Time<Virtual> cap; Phase 2 fixed it, 36a09ba8), and leaving is followed by a 34-39 frame
+  burst. Code traces: DeepSeek #640, #641, #642.
+- **New portal data** `C:\Modding\SkyrimConverted-portal-rooms` (owner note beside it): a full
+  reconversion with the room map (b7488c1c, XPOD) and fresh BC7 textures. 15 UASTC left (from 19,605);
+  room_graph matches p1rooms. It was resumed once (the console was closed at 15:47; --resume-staging
+  worked). The load check passed. AGENTS.md now points at it. Old portal-lod and C:/Modding/SkyrimConverted
+  plus the D: copies were deleted with the user's yes (logged).
+- **portal** now at 4eb2407d (merge of `portal-rooms`, worktree `D:/Modding-overflow/wt-portal-main`):
+  room-culling #188, room-graph, perf-routes (route runner, frame budget), the world-ready fix
+  (adapted to portal's wanted_cells), portal spans (#644), the per-frame series `frame-series.csv`
+  (#645), isolate_cells via Bevy RenderLayers propagation (#649, review #650 fixes; research #646),
+  and the editor-marker gate (#651, review #652 accept). Checks: fmt and clippy clean, engine plus
+  converter nextest 1778/1778.
+- **Correction:** the #651 commit (0d9d2d02) claims visible FX drips were missing. That is wrong:
+  FXDrips01 sets the BSX marker bit (its drips are particles). Only 17 models change (coin bags,
+  cameras, motes): `local/research/editor-marker-bsx-models-2026-10-07.md`. No reconversion for it
+  alone; batch it with the next portal converter change and bump to 102_402 then (review #652).
+- **Play build:** `D:\Modding-overflow\OpenSkyrimProject-target\quick\engine.exe --assets
+  C:\Modding\SkyrimConverted-portal-rooms --demo riverwood --walk [--room-culling]`. Release build:
+  `C:/Modding/builds/portal-release-target`.
+- **Deferred:** phase2/perf-doors (f3daf559). Its route door steps drive #128's door_crossing, which
+  portal does not run. Direction from Upstream Dev: one "activate this door" request that portal's
+  doors.rs answers. DeepSeek research first, Phase 2 reviews. Water-shared-clock is on Phase 2's side.
+- **Next (morning):** the timing window on portal-rooms with the per-frame series (before vs after the
+  isolation rewrite), then the door-step design research. Plan:
+  `local/plans/portal-rooms-rebuild-2026-10-07.md`.
+- No worker running; no coder worktrees left on C:.
+
 ## 2026-10-07 Phase 1 Dev (#188 fix, door_links, #186 terrain merge converter half)
 
 All local; no PRs opened. Hand-offs went to Upstream Dev, Phase 2 Dev and `local/team/2026-10-07.md`.
