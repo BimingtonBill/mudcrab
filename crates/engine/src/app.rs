@@ -245,6 +245,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // The run fingerprint is measurement data: an ordinary play session neither builds one nor
     // pays for the startup system that reads it.
     let records_measurements = crate::fingerprint::records_measurements(&config);
+    let room_culling = crate::room_culling::RoomCullingPlugin::from_config(&config);
     app.insert_resource(config)
         .insert_resource(origin)
         .insert_resource(render_asset_budget)
@@ -285,6 +286,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
         // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
         .add_plugins(crate::lights::LightsPlugin)
+        // Registered for every run; with `--room-culling` off it adds no system.
+        .add_plugins(room_culling)
         .add_systems(Update, capture_acceptance_screenshot);
     add_remote_plugins(&mut app, remote);
     if records_measurements {

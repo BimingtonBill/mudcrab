@@ -35,6 +35,7 @@ pub mod profiling;
 pub mod remote;
 pub mod render;
 pub mod render_timing;
+pub mod room_culling;
 pub mod schedule_timing;
 pub mod shadow_layers;
 pub mod shots;

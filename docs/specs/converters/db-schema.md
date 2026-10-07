@@ -329,6 +329,9 @@ reference and cell fields, validated against their expected sizes:
 | `XCIM`, `XCMO`, `XCAS` | CELL | image space, music type, acoustic space |
 | `XCCM` | CELL | region the cell takes its sky and weather from |
 | `XCLR` | CELL | regions (array) |
+| `XPOD` | REFR | the two rooms a portal marker joins (two FormIDs) |
+| `XLRM` | REFR | linked room of a room marker |
+| `LNAM`, `INAM` | REFR | room marker lighting template, image space (other record types keep their own handling) |
 
 For blob remapping, placed references are REFR, ACHR, ACRE, PGRE, PMIS, PHZD,
 PARW, PBAR, PBEA, PCON and PFLA. This does not expand the record types exported
@@ -336,7 +339,7 @@ to the `references` table; the six newly covered types retain their blobs in
 `records` without adding `references` rows.
 Fields not covered may still hold plugin-local FormIDs. In particular, do not
 consume `WRLD.RNAM` large-reference lists, `XLOC` lock keys, `XPWR` water
-reflections, or `XPOD`/`XLRM` room and portal links as resolved IDs. Other
+reflections as resolved IDs. Other
 unconverted fields include `XLIB`, `XMBR`, `XATR`, `XTNM`, `PDTO`, `CELL.XILL`
 and `WRLD.ZNAM`. Check the converter's field-specific handling before using
 these payloads; this list is not exhaustive.
@@ -512,3 +515,105 @@ grass definitions. The subset export used by movement annotation preserves unrel
 grass rows; if it includes an LTEX, only that texture's association list is replaced.
 Movement annotation continues to accept schema 4 through the current schema and
 preserves the existing database version; it does not perform a full reconversion.
+
+---
+
+### 15. Interior Room Graph (`room_bounds`, `room_portals`, `room_links`, `reference_rooms`, `room_graph_stats`)
+
+Skyrim marks the rooms of an interior with `RoomMarker` references (base `0x1F`) and the
+doorways between them with `PortalMarker` references (base `0x20`). The converter decodes both
+and records which room boxes each placed object belongs to. The tables hold facts only: which
+objects to draw is the engine's policy (design: `docs/research/interior-room-graph-converter.md`,
+upstream issue #188). Only interior cells and only box rooms (`XPRM` shape 1) are written;
+exterior markers are skipped silently, and rooms of other shapes, and rooms or portals with a non-finite size or transform, are skipped and counted in the conversion report.
+All FormIDs are in load-order numbering, like `references.id`.
+
+```sql
+CREATE TABLE IF NOT EXISTS room_bounds (       -- one row per interior RoomMarker with a box XPRM
+    ref_id INTEGER PRIMARY KEY,                -- references.id of the marker
+    cell_id INTEGER NOT NULL,
+    pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,   -- Creation units
+    rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,   -- radians, as references
+    half_x REAL NOT NULL, half_y REAL NOT NULL, half_z REAL NOT NULL, -- XPRM[0..12]
+    lighting_template_id INTEGER,              -- LNAM, NULL when absent
+    image_space_id INTEGER,                    -- INAM, NULL when absent
+    flags INTEGER NOT NULL DEFAULT 0           -- XRMR flags byte | (XRMR u16 << 8), kept raw
+);
+CREATE INDEX IF NOT EXISTS idx_room_bounds_cell ON room_bounds(cell_id);
+
+CREATE TABLE IF NOT EXISTS room_portals (      -- one row per interior PortalMarker with an XPRM
+    ref_id INTEGER PRIMARY KEY,
+    cell_id INTEGER NOT NULL,
+    pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
+    rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
+    half_x REAL NOT NULL, half_z REAL NOT NULL, -- doorway half-width and half-height
+    room_a INTEGER,                            -- XPOD[0]; NULL when 0, absent or not a room of this cell
+    room_b INTEGER                             -- XPOD[1]; same
+);
+CREATE INDEX IF NOT EXISTS idx_room_portals_cell ON room_portals(cell_id);
+
+CREATE TABLE IF NOT EXISTS room_links (        -- XLRM: rooms seen together without a portal
+    room_ref INTEGER NOT NULL,
+    linked_ref INTEGER NOT NULL,
+    PRIMARY KEY (room_ref, linked_ref)
+);
+
+CREATE TABLE IF NOT EXISTS reference_rooms (   -- room membership, interiors with rooms only
+    reference_id INTEGER NOT NULL,             -- references.id
+    room_ref INTEGER NOT NULL,                 -- room_bounds.ref_id
+    contained INTEGER NOT NULL,                -- 1: pivot inside the box; 0: only the bounds overlap it
+    PRIMARY KEY (reference_id, room_ref)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_reference_rooms_room ON reference_rooms(room_ref);
+
+CREATE TABLE IF NOT EXISTS room_graph_stats (  -- conversion report counters, one row per name
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+```
+
+Columns and rules:
+
+- **`room_bounds`**: the box is centred on the marker's position and oriented by its rotation
+  (the same Euler convention as any reference, `shared::coordinates`). `half_*` are the `XPRM`
+  half-extents in the room's own frame. `lighting_template_id` (`LNAM`) and `image_space_id`
+  (`INAM`) are decoded for the lighting work in #129-#135; nothing in the engine uses them yet.
+- **`room_portals`**: a portal's doorway is the marker's local X-Z rectangle (normal along local
+  +Y); `half_x`/`half_z` are its half-width and half-height. A portal marker without `XPRM`
+  has no size and gets no row.
+- **`room_links`**: one row per `XLRM` as stored on the room, with no mirror rows. A link joins
+  rooms that may have no portal between them but must be seen together: if one is visible, so is
+  the other. The target is stored as written, even if it is not a `room_bounds` row.
+- **`reference_rooms`**: written for every placed object (`REFR`, `ACHR`, `ACRE`, `PGRE`,
+  `PMIS`) in an interior cell that has at least one room, except the room and portal markers
+  themselves. `contained = 1` rows come from the ESM export: the object's pivot (its position)
+  lies inside the box, edges included. `contained = 0` rows are added after model bounds are
+  known (the integration stage, once `statics.bounds_*` come from the converted GLBs): the
+  pivot is outside, but the object's bounds, placed with the reference's scale, rotation and
+  position, overlap the box. `statics.bounds_*` are glTF-axis (Y-up) numbers in Creation units,
+  with no metre scale. The test is conservative (the placed bounds' corners, taken into the room
+  frame, as an axis-aligned box against the half-extents), so it can report an overlap that does
+  not exist, which only makes the engine draw more. A `contained = 1` row is never also written
+  as `contained = 0`.
+- **`room_graph_stats`**: the counters the conversion report shows in `integration-report.json`
+  under `room_graph`: `rooms`, `portals`, `links`, `portals_with_missing_side`,
+  `non_box_rooms_skipped`, `portals_without_size_skipped`, `invalid_markers_skipped` (rooms and portals with a non-finite size or transform), `objects_in_no_room` and
+  `objects_in_several_rooms` (both by pivot), and `overlap_rows`.
+
+The tables are derived data: a full load-order export clears and rebuilds them from the winning
+records on every conversion, like the grass tables, and the subset export used by movement
+annotation leaves them alone. `create_tables` adds them to an older reused database.
+
+**These tables are optional and did not bump `shared::WORLD_DATABASE_SCHEMA_VERSION`.** No engine code reads
+them yet; a reader must probe for them first, as the engine does for `lights` and the additive
+`waters` columns, so a database without them behaves as before.
+
+| Case | Converter writes | Engine |
+|---|---|---|
+| Interior without room markers | no rows | draw everything, as today |
+| Old database, tables absent | n/a | feature off, no error |
+| Portal side 0, missing or not a room | `room_a`/`room_b` NULL | ignore that edge |
+| Object in no room / several | no `contained = 1` row / several | always drawn |
+| Camera outside every room | n/a | draw everything |
+| Non-box room shape | skipped, counted | its objects are in no room, so drawn |
+| Exterior markers | not written | out of scope (#106) |
