@@ -27,7 +27,8 @@ Claude (Claude Code) leads the work on this checkout and delegates bounded tasks
 5. Read the current engine goal and the foundation demo gate in `local/plans/foundations-to-portal.md`
    (the user, 2026-10-07): the portal demo is to hold a stable 160 fps while travelling and through
    load doors, with no shortcuts; and no engine-foundation draft or PR opens until it has run in the
-   portal demo and the user has seen it there.
+   portal demo and the user has seen it there. That covers every public release of the work, also
+   pushes of it to our public fork (`myfork`, `public/portal`).
 
 ## Two tracks: Phase 2 first, portal second
 
@@ -90,8 +91,9 @@ before starting any `phase2/*` branch or moving work between tracks.
 >   someone else's PR, and anything that is not a fast-forward.
 > - **Standing yes for comments on our own items (the user, 2026-10-07).** Upstream Dev may post
 >   comments on issues and PRs opened by BimingtonBill without asking each time (AI-labelled, low
->   noise, listed in the evening table). Comments on anyone else's items and replies to people still
->   need the user's yes.
+>   noise, listed in the evening table). Comments only: not reviews, body edits, new issues or PRs,
+>   or pushes. Comments on anyone else's items, and anything that answers a person (even a new
+>   top-level comment on our own item), still need the user's yes.
 > - Reading GitHub (`gh pr view`, `gh api` GETs, `git fetch`) is fine for every session.
 
 > **Handed-out jobs only (the user, 2026-09-30).** Dev sessions work only on jobs the user or
@@ -202,7 +204,8 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
 - **xEdit is the record reference (the user, 2026-10-07; every session and worker).** xEdit
   4.1.5f is installed at `C:\Tools\SSEEdit` (`SSEEdit64.exe` GUI, `SSEDump64.exe` command-line
   dumper). Use it at these points:
-  - **Before decoding or changing any record or field** (converter or engine): read how xEdit
+  - **Before adding or changing how a Bethesda plugin record or field is interpreted** (converter
+    or engine; our own Rust or database fields are not xEdit fields): read how xEdit
     defines it in `Core/wbDefinitionsTES5.pas` **at the `xedit-4.1.5f` tag** of TES5Edit/TES5Edit
     (the default branch is newer than what is installed) and cite "xEdit 4.1.5f defs, file:line" in
     the note, brief or PR. Where xEdit and UESP or our own reading disagree, say so.
@@ -210,11 +213,13 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
     a missing door): check that record's fields and flags in xEdit first, to tell a data or
     converter fault from an engine fault. The user can open records in the GUI for a session;
     workers use the dumper. A single record or cell is triage; a systematic comparison is the next
-    point.
+    point. Rendering faults (shaders, passes) still go to a RenderDoc/PIX capture.
   - **Answer-key checks** (systematic comparison of converter output against xEdit's winning
     records) belong to Chef's #157/#158 programme upstream: help there (via Upstream Dev), never
     build a rival oracle.
-  - **How workers use it:** the brief adds `-AddDir C:/Tools/SSEEdit`; dump output goes to
+  - **How workers use it:** the brief adds `-AddDir C:/Tools/SSEEdit` and an `-AllowTools` rule for
+    the exact `SSEDump64.exe` command (the dumper's command line is not yet smoke-tested here; until
+    Upstream Dev has, workers read the definitions only); dump output goes to
     `D:\Modding-overflow\scratch\ssedit-dumps` (OWNER.txt, class A), never into the game folder or
     `SkyrimConverted*`. Read only: never save a plugin (always "don't save" on exit). Running it on
     game data is CPU and disk work: not during a booked timing window.
