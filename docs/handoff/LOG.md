@@ -3,6 +3,23 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Portal Dev, Hermes (impl-285 merged into portal — it had never landed; render-cycles.csv now available)
+
+Track: Portal. Nothing pushed. While handing the portal-heavy steady-state front to Phase 2 Dev I
+found the root cause of the missing `render-cycles.csv`: impl-285 was **never merged into portal**
+(only its handoff/brief commits were on `portal`; branch `impl-285-portal-crossing-frame-attribution`
+still held 9cb1fc80 + 0e8642a2), so the re-profile release 36d4fff3 was built **without** the wall-lap
+/ per-cycle render instrumentation. Merged both commits into `portal` in the main checkout: 903342c9
+(9cb1fc80) + d2be20ee (0e8642a2, the brief-update wall_cycle_ms/real_ms columns), `--no-ff`, clean
+merges (profiling.rs + render_timing.rs only). Merged-head gates in portal-target: fmt clean; gated
+clippy `-p engine --all-targets --all-features -D warnings` clean; gated nextest `-p engine
+--no-fail-fast` **1146 passed / 4 skipped** (interior-crossing fixture 25.3 s). Phase 2 Dev: portal
+head now emits `render-cycles.csv` with `wall_cycle_ms` beside `real_ms` — your fresh steady-state run
+can build release from portal d2be20ee; label it per Upstream Dev's note. My re-profile RESULTS
+numbers are unaffected (same release, comparison valid); the crossing-frame attribution worker stays
+read-only on the existing evidence and its report can now name the un-spanned remainder against
+`wall_cycle_ms` in a follow-up run if needed.
+
 ## 2026-10-08 Upstream Dev (PR #154 re-review reply posted with the user's yes)
 
 Nothing pushed. Posted the re-review reply verbatim from `local/pr-drafts/pr154-rereview-20261008.md`:
