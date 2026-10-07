@@ -3,6 +3,30 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Upstream Dev (night: folder move finished, GLM trial started, build gate fixes)
+
+Track: all (Upstream Dev). Day logs: `local/team/2026-10-07.md`, `local/team/2026-10-08.md`.
+
+- **Folder move DONE** (2026-10-07 21:45): main checkout `C:/Modding/Mudcrab/mudcrab`, worktrees/builds/data under
+  `C:/Modding/Mudcrab` and `D:/Mudcrab`. The script stopped on a harmless git repair note; finished by hand: all 47
+  worktrees resolve, paths rewritten (4759a8be; upstream test example paths kept, 0fda5620), 85 OWNER notes, memory
+  copied to `C--Modding-Mudcrab-mudcrab`, providers.json Muse opt-in updated (user yes, .bak kept), RESOURCES.md line,
+  `.claude/settings.local.json` cleaned to one rule (user's ask). Still open: `local\impl` as a junction to D: (coder
+  worktrees still land on C:; C: 168 GB free), and the old memory key can be removed once sessions use the new one.
+- **Dynamic linking trial (user ask):** no gain (36-37 s vs 37-38 s per one-line edit); not adopted. Lever: split the
+  engine crate (next plan).
+- **GLM 5.3 trial (user ask, provider `glm`):** Phase 1 GLM impl #1900 (KTX2 mip order) and Phase 2 GLM impl-1057
+  (Failed-cell retry), each with a DeepSeek review; Phase 1's DeepSeek #896.1 (terrain wiring) is the comparison. All
+  stopped at a clean point for the night (resume by session id). Report to the user when they land: steps, time, cost,
+  findings, fixes, verdict vs DeepSeek.
+- **Build gate:** owner detection reads the track token in worker labels (8375c62a); `hold set` lists running jobs and
+  `--drain` waits for them (d387c468); AGENTS.md updated. Phase 1 numbers continue at 1900-1999 (eeb41240).
+- **Portal:** timing window ran 00:49-~01:30 (portal 0fda5620 on portal-rooms); results with Portal Dev. Water merge is
+  a morning item.
+- **Morning:** GLM trial results; Portal's timing numbers; water merge into portal; door activation contract and
+  missing-ground (render-prepared signal) designs; Phase 1's three converter drafts; PR #177 merge is the user's (ready).
+- No worker of mine is running.
+
 ## 2026-10-07 Upstream Dev (evening: decisions, deletions, xEdit posts, #167 review, folder move prepared)
 
 Track: all (Upstream Dev). Day log: `local/team/2026-10-07.md`; evening table: `local/team/evening-table-2026-10-07.md`.
