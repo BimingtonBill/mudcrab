@@ -240,7 +240,9 @@ struct Thresholds {
 
 #[allow(clippy::too_many_arguments)]
 fn collect_and_finish(
-    time: Res<Time>,
+    // Real wall-clock deltas: Bevy's virtual `Time` clamps a frame to 250 ms (`Time<Virtual>`'s
+    // default max delta), so a 340 ms hitch would be recorded as 250 ms.
+    time: Res<Time<Real>>,
     config: Res<EngineConfig>,
     diagnostics: Res<DiagnosticsStore>,
     system: Option<Res<SystemInfo>>,
