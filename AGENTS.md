@@ -56,6 +56,22 @@ Every review brief asks "what shortcut does this take, and what would break for 
 A shortcut found is a "fix first". A deliberate temporary measure needs the user's yes, is labelled TEMPORARY
 in code and text, and gets a follow-up item.
 
+## Parallelism check (the user, 2026-10-07: standing, every session while working)
+
+Whenever a session starts a work block, hands something off, receives a report, hits a hold (a timing window,
+a conversion's build pause, a review wait) or is about to go idle, it checks:
+- **What can run in parallel right now?** Independent briefs run at the same time in separate worktrees with
+  disjoint owned-file lists, not one after another. During a build hold, coders keep writing code and research or
+  analysis workers keep reading; only cargo waits.
+- **Is anything idle that need not be?** A session with no worker running and nothing blocked on the user takes
+  the next item from its queue, or tells Upstream Dev it has room.
+- **Which provider has room?** `ds_spend.py status` (DeepSeek, Sol, Muse, MiMo) and the Claude plan pace; spread
+  the work across them per the provider rules.
+- Limits still apply: timing windows run alone, conversions pause new builds, no unattended runs, one build folder
+  per session, the DeepSeek pace.
+Upstream Dev runs this check across all sessions at least once an hour while the user is working, and at every
+hold and unhold, and messages any session that is idle without a reason.
+
 ## Two tracks: Phase 2 first, portal second
 
 Every task belongs to one track; name it in the brief, the commit and the handoff entry.
