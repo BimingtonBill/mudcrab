@@ -1471,6 +1471,30 @@ fn a_two_pair_xpod_is_remapped_in_every_pair() {
     .concat();
     assert_eq!(data, &expected);
 
+    // A 12-byte XPOD (a pair and a half) is a whole number of FormIDs: kept, all three remapped.
+    // The old fixed 8-byte layout dropped it.
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let patch = plugin(
+        dir.path(),
+        "Patch.esm",
+        &["Base.esm"],
+        1,
+        record(b"REFR", 0x0100_0900, 0, sub(b"XPOD", &payload[..12])),
+    );
+    let merged = EsmParser::merge_plugins(&[base, filler, patch]).unwrap();
+    let data = &merged[&0x0200_0900]
+        .subrecords
+        .iter()
+        .find(|(name, _)| name.as_slice() == b"XPOD")
+        .expect("12-byte XPOD kept")
+        .1;
+    assert_eq!(
+        data,
+        &[word(0x0200_0801), word(0x0200_0802), word(0x0200_0803)].concat()
+    );
+
     // A length that is not a multiple of four is dropped, like any other array.
     let dir = tempfile::tempdir().unwrap();
     let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());

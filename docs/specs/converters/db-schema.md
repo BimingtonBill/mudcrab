@@ -269,7 +269,7 @@ reference and cell fields, validated against their expected sizes:
 | `XCIM`, `XCMO`, `XCAS` | CELL | image space, music type, acoustic space |
 | `XCCM` | CELL | region the cell takes its sky and weather from |
 | `XCLR` | CELL | regions (array) |
-| `XPOD` | REFR | the two rooms a portal marker joins (two FormIDs) |
+| `XPOD` | REFR | the rooms a portal marker joins: an array of (origin, destination) pairs; every u32 a FormID (xEdit 4.1.5f defs) |
 | `XLRM` | REFR | linked room of a room marker |
 | `LNAM`, `INAM` | REFR | room marker lighting template, image space (other record types keep their own handling) |
 
@@ -531,8 +531,9 @@ Columns and rules:
   after the last whole pair are ignored. Every `XPOD` in the official masters is one pair, so
   vanilla output has `pair_index` 0 only. **Readers must not assume `ref_id` is unique**: join
   or group on `(ref_id, pair_index)`, or on `ref_id` and expect several rows. The key changed
-  from `ref_id` alone, and `create_tables` drops an older-shaped `room_portals` (no
-  `pair_index`) so it is recreated; the table is derived data, rebuilt by the next full export.
+  from `ref_id` alone, and `create_tables` migrates an older-shaped `room_portals` (no
+  `pair_index`) in place, inside one savepoint: every row is kept with `pair_index` 0 until the
+  next full export rebuilds the table.
   In the plugin remap `XPOD` is an array of FormIDs: every four bytes are remapped, and a
   length that is not a multiple of four is dropped with a warning, like any other FormID array.
 - **`room_links`**: one row per `XLRM` as stored on the room, with no mirror rows. A link joins

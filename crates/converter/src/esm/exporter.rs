@@ -221,8 +221,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
          );"#
     )?;
     // Optional interior room graph (db-schema.md section 15); an older reused database gains it
-    // here, and an older-shaped `room_portals` (no `pair_index`) is dropped to be recreated.
-    crate::esm::rooms::drop_outdated_room_portals(conn)?;
+    // here, and an older-shaped `room_portals` (no `pair_index`) is migrated in place.
+    crate::esm::rooms::migrate_room_portals(conn)?;
     conn.execute_batch(crate::esm::rooms::ROOM_TABLES_SQL)?;
     conn.execute(
         "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
@@ -1937,10 +1937,9 @@ mod tests {
         assert_eq!(read, report);
     }
 
-    #[test]
-    fn an_older_room_portals_table_is_recreated_with_pair_index() {
+    /// A database whose `room_portals` has the shape before `pair_index`, holding two portals.
+    fn old_shape_database() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        // The shape before `pair_index`: one row per portal reference.
         conn.execute_batch(
             "CREATE TABLE room_portals (
                  ref_id INTEGER PRIMARY KEY, cell_id INTEGER NOT NULL,
@@ -1950,33 +1949,96 @@ mod tests {
                  room_a INTEGER, room_b INTEGER
              );
              CREATE INDEX idx_room_portals_cell ON room_portals(cell_id);
-             INSERT INTO room_portals VALUES (1, 2, 0, 0, 0, 0, 0, 0, 1, 1, NULL, NULL);",
+             INSERT INTO room_portals VALUES (1, 2, 0, 0, 0, 0, 0, 0, 3, 4, 7, 8);
+             INSERT INTO room_portals VALUES (5, 2, 1, 2, 3, 0, 0, 0, 5, 6, NULL, NULL);",
         )
         .unwrap();
+        conn
+    }
+
+    /// `room_portals` as (ref_id, pair_index, cell_id, half_x, room_a, room_b).
+    type PortalTableRow = (i64, i64, i64, f64, Option<i64>, Option<i64>);
+
+    fn portal_table(conn: &Connection) -> Vec<PortalTableRow> {
+        conn.prepare(
+            "SELECT ref_id, pair_index, cell_id, half_x, room_a, room_b FROM room_portals ORDER BY ref_id, pair_index",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    fn old_shape_rows() -> Vec<PortalTableRow> {
+        vec![(1, 0, 2, 3.0, Some(7), Some(8)), (5, 0, 2, 5.0, None, None)]
+    }
+
+    #[test]
+    fn an_older_room_portals_table_is_migrated_in_place_keeping_its_rows() {
+        let conn = old_shape_database();
         create_tables(&conn).unwrap();
-        let columns: Vec<String> = conn
-            .prepare("SELECT name FROM pragma_table_info('room_portals') ORDER BY cid")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert!(columns.contains(&"pair_index".to_string()), "{columns:?}");
-        let rows: i64 = conn
-            .query_row("SELECT count(*) FROM room_portals", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(rows, 0, "derived data is rebuilt by the next export");
-        // The recreated table takes two pairs of one reference; a second pass keeps them.
-        conn.execute_batch(
+        assert_eq!(portal_table(&conn), old_shape_rows());
+        // The key is now (ref_id, pair_index), and the cell index is back.
+        conn.execute(
             "INSERT INTO room_portals(ref_id, pair_index, cell_id, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, half_x, half_z)
-             VALUES (1, 0, 2, 0, 0, 0, 0, 0, 0, 1, 1), (1, 1, 2, 0, 0, 0, 0, 0, 0, 1, 1);",
+             VALUES (1, 1, 2, 0, 0, 0, 0, 0, 0, 3, 4)",
+            [],
         )
         .unwrap();
-        create_tables(&conn).unwrap();
-        let rows: i64 = conn
-            .query_row("SELECT count(*) FROM room_portals", [], |r| r.get(0))
+        let index: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_room_portals_cell'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(rows, 2);
+        assert_eq!(index, 1);
+        let leftovers: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='room_portals_new'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0);
+        // A second pass is a no-op.
+        create_tables(&conn).unwrap();
+        assert_eq!(portal_table(&conn).len(), 3);
+    }
+
+    #[test]
+    fn a_subset_export_on_a_migrated_database_leaves_the_portals_alone() {
+        let conn = old_shape_database();
+        create_tables(&conn).unwrap();
+        let records = vec![
+            interior_cell(0x100),
+            room(0x1001, 0x100, [0.0; 3], [0.0; 3], [10.0; 3], vec![]),
+        ];
+        let master: HashMap<u32, RawRecord> = records.into_iter().map(|r| (r.form_id, r)).collect();
+        export_to_db(&conn, &master).unwrap();
+        assert_eq!(portal_table(&conn), old_shape_rows());
+    }
+
+    #[test]
+    fn a_failed_full_export_leaves_the_migrated_portals_intact() {
+        use crate::esm::load_order::LoadOrder;
+        let conn = old_shape_database();
+        create_tables(&conn).unwrap();
+        // Fail when the export writes its counters, which is after it cleared the room tables
+        // inside the transaction.
+        conn.execute_batch(
+            "CREATE TRIGGER fail_stats_insert BEFORE INSERT ON room_graph_stats
+             BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+        )
+        .unwrap();
+        let master: HashMap<u32, RawRecord> = HashMap::new();
+        let error = export_to_db_with_load_order(&conn, &master, &LoadOrder::read(&[]).unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("forced failure"), "{error}");
+        assert_eq!(portal_table(&conn), old_shape_rows());
     }
 
     #[test]
