@@ -140,9 +140,19 @@ def active_holds() -> list[dict]:
 
 
 def owner_of(label: str) -> str:
-    """The session a run belongs to: BUILD_GATE_OWNER, else the label's track prefix (p2-water -> p2)."""
-    owner = os.environ.get("BUILD_GATE_OWNER") or label.split("-")[0]
-    return {"phase1": "p1", "phase2": "p2", "phase3": "p3"}.get(owner.lower(), owner.lower())
+    """The session a run belongs to: BUILD_GATE_OWNER, else a track token in the label, else its first part."""
+    aliases = {"phase1": "p1", "phase2": "p2", "phase3": "p3"}
+    if os.environ.get("BUILD_GATE_OWNER"):
+        owner = os.environ["BUILD_GATE_OWNER"].lower()
+        return aliases.get(owner, owner)
+    # Worker labels carry the track inside (impl-1900-p1-ktx2, review-650-portal-...), so look for a track
+    # token anywhere; otherwise the first part (p2-water -> p2). 2026-10-08: every ds_impl coder counted as "impl".
+    parts = [part.lower() for part in label.split("-")]
+    for part in parts:
+        part = aliases.get(part, part)
+        if part in ("p1", "p2", "p3", "portal", "upstream"):
+            return part
+    return aliases.get(parts[0], parts[0])
 
 
 def owner_slots(config: dict, owner: str) -> int:
