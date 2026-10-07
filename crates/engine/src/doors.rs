@@ -364,8 +364,9 @@ pub struct DoorAnchor {
     pub source_anchor_height: f32,
     /// The destination door's own placement.
     pub destination: DoorwayGeometry,
-    /// The destination reference's cell grid, for an exterior destination: the cell
-    /// `door_links.destination_cell_id` resolved to, which is where the anchor lands the player and
+    /// The grid of the destination reference's own position, for an exterior destination - not its
+    /// cell's grid, which for a worldspace's persistent cell (where most load doors stand) is (0, 0)
+    /// wherever the door is (`crate::world::database`). It is where the anchor lands the player and
     /// therefore what the streaming paths have to pre-stream. `None` for an interior destination.
     pub destination_grid: Option<[i32; 2]>,
     /// Which way the two doorways face, and whether that could be established.
