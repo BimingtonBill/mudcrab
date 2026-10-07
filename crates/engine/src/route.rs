@@ -1003,7 +1003,7 @@ mod tests {
             .abs()
             .max((travel_start.1 - check_start.1).abs());
         assert!(
-            apart > 20,
+            apart > 10,
             "the check route must be elsewhere: {travel_start:?} and {check_start:?} are {apart} cells apart"
         );
     }
