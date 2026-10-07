@@ -218,8 +218,11 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
     records) belong to Chef's #157/#158 programme upstream: help there (via Upstream Dev), never
     build a rival oracle.
   - **How workers use it:** the brief adds `-AddDir C:/Tools/SSEEdit` and an `-AllowTools` rule for
-    the exact `SSEDump64.exe` command (the dumper's command line is not yet smoke-tested here; until
-    Upstream Dev has, workers read the definitions only); dump output goes to
+    the exact `SSEDump64.exe` command (smoke-tested 2026-10-07: `SSEDump64.exe "-d:<Data path>\" -top:N -dg:<GROUP> Skyrim.esm`
+    prints decoded records with no window, 3 s for a small dump; a full `-check` of Skyrim.esm took
+    398 s). Workers use the dumper only: the full `SSEEdit64.exe` (even with `-autoload -script
+    -autoexit`) opens a window on the user's desktop and creates `SSEEdit Cache` / `SSEEdit Backups`
+    folders inside the game's Data folder, so it runs only with the user present and told first; dump output goes to
     `D:\Modding-overflow\scratch\ssedit-dumps` (OWNER.txt, class A), never into the game folder or
     `SkyrimConverted*`. Read only: never save a plugin (always "don't save" on exit). Running it on
     game data is CPU and disk work: not during a booked timing window.
