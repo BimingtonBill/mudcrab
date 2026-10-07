@@ -197,11 +197,17 @@ def parse_owner_text(text: str) -> tuple[dict | None, str]:
 
 def read_owner(folder: str) -> tuple[dict | None, str]:
     """Read and parse <folder>\\OWNER.txt. Return (info, problem)."""
+    # Converted data keeps its note beside the folder (<folder>.OWNER.txt): a file inside a converted
+    # output makes a later --reuse-assets rebuild refuse it ("retained asset has no manifest provenance").
     path = os.path.join(folder, OWNER_FILE)
     try:
         st = os.lstat(path)
     except OSError:
-        return None, "no OWNER.txt"
+        path = os.path.normpath(folder) + "." + OWNER_FILE
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None, "no OWNER.txt"
     if not stat.S_ISREG(st.st_mode) or st.st_size > OWNER_FILE_MAX_BYTES:
         return None, "OWNER.txt is not a normal small file"
     try:

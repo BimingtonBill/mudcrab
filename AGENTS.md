@@ -360,6 +360,8 @@ only if the user gives one.
   worktree, evidence or data copy, scratch) gets an `OWNER.txt` the moment it is made
   (`python tools/disk_report.py --template`): owner, purpose, class, keep-until (`pr:N`,
   `date:YYYY-MM-DD` or `while-open`), links (yes/no).
+  Converted data (`SkyrimConverted*`) keeps it BESIDE the folder as `<folder>.OWNER.txt`: a file inside a
+  converted output makes a later `--reuse-assets` rebuild refuse it ("retained asset has no manifest provenance").
 - **Classes.** A: rebuildable (build folders, scratch, throwaway checks). B: evidence or data
   copies; they go only after their PR has merged or closed plus a few days, and only once the
   evidence is safe in `local/review/` or the fork's `pr-assets`. C: converted game data, anything
