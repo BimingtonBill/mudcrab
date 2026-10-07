@@ -30,6 +30,32 @@ Claude (Claude Code) leads the work on this checkout and delegates bounded tasks
    portal demo and the user has seen it there. That covers every public release of the work, also
    pushes of it to our public fork (`myfork`, `public/portal`).
 
+## Foundations check (the user, 2026-10-07: every session, worker and review in the Mudcrab project)
+
+Before proposing, approving, building or merging any fix or design, check it against these five points and
+say how it meets them in the brief, handoff, review or PR text:
+
+1. **No shortcuts.** It fixes the root cause. It does not hide a problem: no lower settings, draw distances or
+   shadows, no frame or load caps, no delaying or hiding loading, no code that knows the test data or routes,
+   no skipped cases, disabled checks or weakened tests, no silent fallbacks that turn errors into wrong output.
+2. **Foundationally optimised.** The work sits in the right layer (the converter precomputes; the runtime stays
+   light), its cost scales well with content (per entity, per cell, per mod), and it is measured before and
+   after with the project's own tools (#184 baseline and routes).
+3. **Flexible.** Data-driven, not hard-coded: no Skyrim FormIDs, paths or magic numbers baked into logic; works
+   for any worldspace, plugin set or load order; versioned formats and clean interfaces between converter,
+   shared contracts and engine.
+4. **Moddable.** Mods and load orders keep working: stable IDs, overrides respected, nothing that only holds for
+   vanilla data (the XPOD pairs case); derived data knows when its inputs changed (#185); optional features can
+   be switched off and never become something Mudcrab proper depends on.
+5. **Aligned with the Mudcrab goals.** Upstream's roadmap and phases; Mudcrab as the best modding platform; the
+   portal demo at a stable 160 fps at maximum visuals; long-term foundations over quick wins; the multiplayer
+   design rules (stable IDs, per-cell change data, MP-ready scripting); licence-clean MIT/Apache code (clean-room
+   rules); "plus" features kept separate.
+
+Every review brief asks "what shortcut does this take, and what would break for a mod or another worldspace?"
+A shortcut found is a "fix first". A deliberate temporary measure needs the user's yes, is labelled TEMPORARY
+in code and text, and gets a follow-up item.
+
 ## Two tracks: Phase 2 first, portal second
 
 Every task belongs to one track; name it in the brief, the commit and the handoff entry.
