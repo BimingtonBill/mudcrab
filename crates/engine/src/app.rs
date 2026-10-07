@@ -1081,7 +1081,9 @@ fn setup_terrain_water_fixture(
                 alpha_mode: AlphaMode::Blend,
                 ..default()
             },
-            extension: WaterExtension::with_reflection(reflection.0.clone(), Some(flow_normal)),
+            // A fixed clock keeps the fixture a reproducible still.
+            extension: WaterExtension::with_reflection(reflection.0.clone(), Some(flow_normal))
+                .with_pinned_clock(1.0),
         })),
         Transform::from_xyz(CELL_SIZE_HALF, 12.0, -CELL_SIZE_HALF),
         crate::world::components::WaterSurface,
