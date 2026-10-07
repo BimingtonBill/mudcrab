@@ -751,7 +751,7 @@ pub fn insert_reference(
                 )?;
             }
             None => eprintln!(
-                "warning: XTEL of reference {form_id:08X} is {} bytes, expected at least 28; door link dropped",
+                "warning: XTEL of reference {form_id:08X} ({} bytes) is shorter than 28 bytes or holds a non-finite value; door link dropped",
                 bytes.len()
             ),
         }
@@ -773,7 +773,9 @@ struct DoorLink {
 
 /// Reads an `XTEL` subrecord: a 4-byte destination FormID followed by the
 /// arrival position and rotation as six little-endian `f32`s (the trailing
-/// flags word is not read). Anything shorter than 28 bytes yields `None`.
+/// flags word is not read). Anything shorter than 28 bytes, or with a NaN or
+/// infinite value (SQLite would store NaN as NULL in a NOT NULL column and
+/// abort the export), yields `None`.
 fn door_link(bytes: &[u8]) -> Option<DoorLink> {
     if bytes.len() < 28 {
         return None;
@@ -782,6 +784,9 @@ fn door_link(bytes: &[u8]) -> Option<DoorLink> {
     for (index, value) in values.iter_mut().enumerate() {
         let start = 4 + index * 4;
         *value = f32::from_le_bytes(bytes[start..start + 4].try_into().ok()?);
+    }
+    if !values.iter().all(|value| value.is_finite()) {
+        return None;
     }
     Some(DoorLink {
         destination_ref_id: u32::from_le_bytes(bytes[..4].try_into().ok()?),
@@ -1641,6 +1646,57 @@ mod tests {
             .unwrap();
         assert_eq!(links, 1, "exactly the full-length XTEL carries a link");
         assert_eq!(door_link_row(&conn, 0x3000).0, 0x2000);
+    }
+
+    /// A NaN or infinite arrival value drops that door's link, not the export:
+    /// SQLite would store NaN as NULL and fail the NOT NULL constraint.
+    #[test]
+    fn non_finite_xtel_values_drop_the_link_and_keep_the_export() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut master = HashMap::new();
+        master.insert(
+            0x1000,
+            door_reference(
+                0x1000,
+                0x100,
+                [0.0; 3],
+                xtel(0x3000, [f32::NAN, 2.0, 3.0], [0.0; 3]),
+            ),
+        );
+        master.insert(
+            0x2000,
+            door_reference(
+                0x2000,
+                0x100,
+                [0.0; 3],
+                xtel(0x3000, [1.0, 2.0, 3.0], [0.0, f32::INFINITY, 0.0]),
+            ),
+        );
+        master.insert(
+            0x3000,
+            door_reference(
+                0x3000,
+                0x100,
+                [0.0; 3],
+                xtel(0x1000, [4.0, 5.0, 6.0], [0.0; 3]),
+            ),
+        );
+
+        export_to_db(&conn, &master).unwrap();
+
+        let links: Vec<u32> = conn
+            .prepare("SELECT ref_id FROM door_links ORDER BY ref_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(links, vec![0x3000]);
+        let references: i64 = conn
+            .query_row("SELECT count(*) FROM \"references\"", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(references, 3, "every reference is still exported");
     }
 
     #[test]

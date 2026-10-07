@@ -168,7 +168,8 @@ The arrival position and rotation are the door's own `XTEL` values, not the
 destination reference's transform. The destination cell and worldspace are
 resolved after every reference is written; a destination outside the exported
 plugins leaves both NULL. The plugin loader already drops an `XTEL` that is not
-32 bytes; the exporter also skips one shorter than 28 bytes, with a warning.
+32 bytes; the exporter also skips one shorter than 28 bytes, or one with a NaN or
+infinite position or rotation, with a warning.
 The flags word (bytes 28-31) is not exported. A reference exported again
 without a usable `XTEL` loses its row. Field layout: xEdit 4.1.5f defs,
 `Core/wbDefinitionsTES5.pas:12344-12350` (Door, PosRot, Flags).
