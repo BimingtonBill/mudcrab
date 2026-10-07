@@ -19,6 +19,7 @@ every session and worker on this PC:
 
 Defaults (override in <gate dir>/config.json): 3 slots, at most 2 per session
 (BUILD_GATE_OWNER, else the label's track prefix: p1, p2, p3, portal ...), 8 GB free RAM minimum,
+15 GB free on the drive the build writes to (CARGO_TARGET_DIR, else the working folder),
 wait up to 120 minutes for a slot (then exit 4 with the reason). The gate
 lives in %USERPROFILE%\\.mudcrab\\build-gate, not AppData: the Claude desktop
 app is an MSIX package, and Windows redirects its processes' AppData writes to
@@ -35,6 +36,7 @@ import argparse
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -44,7 +46,7 @@ from datetime import datetime, timedelta
 # Not under AppData: the Claude desktop app is an MSIX package, which redirects AppData writes from its own
 # processes to a private folder that every other process (consoles, workers, cargo) cannot see (2026-10-07).
 GATE_DIR = os.environ.get("MUDCRAB_BUILD_GATE") or os.path.join(os.path.expanduser("~"), ".mudcrab", "build-gate")
-DEFAULTS = {"slots": 3, "max_per_owner": 2, "min_free_ram_gb": 8.0, "max_wait_minutes": 120, "poll_seconds": 10}
+DEFAULTS = {"slots": 3, "max_per_owner": 2, "min_free_ram_gb": 8.0, "min_free_disk_gb": 15.0, "max_wait_minutes": 120, "poll_seconds": 10}
 GB = 1024**3
 
 
@@ -172,6 +174,12 @@ def blocking_reason(config: dict) -> str | None:
     ram = free_ram_gb()
     if ram < float(config["min_free_ram_gb"]):
         return f"free RAM {ram:.1f} GB < {config['min_free_ram_gb']} GB"
+    # The drive the build writes to: CARGO_TARGET_DIR if set, else the working folder (2026-10-07: coder
+    # worktrees filled C: to 0 GB and builds failed with os error 112).
+    target = os.environ.get("CARGO_TARGET_DIR") or os.getcwd()
+    free_disk = shutil.disk_usage(os.path.splitdrive(os.path.abspath(target))[0] + os.sep).free / GB
+    if free_disk < float(config["min_free_disk_gb"]):
+        return f"free disk on {os.path.splitdrive(os.path.abspath(target))[0]} {free_disk:.1f} GB < {config['min_free_disk_gb']} GB"
     return None
 
 
@@ -222,6 +230,8 @@ def cmd_status(_args: argparse.Namespace) -> int:
     clear_stale_slots(config)
     print(f"gate: {GATE_DIR}")
     print(f"free RAM: {free_ram_gb():.1f} GB (minimum {config['min_free_ram_gb']} GB)")
+    for drive in ("C:\\", "D:\\"):
+        print(f"free disk {drive}: {shutil.disk_usage(drive).free / GB:.1f} GB (minimum {config['min_free_disk_gb']} GB for builds there)")
     for path in slot_paths(config):
         info = read_json(path)
         print(f"{os.path.basename(path)}: " + ("free" if info is None else
