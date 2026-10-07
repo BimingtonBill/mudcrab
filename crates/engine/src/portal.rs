@@ -189,7 +189,9 @@ use crate::{
     },
 };
 use bevy::{
-    app::{HierarchyPropagatePlugin, Inherited, Propagate, PropagateOver, PropagateSet},
+    app::{
+        HierarchyPropagatePlugin, Inherited, Propagate, PropagateOver, PropagateSet, PropagateStop,
+    },
     asset::embedded_asset,
     camera::primitives::Aabb,
     camera::{
@@ -2935,6 +2937,10 @@ struct PortalLayerSource {
     root: Option<Entity>,
     /// The layers the node keeps while its cell is active.
     own: RenderLayers,
+    /// The door the door layer is drawing in place of, while it holds it: every node of that door's
+    /// model is on no layer at all, whatever its cell's role asks - its own layers would put it
+    /// back on the main camera under the door-layer door standing in the doorway.
+    door: Option<Entity>,
 }
 
 /// The own-layer sources of every resident cell, so a role change writes one value per source
@@ -2942,8 +2948,14 @@ struct PortalLayerSource {
 #[derive(Resource, Default)]
 struct CellLayerSources {
     /// Each cell root's own-layer sources. A cell that is gone is dropped by [`isolate_cells`] with
-    /// its list; a source that despawned in the meantime is an id the value writes skip.
+    /// its list, and a cell whose role is re-stamped has its list rebuilt without the ids of sources
+    /// that despawned in the meantime: a dead id - which the world may have recycled for something
+    /// else - never takes a role it does not belong to.
     by_root: HashMap<Entity, Vec<Entity>>,
+    /// The sources of each door the door layer is drawing in place of: the nodes of its model that
+    /// have layers of their own, on no layer while the door is held, given their cell's value back
+    /// the frame the layer releases it.
+    door_sources: HashMap<Entity, Vec<Entity>>,
     /// The sources that appeared since the last [`isolate_cells`], which is the only place that
     /// knows the frame's roles: they were adopted with the role of that moment, and the isolation -
     /// every root is classified every frame - gives them the role their cell has *now*. A source
@@ -2990,84 +3002,121 @@ fn own_layers(
     RenderLayers::default()
 }
 
-/// The cell root `entity` stands under, and the role stamped on it: the nearest ancestor (itself
-/// included) that is a resident cell root. `None` for a node no cell owns - the quad, a door-layer
-/// door, a spill light, the portal camera - which the portal leaves on its own layers.
+/// The cell root `entity` stands under, the role stamped on it and the door of `hidden_doors` it
+/// stands under (if any): the nearest ancestor (itself included) that is a resident cell root, and
+/// the nearest hidden-door ancestor above it. `None` for a node no cell owns - the quad, a
+/// door-layer door, a spill light, the portal camera - which the portal leaves on its own layers.
 fn owning_cell(
     entity: Entity,
     parents: &Query<&ChildOf>,
     roots: &Query<Option<&CellRoleStamp>, With<StreamedCellRoot>>,
-) -> Option<(Entity, Option<CellRole>)> {
+    hidden_doors: Option<&HashSet<Entity>>,
+) -> Option<(Entity, Option<CellRole>, Option<Entity>)> {
+    let mut door = None;
     let mut cursor = Some(entity);
     while let Some(current) = cursor {
         if let Ok(stamp) = roots.get(current) {
-            return Some((current, stamp.map(|stamp| stamp.0)));
+            return Some((current, stamp.map(|stamp| stamp.0), door));
+        }
+        // The door the node itself is is not one it stands under: the door path of
+        // [`isolate_cells`] gives the door its own value.
+        if current != entity && hidden_doors.is_some_and(|doors| doors.contains(&current)) {
+            door = door.or(Some(current));
         }
         cursor = parents.get(current).ok().map(ChildOf::parent);
     }
     None
 }
 
+/// The role a cell has *now*: the classification of this frame ([`PortalState::roles`], which every
+/// root is given every frame it is classified in) when it has one for the root, and the root's stamp
+/// otherwise - a root the isolation has not classified yet, or one it has never seen at all (no
+/// camera, no space). The stamp can be a frame older than the classification (it is written when a
+/// cell spawns, with the space of that moment), so a node adopted after the isolation takes its role
+/// from the classification and not from the stamp.
+fn current_role(state: &PortalState, root: Entity, stamp: Option<CellRole>) -> Option<CellRole> {
+    state.roles.get(&root).copied().or(stamp)
+}
+
 /// Makes `entity` a source of its own layers under the cell `root`: the propagation carries
 /// [`source_layers`] from it instead of the cell's value alone, so a node that has layers of its own
 /// keeps them while its cell is active and follows the cell's role while it is not.
 ///
-/// The source is registered with its cell - a role change is then one write for it - and with the
-/// pending list, so the isolation gives it the role its cell has *now*: the role at the moment of
-/// adoption can be the previous frame's (a cell spawning in the frame the isolation already ran in,
-/// a crossing between the spawn and the isolation).
+/// The source is registered with its cell - a role change is then one write for it - with the door
+/// it stands under, if one is held, and with the pending list, so the isolation gives it the role its
+/// cell has *now*: the role at the moment of adoption can be the previous frame's (a cell spawning in
+/// the frame the isolation already ran in, a crossing between the spawn and the isolation).
+#[allow(clippy::too_many_arguments)]
 fn adopt_layer_source(
     commands: &mut Commands,
     entity: Entity,
     root: Option<Entity>,
     role: Option<CellRole>,
     own: RenderLayers,
+    door: Option<Entity>,
     registry: &mut CellLayerSources,
 ) {
-    let value = role.map_or_else(|| own.clone(), |role| source_layers(role, &own));
+    // A node under a door the door layer is drawing in place of is on no layer at all, whatever its
+    // cell's role asks: it would otherwise stand drawn under the door-layer door that hides its own
+    // (`crate::render`'s filler of the door model is such a node).
+    let value = if door.is_some() {
+        RenderLayers::none()
+    } else {
+        role.map_or_else(|| own.clone(), |role| source_layers(role, &own))
+    };
     // `PropagateOver` would keep the node's own layers whatever its cell's role is - it is
     // `crate::render::light_render_layers`'s way of keeping a light's layers under a reference whose
-    // model is moved to the placed-object layer - which is what the value below is for here: the
-    // node's own layers travel with it, and the cell's role is what they are applied to.
+    // model is moved to the placed-object layer - and `PropagateStop` would cut everything under the
+    // node off the cell's value. The value below is what carries the node's own layers and its
+    // cell's role together, so neither has a place under a cell root any more.
     commands
         .entity(entity)
-        .try_insert(PortalLayerSource { root, own });
+        .try_insert(PortalLayerSource { root, own, door });
     commands
         .entity(entity)
         .try_remove::<PropagateOver<RenderLayers>>();
+    commands
+        .entity(entity)
+        .try_remove::<PropagateStop<RenderLayers>>();
     commands.entity(entity).try_insert(Propagate(value));
     if let Some(root) = root {
         let list = registry.by_root.entry(root).or_default();
         if !list.contains(&entity) {
             list.push(entity);
         }
-        registry.pending.push(entity);
     }
+    if let Some(door) = door {
+        let list = registry.door_sources.entry(door).or_default();
+        if !list.contains(&entity) {
+            list.push(entity);
+        }
+    }
+    registry.pending.push(entity);
 }
 
-/// Makes `entity` a source of its own layers from what it says about itself right now: its own
-/// layers, and the cell and role of the root it stands under. A node that is a source of its own
-/// already is left alone - its layers are [`PortalLayerSource::own`], which the observers keep up to
-/// date. Answers whether it adopted anything.
-fn adopt_own_layers(
+/// Adopts `entity` where it stands, from the layers it keeps of its own: the walk up finds the cell
+/// it belongs to and the door the door layer holds above it, and [`current_role`] decides the value
+/// with the classification of this frame rather than with the root's stamp.
+#[allow(clippy::too_many_arguments)]
+fn adopt_where_placed(
     commands: &mut Commands,
     entity: Entity,
-    nodes: &NodeLayerQuery,
+    own: RenderLayers,
     parents: &Query<&ChildOf>,
     roots: &Query<Option<&CellRoleStamp>, With<StreamedCellRoot>>,
+    state: Option<&PortalState>,
     registry: &mut CellLayerSources,
-) -> bool {
-    let Ok((source, layers, inherited, propagate)) = nodes.get(entity) else {
-        return false;
+) {
+    let (root, stamp, door) =
+        owning_cell(entity, parents, roots, state.map(|s| &s.door_layer_hidden))
+            .map_or((None, None, None), |(root, stamp, door)| {
+                (Some(root), stamp, door)
+            });
+    let role = match (root, state) {
+        (Some(root), Some(state)) => current_role(state, root, stamp),
+        _ => stamp,
     };
-    if source.is_some() {
-        return false;
-    }
-    let own = own_layers(source, layers, inherited, propagate);
-    let (root, role) =
-        owning_cell(entity, parents, roots).map_or((None, None), |(root, role)| (Some(root), role));
-    adopt_layer_source(commands, entity, root, role, own, registry);
-    true
+    adopt_layer_source(commands, entity, root, role, own, door, registry);
 }
 
 /// The visibility writes of a cell root's role: the role no camera draws is hidden **and** marked -
@@ -3120,11 +3169,40 @@ fn add_cell_layer_isolation(app: &mut App) {
         PostUpdate,
         PropagateSet::<RenderLayers>::default().before(VisibilitySystems::CheckVisibility),
     )
+    // The propagation's own span of this frame, `portal/propagate`: the per-node cost a cell's role
+    // pays once it is stamped, which the isolation moved out of `portal/isolate`.
+    .init_resource::<LayerPropagation>()
+    .add_systems(
+        PostUpdate,
+        (
+            begin_layer_propagation.before(PropagateSet::<RenderLayers>::default()),
+            end_layer_propagation.after(PropagateSet::<RenderLayers>::default()),
+        ),
+    )
     .init_resource::<CellLayerSources>()
     .add_observer(stamp_streamed_cell)
     .add_observer(adopt_own_layer_node)
     .add_observer(adopt_layer_source_node)
-    .add_observer(release_layer_source);
+    .add_observer(release_layer_source)
+    .add_observer(clear_propagate_stop);
+}
+
+/// The instant [`begin_layer_propagation`] recorded, for [`end_layer_propagation`]'s span.
+#[derive(Resource, Default)]
+struct LayerPropagation(Option<Instant>);
+
+/// Opens the span around Bevy's layer propagation this frame.
+fn begin_layer_propagation(mut mark: ResMut<LayerPropagation>) {
+    mark.0 = Some(Instant::now());
+}
+
+/// Records the layer propagation's cost of this frame as `portal/propagate`, beside `portal/isolate`:
+/// the two together are what a cell's role costs, and the propagation's part is the one that scales
+/// with the nodes of a cell rather than with its sources.
+fn end_layer_propagation(mark: Res<LayerPropagation>, mut profiler: ResMut<ProfilingState>) {
+    if let Some(started) = mark.0 {
+        profiler.record_elapsed("portal/propagate", started);
+    }
 }
 
 /// What a cell root says about itself the moment it spawns: the identity the isolation classifies,
@@ -3213,6 +3291,7 @@ fn adopt_own_layer_node(
     nodes: NodeLayerQuery,
     parents: Query<&ChildOf>,
     roots: Query<Option<&CellRoleStamp>, With<StreamedCellRoot>>,
+    state: Option<Res<PortalState>>,
     mut registry: ResMut<CellLayerSources>,
 ) {
     let entity = event.entity;
@@ -3225,6 +3304,13 @@ fn adopt_own_layer_node(
     if inherited.is_some_and(|inherited| inherited.0 == *layers) {
         return;
     }
+    // A cell's own write is not a node asking for layers of its own: the value the portal put there
+    // - `Propagate`'s, which the propagation carries onto the node - is exactly the one its cell's
+    // role asks of the layers the node keeps, so the `own` below would be that value and the node's
+    // real layers would be lost.
+    if source.is_some() && propagate.is_some_and(|propagate| propagate.0 == *layers) {
+        return;
+    }
     match source {
         // A node that is a source already was given new layers of its own: they are what it keeps
         // while its cell is active from now on.
@@ -3232,9 +3318,16 @@ fn adopt_own_layer_node(
             if source.own == *layers {
                 return;
             }
-            let (root, own) = (source.root, layers.clone());
-            let role = root.and_then(|root| roots.get(root).ok().flatten().map(|stamp| stamp.0));
-            adopt_layer_source(&mut commands, entity, root, role, own, &mut registry);
+            let own = layers.clone();
+            adopt_where_placed(
+                &mut commands,
+                entity,
+                own,
+                &parents,
+                &roots,
+                state.as_deref(),
+                &mut registry,
+            );
         }
         // A node with a `Propagate<RenderLayers>` of its own - a reference whose model is on the
         // placed-object layer of `crate::render` - belongs to [`adopt_layer_source_node`], which
@@ -3243,12 +3336,14 @@ fn adopt_own_layer_node(
             if propagate.is_some() {
                 return;
             }
-            adopt_own_layers(
+            let own = own_layers(source, Some(layers), inherited, propagate);
+            adopt_where_placed(
                 &mut commands,
                 entity,
-                &nodes,
+                own,
                 &parents,
                 &roots,
+                state.as_deref(),
                 &mut registry,
             );
         }
@@ -3263,23 +3358,24 @@ fn release_layer_source(
     event: On<Remove, RenderLayers>,
     mut commands: Commands,
     sources: Query<&PortalLayerSource>,
+    parents: Query<&ChildOf>,
     roots: Query<Option<&CellRoleStamp>, With<StreamedCellRoot>>,
+    state: Option<Res<PortalState>>,
     mut registry: ResMut<CellLayerSources>,
 ) {
     let entity = event.entity;
     // Only a node the portal made a source of: the propagation removes the layers of a node of the
     // active space on its own account (`propagate_output`), and those have nothing of their own.
-    let Ok(source) = sources.get(entity) else {
+    if sources.get(entity).is_err() {
         return;
-    };
-    let root = source.root;
-    let role = root.and_then(|root| roots.get(root).ok().flatten().map(|stamp| stamp.0));
-    adopt_layer_source(
+    }
+    adopt_where_placed(
         &mut commands,
         entity,
-        root,
-        role,
         RenderLayers::default(),
+        &parents,
+        &roots,
+        state.as_deref(),
         &mut registry,
     );
 }
@@ -3288,12 +3384,19 @@ fn release_layer_source(
 /// that source carries has to be the cell's role applied to those layers ([`source_layers`]), or a
 /// nested source would stop the cell's value at every reference and a destination would never reach
 /// the models behind its doors.
+///
+/// Nothing on this branch gives a *production* node such a source: `crate::render`'s placed-object
+/// propagation (render.rs:322-330, [`crate::render::add_placed_object_layer_propagation`]) wires it
+/// for the model of every placed reference on the main branch, and this is the fold that lets a
+/// merge keep it - a reference's model on the placed-object layer while its cell is active, on the
+/// portal camera's layer while the cell is its destination, on none while it is hidden.
 fn adopt_layer_source_node(
     event: On<Insert, Propagate<RenderLayers>>,
     mut commands: Commands,
     nodes: NodeLayerQuery,
     parents: Query<&ChildOf>,
     roots: Query<Option<&CellRoleStamp>, With<StreamedCellRoot>>,
+    state: Option<Res<PortalState>>,
     mut registry: ResMut<CellLayerSources>,
 ) {
     let entity = event.entity;
@@ -3309,9 +3412,36 @@ fn adopt_layer_source_node(
         return;
     }
     let own = propagate.0.clone();
-    let (root, role) = owning_cell(entity, &parents, &roots)
-        .map_or((None, None), |(root, role)| (Some(root), role));
-    adopt_layer_source(&mut commands, entity, root, role, own, &mut registry);
+    adopt_where_placed(
+        &mut commands,
+        entity,
+        own,
+        &parents,
+        &roots,
+        state.as_deref(),
+        &mut registry,
+    );
+}
+
+/// A node under a cell root that stops the propagation at itself: nothing under it would ever take
+/// its cell's value, so a hidden or destination cell's meshes below such a node would stay on the
+/// layers they were spawned with - the main camera's - and a destination would draw over the space
+/// the player stands in. A cell's role is the portal's to carry, so the stop is taken off; a node
+/// that has layers of its own among all this is [`adopt_own_layer_node`]'s, which makes it a source
+/// ([`adopt_layer_source`]) - and that takes the stop off too.
+fn clear_propagate_stop(
+    event: On<Insert, PropagateStop<RenderLayers>>,
+    mut commands: Commands,
+    parents: Query<&ChildOf>,
+    roots: Query<Option<&CellRoleStamp>, With<StreamedCellRoot>>,
+) {
+    let entity = event.entity;
+    if owning_cell(entity, &parents, &roots, None).is_none() {
+        return;
+    }
+    commands
+        .entity(entity)
+        .try_remove::<PropagateStop<RenderLayers>>();
 }
 
 /// The cell root `entity` hangs under - the first of its ancestors (itself included) that has a
@@ -3349,7 +3479,11 @@ fn owning_root(
 /// per cell here is the root's source, one layer value per node of the cell that has layers of its
 /// own ([`PortalLayerSource`], from [`CellLayerSources`] - never a walk), and the doors the door
 /// layer hides. The counters measure exactly that: `portal/cells_relayered` is the roots whose role
-/// this frame stamped, `portal/nodes_relayered` the per-node layer writes it issued for them.
+/// this frame stamped, and `portal/nodes_relayered` **only the portal's own writes** - the own-layer
+/// sources of a re-stamped cell, the nodes of a door the layer holds and the repairs of layers taken
+/// off a node. The per-node cost the same role pays inside Bevy's propagation is
+/// `portal/propagate` (`add_cell_layer_isolation`), and `portal/isolate` is the classification and
+/// the writes above.
 #[allow(clippy::too_many_arguments)]
 fn isolate_cells(
     mut commands: Commands,
@@ -3360,6 +3494,7 @@ fn isolate_cells(
     roots: CellRootQuery,
     stamps: Query<Option<&CellRoleStamp>, With<StreamedCellRoot>>,
     parents: Query<&ChildOf>,
+    children: Query<&Children>,
     nodes: NodeLayerQuery,
     mut removed_layers: RemovedComponents<RenderLayers>,
     mut state: ResMut<PortalState>,
@@ -3413,18 +3548,28 @@ fn isolate_cells(
         };
         commands.entity(root).try_insert(CellRoleStamp(role));
         // One write per node of this cell that has layers of its own; every other node of the cell
-        // follows the root's value through the propagation.
+        // follows the root's value through the propagation. The list is rebuilt while it is walked,
+        // without the ids of sources that despawned since it was written: a dead id - which the
+        // world may have recycled for another cell's entity - never takes a role.
+        let list = registry.by_root.remove(&root).unwrap_or_default();
+        let mut live = Vec::with_capacity(list.len());
         let mut written = 0_u64;
-        if let Some(list) = registry.by_root.get(&root) {
-            for &entity in list {
-                let Ok((Some(source), ..)) = nodes.get(entity) else {
-                    continue;
-                };
-                commands
-                    .entity(entity)
-                    .try_insert(Propagate(source_layers(role, &source.own)));
-                written += 1;
-            }
+        for entity in list {
+            let Ok((Some(source), ..)) = nodes.get(entity) else {
+                continue;
+            };
+            // A node of a door the layer is drawing in place of stays on no layer at all.
+            let value = if source.door.is_some() {
+                off_cameras.clone()
+            } else {
+                source_layers(role, &source.own)
+            };
+            commands.entity(entity).try_insert(Propagate(value));
+            live.push(entity);
+            written += 1;
+        }
+        if !live.is_empty() {
+            registry.by_root.insert(root, live);
         }
         state.churn.restamped(identity, stamped, role, written);
         cells_stamped += 1;
@@ -3435,19 +3580,50 @@ fn isolate_cells(
     // one source of `none` on the door itself, rather than a write per node of it. The value is
     // written when it is not on the door already - the propagation puts it there in the frame the
     // source is set - so a door the layer holds costs nothing on the frames after the first.
+    //
+    // A node of that model that has layers of its own - the filler `crate::render` puts on its own
+    // layer to keep the doorway's floor probe working, a light, a mod's node - is a source of its
+    // own and would keep them: a door that *enters* the layer's set has its model walked once, and
+    // every source under it is marked with the door and put on no layer. The walk is the door's own
+    // model, not the cell, and only on the frame the door is taken over.
+    let entering: Vec<Entity> = hidden_doors
+        .difference(&state.door_layer_applied)
+        .copied()
+        .collect();
+    for door in entering {
+        for entity in children.iter_descendants(door) {
+            let Ok((Some(source), ..)) = nodes.get(entity) else {
+                continue;
+            };
+            commands.entity(entity).try_insert(PortalLayerSource {
+                door: Some(door),
+                ..source.clone()
+            });
+            commands
+                .entity(entity)
+                .try_insert(Propagate(off_cameras.clone()));
+            let list = registry.door_sources.entry(door).or_default();
+            if !list.contains(&entity) {
+                list.push(entity);
+            }
+            nodes_stamped += 1;
+        }
+    }
     for &door in &hidden_doors {
         let Ok((source, layers, inherited, propagate)) = nodes.get(door) else {
             continue;
         };
         if source.is_none() {
             let own = own_layers(source, layers, inherited, propagate);
-            let root = owning_cell(door, &parents, &stamps).map(|(root, _)| root);
+            let root =
+                owning_cell(door, &parents, &stamps, Some(&hidden_doors)).map(|(root, ..)| root);
             adopt_layer_source(
                 &mut commands,
                 door,
                 root,
                 Some(CellRole::Hidden),
                 own,
+                None,
                 &mut registry,
             );
             nodes_stamped += 1;
@@ -3458,22 +3634,47 @@ fn isolate_cells(
             nodes_stamped += 1;
         }
     }
-    // A door the layer gave back takes the value its cell's role asks of its own layers again. A
-    // door no cell root owns (a test's) keeps its own layers, which is what `CellRole::Active`
-    // stands for here.
+    // A door the layer gave back takes the value its cell's role asks of its own layers again, and
+    // so does every source of its model the layer held. A door no cell root owns (a test's) keeps
+    // its own layers, which is what `CellRole::Active` stands for here.
     let released: Vec<Entity> = state
         .door_layer_applied
         .difference(&hidden_doors)
         .copied()
         .collect();
     for door in released {
+        for entity in registry.door_sources.remove(&door).unwrap_or_default() {
+            let Ok((Some(source), ..)) = nodes.get(entity) else {
+                continue;
+            };
+            let role = source
+                .root
+                .and_then(|root| state.roles.get(&root).copied())
+                .unwrap_or(CellRole::Active);
+            commands.entity(entity).try_insert(PortalLayerSource {
+                door: None,
+                ..source.clone()
+            });
+            commands
+                .entity(entity)
+                .try_insert(Propagate(source_layers(role, &source.own)));
+            nodes_stamped += 1;
+        }
         let Ok((source, layers, inherited, propagate)) = nodes.get(door) else {
             continue;
         };
         let own = own_layers(source, layers, inherited, propagate);
         if source.is_none() {
-            let root = owning_cell(door, &parents, &stamps).map(|(root, _)| root);
-            adopt_layer_source(&mut commands, door, root, None, own.clone(), &mut registry);
+            let root = owning_cell(door, &parents, &stamps, None).map(|(root, ..)| root);
+            adopt_layer_source(
+                &mut commands,
+                door,
+                root,
+                None,
+                own.clone(),
+                None,
+                &mut registry,
+            );
         }
         let role = source
             .and_then(|source| source.root)
@@ -3509,7 +3710,7 @@ fn isolate_cells(
             pending.push(entity);
             continue;
         };
-        let value = if hidden_doors.contains(&entity) {
+        let value = if source.door.is_some() || hidden_doors.contains(&entity) {
             off_cameras.clone()
         } else {
             source_layers(role, &source.own)
@@ -8485,6 +8686,353 @@ mod tests {
             layers_of(&app, settled),
             RenderLayers::default(),
             "the layer it was given is not the one its own space gives back"
+        );
+    }
+
+    /// Spawns a cell root the way `streaming::spawn_cell` does - its identity, then the key - and
+    /// flushes the observer's commands: what the root is before any frame runs.
+    fn spawn_stamped_cell(app: &mut App, cell_id: u32) -> Entity {
+        let root = app
+            .world_mut()
+            .spawn((
+                StreamedCellRoot,
+                CellRef(cell_id),
+                Transform::default(),
+                Visibility::default(),
+            ))
+            .id();
+        app.world_mut()
+            .entity_mut(root)
+            .insert(StreamedCellKey(CellKey::Interior(cell_id)));
+        app.world_mut().flush();
+        root
+    }
+
+    /// A root is stamped the moment `streaming::spawn_cell` hands it its key - before a frame runs -
+    /// and the isolation agrees with what it stamped, which is why a committed cell costs a
+    /// comparison and no walk: the layer source and the role are what the cell is *born* on.
+    #[test]
+    fn a_root_is_stamped_the_moment_it_spawns() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let door = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<PortalState>()
+            .draw_destination(door, vec![CellKey::Interior(PRESTREAMED_CELL)]);
+
+        let hidden = spawn_stamped_cell(&mut app, 0x0006_1234);
+        let destination = spawn_stamped_cell(&mut app, PRESTREAMED_CELL);
+        let active = spawn_stamped_cell(&mut app, INTERIOR_ALFTAND01);
+
+        let stamp = |app: &App, root: Entity| {
+            app.world()
+                .entity(root)
+                .get::<CellRoleStamp>()
+                .map(|stamp| stamp.0)
+        };
+        let source = |app: &App, root: Entity| {
+            app.world()
+                .entity(root)
+                .get::<Propagate<RenderLayers>>()
+                .map(|propagate| propagate.0.clone())
+        };
+        assert_eq!(stamp(&app, hidden), Some(CellRole::Hidden));
+        assert_eq!(source(&app, hidden), Some(RenderLayers::none()));
+        assert_eq!(
+            *app.world().entity(hidden).get::<Visibility>().unwrap(),
+            Visibility::Hidden,
+            "and the ray casts are kept off it from that same moment"
+        );
+        assert_eq!(stamp(&app, destination), Some(CellRole::Destination));
+        assert_eq!(
+            source(&app, destination),
+            Some(RenderLayers::layer(DESTINATION_LAYER))
+        );
+        assert_eq!(stamp(&app, active), Some(CellRole::Active));
+        assert_eq!(
+            source(&app, active),
+            None,
+            "the active space has no source: its nodes keep the layers they were spawned with"
+        );
+
+        // The isolation finds the stamps already right: nothing of either cell is written again.
+        let (cells_before, nodes_before) = isolate_counters(&app);
+        update(&mut app, 2);
+        assert_eq!(
+            isolate_counters(&app),
+            (cells_before, nodes_before),
+            "a stamped cell is never walked, let alone re-layered"
+        );
+    }
+
+    /// The role a node takes comes from the classification of the frame, and only from the root's
+    /// stamp where the classification has nothing for the root - a cell the isolation has not seen
+    /// yet. The stamp can be a frame older than the classification: `streaming` stamps a cell with
+    /// the space of the moment it spawned in.
+    #[test]
+    fn the_role_a_source_takes_is_this_frames_classification() {
+        let mut state = PortalState::default();
+        let root = Entity::PLACEHOLDER;
+        assert_eq!(
+            current_role(&state, root, Some(CellRole::Hidden)),
+            Some(CellRole::Hidden),
+            "a root the isolation has not classified yet keeps its stamp"
+        );
+        assert_eq!(current_role(&state, root, None), None);
+        state.roles.insert(root, CellRole::Destination);
+        assert_eq!(
+            current_role(&state, root, Some(CellRole::Hidden)),
+            Some(CellRole::Destination),
+            "the classification of the frame wins over an older stamp"
+        );
+    }
+
+    /// The node a test's own system spawns *after* the isolation has run in a frame, once it is armed
+    /// with the cell to spawn it under.
+    #[derive(Resource, Default)]
+    struct SpawnedAfterIsolation {
+        root: Option<Entity>,
+        spawned: Option<Entity>,
+    }
+
+    /// Spawns the node [`SpawnedAfterIsolation`] is armed with, once, after the frame's isolation.
+    fn spawn_after_isolate(mut commands: Commands, mut spawned: ResMut<SpawnedAfterIsolation>) {
+        let (Some(root), None) = (spawned.root, spawned.spawned) else {
+            return;
+        };
+        spawned.spawned = Some(commands.spawn((RenderLayers::layer(1), ChildOf(root))).id());
+    }
+
+    /// A source that arrives in the frame a cell changes role takes the new role in that same frame,
+    /// whether it was adopted before the isolation ran in the frame or - the case whose role cannot
+    /// come from a settled frame - after it: the walk from the node finds its cell, and the role is
+    /// the classification of this frame ([`current_role`]) rather than the root's stamp.
+    #[test]
+    fn a_source_adopted_in_the_frame_of_a_role_change_takes_the_new_role() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let (root, _) = spawn_cell(&mut app, PRESTREAMED_CELL, None, None, None);
+        app.init_resource::<SpawnedAfterIsolation>()
+            .add_systems(Update, spawn_after_isolate.after(isolate_cells));
+        update(&mut app, 2);
+
+        // The player walks in, the node arrives after the isolation of that frame has run, and one
+        // node of the cell is spawned before the frame with it.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: TAMRIEL,
+            interior: Some(PRESTREAMED_CELL),
+        };
+        app.world_mut().resource_mut::<SpawnedAfterIsolation>().root = Some(root);
+        let before = spawn_mesh(&mut app, root, Some(RenderLayers::layer(1))).0;
+        update(&mut app, 1);
+
+        let after = app
+            .world()
+            .resource::<SpawnedAfterIsolation>()
+            .spawned
+            .expect("the armed system spawned its node");
+        for (entity, when) in [
+            (before, "before the isolation"),
+            (after, "after the isolation"),
+        ] {
+            assert_eq!(
+                layers_of(&app, entity),
+                RenderLayers::layer(1),
+                "a source of the crossing frame takes the role the frame settled on ({when})"
+            );
+        }
+    }
+
+    /// A node of a native door the door layer draws in place of is dark too, even when it has layers
+    /// of its own (the filler `crate::render` keeps on a layer of its own, a light, a mod's node):
+    /// it would otherwise stay drawn on the main camera under the door-layer door that hides the
+    /// door it belongs to - and it has its own layers back the frame the layer releases the door.
+    #[test]
+    fn a_node_of_a_hidden_native_door_with_layers_of_its_own_is_dark_too() {
+        let mut app = door_layer_app();
+        let camera = spawn_camera(&mut app, Vec3::new(0.0, 120.0, 0.0));
+        let case = door_layer_pair(&mut app);
+        // A node of the driver's own model that has a layer of its own.
+        let (modded, _) = spawn_mesh(&mut app, case.driver, Some(RenderLayers::layer(1)));
+        door_layer_door(&mut app, &case);
+        assert_eq!(
+            layers_of(&app, modded),
+            RenderLayers::none(),
+            "the whole model of a door the layer draws in place of is off every camera"
+        );
+
+        // Walked away from: the pair leaves the layer, and the node is back on its own layer with it.
+        move_camera(
+            &mut app,
+            camera,
+            Transform::from_translation(Vec3::new(0.0, 120.0, 5000.0)),
+        );
+        update(&mut app, 3);
+        assert!(layer_copies(&mut app).is_empty());
+        assert_eq!(
+            layers_of(&app, modded),
+            RenderLayers::layer(1),
+            "its own layer back, with the door that held it"
+        );
+    }
+
+    /// A source that despawned is dropped from its cell's list the next time the cell's role is
+    /// stamped: the world recycles an entity's id, and a recycled one must never take a role that
+    /// belonged to a node which is gone.
+    #[test]
+    fn a_source_that_despawned_is_dropped_from_its_cells_list() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let (root, _) = spawn_cell(&mut app, PRESTREAMED_CELL, None, None, None);
+        let (modded, _) = spawn_mesh(&mut app, root, Some(RenderLayers::layer(1)));
+        update(&mut app, 2);
+        let sources = |app: &App| {
+            app.world()
+                .resource::<CellLayerSources>()
+                .by_root
+                .get(&root)
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(sources(&app), vec![modded]);
+
+        app.world_mut().entity_mut(modded).despawn();
+        // The role change of the cell (the player walks in) is what walks its list.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: TAMRIEL,
+            interior: Some(PRESTREAMED_CELL),
+        };
+        update(&mut app, 1);
+        assert!(
+            sources(&app).is_empty(),
+            "a dead id is not carried into the next role change"
+        );
+    }
+
+    /// A light spawned the way `crate::render::light_render_layers` builds one - its own layers and
+    /// a `PropagateOver` that keeps a reference's placed-object layer off it - still follows its
+    /// *cell's* role: the portal camera's layer in a destination (where `lights::budget_lights`
+    /// counts it for the doorway), no layer at all in a hidden cell, and its own layers when its
+    /// cell is the active space again.
+    #[test]
+    fn a_light_under_a_reference_takes_its_cells_role() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let door = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<PortalState>()
+            .draw_destination(door, vec![CellKey::Interior(PRESTREAMED_CELL)]);
+        let (destination_root, _) = spawn_cell(
+            &mut app,
+            PRESTREAMED_CELL,
+            None,
+            Some(CellKey::Interior(PRESTREAMED_CELL)),
+            None,
+        );
+        let (hidden_root, _) = spawn_cell(
+            &mut app,
+            0x0006_1234,
+            None,
+            Some(CellKey::Interior(0x0006_1234)),
+            None,
+        );
+        let light_of = |app: &mut App, root: Entity| {
+            app.world_mut()
+                .spawn((crate::render::light_render_layers(), ChildOf(root)))
+                .id()
+        };
+        let destination_light = light_of(&mut app, destination_root);
+        let hidden_light = light_of(&mut app, hidden_root);
+
+        update(&mut app, 1);
+
+        assert_eq!(
+            layers_of(&app, destination_light),
+            RenderLayers::layer(DESTINATION_LAYER)
+        );
+        assert_eq!(layers_of(&app, hidden_light), RenderLayers::none());
+        assert!(
+            app.world()
+                .entity(destination_light)
+                .get::<PropagateOver<RenderLayers>>()
+                .is_none(),
+            "the cell's role is what moves the light: the stop is off it"
+        );
+
+        // The active space gives the light the layers it was spawned with.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: TAMRIEL,
+            interior: Some(PRESTREAMED_CELL),
+        };
+        update(&mut app, 1);
+        assert_eq!(
+            layers_of(&app, destination_light),
+            RenderLayers::from_layers(&crate::render::LIGHT_LAYERS)
+        );
+    }
+
+    /// A node that stops the propagation at itself cannot stand under a cell the portal isolates:
+    /// nothing below it would ever take the cell's value, so a destination's meshes under it would
+    /// stay on the layer they were spawned with - the main camera's - and draw over the space the
+    /// player is standing in.
+    #[test]
+    fn a_propagate_stop_under_a_cell_does_not_keep_a_mesh_on_the_main_camera() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let door = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<PortalState>()
+            .draw_destination(door, vec![CellKey::Interior(PRESTREAMED_CELL)]);
+        let (root, _) = spawn_cell(
+            &mut app,
+            PRESTREAMED_CELL,
+            None,
+            Some(CellKey::Interior(PRESTREAMED_CELL)),
+            None,
+        );
+        let stop = app
+            .world_mut()
+            .spawn((PropagateStop::<RenderLayers>::default(), ChildOf(root)))
+            .id();
+        let (mesh, _) = spawn_mesh(&mut app, stop, None);
+
+        update(&mut app, 1);
+
+        assert_eq!(
+            layers_of(&app, mesh),
+            RenderLayers::layer(DESTINATION_LAYER),
+            "the cell's value reaches below the node that stopped it"
+        );
+        assert!(!on_main_camera(&app, mesh));
+        assert!(
+            app.world()
+                .entity(stop)
+                .get::<PropagateStop<RenderLayers>>()
+                .is_none(),
+            "the stop is taken off where it stands"
+        );
+    }
+
+    /// The propagation's own cost is measured beside the isolation's: `portal/isolate` is the
+    /// portal's writes, `portal/propagate` the per-node ones Bevy does for the cell's role.
+    #[test]
+    fn the_layer_propagation_is_measured_beside_the_isolation() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        update(&mut app, 1);
+        let spans = app
+            .world()
+            .resource::<ProfilingState>()
+            .span_samples("portal/propagate")
+            .to_vec();
+        assert_eq!(
+            spans.len(),
+            1,
+            "one portal/propagate sample per frame the propagation ran"
+        );
+        assert!(
+            spans[0] > 0.0,
+            "a recorded zero would mean the span was never opened"
         );
     }
 
