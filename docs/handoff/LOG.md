@@ -3,12 +3,30 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Portal Dev, Hermes (impl-286 Stage B reviewed by the lead)
+
+Track: Portal. Nothing pushed. Lead review of the Stage B commits below (full diff read:
+`portal.rs` +718, `transition.rs` +38 tests-only, `demo_tour.rs` +36, handoff entries). Verified
+in the worktree rather than taken on report: the reveal reuses the portal's own
+destination-set → `isolate_cells` stamping path (no second stamping mechanism to drift); the
+warm view is render-only — `apply_collider_role` keeps `ColliderDisabled` for `Destination` and
+`Hidden` alike, so nothing physical wakes behind the closed door during warm frames; restoration
+is a per-frame take-back of exactly the published keys (never the portal's own hold), which the
+`the_prewarm_reveals_the_destination_cell_and_takes_it_back_without_a_crossing` test pins both
+ways; streaming.rs diff is empty. Fixed here: the Stage A report was cited by a name never
+filed (`t286-…` → `portal-prestream-prewarm-mechanism-2026-10-08.md`) in the `PortalPrewarm` doc
+and the handoff entry. Known review points for Upstream Dev: the window is read from
+`PrestreamCells` directly (includes predicted beyond-radius doors, not radius-only); the warm-up
+is readiness-bounded (cache settle, 2 flat frames, nothing waiting) and the tour's wait is held
+adaptively with a 20 s cap; cells are revealed only on warm frames; one door at a time (nearest).
+Reviewer's own gate run below.
+
 ## 2026-10-08 Portal Dev, Hermes (impl-286 Stage B: prestream pre-warm implemented)
 
 Track: Portal. Nothing pushed. Branch `impl-286-portal-prestream-prewarm` commits d51773f0,
 d79833b1, 90155163, worktree `D:/Mudcrab/worktrees/portal-impl-286`, on the portal lineage
 (c9f2ffa7, includes impl-1058's spawn-time layer stamps). Implements Stage A's recommendation
-(`local/research/t286-prestream-prewarm-mechanism-2026-10-08.md`): the pre-warm is the existing
+(`local/research/portal-prestream-prewarm-mechanism-2026-10-08.md`): the pre-warm is the existing
 portal camera activated behind the prestream window.
 
 - **Mechanism.** `portal.rs` gains `PortalPrewarm` (resource, inited with the portal's own

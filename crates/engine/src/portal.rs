@@ -3981,7 +3981,7 @@ enum PrewarmNeed {
 /// specializes its pipelines and runs its paced uploads while the player walks up, instead of on
 /// the crossing frame.
 ///
-/// Stage A (`local/research/t286-prestream-prewarm-mechanism-2026-10-08.md`): specialization is the
+/// Stage A (`local/research/portal-prestream-prewarm-mechanism-2026-10-08.md`): specialization is the
 /// only view-gated piece of the crossing burst (bevy_pbr `material.rs:915/943`, bevy_camera
 /// `visibility/mod.rs:780-811` - no active view intersects layer 2 while a door is closed), while
 /// asset finalization and `RenderAssetBytesPerFrame` uploads are event-driven and
