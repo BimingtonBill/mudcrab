@@ -3,6 +3,37 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Portal Dev, Hermes (re-profile window RAN: impl-1057 + impl-286 merged into portal, priced against the Oct-8 baseline)
+
+Track: Portal. Nothing pushed. Both accepted branches merged into `portal` in the main checkout:
+7360b936 (phase2/failed-cell-retry b2f2bea6, impl-1057) and 36d4fff3 (impl-286
+portal-prestream-prewarm 6925dd4c); both cut from c9f2ffa7, `--no-ff`, messages name the approvals.
+Merged-head gates: fmt clean; gated clippy `-p engine --all-targets --all-features -D warnings`
+clean; gated nextest `-p engine --no-fail-fast` **1138 passed / 4 skipped** (includes 1057's four
+acceptance tests; the interior-crossing streaming fixture passed in 25.6 s).
+
+- **Re-profile window 09:17-09:34** (hold `timing` set with `--drain`, GPU guard checked free,
+  cleared after): `phase2-baseline.ps1 -Scenarios portal -Repeats 3 -DurationSeconds 60
+  -PortalTourSeconds 40`, portal-rooms data (unchanged), release 36d4fff3 in
+  portal-release-target, `-CompareTo` the Oct-8 scenes-3 baseline **ACCEPTED** (same
+  machine/resolution/schema/inputs; only the commit differs). Raw
+  `D:/Mudcrab/evidence/reprofile-portal-2026-10-08/scenes-1` (OWNER.txt class B);
+  results `local/reference/reprofile-2026-10-08/RESULTS.md`; bench
+  `local/bench/portal-bench-2026-10-08_09-34-47`.
+- **Numbers:** tour 81.9 -> 87.7 fps (+7%), lod-flythrough streaming 70.0 -> 73.3 (+4.75%), standing
+  84.2 -> 88.2; portal-heavy 60.2 -> 60.4, lod-far 66.9 -> 67.3, ring-off 122.7 -> 123.2 (flat).
+  Every compared metric pass (no regression). 160 bar: 0/3 runs meet it anywhere (unchanged);
+  over-budget frames still owned by the render thread in every scene. Bench: closed 5.84 -> 5.61,
+  open states 7.90-8.42 -> 7.21-7.50 render ms; GPU 0.81-1.08.
+- **impl-285 attribution payoff:** the two worst tour frames (1256: 546.5 ms, 2891: 342.4 ms) carry
+  ~3-5 ms TOTAL in the spanned main-world phases — the crossing spike lives outside the spanned
+  CPU systems (render thread / pipeline prep / uploads on first interior sight).
+- **Next:** worker to name the owner of the crossing frames (render-thread timings for 1256/2891);
+  portal-heavy steady state (~60 fps, p50 16 ms, 100% over the 6.25 ms budget, render thread) is
+  the second front. Phase2-dev note: your impl-1057 LOG correction was in-flight uncommitted during
+  the merges — I carried it through the impl-286 conflict resolution and committed it inside
+  36d4fff3, content unchanged.
+
 ## 2026-10-08 Portal Dev, Hermes (impl-286 Stage B reviewed by the lead)
 
 Track: Portal. Nothing pushed. Lead review of the Stage B commits below (full diff read:
