@@ -67,7 +67,7 @@ a conversion's build pause, a review wait) or is about to go idle, it checks:
   the next item from its queue, or tells Upstream Dev it has room.
 - **Which provider has room?** `ds_spend.py status` (DeepSeek, Sol, Muse, MiMo) and the Claude plan pace; spread
   the work across them per the provider rules.
-- Limits still apply: timing windows run alone, conversions pause new builds, no unattended runs, one build folder
+- Limits still apply: timing windows run alone, conversions pause new builds, unattended runs only when the user chooses them, one build folder
   per session, the DeepSeek pace.
 - **Builds are the scarce part, not workers (2026-10-07: 26 cargo + 22 rustc at once left 3.3 GB RAM free and
   slowed a conversion to 4 MB/s). Every heavy cargo command goes through the machine-wide build gate:**
@@ -173,9 +173,11 @@ before starting any `phase2/*` branch or moving work between tracks.
 >   (done / running / waiting on you / next), checks, and the ask. Small follow-ups (a flaky test,
 >   a suggestion found in passing) are rows in it, not separate questions. Fix pushes under the
 >   standing yes are listed there as done.
->   **No unattended runs (the user, 2026-10-06):** the PC and the sessions work only while the user is
->   present (late evenings included). Never plan builds, conversions, timing runs or workers for while
->   the user is away or asleep; before they sign off, finish or stop running jobs, commit and log.
+>   **Unattended runs: a preference, not a rule (the user, 2026-10-06, clarified 2026-10-08).** The user
+>   prefers the PC and the sessions to work while they are present (late evenings included), so by default
+>   don't plan builds, conversions, timing runs or workers for while they are away or asleep, and before they
+>   sign off finish or stop running jobs, commit and log. The user may choose otherwise (e.g. an overnight
+>   trial); when they do, the run follows every other rule here and leaves a full handoff entry.
 > - **Quiet in between.** Upstream Dev handles hand-offs and logs them without messaging the user,
 >   except for three urgencies: something public is wrong (our PR breaks main, a wrong push, a
 >   maintainer waiting on us); a clash over the shared PC (a timing run against a build, a
