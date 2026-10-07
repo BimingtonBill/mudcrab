@@ -14,6 +14,7 @@ use crate::{
         VercidiumRendererPlugin, WATER_LAYER, WaterExtension, WaterMaterial,
         WaterReflectionTexture, terrain_layer_sampler,
     },
+    route::{RouteGround, RoutePlan, RouteRunner, drive_route},
     shots::{ShotsFile, ShotsRun},
     sky::SkyCamera,
     streaming::{
@@ -69,6 +70,10 @@ struct AssetDirectoryReadLock {
 pub fn run(mut config: EngineConfig) -> Result<()> {
     validate_fixture_selection(&config)?;
     let remote = RemoteSettings::from_config(&config)?;
+    // `--route`: read here, before the window and the world are opened, so that a route the run
+    // cannot follow is fatal first and the start cell is the route's. (Portal reads `--shots`
+    // itself, further down, once the world database is open.)
+    let route = prepare_route(&mut config)?;
     configure_io_task_pool();
     // The graphics settings (--graphics, the knob flags, --tonemapper and the settings file): a
     // value that is not one is fatal first, with the valid ones, before anything is opened or
@@ -104,6 +109,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         None
     };
+    // The terrain heights along a route are read here, before the window opens, so that following
+    // the ground costs nothing while the run is measured.
+    let mut route_ground = None;
     let runtime_data = if config.streaming_fixture {
         let database_path = config.assets_dir.join("skyrim_world.db");
         Some((
@@ -126,6 +134,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         let database_path = config.assets_dir.join("skyrim_world.db");
         let cache = CellCache::open(&config.assets_dir.join("cell_cache.rkyv"))?;
         let ground_height = initial_camera_ground_height(&config, &database_path, &cache)?;
+        if let Some(plan) = &route {
+            route_ground = Some(RouteGround::load(
+                plan,
+                config.worldspace_id,
+                &database_path,
+                &cache,
+            )?);
+        }
         Some((
             WorldDatabase::open(&database_path)?,
             AssetCatalog::open(&database_path)?,
@@ -336,6 +352,20 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(cache)
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
+        if let (Some(plan), Some(ground)) = (route, route_ground) {
+            info!(
+                route = %plan.source,
+                waypoints = plan.waypoints.len(),
+                length = plan.length(),
+                speed = plan.speed,
+                ground_cells = ground.cell_count(),
+                "following a route"
+            );
+            app.insert_resource(RouteRunner::new(plan, ground))
+                // Before `Update`, so the streaming planner of the same frame sees the camera
+                // where the route put it.
+                .add_systems(PreUpdate, drive_route);
+        }
         // A walked run's world collision: the streamer builds the colliders and enables only the
         // player's space (`crate::portal::gate_cell_colliders`), and `crate::player` walks on them
         // through rapier ray casts. Only rapier itself is added - not main's capsule player
@@ -497,6 +527,44 @@ fn world_gltf_plugin() -> bevy::gltf::GltfPlugin {
         default_sampler: terrain_layer_sampler(),
         ..default()
     }
+}
+
+/// Reads the `--route` file, if one was given, and starts the run where the route starts: the
+/// file's worldspace, and the grid square of its first waypoint. A route needs the converted world to
+/// walk in, and owns the camera, so it cannot be combined with another mode that does.
+fn prepare_route(config: &mut EngineConfig) -> Result<Option<RoutePlan>> {
+    let Some(path) = config.route.clone() else {
+        return Ok(None);
+    };
+    let other_mode = config.benchmark_only
+        || config.acceptance_screenshot.is_some()
+        || config.auto_fly_speed > 0.0
+        || config.portal.shots.is_some()
+        || config.portal.demo_tour.is_some()
+        || config.portal.portal_bench.is_some()
+        || config.portal.start_shot.is_some()
+        || config.material_fixture
+        || config.terrain_water_fixture
+        || config.transform_bounds_fixture
+        || config.renderer_fixture
+        || config.streaming_fixture
+        || config.physics_fixture;
+    color_eyre::eyre::ensure!(
+        !other_mode,
+        "--route walks the converted world: it cannot be combined with --benchmark-only, \
+         an acceptance screenshot, --auto-fly-speed, --shots, --demo-tour, --portal-bench, \
+         --start-shot or a fixture"
+    );
+    if !config.is_benchmark_run() {
+        // The logger is not installed yet, so a `warn!` here would never be seen.
+        eprintln!(
+            "warning: --route without --benchmark-frames or --benchmark-duration moves the camera but writes no report"
+        );
+    }
+    let plan = RoutePlan::load(&path)?;
+    config.worldspace_id = plan.worldspace;
+    config.start_grid = plan.start_grid();
+    Ok(Some(plan))
 }
 
 fn validate_fixture_selection(config: &EngineConfig) -> Result<()> {
@@ -2383,8 +2451,9 @@ fn fly_camera(
     mut profiler: ResMut<ProfilingState>,
     mut auto_flight: Local<AutoFlightState>,
 ) {
-    // Interactive player paths own the camera; automated camera paths keep legacy controls.
-    if config.physics_fixture || world_physics_player(&config) {
+    // Interactive player paths own the camera; automated camera paths keep legacy controls. A
+    // route owns the camera as well.
+    if config.physics_fixture || world_physics_player(&config) || config.route.is_some() {
         return;
     }
     let started = std::time::Instant::now();
