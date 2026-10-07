@@ -69,6 +69,11 @@ a conversion's build pause, a review wait) or is about to go idle, it checks:
   the work across them per the provider rules.
 - Limits still apply: timing windows run alone, conversions pause new builds, no unattended runs, one build folder
   per session, the DeepSeek pace.
+- **Builds are the scarce part, not workers (2026-10-07: 26 cargo + 22 rustc at once left 3.3 GB RAM free and
+  slowed a conversion to 4 MB/s).** Many workers may write code at once, but machine-wide no more than about
+  3 cargo builds or test runs run at the same time, and none starts while free RAM is under 8 GB (check
+  `Get-CimInstance Win32_OperatingSystem` FreePhysicalMemory) or while a conversion is extracting or converting.
+  Coders queue their build behind the session's gate file; parallel code, staggered builds.
 Upstream Dev runs this check across all sessions at least once an hour while the user is working, and at every
 hold and unhold, and messages any session that is idle without a reason.
 
