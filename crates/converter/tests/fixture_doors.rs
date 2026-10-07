@@ -3,13 +3,15 @@
 
 use converter::esm::{
     binary::{parse_group, parse_plugin_file, parse_record_header},
+    exporter::{create_tables, export_to_db},
     records::RawRecord,
 };
 use dummy_content::{
     esm::{self, Plugin},
     layout,
 };
-use std::{fs, path::Path};
+use rusqlite::Connection;
+use std::{collections::HashMap, fs, path::Path};
 
 /// The bytes `dummy-content gen --with-interior` writes: one exterior cell,
 /// its auto-load door into one interior cell, and the return door. The spec is
@@ -185,6 +187,70 @@ fn generated_interior_plugin_holds_an_interior_cell_and_a_door_pair() {
         [128.0, 512.0, 0.0],
         "the arrival point is not the door's own position"
     );
+}
+
+/// The reciprocal door pair reaches the world database as `door_links` rows: each
+/// door's destination is the other door, resolved to the other door's cell, with the
+/// arrival frame `XTEL` carries.
+#[test]
+fn door_pair_exports_to_door_links() {
+    let directory = tempfile::tempdir().unwrap();
+    let records = parse_plugin_file(&write_plugin(directory.path())).unwrap();
+    let interior = records
+        .iter()
+        .find(|record| &record.record_type == b"CELL" && record.worldspace_form_id.is_none())
+        .unwrap()
+        .form_id;
+    let exterior = records
+        .iter()
+        .find(|record| &record.record_type == b"CELL" && record.worldspace_form_id.is_some())
+        .unwrap();
+    let (exterior_cell, worldspace) = (exterior.form_id, exterior.worldspace_form_id.unwrap());
+    let doors: Vec<(u32, Option<u32>)> = records
+        .iter()
+        .filter(|record| subrecord(record, b"XTEL").is_some())
+        .map(|record| (record.form_id, record.cell_form_id))
+        .collect();
+    let master: HashMap<u32, RawRecord> = records
+        .into_iter()
+        .map(|record| (record.form_id, record))
+        .collect();
+
+    let connection = Connection::open_in_memory().unwrap();
+    create_tables(&connection).unwrap();
+    export_to_db(&connection, &master).unwrap();
+
+    assert_eq!(doors.len(), 2);
+    for (door, cell) in doors {
+        let xtel = subrecord_or_panic(&master[&door], b"XTEL");
+        let (destination, pos_x, destination_cell, destination_world): (
+            u32,
+            f64,
+            u32,
+            Option<u32>,
+        ) = connection
+            .query_row(
+                "SELECT destination_ref_id,pos_x,destination_cell_id,destination_worldspace_id FROM door_links WHERE ref_id=?1",
+                [door],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(destination, form_id(xtel));
+        assert_eq!(pos_x, f64::from(floats(&xtel[4..16])[0]));
+        if cell == Some(exterior_cell) {
+            assert_eq!(
+                (destination_cell, destination_world),
+                (interior, None),
+                "the exterior door leads into the interior cell"
+            );
+        } else {
+            assert_eq!(
+                (destination_cell, destination_world),
+                (exterior_cell, Some(worldspace)),
+                "the interior door leads back out to the worldspace"
+            );
+        }
+    }
 }
 
 /// `parse_plugin_file` without file IO, so a prefix of the fixture can be swept.

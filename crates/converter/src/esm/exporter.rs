@@ -122,6 +122,14 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
          CREATE VIRTUAL TABLE IF NOT EXISTS exterior_spatial USING rtree(
              id, minX, maxX, minY, maxY, minZ, maxZ, +cell_id, +worldspace_id
          );
+         CREATE TABLE IF NOT EXISTS door_links (
+             ref_id INTEGER PRIMARY KEY,            -- the source door REFR FormID (load-order numbering)
+             destination_ref_id INTEGER NOT NULL,   -- XTEL bytes 0..4, remapped like any FormID
+             pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,   -- XTEL 4..16, arrival
+             rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,   -- XTEL 16..28, arrival
+             destination_cell_id INTEGER,           -- resolved post-pass from references.cell_id, NULL if unresolved
+             destination_worldspace_id INTEGER      -- resolved post-pass from references.worldspace_id (NULL = interior)
+         );
          CREATE TABLE IF NOT EXISTS land (
              cell_id INTEGER PRIMARY KEY, heightmap BLOB NOT NULL, vtex BLOB, vclr BLOB, normals BLOB
          );
@@ -507,6 +515,18 @@ fn export_records(
             _ => {}
         }
     }
+    // Resolve every door's destination from the reference row it points at. A
+    // destination that is not a reference among the exported plugins (a
+    // master's record when that master was not converted, an uninstalled mod)
+    // stays NULL, and the engine reads that as "this door leads nowhere it
+    // knows". The destination's own position is deliberately not used: the
+    // arrival point of a load door is its own, not the destination ref's.
+    tx.execute(
+        "UPDATE door_links SET
+             destination_cell_id = (SELECT r.cell_id FROM \"references\" r WHERE r.id = door_links.destination_ref_id),
+             destination_worldspace_id = (SELECT r.worldspace_id FROM \"references\" r WHERE r.id = door_links.destination_ref_id)",
+        [],
+    )?;
     tx.commit()
 }
 
@@ -714,7 +734,57 @@ pub fn insert_reference(
     if is_exterior {
         tx.execute("INSERT OR REPLACE INTO exterior_spatial(id, minX, maxX, minY, maxY, minZ, maxZ, cell_id, worldspace_id) VALUES (?1, ?2, ?2, ?3, ?3, ?4, ?4, ?5, ?6)", params![form_id, pos[0], pos[1], pos[2], cell_id, worldspace_id])?;
     }
+    // A reference re-exported without a usable XTEL (a subset export over an
+    // existing database) must not keep the door row from before.
+    tx.execute("DELETE FROM door_links WHERE ref_id=?1", [form_id])?;
+    if let Some(bytes) = view.find(b"XTEL") {
+        // The destination's cell and worldspace are resolved once every
+        // reference is in, at the end of the export.
+        match door_link(bytes) {
+            Some(link) => {
+                tx.execute(
+                    "INSERT OR REPLACE INTO door_links(ref_id, destination_ref_id, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, destination_cell_id, destination_worldspace_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)",
+                    params![form_id, link.destination_ref_id, link.position[0], link.position[1], link.position[2], link.rotation[0], link.rotation[1], link.rotation[2]],
+                )?;
+            }
+            None => eprintln!(
+                "warning: XTEL of reference {form_id:08X} is {} bytes, expected at least 28; door link dropped",
+                bytes.len()
+            ),
+        }
+    }
     Ok(())
+}
+
+/// A load door's `XTEL`: which reference the door leads to, and where in it the
+/// player arrives. The arrival position and rotation are the plugin's own
+/// values, not the destination reference's transform.
+/// Layout per xEdit 4.1.5f defs, `Core/wbDefinitionsTES5.pas:12344-12350`
+/// (Door FormID, PosRot, then a u32 flags word).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DoorLink {
+    destination_ref_id: u32,
+    position: [f32; 3],
+    rotation: [f32; 3],
+}
+
+/// Reads an `XTEL` subrecord: a 4-byte destination FormID followed by the
+/// arrival position and rotation as six little-endian `f32`s (the trailing
+/// flags word is not read). Anything shorter than 28 bytes yields `None`.
+fn door_link(bytes: &[u8]) -> Option<DoorLink> {
+    if bytes.len() < 28 {
+        return None;
+    }
+    let mut values = [0.0f32; 6];
+    for (index, value) in values.iter_mut().enumerate() {
+        let start = 4 + index * 4;
+        *value = f32::from_le_bytes(bytes[start..start + 4].try_into().ok()?);
+    }
+    Some(DoorLink {
+        destination_ref_id: u32::from_le_bytes(bytes[..4].try_into().ok()?),
+        position: [values[0], values[1], values[2]],
+        rotation: [values[3], values[4], values[5]],
+    })
 }
 
 struct CellRow<'a> {
@@ -777,6 +847,7 @@ mod tests {
             "worldspaces",
             "cells",
             "references",
+            "door_links",
             "land",
             "statics",
             "lights",
@@ -1401,6 +1472,222 @@ mod tests {
             })
             .unwrap();
         assert_eq!(statics, 1);
+    }
+
+    /// `XTEL` as Skyrim SE stores it: the destination reference's FormID, the
+    /// arrival position and rotation as six little-endian floats, then flags.
+    fn xtel(destination_ref_id: u32, position: [f32; 3], rotation: [f32; 3]) -> Vec<u8> {
+        let mut bytes = destination_ref_id.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&floats(position));
+        bytes.extend_from_slice(&floats(rotation));
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes
+    }
+
+    fn door_reference(
+        form_id: u32,
+        cell: u32,
+        position: [f32; 3],
+        xtel_bytes: Vec<u8>,
+    ) -> RawRecord {
+        let mut door = reference(form_id, cell, 0x1AD00, position, [0.0; 3]);
+        door.subrecords.push((b"XTEL".to_vec(), xtel_bytes));
+        door
+    }
+
+    type DoorLinkRow = (u32, f64, f64, f64, f64, f64, f64, Option<i64>, Option<i64>);
+
+    fn door_link_row(conn: &Connection, ref_id: u32) -> DoorLinkRow {
+        conn.query_row(
+            "SELECT destination_ref_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,destination_cell_id,destination_worldspace_id
+             FROM door_links WHERE ref_id=?1",
+            [ref_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    /// Tamriel's cell at grid (19,18) joined to the interior Alftand01 by a
+    /// reciprocal pair of load doors. Each door's arrival point is its own
+    /// `XTEL` transform, not the position of the door it leads to.
+    #[test]
+    fn writes_door_links_and_resolves_their_destinations() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut master = HashMap::new();
+        master.insert(
+            0x3C,
+            record(
+                0x3C,
+                b"WRLD",
+                None,
+                None,
+                vec![(b"EDID".to_vec(), cstr("Tamriel"))],
+            ),
+        );
+        let grid: Vec<u8> = [19i32, 18].into_iter().flat_map(i32::to_le_bytes).collect();
+        master.insert(
+            0x8F82,
+            record(
+                0x8F82,
+                b"CELL",
+                None,
+                Some(0x3C),
+                vec![(b"XCLC".to_vec(), grid)],
+            ),
+        );
+        master.insert(
+            0x152C3,
+            record(
+                0x152C3,
+                b"CELL",
+                None,
+                None,
+                vec![(b"EDID".to_vec(), cstr("Alftand01"))],
+            ),
+        );
+        master.insert(
+            0x15D48,
+            door_reference(
+                0x15D48,
+                0x8F82,
+                [78049.18, 76985.0, -5859.11],
+                xtel(0x152CF, [-947.038, 3958.835, 591.917], [0.0, 0.0, 2.96989]),
+            ),
+        );
+        master.insert(
+            0x152CF,
+            door_reference(
+                0x152CF,
+                0x152C3,
+                [4057.0, 8792.0, -516.0],
+                xtel(0x15D48, [77583.23, 77411.89, -5817.21], [0.0, 0.0, 1.5]),
+            ),
+        );
+
+        export_to_db(&conn, &master).unwrap();
+
+        // Exterior -> interior: cell from the destination reference, NULL worldspace.
+        assert_eq!(
+            door_link_row(&conn, 0x15D48),
+            (
+                0x152CF,
+                f64::from(-947.038f32),
+                f64::from(3958.835f32),
+                f64::from(591.917f32),
+                0.0,
+                0.0,
+                f64::from(2.96989f32),
+                Some(0x152C3),
+                None
+            )
+        );
+        // Interior -> exterior: the destination worldspace is Tamriel's.
+        assert_eq!(
+            door_link_row(&conn, 0x152CF),
+            (
+                0x15D48,
+                f64::from(77583.23f32),
+                f64::from(77411.89f32),
+                f64::from(-5817.21f32),
+                0.0,
+                0.0,
+                1.5,
+                Some(0x8F82),
+                Some(0x3C)
+            )
+        );
+    }
+
+    #[test]
+    fn ignores_xtel_shorter_than_28_bytes_without_panicking() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut master = HashMap::new();
+        for (form_id, length) in [(0x1000u32, 27usize), (0x2000, 12), (0x4000, 4)] {
+            let mut bytes = xtel(0xDEAD_BEEF, [1.0, 2.0, 3.0], [0.0; 3]);
+            bytes.truncate(length);
+            master.insert(form_id, door_reference(form_id, 0x100, [0.0; 3], bytes));
+        }
+        master.insert(
+            0x3000,
+            door_reference(
+                0x3000,
+                0x100,
+                [0.0; 3],
+                xtel(0x2000, [4.0, 5.0, 6.0], [0.0; 3]),
+            ),
+        );
+
+        export_to_db(&conn, &master).unwrap();
+
+        let links: i64 = conn
+            .query_row("SELECT count(*) FROM door_links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(links, 1, "exactly the full-length XTEL carries a link");
+        assert_eq!(door_link_row(&conn, 0x3000).0, 0x2000);
+    }
+
+    #[test]
+    fn a_reference_exported_again_without_xtel_drops_its_door_link() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut master = HashMap::new();
+        master.insert(
+            0x1000,
+            door_reference(
+                0x1000,
+                0x100,
+                [0.0; 3],
+                xtel(0x2000, [1.0, 2.0, 3.0], [0.0; 3]),
+            ),
+        );
+        export_to_db(&conn, &master).unwrap();
+        master.insert(
+            0x1000,
+            reference(0x1000, 0x100, 0x1AD00, [0.0; 3], [0.0; 3]),
+        );
+        export_to_db(&conn, &master).unwrap();
+
+        let links: i64 = conn
+            .query_row("SELECT count(*) FROM door_links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(links, 0);
+    }
+
+    #[test]
+    fn leaves_unresolved_door_destinations_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut master = HashMap::new();
+        master.insert(
+            0x1000,
+            door_reference(
+                0x1000,
+                0x100,
+                [0.0; 3],
+                xtel(0xDEAD_BEEF, [1.0, 2.0, 3.0], [0.0, 0.0, 0.25]),
+            ),
+        );
+
+        export_to_db(&conn, &master).unwrap();
+
+        assert_eq!(
+            door_link_row(&conn, 0x1000),
+            (0xDEAD_BEEF, 1.0, 2.0, 3.0, 0.0, 0.0, 0.25, None, None)
+        );
     }
 
     #[test]

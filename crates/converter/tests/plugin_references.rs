@@ -591,6 +591,87 @@ fn reference_and_cell_form_id_fields_use_load_order_numbering() {
     assert_eq!([word(&xclr, 0), word(&xclr, 4)], [0x0000_0123, 0x0400_0124]);
 }
 
+/// `door_links.destination_ref_id` is in the same load-order numbering as `references.id`, so
+/// the post-pass that resolves the destination cell finds the destination reference. The
+/// last plugin mirrors Dragonborn.esm: its local 0x02xxxxxx is slot 4 of the load order, where
+/// 0x02 would be another plugin; a plugin-local destination would stay unresolved.
+#[test]
+fn door_links_use_load_order_numbering_and_resolve_destinations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut paths = vec![
+        plugin(dir.path(), "Skyrim.esm", &[], 1, Vec::new()),
+        plugin(dir.path(), "Update.esm", &["Skyrim.esm"], 1, Vec::new()),
+        plugin(
+            dir.path(),
+            "Dawnguard.esm",
+            &["Skyrim.esm", "Update.esm"],
+            1,
+            Vec::new(),
+        ),
+        plugin(
+            dir.path(),
+            "HearthFires.esm",
+            &["Skyrim.esm", "Update.esm"],
+            1,
+            Vec::new(),
+        ),
+    ];
+    let xtel = |destination: u32, x: f32| {
+        let mut bytes = destination.to_le_bytes().to_vec();
+        bytes.extend(x.to_le_bytes());
+        bytes.extend([0u8; 20]); // rest of position, rotation
+        bytes.extend(0u32.to_le_bytes()); // flags
+        bytes
+    };
+    let door = |id: u32, destination: u32, x: f32| {
+        record(
+            b"REFR",
+            id,
+            0,
+            [sub(b"XTEL", &xtel(destination, x))].concat(),
+        )
+    };
+    paths.push(plugin(
+        dir.path(),
+        "Dragonborn.esm",
+        &["Skyrim.esm", "Update.esm"],
+        1,
+        [
+            record(b"CELL", 0x0200_0900, 0, sub(b"EDID", b"Inside ")),
+            group(
+                6,
+                0x0200_0900,
+                [
+                    door(0x0200_0800, 0x0200_0801, 11.0),
+                    door(0x0200_0801, 0x0200_0800, 22.0),
+                ]
+                .concat(),
+            ),
+        ]
+        .concat(),
+    ));
+    let merged = EsmParser::merge_plugins(&paths).unwrap();
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    converter::esm::exporter::create_tables(&connection).unwrap();
+    converter::esm::exporter::export_to_db(&connection, &merged).unwrap();
+
+    let row = |source: u32| -> (u32, f64, Option<u32>) {
+        connection
+            .query_row(
+                "SELECT destination_ref_id, pos_x, destination_cell_id FROM door_links WHERE ref_id=?1",
+                [source],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(row(0x0400_0800), (0x0400_0801, 11.0, Some(0x0400_0900)));
+    assert_eq!(row(0x0400_0801), (0x0400_0800, 22.0, Some(0x0400_0900)));
+    let doors: i64 = connection
+        .query_row("SELECT count(*) FROM door_links", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(doors, 2);
+}
+
 /// Malformed optional fields are dropped while usable fields and neighboring records
 /// still remap from plugin-local slot 1 to load-order slot 2.
 #[test]

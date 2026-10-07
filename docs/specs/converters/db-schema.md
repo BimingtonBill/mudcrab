@@ -145,6 +145,32 @@ subrecord payload remains in `data`. An invalid parent link is published as
 `enable_parent_id = 0` (no parent) with its flags kept; a malformed `XESP` is
 dropped, so both columns are NULL. See the remapped-field table below.
 
+#### Load Door Links (`door_links`, optional)
+
+One row per placed reference that carries an `XTEL` subrecord (a load door).
+The table is optional and does not change the schema version: a database
+converted before it existed simply lacks it, and a reader treats every
+reference as a non-door.
+
+```sql
+CREATE TABLE IF NOT EXISTS door_links (
+    ref_id INTEGER PRIMARY KEY,           -- Source door reference (`references.id`)
+    destination_ref_id INTEGER NOT NULL,  -- XTEL bytes 0-3, load-order numbering like `references.id`
+    pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,  -- XTEL bytes 4-15, arrival position
+    rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,  -- XTEL bytes 16-27, arrival rotation
+    destination_cell_id INTEGER,          -- `references.cell_id` of the destination; NULL if unresolved
+    destination_worldspace_id INTEGER     -- `references.worldspace_id` of the destination; NULL for an interior or unresolved
+);
+```
+
+The arrival position and rotation are the door's own `XTEL` values, not the
+destination reference's transform. The destination cell and worldspace are
+resolved after every reference is written; a destination outside the exported
+plugins leaves both NULL. An `XTEL` shorter than 28 bytes is dropped with a
+warning. The flags word (bytes 28-31) is not exported. A reference exported again
+without a usable `XTEL` loses its row. Field layout: xEdit 4.1.5f defs,
+`Core/wbDefinitionsTES5.pas:12344-12350` (Door, PosRot, Flags).
+
 ---
 
 ### 6. Hybrid Spatial Indexing (`refs_rtree` & Interior `cell_id` Index)
