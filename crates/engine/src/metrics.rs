@@ -600,6 +600,7 @@ fn record_frame_ledger(
         ledger.scored.push(ScoredFrame {
             ms: milliseconds,
             owner: attribute(milliseconds, &sides),
+            wait_ms: cycle.wait_ms,
         });
     }
     ledger.previous_upload_ms = commit_ms;

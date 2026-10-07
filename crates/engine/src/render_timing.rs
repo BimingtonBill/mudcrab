@@ -196,6 +196,10 @@ pub struct CycleSides {
     pub render_ms: Option<f64>,
     /// The part of that render schedule spent waiting for a swapchain image.
     pub acquire_ms: Option<f64>,
+    /// How long the main thread waited for the render thread to hand the render world back before
+    /// it could extract (pipelined rendering only). A diagnostic: it says whether the main thread
+    /// was blocked on the render thread in this cycle, and is not a side of its own.
+    pub wait_ms: Option<f64>,
 }
 
 /// Pipelines (render and compute) in one render frame. Bevy's `PipelineCache` holds both, so these
@@ -369,11 +373,12 @@ impl RenderTimings {
     fn handed_over(&self, elapsed: Duration) {
         let mut state = self.state();
         if let Some(extract) = state.last_extract.take() {
-            self.record(
-                &mut state,
-                WAIT_FOR_RENDER_THREAD,
-                elapsed.saturating_sub(extract),
-            );
+            let wait = elapsed.saturating_sub(extract);
+            let cycle = state.cycle;
+            Self::write_cycle(&mut state, Some(cycle), |sides| {
+                sides.wait_ms = Some(wait.as_secs_f64() * 1000.0);
+            });
+            self.record(&mut state, WAIT_FOR_RENDER_THREAD, wait);
         }
     }
 
@@ -688,6 +693,28 @@ mod tests {
             );
             assert_eq!(timings.take_previous_cycle(), None, "taken once");
         }
+    }
+
+    /// The hand-over wait is filed under the main frame that waited, beside its extract.
+    #[test]
+    fn cycles_keep_the_main_threads_wait_for_the_render_thread() {
+        let timings = RenderTimings::default();
+        timings.set_cycle_tracking(true, true);
+        timings.start_main();
+        timings.end_main();
+        timings.extracted(Duration::from_millis(3));
+        timings.handed_over(Duration::from_millis(10));
+        timings.start_main();
+        let cycle = timings.take_previous_cycle().expect("cycle 1");
+        assert_eq!(cycle.extract_ms, Some(3.0));
+        assert_eq!(cycle.wait_ms, Some(7.0));
+        // A hand-over without a new extract has nothing to attribute.
+        timings.end_main();
+        timings.handed_over(Duration::from_millis(10));
+        timings.start_main();
+        let next = timings.take_previous_cycle().expect("cycle 2");
+        assert!(next.main_ms.is_some());
+        assert_eq!(next.wait_ms, None);
     }
 
     #[test]

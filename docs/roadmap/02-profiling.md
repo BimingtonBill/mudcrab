@@ -479,6 +479,14 @@ the report does not guess. `upload` covers the streaming commit only; the render
 preparation is on the render thread. The owner counts of a window sum to its `frames_over_budget`,
 and `unknown` is counted, not hidden.
 
+`over_budget_main_thread_wait` is a diagnostic beside the owners, not an owner: for the frames over
+the budget that have the measurement (pipelined rendering only), the median and the largest time the
+main thread waited for the render thread to hand the render world back
+(`render_timing`'s `wait_for_render_thread`, filed under the main frame that waited), and how many
+frames it covers. A frame owned by `render_thread` with a large wait is a busy render thread holding
+the main thread; the same owner with a small wait means the main thread was not blocked on it. It is
+`null` when no over-budget frame has the measurement.
+
 ## Interpretation
 
 Compare the run fingerprints first: two runs whose `fingerprint` objects differ in anything but the

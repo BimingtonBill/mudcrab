@@ -59,7 +59,7 @@ main_world (main schedule + extract, less streaming commit), upload (streaming c
 render_thread (render-schedule CPU time, less the swapchain-acquire wait) or gpu (the swapchain-acquire wait, \
 a lower bound: submit and present waits are counted in render_thread; GPU pass timestamps are not matched \
 to frames because their readback lags by an unknown number of frames). \
-unknown: the cycle has no main-thread or render-thread sample, or the largest side is under half the frame.";
+unknown: the cycle has no main-thread or render-thread sample, or the largest side is under half the frame. over_budget_main_thread_wait is a diagnostic, not an owner: for the frames over the budget, how long the main thread waited for the render thread to hand the render world back (the median and the largest wait of the frames that have one), which tells a busy render thread (large wait) from a blocked-elsewhere main thread (small wait).";
 
 /// Who owned one frame; see the module documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -152,6 +152,19 @@ pub fn attribute(frame_ms: f64, sides: &FrameSides) -> FrameOwner {
 pub struct ScoredFrame {
     pub ms: f64,
     pub owner: FrameOwner,
+    /// The main thread's wait for the render thread in the frame's cycle, when it was measured
+    /// (pipelined rendering only). A diagnostic, not an input to the owner.
+    pub wait_ms: Option<f64>,
+}
+
+/// The main thread's wait for the render thread over the frames that went over the budget.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct WaitSummary {
+    /// Over-budget frames that have a wait measurement.
+    pub frames: u64,
+    /// Nearest rank, 50%.
+    pub median_ms: f64,
+    pub max_ms: f64,
 }
 
 /// How many frames over the budget each owner had.
@@ -217,6 +230,11 @@ pub struct FrameBudgetReport {
     pub meets_pass_bar: Option<bool>,
     /// The frames over the budget, by owner. Sums to `frames_over_budget`.
     pub over_budget_owners: OwnerCounts,
+    /// The main thread's wait for the render thread over the frames over the budget, a diagnostic
+    /// and not an owner: a large wait means the main thread sat blocked on a busy render thread, a
+    /// small one that the render thread was not what held the frame. `null` when no over-budget
+    /// frame has a wait measurement (no frame over the budget, or no pipelined rendering).
+    pub over_budget_main_thread_wait: Option<WaitSummary>,
     /// How owners are assigned and what that cannot tell (see [`OWNER_RULE`]).
     pub owner_rule: &'static str,
 }
@@ -231,6 +249,15 @@ fn nearest_rank(sorted: &[f64], numerator: usize, denominator: usize) -> Option<
     Some(sorted[rank.clamp(1, sorted.len()) - 1])
 }
 
+fn wait_summary(waits: &mut [f64]) -> Option<WaitSummary> {
+    waits.sort_by(f64::total_cmp);
+    Some(WaitSummary {
+        frames: waits.len() as u64,
+        median_ms: nearest_rank(waits, 50, 100)?,
+        max_ms: *waits.last()?,
+    })
+}
+
 impl FrameBudgetReport {
     pub fn from_frames(budget_ms: f64, scope: &str, frames: &[ScoredFrame]) -> Self {
         let mut sorted: Vec<f64> = frames.iter().map(|frame| frame.ms).collect();
@@ -240,10 +267,12 @@ impl FrameBudgetReport {
         let mut owners = OwnerCounts::default();
         let mut over = 0u64;
         let mut over_double = 0u64;
+        let mut waits = Vec::new();
         for frame in frames {
             if frame.ms > budget_ms {
                 over += 1;
                 owners.add(frame.owner);
+                waits.extend(frame.wait_ms.filter(|wait| wait.is_finite()));
             }
             if frame.ms > budget_ms * 2.0 {
                 over_double += 1;
@@ -267,6 +296,7 @@ impl FrameBudgetReport {
             frames_over_double_budget: over_double,
             meets_pass_bar: has_frames.then(|| over * 1000 <= count as u64 && over_double == 0),
             over_budget_owners: owners,
+            over_budget_main_thread_wait: wait_summary(&mut waits),
             owner_rule: OWNER_RULE,
         }
     }
@@ -277,7 +307,47 @@ mod tests {
     use super::*;
 
     fn frame(ms: f64, owner: FrameOwner) -> ScoredFrame {
-        ScoredFrame { ms, owner }
+        ScoredFrame {
+            ms,
+            owner,
+            wait_ms: None,
+        }
+    }
+
+    fn frame_waiting(ms: f64, wait_ms: f64) -> ScoredFrame {
+        ScoredFrame {
+            wait_ms: Some(wait_ms),
+            ..frame(ms, FrameOwner::RenderThread)
+        }
+    }
+
+    /// The wait is summarised over the over-budget frames only, with the median by nearest rank.
+    #[test]
+    fn the_main_thread_wait_covers_the_over_budget_frames_only() {
+        let report = FrameBudgetReport::from_frames(
+            6.25,
+            "test",
+            &[
+                // In budget: its wait is not counted.
+                frame_waiting(5.0, 99.0),
+                frame_waiting(8.0, 1.0),
+                frame_waiting(9.0, 7.0),
+                frame_waiting(10.0, 3.0),
+                // Over budget with no wait measured: not in the summary.
+                frame(11.0, FrameOwner::MainWorld),
+            ],
+        );
+        assert_eq!(report.frames_over_budget, 4);
+        let wait = report.over_budget_main_thread_wait.unwrap();
+        assert_eq!(wait.frames, 3);
+        assert_eq!(wait.median_ms, 3.0);
+        assert_eq!(wait.max_ms, 7.0);
+        // Nothing over budget, or no wait data: no summary rather than zeros.
+        let quiet = FrameBudgetReport::from_frames(6.25, "test", &[frame_waiting(5.0, 1.0)]);
+        assert_eq!(quiet.over_budget_main_thread_wait, None);
+        let none =
+            FrameBudgetReport::from_frames(6.25, "test", &[frame(9.0, FrameOwner::RenderThread)]);
+        assert_eq!(none.over_budget_main_thread_wait, None);
     }
 
     fn sides(main: f64, render: f64, upload: f64, gpu: f64) -> FrameSides {
