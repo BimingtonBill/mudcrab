@@ -171,7 +171,10 @@ function Get-PortalSceneArguments {
                 "--demo", "riverwood",
                 "--terrain-radius", "$($script:portalTerrainRadius)",
                 "--demo-tour", (Join-Path $RunDirectory "tour"),
-                "--tour-doors", "2", "--tour-repeat", "3"
+                "--tour-doors", "2", "--tour-repeat", "3",
+                # Every frame's time, to place the crossing frame's spike against the timeline's
+                # `door_crossed` and `commit_budget_exceeded` events.
+                "--benchmark-frame-times", (Join-Path $RunDirectory "frame-times.csv")
             )
         }
         # A standing view with one open portal view on screen: the camera 350 units in front of Sven's
