@@ -148,10 +148,7 @@ impl Plugin for VercidiumRendererPlugin {
         .add_systems(Startup, setup_water_reflection)
         .add_systems(
             Update,
-            (
-                update_water_reflection_camera,
-                sync_renderer_metrics,
-            ),
+            (update_water_reflection_camera, sync_renderer_metrics),
         );
 
         add_placed_object_layer_propagation(app);
@@ -1632,7 +1629,9 @@ mod tests {
                 AssetPlugin::default(),
             ))
             .init_asset::<WaterMaterial>()
-            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(16)));
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                16,
+            )));
         let handle = harness
             .app
             .world_mut()
@@ -1667,7 +1666,12 @@ mod tests {
             events.is_empty(),
             "time advancing alone modified a water material: {events:?}"
         );
-        assert!(world.resource::<Assets<WaterMaterial>>().get(&handle).is_some());
+        assert!(
+            world
+                .resource::<Assets<WaterMaterial>>()
+                .get(&handle)
+                .is_some()
+        );
     }
 
     /// An unchanged pose and active flag are not written, so the reflection camera is not marked
@@ -1697,7 +1701,7 @@ mod tests {
     /// slot froze the waves and lost the reflection).
     #[test]
     fn water_settings_fields_match_the_shader_struct() {
-        use bevy::reflect::Struct;
+        use bevy::reflect::structs::Struct;
 
         let source = include_str!("shaders/water.wgsl");
         let block = source
@@ -1726,7 +1730,10 @@ mod tests {
         let pinned = WaterExtension::default().with_pinned_clock(1.0);
         assert_eq!(pinned.settings.clock.x, 1.0);
         assert_eq!(pinned.settings.clock.y, 1.0);
-        assert_eq!(pinned.settings.flow_direction, shared.settings.flow_direction);
+        assert_eq!(
+            pinned.settings.flow_direction,
+            shared.settings.flow_direction
+        );
         assert_eq!(
             pinned.settings.wave_scale_speed_strength,
             shared.settings.wave_scale_speed_strength
