@@ -160,6 +160,7 @@ use crate::{
         DOORWAY_FLOOR_PROBE_DEPTH, DoorAnchor, DoorDestination, DoorLeaf, DoorState,
         DoorwayFloorsMeasured, LoadDoor,
     },
+    profiling::ProfilingState,
     render::TerrainMaterial,
     // The doorway's own dome: the marker that gives its camera one, and the destination's colours.
     sky::SkyCamera,
@@ -1488,16 +1489,22 @@ fn anchor_on_measured_floors(
     not_floors: Query<(), NotAFloor>,
     fresh_meshes: Query<(Entity, &GlobalTransform, &Aabb), Added<Aabb>>,
     mut last_door: Local<Option<Entity>>,
+    mut profiler: ResMut<ProfilingState>,
 ) {
+    // The whole body, the returns below included: the frame the portal draws through no doorway is
+    // the common one, and it is the one this system's own cost has to be readable in.
+    let started = Instant::now();
     let open = state.open_doorway();
     let opened_now = open.map(|doorway| doorway.door) != *last_door;
     *last_door = open.map(|doorway| doorway.door);
     let Some(doorway) = open else {
+        profiler.record_elapsed("portal/floor_probe", started);
         return;
     };
     let Ok((global, local, door, mut anchor, database, probe, measured)) =
         doors.get_mut(doorway.door)
     else {
+        profiler.record_elapsed("portal/floor_probe", started);
         return;
     };
     let database = match database {
@@ -1515,6 +1522,7 @@ fn anchor_on_measured_floors(
         if !measured {
             commands.entity(doorway.door).insert(DoorwayFloorsMeasured);
         }
+        profiler.record_elapsed("portal/floor_probe", started);
         return;
     }
     // The role of the cell a mesh belongs to, or `None` for a mesh that is no floor at all.
@@ -1554,6 +1562,7 @@ fn anchor_on_measured_floors(
     let mut probe = probe.copied();
     if measured {
         if !opened_now && quiet {
+            profiler.record_elapsed("portal/floor_probe", started);
             return;
         }
         commands
@@ -1654,6 +1663,7 @@ fn anchor_on_measured_floors(
             );
         }
     }
+    profiler.record_elapsed("portal/floor_probe", started);
 }
 
 /// The doorway box as the frame the door's front comes from sees it: the size of the opening in
@@ -2763,7 +2773,9 @@ fn show_load_door_leaves(
     state: Res<PortalState>,
     held: Query<(), With<CrossingHeld>>,
     mut doors: Query<(Entity, &LoadDoor, Option<&DoorState>, &mut Visibility)>,
+    mut profiler: ResMut<ProfilingState>,
 ) {
+    let started = Instant::now();
     for (door, load_door, door_state, mut visibility) in &mut doors {
         let wanted = drawn_door_visibility(
             load_door.auto_load,
@@ -2776,6 +2788,7 @@ fn show_load_door_leaves(
             *visibility = wanted;
         }
     }
+    profiler.record_elapsed("portal/door_leaves", started);
 }
 
 /// Whether a load door's model is drawn, from the four facts that decide it: whether it is an
@@ -2956,6 +2969,7 @@ fn isolate_cells(
     nodes: Query<(Option<&RenderLayers>, Option<&PortalOriginalLayers>)>,
     mut changes: IsolationChanges,
     mut state: ResMut<PortalState>,
+    mut profiler: ResMut<ProfilingState>,
 ) {
     let (Some(active), Some(config), Some(origin)) = (active, config, origin) else {
         return;
@@ -2963,6 +2977,9 @@ fn isolate_cells(
     let Ok(camera) = camera.single() else {
         return;
     };
+    // Measured from here: the two guards above are a resource read and a one-camera lookup, and a
+    // frame they stop is a frame with no cell role to isolate at all.
+    let started = Instant::now();
     let space = ActiveSpace::of(&active, config.unload_radius, camera.translation, origin.0);
     let destination = state.destination.clone();
     let previous = std::mem::take(&mut state.roles);
@@ -3035,6 +3052,7 @@ fn isolate_cells(
             state
                 .churn
                 .walked(identity, previous.get(&root).copied(), role, count);
+            profiler.increment("portal/nodes_relayered", count);
         }
     }
 
@@ -3111,6 +3129,10 @@ fn isolate_cells(
         }
     }
     state.door_layer_applied = hidden_doors;
+    // The churn of this frame, as counters: the roots whose whole subtree was walked, and the nodes
+    // those walks visited (the node counts `IsolationChurn::walked` debug-logs per root).
+    profiler.increment("portal/cells_relayered", walked.len() as u64);
+    profiler.record_elapsed("portal/isolate", started);
 }
 
 /// The role each cell root's colliders were last left in, so [`gate_cell_colliders`] walks a root's
@@ -3132,6 +3154,7 @@ struct AppliedColliderRoles(HashMap<Entity, CellRole>);
 /// A root's subtree is walked only when the root's role changed since the last frame; a collider
 /// that appears under a root whose role is settled (a model armed later, a destination's scene
 /// finishing its spawn) is caught by its own `Added` flag the first time this system sees it.
+#[allow(clippy::too_many_arguments)]
 fn gate_cell_colliders(
     mut commands: Commands,
     state: Res<PortalState>,
@@ -3140,7 +3163,11 @@ fn gate_cell_colliders(
     parents: Query<&ChildOf>,
     colliders: Query<(), With<Collider>>,
     newly_added: Query<Entity, Added<Collider>>,
+    mut profiler: ResMut<ProfilingState>,
 ) {
+    let started = Instant::now();
+    // The colliders this frame's walk issued a gate command for, counted below.
+    let mut gated = 0_u64;
     // A root that is gone took its colliders with its subtree; nothing to flip.
     applied.0.retain(|root, _| state.roles.contains_key(root));
     for (&root, &role) in &state.roles {
@@ -3149,7 +3176,7 @@ fn gate_cell_colliders(
         }
         applied.0.insert(root, role);
         for entity in children.iter_descendants(root) {
-            apply_collider_role(&mut commands, entity, role, &colliders);
+            gated += u64::from(apply_collider_role(&mut commands, entity, role, &colliders));
         }
     }
     let unmarked = HashSet::new();
@@ -3157,21 +3184,31 @@ fn gate_cell_colliders(
         let Some((root, _)) = owning_root(entity, &state.roles, &parents, &unmarked) else {
             continue;
         };
-        apply_collider_role(&mut commands, entity, state.roles[&root], &colliders);
+        gated += u64::from(apply_collider_role(
+            &mut commands,
+            entity,
+            state.roles[&root],
+            &colliders,
+        ));
     }
+    profiler.increment("portal/colliders_gated", gated);
+    profiler.record_elapsed("portal/colliders", started);
 }
 
 /// Puts one collider in the state its cell's role calls for: live in the active space, disabled
 /// everywhere else. Anything that is not a collider is left alone (the walk covers a cell's whole
 /// subtree, not only its colliders).
+///
+/// Answers whether the entity was a collider, so [`gate_cell_colliders`] can count the commands it
+/// issued this frame (`portal/colliders_gated`).
 fn apply_collider_role(
     commands: &mut Commands,
     entity: Entity,
     role: CellRole,
     colliders: &Query<(), With<Collider>>,
-) {
+) -> bool {
     if colliders.get(entity).is_err() {
-        return;
+        return false;
     }
     match role {
         CellRole::Active => {
@@ -3181,6 +3218,7 @@ fn apply_collider_role(
             commands.entity(entity).try_insert(ColliderDisabled);
         }
     }
+    true
 }
 
 /// Places the portal camera in the destination of the nearest usable door and puts the doorway quad
@@ -3200,7 +3238,11 @@ fn update_portal(
     leaf_openings: Query<&LeafOpening>,
     time: Option<Res<Time>>,
     mut shown: Local<Option<u32>>,
+    mut profiler: ResMut<ProfilingState>,
 ) {
+    // The whole body is measured, guard returns included: this span is what the portal chain costs
+    // a frame, and the frame a run has no portal camera or quad is a frame of that cost too.
+    let started = Instant::now();
     // This frame's portal, from scratch: whenever the camera below cannot be placed there is no
     // doorway rendering the destination, and the door that was open for it has to close again in
     // this frame. Clearing before the early returns is what makes that true of every one of them.
@@ -3210,16 +3252,20 @@ fn update_portal(
     let (Some(active), Some(config), Some(origin), Some(streaming)) =
         (active, config, origin, streaming)
     else {
+        profiler.record_elapsed("portal/update", started);
         return;
     };
     let Ok((main_transform, main_projection, main_camera)) = main.single() else {
+        profiler.record_elapsed("portal/update", started);
         return;
     };
     let Ok((mut camera_transform, mut camera_projection, mut camera)) = portal_camera.single_mut()
     else {
+        profiler.record_elapsed("portal/update", started);
         return;
     };
     let Ok((mut quad_transform, mut quad_visibility)) = quad.single_mut() else {
+        profiler.record_elapsed("portal/update", started);
         return;
     };
     let camera_position = main_transform.translation;
@@ -3342,6 +3388,7 @@ fn update_portal(
         state.lose_destination(now, |_| held);
         *quad_visibility = Visibility::Hidden;
         camera.is_active = false;
+        profiler.record_elapsed("portal/update", started);
         return;
     };
 
@@ -3355,6 +3402,7 @@ fn update_portal(
         state.lose_destination(now, |_| held);
         *quad_visibility = Visibility::Hidden;
         camera.is_active = false;
+        profiler.record_elapsed("portal/update", started);
         return;
     };
     // The doorway opens here: `show_load_door_leaves` hides this door's leaf in this same frame,
@@ -3491,6 +3539,7 @@ fn update_portal(
     };
 
     state.draw_destination(target, destination_keys(&door.destination, anchor));
+    profiler.record_elapsed("portal/update", started);
 }
 
 /// The sight lines [`skip_occluded_doorway`] tests a doorway with: a grid this many points wide
@@ -5105,7 +5154,7 @@ mod tests {
             player_walks_through_doors,
         },
         profiling::ProfilingState,
-        render::{TerrainMaterial, WaterMaterial, WaterReflectionTexture},
+        render::{RendererMetrics, TerrainMaterial, WaterMaterial, WaterReflectionTexture},
         streaming::{
             StreamingMetrics, StreamingPlugin, creation_rotation_to_bevy, creation_to_bevy,
             render_position,
@@ -5187,6 +5236,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .init_resource::<PortalState>()
+            .init_resource::<ProfilingState>()
             .add_systems(Update, gate_cell_colliders);
         let active = app.world_mut().spawn(Name::new("active")).id();
         let destination = app.world_mut().spawn(Name::new("destination")).id();
@@ -5254,6 +5304,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .init_resource::<PortalState>()
+            .init_resource::<ProfilingState>()
             .add_systems(Update, gate_cell_colliders);
         let active = app.world_mut().spawn(Name::new("active")).id();
         let destination = app.world_mut().spawn(Name::new("destination")).id();
@@ -5332,6 +5383,7 @@ mod tests {
         })
         .insert_resource(RenderOrigin(IVec2::new(19, 18)))
         .init_resource::<PortalState>()
+        .init_resource::<ProfilingState>()
         .add_systems(Update, (show_load_door_leaves, isolate_cells).chain());
         app
     }
@@ -7637,6 +7689,89 @@ mod tests {
             RenderLayers::layer(0),
             "a role change is walked once, not every frame after it"
         );
+    }
+
+    /// The two counters [`isolate_cells`] records, read the way a door-tour benchmark reads them:
+    /// out of the profile bundle's `cpu-spans.json`, the counter map's only door.
+    fn isolate_counters(app: &App) -> (u64, u64) {
+        let directory = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            profile_output_dir: Some(directory.path().to_owned()),
+            ..EngineConfig::default()
+        };
+        app.world()
+            .resource::<ProfilingState>()
+            .write_bundle(
+                &config,
+                &serde_json::json!({}),
+                None,
+                &RendererMetrics::default(),
+                None,
+                None,
+            )
+            .unwrap();
+        let bundle: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("cpu-spans.json")).unwrap(),
+        )
+        .unwrap();
+        let counter = |name: &str| bundle["counters"][name].as_u64().unwrap_or(0);
+        (
+            counter("portal/cells_relayered"),
+            counter("portal/nodes_relayered"),
+        )
+    }
+
+    #[test]
+    fn a_role_change_is_measured_as_an_isolate_span_and_churn_counters() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let (_, active_mesh) = spawn_cell(&mut app, INTERIOR_ALFTAND01, None, None, None);
+        let (other_root, _) = spawn_cell(&mut app, 0x0005_6C1B, None, None, None);
+        spawn_mesh(&mut app, other_root, Some(RenderLayers::layer(1)));
+        update(&mut app, 2);
+        assert!(on_main_camera(&app, active_mesh));
+
+        let spans = |app: &App| {
+            app.world()
+                .resource::<ProfilingState>()
+                .span_samples("portal/isolate")
+                .to_vec()
+        };
+        assert_eq!(
+            spans(&app).len(),
+            2,
+            "one portal/isolate sample per frame the system ran"
+        );
+        assert!(
+            spans(&app).iter().any(|ms| *ms > 0.0),
+            "the walk of a first-seen root is real time, not a recorded zero"
+        );
+        let (cells_before, nodes_before) = isolate_counters(&app);
+
+        // The player crosses into the other cell: both roots change role, so the one frame the
+        // crossing is seen in walks both whole subtrees.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: TAMRIEL,
+            interior: Some(0x0005_6C1B),
+        };
+        update(&mut app, 1);
+        assert_eq!(spans(&app).len(), 3, "the crossing frame is measured too");
+        let (cells_after, nodes_after) = isolate_counters(&app);
+        assert_eq!(
+            cells_after - cells_before,
+            2,
+            "the two roots whose role changed are the frame's relayered cells"
+        );
+        assert_eq!(
+            nodes_after - nodes_before,
+            3,
+            "the active cell's one mesh and the other root's two nodes"
+        );
+
+        // The frame after, the roles have settled: the span is still recorded, the churn is not.
+        update(&mut app, 1);
+        assert_eq!(spans(&app).len(), 4);
+        assert_eq!(isolate_counters(&app), (cells_after, nodes_after));
     }
 
     #[test]

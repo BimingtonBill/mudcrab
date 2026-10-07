@@ -75,6 +75,7 @@ use crate::{
 use bevy::prelude::*;
 use std::collections::HashMap;
 use std::f32::consts::PI;
+use std::time::Instant;
 
 /// A load door closer to the camera than this has its destination streamed in.
 pub const DOOR_PRESTREAM_RADIUS: f32 = 800.0;
@@ -350,9 +351,12 @@ fn plan_door_prestream(
     time: Option<Res<Time>>,
     mut prediction: ResMut<DoorPrediction>,
     mut prestream: ResMut<PrestreamCells>,
+    mut profiler: ResMut<ProfilingState>,
 ) {
+    let started = Instant::now();
     prestream.clear();
     let Ok(camera) = camera.single() else {
+        profiler.record_elapsed("portal/prestream", started);
         return;
     };
     // A run without a clock holds nothing: the prediction is the ranking alone, as it was.
@@ -410,6 +414,7 @@ fn plan_door_prestream(
     if let Some(streaming) = streaming.as_deref() {
         prediction.watch_residency(&requested, streaming);
     }
+    profiler.record_elapsed("portal/prestream", started);
 }
 
 /// Why [`plan_door_prestream`] asked for a door's destination, for the residency log.
