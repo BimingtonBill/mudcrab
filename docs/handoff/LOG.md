@@ -3,6 +3,25 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-07 Phase 1 Dev (#188 fix, door_links, #186 terrain merge converter half)
+
+All local; no PRs opened. Hand-offs went to Upstream Dev, Phase 2 Dev and `local/team/2026-10-07.md`.
+
+- **#188 room graph:** `phase1/room-graph-pr` head b7488c1c (worktree `D:/Modding-overflow/wt/p1-main-ro`). The room_portals migration savepoint now closes when RELEASE fails (busy lock). It does a ROLLBACK if the savepoint opened the transaction, else ROLLBACK TO + RELEASE. A new busy-lock test fails without the fix. Workspace nextest 1090/1090 + doctests (evidence `D:/Modding-overflow/p1-evidence/p1-room-graph-workspace-b7488c1c.txt`).
+- **door_links (#112 / Phase 2's crossing):** `phase1/door-links-export` 723c0c39 (worktree `D:/Modding-overflow/wt/up-doorlinks`, now Phase 1's). XTEL is read per xEdit 4.1.5f defs `wbDefinitionsTES5.pas:12344-12350`, 32 bytes only, and non-finite values drop the link. No schema bump. Reviews DeepSeek #889 and Sol #889.1; fixes in. Built `C:/Modding/SkyrimConverted-p2main-v24-doors` (metadata rebuild reusing p2main-v24): 2,204 door_links, 0 unresolved, the same as portal-rooms. Phase 2's Riverwood and Whiterun pairs check out.
+- **UASTC cause found:** portal-lod reused pre-#114 textures. The fresh portal-rooms conversion has 15 UASTC files (cubemaps only).
+- **#186 terrain merge, converter half:** `phase1/terrain-merge` (worktree `C:/Modding/worktrees/p1-terrain-merge`, off main f40ca1df), head 20ac4831. Format v3 is agreed with Phase 2 (`local/research/terrain-merge/format-proposal.md`). Commits:
+  - shared types and paths;
+  - `build_cell_mesh`;
+  - land texture arrays (`terrain_arrays.rs`: full mips, UASTC to BC7, KTX2 data smallest-first, staged publish);
+  - chunk files plus the #185 key (`terrain_chunks.rs`).
+  Checks: clippy clean, terrain tests 42/42, converter+shared green except the known flaky `extraction_does_not_wait_for_a_front_end_that_stopped_reading`. Upstream Dev confirmed the key changes on a load-order shift (remapped FormIDs are hashed). A pinning test is due in the wiring round. World-DB-wide stable IDs are a design candidate for the next plan.
+- **Not done:** the pipeline wiring, DeepSeek impl #896.1 (brief `tasks/deepseek/impl-896.1-p1-terrain-pipeline-wiring.md`). It was stopped at disk-c before writing any code. Relaunch it after the move with its target on D:. After that: image-diff evidence, then workspace nextest + doctests on the head.
+- **Disk:** the three coder worktrees `local/impl/impl-895-*`, `impl-896-*` and `impl-896.1-*` (~43 GB on C:) are for the user to `git worktree remove --force` (the classifier denied mine). Their leftovers are copied to `local/archive/p1-coder-worktree-leftovers-2026-10-07`. Throwaway `D:/Modding-overflow/p1-tmp-doorlinks-target` (class A, keep-until 2026-10-09).
+- **Evening table items:** a converter heartbeat line; the .opensky-srgb alias dedupe; the KTX2 mip-order fix (batched with the schema bump, `local/research/converter/ktx2-mip-order-2026-10-07.md`); porting d4793105's root transform upstream; main's glb_bounds should skip excluded geometry by exclusion data (#84); portal's name-only marker drop (Portal's).
+- **Also pending:** the load bench full run (`D:/Modding-overflow/scratch/p1-load-bench/run-full.ps1`) in a quiet slot, then the collision v3 decision; the p1rooms rebuild from fresh main data.
+- **After tonight's move:** CARGO_TARGET_DIR is `D:\Mudcrab\builds\p1-target`; update paths in `local/handover/phase1-dev.md` and memory. No worker running.
+
 ## 2026-10-06 Upstream Dev (engine foundations, portal catch-up, publishing)
 
 - **Published (the user's yes each):** issues #183 (tracking) and #184-#188 (baseline, derived-data contract, static-rendering experiment, secondary views, interior room visibility); a comment on Chef's #106 offering our .lst/.btt/.bto LOD notes. Under the standing yes: CodeRabbit round-2 fix pushes #121 -> 2167650d, #124 -> 1fd11141, #125 -> 3734ee9e, bot threads answered.
