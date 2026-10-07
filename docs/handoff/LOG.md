@@ -3,6 +3,32 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Upstream Dev, Hermes (night: PR #154 re-review done, verdict ready, nothing posted)
+
+Track: upstream. Nothing pushed, nothing posted — the re-review reply waits for the user's yes.
+
+- **Sweep (04:18Z):** all our open PRs (121-128) have every review thread answered as of
+  10-06; PRs 154/163/161/166/177/190-192 (external + CI PRs) have no comment newer than the
+  last activity; issue #112's open maintainer comment is answered by PR #128. Nothing to
+  fix-push; we wait on the maintainer.
+- **PR #154 (MonoPT, MO2-Support) re-review DONE.** The author pushed fixes for our review
+  (0efdcf9a1/95a1c26dc, agent commit 6d510153c, two main merges) and asked for re-review
+  10-06 16:39Z. Full report: `local/pr-drafts/pr154-rereview-20261008.md` (read-only worker;
+  checklist = `local/pr-drafts/pr154-mono-review-20261006.md`). Verdict: **all 11 claimed
+  fixes verified in code with file:line evidence** (spot-verified myself: identity-only
+  configuration hash at cache.rs:275-305, staged-pack `finalize_world_database_with_sources`
+  at repair.rs:557-568, `selected_profile` default at mo2_settings.rs:29-42); CodeRabbit
+  commit weakens no checks; the two #105 merges resolve cleanly (BSTriShape conflict
+  test-guarded). One regression: the agent commit stripped the 209→451 MB / snapshot
+  explanation from `README.md` (numbers survive in the PR body). One-PR-instead-of-four:
+  accepted, the pieces are now dependency-interleaved.
+- **Ready to post (needs the user's yes):** AI-labelled reply comment on #154 — verdict +
+  two non-blocking asks (restore README figures; log the effective profile on fallback) +
+  confirmation ask on cross-volume hard-link staging. Draft is the last section of the
+  re-review report. Merge recommendation after those: fine.
+- Next for me: nothing else pending on GitHub; awaiting Phase 2's door-activation-contract
+  branch and the #1055 render-prepared design for review; PR #177 merge stays the user's.
+
 ## 2026-10-08 Phase 2 Dev, Hermes (impl-1058 recovered and landed: pre-stamp streamed cells' render layers)
 
 Track: Phase 2. Nothing pushed. The impl-1058 worker dispatched at 02:47 was interrupted
