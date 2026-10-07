@@ -279,7 +279,26 @@ def cmd_hold(args: argparse.Namespace) -> int:
         json.dump({"name": args.name, "owner": args.owner, "reason": args.reason, "until": until,
                    "since": datetime.now().isoformat(timespec="seconds")}, handle)
     print(f"build_gate: hold '{args.name}' set by {args.owner}" + (f" until {until}" if until else ""))
-    return 0
+    # A hold stops new runs only; a run that took its slot just before keeps going (2026-10-08: a cargo check
+    # compiled into the first seconds of a timing window). List them, and with --drain wait until they end.
+    config = load_config()
+    deadline = time.monotonic() + args.drain_minutes * 60
+    while True:
+        clear_stale_slots(config)
+        busy = [info for path in slot_paths(config) if (info := read_json(path)) is not None]
+        if not busy:
+            print("build_gate: no gated runs in progress")
+            return 0
+        for info in busy:
+            print(f"build_gate: still running: {info['label']} ({info.get('owner', '?')}) pid {info['pid']}: "
+                  f"{info['command'][:100]}")
+        if not args.drain or time.monotonic() > deadline:
+            if args.drain:
+                print("build_gate: runs still busy after the drain wait; ask their owners to stop them", file=sys.stderr)
+                return 4
+            print("build_gate: tell their owners, or re-run with --drain to wait for them")
+            return 0
+        time.sleep(float(config["poll_seconds"]))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -296,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
     hold.add_argument("--owner")
     hold.add_argument("--reason")
     hold.add_argument("--until", help="END-by time HH:MM (shown; the owner still clears the hold)")
+    hold.add_argument("--drain", action="store_true", help="after setting, wait until running gated jobs end")
+    hold.add_argument("--drain-minutes", type=float, default=30.0, help="how long --drain waits (default 30)")
     args = parser.parse_args(argv)
     if args.cmd == "run" and args.command and args.command[0] == "--":
         args.command = args.command[1:]

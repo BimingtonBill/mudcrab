@@ -75,7 +75,7 @@ a conversion's build pause, a review wait) or is about to go idle, it checks:
   (also for check, clippy, build, test; sessions, Claude subagents and DeepSeek workers alike). It waits for one of
   3 build slots (at most 2 per session: `BUILD_GATE_OWNER`, else the label's track prefix p1/p2/p3/portal), at least 8 GB free RAM, at least 15 GB free on the drive the build writes to, and no hold, then runs and frees the slot on any exit. `... status` shows
   slots, holds, free RAM and converters. A conversion (extraction and convert phases) and a timing window set a
-  hold (`... hold set conversion --owner <session> --reason <what> --until HH:MM`) and clear it when done;
+  hold (`... hold set conversion --owner <session> --reason <what> --until HH:MM`; timing windows add `--drain`, which lists gated runs still going and waits until they end) and clear it when done;
   this replaces per-session gate files and "no cargo" messages (still announce the job). Source:
   `tools/build_gate.py` (the copy in the gate folder is what everyone runs; Upstream Dev updates it). Workers
   launched from this checkout can no longer run heavy cargo directly (`.deepseek-agents.json`); the gate folder
