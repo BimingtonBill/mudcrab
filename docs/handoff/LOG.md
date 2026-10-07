@@ -3,6 +3,49 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Phase 2 Dev, Hermes (impl-1057 ported onto the detail-tiered streamer: failed-cell retry with backoff)
+
+Track: Phase 2. Nothing pushed. Branch `phase2/failed-cell-retry` commit **b2f2bea6** (from
+portal c9f2ffa7), worktree `C:/d/Mudcrab/worktrees/p2-failed-cell-retry` (OWNER.txt; note the
+`C:/d` path is an MSYS mangling slip - move/remove needs the user's yes), streaming.rs only,
++958/-95. Original GLM worker diff (detached at old base 6f583cd9) was partly superseded - portal
+since landed the `full_failed` terrain rescue and the interior retry budget - so the leftover
+apply was stashed (patch kept in the phase2-dev profile scratch) and the remaining gaps were
+rebuilt per the revised brief `IMPL-1057-PORT-BRIEF.md` in the worktree, by a gated native
+subagent, then re-verified by this session.
+
+- `CellStatus::Failed` = `{ detail, attempts, reason, retry_at: Option<Instant>, replaced }`;
+  `retry_at: None` = given up, never asked again while the entry lives; fresh entry on return
+  (plan retain drops it, as before).
+- `full_failed`: `HashSet<CellKey>` -> `HashMap<CellKey, FullFailure>` `{ attempts, reason,
+  retry_at }` with `retryable(now)`; plan_cells re-asks Full once the entry is retryable
+  (wall-clock backoff 1 s doubling to 2 s, `MAX_CELL_LOAD_ATTEMPTS` = 3), keeping the terrain
+  rescue root drawn as `replaced` the whole time (no ground hole; the tier-swap machinery takes
+  the root over); downgrade-to-terrain stays for pending/given-up entries.
+- `record_failed_cell` (shared exteriors/interiors via `next_full_attempt`): one `warn!` per
+  failure (key, cell id, attempt, reason); deterministic (LAND strict-validation at Full) or
+  budget-spent goes straight to given up with one `error!` + `failed_cells_given_up`; else backoff.
+  Ring/Terrain branches untouched (still empty-space accounting). Metrics: `failed_cell_retries`,
+  `failed_cells_given_up` added beside `failed_cells`.
+- Interior retry: budget unchanged (`INTERIOR_FAILED_RETRIES`), now additionally gated on the same
+  wall-clock backoff; a given-up interior is never re-asked. NOTE: interiors effectively cap at
+  `MAX_CELL_LOAD_ATTEMPTS` (3) via the shared give-up rule - coincides with the old budget, flag
+  to review whether interiors should keep a separate give-up rule.
+- Leak fix riding along: `unload_all_cells_now` and `validate_streaming_lifecycle` now account for
+  `Failed { replaced }` roots (despawn on space change / counted as plan-accounted, not orphan).
+- Deviation recorded: collider-build failure was NOT converted - at c9f2ffa7 it no longer fails
+  the cell at all (`spawn_cell` draws the quadrant without a collider and commits), so there is no
+  site; converting it would change behaviour the brief said to keep.
+- Gated (own build folder `C:/Modding/Mudcrab/builds/p2-failed-cell-retry`, OWNER.txt): fmt clean;
+  gated clippy `-p engine --all-targets --all-features -D warnings` clean (worker x5 + this
+  session fresh); gated nextest `-p engine --no-fail-fast -E "test(streaming)"` **122/122** and
+  full `-p engine --no-fail-fast` **1132 passed / 4 skipped** (worker) - this session re-ran
+  streaming **122/122** fresh on the commit. Four acceptance tests (a)-(d) adapted to the tiered
+  architecture plus the existing suite passing unchanged.
+- Next: hand to Upstream Dev for review against `IMPL-1057-PORT-BRIEF.md`. When the user is
+  awake: move/remove the `C:/d/...` worktree (needs consent), and the booked re-profile window
+  still waits for impl-1058 + prestream pre-warm + impl-285 together.
+
 ## 2026-10-08 Upstream Dev, Hermes (night: PR #154 re-review done, verdict ready, nothing posted)
 
 Track: upstream. Nothing pushed, nothing posted — the re-review reply waits for the user's yes.
