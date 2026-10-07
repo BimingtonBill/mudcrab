@@ -117,8 +117,11 @@
 //! the wall it is mounted on. The reference's `XRDS` radius override *is* applied; see
 //! [`radius_of`].
 
-use crate::world::{components::StreamingCamera, database::LightRow};
-use bevy::{camera::visibility::RenderLayers, prelude::*};
+use crate::{
+    profiling::ProfilingState,
+    world::{components::StreamingCamera, database::LightRow},
+};
+use bevy::{camera::visibility::RenderLayers, platform::time::Instant, prelude::*};
 use std::collections::HashSet;
 
 /// `LIGH` `DATA` flag bit: the record is off until something turns it on, so a reference to it is
@@ -455,6 +458,10 @@ fn counts_toward_budget(layers: Option<&RenderLayers>, doorway_drawn: bool) -> b
 ///
 /// The lights no view draws are [`counts_toward_budget`]'s, and they are switched off along with
 /// the ones past the budget: they are not this system's to turn on either way.
+///
+/// The system's own cost is the `lights/budget` span, which the per-frame series carries as a
+/// column (`crate::profiling`): outdoors a re-choose ranks every spawned light twice and sorts it,
+/// and a cell committed in front of the camera makes one happen.
 fn budget_lights(
     mut budget: ResMut<LightBudget>,
     camera: Query<&GlobalTransform, With<StreamingCamera>>,
@@ -469,10 +476,12 @@ fn budget_lights(
         With<SkyrimLight>,
     >,
     seen: Query<(&ViewVisibility, &PointLight), With<SkyrimLight>>,
+    mut profiler: ResMut<ProfilingState>,
 ) {
     let Ok(camera) = camera.single() else {
         return;
     };
+    let started = Instant::now();
     let camera_position = camera.translation();
     // The portal camera, while it draws a doorway: the one active camera that renders the
     // destination's layer. `crate::portal` switches it off whenever no doorway is shown.
@@ -511,6 +520,10 @@ fn budget_lights(
         && budget.chosen.len() == eligible
         && chosen_at.distance(camera_position) <= BUDGET_RECHOOSE_DISTANCE
     {
+        // The span is recorded on this path too: the frame's cost of budgeting is the pass over the
+        // lights whether or not the selection had to be re-made, and a slow frame's row should show
+        // what the budget cost in it either way.
+        profiler.record_elapsed("lights/budget", started);
         return;
     }
 
@@ -563,6 +576,7 @@ fn budget_lights(
         .map(|(entity, _)| *entity)
         .collect();
     let visible = seen.iter().filter(|(view, _)| view.get()).count();
+    profiler.record_elapsed("lights/budget", started);
     if let Some((nearest, distance_squared)) = active.first().or(destination.first()) {
         let (range, intensity) = seen
             .get(*nearest)
@@ -927,6 +941,7 @@ mod tests {
         ))
         .init_asset::<Mesh>()
         .init_resource::<LightBudget>()
+        .init_resource::<ProfilingState>()
         .add_systems(PostUpdate, budget_lights.after(TransformSystems::Propagate));
         app.world_mut().spawn((
             Transform::from_translation(camera),
@@ -1509,6 +1524,7 @@ mod tests {
         ))
         .init_asset::<Mesh>()
         .init_resource::<LightBudget>()
+        .init_resource::<ProfilingState>()
         .add_systems(
             PostUpdate,
             budget_lights

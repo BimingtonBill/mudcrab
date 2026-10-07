@@ -78,7 +78,7 @@ use bevy::{
         RenderMaterialInstances, RenderMeshInstanceFlags, RenderMeshInstances,
         SpecializedShadowMaterialPipelineCache,
     },
-    platform::collections::HashMap,
+    platform::{collections::HashMap, time::Instant},
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
@@ -90,6 +90,8 @@ use bevy::{
     },
 };
 use std::hash::Hash;
+
+use crate::profiling::ProfilingState;
 
 /// How many frames in a row [`requeue_dropped_shadow_casters`] puts the same entity back into a
 /// shadow view's pending queue before it gives up on it. Bevy's own retries have no limit; this
@@ -138,12 +140,24 @@ impl Plugin for ShadowViewLayersPlugin {
 /// `ViewVisibility` rather than `Mesh3d`, which Bevy itself touches to force a re-extraction
 /// (`bevy_pbr-0.19.0/src/material.rs:658-669`): a changed `Mesh3d` also re-computes the mesh's
 /// `Aabb` from its vertices and re-specializes it for every view, and neither is needed here.
+///
+/// The count is what predicts the frame's render-side cost — it is how many meshes the next
+/// extraction must re-extract and `queue_shadows` must look at again — so it is recorded as the
+/// `shadow/relayered_meshes` gauge every frame, zeroes included, beside the system's own
+/// `shadow/relayer_mark` span. A crossing relays the whole content of every cell whose role
+/// changed, which is what puts the burst into the frames after an exterior re-entry.
 fn reextract_relayered_meshes(
     mut meshes: Query<&mut ViewVisibility, (With<Mesh3d>, Changed<RenderLayers>)>,
+    mut profiler: ResMut<ProfilingState>,
 ) {
+    let started = Instant::now();
+    let mut relayered = 0u64;
     for mut visibility in &mut meshes {
         visibility.set_changed();
+        relayered += 1;
     }
+    profiler.set_gauge("shadow/relayered_meshes", relayered as f64);
+    profiler.record_elapsed("shadow/relayer_mark", started);
 }
 
 /// The render-world state of [`requeue_dropped_shadow_casters`]: which entities it is retrying,
@@ -822,6 +836,7 @@ mod tests {
     fn relayer_app() -> App {
         let mut app = App::new();
         app.init_resource::<TouchedThisFrame>()
+            .init_resource::<ProfilingState>()
             .add_systems(Update, (reextract_relayered_meshes, count_touched).chain());
         app
     }
