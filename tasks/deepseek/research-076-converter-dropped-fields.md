@@ -24,7 +24,7 @@ write the report with whatever is finished and name what is missing. Never end w
      (`roughness = 1 - glossiness/100`) - wrong for all 59,268 materials (fixed in impl-062).
   2. `SLSF1_VERTEX_ALPHA` was treated as opacity, so 1,337 meshes rendered translucent (impl-063;
      the vertex-colour alpha is a shader parameter, not transparency).
-- Published tree to count against, **read-only, never write**: `C:/Modding/SkyrimConverted/`
+- Published tree to count against, **read-only, never write**: `C:/Modding/Mudcrab/SkyrimConverted/`
   (manifest: schema 18, complete, 22,761 NIFs, 32,945 DDS, 59,268 materials). GLBs at
   `meshes/**/*.glb`, textures at `textures/**/*.ktx2`.
 - Skyrim SE install, read-only: `C:/Games/Steam/steamapps/common/Skyrim Special Edition`.
@@ -98,7 +98,7 @@ impact, one sentence each on what would change on screen.
 
 - Every field of `ValidatedNifMaterial` and of the five block structs is accounted for, with read and
   write sites.
-- Counts are measured against `C:/Modding/SkyrimConverted` or explicitly unmeasured with the search
+- Counts are measured against `C:/Modding/Mudcrab/SkyrimConverted` or explicitly unmeasured with the search
   that would measure them.
 - The report exists, however much is finished.
 

@@ -43,11 +43,11 @@ dithering is **not** the explanation; do not spend time on it beyond confirming 
 2. **What the real assets carry.** For `Landscape\Trees\TreePineForest03.nif` and at least three
    more of the tree and plant models Riverwood actually places (get the list from
    `docs/design/riverwood-demo.md` section 4, resolve paths in
-   `C:/Modding/SkyrimConverted/skyrim_world.db`), report from the **source NIF**: the
+   `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`), report from the **source NIF**: the
    `NiAlphaProperty` flags word, the decoded test-enable bit, the threshold byte, and the blend
    factors. The BSA reader is `crates/converter/src/archive/bsa.rs`.
 3. **What the converted glb carries.** For the same models, the `alphaMode` and `alphaCutoff` in
-   the glb's JSON chunk under `C:/Modding/SkyrimConverted/meshes`. A table of model → NIF flags →
+   the glb's JSON chunk under `C:/Modding/Mudcrab/SkyrimConverted/meshes`. A table of model → NIF flags →
    glb alphaMode/cutoff is the core deliverable.
 4. **What the engine does with it.** Follow the glb `alphaMode` through `render.rs` and the
    `CanonicalMaterialKind` checks at `app.rs:650-670` to the `StandardMaterial` that is finally

@@ -90,7 +90,7 @@ misread; unparsed types are counted in `NifParseDiagnostics::fallback_blocks`
 of every animated door in this install uses `XYZ_ROTATION_KEY` (KeyType 4,
 `vendor/project-wormhole-nif/src/nif_enum.rs:54`), whose doc comment is "Separate X, Y, and Z keys
 will be stored instead of using quaternions". The layout that consumes **all 645** `NiTransformData`
-blocks of the door-ish NIFs in `C:\Modding\SkyrimConverted\vfs\meshes` exactly is:
+blocks of the door-ish NIFs in `C:\Modding\Mudcrab\SkyrimConverted\vfs\meshes` exactly is:
 
 ```
 NiTransformData
@@ -177,7 +177,7 @@ static.** If the user wants to *see* a door swing, the demo needs a door that sw
 
 ### 1.5 How much of the install is animated
 
-`tools/research/door_animation_nif.py census`, over `C:\Modding\SkyrimConverted\vfs\meshes`:
+`tools/research/door_animation_nif.py census`, over `C:\Modding\Mudcrab\SkyrimConverted\vfs\meshes`:
 
 | scope | files | animated | with `Open` **and** `Close` | `NiTransformData` blocks fitted |
 |---|---|---|---|---|

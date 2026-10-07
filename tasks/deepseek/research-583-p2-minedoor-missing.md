@@ -3,14 +3,14 @@ Track: Phase 2. Find out why the engine reports `meshes/Dungeons/Mines/MineDoor0
 runtime, and say whether it is a converter bug, a data quirk, or an engine lookup bug. Change no code.
 
 # Context
-- Observed at runtime on the converted data `C:\Modding\SkyrimConverted` (converter schema 26):
+- Observed at runtime on the converted data `C:\Modding\Mudcrab\SkyrimConverted` (converter schema 26):
   the engine logs `meshes/Dungeons/Mines/MineDoor01.glb` as missing.
 - In that output: `meshes/dungeons/mines/` holds `minedoorload01.glb` and `minedoorload02.glb`,
   but no `minedoor01.glb`; the conversion manifest (`conversion-manifest.json`, keys are source
   paths) has no entry for a `minedoor01.nif` mesh and no failure for it; textures
   `textures/dungeons/mines/minedoor01.dds` and `minedoor01_n.dds` exist. The extracted sources are
-  under `C:\Modding\SkyrimConverted\vfs\` (a find for `minedoor01*` under `vfs/meshes` returned nothing).
-- The world database is `C:\Modding\SkyrimConverted\skyrim_world.db` (SQLite; open read-only with a
+  under `C:\Modding\Mudcrab\SkyrimConverted\vfs\` (a find for `minedoor01*` under `vfs/meshes` returned nothing).
+- The world database is `C:\Modding\Mudcrab\SkyrimConverted\skyrim_world.db` (SQLite; open read-only with a
   `file:...?mode=ro` URI). Base objects with models are in tables such as `statics` (id, editor_id,
   model_path) and the door table; references in `references` (base_form_id, cell_id, worldspace_id).
 - The game's archives are in `C:\Games\Steam\steamapps\common\Skyrim Special Edition\Data` (read-only).

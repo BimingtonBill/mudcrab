@@ -7,8 +7,8 @@ unused `SkyPlugin` half of `sky.rs` stay: deleting them only adds conflicts to t
 - Audit (read it first, it has file:line for everything):
   `C:/Modding/wkj-portal-merge/local/agents/runs/research-282-portal-cleanup-audit.1/report.md`.
 - Work in your own worktree on D: (C: is nearly full):
-  `git -C C:/Modding/wkj-portal-merge worktree add D:/Modding-overflow/wt-284 portal-merge-main --detach`,
-  and build with `CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/impl-284`. Commit there with prefix
+  `git -C C:/Modding/wkj-portal-merge worktree add D:/Mudcrab/worktrees-284 portal-merge-main --detach`,
+  and build with `CARGO_TARGET_DIR=D:/Mudcrab/builds/impl-284`. Commit there with prefix
   `[claude]`, one commit per group below, each green. Never edit `C:/Modding/wkj-portal-merge` itself.
 
 # Scope (items by the audit's numbers)
@@ -34,4 +34,4 @@ Acceptance passes on the last commit; every existing test still passes (list any
 
 # Report
 Commit list (hash, subject), per-item done/skipped with reason, tests changed, line delta. Then remove
-`D:/Modding-overflow/wt-targets/impl-284` (keep the worktree for the lead to cherry-pick).
+`D:/Mudcrab/builds/impl-284` (keep the worktree for the lead to cherry-pick).

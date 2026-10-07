@@ -321,7 +321,7 @@ now a different, about twice as dense place: compare old results with `dense-leg
 
 The portal branch adds four scenes to both scripts, none in a default set (`-Scenarios portal` runs
 all four). They load the portal's converted assets, so `-Assets` must name those
-(`C:\Modding\SkyrimConverted-portal-lod`), and they are defined in
+(`C:\Modding\Mudcrab\SkyrimConverted-portal-lod`), and they are defined in
 `phase2-profile.ps1` (`Get-PortalSceneArguments`), where each scene's pose is written out.
 
 | Scene | What it is | Window |

@@ -15,7 +15,7 @@ yourself; do not guess from file names.
 
 ## Context
 
-- **Database** (read-only, open it with `sqlite3` URI `file:C:/Modding/SkyrimConverted/skyrim_world.db?mode=ro`):
+- **Database** (read-only, open it with `sqlite3` URI `file:C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db?mode=ro`):
   - `"references"` holds every placed object: `id, cell_id, worldspace_id, base_form_id,
     is_exterior, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, scale`.
   - `statics` holds the base objects: `id, editor_id, model_path`, and more. Check the columns

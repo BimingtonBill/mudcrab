@@ -7,4 +7,4 @@ if not exist "target\release\engine.exe" (
   echo Building the engine first, this takes a few minutes...
   cargo build --release -p engine --bin engine || pause
 )
-start "" "target\release\engine.exe" --assets "C:\Modding\SkyrimConverted" --demo riverwood --walk
+start "" "target\release\engine.exe" --assets "C:\Modding\Mudcrab\SkyrimConverted" --demo riverwood --walk

@@ -13,16 +13,16 @@ out (rock gravel skirts). Change no code.
 - Why alpha is forced to 1 on alpha-tested shapes: Whiterun's alpha-tested walls and roofs carry
   vertex alpha 0.5 and 0.08 against cutoffs 0.31 and 0.5, yet draw solid in Skyrim. With the alpha
   in the test they rendered with holes.
-- New observation: rock gravel skirts, e.g. `C:\Modding\SkyrimConverted\vfs\meshes\landscape\rocks\rockpilem01.nif`
+- New observation: rock gravel skirts, e.g. `C:\Modding\Mudcrab\SkyrimConverted\vfs\meshes\landscape\rocks\rockpilem01.nif`
   shape `RockPileM01:8` (glTF material MASK, cutoff 0.1333, shaderFlags1 2386559752,
   shaderFlags2 32808, COLOR_0 alpha 0..1 in the source), now end in hard polygon edges. In Skyrim
   their rim appears to fade into the terrain. Renders: `C:\Modding\MudcrabProject\local\gallery\s26-check\cap-07.png`
   (now) and `...\s25-check\cap-07.png` (alpha kept; the faded rim shows sky colour because of an
   engine depth-prepass issue, ignore that colour). Look at both.
-- Find the Whiterun wall/roof NIFs with the low vertex alpha yourself: `C:\Modding\SkyrimConverted\skyrim_world.db`
+- Find the Whiterun wall/roof NIFs with the low vertex alpha yourself: `C:\Modding\Mudcrab\SkyrimConverted\skyrim_world.db`
   (SQLite, open read-only with a `file:...?mode=ro` URI; tables `references` (worldspace_id,
   pos_x/y/z, base_form_id) and `statics` (id, model_path)); WhiterunWorld is worldspace 0x1A26F
-  (107119). Source NIFs are under `C:\Modding\SkyrimConverted\vfs\meshes\`.
+  (107119). Source NIFs are under `C:\Modding\Mudcrab\SkyrimConverted\vfs\meshes\`.
 - Community Shaders' Lighting.hlsl (github.com/doodlum/skyrim-community-shaders) is the best
   public reconstruction of the vanilla shader. Also relevant: NifSkope/nif.xml flag names
   (BSLightingShaderProperty SLSF1/SLSF2), UESP and the Nexus/NifTools wikis.

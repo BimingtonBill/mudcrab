@@ -21,7 +21,7 @@ converted data and exits non-zero when it stops holding.
 (`outward_from_return_link` crates/engine/src/doors.rs:87, `door_frame` transition.rs:237,
 `arrival_camera_rotation` transition.rs:216, `door_to_arrival_rotation` transition.rs:287,
 `portal_pose` transition.rs:303) and measures, over every door with a `door_links` row in
-`C:/Modding/SkyrimConverted/skyrim_world.db` (converter schema 19), how far that map is from the map
+`C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` (converter schema 19), how far that map is from the map
 that would make the two doorways coincide as geometry. Its `selftest` command already checks six of
 the port's properties against the engine's documented behaviour, by hand, in `command_selftest`.
 
@@ -33,7 +33,7 @@ direction is a door and the door its link leads to.
 1. **A `check` command** that asserts the characterisation below and prints one line per assertion
    (`ok` / `FAIL` with the expected and the measured value), returning 0 only when all pass. Read it
    from the database; skip with a clear "database not present" line and return 0 when
-   `C:/Modding/SkyrimConverted/skyrim_world.db` does not exist (this is a developer machine, not
+   `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` does not exist (this is a developer machine, not
    CI). Tolerances: 0.05 degrees, 2 units, 1% of a count.
    - counts: 2,204 doors with links, 2,204 links, 2,204 directions, 1,102 reciprocal pairs; all
      1,863 doors carry usable bounds; outward rule = 1,848 point, 356 heading; 259 doors have a

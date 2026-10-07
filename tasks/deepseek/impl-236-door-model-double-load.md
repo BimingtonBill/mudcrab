@@ -30,7 +30,7 @@ Sometimes a closed door fills Sven's open doorway. It is Sven's own front door `
 ## Build and run rules
 - Build: `cargo build --profile quick --bin engine` in your own worktree, with its own target (the harness sets it; never another folder's target) and `CARGO_BUILD_JOBS=6`. After each build, check that `quick/engine.d` names your worktree before you run the exe.
 - Tests use your worktree's target; the harness runs the acceptance commands.
-- Assets: `C:\Modding\SkyrimConverted`.
+- Assets: `C:\Modding\Mudcrab\SkyrimConverted`.
 - No timing or benchmark runs. If the lead messages HOLD, finish the command in hand and start no cargo or engine command until told to resume.
 
 ## Commits

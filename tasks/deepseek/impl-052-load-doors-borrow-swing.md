@@ -22,7 +22,7 @@ is false, the existing 45-degree rule), look for the door's **non-load twin mode
 - The twin's model path is the door's own with the "load" marker removed, for example
   `dungeons/dwemer/door/dwemerlargedoorload01.nif` → `dwemerlargedoor01.nif`. **Derive the rule
   from the data, not from one example:** query `statics` in
-  `C:/Modding/SkyrimConverted/skyrim_world.db` (read-only, a script under `tools/research/`) for
+  `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` (read-only, a script under `tools/research/`) for
   every load door's `model_path`, work out which ones have a plausible twin, and report the
   coverage: how many load doors get a swing this way, how many do not, and the patterns you
   found (`...Load01`, `...LoadDoor`, and so on).

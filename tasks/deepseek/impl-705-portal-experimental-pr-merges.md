@@ -1,6 +1,6 @@
 # Goal
 Track: portal (internal experimental demo, local only, NEVER pushed). Finish merging the remaining open upstream
-PRs into branch `experimental/2026-10-03` in worktree `D:/Modding-overflow/wt-experimental`, resolving conflicts
+PRs into branch `experimental/2026-10-03` in worktree `D:/Mudcrab/worktrees-experimental`, resolving conflicts
 so the workspace builds. Merge resolution only: do not fix or change the PRs themselves.
 
 # Context
@@ -17,7 +17,7 @@ so the workspace builds. Merge resolution only: do not fix or change the PRs the
   `git -c rerere.enabled=true commit --no-edit` (rerere records the resolution so the rebuild script replays it).
 - If a PR's conflicts turn out deep (a real design clash, not neighbouring edits), `git merge --abort`, skip it,
   and report why.
-- Build check after the last merge: `CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/experimental cargo check
+- Build check after the last merge: `CARGO_TARGET_DIR=D:/Mudcrab/builds/experimental cargo check
   --workspace --all-targets -j 6`. Fix compile errors that come from merge resolution (e.g. duplicate
   registrations, a call site of a changed signature); report anything that is a PR-vs-PR incompatibility
   instead of redesigning it.

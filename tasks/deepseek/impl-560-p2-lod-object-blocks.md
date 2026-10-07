@@ -50,7 +50,7 @@ Skyrim does, and never draw a coarse object block over a finer one.
 - `LodBlockKind::Objects` already exists in `crates/engine/src/world/database.rs`, and the
   `lod_block` table already lists `objects` rows; `plan_lod_blocks` plans `Terrain` only today.
   Objects are on whenever `--lod` is; `--lod-objects off` turns them off.
-- Converted data for reference: `C:/Modding/SkyrimConverted-upstream15/` (717 Tamriel object
+- Converted data for reference: `C:/Modding/Mudcrab/SkyrimConverted-upstream15/` (717 Tamriel object
   blocks at levels 4, 8 and 16 under `meshes/terrain/tamriel/objects/`). You need no GPU: the lead
   runs the real-data render.
 

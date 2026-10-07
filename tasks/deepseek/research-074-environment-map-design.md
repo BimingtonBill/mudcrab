@@ -37,7 +37,7 @@ rock" - and say precisely where the converter's job ends and what the engine mus
   all; if not, say where it lives in the file bytes and what change would expose it.
 - Budget: ONE reconversion for this whole batch (schema 18 -> 19). A converter change whose payoff
   needs engine work is acceptable if that engine work is stated exactly.
-- Published tree, read-only: `C:/Modding/SkyrimConverted/` (`meshes/**/*.glb`). Skyrim SE install,
+- Published tree, read-only: `C:/Modding/Mudcrab/SkyrimConverted/` (`meshes/**/*.glb`). Skyrim SE install,
   read-only: `C:/Games/Steam/steamapps/common/Skyrim Special Edition`. Bevy 0.19 source is in the
   local registry: `C:\Users\Brannock\.cargo\registry\src\index.crates.io-*\bevy_*`.
 
@@ -71,7 +71,7 @@ rock" - and say precisely where the converter's job ends and what the engine mus
    map. Say plainly whether the engine can do it today with zero converter change.
 5. **What not to do yet**, briefly: metalness (there is a stated reason), and anything that presumes a
    binding that does not exist.
-6. **The holdout check.** Which real glb paths under `C:/Modding/SkyrimConverted/meshes/` to look at
+6. **The holdout check.** Which real glb paths under `C:/Modding/Mudcrab/SkyrimConverted/meshes/` to look at
    after the reconversion, and what "correct" looks like in each.
 
 ## Done when

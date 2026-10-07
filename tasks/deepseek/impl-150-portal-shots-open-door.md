@@ -54,7 +54,7 @@ Coding workers may run the release engine (`target/release/engine.exe`, in `impl
 Build it and render at least:
 
 - **Sven's House, through its open door, from outside:** door `0x0001CBB0`. Its position is in
-  `door_links` / `references` in `C:/Modding/SkyrimConverted/skyrim_world.db` (worldspace 60), and
+  `door_links` / `references` in `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` (worldspace 60), and
   `docs/design/riverwood-demo.md` section 2 has the door and its arrival. Take one pose square to the
   door and one at an oblique angle (30-45 degrees off its axis). **The render must reproduce the
   user's defect** - the interior drawn at the wrong angle - because that is what proves the
@@ -66,7 +66,7 @@ Put the shots file you used in `tools/reference/doorway_shots.json` and the rend
 (git-ignored). Report the paths.
 
 Engine rules (`AGENTS.md`): engines may run beside other engines, but **none may hold a file inside
-a folder a conversion is publishing into** - if `C:\Modding\SkyrimConverted.staging-*` exists or a
+a folder a conversion is publishing into** - if `C:\Modding\Mudcrab\SkyrimConverted.staging-*` exists or a
 `converter.exe` is running against `SkyrimConverted`, wait. Timing runs are not yours to do.
 
 ## Owned files

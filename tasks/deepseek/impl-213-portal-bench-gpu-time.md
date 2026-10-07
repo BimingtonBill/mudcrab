@@ -13,7 +13,7 @@ Track: portal. The user (2026-09-25):
 
 ### 1. `tools/bench/portal_bench_doors.py`: pick the stress doors from data
 
-Read `C:/Modding/SkyrimConverted/skyrim_world.db` (read-only URI). Rank the load doors by how much the portal has to draw:
+Read `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` (read-only URI). Rank the load doors by how much the portal has to draw:
 - the number of references within about 3000 units of the door in its own space;
 - the number of references in the destination cell (for an interior) or within about 3000 units of the destination door (for an exterior);
 - prefer doors in the big cities (Whiterun, Solitude, Windhelm, Markarth, Riften worldspaces and their interiors), and mix exterior-to-interior with interior-to-interior.

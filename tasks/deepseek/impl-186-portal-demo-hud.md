@@ -30,7 +30,7 @@ A new module `demo_hud.rs` holds the HUD's one style (the pose tool's: cream tex
 ## Checks
 
 - Unit tests for the pure parts (the controls text for walk and fly, the prompt and notice texts, the H toggle state).
-- `cargo build --profile quick --bin engine`; the short tour `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t186 --tour-doors 2` still ends `tour PASSED after 2 crossings (short tour)`, and its screenshots show no HUD text.
+- `cargo build --profile quick --bin engine`; the short tour `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t186 --tour-doors 2` still ends `tour PASSED after 2 crossings (short tour)`, and its screenshots show no HUD text.
 - A screenshot of the HUD in a normal walked demo: use `--field-notes-test` (it takes an F12 capture after the first crossing) together with `--demo-tour local/t186-hud --tour-doors 2 --show-window --captures-dir local/t186-captures` if the HUD shows in that run, or add the smallest hidden flag you need; show the image with the controls panel, a door prompt or a notice. Read only `local/t186*` and `local/captures/2026-09-25_02-01-35/` under `local/`.
 - `docs/demo/README.md`: the controls table matches the panel; no mention of an objective.
 

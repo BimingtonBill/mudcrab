@@ -2,7 +2,7 @@
 """Read-only disk report for the shared Windows dev machine.
 
 Several sessions create build folders, git worktrees, evidence copies and
-scratch folders under C:\\Modding and D:\\Modding-overflow. This script lists
+scratch folders under C:\\Modding and D:\\Mudcrab. This script lists
 them with owner, class, size and expiry so the owner can clean up.
 
 THIS SCRIPT NEVER DELETES, MOVES, RENAMES OR WRITES ANYTHING (except the
@@ -33,7 +33,7 @@ from datetime import date, datetime, timedelta, timezone
 # Constants (easy to extend)
 # ---------------------------------------------------------------------------
 
-DEFAULT_ROOTS = [r"C:\Modding", r"D:\Modding-overflow"]
+DEFAULT_ROOTS = [r"C:\Modding", r"D:\Mudcrab"]
 
 # Folders whose children (not the folder itself) are the entries.
 PARENT_DIR_NAMES = ["wt", "wt-targets", "worktrees", "builds"]
@@ -48,7 +48,7 @@ NEVER_TOUCH_PATTERNS = [
     "SkyrimConverted*",  # converted game data; measuring it once blocked a conversion
     ".cargo",  # C:\Modding\.cargo holds the quick build profile for every checkout
     "wkj-contributor-status",  # the user's local-only contributor status tool (old path)
-    "contributor-status",  # the same tool under C:\Modding\worktrees since 2026-10-07
+    "contributor-status",  # the same tool under C:\Modding\Mudcrab\worktrees since 2026-10-07
     "OpenSkyrimProject",  # the main checkout (folder name on this PC)
 ]
 

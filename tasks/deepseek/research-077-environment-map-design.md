@@ -17,7 +17,7 @@ what you have even if unfinished. Never end without a report.
   Engine `crates/engine/**` is another lead's - read, never edit. `vendor/project-wormhole-nif/**`
   (the NIF parser) is a vendored copy, read-only for us.
 - The gap: `docs/research/visual-gaps-spec.md` gap 3 (the Alftand ice set under
-  `C:/Modding/SkyrimConverted/meshes/dungeons/caves/ice/`, base colour `icefrozen01`; the Dwemer roof
+  `C:/Modding/Mudcrab/SkyrimConverted/meshes/dungeons/caves/ice/`, base colour `icefrozen01`; the Dwemer roof
   `meshes/dungeons/dwemer/facades/dwefacadetowerroof01.glb` is the other named example). The engine
   binds no `EnvironmentMapLight`, `LightProbe` or `IrradianceVolume` anywhere.
 - `docs/research/specular-gloss-mapping.md` sections 5.1 and 7: 7,823 materials carry an

@@ -42,7 +42,7 @@ the sibling `logs/` folder (`rural-run-1.log`) if you need the camera height or 
   why they did not catch A and B.
 - Bevy 0.19 source in the cargo registry for sampler defaults (`ImageSampler`, filter modes,
   address modes, mipmaps) - check the real defaults, do not recall them.
-- The real converted data at `C:/Modding/SkyrimConverted` (read-only reference folder): you may
+- The real converted data at `C:/Modding/Mudcrab/SkyrimConverted` (read-only reference folder): you may
   read `skyrim_world.db` with a script (`sqlite3.connect('file:...?mode=ro', uri=True)`) to look at
   the `land` rows of cell (0,0) in worldspace 60, e.g. how many weight samples per quadrant exist.
 

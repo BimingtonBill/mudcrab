@@ -11,7 +11,7 @@ Read these first:
 ## Step 0: settle the unknowns from real bytes (mandatory, before writing parsers)
 
 The spec's record layouts come from web documentation and were **never checked against our data**.
-The raw records are in `C:/Modding/SkyrimConverted/skyrim_world.db` (read-only, `records.data` /
+The raw records are in `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` (read-only, `records.data` /
 `cells.data`) and in the game's `Skyrim.esm` (read-only). Write a script under `tools/research/`
 and run it with `python tools/research/<script>.py`. It must print:
 - the `XCLL` subrecord lengths across all cells, and for Alftand01 (86723), Alftand02 (355355),

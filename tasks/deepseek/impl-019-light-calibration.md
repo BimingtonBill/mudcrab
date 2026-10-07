@@ -48,7 +48,7 @@ the light sources themselves. Tune against the reference screenshots.
    walls.
 1. Render the reference poses:
    ```
-   target/release/engine.exe --assets C:/Modding/SkyrimConverted --shots tools/reference/uesp_shots_4x3.json --shots-out local/calib/<run>
+   target/release/engine.exe --assets C:/Modding/Mudcrab/SkyrimConverted --shots tools/reference/uesp_shots_4x3.json --shots-out local/calib/<run>
    ```
    Then compare them with the references:
    ```

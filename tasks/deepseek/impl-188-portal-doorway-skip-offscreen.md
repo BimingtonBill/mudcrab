@@ -15,7 +15,7 @@ Track: portal. The user (2026-09-25 demo notes): "performance isn't great: porta
 ## Checks
 
 - Unit tests for `doorway_screen_rect`: in front and on screen, behind the eye, off to the side, partly on screen (clamped), the camera inside the doorway plane.
-- `cargo build --profile quick --bin engine`; the short tour `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t188 --tour-doors 2` ends `tour PASSED after 2 crossings (short tour)`.
+- `cargo build --profile quick --bin engine`; the short tour `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t188 --tour-doors 2` ends `tour PASSED after 2 crossings (short tour)`.
 - A rough cost check (not a timing run; say so): the average frame time the tour logs, or a `--shots` pose looking away from an open door, before and after. Read only `local/t188*` and `local/agents/research-175.out` under `local/`.
 
 ## Report

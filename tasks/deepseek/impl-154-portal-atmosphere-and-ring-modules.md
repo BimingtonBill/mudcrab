@@ -57,8 +57,8 @@ tours (you may build and run the engine; the assets are read-only; create `local
 ```
 mkdir local
 cargo build --release -p engine
-target/release/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t154-riverwood
-target/release/engine.exe --assets C:\Modding\SkyrimConverted --demo alftand --walk --demo-tour local/t154-alftand
+target/release/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t154-riverwood
+target/release/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo alftand --walk --demo-tour local/t154-alftand
 ```
 
 Both must end `tour PASSED` (8 and 4 crossings), no `panicked`. Lighting must be unchanged: compare

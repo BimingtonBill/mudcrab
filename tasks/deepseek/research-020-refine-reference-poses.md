@@ -20,7 +20,7 @@ looking at the reference and the render together.
 
 - Render a shots file:
   ```
-  target/release/engine.exe --assets C:/Modding/SkyrimConverted --shots <file.json> --shots-out <dir>
+  target/release/engine.exe --assets C:/Modding/Mudcrab/SkyrimConverted --shots <file.json> --shots-out <dir>
   ```
   It opens a window, renders each shot once streaming has settled, writes `<dir>/<name>.png`
   and `<dir>/shots.log`, and exits by itself, in about 1 to 3 s per shot. Make small shots files
@@ -31,7 +31,7 @@ looking at the reference and the render together.
   render side by side. **Known bug:** its `_sheet.jpg` shows only the first 10 pairs although it
   says 25. Fix it, add a test, and commit the fix.
 - The research-018 scripts under `tools/research/`: maps, projection, pose fitting, database
-  probes. The database is read-only at `C:/Modding/SkyrimConverted/skyrim_world.db`.
+  probes. The database is read-only at `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`.
 
 ## Conventions (check them, do not assume)
 

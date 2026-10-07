@@ -38,7 +38,7 @@ read directly.)
 destroys that data permanently, leaves Blend meshes alone. Ours forces it engine-side at mesh load —
 **unconditionally, for every alpha mode** (checked: `force_opaque_vertex_colours` has no
 `AlphaMode`/material check) — non-destructive but broader than the bug requires. I independently
-measured real per-vertex alpha on `C:/Modding/SkyrimConverted-upstream15` (our own schema-15 GLBs,
+measured real per-vertex alpha on `C:/Modding/Mudcrab/SkyrimConverted-upstream15` (our own schema-15 GLBs,
 untouched by either fix) with a hand-written GLB parser over all 429 tree/plant files plus a
 3,000-file general sample. **#27's "244 of 25,391" count is corroborated** (~246 extrapolated), but
 the "small, harmless" framing is not: concentrated in trees (26.3% of tree files vs 0.97%

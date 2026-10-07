@@ -32,14 +32,14 @@ full meshes.
 - Materials: the converter's `crates/converter/src/material.rs` (alpha flags from `NiAlphaProperty`,
   shader flags, what becomes glTF `alphaMode`/`alphaCutoff`/`doubleSided`), and the engine side
   (`crates/engine/src/streaming.rs` material validation, `crates/engine/src/render.rs`).
-- Converted assets (read-only): `C:/Modding/SkyrimConverted/meshes/**/*.glb` - a GLB's JSON chunk shows
+- Converted assets (read-only): `C:/Modding/Mudcrab/SkyrimConverted/meshes/**/*.glb` - a GLB's JSON chunk shows
   each material's `alphaMode`, `alphaCutoff`, `doubleSided` and the `OPEN_SKYRIM_material` extension.
-  `C:/Modding/SkyrimConverted/skyrim_world.db` (read-only, open with `mode=ro`) maps references to base
+  `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` (read-only, open with `mode=ro`) maps references to base
   objects and models; `tools/research/` scripts from earlier tasks show how.
 - Identify the actual meshes in the screenshots: use the camera positions in `tour.txt` and the DB
   (references near those positions, their `model_path`) to name the models you see. Name them.
 - The original NIFs are in the game's BSAs (`C:/Games/Steam/steamapps/common/Skyrim Special Edition/Data`)
-  and extracted copies under `C:/Modding/SkyrimConverted/vfs/meshes/` - compare the NIF's
+  and extracted copies under `C:/Modding/Mudcrab/SkyrimConverted/vfs/meshes/` - compare the NIF's
   `NiAlphaProperty` flags / threshold with what the GLB says.
 
 ## Deliver

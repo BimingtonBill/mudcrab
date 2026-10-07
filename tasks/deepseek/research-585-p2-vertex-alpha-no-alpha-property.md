@@ -10,7 +10,7 @@ vertex alpha as opacity. Change no project code.
   the NiAlphaProperty: test enabled → MASK with its threshold; blend enabled → BLEND; no property →
   OPAQUE. So a Vertex_Alpha shape with no alpha property keeps its vertex alpha in COLOR_0 but is
   drawn OPAQUE, i.e. the alpha has no effect.
-- The case that shows it: `C:\Modding\SkyrimConverted\vfs\meshes\landscape\rocks\rockpilem01.nif`,
+- The case that shows it: `C:\Modding\Mudcrab\SkyrimConverted\vfs\meshes\landscape\rocks\rockpilem01.nif`,
   shape `RockPileM01:0` (a dark dirt skirt under the rock): shaderFlags1 2185233161 (bit 3 set),
   shaderFlags2 32801, no NiAlphaProperty, vertex alpha 0..0.55. It renders as a hard dark polygon
   on the terrain; in Skyrim it fades into the ground. Render:
@@ -21,8 +21,8 @@ vertex alpha as opacity. Change no project code.
   tree-animated (now excluded from opacity anyway) versus other shapes.
 - Parse NIFs with your own Python (SSE NIF 20.2.0.7, user version 12, BS version 100): BSTriShape
   vertex data (the vertex descriptor says whether colours are present), BSLightingShaderProperty
-  flags, NiAlphaProperty presence/flags. Source NIFs: `C:\Modding\SkyrimConverted\vfs\meshes\`.
-  World DB: `C:\Modding\SkyrimConverted\skyrim_world.db` (SQLite, open read-only with
+  flags, NiAlphaProperty presence/flags. Source NIFs: `C:\Modding\Mudcrab\SkyrimConverted\vfs\meshes\`.
+  World DB: `C:\Modding\Mudcrab\SkyrimConverted\skyrim_world.db` (SQLite, open read-only with
   `file:...?mode=ro`; `statics(id, model_path)`, `references(base_form_id, ...)`), to weight by
   placements.
 - Vanilla shader reference (from an earlier web worker, Community Shaders `Lighting.hlsl`):

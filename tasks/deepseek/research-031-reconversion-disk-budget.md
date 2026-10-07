@@ -4,7 +4,7 @@ Read `tasks/deepseek/context.md` first. Read-only: do not delete or move anythin
 
 ## Goal
 
-`C:/Modding/SkyrimConverted` (the converted assets) is 67 GB, and drive C: has 69 GB free.
+`C:/Modding/Mudcrab/SkyrimConverted` (the converted assets) is 67 GB, and drive C: has 69 GB free.
 Tonight's coding tasks will change the converter: materials, emissive, directional snow, door
 animations and new database columns. That means a reconversion. Find out whether one fits, and
 what the smallest safe reconversion is.
@@ -18,7 +18,7 @@ what the smallest safe reconversion is.
 2. What a reconversion after a converter schema bump does: does every GLB or KTX2 get rewritten,
    or only the invalidated kinds? Can a run redo only the database and the meshes but not the
    textures (flags, cache keys by kind)?
-3. What is on disk now: list the sizes of the top-level folders of `C:/Modding/SkyrimConverted`
+3. What is on disk now: list the sizes of the top-level folders of `C:/Modding/Mudcrab/SkyrimConverted`
    (`meshes`, `textures`, `vfs`, `scripts`, the database, `cell_cache.rkyv`, and any staging or
    cache folders). Also list any old staging or cache folders elsewhere: search `C:/Modding`,
    the converter's default cache location (read its config), `%TEMP%` and `local/`. Use a Python

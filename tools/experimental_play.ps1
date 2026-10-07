@@ -4,8 +4,8 @@ Plays the internal experimental demo (main + open PRs + portal), built by tools/
 LOCAL ONLY. Extra arguments go to the engine, e.g. `-- --demo alftand`.
 #>
 param(
-    [string]$Exe = "D:/Modding-overflow/wt-targets/experimental/quick/engine.exe",
-    [string]$Assets = "D:/Modding-overflow/SkyrimConverted-experimental",
+    [string]$Exe = "D:/Mudcrab/builds/experimental/quick/engine.exe",
+    [string]$Assets = "D:/Mudcrab/SkyrimConverted-experimental",
     [string]$Demo = "riverwood",
     [Parameter(ValueFromRemainingArguments)]$EngineArgs
 )

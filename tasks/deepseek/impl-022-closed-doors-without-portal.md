@@ -40,7 +40,7 @@ Run `cargo build --release -p engine`. Then render the tower door with the shots
 render one pose close enough (about 300 units) for the portal to pick the door. Run the demo tour:
 
 ```
-target/release/engine.exe --assets C:/Modding/SkyrimConverted --demo alftand --demo-tour local/tour
+target/release/engine.exe --assets C:/Modding/Mudcrab/SkyrimConverted --demo alftand --demo-tour local/tour
 ```
 
 It must still pass 4/4, and its `NN-door.png` must still show the destinations. You can see

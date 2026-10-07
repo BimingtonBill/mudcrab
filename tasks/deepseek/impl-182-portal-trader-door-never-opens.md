@@ -13,7 +13,7 @@ Today's changes that could be responsible (all merged on portal):
 
 ## What to do
 
-1. Reproduce: `cargo build --profile quick --bin engine`, then `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t182`. Confirm the failure and at which stage.
+1. Reproduce: `cargo build --profile quick --bin engine`, then `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t182`. Confirm the failure and at which stage.
 2. Find why the press does not open the door. Candidates, test each with logs or a run: the press was refused by `player_door` (the target was a different door, or out of cone/range at that door's geometry - the Trader's doorway may sit differently from Sven's); the press was held (`PendingDoorOpens`) because `destination_is_loaded` never became true (which key is missing, and is it resident / failed / never requested?); the hold was cancelled by a second press; auto-close or `run_activation` undid it. Say which, with the run's evidence.
 3. Fix the real cause. If it is the tour's press logic, fix the tour; if it is a door or streaming rule that a player would hit too, fix that (it matters more). Keep every earlier behaviour: E closes an open door; an opening waits for the far side; the short tour and the Alftand tours pass.
 

@@ -15,7 +15,7 @@ Then search `crates/engine/src` for any remaining hand-written `* CELL_SIZE` wit
 
 ## Checks
 - `cargo test -p engine --lib` in your worktree; the existing tests of each function must still pass unchanged. If a function has no test that pins it at a non-zero origin, add one.
-- Short walked tour: `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour <dir under your worktree> --tour-doors 2`. Report its last line.
+- Short walked tour: `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour <dir under your worktree> --tour-doors 2`. Report its last line.
 
 ## Build and run rules
 - Build: `cargo build --profile quick --bin engine` in your own worktree with its own target, `CARGO_BUILD_JOBS=6`; check `quick/engine.d` names your worktree.

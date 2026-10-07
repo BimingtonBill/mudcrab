@@ -22,7 +22,7 @@ Track: portal. The user's demo note of 2026-09-25 (`docs/roadmap/backlog-engine-
 ## Checks
 
 - Unit tests in the style of the existing ones: an open door beyond `AUTO_CLOSE_DISTANCE` starts `Closing`; one inside it stays open; a closing door's destination stays in `PrestreamCells` beyond 800 units and leaves it once `Closed`; a door with no Close clip is never auto-closed.
-- `cargo build --profile quick --bin engine`, then the short tour: `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t179 --tour-doors 2` must end `tour PASSED after 2 crossings (short tour)`. Read only `local/t179` under `local/`. (The tour does not walk away from doors, so it only proves nothing broke; say so.)
+- `cargo build --profile quick --bin engine`, then the short tour: `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t179 --tour-doors 2` must end `tour PASSED after 2 crossings (short tour)`. Read only `local/t179` under `local/`. (The tour does not walk away from doors, so it only proves nothing broke; say so.)
 
 ## Report
 

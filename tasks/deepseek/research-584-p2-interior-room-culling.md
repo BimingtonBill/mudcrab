@@ -14,7 +14,7 @@ room. Change no code; the output is a design the lead turns into implementation 
   subrecords exist, their byte layouts, and how the game uses them, from the data and public
   documentation (UESP Skyrim mod file format pages, xEdit's record definitions).
 - Game data: `C:\Games\Steam\steamapps\common\Skyrim Special Edition\Data\Skyrim.esm` (read-only);
-  the converted database: `C:\Modding\SkyrimConverted\skyrim_world.db`.
+  the converted database: `C:\Modding\Mudcrab\SkyrimConverted\skyrim_world.db`.
 
 # Scope
 Read-only. You may write and run Python scripts in your working folder to walk Skyrim.esm records

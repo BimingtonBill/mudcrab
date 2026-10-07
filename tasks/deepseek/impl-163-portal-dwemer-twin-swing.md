@@ -13,12 +13,12 @@ scaling path ("load door's own swing scaled up to open the doorway ... factor=10
 `door_animation.rs` already has a twin path (`twin_swing`, `SwingSource::Twin`, and the test
 `a_load_door_whose_own_clip_is_narrow_borrows_its_twins_swing`). Find why the real Dwemer doors do
 not take it (the twin's model path, how it is derived from the load door's, whether the twin is
-found in the converted assets under `C:\Modding\SkyrimConverted`, the order the two paths are
+found in the converted assets under `C:\Modding\Mudcrab\SkyrimConverted`, the order the two paths are
 tried), and make the twin the first choice, keeping scaling as the fallback for a door with no
 usable twin. Log which source each model got.
 
 Checks: unit tests for the choice; then `cargo build --release -p engine` and the Alftand tour
-(`target/release/engine.exe --assets C:\Modding\SkyrimConverted --demo alftand --walk --demo-tour local/t163`)
+(`target/release/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo alftand --walk --demo-tour local/t163`)
 must pass, with the log showing the Dwemer doors borrowing their twin. Look at the walk-through
 frames of one Dwemer door and say whether it swings open visibly. Riverwood's farmhouse doors are
 not affected (their own swing is scaled today; say what they get after your change - a farmhouse

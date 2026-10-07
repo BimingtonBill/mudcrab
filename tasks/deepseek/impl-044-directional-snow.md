@@ -20,7 +20,7 @@ Read these first:
 
 ## Status of the data (read first)
 
-The published assets at `C:/Modding/SkyrimConverted` do **not** have the new tables yet. The
+The published assets at `C:/Modding/Mudcrab/SkyrimConverted` do **not** have the new tables yet. The
 reconversion is waiting on a user decision about disk space, so the real `skyrim_world.db` has
 no `space_lighting`, `matos` or `statics.material_*`. So:
 - Implement, and prove correctness with unit tests on **fixture databases** that you build in

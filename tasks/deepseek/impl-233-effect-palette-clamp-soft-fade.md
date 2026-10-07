@@ -26,11 +26,11 @@ The data carries `softFalloffDepth` (16, 32 or 100 on the hearth cards) in `OPEN
 The flame atlas is loaded as sRGB, so its green channel, the palette index, is darkened before the lookup. Load that texture linear only if the change is local to the effect material path; otherwise note it for later.
 
 ## Build and run rules
-- Build: `cargo build --profile quick --bin engine` with `CARGO_TARGET_DIR=D:/Modding-overflow/portal-quick-target` and `CARGO_BUILD_JOBS=6`.
+- Build: `cargo build --profile quick --bin engine` with `CARGO_TARGET_DIR=D:/Mudcrab/portal-quick-target` and `CARGO_BUILD_JOBS=6`.
   - Other portal coders share that target dir, so cargo's lock runs one build at a time; the machine's memory commit only fits one.
   - Straight after each build, copy `engine.exe` to `local/t233/engine.exe` and run the copy, because the next coder's build overwrites the shared one.
-- Tests and clippy use `--target-dir D:/Modding-overflow/shared-check-target`.
-- Assets: `C:\Modding\SkyrimConverted`.
+- Tests and clippy use `--target-dir D:/Mudcrab/shared-check-target`.
+- Assets: `C:\Modding\Mudcrab\SkyrimConverted`.
 - No timing or benchmark runs.
 - Under `local/`, read only `local/t230/`, `local/t233/`, `local/gallery/` and the research file.
 

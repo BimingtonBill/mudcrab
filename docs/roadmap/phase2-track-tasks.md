@@ -59,7 +59,7 @@ Next candidates: the reference-shot tool (`phase2/reference-shots`, ready); poin
 
 | | Task | Status |
 |---|---|---|
-| ✅ | Local branch `phase2/integration`: every Phase 2 branch merged (schema 15 once, in `crates/shared`); all tests pass; release engine and converter in `C:/Modding/wkj-tools/` | done |
+| ✅ | Local branch `phase2/integration`: every Phase 2 branch merged (schema 15 once, in `crates/shared`); all tests pass; release engine and converter in `C:/Modding/Mudcrab/worktrees/p2-tools/` | done |
 | ✅ | Independent audit of all 12 branches ([`phase2-branch-audit.md`](../pr/phase2-branch-audit.md)) | done: 1 ready, 10 fix first, 1 needs discussion |
 | ✅ | One fix worker per branch: all 11 fixed and committed on their branches (the rotation fix is local only; pushing it to #25 needs the user) | done |
 | ✅ | Local `--shots` tool for the integration build (`phase2/local-shots`) | done, not run yet |

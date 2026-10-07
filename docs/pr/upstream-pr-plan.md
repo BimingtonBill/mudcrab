@@ -15,7 +15,7 @@ past what this branch merged** (`0ec2d36`) — see §0.1.
 and `origin/main...HEAD`; `git grep` over the tracked tree; `git ls-files`; `cargo fmt --all --
 --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test
 --workspace`; `cargo test --release -p dummy-content -- --ignored performance --test-threads=1`;
-direct reads of `C:\Modding\SkyrimConverted` (manifest, integration report, one door `.glb`). Windows,
+direct reads of `C:\Modding\Mudcrab\SkyrimConverted` (manifest, integration report, one door `.glb`). Windows,
 warm `target/`.
 
 ---
@@ -54,10 +54,10 @@ warm `target/`.
    `crates/` finds no `local/`, no `impl-NNN`, no machine path, no `SKYRIM_DATA_DIR`; the two
    fallbacks ADR-0002 forbids are gone and `MUDCRAB_SKYRIM_DATA` / `MUDCRAB_CONVERTED_DIR`
    are respected with a printed skip. **`docs/` and `tools/` were not swept** — 22 research scripts
-   and 11 research/handoff notes still carry `C:/Modding/SkyrimConverted`, and production doc
+   and 11 research/handoff notes still carry `C:/Modding/Mudcrab/SkyrimConverted`, and production doc
    comments now cite `docs/research/*` and `tools/research/*.py` **files that the exclusion list
    keeps out of the PR** (new problem, §2.6).
-3. **The reconversion happened. Almost nothing is inert any more.** `C:\Modding\SkyrimConverted` is
+3. **The reconversion happened. Almost nothing is inert any more.** `C:\Modding\Mudcrab\SkyrimConverted` is
    **converter schema 17, `complete: true`**, integration report **schema 5**; the database carries
    `space_lighting`, `statics.material_object`, `matos`, `door_links` and animation data, and
    `meshes/dungeons/dwemer/door/dwemerlargedoorload01.glb` contains an `"Open"` clip. Door
@@ -399,7 +399,7 @@ disappear. Our own `git apply` of PR 3–5 diffs must not include that file (the
   and Euler-order alternatives. Both are re-derivable from an unmodded install, and the reference
   renders were re-fitted afterwards (`6804978`, `9d6d844`).
 * **Surgery before sending:** `tools/research/rotation_convention.py` (1,018 lines) has
-  `DB = "C:/Modding/SkyrimConverted/skyrim_world.db"` at module level — parameterise it (argv or
+  `DB = "C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db"` at module level — parameterise it (argv or
   `MUDCRAB_CONVERTED_DIR`) before shipping it as the proof. Also worth sending:
   `docs/research/object-rotation-convention.md` + `docs/research/data/object-rotation-audit.json`,
   which currently cite the same machine path (2 lines).
@@ -717,18 +717,18 @@ disappear. Our own `git apply` of PR 3–5 diffs must not include that file (the
 | Path | Why |
 |---|---|
 | `AGENTS.md` (137), `CLAUDE.md` (1) | the working agreement and the handoff log: `C:\Modding\MudcrabProject`, `C:/Users/Brannock`, worker names, task ids, the user's goals in quotes |
-| `.deepseek-agents.json` | `readOnlyDirs` names `C:/Users/Brannock/.cargo/registry/src` and `C:/Modding/SkyrimConverted` |
+| `.deepseek-agents.json` | `readOnlyDirs` names `C:/Users/Brannock/.cargo/registry/src` and `C:/Modding/Mudcrab/SkyrimConverted` |
 | `tasks/deepseek/**` (61 files) | briefs, prompt templates, reviewer/analyst/advisor roles, result schemas, `context.md`, `cookbook.md` |
 | `tools/ds_impl.ps1`, `ds_status.ps1`, `run_ds_queue.ps1`, `ds_report.py`, `check_worker_result.py`, `check_citations.py` | the harness: `~/.claude/skills/deepseek-agents`, `local/agents`, `DS_RUN_ID` |
 | `tests/test_check_citations.py`, `test_check_worker_result.py`, `test_ds_report.py` | tests for the above |
 | `docs/handoff/**` (12 notes) | process records; they cite `local/`, `tasks/deepseek/` and machine paths |
 | `docs/pr/upstream-pr-plan.md` (this file) | it names the harness, the machine paths and the private plan by design — it is a working document, not a PR artefact |
-| `tools/research/**` (52 scripts) | one-off probes; 22 hard-code `C:/Modding/SkyrimConverted` at module level. Keep-and-parameterise `rotation_convention.py` (PR 2's proof) and, if the matching PR is sent, `auto_load_doors.py`, `space_lighting_dump.py`, `esm_route.py`, `door_animation_nif.py`, `load_door_twin_coverage.py`; leave the other ~46 private |
+| `tools/research/**` (52 scripts) | one-off probes; 22 hard-code `C:/Modding/Mudcrab/SkyrimConverted` at module level. Keep-and-parameterise `rotation_convention.py` (PR 2's proof) and, if the matching PR is sent, `auto_load_doors.py`, `space_lighting_dump.py`, `esm_route.py`, `door_animation_nif.py`, `load_door_twin_coverage.py`; leave the other ~46 private |
 | `tools/compare_shots.py`, `tools/reference/uesp_shots_*.json`, `tests/test_compare_shots.py`, `tests/test_reference_shots.py` | the private UESP reference workflow (CC BY-SA images live in `local/`) |
 | `crates/engine/src/shots.rs` (`--shots`), its `config.rs` arms, `docs/design/reference-shots.md` | a genuinely useful visual-regression tool, but every default points at the reference workflow and its companion tools are Windows-path scripts. Good PR *after* the paths are parameterised and a synthetic shots file is generated by `dummy-content` |
 | `docs/demo/README.md`, `tools/demo/*.ps1`, `README.md`'s "Walk the demo" bullet | demo-specific; they hard-code a converted-assets path and a route |
 | the demo code: `crates/engine/src/demo_tour.rs`, `config.rs`'s `demo_tour`/`demo` fields, `--demo-tour`/`--demo` arms, `DemoStart` and its presets, the objective overlay in `app.rs` | cell ids, absolute positions, route names |
-| `play-blackreach-demo.cmd`, `play-blackreach-shortcut.cmd` | hard-code `C:\Modding\SkyrimConverted` |
+| `play-blackreach-demo.cmd`, `play-blackreach-shortcut.cmd` | hard-code `C:\Modding\Mudcrab\SkyrimConverted` |
 | `.gitignore` additions: the `# AI worker harness` block, `/local/`, `tools/_dev_*.py`, `tools/tmp_*.py` | harness scratch rules. `__pycache__/` and `*.pyc` on their own are a welcome upstream contribution — send them alone if at all |
 | `local/**` | worker state, checkouts, reference images, screenshots — git-ignored, never add |
 
@@ -761,7 +761,7 @@ git ls-files | grep -vE '\.(rs|toml|lock|md|json|wgsl|py|ps1|cmd|yml|yaml|txt|pn
 4. **Strip private names from the docs that will ship** —
    `docs/design/animated-doors-and-seamless-crossing.md:3,22,23` says "DeepSeek, research-027" and
    points at `tasks/deepseek/context.md` and `C:/Users/Brannock/…`; 11 notes across
-   `docs/design/`, `docs/research/` and `docs/handoff/` carry `C:/Modding/SkyrimConverted` in their
+   `docs/design/`, `docs/research/` and `docs/handoff/` carry `C:/Modding/Mudcrab/SkyrimConverted` in their
    method section, and several sign off with "(Claude)" or "Owner: Claude (lead)". Replace with the
    fact, or with "computed from a converted install".
 5. **Tie the duplicated schema constant with a test** — `crates/engine/src/app.rs:1344` versus
@@ -787,7 +787,7 @@ git ls-files | grep -vE '\.(rs|toml|lock|md|json|wgsl|py|ps1|cmd|yml|yaml|txt|pn
 
 ### 6.1 What works, on real data (converter schema 17, integration report schema 5)
 
-- **`C:\Modding\SkyrimConverted` is complete**: 87,804 references, 72,964 exterior cells, 52,181
+- **`C:\Modding\Mudcrab\SkyrimConverted` is complete**: 87,804 references, 72,964 exterior cells, 52,181
   terrain cells, 0 missing models, 0 invalid models, 0 missing textures, empty `failures` in the
   manifest, `complete: true`, integration report `passed: true`.
 - **Walking the Alftand → Blackreach route with no loading screens**: four load doors, a portal view
@@ -839,7 +839,7 @@ git ls-files | grep -vE '\.(rs|toml|lock|md|json|wgsl|py|ps1|cmd|yml|yaml|txt|pn
   `docs/demo/README.md` still calls them broken.
 - **No skinned meshes, NPCs, physics or UI** — Phase 4, by design.
 - **Nothing has ever been built on Linux**, which is where CI runs.
-- **The reconversion's disk cost**: `C:\Modding\SkyrimConverted` was ~67 GB with ~69 GB free on the
+- **The reconversion's disk cost**: `C:\Modding\Mudcrab\SkyrimConverted` was ~67 GB with ~69 GB free on the
   drive before the schema-17 run (research-031); worth knowing before anyone re-runs it.
 
 ---

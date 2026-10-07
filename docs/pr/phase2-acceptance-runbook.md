@@ -23,7 +23,7 @@ cd C:\Modding\wkj-phase2
 $PSVersionTable.PSVersion.ToString()      # must be 7.x
 git rev-parse --short=12 HEAD             # must be 2105bfd...
 git status --short                        # must print nothing
-$Assets = 'C:\Modding\SkyrimConverted-upstream'
+$Assets = 'C:\Modding\Mudcrab\SkyrimConverted-upstream'
 New-Item -ItemType Directory -Force target\preflight, C:\Modding\evidence | Out-Null
 ```
 
@@ -264,7 +264,7 @@ The script writes `visual-review-template.json` (`:420-436`, format 2) into the 
 
 ## 5. What I could not determine
 
-1. **Anything about tonight's actual conversion** — `C:\Modding\SkyrimConverted-upstream` does not exist yet, and reads outside `C:\Modding\wkj-phase2` / the Skyrim install are blocked by policy. So `conversion-complete`, `integration-report-passed`, `asset-closure`, and above all the **bounds gate population are inferences from upstream code plus the fork's measurements, not measurements of this data**. Step 3.3 resolves the decisive one.
+1. **Anything about tonight's actual conversion** — `C:\Modding\Mudcrab\SkyrimConverted-upstream` does not exist yet, and reads outside `C:\Modding\wkj-phase2` / the Skyrim install are blocked by policy. So `conversion-complete`, `integration-report-passed`, `asset-closure`, and above all the **bounds gate population are inferences from upstream code plus the fork's measurements, not measurements of this data**. Step 3.3 resolves the decisive one.
 2. **The machine's PowerShell version, cargo/git presence, free disk, and GPU identity** — could not execute `pwsh`/`Get-CimInstance` (command denied). Hardware above is quoted from the fork's evidence path, not verified.
 3. **`cargo test --workspace --all-targets -j1` and clippy on Windows** — never run in this combination (CI is Linux); the fork ran the equivalent gates on its superset tree, which is evidence but not proof for `2105bfd`.
 4. **Whether any other LAND seam exists beyond (18,18)/(18,20)** in the tested footprint — the fork measured two; the audit explicitly lists the per-cell seam distribution as unmeasured.

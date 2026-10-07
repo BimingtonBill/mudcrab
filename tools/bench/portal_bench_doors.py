@@ -26,7 +26,7 @@ the script again reproduces ``tools/bench/portal_bench_doors.json`` exactly.
 
 Usage::
 
-    python tools/bench/portal_bench_doors.py [--db C:/Modding/SkyrimConverted/skyrim_world.db]
+    python tools/bench/portal_bench_doors.py [--db C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db]
         [--out tools/bench/portal_bench_doors.json]
         [--view-out tools/bench/portal_bench_doors_out.json]
 
@@ -42,7 +42,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_DB = "C:/Modding/SkyrimConverted/skyrim_world.db"
+DEFAULT_DB = "C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db"
 DEFAULT_OUT = Path(__file__).with_name("portal_bench_doors.json")
 DEFAULT_VIEW_OUT = Path(__file__).with_name("portal_bench_doors_out.json")
 

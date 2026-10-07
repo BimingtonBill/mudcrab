@@ -90,24 +90,24 @@ hold and unhold, and messages any session that is idle without a reason.
 Every task belongs to one track; name it in the brief, the commit and the handoff entry.
 
 - **Phase 2** (the priority): contributions to upstream Phase 2 as its README, CONTRIBUTING.md and
-  `docs/roadmap/02-completion-plan.md` describe. Worktrees under `C:\Modding\worktrees\p2-*` and `D:\Modding-overflow\wt\p2-*` (one per branch), branches
+  `docs/roadmap/02-completion-plan.md` describe. Worktrees under `C:\Modding\Mudcrab\worktrees\p2-*` and `D:\Mudcrab\worktrees\p2-*` (one per branch), branches
   `phase2/<topic>` cut from `main` (a mirror of `origin/main`), assets
-  `C:\Modding\SkyrimConverted-p2main-v24-doors` (since 2026-10-07 evening: p2main-v24's assets plus door_links from phase1/door-links-export 723c0c39; `C:\Modding\SkyrimConverted-p2main-v24`, a full conversion with main f40ca1df, schema 24, stays for now; the older pre-#142 `D:\Modding-overflow\SkyrimConverted-p2main` stays until the user decides), upstream's commit style, worker tasks `<kind>-<nnn>-p2-<slug>` numbered 500-599.
+  `C:\Modding\Mudcrab\SkyrimConverted-p2main-v24-doors` (since 2026-10-07 evening: p2main-v24's assets plus door_links from phase1/door-links-export 723c0c39; `C:\Modding\Mudcrab\SkyrimConverted-p2main-v24`, a full conversion with main f40ca1df, schema 24, stays for now; the older pre-#142 `D:\Mudcrab\SkyrimConverted-p2main` stays until the user decides), upstream's commit style, worker tasks `<kind>-<nnn>-p2-<slug>` numbered 500-599.
 - **Portal** (parked 2026-09-28; **ACTIVE again since 2026-10-01** (the user): catch up with main and
   build a showcase of where the project and the portals are now): the user's seamless-door feature and demos. This checkout, branch `portal`, assets
-  `C:\Modding\SkyrimConverted-portal-rooms` (since 2026-10-07: full reconversion with room_graph, fresh UASTC/BC7 textures, #105 LOD; load check passed on portal-rooms 5dc5c9a2; the older `SkyrimConverted-portal-lod` is on the can-go list), `[claude]`/`[deepseek]` prefixes, worker tasks `<kind>-<nnn>-portal-<slug>` numbered 100-199 (then 600+).
+  `C:\Modding\Mudcrab\SkyrimConverted-portal-rooms` (since 2026-10-07: full reconversion with room_graph, fresh UASTC/BC7 textures, #105 LOD; load check passed on portal-rooms 5dc5c9a2; the older `SkyrimConverted-portal-lod` is on the can-go list), `[claude]`/`[deepseek]` prefixes, worker tasks `<kind>-<nnn>-portal-<slug>` numbered 100-199 (then 600+).
   Portal schema numbers = 100_000 + main_version*100 + portal_revision (converter 102_401, world DB 100_701 at
   main 24/7); a main bump merged into portal moves the hundreds and resets the revision; never take main's raw numbers.
 - **Phase 1** (added 2026-09-27, the user's new Phase 1 Dev session): improvements to upstream's
   finished converter (`docs/roadmap/01-asset-pipeline.md`), sent upstream like Phase 2. Worktree
-  `C:\Modding\worktrees\phase1`, branches `phase1/<topic>` cut from `main`, upstream's commit style, build
+  `C:\Modding\Mudcrab\worktrees\phase1`, branches `phase1/<topic>` cut from `main`, upstream's commit style, build
   targets and conversion output on D:, worker tasks `<kind>-<nnn>-p1-<slug>` numbered 800-899. It owns
   `crates/converter/**` and `crates/dummy-content/**`; `crates/shared/**` changes are agreed by message.
   Starting brief: `local/handover/phase1-dev.md`.
 - **Phase 3** (added 2026-09-28, the user's Phase 3 Dev session; **PARKED for new work by the user,
   2026-10-01**: finish, package and send the launcher work already built, start nothing new): the launcher (upstream Phase 3
   item 3.4, `docs/roadmap/03-luau-and-ui.md`), sent upstream like Phase 2. Worktree
-  `C:\Modding\worktrees\phase3-safety`, branches `phase3/<topic>` cut from `main`, upstream's commit style
+  `C:\Modding\Mudcrab\worktrees\phase3-safety`, branches `phase3/<topic>` cut from `main`, upstream's commit style
   (`feat(launcher): ...`), build targets on D:, worker tasks `<kind>-<nnn>-p3-<slug>` numbered
   900-999. It owns `crates/launcher/**` and `crates/converter-gui/**` (being folded into the
   launcher; the crate is then deleted); converter API changes go through Phase 1 Dev by message.
@@ -278,7 +278,7 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
     398 s). Workers use the dumper only: the full `SSEEdit64.exe` (even with `-autoload -script
     -autoexit`) opens a window on the user's desktop and creates `SSEEdit Cache` / `SSEEdit Backups`
     folders inside the game's Data folder, so it runs only with the user present and told first; dump output goes to
-    `D:\Modding-overflow\scratch\ssedit-dumps` (OWNER.txt, class A), never into the game folder or
+    `D:\Mudcrab\scratch\ssedit-dumps` (OWNER.txt, class A), never into the game folder or
     `SkyrimConverted*`. Read only: never save a plugin (always "don't save" on exit). Running it on
     game data is CPU and disk work: not during a booked timing window.
   - **Clean room:** read and cite only. Never copy or translate xEdit code into Mudcrab, whatever
@@ -352,11 +352,11 @@ only if the user gives one.
   (an engine built against another branch's `shared` crate).
 - **C:\Modding layout (the user, 2026-10-07):** top level holds only the main checkout, `.cargo`, the converted
   data (`SkyrimConverted*`) and the user's tools; every agent worktree or work repo goes in
-  `C:\Modding\worktrees\<name>` and every build folder in `C:\Modding\builds\<name>` (no `wkj-` prefix for new ones).
+  `C:\Modding\Mudcrab\worktrees\<name>` and every build folder in `C:\Modding\Mudcrab\builds\<name>` (no `wkj-` prefix for new ones).
 - **Layout and naming (2026-10-07):** `local/LAYOUT.md` says where things go in `local/` (handover/,
   logs/, archive/, bin/) and how new files and folders are named (`<track>-<subject>-<YYYY-MM-DD>`, existing
   task ids unchanged); paths moved in the 2026-10-07 sweep are mapped in `local/disk/moves-2026-10-07.tsv`.
-- **Every folder a session creates** under `C:\Modding` or `D:\Modding-overflow` (build folder,
+- **Every folder a session creates** under `C:\Modding` or `D:\Mudcrab` (build folder,
   worktree, evidence or data copy, scratch) gets an `OWNER.txt` the moment it is made
   (`python tools/disk_report.py --template`): owner, purpose, class, keep-until (`pr:N`,
   `date:YYYY-MM-DD` or `while-open`), links (yes/no).

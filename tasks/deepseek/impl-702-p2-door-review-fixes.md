@@ -4,7 +4,7 @@ Track: Phase 2 (upstream #112 door-crossing draft). Fix the confirmed findings o
 
 # Context
 Base: the commit named in "This run". Own worktree on D: (`git -C C:/Modding/MudcrabProject worktree add
-D:/Modding-overflow/wt-702 <base> --detach`, `CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/impl-702`).
+D:/Mudcrab/worktrees-702 <base> --detach`, `CARGO_TARGET_DIR=D:/Mudcrab/builds/impl-702`).
 Upstream style (`fix(engine): ...`), trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`, new
 commits only. Owned: `crates/engine/src/door_crossing.rs`, `doors.rs`, `world/database.rs`, `streaming.rs`
 (only lines this branch added or the stale comment below). Never physics.rs (its teleport block is frozen: an
@@ -17,7 +17,7 @@ timeout up to 600000 ms); if rustc crashes with STATUS_STACK_BUFFER_OVERRUN dele
 1. **The readiness gate is global, not the landing cell's (MiMo 2; real-data evidence).** The hold waits for
    `StreamingMetrics.pending_asset_instances/pending_surface_instances == 0`, counts over every streaming cell,
    so an exterior landing waits for the whole stream window and hits the 10 s timeout (Sven's house -> Riverwood:
-   `WARN ... the destination was not ready in time` after 10.0 s, `D:/Modding-overflow/door-evidence-run3/run.log`).
+   `WARN ... the destination was not ready in time` after 10.0 s, `D:/Mudcrab/door-evidence-run3/run.log`).
    Scope it to the landing cell: nothing pending UNDER THE LANDING ROOT (pending model / pending asset / pending
    surface components on its descendants: find the marker components the streamer uses), plus the existing
    asset-load check under that root. Test: pending work in another cell does not hold the fade-in; pending work

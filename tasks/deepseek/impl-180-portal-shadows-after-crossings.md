@@ -25,7 +25,7 @@ Track: portal. The user, in play (2026-09-25, on a build with impl-176..179): "I
 ## Checks
 
 - Unit tests for the new tour option and for any pure logic you add.
-- `cargo build --profile quick --bin engine`, then `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t180 --tour-doors 2 --tour-repeat 5` before and after the fix. Read only `local/t180*` under `local/`.
+- `cargo build --profile quick --bin engine`, then `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t180 --tour-doors 2 --tour-repeat 5` before and after the fix. Read only `local/t180*` under `local/`.
 
 ## Report
 

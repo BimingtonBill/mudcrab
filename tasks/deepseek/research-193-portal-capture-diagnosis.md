@@ -27,7 +27,7 @@ At Chillfurrow Farm (`06.png`, "this alignment is off") and Cracked Tusk Keep (`
 
 The doorway map anchors both doorways. The code is in `crates/engine/src/portal.rs` (the doorway-anchor code from impl-103) and in `doors.rs` (`DoorwayFacings`, `DoorAnchor`).
 
-Compute where each doorway's centre and facing end up on both sides. Use the world DB (`C:/Modding/SkyrimConverted/skyrim_world.db`, opened read-only with `mode=ro`) and the door models' bounds. Say which number is wrong for these two doors but right for Sven's House.
+Compute where each doorway's centre and facing end up on both sides. Use the world DB (`C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`, opened read-only with `mode=ro`) and the door models' bounds. Say which number is wrong for these two doors but right for Sven's House.
 
 ### 3. Bleak Falls Barrow is lit differently through the doorway (`10.png`, `11.png`)
 

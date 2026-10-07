@@ -59,7 +59,7 @@ render the same views as reference screenshots of the real game.
 
 ## Manual check (do it if you can; say in the report if you could not)
 
-The converted assets are at `C:/Modding/SkyrimConverted` (read-only). The lead will run the real
+The converted assets are at `C:/Modding/Mudcrab/SkyrimConverted` (read-only). The lead will run the real
 render. If your tools allow it, a debug run of two shots (one Tamriel exterior near
 (77583, 77411, -5700), yaw 45, and one in interior 86723 at (-947, 3958, 712), yaw 170) is worth
 more than any unit test. Do not run the profiling or acceptance scripts.

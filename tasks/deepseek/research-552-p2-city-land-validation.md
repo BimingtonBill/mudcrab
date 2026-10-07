@@ -24,7 +24,7 @@ Report the cause with evidence and the smallest fix. Do not implement it.
     child worldspace simply different, because Bethesda never meant those edges to meet?
   - What does Skyrim do: does it compare or stitch those edges at all?
 - Data:
-  - `C:/Modding/SkyrimConverted/skyrim_world.db` and `C:/Modding/SkyrimConverted-upstream15/skyrim_world.db`
+  - `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` and `C:/Modding/Mudcrab/SkyrimConverted-upstream15/skyrim_world.db`
     (tables `worldspaces`, `cells`, `land`; the `records` table holds raw records, including WRLD);
   - the game's `.esm` files are in `C:/Games/Steam/steamapps/common/Skyrim Special Edition/Data/`
     (read-only).

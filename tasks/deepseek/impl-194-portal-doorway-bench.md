@@ -22,7 +22,7 @@ Keep the tour's verdict line unchanged. A bench run is not a timing run unless i
 ## Checks
 
 - Unit tests: the percentile and CSV row formatting, and the state sequencing, as pure logic.
-- `cargo build --profile quick --bin engine`. Then `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t194 --tour-doors 2 --tour-bench local/t194/bench.csv` must still end `tour PASSED after 2 crossings (short tour)` and write the CSV. Show the CSV.
+- `cargo build --profile quick --bin engine`. Then `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t194 --tour-doors 2 --tour-bench local/t194/bench.csv` must still end `tour PASSED after 2 crossings (short tour)` and write the CSV. Show the CSV.
 - Under `local/`, read only `local/t194*` and the two research files named above.
 
 ## Report

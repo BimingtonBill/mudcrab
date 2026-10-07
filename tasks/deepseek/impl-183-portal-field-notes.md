@@ -37,7 +37,7 @@ Keep the capture from blocking a frame: writing a PNG and two small JSON files p
 
 - Unit tests for the pure parts: the run folder name, the index lines (capture and crossing), the snapshot/JSON shape, the shots file the captures produce loads back as a `ShotsFile` with the right names and poses, the note editing (characters, Backspace, Enter, Esc).
 - `cargo build --profile quick --bin engine`, then the short tour must still pass unchanged:
-  `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t183 --tour-doors 2` ends `tour PASSED after 2 crossings (short tour)`. Read only `local/t183*` and `local/captures*` under `local/`.
+  `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t183 --tour-doors 2` ends `tour PASSED after 2 crossings (short tour)`. Read only `local/t183*` and `local/captures*` under `local/`.
 - A capture on a real run: add a hidden test flag if you need one (e.g. `--field-notes-test`: after the first crossing and 3 s later, capture with note "test", then exit), run it with `--captures-dir local/captures-t183`, and show the resulting `notes.md`, `01.json` and that `01.png` exists. Then check `engine --shots local/captures-t183/<run>/shots.json --shots-out local/t183-reshot` renders `01`.
 - `docs/demo/README.md`: a short "Showing us a bug" section: F12, the note box, where the folder is, send the folder path.
 

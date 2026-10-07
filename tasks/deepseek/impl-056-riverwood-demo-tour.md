@@ -42,7 +42,7 @@ set where `--demo` is parsed, defaulted to `None`. That field is yours; it is th
 make in `config.rs` and you must not touch the `DemoStart::named` match arms.
 
 **2. The Riverwood route.** Eight doors, verified against `door_links` in the converted database
-(`C:/Modding/SkyrimConverted/skyrim_world.db`) - each pair is reciprocal, so the tour enters a
+(`C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`) - each pair is reciprocal, so the tour enters a
 house and comes back out before walking to the next:
 
 | # | door ref | what it does |

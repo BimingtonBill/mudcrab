@@ -10,9 +10,9 @@ code.
   - `05.png` / `05.json`: worldspace 0x1A26F (WhiterunWorld), "dragonsreach bridge is rotated the
     wrong way".
   Look at both images.
-- Converted data: `C:\Modding\SkyrimConverted\skyrim_world.db` (SQLite; tables `references`
+- Converted data: `C:\Modding\Mudcrab\SkyrimConverted\skyrim_world.db` (SQLite; tables `references`
   with `pos_x/y/z`, `rot_x/y/z` in radians and `scale`, `cells`, `statics` with `model_path`), GLBs under
-  `C:\Modding\SkyrimConverted\meshes\`, source NIFs under `C:\Modding\SkyrimConverted\vfs\meshes\`.
+  `C:\Modding\Mudcrab\SkyrimConverted\meshes\`, source NIFs under `C:\Modding\Mudcrab\SkyrimConverted\vfs\meshes\`.
   Read the database with a Python script you write (the `sqlite3` module); open it read-only
   (`file:...?mode=ro` URI).
 - How the engine turns a reference into a transform: Creation REFR angles turn clockwise; objects are

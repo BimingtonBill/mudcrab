@@ -28,7 +28,7 @@ asset itself (the loaded scene has no mesh primitives), not from the model's nam
 ## Check it
 
 Run `cargo build --release -p engine`, then render one shot in Blackreach cell 0002D4E0 with the
-shots mode (`docs/design/reference-shots.md`); `C:/Modding/SkyrimConverted/skyrim_world.db` has the
+shots mode (`docs/design/reference-shots.md`); `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` has the
 cell's grid. The log must show no bounds error for those two references.
 
 ## Scope

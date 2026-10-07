@@ -15,7 +15,7 @@ Not in scope: shots.rs, transition.rs, portal.rs, portal_bench.rs (another worke
 
 ## Checks
 - `cargo test -p engine --lib` in your worktree; check your new tests appear in the run (a shared target can serve a stale binary).
-- Short walked tour passes: `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour <dir under your worktree> --tour-doors 2`. Report its last line.
+- Short walked tour passes: `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour <dir under your worktree> --tour-doors 2`. Report its last line.
 
 ## Build and run rules
 - Build: `cargo build --profile quick --bin engine` in your own worktree with its own target, `CARGO_BUILD_JOBS=6`; check `quick/engine.d` names your worktree.

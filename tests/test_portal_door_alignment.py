@@ -7,7 +7,7 @@ outward rule and its two distances, `door_frame`, `Rigid` and the two maps, and 
 report's tables are cut with - and its `check` gate is both unit-tested and run against the
 converted data when that data is installed.
 
-The last class is skipped when `C:/Modding/SkyrimConverted/skyrim_world.db` is absent: the gate
+The last class is skipped when `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` is absent: the gate
 asserts one machine's converted data, and a checkout that has never run a conversion is not a
 failure (the command itself exits 0 there, which is also tested).
 """

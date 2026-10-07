@@ -33,6 +33,6 @@ flags. Add a short section to `docs/design/reference-shots.md` with the exact co
 
 Commands on entities: use the `try_` forms. Tests: the round-trip above; the flag parsing (good,
 missing file, missing name, refused combinations). You may build and run the release engine
-(`cargo build --release -p engine`; assets `C:\Modding\SkyrimConverted`, read-only; output only
+(`cargo build --release -p engine`; assets `C:\Modding\Mudcrab\SkyrimConverted`, read-only; output only
 under `local/`) to check that `--start-shot` puts the camera where a `--shots` render of the same
 shot looks - compare one pose by eye and say which.

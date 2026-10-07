@@ -41,7 +41,7 @@ square to the door. Do not re-derive that result; it holds, and it is not eviden
 
 ## What to measure
 
-The data: `C:/Modding/SkyrimConverted/skyrim_world.db` (converter schema 19). `door_links` has
+The data: `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` (converter schema 19). `door_links` has
 `ref_id, destination_ref_id, pos_x/y/z, rot_x/y/z` (the `XTEL` arrival), `destination_cell_id,
 destination_worldspace_id`; `references` has each door's own `pos_x/y/z` and `rot_x/y/z`. A pair is
 reciprocal when door A's `destination_ref_id` is door B and B's is A.

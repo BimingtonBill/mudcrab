@@ -4,8 +4,8 @@ before the landing cell's textures and meshes are on the GPU. Today it waits onl
 (`pending_asset_instances`/`pending_surface_instances` = 0); main's per-frame upload budget
 (`RenderAssetBytesPerFrame`, `--max-upload-mib-per-frame`, default 16) can still hold uploads back, so the view
 fades in with parts missing. Real-data evidence: Riverwood -> Sven's house, the stone hearth and chimney are
-missing 1.5 s after fade-in at the default budget (`D:/Modding-overflow/door-evidence-run1/out_00173.png`) and
-present with `--max-upload-mib-per-frame 0` (`D:/Modding-overflow/door-evidence-run2/out_00173.png`).
+missing 1.5 s after fade-in at the default budget (`D:/Mudcrab/door-evidence-run1/out_00173.png`) and
+present with `--max-upload-mib-per-frame 0` (`D:/Mudcrab/door-evidence-run2/out_00173.png`).
 
 # Design (fixed)
 1. While the screen is fully black (from the space switch until the fade-in starts), lift the upload budget
@@ -19,8 +19,8 @@ present with `--max-upload-mib-per-frame 0` (`D:/Modding-overflow/door-evidence-
 
 # Context
 Base: branch `phase2/door-preload` head the lead names in "This run". Own worktree on D:
-(`git -C C:/Modding/MudcrabProject worktree add D:/Modding-overflow/wt-699 <base> --detach`,
-`CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/impl-699`). Upstream style `fix(engine): ...`, trailer
+(`git -C C:/Modding/MudcrabProject worktree add D:/Mudcrab/worktrees-699 <base> --detach`,
+`CARGO_TARGET_DIR=D:/Mudcrab/builds/impl-699`). Upstream style `fix(engine): ...`, trailer
 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Owned: `crates/engine/src/door_crossing.rs` (and
 `app.rs` only if the budget's configured value must be read from config there). Read-only everything else;
 never physics.rs, console.rs, crates/converter, crates/shared. Overlap to name in the report: issue #117 plans

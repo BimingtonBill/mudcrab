@@ -56,7 +56,7 @@ These follow the design's task 4:
 ## Check it (you can build and run the engine)
 
 - `cargo build --release -p engine`.
-- `--demo-tour` (`target/release/engine.exe --assets C:/Modding/SkyrimConverted --demo alftand --demo-tour local/tour`)
+- `--demo-tour` (`target/release/engine.exe --assets C:/Modding/Mudcrab/SkyrimConverted --demo alftand --demo-tour local/tour`)
   must still pass 4/4 with 0 errors.
 - Add a **walk-through** check to the tour, a new phase or a flag such as
   `--demo-tour-walkthrough`: at each route door, press E, walk forward through the doorway, and

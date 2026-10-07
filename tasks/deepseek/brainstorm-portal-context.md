@@ -4,7 +4,7 @@ Track: portal. The user asked for "intelligent, creative and dynamic ways of dev
 
 ## What the portal is today (2026-09-25)
 
-Mudcrab re-implements Skyrim's world in Rust/Bevy 0.19, from converted game data (`C:\Modding\SkyrimConverted`, read-only).
+Mudcrab re-implements Skyrim's world in Rust/Bevy 0.19, from converted game data (`C:\Modding\Mudcrab\SkyrimConverted`, read-only).
 
 **The portal feature.** Skyrim's load doors (a house door, a dungeon door) normally teleport the player behind a loading screen. Here they are seamless:
 - The far side (the interior cell, or another worldspace) streams in near the door, on its own render layer (layer 2).
@@ -41,7 +41,7 @@ Mudcrab re-implements Skyrim's world in Rust/Bevy 0.19, from converted game data
 - `docs/design/portal-*.md`;
 - `local/research/*.md` (today's research: capture faults, occlusion culling, first-open hitch, frame-cost audit).
 
-**Skyrim data** (read-only) is at `C:\Games\Steam\steamapps\common\Skyrim Special Edition\Data`. The world DB is `C:/Modding/SkyrimConverted/skyrim_world.db` (open read-only).
+**Skyrim data** (read-only) is at `C:\Games\Steam\steamapps\common\Skyrim Special Edition\Data`. The world DB is `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` (open read-only).
 
 ## Rules for brainstormers
 

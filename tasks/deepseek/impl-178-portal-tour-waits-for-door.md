@@ -27,7 +27,7 @@ Keep the log lines' style; add one line when the door is seen fully open ("stage
 
 - Unit tests where the existing `demo_tour.rs` tests make it possible (pure helpers are fine: e.g. a function deciding "press E / wait / walk" from the door state and whether it was already pressed).
 - `cargo build --profile quick --bin engine`, then the short tour:
-  `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t178 --tour-doors 2`
+  `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t178 --tour-doors 2`
   It must end `tour PASSED after 2 crossings (short tour)`, and `local/t178/tour.txt` must contain **no** "going nowhere" line. Also run the Alftand short tour (`--demo alftand --walk --demo-tour local/t178a --tour-doors 2`) and report its last line. Read only `local/t178*` under `local/`.
 
 ## Report

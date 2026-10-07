@@ -229,7 +229,7 @@ Rules:
 >   tangent-space map, it lit far peaks near-black.
 >
 > Commit `e75704b` on `phase2/lod-engine-terrain`; before and after in
-> `C:/Modding/wkj-tools/shots-lod/cmp-clip2.jpg` (local).
+> `C:/Modding/Mudcrab/worktrees/p2-tools/shots-lod/cmp-clip2.jpg` (local).
 
 
 - **Z-fighting with full-detail cells.** SSE solves this by lowering distant LOD in a distance-dependent shader. Two mechanisms here, in order: **(a)** bake a small constant downward offset into the converted LOD terrain meshes (`lod_depth_offset`, start at 32 units ≈ 0.8 % of a cell) so full-detail terrain always wins the depth test where they overlap; **(b)** if the visual review still finds fighting or a visible step at the ring boundary, add a `TerrainLodMaterial` with `Material::depth_bias` or a vertex offset proportional to view distance, matching SSE more closely. Mechanism (a) costs nothing beyond a constant and is measurable in the `rural` scenario screenshots.

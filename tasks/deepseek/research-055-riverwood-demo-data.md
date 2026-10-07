@@ -9,7 +9,7 @@ The user wants a Riverwood demo next, built with everything the Alftand → Blac
 us. Work out, **from the converted data**, exactly what a Riverwood demo would contain, so the
 lead can design the route and the reference shots.
 
-The database is read-only at `C:/Modding/SkyrimConverted/skyrim_world.db` (converter schema 17,
+The database is read-only at `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` (converter schema 17,
 DB schema 5; it now also carries `space_lighting`, `matos` and door animation clips in the GLBs).
 Write scripts under `tools/research/` and run them with `python tools/research/<script>.py`.
 

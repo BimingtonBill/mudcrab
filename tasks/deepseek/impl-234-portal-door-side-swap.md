@@ -26,11 +26,11 @@ Check the fix against the depth composite, now the default (impl-227: filler on 
 - The short tour passes (`--demo riverwood --demo-tour <dir> --tour-doors 2`).
 
 ## Build and run rules
-- Build: `cargo build --profile quick --bin engine` with `CARGO_TARGET_DIR=D:/Modding-overflow/portal-quick-target` and `CARGO_BUILD_JOBS=6`.
+- Build: `cargo build --profile quick --bin engine` with `CARGO_TARGET_DIR=D:/Mudcrab/portal-quick-target` and `CARGO_BUILD_JOBS=6`.
   - The target is shared with other portal coders, so cargo's lock runs one build at a time.
   - Straight after each build, copy `engine.exe` to `local/t234/engine.exe` and run the copy.
-- Tests and clippy use `--target-dir D:/Modding-overflow/shared-check-target`.
-- Assets: `C:\Modding\SkyrimConverted`.
+- Tests and clippy use `--target-dir D:/Mudcrab/shared-check-target`.
+- Assets: `C:\Modding\Mudcrab\SkyrimConverted`.
 - No timing or benchmark runs.
 
 ## Commits

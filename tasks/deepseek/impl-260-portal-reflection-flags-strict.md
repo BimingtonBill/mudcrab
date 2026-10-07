@@ -12,7 +12,7 @@ Track: portal. The user approved this batch on 2026-09-27. Source: review-258 it
 
 ## Checks
 - `cargo test -p engine --lib` in your worktree; check that your new or renamed tests appear.
-- A run with a bad flag shows the error and exits non-zero: `<exe> --assets C:\Modding\SkyrimConverted --reflection-cascades 5` (quick build). A run with defaults still starts (let it run a few seconds, then stop it).
+- A run with a bad flag shows the error and exits non-zero: `<exe> --assets C:\Modding\Mudcrab\SkyrimConverted --reflection-cascades 5` (quick build). A run with defaults still starts (let it run a few seconds, then stop it).
 
 ## Build and run rules
 - Build: `cargo build --profile quick --bin engine` in your own worktree with its own target, `CARGO_BUILD_JOBS=6`; check `quick/engine.d` names your worktree.

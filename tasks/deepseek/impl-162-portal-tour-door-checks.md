@@ -22,7 +22,7 @@ crossing landed inside the closed far door (fixed by impl-152).
 
 Each check writes one line per door to `tour.txt` (ok or FAIL) and a failure fails the tour. Unit-test
 the decision logic where it can be tested without assets. Then run both full tours and one
-`--tour-doors 1` smoke run (`cargo build --release -p engine`; assets `C:\Modding\SkyrimConverted`,
+`--tour-doors 1` smoke run (`cargo build --release -p engine`; assets `C:\Modding\Mudcrab\SkyrimConverted`,
 read-only; output under `local/`): all must still pass, with the new lines present for every door.
 Show the swing check is not vacuous: temporarily disable `forget_lost_door_players`'s registration
 (or `DoorModel`), confirm the tour now FAILs on the swing check, and restore it; say so in the report.

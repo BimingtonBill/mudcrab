@@ -20,7 +20,7 @@ Read `AGENTS.md` ("While working", the parallel-engine rules) and `docs/demo/REA
 Automated testing today:
 - `cargo test -p engine --lib` (~344 unit tests), plus converter/shared tests; CI runs
   `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, tests.
-- Demo tours: `target/release/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour <dir>`
+- Demo tours: `target/release/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour <dir>`
   (8 door crossings, then a walk test) and `--demo alftand` (4 crossings). About 5 min each, run
   one after another after a ~4 min release build. `crates/engine/src/demo_tour.rs`.
 - Reference shots: `--shots tools/reference/*.json --shots-out <dir>` and `tools/compare_shots.py`

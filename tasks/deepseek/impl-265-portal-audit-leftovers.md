@@ -15,7 +15,7 @@ Not in scope: streaming.rs, app.rs, world/cache.rs (another merge lands there on
 
 ## Checks
 - `cargo test -p engine --lib` in your worktree; check that your new tests appear in the run (`cargo nextest list -p engine --lib` or the test output) - a shared target can serve a stale binary.
-- The short walked tour passes: `<quick exe> --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour <dir under your worktree> --tour-doors 2`. Report its last line.
+- The short walked tour passes: `<quick exe> --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour <dir under your worktree> --tour-doors 2`. Report its last line.
 
 ## Build and run rules
 - Build: `cargo build --profile quick --bin engine` in your own worktree with its own target, `CARGO_BUILD_JOBS=6`; check `quick/engine.d` names your worktree.

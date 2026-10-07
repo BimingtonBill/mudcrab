@@ -10,7 +10,7 @@ are calibrating.
 
 ## Where things stand
 
-Per-space lighting now runs on real data: `C:/Modding/SkyrimConverted` is converter schema 17 and
+Per-space lighting now runs on real data: `C:/Modding/Mudcrab/SkyrimConverted` is converter schema 17 and
 its `skyrim_world.db` carries `space_lighting` (810 rows), `matos` (42) and the `statics` snow
 columns. Colours from the records are applied as **hue**, with the calibrated brightness kept.
 
@@ -47,7 +47,7 @@ why.
 ## Commands
 
 ```
-target/release/engine.exe --assets C:/Modding/SkyrimConverted --shots tools/reference/uesp_shots_4x3.json --shots-out <dir>
+target/release/engine.exe --assets C:/Modding/Mudcrab/SkyrimConverted --shots tools/reference/uesp_shots_4x3.json --shots-out <dir>
 python tools/research/exposure_stats.py --shots tools/reference/uesp_shots_4x3.json --render <dir>
 python tools/compare_shots.py tools/reference/uesp_shots_4x3.json <dir> <cmp dir>
 ```

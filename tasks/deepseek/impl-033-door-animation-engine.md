@@ -59,7 +59,7 @@ Use a hand-built `AnimationClip`, `AnimationGraph` and `AnimationPlayer` with no
 
 ## Check it
 
-Run `cargo build --release -p engine` and `--demo-tour` (`target/release/engine.exe --assets C:/Modding/SkyrimConverted --demo alftand --demo-tour local/tour`).
+Run `cargo build --release -p engine` and `--demo-tour` (`target/release/engine.exe --assets C:/Modding/Mudcrab/SkyrimConverted --demo alftand --demo-tour local/tour`).
 It must still pass 4/4: the current assets have no clips, so every door takes the static path.
 
 ## Scope

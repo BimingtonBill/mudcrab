@@ -22,7 +22,7 @@ proposals P1-P5, with file:line). Implement **P1-P5** from it:
 
 Do **not** change what the tour checks: every crossing, the walk test and the verdict must stay.
 Checks: build (`cargo build --release -p engine`, then `cargo build --profile release-fast -p engine`)
-and run both full tours on each, then one `--tour-doors 1` smoke run (assets `C:\Modding\SkyrimConverted`,
+and run both full tours on each, then one `--tour-doors 1` smoke run (assets `C:\Modding\Mudcrab\SkyrimConverted`,
 read-only; output only under `local/`). Report per tour: verdict, wall time before (research-157's
 232.8 s Riverwood / 132.5 s Alftand) and after, frames written, and the build times of both profiles.
 Commands on entities use the `try_` forms.

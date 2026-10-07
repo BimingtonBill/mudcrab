@@ -7,7 +7,7 @@ Read `tasks/deepseek/context.md` first.
 The lead ran:
 
 ```
-target/release/engine.exe --assets C:/Modding/SkyrimConverted --streaming-fixture --terrain-radius 8
+target/release/engine.exe --assets C:/Modding/Mudcrab/SkyrimConverted --streaming-fixture --terrain-radius 8
 ```
 
 on the current build, and it did not exit within 400 s. It was killed; its logs are

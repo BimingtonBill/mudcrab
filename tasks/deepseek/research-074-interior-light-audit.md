@@ -111,7 +111,7 @@ python tools/research/lead071_db.py base <hex-light-record-id> [...] # one LIGH 
 python tools/research/lead071_db.py spaces <hex-space-id> [...]
 ```
 
-The database is `C:\Modding\SkyrimConverted\skyrim_world.db` (read-only). If python is denied, say
+The database is `C:\Modding\Mudcrab\SkyrimConverted\skyrim_world.db` (read-only). If python is denied, say
 so in your report and do the audit from the images, the code and the numbers above.
 
 # Done when

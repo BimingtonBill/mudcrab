@@ -18,7 +18,7 @@ correctly rotated world.
 The same as research-020 (read its brief, `tasks/deepseek/research-020-refine-reference-poses.md`,
 for the details):
 
-- render: `target/release/engine.exe --assets C:/Modding/SkyrimConverted --shots <file> --shots-out <dir>`;
+- render: `target/release/engine.exe --assets C:/Modding/Mudcrab/SkyrimConverted --shots <file> --shots-out <dir>`;
 - compare: `python tools/compare_shots.py`;
 - sweep and aim: `tools/research/shot_grid.py`, `aim.py`;
 - probe the database: `uesp_probe.py`.

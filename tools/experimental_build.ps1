@@ -23,8 +23,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/experimental_build.ps1
 #>
 param(
     [string]$Branch = "experimental/$(Get-Date -Format yyyy-MM-dd)",
-    [string]$Worktree = "D:/Modding-overflow/wt-experimental",
-    [string]$TargetDir = "D:/Modding-overflow/wt-targets/experimental",
+    [string]$Worktree = "D:/Mudcrab/worktrees-experimental",
+    [string]$TargetDir = "D:/Mudcrab/builds/experimental",
     [switch]$Resume,          # continue merging from the current branch head instead of resetting
     [switch]$SkipOnConflict,  # skip a PR whose conflicts have no recorded resolution
     [switch]$NoPortal,        # main + PRs only

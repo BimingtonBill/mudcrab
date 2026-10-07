@@ -21,7 +21,7 @@ provenance as data or dates, for example "measured against the UESP reference sc
 evidence lives. Check that each linked doc exists.
 
 Also:
-- tests that read `C:/Modding/SkyrimConverted/...` or other machine paths use
+- tests that read `C:/Modding/Mudcrab/SkyrimConverted/...` or other machine paths use
   `MUDCRAB_CONVERTED_DIR` (for converted output) or `MUDCRAB_SKYRIM_DATA` (for the game
   install), skip when unset, and keep no machine-path fallback. The converter uses the same
   convention (commit `410ce31`; ADR-0002);
@@ -30,7 +30,7 @@ Also:
 ## Check
 
 - The acceptance commands must pass. Keep every test: counts may not shrink.
-- With `MUDCRAB_CONVERTED_DIR=C:/Modding/SkyrimConverted`, run
+- With `MUDCRAB_CONVERTED_DIR=C:/Modding/Mudcrab/SkyrimConverted`, run
   `cargo test -p engine --lib -- --include-ignored` and report what ran.
 - In the report, list the remaining private names in `app.rs`, `portal.rs` and
   `world/database.rs`, which another task owns right now, so part 3 can be briefed.

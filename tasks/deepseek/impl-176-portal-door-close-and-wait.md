@@ -33,7 +33,7 @@ Track: portal. The user's demo notes of 2026-09-25 (`docs/roadmap/backlog-engine
   - an `OpenDoor` for a load door whose destination is not loaded stays pending and starts the swing the frame it becomes loaded; a door without a destination opens at once; a despawned door's pending request is dropped.
   - `destination_is_loaded` is false when any pre-streamed key is missing and true when all are resident.
 - `cargo build --profile quick --bin engine`, then a short door tour (the user's standing check: 1-2 doors):
-  `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t176 --tour-doors 2`
+  `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t176 --tour-doors 2`
   It must end `tour PASSED after 2 crossings (short tour)`. Read only `local/t176` under `local/`.
 
 ## Report

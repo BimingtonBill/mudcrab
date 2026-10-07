@@ -15,7 +15,7 @@ impl-182 found a second load door, `00070E69` (model `FarmhouseLDoor01`, linked 
 
 ## Context
 
-- Skyrim SE: `C:\Games\Steam\steamapps\common\Skyrim Special Edition\Data` (read-only). The converted world DB: `C:\Modding\SkyrimConverted\skyrim_world.db` (SQLite; read only with `python`'s sqlite3 in `mode=ro` URI; never open it read-write).
+- Skyrim SE: `C:\Games\Steam\steamapps\common\Skyrim Special Edition\Data` (read-only). The converted world DB: `C:\Modding\Mudcrab\SkyrimConverted\skyrim_world.db` (SQLite; read only with `python`'s sqlite3 in `mode=ro` URI; never open it read-write).
 - Look for existing ESM-reading scripts under `tools/` before writing your own; a new script goes in your scratch folder, not the repository.
 - Do not read under `local/` except `local/research/`.
 

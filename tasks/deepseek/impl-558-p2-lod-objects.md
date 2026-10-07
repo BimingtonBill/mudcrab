@@ -37,7 +37,7 @@ of a block that belongs to a loaded cell, as Skyrim does.
   - If you find you cannot put several primitives in one mesh without a large refactor, stop and
     report why, and propose the alternative (one glTF mesh and node per segment, each with the same
     extras) before implementing it.
-- Converted data to check against (read-only): `C:/Modding/SkyrimConverted-upstream15/` (source NIFs
+- Converted data to check against (read-only): `C:/Modding/Mudcrab/SkyrimConverted-upstream15/` (source NIFs
   extracted under `vfs/meshes/terrain/<worldspace>/objects/`). Write a small Python check of one
   real block's converted GLB in a temporary output folder if you can convert a single file;
   otherwise rely on tests.

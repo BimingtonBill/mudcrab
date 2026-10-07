@@ -5,8 +5,8 @@ load-door reference knows where it leads. No behaviour change: nothing activates
 
 # Context
 - Work in your own worktree on D: (C: is nearly full):
-  `git -C C:/Modding/MudcrabProject worktree add D:/Modding-overflow/wt-692 phase2/door-preload --detach`
-  and `CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/impl-692`. Base is origin/main 461517bf.
+  `git -C C:/Modding/MudcrabProject worktree add D:/Mudcrab/worktrees-692 phase2/door-preload --detach`
+  and `CARGO_TARGET_DIR=D:/Mudcrab/builds/impl-692`. Base is origin/main 461517bf.
   Never edit C:/Modding/wkj-door-preload or any portal checkout.
 - Upstream style: commit subjects like `feat(engine): read load-door links from the world database`, no
   `[claude]` prefix, upstream comment density; end each commit message with
@@ -44,4 +44,4 @@ spawned door reference carries `LoadDoor` (headless app, as the existing spawn t
 # Report
 Commits (hash, subject), files, line delta, tests, clippy result (and which warnings pre-exist on main),
 the table shape you read (column list) so the converter slice can match it. Remove
-`D:/Modding-overflow/wt-targets/impl-692` when done; keep the worktree.
+`D:/Mudcrab/builds/impl-692` when done; keep the worktree.

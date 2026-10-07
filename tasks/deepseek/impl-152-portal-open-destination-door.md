@@ -68,7 +68,7 @@ fix that instead - the evidence is what matters, not this brief's diagnosis.
 - A unit test: an un-anchored crossing and a `Snap` crossing leave the destination door as it was.
 - Then run the real thing. You may build the release engine and run it (read-only assets):
   `cargo build --release -p engine`, then
-  `target/release/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t152-riverwood`
+  `target/release/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t152-riverwood`
   and the same with `--demo alftand` into `local/t152-alftand`. Both must end `tour PASSED`, and the
   first frames after each crossing (`walk-through/NN/`) must show the room or street, not planks.
   Report the tour lines and the frames you looked at.

@@ -37,7 +37,7 @@ Find out, from the code and the data:
 3. **What the resulting numbers are on real assets.** Open the glb JSON chunks of at least
    `Architecture/Farmhouse/Farmhouse02.nif`'s and `Inn01.nif`'s converted materials, a barrel
    (`Clutter/Barrel01` or whatever the Riverwood references actually use - find it in
-   `C:/Modding/SkyrimConverted/skyrim_world.db`), and the inn's interior pillars, and report the
+   `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`), and the inn's interior pillars, and report the
    actual `roughnessFactor` / `metallicFactor` values and whether a
    `metallicRoughnessTexture` is present. A table of model → values is the deliverable here. If
    every material has the same pair of numbers, say so plainly: that is the answer.

@@ -21,7 +21,7 @@ provenance as data or dates, for example "measured against the UESP reference sc
 evidence lives. Check that each linked doc exists.
 
 Also:
-- tests that read `C:/Modding/SkyrimConverted/...` or other machine paths use
+- tests that read `C:/Modding/Mudcrab/SkyrimConverted/...` or other machine paths use
   `MUDCRAB_CONVERTED_DIR` (for converted output) or `MUDCRAB_SKYRIM_DATA` (for the game
   install), skip when unset, and keep no machine-path fallback. The converter uses the same
   convention (commit `410ce31`; ADR-0002);
@@ -30,7 +30,7 @@ Also:
 ## Check
 
 - The acceptance commands must pass. Keep every test: counts may not shrink.
-- With `MUDCRAB_CONVERTED_DIR=C:/Modding/SkyrimConverted`, run
+- With `MUDCRAB_CONVERTED_DIR=C:/Modding/Mudcrab/SkyrimConverted`, run
   `cargo test -p engine --lib -- --include-ignored` and report what ran.
 - This is the last part. In the report, confirm with a repo-wide grep over `crates/` that no
   private name is left in any Rust file (`impl-0`, `research-0`, `review-0`, `lead-0`,

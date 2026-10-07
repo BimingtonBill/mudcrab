@@ -9,7 +9,7 @@ at the door's XTEL arrival point, and the view fades back in once the landing ce
 - Base: branch `phase2/door-preload` at the commit the lead names in "This run" (it carries the door-link
   reader: `crate::doors::LoadDoor` on every spawned load-door reference, links read from the optional
   `door_links` table). Own worktree on D: (`git -C C:/Modding/MudcrabProject worktree add
-  D:/Modding-overflow/wt-693 <base> --detach`, `CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/impl-693`).
+  D:/Mudcrab/worktrees-693 <base> --detach`, `CARGO_TARGET_DIR=D:/Mudcrab/builds/impl-693`).
 - Upstream style: subjects like `feat(engine): go through load doors with a fade`, no `[claude]` prefix,
   each commit ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. No portal code.
 - What main has (research #690, `C:/Users/Brannock/.claude-deepseek/agents/runs/research-690-p2-door-preload-main.1/report.md`):

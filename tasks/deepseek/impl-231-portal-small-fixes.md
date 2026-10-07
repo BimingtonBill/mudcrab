@@ -25,11 +25,11 @@ Pick auto-exposure settings, or a compensation curve, so that `bevy` averages cl
 - Check that the path exists before loading it. Log "no twin" at debug level, not as an asset failure. Add a test.
 
 ## Build and run rules
-- Build: `cargo build --profile quick --bin engine` with `CARGO_TARGET_DIR=D:/Modding-overflow/portal-quick-target` and `CARGO_BUILD_JOBS=6`.
+- Build: `cargo build --profile quick --bin engine` with `CARGO_TARGET_DIR=D:/Mudcrab/portal-quick-target` and `CARGO_BUILD_JOBS=6`.
   - Other portal coders share that target dir, so cargo's lock runs one build at a time; the machine's memory commit only fits one.
   - Straight after each build, copy `engine.exe` to `local/t231/engine.exe` and run the copy, because the next coder's build overwrites the shared one.
-- Tests and clippy use `--target-dir D:/Modding-overflow/shared-check-target` (portal's shared check target only).
-- Assets: `C:\Modding\SkyrimConverted`.
+- Tests and clippy use `--target-dir D:/Mudcrab/shared-check-target` (portal's shared check target only).
+- Assets: `C:\Modding\Mudcrab\SkyrimConverted`.
 - No timing or benchmark runs.
 - Under `local/`, read only `local/t231*`, `local/team/2026-09-26.md` and `local/gallery/`.
 

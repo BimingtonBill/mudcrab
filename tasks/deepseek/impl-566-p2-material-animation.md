@@ -8,7 +8,7 @@ controllers are dropped, and every such card is one still frame.
   materials, blend factors, refraction exclusion). Ride that schema; do not bump it. Use upstream's
   commit style (`feat(converter): ...`), with no `[deepseek]` prefix.
 - What Skyrim stores (decoded from `meshes/clutter/woodfires/fireplacewood01burning.nif`, extracted at
-  `C:/Modding/SkyrimConverted-upstream15/vfs/meshes/clutter/woodfires/`):
+  `C:/Modding/Mudcrab/SkyrimConverted-upstream15/vfs/meshes/clutter/woodfires/`):
   - A shader property (`BSEffectShaderProperty` or `BSLightingShaderProperty`) has a controller
     reference (its `NiObjectNET` controller field). Controllers chain through `next_controller`.
   - `BSEffectShaderPropertyFloatController` / `BSLightingShaderPropertyFloatController`: an

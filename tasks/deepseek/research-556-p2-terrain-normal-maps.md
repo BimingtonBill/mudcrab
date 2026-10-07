@@ -15,7 +15,7 @@ and matte. Say whether it fits within wgpu/Bevy limits, and the smallest safe de
     `uv_b`, so the mesh has no real tangents;
   - no layer normal map is sampled (research-554 found this).
 - Landscape texture sets have normal maps: DB `landscape_textures.texture_set_id` points at
-  `texture_sets.normal_path` in `C:/Modding/SkyrimConverted-upstream15/skyrim_world.db`, and the
+  `texture_sets.normal_path` in `C:/Modding/Mudcrab/SkyrimConverted-upstream15/skyrim_world.db`, and the
   converter converts every DDS, so the normal KTX2s exist under `textures/landscape/`. Check.
 - Constraints to check: wgpu's default `max_sampled_textures_per_shader_stage` (16) and
   `max_samplers_per_shader_stage` (16) against what StandardMaterial already binds in Bevy 0.19,

@@ -20,7 +20,7 @@ This is the source material for `docs/research/converter-dropped-fields.md`.
   2. `SLSF1_VERTEX_ALPHA` was treated as opacity, so 1,337 meshes rendered translucent
      (impl-063; the vertex-colour alpha is a shader parameter, not transparency).
   A systematic list is the point of this task: find the rest.
-- Published tree to count against, **read-only, never write**: `C:/Modding/SkyrimConverted/`. Its
+- Published tree to count against, **read-only, never write**: `C:/Modding/Mudcrab/SkyrimConverted/`. Its
   `conversion-manifest.json` says schema 18, complete, 22,761 NIFs, 32,945 DDS; the published
   material count is 59,268. GLBs at `meshes/**/*.glb`, textures at `textures/**/*.ktx2`, world
   database `skyrim_world.db`.
@@ -53,7 +53,7 @@ This is the source material for `docs/research/converter-dropped-fields.md`.
 - For counts, use your file-search tool over the published tree: each `.glb` is a JSON chunk plus a
   binary chunk, and the JSON is greppable as text, so a search for a JSON key such as
   `"metallicFactor":0.0` counts the documents carrying it. Search first to see whether
-  `C:/Modding/SkyrimConverted` is reachable; previous work counted 59,268 materials and 53,190
+  `C:/Modding/Mudcrab/SkyrimConverted` is reachable; previous work counted 59,268 materials and 53,190
   normal maps that way.
 - If the tree is not reachable, mark the count "unmeasured" and write down the exact search that
   would measure it so the lead can run it. Never guess a number.
@@ -76,7 +76,7 @@ Separately, and clearly apart from the converter findings:
 
 - Every field of `ValidatedNifMaterial` and every field of the five block structs listed above is
   accounted for as published / dropped / constant, with read and write sites.
-- Every count is either measured against `C:/Modding/SkyrimConverted` or explicitly unmeasured with
+- Every count is either measured against `C:/Modding/Mudcrab/SkyrimConverted` or explicitly unmeasured with
   the search that would measure it.
 - Ranking is by measured count where measurable.
 

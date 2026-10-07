@@ -62,7 +62,7 @@ model.
 ## Check it (you can build and run the engine)
 
 Run `cargo build --release -p engine`, then:
-- the demo tour, `target/release/engine.exe --assets C:/Modding/SkyrimConverted --demo alftand --demo-tour local/tour`,
+- the demo tour, `target/release/engine.exe --assets C:/Modding/Mudcrab/SkyrimConverted --demo alftand --demo-tour local/tour`,
   which must pass 4/4, with `NN-door.png` and `NN-portal-view.png` showing each destination;
 - a shots file (`docs/design/reference-shots.md`) with the tower door seen from the east at
   about 300 units: Tamriel (73850, 78431, -5500), yaw 270, pitch 0. The portal must now show

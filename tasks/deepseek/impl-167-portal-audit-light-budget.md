@@ -41,7 +41,7 @@ Every command on an entity that may have been despawned uses the `try_` forms.
 
 `cargo test -p engine --lib`, clippy, fmt. Then build with the fast, non-measured profile
 `cargo build --profile quick -p engine --bin engine` (the binary lands in `target/quick/engine.exe`)
-and run both tours from it: `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/impl-167-portal-audit-light-budget-riverwood`
+and run both tours from it: `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/impl-167-portal-audit-light-budget-riverwood`
 and the same with `--demo alftand`. Both must end `tour PASSED` (8 and 4 crossings), with every
 `swing ok` / `far door ok` line and no `FAIL`. Report, per finding: reproduced or not (with the
 failing test's message), what you changed, and the tour lines.

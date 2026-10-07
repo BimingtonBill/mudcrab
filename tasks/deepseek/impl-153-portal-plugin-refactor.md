@@ -72,8 +72,8 @@ also run both tours on a release build (you may build and run the engine; the as
 
 ```
 cargo build --release -p engine
-target/release/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t153-riverwood
-target/release/engine.exe --assets C:\Modding\SkyrimConverted --demo alftand --walk --demo-tour local/t153-alftand
+target/release/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t153-riverwood
+target/release/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo alftand --walk --demo-tour local/t153-alftand
 ```
 
 Both must end `tour PASSED` (Riverwood after 8 crossings, Alftand after 4) with no `panicked` in

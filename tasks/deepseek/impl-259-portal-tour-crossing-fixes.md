@@ -15,12 +15,12 @@ Three small fixes to the demo tour and the scripted crossing.
 
 ## Checks
 - Unit tests for (1) the landing choice (open door: doorway map; closed: XTEL) and (2) the missing-door arm.
-- Run the short tours: `<exe> --assets C:\Modding\SkyrimConverted --demo riverwood --demo-tour <dir> --tour-doors 2` (scripted) and the same with `--walk`. Both pass; each writes `00-portal-view.png` and `01-portal-view.png`. Open one scripted `NN-portal-view.png` and the tour's first frame after that swap and say whether they match.
+- Run the short tours: `<exe> --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --demo-tour <dir> --tour-doors 2` (scripted) and the same with `--walk`. Both pass; each writes `00-portal-view.png` and `01-portal-view.png`. Open one scripted `NN-portal-view.png` and the tour's first frame after that swap and say whether they match.
 
 ## Build and run rules
 - Build: `cargo build --profile quick --bin engine` in your own worktree with its own target (the harness sets it), `CARGO_BUILD_JOBS=6`. Check `quick/engine.d` names your worktree before running the exe.
 - Tests run in your worktree's target; check that your new tests appear in the run.
-- Assets: `C:\Modding\SkyrimConverted` (read-only).
+- Assets: `C:\Modding\Mudcrab\SkyrimConverted` (read-only).
 - No timing or benchmark runs. If the lead messages HOLD, finish the command in hand and start no cargo or engine command until told to resume.
 
 ## Commits

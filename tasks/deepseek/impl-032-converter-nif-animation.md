@@ -48,11 +48,11 @@ others), with channels on the matching glTF nodes. The engine will play them by 
 ## Tests (write them to fail before your change)
 
 - Unit tests on synthetic `NiTransformData` byte buffers, one for each key type.
-- A real-data test on the extracted meshes at `C:/Modding/SkyrimConverted/vfs/meshes/`
+- A real-data test on the extracted meshes at `C:/Modding/Mudcrab/SkyrimConverted/vfs/meshes/`
   (read-only), gated like the existing real-data tests in `mesh.rs` (read how they find the data
   and skip when it is absent):
   - `dungeons/dwemer/door/dwemersmalldoorload01.nif` and the `DweDoorLarge01Load` model (find it
-    via the database `statics` table, `C:/Modding/SkyrimConverted/skyrim_world.db`, read-only)
+    via the database `statics` table, `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`, read-only)
     export `Open`/`Close` animations whose t = 0 pose equals the rest pose;
   - a Nordic door swings about 90 to 135 degrees; research-027 found `FarmhouseAnimDoor01` at -95.
 - `cargo test -p converter --lib` stays green.

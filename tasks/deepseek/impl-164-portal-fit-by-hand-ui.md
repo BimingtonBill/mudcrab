@@ -25,7 +25,7 @@ screenshots by hand, and reported three problems. Fix all three.
 
 Tests where logic allows (the reference path rule; the start pose reaching the controller unchanged).
 Then build (`cargo build --release -p engine`) and run
-`target/release/engine.exe --assets C:\Modding\SkyrimConverted --start-shot tools/reference/riverwood_shots.json RW-03-trader-front`
+`target/release/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --start-shot tools/reference/riverwood_shots.json RW-03-trader-front`
 for a few seconds with `--acceptance-screenshot local/t164/start.png --benchmark-duration 8` (or
 another self-exiting way) and look at the screenshot: the reference in the corner and the help text
 must be visible and the view must be the shot's. Say plainly that key presses cannot be tested

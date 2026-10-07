@@ -16,7 +16,7 @@ Not in scope: CC-20260927-01 (`RankedFrom` in transition.rs; another worker owns
 
 ## Checks
 - `cargo test -p engine --lib` in your worktree; check that your new tests appear in the run.
-- The short walked tour passes: `<exe> --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour <dir> --tour-doors 2`.
+- The short walked tour passes: `<exe> --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour <dir> --tour-doors 2`.
 
 ## Build and run rules
 - Build: `cargo build --profile quick --bin engine` in your own worktree with its own target, `CARGO_BUILD_JOBS=6`; check `quick/engine.d` names your worktree.

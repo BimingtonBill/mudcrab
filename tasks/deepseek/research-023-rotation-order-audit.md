@@ -18,7 +18,7 @@ and their signs. Settle it from Skyrim.esm's own data, and audit the rest of obj
 - Many references are tilted to sit on sloped ground: rocks, snow drifts, clutter, trees. Their
   up vector should roughly follow the terrain normal where they stand. Decode the terrain heights
   from the database (research-018 has a LAND/VHGT decoder in `tools/research/uesp_space_map.py`
-  and `world_db.py`; the database is read-only at `C:/Modding/SkyrimConverted/skyrim_world.db`).
+  and `world_db.py`; the database is read-only at `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`).
   Take references with `|rot_x|` or `|rot_y|` above about 3 degrees in exterior cells. Compute the
   terrain normal at each one, and compare it with the reference's up vector under several
   candidate conventions:

@@ -11,7 +11,7 @@ published**: this is local preparation, and the lead decides later what goes whe
 ## Context
 
 - The demo today:
-  - `play-blackreach-demo.cmd` runs `target\release\engine.exe --assets C:\Modding\SkyrimConverted --demo alftand --walk`;
+  - `play-blackreach-demo.cmd` runs `target\release\engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo alftand --walk`;
   - `play-blackreach-shortcut.cmd` runs the Blackreach start.
   Both hard-code this machine's paths.
 - The assets come from the converter (`crates/converter`), run against the user's own Skyrim SE
@@ -33,7 +33,7 @@ published**: this is local preparation, and the lead decides later what goes whe
      from `AGENTS.md`'s handoff log);
    - prerequisites;
    - step-by-step build → convert → run, with the time and disk space conversion needs (find the
-     numbers: the size of `C:/Modding/SkyrimConverted`, which you may read, and conversion times
+     numbers: the size of `C:/Modding/Mudcrab/SkyrimConverted`, which you may read, and conversion times
      from the docs or logs);
    - controls, command-line options, troubleshooting (for example "Access is denied" on publish,
      GPU and driver issues, where the logs are), and how to take reference shots.

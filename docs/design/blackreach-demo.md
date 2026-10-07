@@ -5,7 +5,7 @@ Owner: Claude (lead). Status: working, 2026-09-22 (`--demo-tour` passes 4/4 cros
 
 ## What the user gets
 
-`engine.exe --assets C:\Modding\SkyrimConverted --demo alftand --walk` starts the player on foot in
+`engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo alftand --walk` starts the player on foot in
 front of the Alftand entrance in the Pale (Tamriel, grid 19,18). Mouse to look, WASD to walk, Shift
 to run, Space to jump, F to toggle flying, E to open a load door. Four doors lead down: Tamriel ->
 Alftand01 -> Alftand02 -> AlftandWorld -> Blackreach. Each crossing is instant: the destination was

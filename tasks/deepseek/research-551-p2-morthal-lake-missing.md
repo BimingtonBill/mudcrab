@@ -16,7 +16,7 @@ draws a surface. Report the exact cause, with evidence, and the smallest fix. Do
   - elsewhere water is drawn but white.
 
   The shot is `SR-place-Morthal` in `tools/reference/world_shots_4x3.json`. Renders are in
-  `C:/Modding/wkj-tools/shots-hand/{demo,up15}-world_shots_4x3/SR-place-Morthal.png`, and the
+  `C:/Modding/Mudcrab/worktrees/p2-tools/shots-hand/{demo,up15}-world_shots_4x3/SR-place-Morthal.png`, and the
   screenshot is `local/reference/world/SR-place-Morthal.jpg`.
 - How Skyrim does exterior water:
   - each exterior cell has a water height (`XCLW` in CELL, often "use the worldspace default"
@@ -26,7 +26,7 @@ draws a surface. Report the exact cause, with evidence, and the smallest fix. Do
     `ACTI` water references instead of cell water.
 
   Check which applies to Morthal's cells.
-- Data: `C:/Modding/SkyrimConverted/skyrim_world.db` (tables `cells`, with `data`, `waters` and
+- Data: `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` (tables `cells`, with `data`, `waters` and
   `references`; the `records` table has raw record data). The game's `.esm` files are in
   `C:/Games/Steam/steamapps/common/Skyrim Special Edition/Data/` (read-only).
 

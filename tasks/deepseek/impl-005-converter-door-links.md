@@ -49,7 +49,7 @@ four doors and their `XTEL` targets are in its section 2.2 - use them as known-g
 
 ## Real-data check (read-only, after your tests pass)
 
-The real converted database from the old schema is at `C:/Modding/SkyrimConverted/skyrim_world.db`
+The real converted database from the old schema is at `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`
 (read-only). You may **not** run the converter over the game install (it takes 20+ minutes and
 writes outside your checkout). Instead, write a small test or script that parses `Skyrim.esm`'s four
 route doors from the install at `C:/Games/Steam/steamapps/common/Skyrim Special Edition/Data/Skyrim.esm`

@@ -15,7 +15,7 @@ implement it.
 - Shots:
   - `SR-place-Alftand`, `_02` to `_06` in `tools/reference/uesp_shots_4x3.json`;
   - references in `local/reference/uesp/`;
-  - renders in `C:/Modding/wkj-tools/shots-hand/{demo,up15}-uesp_shots_4x3/`.
+  - renders in `C:/Modding/Mudcrab/worktrees/p2-tools/shots-hand/{demo,up15}-uesp_shots_4x3/`.
 - What to establish:
   - Which meshes and materials are the ice (Alftand's glacier pieces, e.g. `Landscape\Ice\`,
     `Glacier*`, `IceCliff*`)?
@@ -25,9 +25,9 @@ implement it.
   - What the converter publishes for them, and what the engine draws.
   - The green: is it a texture slot drawn as diffuse (a normal map or mask sampled as colour),
     vertex colour, a missing texture fallback, or the specular or environment term?
-- Data: `C:/Modding/SkyrimConverted-upstream15/` and `C:/Modding/SkyrimConverted/`. Use the GLB
+- Data: `C:/Modding/Mudcrab/SkyrimConverted-upstream15/` and `C:/Modding/Mudcrab/SkyrimConverted/`. Use the GLB
   tools in `tools/research/` (`glb_materials.py`) and the world DB
-  (`C:/Modding/SkyrimConverted/skyrim_world.db`, tables `references` and `statics`).
+  (`C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`, tables `references` and `statics`).
 
 # Method
 1. Pick 3-4 ice meshes placed in view of `SR-place-Alftand` / `_02`.

@@ -3,7 +3,7 @@
 ## Goal
 
 A crash kills the user's session on door crossings when they play the Riverwood demo themselves
-(`play-riverwood-demo.cmd` runs `engine --assets C:\Modding\SkyrimConverted --demo riverwood --walk`,
+(`play-riverwood-demo.cmd` runs `engine --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk`,
 no tour). The project's own scripted tour, `--demo-tour`, is meant to catch that sort of thing and
 has crossed all eight Riverwood doorways in a run without failing. The claim to test is:
 

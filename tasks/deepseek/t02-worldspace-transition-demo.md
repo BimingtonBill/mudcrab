@@ -29,7 +29,7 @@ exterior; only a unit test covers that boundary.
 2. **What the converter keeps.** Does `crates/converter/src/esm/` parse `XTEL` or door refs at all?
    Does the SQLite schema (`docs/specs/converters/db-schema.md`, `crates/converter/src/esm/exporter.rs`)
    have interior cells, non-Tamriel worldspaces and door links? Once the running conversion finishes
-   there will be a real `C:/Modding/SkyrimConverted/skyrim_world.db` - if it exists when you get
+   there will be a real `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db` - if it exists when you get
    there, you may query it read-only with a script (open it with `mode=ro` in the URI); if not, answer
    from code.
 3. **What the engine does.** How `crates/engine/src/streaming.rs`, `world/database.rs` and `app.rs`
@@ -48,7 +48,7 @@ exterior; only a unit test covers that boundary.
 - Write only `docs/research/worldspace-transition-demo.md`,
   `docs/handoff/t02-worldspace-transition-demo.md`, and any script under `tools/research/`.
 - Read-only everywhere else. Do not run the engine, the converter or `scripts/`. Do not touch
-  `C:/Modding/SkyrimConverted` except to read the DB.
+  `C:/Modding/Mudcrab/SkyrimConverted` except to read the DB.
 
 ## Done when
 

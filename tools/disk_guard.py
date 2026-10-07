@@ -6,7 +6,7 @@ conversion, a worker worktree) or uses the GPU heavily (a timing run, a
 capture). It reads only, except for the optional --ledger line.
 
     python tools/disk_guard.py --drive D: --need 20
-    python tools/disk_guard.py --drive D: --need 20 --ledger "Phase 1 conversion into D:\\Modding-overflow\\x"
+    python tools/disk_guard.py --drive D: --need 20 --ledger "Phase 1 conversion into D:\\Mudcrab\\x"
     python tools/disk_guard.py --gpu
 
 Exit codes: 0 go; 1 not enough space (free minus need would fall below the

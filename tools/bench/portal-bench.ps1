@@ -4,7 +4,7 @@
 # With -Doors tools/bench/portal_bench_doors_out.json it times the two look-out states instead
 # (closed-out, open-out-view: standing inside a house, looking out through its door at the exterior).
 #
-#   pwsh -File tools/bench/portal-bench.ps1 [-Assets C:\Modding\SkyrimConverted-portal-lod][-BuildProfile release|quick]
+#   pwsh -File tools/bench/portal-bench.ps1 [-Assets C:\Modding\Mudcrab\SkyrimConverted-portal-lod][-BuildProfile release|quick]
 #   pwsh -Command "& tools/bench/portal-bench.ps1 -Variants 'default=','depth=--portal-depth-composite' -Repeats 2"
 #   pwsh -Command "& tools/bench/portal-bench.ps1 -Doors tools/bench/portal_bench_doors_out.json"
 #   (-Command, not -File: -File passes a comma list as one string)
@@ -22,7 +22,7 @@
 [CmdletBinding()]
 param(
     # The converted asset folder: the one holding skyrim_world.db.
-    [string]$Assets = "C:\Modding\SkyrimConverted-portal-lod",
+    [string]$Assets = "C:\Modding\Mudcrab\SkyrimConverted-portal-lod",
     # The build profile. Report figures from release; quick only to compare against another quick run.
     [ValidateSet("release", "quick")]
     [string]$BuildProfile = "release",

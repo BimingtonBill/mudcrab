@@ -6,12 +6,12 @@ clip and reads the crossing's own INFO lines for timing.
 
 # Context
 - Base `af797aeb` (branch phase2/door-preload). Make a LOCAL branch: `git -C C:/Modding/MudcrabProject
-  worktree add -b local/door-evidence D:/Modding-overflow/wt-697 af797aeb`; target
-  `CARGO_TARGET_DIR=D:/Modding-overflow/wt-targets/door-evidence` (keep it: the lead runs the binary).
+  worktree add -b local/door-evidence D:/Mudcrab/worktrees/697 af797aeb`; target
+  `CARGO_TARGET_DIR=D:/Mudcrab/builds/door-evidence` (keep it: the lead runs the binary).
 - Crossing code: `crates/engine/src/door_crossing.rs` (activation = E with the camera ray against the door's
   bounds within 200 units; fade; INFO line `door crossing: fade-in starts` with `milliseconds=`),
   `physics.rs` `TeleportPlayer`, doors: `crates/engine/src/doors.rs` (`LoadDoor`).
-- Data: `D:/Modding-overflow/p2main-doors` (main conversion + door_links). Sven's house, Riverwood:
+- Data: `D:/Mudcrab/p2main-doors` (main conversion + door_links). Sven's house, Riverwood:
   exterior door 0x1CBB0 at Creation (20669.5, -46394.5, -122.1), grid (5,-12), worldspace 60 (0x3C); its link
   arrives inside at (-510.2,-198.9,-16.0) in interior cell 117636 RiverwoodSvensHouse. The inside door 0x1CBAF
   at (-511.5,-254.9,-16.0); its link arrives outside at (20644.0,-46318.4,-121.9), yaw -0.483 rad.
@@ -35,5 +35,5 @@ commands (foreground builds, timeout up to 600000 ms); never kill engine.exe by 
 
 # Report
 Commit hash, the exact command line to run it (start flags for grid (5,-12) worldspace 0x3C with `--assets
-D:/Modding-overflow/p2main-doors`, the env var, the binary path), what it logs, any assumption about the
+D:/Mudcrab/p2main-doors`, the env var, the binary path), what it logs, any assumption about the
 cursor-capture gate.

@@ -53,7 +53,7 @@ walkable once it is open. The player walks through, and the crossing is seamless
 ## Check (you can build and run the engine)
 
 - `cargo build --release -p engine`.
-- `target/release/engine.exe --assets C:/Modding/SkyrimConverted --demo alftand --demo-tour local/tour`
+- `target/release/engine.exe --assets C:/Modding/Mudcrab/SkyrimConverted --demo alftand --demo-tour local/tour`
   must pass 4/4.
 - `... --demo alftand --walk --demo-tour local/tour-walk` must pass 4/4 by walking, with the ±10
   frames around each swap showing no doorway-sized jump. You can see images: look at them.

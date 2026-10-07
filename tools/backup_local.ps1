@@ -1,13 +1,13 @@
 # Nightly copy of local/'s text folders to D: (the user, 2026-10-02).
 #
 # local/ is git-ignored, so PR drafts, review copies, team logs, research and PR evidence have no other
-# copy. Each run writes a dated snapshot under D:\Modding-overflow\local-backup\<yyyy-MM-dd> and keeps
+# copy. Each run writes a dated snapshot under D:\Mudcrab\local-backup\<yyyy-MM-dd> and keeps
 # the newest 14; it only ever removes its own dated snapshot folders. It protects against an accidental
 # delete or `git clean`, not against the PC failing.
 
 $ErrorActionPreference = 'Stop'
 $source = 'C:\Modding\MudcrabProject\local'
-$backupRoot = 'D:\Modding-overflow\local-backup'
+$backupRoot = 'D:\Mudcrab\local-backup'
 $folders = @('pr-drafts', 'review', 'team', 'research', 'pr-evidence')
 $keep = 14
 

@@ -22,11 +22,11 @@ Suspected cause: the brightness the spill compares is measured in the wrong plac
    - Tune on Trader and Sven. Check on Honningbrew and Gerdur, which you never tune on.
 
 ## Build and run rules
-- Build: `cargo build --profile quick --bin engine` with `CARGO_TARGET_DIR=D:/Modding-overflow/portal-quick-target` and `CARGO_BUILD_JOBS=6`.
+- Build: `cargo build --profile quick --bin engine` with `CARGO_TARGET_DIR=D:/Mudcrab/portal-quick-target` and `CARGO_BUILD_JOBS=6`.
   - Other portal coders share that target dir, so cargo's lock runs one build at a time; the machine's memory commit only fits one.
   - Straight after each build, copy `engine.exe` to `local/t232/engine.exe` and run the copy, because the next coder's build overwrites the shared one.
-- Tests and clippy use `--target-dir D:/Modding-overflow/shared-check-target`.
-- Assets: `C:\Modding\SkyrimConverted`.
+- Tests and clippy use `--target-dir D:/Mudcrab/shared-check-target`.
+- Assets: `C:\Modding\Mudcrab\SkyrimConverted`.
 - No timing or benchmark runs.
 
 ## Commits

@@ -21,7 +21,7 @@ Track: portal. The user, in play (2026-09-25): "when closing a door, the portal 
 
 - Unit tests next to the existing `portal.rs` tests: a door `Opening`, `Open` and `Closing` is selected; `Closed` is not; the other conditions still apply.
 - `cargo build --profile quick --bin engine`, then the short tour (the user's standing check):
-  `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t181 --tour-doors 2` must end `tour PASSED after 2 crossings (short tour)`. Read only `local/t181*` under `local/`.
+  `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t181 --tour-doors 2` must end `tour PASSED after 2 crossings (short tour)`. Read only `local/t181*` under `local/`.
 
 ## Report
 

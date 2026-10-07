@@ -20,7 +20,7 @@ terrain LOD. A design document only, no code.
   - FormID slots in tree LOD use the authoring master index (Dragonborn 0x02 -> 0x04);
   - step 3 has the block lookup (origin-relative `div_euclid`), bands, hysteresis and the shared
     commit budget (documented as a new baseline when `--lod` is on).
-- Converted data: `C:/Modding/SkyrimConverted-upstream15/` (DB schema 4 with the `lod_*` tables;
+- Converted data: `C:/Modding/Mudcrab/SkyrimConverted-upstream15/` (DB schema 4 with the `lod_*` tables;
   the LOD GLBs under `meshes/terrain/`).
 
 # What to design

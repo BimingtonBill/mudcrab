@@ -38,7 +38,7 @@ Phase 4 side, so most of the portal feature is not Phase 2 work and must not be 
 | Purpose | contribute to upstream Phase 2, as its README, CONTRIBUTING.md and roadmap describe | the user's seamless-door / portal feature and demos; offered upstream later as a Phase 4 proposal |
 | Branches | `main` (mirror of `origin/main`, never committed to) and `phase2/<topic>`, one per upstream PR, cut from `main` | `portal` (formerly `deepseek-setup`) |
 | Worktree | `C:\Modding\wkj-phase2` | `C:\Modding\MudcrabProject` |
-| Converted assets | `C:\Modding\SkyrimConverted-upstream`, converted by the `phase2` worktree's converter | `C:\Modding\SkyrimConverted` |
+| Converted assets | `C:\Modding\Mudcrab\SkyrimConverted-upstream`, converted by the `phase2` worktree's converter | `C:\Modding\Mudcrab\SkyrimConverted` |
 | Push target | `myfork` (`BimingtonBill/mudcrab`), PR to `realfakenerd/Mudcrab` `main` | never pushed |
 | Commit style | upstream's: conventional commits (`fix(converter): ...`), no `[claude]`/`[deepseek]` prefix, no citations of fork-only files | this repo's: `[claude]` / `[deepseek]` prefixes |
 | Worker task names | `<kind>-<nnn>-p2-<slug>`, numbers 500-599 | `<kind>-<nnn>-portal-<slug>`, numbers 100-199, then 600+ |
@@ -71,7 +71,7 @@ converter manifest 14 and cell cache 3 (`02-core-engine.md`, "Compatibility"); `
 converter 18. Each track converts with its own converter into its own directory. A `phase2/*` PR
 that bumps a schema also updates that Compatibility section.
 
-**Disk is the blocker.** On 2026-09-23 `C:\Modding\SkyrimConverted` was 73.8 GB, the portal `target/`
+**Disk is the blocker.** On 2026-09-23 `C:\Modding\Mudcrab\SkyrimConverted` was 73.8 GB, the portal `target/`
 19.4 GB, and C: had 43 GB free. A second full conversion does not fit beside the first. The user is
 freeing 40+ GB (2026-09-23). Order: the portal session finishes its post-impl-064 reconversion
 first and reports its peak staging space; only then does the Phase 2 session build a `target/` in
@@ -79,10 +79,10 @@ first and reports its peak staging space; only then does the Phase 2 session bui
 
 ## Tonight's upstream conversion (planned 2026-09-23)
 
-Converter: `C:\Modding\wkj-tools\converter-upstream14-pruned.exe`, built from
+Converter: `C:\Modding\Mudcrab\worktrees\p2-tools\converter-upstream14-pruned.exe`, built from
 `phase2/pruned-texture-complete` (upstream `main` plus PR 3, schema 14 unchanged), so the set ends
 `complete` and doubles as PR 3's real-install evidence. Command:
-`converter-upstream14-pruned.exe "<Skyrim SE>\Data" C:\Modding\SkyrimConverted-upstream --cpu-jobs 6 --io-jobs 4`.
+`converter-upstream14-pruned.exe "<Skyrim SE>\Data" C:\Modding\Mudcrab\SkyrimConverted-upstream --cpu-jobs 6 --io-jobs 4`.
 A fresh run re-encodes every texture (hours). Announce "converting" to Portal Dev first; no new
 builds on either track until "past conversion"; nothing reads the output or staging folders;
 budget about 75 GB.
@@ -91,8 +91,8 @@ Result: complete 2026-09-24 07:14, 242,969 converted, 0 skipped, integration pas
 
 ## The schema-15 conversion (2026-09-24)
 
-With 116 GB free, a second set goes into a **new** folder, `C:\Modding\SkyrimConverted-upstream15`,
-so the schema-14 set stays as PR 3's evidence. Converter `C:\Modding\wkj-tools\converter-integration-lod.exe`,
+With 116 GB free, a second set goes into a **new** folder, `C:\Modding\Mudcrab\SkyrimConverted-upstream15`,
+so the schema-14 set stays as PR 3's evidence. Converter `C:\Modding\Mudcrab\worktrees\p2-tools\converter-integration-lod.exe`,
 built from `phase2/integration-lod` (the integration branch plus distant LOD steps 1-3): converter
 schema 15, world DB schema 4. One run lets the reference sheet show trees, plants and the material
 fixes, and gives LOD step 3 its first database. It carries the vertex-alpha branch that is still

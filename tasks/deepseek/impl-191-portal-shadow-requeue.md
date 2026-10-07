@@ -25,7 +25,7 @@ A safety net that makes Bevy look at such entities again, cheaply:
 ## Checks
 
 - Unit tests for the pure selection logic.
-- `cargo build --profile quick --bin engine`. Then reproduce with impl-185's `--tour-dwell`, **5 runs**: `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --demo riverwood --walk --demo-tour local/t191-<n> --tour-doors 2 --tour-dwell 2`.
+- `cargo build --profile quick --bin engine`. Then reproduce with impl-185's `--tour-dwell`, **5 runs**: `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --demo riverwood --walk --demo-tour local/t191-<n> --tour-doors 2 --tour-dwell 2`.
   - Count the runs whose `02-arrived.png` has the roof-beam shadow across the boardwalk. For comparison, `local/captures/2026-09-25_03-57-58/03.png` is broken and `local/captures/2026-09-25_02-01-35/02.png` is correct.
   - Report the counts before (current portal) and after the fix.
   - Add an info log line saying how many entities the safety net re-queued per crossing.

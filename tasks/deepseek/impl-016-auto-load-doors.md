@@ -21,7 +21,7 @@ Make auto-load doors cross on contact; keep E for all other load doors.
 2. **Streaming / database**: set `auto_load` for doors whose base object marks them as auto-load - the
    base's `statics.editor_id` starting `AutoLoadDoor` or its `model_path` containing `AutoLoadMarker`
    (case-insensitive). Check the real database read-only
-   (`C:/Modding/SkyrimConverted/skyrim_world.db`, a script under `tools/research/` with `mode=ro`) for
+   (`C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`, a script under `tools/research/` with `mode=ro`) for
    how many load doors match, and whether other editor-id patterns are auto-load too (look at the base
    `DOOR` records' flags if you can: Skyrim `DOOR` has an "automatic door" flag - UESP
    "Skyrim Mod:Mod File Format/DOOR"; if that flag is available in the data, prefer it and say so).

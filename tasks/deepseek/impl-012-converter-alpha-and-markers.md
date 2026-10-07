@@ -57,9 +57,9 @@ skipped the same way other non-rendering models are - follow the existing rule, 
 ## Real-data check (read-only)
 
 After your tests pass, if feasible within the crate's reader API, convert one real affected NIF from
-the extracted copies under `C:/Modding/SkyrimConverted/vfs/meshes/` in a test marked `#[ignore]`
+the extracted copies under `C:/Modding/Mudcrab/SkyrimConverted/vfs/meshes/` in a test marked `#[ignore]`
 (pick one research-011 names, e.g. an ice pile) and assert its materials are opaque. Do not run the full
-converter and do not write into `C:/Modding/SkyrimConverted`.
+converter and do not write into `C:/Modding/Mudcrab/SkyrimConverted`.
 
 ## Scope
 

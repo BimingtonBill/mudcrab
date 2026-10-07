@@ -31,7 +31,7 @@ their edge.
      (`lod_tree_instances_per_frame`, default in the design), counted in the shared commit budget.
      A tree block's root is shown once all its instances are spawned.
   7. `--lod` turns trees on with the other kinds; `--lod-trees off` turns them off alone.
-- Step 2 data (converted, read-only): `C:/Modding/SkyrimConverted-upstream15/` has 120 tree types
+- Step 2 data (converted, read-only): `C:/Modding/Mudcrab/SkyrimConverted-upstream15/` has 120 tree types
   and 43,333 instances in `lod_tree_type` / `lod_tree_instance`. Tree-instance block keys are
   absolute cell coordinates (see design section 9, finding 4).
 - Released LOD roots use `try_despawn`, as in the rest of `lod.rs`.

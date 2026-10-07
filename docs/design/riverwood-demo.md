@@ -1,7 +1,7 @@
 # Riverwood demo: the data behind a second walkable demo
 
 **Status:** research, 2026-09-23 (research-055). Read from the converted database
-(`C:/Modding/SkyrimConverted/skyrim_world.db`, converter schema 17 / DB schema 5) and from
+(`C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`, converter schema 17 / DB schema 5) and from
 `Skyrim.esm`'s `LAND` records. Nothing was rendered: every number below is a data measurement,
 and the poses are proposals to be refined by rendering, exactly as `research-018` did for Alftand
 (`docs/research/reference-shot-poses.md`).
@@ -281,7 +281,7 @@ references whose model fails the bounds gate):
   `BucketCarryPourMarker`, `FXSmokeRiverwoodSmith01`, `FXSmokeChimney02`, `FXMistMillWheel01` (1
   each). The four FX ones I opened are **empty glb scenes**, so the gate is right about them.
 - **Models present:** all 182 distinct models referenced in the village box have a converted glb
-  under `C:/Modding/SkyrimConverted/meshes` (no missing asset).
+  under `C:/Modding/Mudcrab/SkyrimConverted/meshes` (no missing asset).
 - **126 references have no `statics` row**: 7 `IDLM`, 6 `MISC`, 5 `ARMO`, 4 `WEAP`, 3 `NPC_`,
   3 `APPA`, 2 `LIGH`, 1 `SOUN`, 1 `ALCH` — items, idle markers and the two exterior lights.
 - **Space lighting:** all six interior templates resolve, and the Tamriel worldspace has a

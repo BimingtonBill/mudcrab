@@ -14,7 +14,7 @@ The user: "occlusion culling and rendering only what the player sees", for the w
 2. **Skyrim's own data.**
    - Interiors are split into rooms by `RoomMarker` references connected by `PortalMarker`s (`XRMR`, `XLRM`, `XPOD`, `XPTL` subrecords on REFRs).
    - Exteriors carry occlusion planes (`PlaneMarker` / occlusion box references, `XOCP`) and multibounds (`BSMultiBoundNode` in NIFs; research-190 mentions portal code handling them).
-   - Does the converter keep any of this? Look at `crates/converter/src/esm/`, the world DB (`C:/Modding/SkyrimConverted/skyrim_world.db`, read-only `mode=ro`: count references whose base is a RoomMarker, PortalMarker or PlaneMarker, and whose data blob contains XRMR, XPOD or XOCP) and `docs/`.
+   - Does the converter keep any of this? Look at `crates/converter/src/esm/`, the world DB (`C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`, read-only `mode=ro`: count references whose base is a RoomMarker, PortalMarker or PlaneMarker, and whose data blob contains XRMR, XPOD or XOCP) and `docs/`.
    - How many interiors in Skyrim.esm have room markers?
 3. **The doorway (portal).**
    - After impl-188 (skip when off screen) and impl-189 (render only the doorway's screen rectangle, `sub_camera_view`), what is left? The doorway can be on screen but hidden behind a wall.

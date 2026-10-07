@@ -8,7 +8,7 @@ Acceptance: cargo test -p engine --lib,cargo clippy --workspace --all-targets --
 
 Track: portal (the engine the demo renders with). Look-gaps item 3 (`docs/research/look-gaps-2026-09-24.md`): every hearth fire, candle flame and light shaft renders as a white-grey shape. Cause, found by render on the converted assets: Skyrim's effect textures are **greyscale** (`textures/effects/fxfireatlas04`), and the game colours them through a second **palette** texture. No engine applies the palette, so fire comes out white.
 
-## What the converted data carries (schema 20, `C:\Modding\SkyrimConverted`, read-only)
+## What the converted data carries (schema 20, `C:\Modding\Mudcrab\SkyrimConverted`, read-only)
 
 An effect-shader material (`BSEffectShaderProperty`) in a GLB, e.g. `meshes/clutter/woodfires/fireplacewood01burning.glb`, material `Flames:0`:
 - `extensions.OPEN_SKYRIM_material`: `"shaderFamily": "effect"`, `"shaderFlags1": 3221225592` (0xC0000078), `"textureSlots": [{"semantic": "greyscale", "slot": 1, "texture": 1, "colorSpace": "linear"}]` - `texture` is the glTF texture index of the palette.
@@ -32,7 +32,7 @@ An effect-shader material (`BSEffectShaderProperty`) in a GLB, e.g. `meshes/clut
 ## Checks
 
 - Unit tests: flag parsing (bit 4, bit 5, neither), the palette slot lookup from the extension JSON, the uniform values, and the swap in a small Bevy `App` (as `streaming.rs`'s `a_validated_scene_is_swapped_onto_the_snow_material` does for snow).
-- `cargo build --profile quick --bin engine`, then render the fire shots: `target/quick/engine.exe --assets C:\Modding\SkyrimConverted --shots tasks/deepseek/impl-170-fire-shots.json --shots-out local/t170`. Look at `RW-09-inn-common-room.png` and `SR-interior-Candlehearth_Hall.png` in `local/t170` and say what colour the hearth fire is now. (Read only `local/t170` under `local/`.)
+- `cargo build --profile quick --bin engine`, then render the fire shots: `target/quick/engine.exe --assets C:\Modding\Mudcrab\SkyrimConverted --shots tasks/deepseek/impl-170-fire-shots.json --shots-out local/t170`. Look at `RW-09-inn-common-room.png` and `SR-interior-Candlehearth_Hall.png` in `local/t170` and say what colour the hearth fire is now. (Read only `local/t170` under `local/`.)
 - Everything else draws as before: a non-effect material and an effect material without the palette flags are not swapped.
 
 ## Report

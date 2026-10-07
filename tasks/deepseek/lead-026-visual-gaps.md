@@ -9,7 +9,7 @@ into coding tasks.
   - The workspace is at `C:/Modding/MudcrabProject`, with the crates `converter`, `engine`
     and `shared`.
   - The converter turns Skyrim.esm and the BSA archives into glTF, KTX2 and a SQLite world
-    database: `C:/Modding/SkyrimConverted/skyrim_world.db`, read-only. Open it with the URI
+    database: `C:/Modding/Mudcrab/SkyrimConverted/skyrim_world.db`, read-only. Open it with the URI
     `file:...?mode=ro`.
   - The game install is read-only at `C:/Games/Steam/steamapps/common/Skyrim Special Edition`.
   - `tools/research/` has Python helpers for the database (`world_db.py`, `uesp_probe.py`,
