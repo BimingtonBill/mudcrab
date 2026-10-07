@@ -84,6 +84,10 @@ before starting any `phase2/*` branch or moving work between tracks.
 >   such push in one summary table for the user the same day. Still the user's yes each time:
 >   opening a new PR (drafts too), marking a draft ready, any reply to a person, anything on
 >   someone else's PR, and anything that is not a fast-forward.
+> - **Standing yes for comments on our own items (the user, 2026-10-07).** Upstream Dev may post
+>   comments on issues and PRs opened by BimingtonBill without asking each time (AI-labelled, low
+>   noise, listed in the evening table). Comments on anyone else's items and replies to people still
+>   need the user's yes.
 > - Reading GitHub (`gh pr view`, `gh api` GETs, `git fetch`) is fine for every session.
 
 > **Handed-out jobs only (the user, 2026-09-30).** Dev sessions work only on jobs the user or
