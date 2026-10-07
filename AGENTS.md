@@ -289,6 +289,9 @@ only if the user gives one.
 - **One build folder per session**, never shared between sessions; combined or branch-vs-main
   checks use a throwaway folder deleted afterwards. A shared folder mixed worktrees on 2026-10-02
   (an engine built against another branch's `shared` crate).
+- **Layout and naming (2026-10-07):** `local/LAYOUT.md` says where things go in `local/` (handover/,
+  logs/, archive/, bin/) and how new files and folders are named (`<track>-<subject>-<YYYY-MM-DD>`, existing
+  task ids unchanged); paths moved in the 2026-10-07 sweep are mapped in `local/disk/moves-2026-10-07.tsv`.
 - **Every folder a session creates** under `C:\Modding` or `D:\Modding-overflow` (build folder,
   worktree, evidence or data copy, scratch) gets an `OWNER.txt` the moment it is made
   (`python tools/disk_report.py --template`): owner, purpose, class, keep-until (`pr:N`,
