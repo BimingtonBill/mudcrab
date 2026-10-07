@@ -481,14 +481,16 @@ CREATE TABLE IF NOT EXISTS room_bounds (       -- one row per interior RoomMarke
 );
 CREATE INDEX IF NOT EXISTS idx_room_bounds_cell ON room_bounds(cell_id);
 
-CREATE TABLE IF NOT EXISTS room_portals (      -- one row per interior PortalMarker with an XPRM
-    ref_id INTEGER PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS room_portals (      -- one row per XPOD pair of an interior PortalMarker with an XPRM
+    ref_id INTEGER NOT NULL,                   -- references.id of the marker; NOT unique, see pair_index
+    pair_index INTEGER NOT NULL DEFAULT 0,     -- position of the (origin, destination) pair in XPOD
     cell_id INTEGER NOT NULL,
     pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
     rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
     half_x REAL NOT NULL, half_z REAL NOT NULL, -- doorway half-width and half-height
-    room_a INTEGER,                            -- XPOD[0]; NULL when 0, absent or not a room of this cell
-    room_b INTEGER                             -- XPOD[1]; same
+    room_a INTEGER,                            -- the pair's origin; NULL when 0, absent or not a room of this cell
+    room_b INTEGER,                            -- the pair's destination; same
+    PRIMARY KEY (ref_id, pair_index)
 );
 CREATE INDEX IF NOT EXISTS idx_room_portals_cell ON room_portals(cell_id);
 
@@ -520,7 +522,19 @@ Columns and rules:
   (`INAM`) are decoded for the lighting work in #129-#135; nothing in the engine uses them yet.
 - **`room_portals`**: a portal's doorway is the marker's local X-Z rectangle (normal along local
   +Y); `half_x`/`half_z` are its half-width and half-height. A portal marker without `XPRM`
-  has no size and gets no row.
+  has no size and gets no row. `XPOD` is an array of 8-byte (origin, destination) FormID pairs
+  (xEdit 4.1.5f defs, `Core/wbDefinitionsTES5.pas`: `wbArray(XPOD, 'Portal Data',
+  wbStruct('References', [wbFormIDCk('Origin', [REFR, NULL]), wbFormIDCk('Destination',
+  [REFR, NULL])]))`), so a portal gets **one row per pair**, numbered by `pair_index` from 0
+  in stored order; the geometry columns repeat on every row. A portal whose `XPOD` is absent,
+  empty or shorter than one pair gets one row with `pair_index` 0 and both sides NULL. Bytes
+  after the last whole pair are ignored. Every `XPOD` in the official masters is one pair, so
+  vanilla output has `pair_index` 0 only. **Readers must not assume `ref_id` is unique**: join
+  or group on `(ref_id, pair_index)`, or on `ref_id` and expect several rows. The key changed
+  from `ref_id` alone, and `create_tables` drops an older-shaped `room_portals` (no
+  `pair_index`) so it is recreated; the table is derived data, rebuilt by the next full export.
+  In the plugin remap `XPOD` is an array of FormIDs: every four bytes are remapped, and a
+  length that is not a multiple of four is dropped with a warning, like any other FormID array.
 - **`room_links`**: one row per `XLRM` as stored on the room, with no mirror rows. A link joins
   rooms that may have no portal between them but must be seen together: if one is visible, so is
   the other. The target is stored as written, even if it is not a `room_bounds` row.
@@ -542,7 +556,10 @@ Columns and rules:
   lighting question, not geometry), decals (`TXST`), and bases with no geometry (`IDLM`, `SOUN`,
   `ASPC`). In the all-plugins conversion these are 22,251 of 364,262 pivot rows.
 - **`room_graph_stats`**: the counters the conversion report shows in `integration-report.json`
-  under `room_graph`: `rooms`, `portals`, `links`, `portals_with_missing_side`,
+  under `room_graph`: `rooms`, `portals` (portal markers written, not rows), `links`,
+  `portals_with_missing_side` (`room_portals` rows with a NULL side, so a portal with several
+  pairs can add several), `portals_with_extra_pairs` (markers whose `XPOD` holds more than one
+  pair), `portals_with_trailing_xpod_bytes` (markers whose `XPOD` length is not a multiple of 8),
   `non_box_rooms_skipped`, `portals_without_size_skipped`, `invalid_markers_skipped` (rooms and portals with a non-finite size or transform), `objects_in_no_room` and
   `objects_in_several_rooms` (both by pivot), and `overlap_rows`.
 

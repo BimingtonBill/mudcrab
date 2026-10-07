@@ -29,7 +29,7 @@ Subrecords on a marker reference, besides the usual `NAME` and `DATA` (position,
 |---|---|---|---|
 | `XPRM` | 32 | `float[3]` half-extents, `float[3]` colour/255, `float` unknown (0.2 room, 0.25 portal), `u32` shape (1 box, 2 sphere, 3 portal box) | every room, 2,611 portals |
 | `XMBO` | 12 | `float[3]`, equal to `XPRM[0..12]` on every room (the Creation Kit rejects a mismatch) | every room |
-| `XPOD` | 8 | two `u32` FormIDs: the rooms on either side | 2,592 portals (121 with the second id 0, 20 without `XPOD`) |
+| `XPOD` | 8 per pair | array of (origin, destination) `u32` FormID pairs (xEdit 4.1.5f defs, `wbArray` of a two-FormID struct): the rooms on either side; the masters only have one pair | 2,592 portals (121 with the second id 0, 20 without `XPOD`) |
 | `XRMR` | 4 | `u8` count of `XLRM` that follow, `u8` flags, `u16` unknown (0 or 1) | 1,991 rooms |
 | `LNAM` | 4 | `u32` FormID: lighting template for the room | follows `XRMR` when flag `0x80` is set |
 | `INAM` | 4 | `u32` FormID: image space for the room | follows `XRMR` when flag `0x40` is set |
@@ -79,14 +79,16 @@ CREATE TABLE IF NOT EXISTS room_bounds (       -- one row per interior RoomMarke
 );
 CREATE INDEX IF NOT EXISTS idx_room_bounds_cell ON room_bounds(cell_id);
 
-CREATE TABLE IF NOT EXISTS room_portals (      -- one row per interior PortalMarker
-    ref_id INTEGER PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS room_portals (      -- one row per XPOD pair of an interior PortalMarker
+    ref_id INTEGER NOT NULL,                   -- not unique: one row per XPOD pair
+    pair_index INTEGER NOT NULL DEFAULT 0,
     cell_id INTEGER NOT NULL,
     pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
     rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
     half_x REAL NOT NULL, half_z REAL NOT NULL, -- doorway half-width and half-height
-    room_a INTEGER,                            -- XPOD[0]; NULL when 0, absent or not a room_bounds row of the same cell
-    room_b INTEGER                             -- XPOD[1]; same
+    room_a INTEGER,                            -- the pair's origin; NULL when 0, absent or not a room_bounds row of the same cell
+    room_b INTEGER,                            -- the pair's destination; same
+    PRIMARY KEY (ref_id, pair_index)
 );
 CREATE INDEX IF NOT EXISTS idx_room_portals_cell ON room_portals(cell_id);
 
@@ -130,7 +132,8 @@ Why this shape:
    layouts today (`crates/converter/src/esm/mod.rs`, `form_id_layout`), so they keep plugin-local
    numbering. That is invisible for Skyrim.esm (slot 0) and wrong for any mod's markers. Add them
    to the layout table, with a test beside `every_covered_reference_and_cell_field_is_remapped_at_its_offsets`
-   (`crates/converter/tests/plugin_references.rs`).
+   (`crates/converter/tests/plugin_references.rs`). `XPOD` is an array of pairs, so it is an
+   `Array { stride: 4 }` layout and a mod's portal with several pairs is remapped in full.
 2. **Graph tables.** In `export_records` (`crates/converter/src/esm/exporter.rs`), after the
    reference loop, read the markers from the parsed subrecords (not from the stored blob, which is
    rkyv's layout). Rebuild the tables each export, as the grass tables are.

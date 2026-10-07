@@ -220,7 +220,9 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              plugin_path TEXT PRIMARY KEY, file_hash BLOB NOT NULL, last_converted INTEGER NOT NULL
          );"#
     )?;
-    // Optional interior room graph (db-schema.md section 15); an older reused database gains it here.
+    // Optional interior room graph (db-schema.md section 15); an older reused database gains it
+    // here, and an older-shaped `room_portals` (no `pair_index`) is dropped to be recreated.
+    crate::esm::rooms::drop_outdated_room_portals(conn)?;
     conn.execute_batch(crate::esm::rooms::ROOM_TABLES_SQL)?;
     conn.execute(
         "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
@@ -1847,6 +1849,134 @@ mod tests {
         assert_eq!(size, (40.0, 60.0));
         assert_eq!(report.portals, 4);
         assert_eq!(report.portals_with_missing_side, 3);
+    }
+
+    /// A portal marker whose `XPOD` is the given raw bytes.
+    fn portal_with_xpod(form_id: u32, cell: u32, xpod: Vec<u8>) -> RawRecord {
+        marker(
+            form_id,
+            cell,
+            PORTAL_MARKER_BASE,
+            [0.0; 3],
+            [0.0; 3],
+            vec![(b"XPRM", xprm([40.0, 1.0, 60.0], 3)), (b"XPOD", xpod)],
+        )
+    }
+
+    fn portal_rows(conn: &Connection, id: u32) -> Vec<(i64, Option<u32>, Option<u32>)> {
+        conn.prepare(
+            "SELECT pair_index, room_a, room_b FROM room_portals WHERE ref_id=?1 ORDER BY pair_index",
+        )
+        .unwrap()
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_portal_with_several_xpod_pairs_gets_one_row_per_pair() {
+        let (conn, report) = export_rooms(vec![
+            interior_cell(0x100),
+            room(0x1001, 0x100, [0.0; 3], [0.0; 3], [10.0; 3], vec![]),
+            room(0x1002, 0x100, [50.0, 0.0, 0.0], [0.0; 3], [10.0; 3], vec![]),
+            room(0x1003, 0x100, [90.0, 0.0, 0.0], [0.0; 3], [10.0; 3], vec![]),
+            // Two pairs.
+            portal_with_xpod(
+                0x3001,
+                0x100,
+                [word(0x1001), word(0x1002), word(0x1002), word(0x1003)].concat(),
+            ),
+            // One pair and four trailing bytes, which are ignored and counted.
+            portal_with_xpod(
+                0x3002,
+                0x100,
+                [word(0x1001), word(0x1002), word(0x1003)].concat(),
+            ),
+            // The old shape: exactly one pair.
+            portal_with_xpod(0x3003, 0x100, [word(0x1002), word(0x1003)].concat()),
+            // Shorter than one pair: one row, NULL sides, counted as trailing bytes.
+            portal_with_xpod(0x3004, 0x100, word(0x1001)),
+            // Empty XPOD, and none at all.
+            portal_with_xpod(0x3005, 0x100, Vec::new()),
+            portal(0x3006, 0x100, None),
+        ]);
+        assert_eq!(
+            portal_rows(&conn, 0x3001),
+            vec![
+                (0, Some(0x1001), Some(0x1002)),
+                (1, Some(0x1002), Some(0x1003))
+            ]
+        );
+        assert_eq!(
+            portal_rows(&conn, 0x3002),
+            vec![(0, Some(0x1001), Some(0x1002))]
+        );
+        assert_eq!(
+            portal_rows(&conn, 0x3003),
+            vec![(0, Some(0x1002), Some(0x1003))]
+        );
+        for id in [0x3004, 0x3005, 0x3006] {
+            assert_eq!(portal_rows(&conn, id), vec![(0, None, None)], "{id:X}");
+        }
+        // Geometry repeats on every row of a portal.
+        let sizes: Vec<(f64, f64)> = conn
+            .prepare("SELECT half_x, half_z FROM room_portals WHERE ref_id=0x3001")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(sizes, vec![(40.0, 60.0); 2]);
+        // `portals` counts markers; the missing-side counter counts rows (3004-3006).
+        assert_eq!(report.portals, 6);
+        assert_eq!(report.portals_with_missing_side, 3);
+        assert_eq!(report.portals_with_extra_pairs, 1);
+        assert_eq!(report.portals_with_trailing_xpod_bytes, 2);
+        let read = rooms::RoomGraphReport::read(&conn).unwrap();
+        assert_eq!(read, report);
+    }
+
+    #[test]
+    fn an_older_room_portals_table_is_recreated_with_pair_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The shape before `pair_index`: one row per portal reference.
+        conn.execute_batch(
+            "CREATE TABLE room_portals (
+                 ref_id INTEGER PRIMARY KEY, cell_id INTEGER NOT NULL,
+                 pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
+                 rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
+                 half_x REAL NOT NULL, half_z REAL NOT NULL,
+                 room_a INTEGER, room_b INTEGER
+             );
+             CREATE INDEX idx_room_portals_cell ON room_portals(cell_id);
+             INSERT INTO room_portals VALUES (1, 2, 0, 0, 0, 0, 0, 0, 1, 1, NULL, NULL);",
+        )
+        .unwrap();
+        create_tables(&conn).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('room_portals') ORDER BY cid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"pair_index".to_string()), "{columns:?}");
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM room_portals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "derived data is rebuilt by the next export");
+        // The recreated table takes two pairs of one reference; a second pass keeps them.
+        conn.execute_batch(
+            "INSERT INTO room_portals(ref_id, pair_index, cell_id, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, half_x, half_z)
+             VALUES (1, 0, 2, 0, 0, 0, 0, 0, 0, 1, 1), (1, 1, 2, 0, 0, 0, 0, 0, 0, 1, 1);",
+        )
+        .unwrap();
+        create_tables(&conn).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM room_portals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
     }
 
     #[test]
