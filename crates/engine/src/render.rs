@@ -1619,7 +1619,11 @@ mod tests {
         harness.spawn_water(Vec3::new(0.0, 0.0, -500.0), CELL_WATER_HALF_EXTENTS);
         harness
             .app
-            .add_plugins(AssetPlugin::default())
+            .add_plugins((
+                bevy::app::TaskPoolPlugin::default(),
+                bevy::time::TimePlugin,
+                AssetPlugin::default(),
+            ))
             .init_asset::<WaterMaterial>()
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(16)));
         let handle = harness
