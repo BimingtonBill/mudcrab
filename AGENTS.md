@@ -24,6 +24,10 @@ Claude (Claude Code) leads the work on this checkout and delegates bounded tasks
 3. If `git status` shows uncommitted changes you did not make, stop and ask the user before touching them. Another session or a worker may be mid-task. `tools/ds_status.ps1` shows whether a worker is running.
 4. Read the **Publishing rule** under "Working together": nothing leaves this machine for GitHub
    (a push, a PR, a comment) except through Upstream Dev, with the user's permission.
+5. Read the current engine goal and the foundation demo gate in `local/plans/foundations-to-portal.md`
+   (the user, 2026-10-07): the portal demo is to hold a stable 160 fps while travelling and through
+   load doors, with no shortcuts; and no engine-foundation draft or PR opens until it has run in the
+   portal demo and the user has seen it there.
 
 ## Two tracks: Phase 2 first, portal second
 
@@ -75,7 +79,7 @@ before starting any `phase2/*` branch or moving work between tracks.
 >   given for. (Job hand-outs are different: a job the user approved in Upstream Dev's session and
 >   Upstream Dev hands to a dev session is a valid hand-out.)
 > - Exception (the user, 2026-09-28): Upstream Dev may reply to CodeRabbit (the bot) on our PRs
-  without asking, AI-labelled. Replies to people still need the user's yes.
+>   without asking, AI-labelled. Replies to people still need the user's yes.
 > - **Standing yes for fix pushes (the user, 2026-10-02).** Upstream Dev may push, without asking
 >   each time, a fix to one of OUR already-open PRs when all hold: it answers findings someone
 >   raised (CodeRabbit, a reviewer, our own pre-open review), no new features; the dev session's
@@ -199,19 +203,25 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
   4.1.5f is installed at `C:\Tools\SSEEdit` (`SSEEdit64.exe` GUI, `SSEDump64.exe` command-line
   dumper). Use it at these points:
   - **Before decoding or changing any record or field** (converter or engine): read how xEdit
-    defines it (its `Core/wbDefinitions*.pas` on GitHub, TES5Edit/TES5Edit) and cite "xEdit 4.1.5f
-    defs" in the note, brief or PR. Where xEdit and UESP or our own reading disagree, say so.
+    defines it in `Core/wbDefinitionsTES5.pas` **at the `xedit-4.1.5f` tag** of TES5Edit/TES5Edit
+    (the default branch is newer than what is installed) and cite "xEdit 4.1.5f defs, file:line" in
+    the note, brief or PR. Where xEdit and UESP or our own reading disagree, say so.
   - **Bug triage when something looks wrong in game** (a mesh that shouldn't show, a wrong light,
-    a missing door): check the record's fields and flags in xEdit first, to tell a data or converter
-    fault from an engine fault. The user can open records in the GUI for a session; workers use
-    the dumper.
-  - **Answer-key checks** of converter output against xEdit's winning records belong to Chef's
-    #157/#158 programme upstream: help there (via Upstream Dev), never build a rival oracle.
-  - Rules: read only, never save a plugin (always "don't save" on exit; dumps write outside game
-    and `SkyrimConverted*` folders). xEdit is open source (MPL-2.0), so reading and citing it is
-    within the clean-room rules; copying or translating its code into Mudcrab (MIT/Apache) needs
-    the team's licence decision first. Running it on game data is CPU and disk work: not during a
-    booked timing window.
+    a missing door): check that record's fields and flags in xEdit first, to tell a data or
+    converter fault from an engine fault. The user can open records in the GUI for a session;
+    workers use the dumper. A single record or cell is triage; a systematic comparison is the next
+    point.
+  - **Answer-key checks** (systematic comparison of converter output against xEdit's winning
+    records) belong to Chef's #157/#158 programme upstream: help there (via Upstream Dev), never
+    build a rival oracle.
+  - **How workers use it:** the brief adds `-AddDir C:/Tools/SSEEdit`; dump output goes to
+    `D:\Modding-overflow\scratch\ssedit-dumps` (OWNER.txt, class A), never into the game folder or
+    `SkyrimConverted*`. Read only: never save a plugin (always "don't save" on exit). Running it on
+    game data is CPU and disk work: not during a booked timing window.
+  - **Clean room:** read and cite only. Never copy or translate xEdit code into Mudcrab, whatever
+    its licence (the clean-room rule, `local/research/reference/skyrim-re-digest.md`). Using xEdit
+    as a separate tool in the pipeline (scripts, or a fork kept in its own MPL-2.0 repository), as
+    Chef proposed on 2026-10-07, is the user's decision taken with upstream, not a worker's.
 - **Installed dev tools (2026-09-26):** `cargo nextest run` matches CI's test runner, so prefer it
   locally; it still compiles, so the build rules above apply. For render bugs, capture a frame
   before guessing from screenshots: RenderDoc (`C:\Program Files\RenderDoc\qrenderdoc.exe`, run the
