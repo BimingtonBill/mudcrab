@@ -336,7 +336,16 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // an exact Creation position, and takes no input.
         app.add_systems(Update, fly_camera);
     }
-    if atmosphere_applies(interactive, app.world().resource::<EngineConfig>()) {
+    let atmosphere = {
+        let config = app.world().resource::<EngineConfig>();
+        let has_lod = has_lod_data(config, runtime_data.as_ref().map(|(database, ..)| database));
+        atmosphere_applies(
+            interactive,
+            config.effective_terrain_radius(has_lod),
+            config.stream_radius,
+        )
+    };
+    if atmosphere {
         // The sky, the fog, the ambient and the per-space lighting, in one call: the plugin owns
         // the clear colour and the system that writes them (`crate::atmosphere`).
         app.add_plugins(crate::atmosphere::AtmospherePlugin);
@@ -2033,13 +2042,18 @@ fn setup_synthetic_benchmark(
 }
 
 /// How far the camera draws: the far corner of the terrain ring and a margin, so the whole ring is
-/// inside it. With the ring off (a `terrain_radius` at or below `stream_radius`) this is what it
-/// was before the ring existed, `CELL_SIZE * (stream_radius + 2) * 2`.
+/// inside it. With the ring off (an effective `terrain_radius` at or below `stream_radius`) this is
+/// what it was before the ring existed, `CELL_SIZE * (stream_radius + 2) * 2` - and a worldspace
+/// whose LOD draws beyond the ring is reached by `crate::streaming::lod`'s own extension of the far
+/// plane when its first chunks arrive.
+///
+/// `terrain_radius` is the ring the run draws here, not the configured one:
+/// [`EngineConfig::effective_terrain_radius`] of the worldspace the camera starts in.
 ///
 /// A long far plane costs almost nothing: Bevy uses reverse-Z, whose precision at a given distance
 /// depends on the near plane and the float's mantissa, not on where the far plane is.
-pub(crate) fn camera_far_plane(config: &EngineConfig) -> f32 {
-    let radius = config.terrain_radius.max(config.stream_radius).max(1);
+pub(crate) fn camera_far_plane(stream_radius: i32, terrain_radius: i32) -> f32 {
+    let radius = terrain_radius.max(stream_radius).max(1);
     crate::world::components::CELL_SIZE * (radius + 2) as f32 * 2.0
 }
 
@@ -2215,6 +2229,18 @@ pub(crate) fn sun_shadow_cascades(
 /// at the origin of the world grid: the acceptance screenshot is taken from far above it, the
 /// walk-around view from behind and above it. [`sun_shadow_cascades`] measures its range from the
 /// camera, so the offsets live here rather than in two places.
+/// Whether the worldspace the run is configured with draws its own terrain LOD data, which decides
+/// the ring it starts with ([`EngineConfig::effective_terrain_radius`]). Read through the world
+/// database when the run opened one; a run that streams no world (a fixture, `--benchmark-only`)
+/// has none, and so does a database converted before LOD existed.
+///
+/// This is the configured worldspace and not the active one: it is what the camera is placed in
+/// before the first frame, and every later space change resolves its own
+/// ([`crate::streaming::plan_cells`], [`crate::atmosphere`]).
+fn has_lod_data(config: &EngineConfig, database: Option<&WorldDatabase>) -> bool {
+    database.is_some_and(|database| database.has_lod_for(config.worldspace_id))
+}
+
 fn camera_offset(config: &EngineConfig) -> Vec3 {
     if config.acceptance_screenshot.is_some() {
         config
@@ -2228,6 +2254,7 @@ fn camera_offset(config: &EngineConfig) -> Vec3 {
 fn setup_world(
     mut commands: Commands,
     config: Res<EngineConfig>,
+    database: Option<Res<WorldDatabase>>,
     ground_height: Option<Res<InitialCameraGroundHeight>>,
     start_pose: Option<Res<crate::portal::StartPose>>,
     tuning: Option<Res<MovementTuning>>,
@@ -2257,7 +2284,10 @@ fn setup_world(
         },
         |pose| pose.0,
     );
-    let far = camera_far_plane(&config);
+    let far = camera_far_plane(
+        config.stream_radius,
+        config.effective_terrain_radius(has_lod_data(&config, database.as_deref())),
+    );
     commands.spawn((
         Camera3d::default(),
         crate::color_pipeline::SceneColorPipeline::default(),
@@ -3298,7 +3328,9 @@ mod tests {
     #[test]
     fn the_default_far_plane_and_fog_cover_the_terrain_ring() {
         let config = EngineConfig::default();
-        let far = camera_far_plane(&config);
+        // The ring this run draws where the worldspace has no LOD data, which is what this test is
+        // about: the far plane is measured from the ring the run draws, not the configured one.
+        let far = camera_far_plane(config.stream_radius, config.effective_terrain_radius(false));
         let cell = crate::world::components::CELL_SIZE;
         assert_eq!(config.stream_radius, 2);
         assert_eq!(config.terrain_radius, crate::config::DEFAULT_TERRAIN_RADIUS);
@@ -3345,10 +3377,14 @@ mod tests {
     /// plane is the one the engine drew the inner grid with before the ring existed.
     #[test]
     fn without_a_ring_the_far_plane_and_the_fog_are_what_they_were() {
-        let far = camera_far_plane(&EngineConfig {
-            terrain_radius: 2,
-            ..EngineConfig::default()
-        });
+        let far = camera_far_plane(
+            2,
+            EngineConfig {
+                terrain_radius: 2,
+                ..EngineConfig::default()
+            }
+            .effective_terrain_radius(true),
+        );
         assert_eq!(far, crate::world::components::CELL_SIZE * 4.0 * 2.0);
 
         let DistanceFog {
@@ -3420,7 +3456,10 @@ mod tests {
             linear(exterior_fog(2, 2, Some(horizon), SKY_COLOR)).1,
             horizon
         );
-        assert!(linear(exterior_fog(2, 2, Some(cell), SKY_COLOR)).0 > camera_far_plane(&defaults));
+        assert!(
+            linear(exterior_fog(2, 2, Some(cell), SKY_COLOR)).0
+                > camera_far_plane(defaults.stream_radius, 2)
+        );
     }
 
     /// The sun's cascades as the demo's look (`current`) asks for them.
@@ -3525,7 +3564,13 @@ mod tests {
     /// draws - while staying on the camera, so a crossing does not rebuild the pipeline.
     #[test]
     fn the_fog_of_an_interior_cannot_reach_its_geometry() {
-        let far = camera_far_plane(&EngineConfig::default());
+        let defaults = EngineConfig::default();
+        // The far plane an interior run starts with: its exterior's ring, which is the largest one
+        // a run of these tests draws.
+        let far = camera_far_plane(
+            defaults.stream_radius,
+            defaults.effective_terrain_radius(false),
+        );
         let DistanceFog {
             falloff: FogFalloff::Linear { start, end },
             ..
