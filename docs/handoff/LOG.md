@@ -3,6 +3,15 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Hermes trial (water merge into portal)
+
+Track: Portal. Nothing pushed. Job: the user's yes in the Hermes session ("start on water merge"); the morning item from Portal Dev's handoff aa395beb.
+
+- **Water merge done.** `git merge --no-ff 8acbdb7c` on `portal`: rerere replayed both recorded conflicts (app.rs, render.rs) from the saved resolution; verified the merged result against `local/plans/portal-water-merge-resolution-2026-10-08.patch` by reading every hunk: app.rs fixture carries `.with_pinned_clock(1.0)`; render.rs has portal's layer block (moved lower) + the branch's TEMPORARY 12 h wrap + both embedded shaders + shared-clock system list + all four water tests (`advancing_time_leaves_water_materials_unmodified`, `a_still_view_does_not_rewrite_the_reflection_camera`, `water_settings_fields_match_the_shader_struct`, `only_a_pinned_water_clock_reads_the_material_time`); water.wgsl reads `globals.time` with the pinned-clock select; physics.rs / coordinates.rs / CI yaml / SPEC.md / dummy-content perf test from the branch. Merge commit **77bb484b** on `portal`. No `animate_water_materials` remains.
+- **Checks, in a fresh build folder** `C:/Modding/Mudcrab/builds/portal-hermes-target` (OWNER.txt written, class A, this session's own — never shared): gated `cargo clippy -p engine --all-targets --all-features` clean (53 s); gated `cargo nextest run -p engine --all-targets` **1121/1121 passed, 4 skipped** (includes the streaming-fixture test the handoff log called flaky — passed in 25 s on a quiet machine). fmt check not run (merge applied recorded resolutions, no hand edits).
+- Foundations check: no shortcuts (the 12 h wrap stays TEMPORARY-labelled with its follow-up, as agreed); right layer (shared clock removes a per-frame material rewrite); data-driven; no test-data special cases added by this merge.
+- Next: the crossing-frame analysis (door tour frames 895/2666, ~320-360 ms) and the 37.7 ms `portal/propagate` peak; impl-190 resume; then the user plays the merged portal before anything public.
+
 ## 2026-10-08 Portal Dev (timing window after the isolation rewrite; stopped at wrap-up)
 
 Track: Portal. Nothing pushed. Jobs from Upstream Dev (the user's plan for 10-08) and the user's own "match vanilla" decision (10-07 night).
