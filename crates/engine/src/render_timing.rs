@@ -32,6 +32,16 @@
 //!   `n` runs during cycle `n + 1` (alongside main frame `n + 1`), so it is filed under `n + 1`;
 //!   without it the render schedule runs inside cycle `n`. See [`CycleSides`].
 //!
+//! * `wall_cycle_ms` and `real_ms`: the per-cycle record carries two clocks. `wall_cycle_ms` is
+//!   the lap from this cycle's `First` to the next's, measured on the main thread — the number
+//!   the identity `main_world + extract + wait + frame/remainder` accounts for, which the identity
+//!   test checks. `real_ms` is the `Time<Real>` delta the next `First` read: under pipelined
+//!   rendering Bevy feeds the main world's `Time<Real>` from the render thread (bevy_time 0.19.1
+//!   `TimeReceiver`), so that reading is render-paced and lagged rather than the cycle's wall
+//!   time — it is kept beside the wall lap so a profile can quantify the clock skew directly
+//!   instead of assuming it. Both close when the next cycle's `First` runs, so the run's last
+//!   cycle keeps neither.
+//!
 //! * `frame/remainder`: the main-thread time of a cycle that none of the sides above own — the
 //!   window from the end of `Last` to the start of the next `First`, less the extract and the wait
 //!   for the render thread when both ran inside it (pipelined rendering runs them there). This is
@@ -50,6 +60,7 @@ use bevy::{
         Render, RenderApp, RenderSystems, pipelined_rendering::RenderExtractApp,
         render_resource::PipelineCache, view::prepare_windows,
     },
+    time::TimeSystems,
 };
 use serde::Serialize;
 use std::{
@@ -67,6 +78,14 @@ pub const EXTRACT: &str = "extract";
 pub const RENDER_THREAD: &str = "render_thread";
 pub const SWAPCHAIN_ACQUIRE: &str = "render/swapchain_acquire";
 pub const REMAINDER: &str = "frame/remainder";
+/// The cycle record's wall time, as the CSV column names it: the lap from one main frame's
+/// `First` to the next's, measured on the main thread. The identity `main_world + extract + wait
+/// + frame/remainder` accounts for this number, which the identity test checks.
+pub const WALL_CYCLE_MS: &str = "wall_cycle_ms";
+/// The cycle record's `Time<Real>` delta, as the CSV column names it, read at the next cycle's
+/// `First` — under pipelined rendering a render-paced, lagged reading (see the module doc), kept
+/// beside the wall lap so the skew between the two clocks is measurable per cycle.
+pub const REAL_MS: &str = "real_ms";
 /// The render schedule's phases, as span names; the per-cycle record keeps one value each (the
 /// distributions live in the samples). Shared with the per-cycle CSV's column list, so the two
 /// cannot drift apart.
@@ -84,7 +103,7 @@ pub struct RenderTimingPlugin;
 impl Plugin for RenderTimingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<RenderTimings>()
-            .add_systems(First, start_main_world)
+            .add_systems(First, start_main_world.after(TimeSystems))
             .add_systems(Last, end_main_world);
     }
 
@@ -180,6 +199,10 @@ struct Shared {
 struct State {
     samples: BTreeMap<&'static str, Vec<f64>>,
     main_started: Option<Instant>,
+    /// When the cycle in progress began, set at its `First`: the next `First` closes the cycle's
+    /// wall lap against it, and reads the real clock into the same row. Kept only when cycles are
+    /// tracked (a benchmark run).
+    cycle_started: Option<Instant>,
     render_started: Option<Instant>,
     render_mark: Option<Instant>,
     acquire_started: Option<Instant>,
@@ -217,6 +240,14 @@ struct State {
 /// What ran in one main-thread cycle, in milliseconds; `None` is "not measured in this cycle".
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CycleSides {
+    /// The cycle's wall time ([`WALL_CYCLE_MS`]): the lap from this cycle's `First` to the next
+    /// cycle's `First`, measured on the main thread. `None` until the next `First` closed it —
+    /// the run's last cycle keeps none.
+    pub wall_ms: Option<f64>,
+    /// The cycle's `Time<Real>` delta ([`REAL_MS`]), read at the next cycle's `First` — under
+    /// pipelined rendering a render-paced, lagged reading, kept beside the wall lap so the skew
+    /// between the two clocks is measurable per cycle.
+    pub real_ms: Option<f64>,
     /// The main schedule, `First` to `Last`.
     pub main_ms: Option<f64>,
     /// The extract step on the main thread.
@@ -462,7 +493,8 @@ impl RenderTimings {
         }
     }
 
-    fn start_main(&self) {
+    fn start_main(&self, real_ms: f64) {
+        let now = Instant::now();
         let mut state = self.state();
         if let Some(started) = state.remainder_started.take() {
             let raw_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -473,7 +505,27 @@ impl RenderTimings {
             });
             self.record(&mut state, REMAINDER, Duration::from_secs_f64(ms / 1000.0));
         }
-        state.main_started = Some(Instant::now());
+        // The cycle that just ended takes its clocks, both closed by this `First` because a
+        // cycle's duration is only known once the next one begins (as with the per-frame series'
+        // rows): the wall lap from its own `First` to this one, measured on the main thread, and
+        // the `Time<Real>` delta this `First` read — the same render-paced reading the per-frame
+        // series' row carries, so the two files join clock for clock.
+        if state.track_cycles {
+            let cycle = state.cycle;
+            if let Some(started) = state.cycle_started.take() {
+                let wall_ms = now.saturating_duration_since(started).as_secs_f64() * 1000.0;
+                Self::write_cycle(&mut state, Some(cycle), |sides| {
+                    sides.wall_ms = Some(wall_ms);
+                });
+            }
+            if real_ms.is_finite() && real_ms > 0.0 {
+                Self::write_cycle(&mut state, Some(cycle), |sides| {
+                    sides.real_ms = Some(real_ms);
+                });
+            }
+            state.cycle_started = Some(now);
+        }
+        state.main_started = Some(now);
         state.cycle += 1;
     }
 
@@ -562,9 +614,11 @@ impl RenderTimings {
 
 /// Opens the main world's sample. `pub(crate)` so the per-cycle series' drain can order itself
 /// after the main frame has begun (a cycle's row is complete only once the next `First` has
-/// closed its remainder window).
-pub(crate) fn start_main_world(timings: Res<RenderTimings>) {
-    timings.start_main();
+/// closed its remainder window). Ordered after the time systems too, so the cycle's `Time<Real>`
+/// delta is the same reading the per-frame series and the frame ledger read this frame — with the
+/// time update unapplied the column would trail theirs by a frame.
+pub(crate) fn start_main_world(timings: Res<RenderTimings>, real_time: Res<Time<Real>>) {
+    timings.start_main(real_time.delta_secs_f64() * 1000.0);
 }
 
 /// Ends the main world's sample. A benchmark that stops recording in `Last` runs after this, so
@@ -659,15 +713,15 @@ mod tests {
     #[test]
     fn keeps_samples_only_while_recording() {
         let timings = RenderTimings::default();
-        timings.start_main();
+        timings.start_main(0.0);
         timings.end_main();
         assert!(timings.take_samples().is_empty());
 
         timings.set_recording(true);
-        timings.start_main();
+        timings.start_main(0.0);
         timings.end_main();
         timings.set_recording(false);
-        timings.start_main();
+        timings.start_main(0.0);
         timings.end_main();
         assert_eq!(timings.take_samples()[MAIN_WORLD].len(), 1);
         assert!(
@@ -789,7 +843,7 @@ mod tests {
             timings.set_cycle_tracking(true, pipelined);
             assert_eq!(timings.take_previous_cycle(), None, "no frame yet");
             // Main frame 1, its extract, and the render frame that extract fed.
-            timings.start_main();
+            timings.start_main(0.0);
             timings.end_main();
             timings.extracted(Duration::from_millis(1));
             timings.start_render();
@@ -797,7 +851,7 @@ mod tests {
             timings.end_acquire();
             timings.end_render();
             // Main frame 2 starts: the frame time it measures is cycle 1's.
-            timings.start_main();
+            timings.start_main(0.0);
             let first = timings.take_previous_cycle().expect("cycle 1");
             assert!(first.main_ms.is_some());
             assert_eq!(first.extract_ms, Some(1.0));
@@ -809,7 +863,7 @@ mod tests {
             // Frame 2 runs, extracts, and frame 3 starts: cycle 2 is the previous one.
             timings.end_main();
             timings.extracted(Duration::from_millis(2));
-            timings.start_main();
+            timings.start_main(0.0);
             let second = timings.take_previous_cycle().expect("cycle 2");
             assert_eq!(second.extract_ms, Some(2.0));
             assert_eq!(
@@ -826,18 +880,18 @@ mod tests {
     fn cycles_keep_the_main_threads_wait_for_the_render_thread() {
         let timings = RenderTimings::default();
         timings.set_cycle_tracking(true, true);
-        timings.start_main();
+        timings.start_main(0.0);
         timings.end_main();
         timings.extracted(Duration::from_millis(3));
         timings.handed_over(Duration::from_millis(10));
-        timings.start_main();
+        timings.start_main(0.0);
         let cycle = timings.take_previous_cycle().expect("cycle 1");
         assert_eq!(cycle.extract_ms, Some(3.0));
         assert_eq!(cycle.wait_ms, Some(7.0));
         // A hand-over without a new extract has nothing to attribute.
         timings.end_main();
         timings.handed_over(Duration::from_millis(10));
-        timings.start_main();
+        timings.start_main(0.0);
         let next = timings.take_previous_cycle().expect("cycle 2");
         assert!(next.main_ms.is_some());
         assert_eq!(next.wait_ms, None);
@@ -846,10 +900,10 @@ mod tests {
     #[test]
     fn cycles_are_kept_only_for_a_run_that_tracks_them() {
         let timings = RenderTimings::default();
-        timings.start_main();
+        timings.start_main(0.0);
         timings.end_main();
         timings.extracted(Duration::from_millis(1));
-        timings.start_main();
+        timings.start_main(0.0);
         assert_eq!(timings.take_previous_cycle(), None);
     }
 
@@ -858,10 +912,10 @@ mod tests {
         let timings = RenderTimings::default();
         timings.set_cycle_tracking(true, false);
         for _ in 0..5 {
-            timings.start_main();
+            timings.start_main(0.0);
             timings.end_main();
         }
-        timings.start_main();
+        timings.start_main(0.0);
         assert!(timings.take_previous_cycle().is_some());
         assert!(
             timings.state().cycles.is_empty(),
@@ -913,11 +967,11 @@ mod tests {
     fn the_cycle_remainder_excludes_the_extract_and_wait_that_ran_in_its_window() {
         let timings = RenderTimings::default();
         timings.set_cycle_tracking(true, true);
-        timings.start_main();
+        timings.start_main(0.0);
         timings.end_main();
         timings.extracted(Duration::from_millis(3));
         timings.handed_over(Duration::from_millis(10));
-        timings.start_main();
+        timings.start_main(0.0);
         let cycle = timings.take_previous_cycle().expect("cycle 1");
         assert_eq!(cycle.extract_ms, Some(3.0));
         assert_eq!(cycle.wait_ms, Some(7.0));
@@ -926,22 +980,28 @@ mod tests {
             Some(0.0),
             "the window was extract and wait and nothing else"
         );
+        assert_eq!(
+            cycle.real_ms, None,
+            "a `First` that read no positive delta keeps the clock column empty"
+        );
     }
 
     /// The identity that makes the next re-profile trustworthy: `main_world + extract + wait +
-    /// remainder` is the whole cycle, the wall time from one main frame's start to the next's.
+    /// remainder` is the whole cycle — the wall lap from one main frame's start to the next's,
+    /// which the row carries as `wall_cycle_ms` — and the row's `real_ms` is the `Time<Real>`
+    /// delta the closing `First` read, the same lagged reading the per-frame series joins with.
     #[test]
     fn the_cycle_sides_account_for_the_whole_cycle() {
         let timings = RenderTimings::default();
         timings.set_cycle_tracking(true, true);
-        timings.start_main();
+        timings.start_main(16.0);
         std::thread::sleep(Duration::from_millis(4));
         timings.end_main();
         let window = Instant::now();
         std::thread::sleep(Duration::from_millis(16));
         timings.extracted(Duration::from_millis(1));
         timings.handed_over(Duration::from_millis(9)); // 1 ms of extract, 8 of wait
-        timings.start_main();
+        timings.start_main(16.0);
         let cycle = timings.take_previous_cycle().expect("cycle 1");
         let main_ms = cycle.main_ms.expect("the main schedule ran");
         let window_ms = window.elapsed().as_secs_f64() * 1000.0;
@@ -959,6 +1019,21 @@ mod tests {
             cycle.remainder_ms.unwrap() >= 6.0,
             "the window held sleep on top of the extract and the wait"
         );
+        let wall = cycle.wall_ms.expect("the next `First` closed the wall lap");
+        assert!(
+            (wall - (main_ms + window_ms)).abs() < 2.0,
+            "the wall lap is the main schedule plus the window after it: {wall} vs \
+             {main_ms} + {window_ms}"
+        );
+        assert!(
+            (main_ms + accounted - wall).abs() < 2.0,
+            "the sides must account for the whole wall lap: {main_ms} + {accounted} vs {wall}"
+        );
+        assert_eq!(
+            cycle.real_ms,
+            Some(16.0),
+            "the row carries the Time<Real> delta the closing First read"
+        );
     }
 
     /// Without cycle tracking no window opens, so no remainder is written into a record or
@@ -967,11 +1042,11 @@ mod tests {
     fn the_remainder_is_kept_only_when_cycles_are_tracked() {
         let timings = RenderTimings::default();
         timings.set_recording(true);
-        timings.start_main();
+        timings.start_main(0.0);
         timings.end_main();
         timings.extracted(Duration::from_millis(1));
         timings.handed_over(Duration::from_millis(5));
-        timings.start_main();
+        timings.start_main(0.0);
         let samples = timings.take_samples();
         assert!(
             !samples.contains_key(REMAINDER),
@@ -992,7 +1067,7 @@ mod tests {
         for pipelined in [true, false] {
             let timings = RenderTimings::default();
             timings.set_cycle_tracking(true, pipelined);
-            timings.start_main();
+            timings.start_main(0.0);
             timings.end_main();
             timings.extracted(Duration::from_millis(1));
             timings.start_render();
@@ -1003,7 +1078,7 @@ mod tests {
             timings.lap(GRAPH_AND_PRESENT);
             timings.lap(CLEANUP);
             timings.end_render();
-            timings.start_main();
+            timings.start_main(0.0);
             let first = timings.take_previous_cycle().expect("cycle 1");
             let (has_phases, has_render) = (
                 first.extract_commands_and_assets_ms.is_some(),
@@ -1017,7 +1092,7 @@ mod tests {
             if pipelined {
                 timings.end_main();
                 timings.extracted(Duration::from_millis(1));
-                timings.start_main();
+                timings.start_main(0.0);
             }
             let second = if pipelined {
                 timings.take_previous_cycle().expect("cycle 2")
@@ -1057,7 +1132,7 @@ mod tests {
         let timings = RenderTimings::default();
         timings.set_cycle_tracking(true, true);
         for _ in 0..3 {
-            timings.start_main();
+            timings.start_main(0.0);
             timings.end_main();
         }
         // Cycles 1 and 2 are complete (the cycle after each has begun); cycle 3 is the one in
@@ -1071,7 +1146,7 @@ mod tests {
             assert!(sides.main_ms.is_some());
             assert!(sides.remainder_ms.is_some(), "the window closed");
         }
-        timings.start_main(); // cycle 4 begins: cycle 3's remainder window closed
+        timings.start_main(0.0); // cycle 4 begins: cycle 3's remainder window closed
         let rows = timings.take_completed_cycles();
         assert_eq!(
             rows.iter().map(|(cycle, _)| *cycle).collect::<Vec<_>>(),
