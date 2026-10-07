@@ -8837,6 +8837,149 @@ mod tests {
         assert!(app.world().resource::<PortalPrewarm>().settled());
     }
 
+    /// The pre-warm is observable in the cell itself (impl-286): while the warm view runs, the
+    /// pre-streamed cell - born [`CellRole::Hidden`], on no layer of anyone's and hidden - is
+    /// stamped the destination, layer 2 and visible, the stamps the crossing itself applies; and
+    /// when the wait ends without a crossing, every one of those writes is taken back and the
+    /// cell is exactly as the wait found it.
+    #[test]
+    fn the_prewarm_reveals_the_destination_cell_and_takes_it_back_without_a_crossing() {
+        let mut app = portal_app();
+        prewarm_app(&mut app, PRESTREAMED_CELL);
+        spawn_prewarm_main_camera(&mut app, Vec3::new(0.0, 0.0, -400.0));
+        let camera = spawn_portal_camera(&mut app);
+        spawn_windowed_door(&mut app, PRESTREAMED_CELL);
+        // The destination cell itself, born the way impl-1058's spawn stamp births one.
+        let (root, mesh) = spawn_cell(
+            &mut app,
+            PRESTREAMED_CELL,
+            None,
+            Some(CellKey::Interior(PRESTREAMED_CELL)),
+            None,
+        );
+        let stamp =
+            |app: &App, root: Entity| app.world().get::<CellRoleStamp>(root).map(|stamp| stamp.0);
+        let reveal = |app: &App| {
+            app.world()
+                .resource::<PortalState>()
+                .destination()
+                .contains(&CellKey::Interior(PRESTREAMED_CELL))
+        };
+
+        // The first frame only classifies; the second is the first warm frame, and the reveal
+        // lands in it: the isolation runs after the pre-warm in the plugin's order.
+        app.update();
+        assert_eq!(stamp(&app, root), Some(CellRole::Hidden));
+        app.update();
+
+        assert_eq!(
+            stamp(&app, root),
+            Some(CellRole::Destination),
+            "the warm view's frames stamp the cell the destination"
+        );
+        assert_eq!(
+            layers_of(&app, mesh),
+            RenderLayers::layer(DESTINATION_LAYER),
+            "on the warm view's own layer, which is what its camera draws"
+        );
+        assert_ne!(
+            app.world().get::<Visibility>(root),
+            Some(&Visibility::Hidden),
+            "a hidden entity reaches no view: the reveal is what the specialization rides on"
+        );
+        assert!(
+            reveal(&app),
+            "the destination set carries the window's keys"
+        );
+        let camera_state = app.world().get::<Camera>(camera).unwrap();
+        assert!(camera_state.is_active, "the warm view ran");
+        assert_eq!(
+            camera_state.viewport.clone().unwrap().physical_size,
+            WARMUP_VIEWPORT,
+            "a small viewport: fragments are not what the wait buys"
+        );
+
+        // Readiness ends the warm view, and the frame after it the take-back has run: the cell
+        // is hidden again - no layers, hidden, exactly as the wait found it - the destination
+        // set is the portal's own (empty here), and no viewport is left on the camera.
+        app.update();
+        app.update();
+
+        assert_eq!(stamp(&app, root), Some(CellRole::Hidden));
+        assert_eq!(
+            layers_of(&app, mesh),
+            RenderLayers::none(),
+            "off every camera again"
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(root),
+            Some(&Visibility::Hidden),
+            "and out of the ray casts too, as a hidden cell is"
+        );
+        assert!(!reveal(&app));
+        assert!(!app.world().get::<Camera>(camera).unwrap().is_active);
+        assert!(
+            app.world()
+                .get::<Camera>(camera)
+                .unwrap()
+                .viewport
+                .is_none()
+        );
+    }
+
+    /// A doorway the portal is drawing takes the warm state down: the warm viewport is cleared
+    /// (the doorway renders the whole target), the camera stays the portal's, and the keys the
+    /// warm view published leave the destination set - the portal's own destination is the only
+    /// thing the crossing's stamps are ever derived from.
+    #[test]
+    fn a_doorway_the_portal_is_drawing_takes_the_warm_state_down() {
+        let mut app = portal_app();
+        prewarm_app(&mut app, PRESTREAMED_CELL);
+        spawn_prewarm_main_camera(&mut app, Vec3::new(0.0, 0.0, -400.0));
+        let camera = spawn_portal_camera(&mut app);
+        let door = spawn_windowed_door(&mut app, PRESTREAMED_CELL);
+        let (root, _) = spawn_cell(
+            &mut app,
+            PRESTREAMED_CELL,
+            None,
+            Some(CellKey::Interior(PRESTREAMED_CELL)),
+            None,
+        );
+        app.update();
+        app.update();
+        assert!(
+            app.world().get::<Camera>(camera).unwrap().is_active,
+            "the warm view is running"
+        );
+
+        // The door opens and the portal draws it: `update_portal` published the destination and
+        // activated the camera, which is the frame the pre-warm stands down around.
+        portal_shows(&mut app, Some(door));
+        app.update();
+
+        let camera_state = app.world().get::<Camera>(camera).unwrap();
+        assert!(
+            camera_state.is_active,
+            "the portal's own activation is not the pre-warm's to undo"
+        );
+        assert!(
+            camera_state.viewport.is_none(),
+            "and the doorway renders the whole target, not the warm view's corner of it"
+        );
+        assert!(
+            !app.world()
+                .resource::<PortalState>()
+                .destination()
+                .contains(&CellKey::Interior(PRESTREAMED_CELL)),
+            "the pre-warm's keys are taken back"
+        );
+        assert_eq!(
+            app.world().get::<CellRoleStamp>(root).map(|stamp| stamp.0),
+            Some(CellRole::Hidden),
+            "the cell is the portal's to reveal, which it does through its own destination"
+        );
+    }
+
     #[test]
     fn a_cell_of_another_worldspace_stays_hidden_when_its_grid_matches_the_active_one() {
         let mut app = portal_app();

@@ -2550,6 +2550,44 @@ mod tests {
         }));
     }
 
+    /// A run without the portal prestreams exactly as it did, and gains nothing for the warm-up:
+    /// the pre-warm is [`PortalPlugin`](crate::portal::PortalPlugin)'s - it inits the resource
+    /// and adds the system - so a run driven by [`TransitionPlugin`] alone has neither, and
+    /// nothing is spawned for it (impl-286's gate, the one impl-1058 used for the spawn-time
+    /// stamps).
+    #[test]
+    fn a_run_without_the_portal_prestreams_but_never_warms() {
+        let mut app = App::new();
+        app.add_plugins(TransitionPlugin)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .init_resource::<ProfilingState>()
+            .init_resource::<EngineConfig>();
+        spawn_camera(&mut app, Vec3::ZERO);
+        spawn_door(
+            &mut app,
+            Vec3::new(0.0, 0.0, -700.0),
+            interior_destination(99),
+        );
+
+        app.update();
+
+        assert!(
+            app.world()
+                .resource::<PrestreamCells>()
+                .contains(&CellKey::Interior(99)),
+            "the pre-stream itself is untouched"
+        );
+        assert!(
+            !app.world()
+                .contains_resource::<crate::portal::PortalPrewarm>(),
+            "no warm-up state exists without the portal, and so nothing is spawned for it"
+        );
+    }
+
     /// The far side of a door that is open stays streamed in however far the camera is - the
     /// doorway is a way through and the space behind it may be walked into at any moment - and it
     /// is held while the door closes too, so the doorway never empties under a leaf on its way
