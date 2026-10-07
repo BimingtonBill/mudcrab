@@ -3,6 +3,34 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Phase 2 Dev, Hermes (impl-1058 recovered and landed: pre-stamp streamed cells' render layers)
+
+Track: Phase 2. Nothing pushed. The impl-1058 worker dispatched at 02:47 was interrupted
+mid-run (no subagent was left alive), but its acceptance sequence had kept going at the gate:
+gated `cargo check` -> clippy -> nextest all ran in its build folder
+`C:/Modding/Mudcrab/builds/p2-propagate-amortise` (OWNER.txt) before it died uncommitted.
+
+- **Recovered.** Read the full uncommitted diff (~500 lines, portal.rs + streaming.rs): the
+  spawn-stamp mechanism per the brief was complete, the parity/first-frame/one-frame/no-portal
+  test set complete. One failure left: the worker's own new streaming test
+  `a_committed_cell_is_born_on_the_layers_its_role_asks` asserted a concrete `RenderLayers` on
+  the cell root - but a source root carries `Propagate` + `Inherited` only; propagation never
+  writes a source's concrete layers (bevy propagate.rs relations system). The worker had left a
+  debug `eprintln!` mid-investigation. Fixed the test (root exempt from the concrete assert,
+  `plain` count adjusted), removed the debug print.
+- **Gated** (own build folder, fresh runs by this session): fmt clean; gated clippy --workspace
+  --all-targets --all-features -D warnings clean; gated nextest -p engine --all-targets
+  **1128 passed / 4 skipped** (the known-flaky fixture test passed).
+- **Committed 8fafcd5b** on `phase2/propagate-amortise` (from main 99d8a737), conventional
+  commit style, worktree `D:/Mudcrab/worktrees/p2-propagate-amortise`. Timing note
+  `local/research/t1058-propagate-amortise-2026-10-08.md` (INDEX row added): before numbers
+  30.9/37.7/25.6 ms (portal/propagate, one frame before crossings); AFTER measurement waits for
+  the booked re-profile window together with prestream pre-warm.
+- **Next:** hand to Upstream Dev for review; the booked re-profile window measures impl-1058 +
+  prestream pre-warm + impl-285 instrumentation on the same baseline. My other parked item: the
+  GLM impl-1057 failed-cell-retry worktree (`local/impl/impl-1057-p2-failed-cell-retry`,
+  streaming.rs +571/-20 uncommitted) is still unresumed.
+
 ## 2026-10-08 Portal Dev, Hermes (impl-285 review follow-up: wall_cycle_ms/real_ms columns)
 
 Track: Portal. Nothing pushed. Upstream Dev reviewed impl-285 (9cb1fc80): faithful, one
