@@ -10,7 +10,7 @@ Track: Phase 2. Nothing pushed. Job from Upstream Dev (the user's yes, 2026-10-0
 - **GLM trial impl-1057, failed-cell retry** (brief `tasks/deepseek/impl-1057-p2-failed-cell-retry.md`,
   #1055 cause 3: `CellStatus::Failed` sticky at `streaming.rs:815`): GLM 5.3 coder, effort high, base
   origin/main f40ca1df, worktree `local/impl/impl-1057-p2-failed-cell-retry`. Stopped at 01:10 for the
-  night after 67 steps / 30 min / $0.51, while it waited for the gate (Portal's timing hold). Its work so
+  night after 67 steps / 30 min (GLM cost unclear: the spend status showed $1.10 this week mid-run, then $0.59 after the stop; check `ds_spend.py` tomorrow), while it waited for the gate (Portal's timing hold). Its work so
   far, `streaming.rs` +571/-20, is uncommitted in the worktree and has not been compiled or reviewed yet.
   Resume tomorrow: worker session `9ec2f73a-bc8e-4503-a4e1-15df893d64bc` (or `ds_impl.ps1 -Post` on the
   worktree to run its checks), then a DeepSeek review, then report to Upstream Dev: steps, wall time
