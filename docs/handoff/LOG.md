@@ -3,6 +3,40 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-07 Phase 2 Dev (doors scene, water clock, terrain merge engine, scenario runner, terrain holes)
+
+Track: Phase 2. All local; nothing pushed. Hand-offs to Upstream Dev, Portal Dev and `local/team/2026-10-07.md`.
+
+- **Doors scene** `phase2/perf-doors` f3daf559 (worktree C:/Modding/wkj-p2-doors): route door steps cross
+  through the player's activation (#128), per-crossing windows, aim at the door's bounds centre or the
+  activation's fallback box. fmt/clippy green, route 27/27, workspace 1223/1224 (the app streaming-fixture
+  test flakes under load, pre-existing). Smoke on `C:/Modding/SkyrimConverted-p2main-v24-doors`: 10/10
+  crossings. Portal declined it tonight (portal crosses with its own doors.rs): tomorrow's door activation
+  contract (shared request + crossing start/end events in the engine crate, one path for player, routes,
+  scenarios, console, Luau).
+- **Water shared clock** `phase2/water-shared-clock` 8acbdb7c (C:/Modding/worktrees/p2-water): water reads
+  `globals.time`, no per-frame material rewrite; reviews DeepSeek + Muse #1041 caught a uniform field-order
+  bug (fixed, layout test added). All checks green (workspace 1088/1088). Parity: identical to main whenever
+  terrain draws. Approved for portal by Upstream Dev; merges tomorrow AFTER Portal's timing window. The 12 h
+  `Time<Virtual>` wrap is TEMPORARY, pending the user's evening-table answer.
+- **Terrain holes (#1055, user's yes):** analysis `local/research/engine-foundations/analysis-1055-terrain-missing-cells.md`:
+  LOD tiles hide on the CPU "terrain ready" flag while `RenderAssetBytesPerFrame` still defers the GPU
+  prepare, so neither draws; `--shots` settle ignores LOD and GPU prepare; `CellStatus::Failed` is sticky.
+  Design step tomorrow (Chef's LOD area: owner check and announce first; general render-to-main "prepared"
+  signal; websearch-1056 checks Bevy 0.20 for one).
+- **Terrain merge engine half** `phase2/terrain-merge` (C:/Modding/worktrees/p2-terrain): reviews DeepSeek +
+  Muse #1042, 7 fixes in (weld fallback, setup stall/timeout, back faces, RENDER_WORLD arrays, real KTX2
+  colour-space check, no data asserts, documented differences); Phase 1's writers merged (880363fa). Gates
+  and the GPU probe were running at wrap-up; see the coder's last report in the day log.
+- **Scenario runner v1** `phase2/scenarios` (C:/Modding/worktrees/p2-scenarios; spec
+  `docs/specs/engine/scenarios.md`, posted on #193): runner drives the real controller; reviews #1043
+  (DeepSeek accept, Muse fix first: input gate) fixed. Not yet run on real data; smoke and re-picks tomorrow.
+- **Disk:** C: filled to 0.5 GB at 18:46 (other sessions' coder worktrees in `local/impl`). Deleted, with the
+  user's yes: `C:/Modding/wkj-p2-routes-target` (20 GB). `SkyrimConverted-p2main-v24.assets-cache` (21 GB)
+  kept, on the can-go list. Owner notes for converted data now sit beside the folder.
+- **Next:** door contract and #1055 design (morning plan), water into portal after the timing window,
+  scenario smoke runs, terrain checks plus identity shots once Phase 1's pipeline writes real terrain data.
+
 ## 2026-10-07 Portal Dev (portal baseline, portal-rooms data, foundations merged, isolation rewrite)
 
 Track: Portal. All local; nothing pushed. Hand-offs to Upstream Dev and `local/team/2026-10-07.md`.
