@@ -48,7 +48,7 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   `C:\Modding\wkj-phase1`, branches `phase1/<topic>` cut from `main`, upstream's commit style, build
   targets and conversion output on D:, worker tasks `<kind>-<nnn>-p1-<slug>` numbered 800-899. It owns
   `crates/converter/**` and `crates/dummy-content/**`; `crates/shared/**` changes are agreed by message.
-  Starting brief: `local/handover-phase1-dev.md`.
+  Starting brief: `local/handover/phase1-dev.md`.
 - **Phase 3** (added 2026-09-28, the user's Phase 3 Dev session; **PARKED for new work by the user,
   2026-10-01**: finish, package and send the launcher work already built, start nothing new): the launcher (upstream Phase 3
   item 3.4, `docs/roadmap/03-luau-and-ui.md`), sent upstream like Phase 2. Worktree
@@ -56,7 +56,7 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   (`feat(launcher): ...`), build targets on D:, worker tasks `<kind>-<nnn>-p3-<slug>` numbered
   900-999. It owns `crates/launcher/**` and `crates/converter-gui/**` (being folded into the
   launcher; the crate is then deleted); converter API changes go through Phase 1 Dev by message.
-  Starting brief: `local/handover-phase3-dev.md`.
+  Starting brief: `local/handover/phase3-dev.md`.
 - Changes flow one way: `main`, `phase1/*` and `phase2/*` merge into `portal`, never the reverse. A
   Phase 1 or Phase 2 bug found on the portal is fixed on a `phase1/*` or `phase2/*` branch first.
 
