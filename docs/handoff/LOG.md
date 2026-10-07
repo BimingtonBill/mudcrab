@@ -3,6 +3,16 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Upstream Dev (PR #154 re-review reply posted with the user's yes)
+
+Nothing pushed. Posted the re-review reply verbatim from `local/pr-drafts/pr154-rereview-20261008.md`:
+https://github.com/Mudcrab-Team/mudcrab/pull/154#issuecomment-6048938202 (verified by read-back).
+Content: all 11 of MonoPT's claimed fixes verified in code; two non-blocking asks (README lost the
+209→451 MB figures + snapshot sentence in CodeRabbit commit 6d510153c — PR body still has them;
+print the actually-selected MO2 profile at start); hard-link staging is same-volume by design with
+a `link_or_copy` fallback; one-PR-not-four accepted, CI + fixture coverage reasonable for merge.
+The PR waits on the author + CI. Full report stays in the draft file; nothing else published.
+
 ## 2026-10-08 Portal Dev, Hermes (re-profile window RAN: impl-1057 + impl-286 merged into portal, priced against the Oct-8 baseline)
 
 Track: Portal. Nothing pushed. Both accepted branches merged into `portal` in the main checkout:
