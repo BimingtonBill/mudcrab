@@ -112,6 +112,13 @@ pub fn add_placed_object_layer_propagation(app: &mut App) {
 }
 
 /// Period after which `globals.time`, the clock the water waves read, wraps back to zero.
+///
+/// This is applied to Bevy's `Time<Virtual>` wrap period, so it changes the wrap engine-wide, from
+/// Bevy's default of 1 hour to 12 hours, for everything that reads `elapsed_wrapped` or the
+/// `globals` uniform's `time`, not only the water. The water's wave phase is not periodic over any
+/// wrap period, so every wrap is a one-off visible jump of the waves; 12 hours makes it rare, while
+/// f32 still resolves about 4 ms at that magnitude, no worse than the unwrapped clock the water used
+/// before. Nothing else in the engine reads the wrapped clock.
 const WATER_CLOCK_WRAP_PERIOD: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
 
 pub struct VercidiumRendererPlugin;
@@ -608,12 +615,13 @@ pub struct WaterExtension {
 
 #[derive(ShaderType, Reflect, Debug, Clone)]
 struct WaterSettings {
-    /// x = wave scale, y = wave speed, z = wave strength, w = the pinned clock in seconds (read
-    /// only when `flow_direction.z` is set, see [`WaterExtension::with_pinned_clock`]).
+    /// x = wave scale, y = wave speed, z = wave strength. w unused.
     wave_scale_speed_strength: Vec4,
-    /// xy = flow direction, z = 1 when the water uses the pinned clock in `w` instead of the shared
-    /// view clock, w = 1 when the flow normal texture is present.
+    /// xy = flow direction, z unused, w = 1 when the flow normal texture is present.
     flow_direction: Vec4,
+    /// x = the pinned clock in seconds, y = 1 when the water uses it instead of the shared view
+    /// clock. z/w unused. See [`WaterExtension::with_pinned_clock`].
+    clock: Vec4,
     /// x = Fresnel Amount (Schlick F0), y = Reflectivity Amount. z/w unused.
     fresnel_reflectivity: Vec4,
 }
@@ -624,6 +632,7 @@ impl Default for WaterExtension {
             settings: WaterSettings {
                 wave_scale_speed_strength: Vec4::new(0.006, 0.15, WAVE_STRENGTH, 0.0),
                 flow_direction: Vec4::new(0.8, 0.35, 0.0, 0.0),
+                clock: Vec4::ZERO,
                 fresnel_reflectivity: Vec4::new(
                     DEFAULT_WATER_FRESNEL,
                     DEFAULT_WATER_REFLECTIVITY,
@@ -663,6 +672,7 @@ impl WaterExtension {
             settings: WaterSettings {
                 wave_scale_speed_strength: Vec4::new(0.006, 0.15, WAVE_STRENGTH, 0.0),
                 flow_direction: Vec4::new(0.8, 0.35, 0.0, has_flow_normal),
+                clock: Vec4::ZERO,
                 fresnel_reflectivity: Vec4::new(fresnel, reflectivity, 0.0, 0.0),
             },
         }
@@ -677,8 +687,7 @@ impl WaterExtension {
     /// not re-prepare its bind group every frame. A pinned clock is for scenes that need a
     /// reproducible still, such as the terrain/water fixture.
     pub fn with_pinned_clock(mut self, seconds: f32) -> Self {
-        self.settings.wave_scale_speed_strength.w = seconds;
-        self.settings.flow_direction.z = 1.0;
+        self.settings.clock = Vec4::new(seconds, 1.0, 0.0, 0.0);
         self
     }
 }
@@ -1675,10 +1684,15 @@ mod tests {
     #[test]
     fn only_a_pinned_water_clock_reads_the_material_time() {
         let shared = WaterExtension::default();
-        assert_eq!(shared.settings.flow_direction.z, 0.0);
+        assert_eq!(shared.settings.clock.y, 0.0);
         let pinned = WaterExtension::default().with_pinned_clock(1.0);
-        assert_eq!(pinned.settings.flow_direction.z, 1.0);
-        assert_eq!(pinned.settings.wave_scale_speed_strength.w, 1.0);
+        assert_eq!(pinned.settings.clock.x, 1.0);
+        assert_eq!(pinned.settings.clock.y, 1.0);
+        assert_eq!(pinned.settings.flow_direction, shared.settings.flow_direction);
+        assert_eq!(
+            pinned.settings.wave_scale_speed_strength,
+            shared.settings.wave_scale_speed_strength
+        );
     }
 
     #[test]
