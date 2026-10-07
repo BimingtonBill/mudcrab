@@ -82,6 +82,9 @@ pub fn migrate_room_portals(conn: &Connection) -> Result<()> {
     if has_pair_index.is_some() {
         return Ok(());
     }
+    // Outside a transaction the savepoint opens one, and RELEASE then commits it; that
+    // commit can fail (SQLITE_BUSY while another connection reads the file).
+    let outermost = conn.is_autocommit();
     conn.execute_batch("SAVEPOINT room_portals_migration")?;
     let migrated = conn.execute_batch(
         "DROP TABLE IF EXISTS room_portals_new;
@@ -103,13 +106,20 @@ pub fn migrate_room_portals(conn: &Connection) -> Result<()> {
          ALTER TABLE room_portals_new RENAME TO room_portals;
          CREATE INDEX IF NOT EXISTS idx_room_portals_cell ON room_portals(cell_id);",
     );
-    match migrated {
-        Ok(()) => conn.execute_batch("RELEASE room_portals_migration"),
+    match migrated.and_then(|()| conn.execute_batch("RELEASE room_portals_migration")) {
+        Ok(()) => Ok(()),
         Err(error) => {
-            // Undo the partial migration and close the savepoint; report the original error.
-            let _ = conn.execute_batch(
-                "ROLLBACK TO room_portals_migration; RELEASE room_portals_migration",
-            );
+            // Undo the partial migration and close the savepoint, including after a failed
+            // RELEASE, so no transaction is left open; report the original error. When the
+            // savepoint opened the transaction, ROLLBACK ends it (a second RELEASE could fail
+            // the same way); inside the caller's transaction, releasing a nested savepoint
+            // commits nothing and cannot be busy.
+            let cleanup = if outermost {
+                "ROLLBACK"
+            } else {
+                "ROLLBACK TO room_portals_migration; RELEASE room_portals_migration"
+            };
+            let _ = conn.execute_batch(cleanup);
             Err(error)
         }
     }

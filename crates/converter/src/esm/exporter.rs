@@ -2022,6 +2022,55 @@ mod tests {
         assert_eq!(portal_table(&conn), old_shape_rows());
     }
 
+    /// A RELEASE that fails (another connection holds a read lock, so the commit is busy)
+    /// leaves no transaction open and the old table untouched; the next pass migrates it.
+    #[test]
+    fn a_busy_commit_rolls_the_migration_back_and_closes_the_savepoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE room_portals (
+                     ref_id INTEGER PRIMARY KEY, cell_id INTEGER NOT NULL,
+                     pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
+                     rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
+                     half_x REAL NOT NULL, half_z REAL NOT NULL,
+                     room_a INTEGER, room_b INTEGER
+                 );
+                 INSERT INTO room_portals VALUES (1, 2, 0, 0, 0, 0, 0, 0, 3, 4, 7, 8);",
+            )
+            .unwrap();
+        writer.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let reader = Connection::open(&path).unwrap();
+        // An open read transaction keeps its shared lock until COMMIT.
+        reader.execute_batch("BEGIN").unwrap();
+        let held: i64 = reader
+            .query_row("SELECT count(*) FROM room_portals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(held, 1);
+
+        assert!(rooms::migrate_room_portals(&writer).is_err());
+        assert!(writer.is_autocommit(), "the savepoint was left open");
+
+        reader.execute_batch("COMMIT").unwrap();
+        use rusqlite::OptionalExtension;
+        let pair_index: Option<i64> = writer
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('room_portals') WHERE name='pair_index'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(pair_index, None);
+        rooms::migrate_room_portals(&writer).unwrap();
+        assert_eq!(
+            portal_table(&writer),
+            vec![(1, 0, 2, 3.0, Some(7), Some(8))]
+        );
+    }
+
     #[test]
     fn a_failed_full_export_leaves_the_migrated_portals_intact() {
         use crate::esm::load_order::LoadOrder;
