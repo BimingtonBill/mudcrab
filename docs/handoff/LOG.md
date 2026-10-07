@@ -3,6 +3,37 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-07 Upstream Dev (evening: decisions, deletions, xEdit posts, #167 review, folder move prepared)
+
+Track: all (Upstream Dev). Day log: `local/team/2026-10-07.md`; evening table: `local/team/evening-table-2026-10-07.md`.
+
+- **User decisions (evening table):** 1 folder move now; 2 Upstream Dev deletes the listed old data; 3 three converter
+  fixes (KTX2 mip order, NIF root transform port, marker bounds skip excluded geometry) prepared as upstream DRAFTS by
+  Phase 1 (show the user before opening); 4 PR #177 re-read: only a main merge, changed lines identical to the reviewed
+  commit, merges clean: ready for the user's merge (keep co-author trailers); 5 water 12 h wrap yes (TEMPORARY);
+  6 launcher builds paused while the GPL question is open (Phase 3 told); 7 xEdit comments posted on #158, #185, #106;
+  8 Bevy binding-array contribution later.
+- **Posted today (user's yes):** review comment on Chef's PR #167; xEdit comments #158/#185/#106 (links in the day log).
+- **Deleted (user's yes, links checked):** p2main-v24.assets-cache 21 GB, scratch p2-scenarios-backup, builds/p2-water-base,
+  D: engine-before-water.exe, duplicate report. KEPT: D: SkyrimConverted-p2main (pr:125 open; p2main-doors junctions for
+  open PR #128) and SkyrimConverted-p1rooms (Phase 1, while-open): ask the owners again.
+- **Build gate** (tools/build_gate.py, runnable copy `C:/Users/Brannock/.mudcrab/build-gate/`): moved out of AppData
+  (MSIX virtualization hid it), 2 slots per session, 15 GB free-disk floor. Hold `move` set until 22:00: clear it after
+  the move (`... hold clear move`).
+- **Folder move: NOT run yet.** Script `local/disk/move-2026-10-07.ps1` (re-runnable, logs to C:/Modding/move-2026-10-07.log,
+  exit file C:/Modding/move-2026-10-07.exit); path rewrite `local/disk/rewrite_paths_1007.py` (dry run: ~3,000 paths in
+  742 live files). The user closes every Mudcrab session, runs the script in a standalone PowerShell, then reopens the
+  sessions in `C:/Modding/Mudcrab/mudcrab`. The script copies the Claude memory to the new key. `.cargo` stays at
+  `C:/Modding` (still an ancestor). Not touched (user's own, needs their yes): ~/.claude/settings.json,
+  .claude/settings.local.json, ~/.claude-deepseek/providers.json (Muse opt-in path), the backup scheduled task, and our
+  line in D:/VFXEnhance/coordination/RESOURCES.md. After reopening: commit the rewritten tracked files, check
+  `git worktree list` (no prunable), clear the `move` hold, tell every session and the DAO/VFX sessions.
+- **Tomorrow's plan items:** door activation contract (Phase 2 + Portal); missing-ground fix design (render-to-main
+  prepared signal, Chef's LOD area: announce first); Portal's timing window, then water merge into portal;
+  terrain-merge wiring (DeepSeek, target on D:); coder worktrees on D: (local/impl junction after the move);
+  world-DB stable IDs; rolled rows in the evening table file.
+- No worker of mine is running.
+
 ## 2026-10-07 Phase 2 Dev (doors scene, water clock, terrain merge engine, scenario runner, terrain holes)
 
 Track: Phase 2. All local; nothing pushed. Hand-offs to Upstream Dev, Portal Dev and `local/team/2026-10-07.md`.
