@@ -201,7 +201,7 @@ use bevy::{
     asset::embedded_asset,
     camera::primitives::Aabb,
     camera::{
-        CameraUpdateSystems, ClearColorConfig, Hdr, RenderTarget, SubCameraView,
+        CameraUpdateSystems, ClearColorConfig, Hdr, RenderTarget, SubCameraView, Viewport,
         primitives::Frustum,
         visibility::{RenderLayers, VisibilitySystems},
     },
@@ -770,6 +770,11 @@ pub(crate) struct PortalState {
     /// The doors [`isolate_cells`] last hid for the door layer: one that leaves the set is given
     /// its cell's layers back.
     door_layer_applied: HashSet<Entity>,
+    /// The destination keys the pre-warm ([`prewarm_destination_view`]) has published into
+    /// [`destination`](Self::destination) for its warm view's frames and not yet taken back: the
+    /// take-back removes exactly these, and never a key of the portal's own
+    /// ([`hold`](Self::hold)).
+    warm: Vec<CellKey>,
 }
 
 impl PortalState {
@@ -3925,6 +3930,13 @@ fn apply_collider_role(
     true
 }
 
+/// How many pixels on a side the warm view renders into: a small viewport, so the wait buys
+/// extraction, visibility and pipeline specialization, not fragments. `Camera::viewport` is not
+/// part of a pipeline key - the view key is built from HDR and tonemapping bits alone
+/// (bevy_pbr `render/mesh.rs:358-505`) - so what this view specializes is what the crossing
+/// reuses. Clamped to the portal target's own size, which is whatever the last doorway left it.
+const WARMUP_VIEWPORT: UVec2 = UVec2::new(256, 144);
+
 /// Frames the render pipeline cache's created count must hold flat, with nothing left waiting in
 /// it, before a warm view calls the destination's specialization done ([`PortalPrewarm`]).
 ///
@@ -4018,6 +4030,25 @@ impl PortalPrewarm {
     }
 }
 
+/// Takes the pre-warm's published keys back out of the destination set: exactly the keys
+/// [`prewarm_destination_view`] published ([`PortalState::warm`]), and never a key of the
+/// portal's own hold - the destination the doorway's window is still riding on
+/// ([`PortalState::draw_destination`] keeps that hold alive through the frames it is lost). What
+/// the destination set is left holding is the portal's own, which is what the crossing's cell
+/// roles have always been derived from.
+fn take_back_warm_keys(state: &mut PortalState) {
+    for key in std::mem::take(&mut state.warm) {
+        let held = state
+            .hold
+            .as_ref()
+            .is_some_and(|hold| hold.destination.contains(&key));
+        if held {
+            continue;
+        }
+        state.destination.retain(|published| published != &key);
+    }
+}
+
 /// Pre-warms the destination behind the prestream window: picks the nearest door of the active
 /// space whose destination the window is streaming and that still has something to warm, holds
 /// while that destination loads ([`PrewarmPhase::WaitingLoad`]), then activates the portal camera
@@ -4029,15 +4060,26 @@ impl PortalPrewarm {
 /// warmed are the ones the doorway renders. The quad and the published doorway stay exactly what
 /// `update_portal` left them: the warm view draws the destination and nothing else, and nothing
 /// samples its target until a real doorway stands open.
+///
+/// What makes the view a warm view at all is the reveal: a pre-streamed cell is born
+/// [`CellRole::Hidden`] - on no layer of anyone's and hidden - so an active camera on
+/// [`DESTINATION_LAYER`] would extract nothing and specialize nothing. While the warm view runs,
+/// the window's keys are published into the destination set ([`PortalState::destination`]), which
+/// `isolate_cells` (later in this chain) stamps `CellRole::Destination` for - layer 2 and
+/// visible - in the same frame, the stamps the crossing itself applies; the take-back at the top
+/// of this system takes exactly those keys back (never the portal's own hold) the frame the warm
+/// view does not run, which is what makes the warm-up idempotent and its restoration automatic.
 #[allow(clippy::too_many_arguments)]
 fn prewarm_destination_view(
-    state: ResMut<PortalState>,
+    mut state: ResMut<PortalState>,
     active: Option<Res<ActiveCell>>,
     config: Option<Res<EngineConfig>>,
     origin: Option<Res<RenderOrigin>>,
     streaming: Option<Res<StreamingWorld>>,
     prestream: Option<Res<PrestreamCells>>,
     counts: Option<Res<PipelineCounts>>,
+    texture: Option<Res<PortalTexture>>,
+    images: Option<Res<Assets<Image>>>,
     mut prewarm: ResMut<PortalPrewarm>,
     main: MainCameraQuery,
     doors: LoadDoorQuery,
@@ -4046,6 +4088,12 @@ fn prewarm_destination_view(
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = Instant::now();
+    // Last frame's warm state comes down first, whatever this frame decides: the keys it
+    // published leave the destination set - never a key of the portal's own hold - and the warm
+    // branch below publishes again while the view runs. A frame the warm view does not run
+    // therefore leaves the destination and the camera exactly as the portal left them, which is
+    // what makes the warm-up idempotent and its restoration automatic.
+    take_back_warm_keys(&mut state);
     // The guards mirror `update_portal`'s: a frame any of them fails on is a frame with no
     // window to warm, and the phase is set down at once so the wait cannot be held by a stale
     // one.
@@ -4065,6 +4113,10 @@ fn prewarm_destination_view(
         profiler.record_elapsed("portal/prewarm", started);
         return;
     };
+    // The warm viewport is the warm view's alone, and it is cleared before anything else reads
+    // the camera: a doorway the portal draws this very frame must render the whole target, and
+    // the warm branch below puts the small one back.
+    camera.viewport = None;
     let Some(prestream) = prestream else {
         prewarm.go_idle();
         profiler.record_elapsed("portal/prewarm", started);
@@ -4203,6 +4255,33 @@ fn prewarm_destination_view(
     camera.sub_camera_view = None;
     camera.is_active = true;
     prewarm.phase = PrewarmPhase::Warming;
+
+    // The reveal (see this system's doc): the window's keys go into the destination set, which
+    // `isolate_cells` - after this system in the chain - stamps `CellRole::Destination` for in
+    // this same frame, layer 2 and visible, exactly the stamps the crossing applies. A key the
+    // portal's own destination already holds is left alone, and only what was published here is
+    // recorded ([`PortalState::warm`]) for the take-back.
+    for key in &wanted {
+        if !state.destination.contains(key) {
+            state.destination.push(*key);
+            state.warm.push(*key);
+        }
+    }
+
+    // A small viewport ([`WARMUP_VIEWPORT`]): the wait buys extraction, visibility and
+    // specialization, not fragments, and `Camera::viewport` is not part of a pipeline key, so
+    // what this view specializes is what the crossing reuses. Held inside the target's own size,
+    // which is whatever the last doorway left it.
+    let target_size = texture
+        .as_ref()
+        .zip(images.as_ref())
+        .and_then(|(texture, images)| images.get(&texture.0))
+        .map(Image::size);
+    camera.viewport = Some(Viewport {
+        physical_position: UVec2::ZERO,
+        physical_size: target_size.map_or(WARMUP_VIEWPORT, |target| target.min(WARMUP_VIEWPORT)),
+        ..default()
+    });
 
     // Readiness: the warm view stays up until the pipeline cache has stopped growing with
     // nothing left waiting in it, then goes off the same frame. Cells that commit later in the
@@ -8609,31 +8688,30 @@ mod tests {
     }
 
     /// A closed load door of the active space whose destination is `cell_id`: the approach state
-    /// the pre-warm exists for.
+    /// the pre-warm exists for. The door hangs under the active cell's root, the way a streamed
+    /// cell hangs its doors, so [`isolate_cells`]'s own role rebuild keeps it in the active space.
     fn spawn_windowed_door(app: &mut App, cell_id: u32) -> Entity {
-        let root = app.world_mut().spawn_empty().id();
-        app.world_mut()
-            .resource_mut::<PortalState>()
-            .roles
-            .insert(root, CellRole::Active);
+        let (active_root, _) = spawn_cell(app, INTERIOR_ALFTAND01, None, None, None);
         app.world_mut()
             .spawn((
                 Transform::default(),
                 GlobalTransform::default(),
                 interior_door(cell_id),
-                ChildOf(root),
+                ChildOf(active_root),
             ))
             .id()
     }
 
     /// Everything [`prewarm_destination_view`] reads that [`portal_app`] does not already have:
-    /// the pipeline counts and a window streaming `cell_id`'s destination.
+    /// the pipeline counts, a window streaming `cell_id`'s destination, and the pre-warm state
+    /// the plugin's own build inserts - in the plugin's own order, before the isolation.
     fn prewarm_app(app: &mut App, cell_id: u32) {
-        app.insert_resource(PipelineCounts::default());
+        app.init_resource::<PortalPrewarm>()
+            .insert_resource(PipelineCounts::default());
         let mut prestream = PrestreamCells::default();
         prestream.request_interior(cell_id);
         app.insert_resource(prestream);
-        app.add_systems(Update, prewarm_destination_view);
+        app.add_systems(Update, prewarm_destination_view.before(isolate_cells));
     }
 
     #[test]
@@ -8645,7 +8723,14 @@ mod tests {
         spawn_windowed_door(&mut app, PRESTREAMED_CELL);
 
         // The approach: the door is closed, no doorway is drawn, and yet the destination's own
-        // view runs - the frame the crossing burst is spent in instead of on.
+        // view runs - the frame the crossing burst is spent in instead of on. The first frame
+        // only classifies the cell (`isolate_cells` builds the roles the portal and the pre-warm
+        // read); the warm view starts the frame after, like the portal's own first doorway.
+        app.update();
+        assert!(
+            app.world().resource::<PortalPrewarm>().settled(),
+            "the first frame only classifies the cell"
+        );
         app.update();
         let camera_state = app.world().get::<Camera>(camera).unwrap().clone();
         assert!(
@@ -8731,6 +8816,7 @@ mod tests {
         let mut app = portal_app();
         app.insert_resource(PipelineCounts::default());
         app.insert_resource(PrestreamCells::default());
+        app.init_resource::<PortalPrewarm>();
         app.add_systems(Update, prewarm_destination_view);
         spawn_prewarm_main_camera(&mut app, Vec3::new(0.0, 0.0, -400.0));
         let camera = spawn_portal_camera(&mut app);
