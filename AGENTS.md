@@ -291,7 +291,7 @@ only if the user gives one.
   (an engine built against another branch's `shared` crate).
 - **C:\Modding layout (the user, 2026-10-07):** top level holds only the main checkout, `.cargo`, the converted
   data (`SkyrimConverted*`) and the user's tools; every agent worktree or work repo goes in
-  `C:\Modding\worktrees\<name>` and every build folder in `C:\Moddinguilds\<name>` (no `wkj-` prefix for new ones).
+  `C:\Modding\worktrees\<name>` and every build folder in `C:\Modding\builds\<name>` (no `wkj-` prefix for new ones).
 - **Layout and naming (2026-10-07):** `local/LAYOUT.md` says where things go in `local/` (handover/,
   logs/, archive/, bin/) and how new files and folders are named (`<track>-<subject>-<YYYY-MM-DD>`, existing
   task ids unchanged); paths moved in the 2026-10-07 sweep are mapped in `local/disk/moves-2026-10-07.tsv`.
