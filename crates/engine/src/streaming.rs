@@ -326,7 +326,24 @@ impl StreamingWorld {
         center: IVec2,
         radius: i32,
     ) -> (usize, usize, usize) {
-        let wanted = wanted_cells(space, configured_worldspace, center, radius.max(0));
+        // Portal's planner (`wanted_cells`) takes the `ActiveCell` and the door pre-stream; the
+        // window this check waits for is the same one, written out for the `ActiveSpace` it reads.
+        let wanted: Vec<CellKey> = match space.interior {
+            Some(cell_id) => vec![CellKey::Interior(cell_id)],
+            None => {
+                let worldspace_id = space.worldspace_id.unwrap_or(configured_worldspace);
+                let radius = radius.max(0);
+                (-radius..=radius)
+                    .flat_map(|y| {
+                        (-radius..=radius).map(move |x| CellKey::Exterior {
+                            worldspace_id,
+                            grid_x: center.x + x,
+                            grid_y: center.y + y,
+                        })
+                    })
+                    .collect()
+            }
+        };
         let mut resident = 0;
         let mut failed = 0;
         for key in &wanted {
