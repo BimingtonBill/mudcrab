@@ -26,11 +26,16 @@ Track: Phase 2. All local; nothing pushed. Hand-offs to Upstream Dev, Portal Dev
   signal; websearch-1056 checks Bevy 0.20 for one).
 - **Terrain merge engine half** `phase2/terrain-merge` (C:/Modding/worktrees/p2-terrain): reviews DeepSeek +
   Muse #1042, 7 fixes in (weld fallback, setup stall/timeout, back faces, RENDER_WORLD arrays, real KTX2
-  colour-space check, no data asserts, documented differences); Phase 1's writers merged (880363fa). Gates
-  and the GPU probe were running at wrap-up; see the coder's last report in the day log.
+  colour-space check, no data asserts, documented differences); Phase 1's writers merged (880363fa). Head
+  0d1d3bc3: clippy, workspace nextest 1173/1173, doctests and the converter-chunk test green; the GPU probe
+  runs but FAILS (blend quadrants brighter than reference, a whitish offset up to 190/255; the back-face case
+  passes), so the shader is not device-verified. Tomorrow: rerun clippy and engine tests for the naga_oil
+  default-features change, then find the probe's offset.
 - **Scenario runner v1** `phase2/scenarios` (C:/Modding/worktrees/p2-scenarios; spec
   `docs/specs/engine/scenarios.md`, posted on #193): runner drives the real controller; reviews #1043
-  (DeepSeek accept, Muse fix first: input gate) fixed. Not yet run on real data; smoke and re-picks tomorrow.
+  (DeepSeek accept, Muse fix first: input gate) fixed; head 878fa1f5, workspace 1275/1276 (its own test, fixed;
+  scenario+door 75/75). Not yet run on real data; smoke and re-picks tomorrow. Bevy has no render-to-main
+  "prepared" signal (websearch-1056: in 0.20 no), so #1055 needs our own ExtractSchedule bridge.
 - **Disk:** C: filled to 0.5 GB at 18:46 (other sessions' coder worktrees in `local/impl`). Deleted, with the
   user's yes: `C:/Modding/wkj-p2-routes-target` (20 GB). `SkyrimConverted-p2main-v24.assets-cache` (21 GB)
   kept, on the can-go list. Owner notes for converted data now sit beside the folder.
