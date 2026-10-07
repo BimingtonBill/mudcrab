@@ -3,6 +3,31 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Portal Dev, Hermes (impl-190 merged into portal)
+
+Track: Portal. Nothing pushed. Job: the user's "keep working on 160 fps in portal demo,
+organise the work into prepped drafts/PRs". Took Upstream Dev's prepped impl-190 draft (its
+message in the group chat): the merge toward portal is Portal's to do.
+
+- **Merged `impl-190-portal-ring-off-with-lod` (e00f7100, cut from 0fda5620) into `portal`
+  with `--no-ff`.** Auto-merge clean, no conflicts (app.rs auto-merged over the water-merge
+  content; the water tests still pass). Merge commit **ad1c60e2**.
+- **Checks** in `C:/Modding/Mudcrab/builds/portal-hermes-target` (this profile's own folder,
+  OWNER.txt reused, same branch as its last build): `cargo fmt --all -- --check` clean; gated
+  `cargo clippy -p engine --all-targets --all-features -- -D warnings` clean (23.8 s); gated
+  `cargo nextest run -p engine --all-targets` **1123 passed / 4 skipped** (24.9 s, includes the
+  streaming-fixture interior-crossing test).
+- Foundations check: no shortcuts — the ring turns off only where a worldspace has a LOD
+  manifest (data-driven, matches vanilla), never a draw-distance cap; right layer (streaming
+  plan reads the world DB per frame, the documented deviation); flexible/moddable — any
+  worldspace with LOD benefits, others unchanged; aligned — ring-off is the exact
+  lod-far-ring-off scene from the crossing-frames note (p50 8.22 ms vs 13.71 with the ring),
+  the biggest steady-state lever toward 160 fps. Caveat carried from the timing note: the
+  13.71/8.22 pair was not a clean A/B (data changed too).
+- Next: implement fix #2 from `local/research/portal-crossing-frames-895-2666-2026-10-08.md`
+  (extend portal/prestream to pre-warm interior pipeline specialisation during approach) as a
+  prepped portal draft; its measurement waits on the #1 instrumentation brief (Upstream Dev).
+
 ## 2026-10-08 Hermes trial (water merge into portal)
 
 Track: Portal. Nothing pushed. Job: the user's yes in the Hermes session ("start on water merge"); the morning item from Portal Dev's handoff aa395beb.
