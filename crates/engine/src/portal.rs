@@ -201,7 +201,7 @@ use bevy::{
     asset::embedded_asset,
     camera::primitives::Aabb,
     camera::{
-        CameraUpdateSystems, ClearColorConfig, Hdr, RenderTarget, SubCameraView, Viewport,
+        CameraUpdateSystems, ClearColorConfig, Hdr, RenderTarget, SubCameraView,
         primitives::Frustum,
         visibility::{RenderLayers, VisibilitySystems},
     },
@@ -4031,7 +4031,7 @@ impl PortalPrewarm {
 /// samples its target until a real doorway stands open.
 #[allow(clippy::too_many_arguments)]
 fn prewarm_destination_view(
-    mut state: ResMut<PortalState>,
+    state: ResMut<PortalState>,
     active: Option<Res<ActiveCell>>,
     config: Option<Res<EngineConfig>>,
     origin: Option<Res<RenderOrigin>>,
@@ -4101,6 +4101,7 @@ fn prewarm_destination_view(
     // The nearest door of the active space whose destination the window is streaming and that
     // still has cells to warm. The window is the walk's, not the tour's: any run approaching a
     // door prestreams it, so any run gets the warm view.
+    let streaming = streaming.as_deref();
     let mut candidates: Vec<(f32, Entity, Vec<CellKey>, PrewarmNeed)> = Vec::new();
     for (entity, global, local, door, _, _, _, anchor) in &doors {
         if state
@@ -4119,7 +4120,7 @@ fn prewarm_destination_view(
         if wanted.is_empty() {
             continue;
         }
-        let need = if !destination_is_loaded(&door.destination, anchor, streaming.as_deref()) {
+        let need = if !destination_is_loaded(&door.destination, anchor, streaming) {
             PrewarmNeed::Load
         } else if streaming
             .is_none_or(|streaming| destination_is_resident(&door.destination, anchor, streaming))
