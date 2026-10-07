@@ -189,7 +189,7 @@ use crate::{
     },
 };
 use bevy::{
-    app::{HierarchyPropagatePlugin, Inherited, Propagate, PropagateSet},
+    app::{HierarchyPropagatePlugin, Inherited, Propagate, PropagateOver, PropagateSet},
     asset::embedded_asset,
     camera::primitives::Aabb,
     camera::{
@@ -3025,9 +3025,16 @@ fn adopt_layer_source(
     registry: &mut CellLayerSources,
 ) {
     let value = role.map_or_else(|| own.clone(), |role| source_layers(role, &own));
+    // `PropagateOver` would keep the node's own layers whatever its cell's role is - it is
+    // `crate::render::light_render_layers`'s way of keeping a light's layers under a reference whose
+    // model is moved to the placed-object layer - which is what the value below is for here: the
+    // node's own layers travel with it, and the cell's role is what they are applied to.
     commands
         .entity(entity)
         .try_insert(PortalLayerSource { root, own });
+    commands
+        .entity(entity)
+        .try_remove::<PropagateOver<RenderLayers>>();
     commands.entity(entity).try_insert(Propagate(value));
     if let Some(root) = root {
         let list = registry.by_root.entry(root).or_default();
