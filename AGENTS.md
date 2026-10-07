@@ -195,6 +195,23 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
   --workspace --all-targets` plus `cargo test --workspace --doc` (nextest skips doctests). Each in the
   session's own build folder (see "Disk"); a combined or branch-vs-main check in a throwaway one.
 - Keep `docs/` current. Findings go in the docs (`docs/research/`, `docs/roadmap/`), not only in chat.
+- **xEdit is the record reference (the user, 2026-10-07; every session and worker).** xEdit
+  4.1.5f is installed at `C:\Tools\SSEEdit` (`SSEEdit64.exe` GUI, `SSEDump64.exe` command-line
+  dumper). Use it at these points:
+  - **Before decoding or changing any record or field** (converter or engine): read how xEdit
+    defines it (its `Core/wbDefinitions*.pas` on GitHub, TES5Edit/TES5Edit) and cite "xEdit 4.1.5f
+    defs" in the note, brief or PR. Where xEdit and UESP or our own reading disagree, say so.
+  - **Bug triage when something looks wrong in game** (a mesh that shouldn't show, a wrong light,
+    a missing door): check the record's fields and flags in xEdit first, to tell a data or converter
+    fault from an engine fault. The user can open records in the GUI for a session; workers use
+    the dumper.
+  - **Answer-key checks** of converter output against xEdit's winning records belong to Chef's
+    #157/#158 programme upstream: help there (via Upstream Dev), never build a rival oracle.
+  - Rules: read only, never save a plugin (always "don't save" on exit; dumps write outside game
+    and `SkyrimConverted*` folders). xEdit is open source (MPL-2.0), so reading and citing it is
+    within the clean-room rules; copying or translating its code into Mudcrab (MIT/Apache) needs
+    the team's licence decision first. Running it on game data is CPU and disk work: not during a
+    booked timing window.
 - **Installed dev tools (2026-09-26):** `cargo nextest run` matches CI's test runner, so prefer it
   locally; it still compiles, so the build rules above apply. For render bugs, capture a frame
   before guessing from screenshots: RenderDoc (`C:\Program Files\RenderDoc\qrenderdoc.exe`, run the
