@@ -36,7 +36,7 @@ from datetime import date, datetime, timedelta, timezone
 DEFAULT_ROOTS = [r"C:\Modding", r"D:\Modding-overflow"]
 
 # Folders whose children (not the folder itself) are the entries.
-PARENT_DIR_NAMES = ["wt", "wt-targets"]
+PARENT_DIR_NAMES = ["wt", "wt-targets", "worktrees", "builds"]
 
 # NEVER-TOUCH list: folder names (case-insensitive, fnmatch patterns). These
 # are listed by name only and never walked or sized. Add new names here.
@@ -47,7 +47,9 @@ NEVER_TOUCH_PATTERNS = [
     "MudcrabProject",  # the main checkout
     "SkyrimConverted*",  # converted game data; measuring it once blocked a conversion
     ".cargo",  # C:\Modding\.cargo holds the quick build profile for every checkout
-    "wkj-contributor-status",  # the user's local-only contributor status tool
+    "wkj-contributor-status",  # the user's local-only contributor status tool (old path)
+    "contributor-status",  # the same tool under C:\Modding\worktrees since 2026-10-07
+    "OpenSkyrimProject",  # the main checkout (folder name on this PC)
 ]
 
 DRIVES = ["C:\\", "D:\\"]
