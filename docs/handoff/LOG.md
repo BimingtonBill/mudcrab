@@ -3,6 +3,33 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Portal Dev, Hermes (impl-285 review follow-up: wall_cycle_ms/real_ms columns)
+
+Track: Portal. Nothing pushed. Upstream Dev reviewed impl-285 (9cb1fc80): faithful, one
+recorded deviation — the brief-update's `wall_cycle_ms`/`real_ms` were not separate CSV
+columns — acceptable, and left them as an optional same-branch add before the re-profile.
+Done: branch `impl-285-portal-crossing-frame-attribution` commit **0e8642a2**, worktree
+`D:\Mudcrab\worktrees\portal-impl-285`, on top of the cherry-picked brief-update
+(bf598688 = portal's 6f467d53), so the branch carries the brief it now satisfies.
+
+- `CycleSides` gains `wall_ms` and `real_ms`, both closed by the next cycle's `start_main`:
+  `wall_ms` is a main-thread `Instant` lap `First` → next `First` (its own lap, not a sum of
+  sides); `real_ms` is the `Time<Real>` delta that `First` read. `start_main_world` now reads
+  `Time<Real>` and is ordered after `TimeSystems`, so the column is the same reading
+  `frame-series.csv` and the frame ledger read that frame — the files join clock for clock.
+- `render-cycles.csv` header is now `cycle,wall_cycle_ms,real_ms,main_world,extract,
+  wait_for_render_thread,frame/remainder,render_thread,<seven phase columns>` (row `n` ↔
+  frame `n`, n → n+1 render offset unchanged). The run's last cycle keeps neither clock.
+- Identity test `the_cycle_sides_account_for_the_whole_cycle` asserts
+  `main_world + extract + wait + frame/remainder ≈ wall_cycle_ms` against the row's own lap,
+  plus wall lap ≈ main + raw window; the CSV header test names the new columns.
+- Gated (`BUILD_GATE_OWNER=portal`): fmt clean, clippy `-p engine --all-targets
+  --all-features -- -D warnings` clean, nextest `-p engine --all-targets` 1131 passed / 4
+  skipped. Measurement only; no behaviour change (the one ordering change,
+  `start_main_world` after `TimeSystems`, is measurement alignment).
+- Next: unchanged — prestream pre-warm + impl-1058 land, then the booked re-profile; the CSV
+  now reads wall time and clock skew directly.
+
 ## 2026-10-08 Portal Dev, Hermes (impl-285 implemented: crossing-frame attribution)
 
 Track: Portal. Nothing pushed. Job: Upstream Dev's brief
