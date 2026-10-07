@@ -55,11 +55,13 @@ pub const ROOM_TABLES_SQL: &str = r#"
          );
 "#;
 
-/// Drops a `room_portals` table of the older shape (one row per `ref_id`, no `pair_index`) so
-/// `ROOM_TABLES_SQL` recreates it. `CREATE TABLE IF NOT EXISTS` cannot change an existing
-/// table's key. The table is derived data, rebuilt by every full export, so nothing is lost
-/// that a reconversion does not restore. Call before executing `ROOM_TABLES_SQL`.
-pub fn drop_outdated_room_portals(conn: &Connection) -> Result<()> {
+/// Migrates a `room_portals` table of the older shape (`ref_id` alone as the key, no
+/// `pair_index`) to the current one in place: every existing row is copied with `pair_index` 0.
+/// `CREATE TABLE IF NOT EXISTS` cannot change an existing table's key, and dropping the table
+/// would leave it empty beside `room_bounds` after a subset export or a failed full export.
+/// Runs in one savepoint, so it is atomic whether or not a transaction is already open. Call
+/// before executing `ROOM_TABLES_SQL`.
+pub fn migrate_room_portals(conn: &Connection) -> Result<()> {
     let has_table: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='room_portals'",
@@ -77,11 +79,50 @@ pub fn drop_outdated_room_portals(conn: &Connection) -> Result<()> {
             |row| row.get(0),
         )
         .optional()?;
-    if has_pair_index.is_none() {
-        // The index goes with the table.
-        conn.execute_batch("DROP TABLE room_portals")?;
+    if has_pair_index.is_some() {
+        return Ok(());
     }
-    Ok(())
+    // Outside a transaction the savepoint opens one, and RELEASE then commits it; that
+    // commit can fail (SQLITE_BUSY while another connection reads the file).
+    let outermost = conn.is_autocommit();
+    conn.execute_batch("SAVEPOINT room_portals_migration")?;
+    let migrated = conn.execute_batch(
+        "DROP TABLE IF EXISTS room_portals_new;
+         CREATE TABLE room_portals_new (
+             ref_id INTEGER NOT NULL, pair_index INTEGER NOT NULL DEFAULT 0,
+             cell_id INTEGER NOT NULL,
+             pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
+             rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
+             half_x REAL NOT NULL, half_z REAL NOT NULL,
+             room_a INTEGER, room_b INTEGER,
+             PRIMARY KEY (ref_id, pair_index)
+         );
+         INSERT INTO room_portals_new (ref_id, pair_index, cell_id, pos_x, pos_y, pos_z,
+                                       rot_x, rot_y, rot_z, half_x, half_z, room_a, room_b)
+             SELECT ref_id, 0, cell_id, pos_x, pos_y, pos_z,
+                    rot_x, rot_y, rot_z, half_x, half_z, room_a, room_b
+             FROM room_portals;
+         DROP TABLE room_portals;
+         ALTER TABLE room_portals_new RENAME TO room_portals;
+         CREATE INDEX IF NOT EXISTS idx_room_portals_cell ON room_portals(cell_id);",
+    );
+    match migrated.and_then(|()| conn.execute_batch("RELEASE room_portals_migration")) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Undo the partial migration and close the savepoint, including after a failed
+            // RELEASE, so no transaction is left open; report the original error. When the
+            // savepoint opened the transaction, ROLLBACK ends it (a second RELEASE could fail
+            // the same way); inside the caller's transaction, releasing a nested savepoint
+            // commits nothing and cannot be busy.
+            let cleanup = if outermost {
+                "ROLLBACK"
+            } else {
+                "ROLLBACK TO room_portals_migration; RELEASE room_portals_migration"
+            };
+            let _ = conn.execute_batch(cleanup);
+            Err(error)
+        }
+    }
 }
 
 /// Counters for the conversion report (`integration-report.json`).
