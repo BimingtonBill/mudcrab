@@ -582,10 +582,13 @@ fn record_frame_ledger(
         .map(|metrics| ledger.commit_ms(metrics));
     // Taken on every frame, warm-up included, so the records of frames nobody scores do not pile up.
     let cycle = render_timings.take_previous_cycle();
-    let measured = ledger.frames_seen > config.benchmark_warmup_frames;
-    let on_route = route.as_deref().is_none_or(RouteRunner::scoring);
+    let scored = frame_is_scored(
+        ledger.frames_seen,
+        config.benchmark_warmup_frames,
+        route.as_deref().map(RouteRunner::scoring),
+    );
     let milliseconds = real_time.delta_secs_f64() * 1000.0;
-    if measured && on_route && milliseconds.is_finite() && milliseconds > 0.0 {
+    if scored && milliseconds.is_finite() && milliseconds > 0.0 {
         let cycle = cycle.unwrap_or_default();
         let sides = FrameSides::from_samples(
             cycle.main_ms,
@@ -600,6 +603,15 @@ fn record_frame_ledger(
         });
     }
     ledger.previous_upload_ms = commit_ms;
+}
+
+/// Whether a frame belongs to the frame budget's window. A run with no route scores the frames
+/// after the warm-up, as the rest of the report does. A route run scores the route's own frames
+/// and nothing else: the route's start (waiting for the world, or none at all) is what opens the
+/// window, so the warm-up frames are not trimmed on top of it, which would drop the first frames
+/// of a route that starts at once.
+fn frame_is_scored(frames_seen: u32, warmup_frames: u32, on_route: Option<bool>) -> bool {
+    on_route.unwrap_or(frames_seen > warmup_frames)
 }
 
 fn memory_settle_seconds(config: &EngineConfig) -> f64 {
@@ -917,6 +929,21 @@ mod tests {
         .unwrap();
         assert_eq!(value["world_ready_reached"], serde_json::json!(true));
         assert_eq!(value["frames"], serde_json::json!(3));
+    }
+
+    /// A route run scores from the route's start, with no warm-up trimmed: a route that starts on
+    /// the first frame loses none of its frames. Without a route the warm-up is dropped.
+    #[test]
+    fn route_runs_score_from_the_route_start_without_a_warmup_trim() {
+        // No route: frames 1..=60 are warm-up, 61 is the first scored.
+        assert!(!frame_is_scored(60, 60, None));
+        assert!(frame_is_scored(61, 60, None));
+        // A route that has not started, or is on its first frame, scores nothing, whatever the
+        // frame number.
+        assert!(!frame_is_scored(500, 60, Some(false)));
+        // A route scoring on frame 3 (it started on frame 2) is scored inside the warm-up.
+        assert!(frame_is_scored(3, 60, Some(true)));
+        assert!(frame_is_scored(500, 60, Some(true)));
     }
 
     #[test]

@@ -425,7 +425,7 @@ start cell (`"start": "immediately"` skips the wait); from then on the runner ne
 loading, never slows down and hides nothing. The route ends the benchmark window when its last
 waypoint is reached, so the report covers the route, and the distance travelled follows the real
 clock, so a hitch costs the camera its distance. Frame times are scored from the first full frame on the
-route. The engine knows no route: the files are data, and `-Scenarios travel` or `check` only names a
+route (the benchmark's warm-up frames are not trimmed on top of that). The engine knows no route: the files are data, and `-Scenarios travel` or `check` only names a
 file.
 
 - `scripts/routes/travel.json` (`-Scenarios travel`): about 23,800 units at 400 units per second, a
