@@ -43,12 +43,25 @@ portal camera activated behind the prestream window.
   readiness, warmed destination never re-warmed); `the_prewarm_holds_the_prestream_wait_while_
   the_destination_loads` (WaitingLoad holds with an empty StreamingWorld, then warms when loads
   land); `a_run_without_a_prestream_window_is_never_warmed` (empty window and no-portal camera
-  both idle, camera untouched). Existing transition/portal/tour tests unchanged and green.
+  both idle, camera untouched). Three more were recovered from the worker's leftover working
+  copy by the lead and committed as 5f3717a6: `the_prewarm_reveals_the_destination_cell_and_
+  takes_it_back_without_a_crossing` (while the warm view runs the cell is stamped
+  Destination/layer 2/visible - the crossing's own stamps - and every write is taken back when
+  the wait ends without a crossing); `a_doorway_the_portal_is_drawing_takes_the_warm_state_down`
+  (a really-drawn doorway stands the warm view down, clears the viewport, keeps the portal's
+  own activation); `a_run_without_the_portal_prestreams_but_never_warms` (transition.rs:
+  TransitionPlugin alone never gains PortalPrewarm). Existing transition/portal/tour tests
+  unchanged and green.
 - **Gated** (own build folder): fmt clean; gated clippy --workspace --all-targets --all-features
-  -D warnings clean; gated nextest -p engine --all-targets **1131 passed / 4 skipped**.
+  -D warnings clean; gated nextest -p engine --all-targets 1131/1131 on the worker's four
+  commits; the lead's watched re-run on the recovered tree (5f3717a6) in the same folder: fmt
+  clean, gated clippy clean, gated nextest -p engine --all-targets **1134 passed / 4 skipped**.
 - **Incident:** one stray `Viewport` import from outside this branch's work arrived in the
-  working copy mid-run and was swept into d51773f0; removed in d79833b1. Check concurrent
-  writers before trusting a shared worktree's diff.
+  working copy mid-run and was swept into d51773f0; removed in d79833b1. The lead saw the
+  second occurrence: a botched re-indent of a transition test appeared in the working copy
+  between two reads and was cleaned up again minutes later (stable since 05:22, sha-verified).
+  Check concurrent writers before trusting a shared worktree's diff; no other session claimed
+  this worktree.
 - **Next:** hand to Upstream Dev for review; then the booked re-profile window prices impl-285 +
   impl-1058 + this together on the door-tour baseline.
 
