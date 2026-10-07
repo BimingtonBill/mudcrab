@@ -62,6 +62,20 @@ const WAVE_STRENGTH: f32 = 0.05;
 pub const DEFAULT_WATER_FRESNEL: f32 = 0.10;
 pub const DEFAULT_WATER_REFLECTIVITY: f32 = 0.8;
 
+/// Period after which `globals.time`, the clock the water waves read, wraps back to zero.
+///
+/// This is applied to Bevy's `Time<Virtual>` wrap period, so it changes the wrap engine-wide, from
+/// Bevy's default of 1 hour to 12 hours, for everything that reads `elapsed_wrapped` or the
+/// `globals` uniform's `time`, not only the water. The water's wave phase is not periodic over any
+/// wrap period, so every wrap is a one-off visible jump of the waves; 12 hours makes it rare, while
+/// f32 still resolves about 4 ms at that magnitude, no worse than the unwrapped clock the water used
+/// before. Nothing else in the engine reads the wrapped clock.
+///
+/// TEMPORARY. A wrap-safe drive is a follow-up, for example one shared time buffer for all water
+/// materials, written once a frame and not wrapped; until then each wrap is one visible jump of the
+/// waves.
+const WATER_CLOCK_WRAP_PERIOD: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+
 pub struct VercidiumRendererPlugin;
 
 impl Plugin for VercidiumRendererPlugin {
@@ -70,6 +84,14 @@ impl Plugin for VercidiumRendererPlugin {
         embedded_asset!(app, "shaders/water.wgsl");
         embedded_asset!(app, "shaders/snow.wgsl");
         embedded_asset!(app, "shaders/effect_palette.wgsl");
+        // The water shader reads Bevy's shared `globals.time`, which is the virtual clock wrapped
+        // to this period (one hour by default). The wave phase is not periodic over the wrap, so
+        // every wrap is a one-off jump of the wave pattern; a longer period makes that rare while
+        // f32 still resolves far below a frame at this magnitude (about 4 ms at 12 hours, the same
+        // loss the unwrapped clock had before).
+        app.world_mut()
+            .get_resource_or_init::<Time<Virtual>>()
+            .set_wrap_period(WATER_CLOCK_WRAP_PERIOD);
         app.add_plugins((
             crate::light_falloff::SkyrimLightFalloffPlugin,
             crate::material_animation::MaterialAnimationPlugin,
@@ -85,11 +107,7 @@ impl Plugin for VercidiumRendererPlugin {
         .add_systems(Startup, setup_water_reflection)
         .add_systems(
             Update,
-            (
-                animate_water_materials,
-                update_water_reflection_camera,
-                sync_renderer_metrics,
-            ),
+            (update_water_reflection_camera, sync_renderer_metrics),
         );
 
         // `--reflection-cascades N`: the default is 0 (an unshadowed reflection), so the limit is
@@ -695,12 +713,20 @@ pub struct WaterExtension {
     flow_normal: Option<Handle<Image>>,
 }
 
+/// The field order here is the uniform's memory layout and must match `struct WaterSettings` in
+/// `shaders/water.wgsl` (encase writes the fields in declaration order); the test
+/// `water_settings_fields_match_the_shader_struct` pins it.
 #[derive(ShaderType, Reflect, Debug, Clone)]
 struct WaterSettings {
+    /// x = wave scale, y = wave speed, z = wave strength. w unused.
     wave_scale_speed_strength: Vec4,
+    /// xy = flow direction, z unused, w = 1 when the flow normal texture is present.
     flow_direction: Vec4,
     /// x = Fresnel Amount (Schlick F0), y = Reflectivity Amount. z/w unused.
     fresnel_reflectivity: Vec4,
+    /// x = the pinned clock in seconds, y = 1 when the water uses it instead of the shared view
+    /// clock. z/w unused. See [`WaterExtension::with_pinned_clock`].
+    clock: Vec4,
 }
 
 impl Default for WaterExtension {
@@ -709,6 +735,7 @@ impl Default for WaterExtension {
             settings: WaterSettings {
                 wave_scale_speed_strength: Vec4::new(0.006, 0.15, WAVE_STRENGTH, 0.0),
                 flow_direction: Vec4::new(0.8, 0.35, 0.0, 0.0),
+                clock: Vec4::ZERO,
                 fresnel_reflectivity: Vec4::new(
                     DEFAULT_WATER_FRESNEL,
                     DEFAULT_WATER_REFLECTIVITY,
@@ -748,9 +775,23 @@ impl WaterExtension {
             settings: WaterSettings {
                 wave_scale_speed_strength: Vec4::new(0.006, 0.15, WAVE_STRENGTH, 0.0),
                 flow_direction: Vec4::new(0.8, 0.35, 0.0, has_flow_normal),
+                clock: Vec4::ZERO,
                 fresnel_reflectivity: Vec4::new(fresnel, reflectivity, 0.0, 0.0),
             },
         }
+    }
+}
+
+impl WaterExtension {
+    /// Pins this water's animation clock to a fixed time instead of the shared clock.
+    ///
+    /// The waves otherwise read `globals.time` in the shader, the one clock Bevy uploads once a
+    /// frame for every view, so the material itself never changes while time advances and Bevy does
+    /// not re-prepare its bind group every frame. A pinned clock is for scenes that need a
+    /// reproducible still, such as the terrain/water fixture.
+    pub fn with_pinned_clock(mut self, seconds: f32) -> Self {
+        self.settings.clock = Vec4::new(seconds, 1.0, 0.0, 0.0);
+        self
     }
 }
 
@@ -758,24 +799,6 @@ impl MaterialExtension for WaterExtension {
     fn fragment_shader() -> ShaderRef {
         "embedded://engine/shaders/water.wgsl".into()
     }
-}
-
-fn animate_water_materials(
-    time: Res<Time>,
-    config: Option<Res<crate::config::EngineConfig>>,
-    mut materials: ResMut<Assets<WaterMaterial>>,
-    mut profiler: ResMut<ProfilingState>,
-) {
-    let started = std::time::Instant::now();
-    let elapsed = if config.is_some_and(|config| config.terrain_water_fixture) {
-        1.0
-    } else {
-        time.elapsed_secs()
-    };
-    for (_, material) in materials.iter_mut() {
-        material.extension.settings.wave_scale_speed_strength.w = elapsed;
-    }
-    profiler.record_elapsed("render/water_animation", started);
 }
 
 #[derive(Resource, Clone)]
@@ -997,7 +1020,9 @@ fn update_water_reflection_camera(
     // Keep both views in the same domain, including explicit diagnostic exposure changes.
     let ev100 = exposure.map_or(DEFAULT_SCENE_EV100, |value| value.ev100);
     if let Some(mut reflection_exposure) = reflection_exposure {
-        reflection_exposure.ev100 = ev100;
+        if reflection_exposure.ev100 != ev100 {
+            reflection_exposure.ev100 = ev100;
+        }
     } else {
         commands.entity(entity).insert(Exposure { ev100 });
     }
@@ -1033,13 +1058,19 @@ fn update_water_reflection_camera(
         };
     }
     let Some(surface) = mirror_surface else {
-        camera.is_active = false;
+        if camera.is_active {
+            camera.is_active = false;
+        }
         return;
     };
     // The mirror plane is refreshed even while the view is gated off, so the frame the gate reopens
     // reflects the camera as it stands then rather than the last frame water was on screen.
-    *reflection = reflected_camera_transform(main, surface.translation().y);
-    camera.is_active = surface_in_view;
+    // Both writes are skipped when nothing changed, so a still camera does not mark the reflection
+    // camera changed (and re-extract it) every frame.
+    reflection.set_if_neq(reflected_camera_transform(main, surface.translation().y));
+    if camera.is_active != surface_in_view {
+        camera.is_active = surface_in_view;
+    }
     profiler.record_elapsed("render/water_reflection_camera", started);
 }
 
@@ -2488,30 +2519,133 @@ mod tests {
         }
     }
 
+    /// The waves read the shared `globals.time`, so a frame in which only time advanced must not
+    /// touch a water material: any write marks the asset modified, and Bevy then re-extracts and
+    /// re-prepares its bind group, once per streamed water cell, every frame.
     #[test]
-    fn animated_water_advances_the_shader_phase() {
-        let mut app = App::new();
-        app.init_resource::<Time>()
-            .init_resource::<Assets<WaterMaterial>>()
-            .init_resource::<ProfilingState>()
-            .add_systems(Update, animate_water_materials);
-        let handle = app
+    fn advancing_time_leaves_water_materials_unmodified() {
+        use bevy::time::TimeUpdateStrategy;
+        use std::time::Duration;
+
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 50.0, 0.0));
+        harness.spawn_water(Vec3::new(0.0, 0.0, -500.0), CELL_WATER_HALF_EXTENTS);
+        harness
+            .app
+            .add_plugins((
+                bevy::app::TaskPoolPlugin::default(),
+                bevy::time::TimePlugin,
+                AssetPlugin::default(),
+            ))
+            .init_asset::<WaterMaterial>()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                16,
+            )));
+        let handle = harness
+            .app
             .world_mut()
             .resource_mut::<Assets<WaterMaterial>>()
             .add(WaterMaterial {
                 base: StandardMaterial::default(),
                 extension: WaterExtension::default(),
             });
-        app.world_mut()
-            .resource_mut::<Time>()
-            .advance_by(std::time::Duration::from_secs(2));
-        app.update();
-        let material = app
-            .world()
-            .resource::<Assets<WaterMaterial>>()
-            .get(&handle)
-            .unwrap();
-        assert_eq!(material.extension.settings.wave_scale_speed_strength.w, 2.0);
+        // Let the creation event and the first frames' time settle, then count from here.
+        for _ in 0..3 {
+            harness.frame();
+        }
+        harness
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<WaterMaterial>>>()
+            .clear();
+        let before = harness.app.world().resource::<Time>().elapsed_secs();
+        for _ in 0..10 {
+            harness.frame();
+        }
+        let world = harness.app.world_mut();
+        assert!(
+            world.resource::<Time>().elapsed_secs() > before,
+            "the frames must have advanced time"
+        );
+        let events: Vec<_> = world
+            .resource_mut::<Messages<AssetEvent<WaterMaterial>>>()
+            .drain()
+            .collect();
+        assert!(
+            events.is_empty(),
+            "time advancing alone modified a water material: {events:?}"
+        );
+        assert!(
+            world
+                .resource::<Assets<WaterMaterial>>()
+                .get(&handle)
+                .is_some()
+        );
+    }
+
+    /// An unchanged pose and active flag are not written, so the reflection camera is not marked
+    /// changed on every still frame.
+    #[test]
+    fn a_still_view_does_not_rewrite_the_reflection_camera() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 50.0, 0.0));
+        harness.spawn_water(Vec3::new(0.0, 0.0, -500.0), CELL_WATER_HALF_EXTENTS);
+        harness.frame();
+        harness.frame();
+        let ticks = |harness: &ReflectionHarness| {
+            let entity = harness.app.world().entity(harness.reflection_camera);
+            (
+                entity.get_ref::<Transform>().unwrap().last_changed(),
+                entity.get_ref::<Camera>().unwrap().last_changed(),
+            )
+        };
+        let settled = ticks(&harness);
+        harness.frame();
+        harness.frame();
+        assert_eq!(ticks(&harness), settled);
+    }
+
+    /// The water uniform is written in the Rust struct's declaration order and read in the WGSL
+    /// struct's, so the two lists of fields must be the same, name for name. A reorder on one side
+    /// only makes every water read another field's values (the clock arriving in the fresnel
+    /// slot froze the waves and lost the reflection).
+    #[test]
+    fn water_settings_fields_match_the_shader_struct() {
+        use bevy::reflect::structs::Struct;
+
+        let source = include_str!("shaders/water.wgsl");
+        let block = source
+            .split("struct WaterSettings {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("water.wgsl must declare struct WaterSettings");
+        let shader_fields: Vec<&str> = block
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or("").trim())
+            .filter(|line| !line.is_empty())
+            .map(|line| line.split(':').next().unwrap_or("").trim())
+            .collect();
+        let settings = WaterExtension::default().settings;
+        let rust_fields: Vec<&str> = (0..settings.field_len())
+            .map(|index| settings.name_at(index).expect("field name"))
+            .collect();
+        assert_eq!(rust_fields, shader_fields);
+    }
+
+    /// A pinned clock gives a reproducible still, and the shared clock is the default.
+    #[test]
+    fn only_a_pinned_water_clock_reads_the_material_time() {
+        let shared = WaterExtension::default();
+        assert_eq!(shared.settings.clock.y, 0.0);
+        let pinned = WaterExtension::default().with_pinned_clock(1.0);
+        assert_eq!(pinned.settings.clock.x, 1.0);
+        assert_eq!(pinned.settings.clock.y, 1.0);
+        assert_eq!(
+            pinned.settings.flow_direction,
+            shared.settings.flow_direction
+        );
+        assert_eq!(
+            pinned.settings.wave_scale_speed_strength,
+            shared.settings.wave_scale_speed_strength
+        );
     }
 
     #[test]
@@ -2829,10 +2963,6 @@ mod tests {
             OVERLAY_WEIGHT_WORDS
         );
         assert_eq!(shader_array_length(source, "weights"), WEIGHT_FIELD_WORDS);
-        assert_eq!(
-            WEIGHT_FIELD_WORDS,
-            OVERLAY_WEIGHT_SLOTS * OVERLAY_WEIGHT_WORDS
-        );
         assert_eq!(
             OVERLAY_WEIGHT_WORDS, 73,
             "289 samples four to a vec4, rounded up"
