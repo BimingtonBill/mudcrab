@@ -18,7 +18,7 @@
 //!   measured walk is not the cold load of the start cell; until then the camera waits at the first
 //!   waypoint. That wait is the only one: once the route has started the runner never waits for
 //!   loading, never slows down and hides nothing. A route with `"start": "immediately"` does not
-//!   wait at all. Frame times are scored from the first frame on the route.
+//!   wait at all. Frame times are scored from the first full frame on the route.
 //! * The route ends when the last waypoint is reached, and the benchmark window with it, so the
 //!   report covers the route and nothing after it. A looped route never ends; the benchmark's own
 //!   duration does.

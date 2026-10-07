@@ -410,7 +410,7 @@ fn collect_and_finish(
     let frame_budget = FrameBudgetReport::from_frames(
         config.frame_budget_ms,
         if route.is_some() {
-            "route window: the frames from the first on the route to the end of the measured window"
+            "route window: the frames from the first full frame on the route to the end of the measured window"
         } else {
             "measured window: every frame after the warm-up"
         },
