@@ -70,10 +70,15 @@ a conversion's build pause, a review wait) or is about to go idle, it checks:
 - Limits still apply: timing windows run alone, conversions pause new builds, no unattended runs, one build folder
   per session, the DeepSeek pace.
 - **Builds are the scarce part, not workers (2026-10-07: 26 cargo + 22 rustc at once left 3.3 GB RAM free and
-  slowed a conversion to 4 MB/s).** Many workers may write code at once, but machine-wide no more than about
-  3 cargo builds or test runs run at the same time, and none starts while free RAM is under 8 GB (check
-  `Get-CimInstance Win32_OperatingSystem` FreePhysicalMemory) or while a conversion is extracting or converting.
-  Coders queue their build behind the session's gate file; parallel code, staggered builds.
+  slowed a conversion to 4 MB/s). Every heavy cargo command goes through the machine-wide build gate:**
+  `python C:/Users/Brannock/AppData/Local/mudcrab/build-gate/build_gate.py run -- cargo nextest run -p <crate>`
+  (also for check, clippy, build, test; sessions, Claude subagents and DeepSeek workers alike). It waits for one of
+  3 build slots, at least 8 GB free RAM and no hold, then runs and frees the slot on any exit. `... status` shows
+  slots, holds, free RAM and converters. A conversion (extraction and convert phases) and a timing window set a
+  hold (`... hold set conversion --owner <session> --reason <what> --until HH:MM`) and clear it when done;
+  this replaces per-session gate files and "no cargo" messages (still announce the job). Source:
+  `tools/build_gate.py` (the copy in the gate folder is what everyone runs; Upstream Dev updates it). Workers
+  launched from this checkout can no longer run heavy cargo directly (`.deepseek-agents.json`).
 Upstream Dev runs this check across all sessions at least once an hour while the user is working, and at every
 hold and unhold, and messages any session that is idle without a reason.
 

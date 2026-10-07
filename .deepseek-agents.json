@@ -21,7 +21,7 @@
     "CLAUDE.md",
     ".deepseek-agents.json"
   ],
-  "allowTools": "Bash(cargo check *),Bash(cargo test *),Bash(cargo nextest *),Bash(cargo clippy *),Bash(cargo fmt --check*),Bash(cargo tree *),Bash(python tools/*),Bash(python -m unittest *),Bash(git add *),Bash(git commit *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(target/release/engine.exe *),Bash(./target/release/engine.exe *),Bash(target/quick/engine.exe *),Bash(./target/quick/engine.exe *)",
+  "allowTools": "Bash(python C:/Users/Brannock/AppData/Local/mudcrab/build-gate/build_gate.py *),Bash(cargo fmt --check*),Bash(cargo tree *),Bash(python tools/*),Bash(python -m unittest *),Bash(git add *),Bash(git commit *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(target/release/engine.exe *),Bash(./target/release/engine.exe *),Bash(target/quick/engine.exe *),Bash(./target/quick/engine.exe *)",
   "stateDir": "local/agents",
   "defaults": {
     "mode": "read",
@@ -29,6 +29,7 @@
     "timeoutMinutes": 150
   },
   "delegationLevel": 4,
-  "implAllowTools": "Bash(cargo check *),Bash(cargo test *),Bash(cargo nextest *),Bash(cargo clippy *),Bash(cargo fmt *),Bash(cargo tree *),Bash(cargo build *),Bash(python *),Bash(python -m unittest *),Bash(target/release/engine.exe *),Bash(./target/release/engine.exe *),Bash(target/quick/engine.exe *),Bash(./target/quick/engine.exe *)",
-  "_implAllowToolsNote": "implAllowTools replaces ds_impl's cargo+python default; cargo build and the release engine were added 2026-09-22 for --shots render tasks (impl-019)."
+  "implAllowTools": "Bash(python C:/Users/Brannock/AppData/Local/mudcrab/build-gate/build_gate.py *),Bash(cargo fmt *),Bash(cargo tree *),Bash(python *),Bash(python -m unittest *),Bash(target/release/engine.exe *),Bash(./target/release/engine.exe *),Bash(target/quick/engine.exe *),Bash(./target/quick/engine.exe *)",
+  "_implAllowToolsNote": "implAllowTools replaces ds_impl's cargo+python default; cargo build and the release engine were added 2026-09-22 for --shots render tasks (impl-019).",
+  "_buildGateNote": "2026-10-07 (the user: learn from the PC clash): heavy cargo (check/test/nextest/clippy/build) runs only through the machine-wide build gate: python C:/Users/Brannock/AppData/Local/mudcrab/build-gate/build_gate.py run -- cargo ... (max 3 slots, >= 8 GB free RAM, waits for conversion/timing holds). Direct heavy cargo is no longer allowed for workers."
 }
