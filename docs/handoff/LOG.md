@@ -3,6 +3,86 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Portal Dev, Hermes (impl-286 Stage B reviewed by the lead)
+
+Track: Portal. Nothing pushed. Lead review of the Stage B commits below (full diff read:
+`portal.rs` +718, `transition.rs` +38 tests-only, `demo_tour.rs` +36, handoff entries). Verified
+in the worktree rather than taken on report: the reveal reuses the portal's own
+destination-set → `isolate_cells` stamping path (no second stamping mechanism to drift); the
+warm view is render-only — `apply_collider_role` keeps `ColliderDisabled` for `Destination` and
+`Hidden` alike, so nothing physical wakes behind the closed door during warm frames; restoration
+is a per-frame take-back of exactly the published keys (never the portal's own hold), which the
+`the_prewarm_reveals_the_destination_cell_and_takes_it_back_without_a_crossing` test pins both
+ways; streaming.rs diff is empty. Fixed here: the Stage A report was cited by a name never
+filed (`t286-…` → `portal-prestream-prewarm-mechanism-2026-10-08.md`) in the `PortalPrewarm` doc
+and the handoff entry. Known review points for Upstream Dev: the window is read from
+`PrestreamCells` directly (includes predicted beyond-radius doors, not radius-only); the warm-up
+is readiness-bounded (cache settle, 2 flat frames, nothing waiting) and the tour's wait is held
+adaptively with a 20 s cap; cells are revealed only on warm frames; one door at a time (nearest).
+Reviewer's own gate run below.
+
+## 2026-10-08 Portal Dev, Hermes (impl-286 Stage B: prestream pre-warm implemented)
+
+Track: Portal. Nothing pushed. Branch `impl-286-portal-prestream-prewarm` commits d51773f0,
+d79833b1, 90155163, worktree `D:/Mudcrab/worktrees/portal-impl-286`, on the portal lineage
+(c9f2ffa7, includes impl-1058's spawn-time layer stamps). Implements Stage A's recommendation
+(`local/research/portal-prestream-prewarm-mechanism-2026-10-08.md`): the pre-warm is the existing
+portal camera activated behind the prestream window.
+
+- **Mechanism.** `portal.rs` gains `PortalPrewarm` (resource, inited with the portal's own
+  build) and `prewarm_destination_view`, chained in `PortalFrame` after `update_portal` and
+  before the occlusion test/resize/leaf/isolation systems. Per frame: a doorway `update_portal`
+  is really drawing marks its destination warmed; otherwise the nearest active-space door whose
+  destination `plan_door_prestream` is streaming and not yet warmed becomes the target. While
+  that destination's cells are still streaming the phase is `WaitingLoad` (the wait holds); once
+  the landing cell is resident the phase is `Warming`: the portal camera is placed exactly where
+  the doorway render places it (door_map pose, destination clip plane, main projection, full
+  view, `sub_camera_view` cleared) and activated, spending the wait's frames on the 44-pipeline
+  specialization burst and the destination's paced uploads. Deactivation is readiness-gated:
+  `PipelineCounts` (the shared render-world bridge) read each frame; the view goes off the frame
+  the created count has held flat `PREWARM_SETTLE_FRAMES` (2) with an empty waiting set. Warmed
+  keys are remembered run-wide (a doorway the portal drew counts too), so re-approaches and
+  windows that persist re-warm nothing.
+- **Adaptive wait.** `demo_tour.rs` `Phase::Prestream` keeps its 6 s floor but holds past it
+  while `PortalPrewarm::settled()` is false (destination still streaming in, or warm view
+  running), capped at `PRESTREAM_WAIT_MAX_SECONDS` (20 s) like `Phase::Settle`'s ceiling; one
+  log line names what held the wait when it ran >1 s past the floor. Walked runs need no timer:
+  their window is `plan_door_prestream`'s own, and the warm view simply runs in it.
+- **Foundations check.** No shortcuts: nothing loads faster or hides loading - the wait already
+  exists and the work moves into it; `RenderAssetBytesPerFrame`/`upload_budget` untouched
+  (tours run it unpaced today; noted, unchanged here). No scene/route knowledge: doors, cells
+  and keys only, any worldspace. Destination sun off during warm-up (illuminance 0 while
+  `update_destination_atmosphere` has no open doorway; no shadow cascades warmed); the warm view
+  costs ~+1.6-2.5 ms render CPU per frame while the wait is open, named in the code. No
+  `streaming.rs` touches; no timing run (AFTER numbers come from the booked re-profile window
+  with impl-1058 and impl-285).
+- **Tests** (headless, no GPU): `the_prewarm_draws_the_destination_behind_the_prestream_wait`
+  (warm view runs behind the wait while the door is closed, publishes no doorway, deactivates on
+  readiness, warmed destination never re-warmed); `the_prewarm_holds_the_prestream_wait_while_
+  the_destination_loads` (WaitingLoad holds with an empty StreamingWorld, then warms when loads
+  land); `a_run_without_a_prestream_window_is_never_warmed` (empty window and no-portal camera
+  both idle, camera untouched). Three more were recovered from the worker's leftover working
+  copy by the lead and committed as 5f3717a6: `the_prewarm_reveals_the_destination_cell_and_
+  takes_it_back_without_a_crossing` (while the warm view runs the cell is stamped
+  Destination/layer 2/visible - the crossing's own stamps - and every write is taken back when
+  the wait ends without a crossing); `a_doorway_the_portal_is_drawing_takes_the_warm_state_down`
+  (a really-drawn doorway stands the warm view down, clears the viewport, keeps the portal's
+  own activation); `a_run_without_the_portal_prestreams_but_never_warms` (transition.rs:
+  TransitionPlugin alone never gains PortalPrewarm). Existing transition/portal/tour tests
+  unchanged and green.
+- **Gated** (own build folder): fmt clean; gated clippy --workspace --all-targets --all-features
+  -D warnings clean; gated nextest -p engine --all-targets 1131/1131 on the worker's four
+  commits; the lead's watched re-run on the recovered tree (5f3717a6) in the same folder: fmt
+  clean, gated clippy clean, gated nextest -p engine --all-targets **1134 passed / 4 skipped**.
+- **Incident:** one stray `Viewport` import from outside this branch's work arrived in the
+  working copy mid-run and was swept into d51773f0; removed in d79833b1. The lead saw the
+  second occurrence: a botched re-indent of a transition test appeared in the working copy
+  between two reads and was cleaned up again minutes later (stable since 05:22, sha-verified).
+  Check concurrent writers before trusting a shared worktree's diff; no other session claimed
+  this worktree.
+- **Next:** hand to Upstream Dev for review; then the booked re-profile window prices impl-285 +
+  impl-1058 + this together on the door-tour baseline.
+
 ## 2026-10-08 Phase 2 Dev, Hermes (impl-1057 ported onto the detail-tiered streamer: failed-cell retry with backoff)
 
 Track: Phase 2. Nothing pushed. Branch `phase2/failed-cell-retry` commit **b2f2bea6** (from
@@ -29,8 +109,9 @@ subagent, then re-verified by this session.
   `failed_cells_given_up` added beside `failed_cells`.
 - Interior retry: budget unchanged (`INTERIOR_FAILED_RETRIES`), now additionally gated on the same
   wall-clock backoff; a given-up interior is never re-asked. NOTE: interiors effectively cap at
-  `MAX_CELL_LOAD_ATTEMPTS` (3) via the shared give-up rule - coincides with the old budget, flag
-  to review whether interiors should keep a separate give-up rule.
+  `MAX_CELL_LOAD_ATTEMPTS` (3) via the shared give-up rule - one load TIGHTER than the old
+  budget (old was 1 + 3 re-asks = 4; conservative direction, per Upstream Dev's impl-1057
+  review), flag to review whether interiors should keep a separate give-up rule.
 - Leak fix riding along: `unload_all_cells_now` and `validate_streaming_lifecycle` now account for
   `Failed { replaced }` roots (despawn on space change / counted as plan-accounted, not orphan).
 - Deviation recorded: collider-build failure was NOT converted - at c9f2ffa7 it no longer fails
