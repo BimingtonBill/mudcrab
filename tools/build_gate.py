@@ -17,7 +17,8 @@ every session and worker on this PC:
         a hold stops NEW gated runs machine-wide (running ones finish). Use it
         for a conversion's extraction/convert phase and for timing windows.
 
-Defaults (override in <gate dir>/config.json): 3 slots, 8 GB free RAM minimum,
+Defaults (override in <gate dir>/config.json): 3 slots, at most 2 per session
+(BUILD_GATE_OWNER, else the label's track prefix: p1, p2, p3, portal ...), 8 GB free RAM minimum,
 wait up to 120 minutes for a slot (then exit 4 with the reason). The gate
 lives in %LOCALAPPDATA%\\mudcrab\\build-gate so it survives folder moves and
 is shared by every checkout and worktree.
@@ -39,7 +40,7 @@ from ctypes import wintypes
 from datetime import datetime, timedelta
 
 GATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "mudcrab", "build-gate")
-DEFAULTS = {"slots": 3, "min_free_ram_gb": 8.0, "max_wait_minutes": 120, "poll_seconds": 10}
+DEFAULTS = {"slots": 3, "max_per_owner": 2, "min_free_ram_gb": 8.0, "max_wait_minutes": 120, "poll_seconds": 10}
 GB = 1024**3
 
 
@@ -132,15 +133,29 @@ def active_holds() -> list[dict]:
     return holds
 
 
+def owner_of(label: str) -> str:
+    """The session a run belongs to: BUILD_GATE_OWNER, else the label's track prefix (p2-water -> p2)."""
+    owner = os.environ.get("BUILD_GATE_OWNER") or label.split("-")[0]
+    return {"phase1": "p1", "phase2": "p2", "phase3": "p3"}.get(owner.lower(), owner.lower())
+
+
+def owner_slots(config: dict, owner: str) -> int:
+    return sum(1 for path in slot_paths(config)
+               if (info := read_json(path)) is not None and info.get("owner") == owner)
+
+
 def try_acquire(config: dict, label: str, command: list[str]) -> str | None:
     clear_stale_slots(config)
+    owner = owner_of(label)
+    if owner_slots(config, owner) >= int(config["max_per_owner"]):
+        return None
     for path in slot_paths(config):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             continue
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"pid": os.getpid(), "label": label, "command": " ".join(command)[:300],
+            json.dump({"pid": os.getpid(), "label": label, "owner": owner, "command": " ".join(command)[:300],
                        "cwd": os.getcwd(), "since": datetime.now().isoformat(timespec="seconds")}, handle)
         return path
     return None
@@ -168,7 +183,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         reason = blocking_reason(config)
         slot = None if reason else try_acquire(config, label, args.command)
         if slot is None and reason is None:
-            reason = f"all {config['slots']} build slots busy"
+            owner = owner_of(label)
+            reason = (f"{owner} already holds {config['max_per_owner']} slots (max per session)"
+                      if owner_slots(config, owner) >= int(config["max_per_owner"])
+                      else f"all {config['slots']} build slots busy")
         if slot is not None:
             # Re-check after taking the slot: a hold set in between wins.
             late = blocking_reason(config)
@@ -203,7 +221,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
     for path in slot_paths(config):
         info = read_json(path)
         print(f"{os.path.basename(path)}: " + ("free" if info is None else
-              f"{info['label']} since {info['since']} pid {info['pid']}: {info['command'][:120]}"))
+              f"{info['label']} ({info.get('owner', '?')}) since {info['since']} pid {info['pid']}: {info['command'][:120]}"))
     holds = active_holds()
     print("holds: " + ("none" if not holds else ""))
     for hold in holds:
