@@ -21,7 +21,7 @@
 //!
 //! | role | layers | visibility | seen by |
 //! |---|---|---|---|
-//! | [`CellRole::Active`] | its own (0, or 1 for water) | unchanged | main camera, reflection camera |
+//! | [`CellRole::Active`] | the world layer on the root; its own (0, or 1 for water) on sources | unchanged | main camera, reflection camera |
 //! | [`CellRole::Destination`] | [`DESTINATION_LAYER`] | unchanged | the portal camera only |
 //! | [`CellRole::Hidden`] | none | hidden | nothing |
 //!
@@ -42,6 +42,12 @@
 //! is *also* hidden with `Visibility` - that one *is* inherited, so it covers meshes that appear
 //! later. The portal's destination stays visible: the portal camera renders layers, and a hidden
 //! entity is skipped by every camera.
+//!
+//! The root carries its role's source in **every** role ([`root_layers`]) and a cell's plain nodes
+//! are born with the role's `Inherited` and `RenderLayers` where the tree is built
+//! (`streaming::spawn_cell`, [`StreamedCellLayerStamps`]) - so a crossing's role flip is a value
+//! write per node, never the two archetype moves per node that re-stamping a bare subtree costs,
+//! which was the whole `portal/propagate` spike on the door-crossing frames (impl-1058).
 //!
 //! # Doors
 //!
@@ -492,6 +498,9 @@ impl Plugin for PortalPlugin {
         add_cell_layer_isolation(app);
         app.add_plugins(MaterialPlugin::<PortalMaterial>::default())
             .init_resource::<PortalState>()
+            // The streaming commit reads this to stamp a cell's nodes at birth
+            // (`spawn_layer_stamp`); a run without the portal never has it and never stamps.
+            .init_resource::<StreamedCellLayerStamps>()
             .add_plugins(crate::door_layer::DoorLayerPlugin)
             // The quad reads PortalTexture, which the camera setup inserts through commands:
             // chaining adds the sync point that applies them in between.
@@ -755,6 +764,15 @@ pub(crate) struct PortalState {
     door_layer_applied: HashSet<Entity>,
 }
 
+impl PortalState {
+    /// The cell keys the portal is currently drawing - or, within the hold, last drew - as its
+    /// destination, for `crate::streaming`'s spawn stamp ([`spawn_layer_stamp`]): a cell born
+    /// inside this set is born the destination the portal will render through its door.
+    pub(crate) fn destination(&self) -> &[CellKey] {
+        &self.destination
+    }
+}
+
 /// The door the portal last drew through and its destination cells, kept for
 /// [`DESTINATION_HOLD_SECONDS`] after the portal stops drawing through it (impl-225).
 #[derive(Debug, Clone, PartialEq)]
@@ -846,7 +864,7 @@ pub(crate) struct OpenDoorway {
 impl PortalState {
     /// The portal draws through `door` this frame, into `destination`: the destination role goes to
     /// those cells, and any hold of another door's ends.
-    fn draw_destination(&mut self, door: Entity, destination: Vec<CellKey>) {
+    pub(crate) fn draw_destination(&mut self, door: Entity, destination: Vec<CellKey>) {
         self.destination.clone_from(&destination);
         self.hold = Some(DestinationHold {
             door,
@@ -2887,10 +2905,12 @@ fn drawn_door_visibility(
     }
 }
 
-/// The layers a cell's role asks of the nodes below its root: the portal camera's layer for the
-/// destination, none at all for a cell no camera draws, and **nothing** for the active space - which
-/// is what leaves every node there on the layers it has of its own (Bevy's layer 0 for a node that
-/// was given none).
+/// The layers a cell's role asks of the nodes below its root **when they are a source of their
+/// own** ([`PortalLayerSource`]): the portal camera's layer for the destination, none at all for a
+/// cell no camera draws, and **nothing** for the active space - which is what leaves every source
+/// there on the layers it has of its own (Bevy's layer 0 for a node that was given none). The
+/// root's own source is [`root_layers`], which has a value for every role: the active space's
+/// subtrees stay stamped so a crossing's role flip is a value write, not a re-stamp.
 fn role_layers(role: CellRole) -> Option<RenderLayers> {
     match role {
         CellRole::Active => None,
@@ -2905,6 +2925,77 @@ fn role_layers(role: CellRole) -> Option<RenderLayers> {
 fn source_layers(role: CellRole, own: &RenderLayers) -> RenderLayers {
     role_layers(role).unwrap_or_else(|| own.clone())
 }
+
+/// The layers a cell root's own `Propagate<RenderLayers>` source carries for its role. Every role
+/// has one, **the active space included**: its value is the world layer the nodes were on anyway,
+/// so the stamp changes nothing a camera sees, and a crossing's role flips become value writes on
+/// nodes that already carry the components instead of the two archetype moves per node that
+/// stripping the active space's subtrees bare paid again on every door crossing - which is where
+/// the `portal/propagate` spike lived (impl-1058: the frames a crossing re-stamped thousands of
+/// bare nodes in one `PostUpdate`, 25.6-37.7 ms).
+///
+/// This is deliberately not [`role_layers`]: a node that is a source of its own
+/// ([`PortalLayerSource`]) in the active space keeps the layers it was given ([`source_layers`]),
+/// which is why that one stays `None` there while the root's source is the world layer. A plain
+/// node's default when it carries no `RenderLayers` at all is layer 0 (`bevy_render`'s own
+/// default), so writing [`crate::render::WORLD_LAYER`] over it is the same picture.
+fn root_layers(role: CellRole) -> Option<RenderLayers> {
+    match role {
+        CellRole::Active => Some(RenderLayers::layer(crate::render::WORLD_LAYER)),
+        CellRole::Destination => Some(RenderLayers::layer(DESTINATION_LAYER)),
+        CellRole::Hidden => Some(RenderLayers::none()),
+    }
+}
+
+/// The role a cell whose key is known stands in this frame, classified against the active space of
+/// the moment: the one classification [`stamp_streamed_cell`] applies when the root's key lands
+/// and `crate::streaming`'s commit applies while it builds the cell ([`spawn_layer_stamp`]), so a
+/// cell cannot be born on a value the isolation would not have picked. A spawning cell always
+/// carries [`StreamedCellKey`], so the key decides the identity on its own
+/// ([`CellIdentity::Key`]).
+fn classify_streamed_cell(
+    key: &CellKey,
+    active: &ActiveCell,
+    unload_radius: i32,
+    camera: Vec3,
+    origin: IVec2,
+    destination: &[CellKey],
+) -> CellRole {
+    let space = ActiveSpace::of(active, unload_radius, camera, origin);
+    role_of(CellIdentity::Key(*key), &space, destination)
+}
+
+/// The layers `crate::streaming::spawn_cell` stamps a freshly building cell's root and plain nodes
+/// with at birth, from the space of the moment - the same answer [`stamp_streamed_cell`] confirms
+/// when the root's key lands. The nodes are then spawned with [`Inherited`] and the concrete
+/// [`RenderLayers`] in their own bundle, and the propagation's first pass over the tree is a
+/// comparison: the values are computed once, where the tree is already being built, instead of
+/// being moved into every node's archetype afterwards.
+pub(crate) fn spawn_layer_stamp(
+    key: &CellKey,
+    active: &ActiveCell,
+    unload_radius: i32,
+    camera: Vec3,
+    origin: IVec2,
+    destination: &[CellKey],
+) -> RenderLayers {
+    root_layers(classify_streamed_cell(
+        key,
+        active,
+        unload_radius,
+        camera,
+        origin,
+        destination,
+    ))
+    .expect("a cell root carries its role's source in every role")
+}
+
+/// Installed by [`PortalPlugin`] for the runs that are looked at: `crate::streaming`'s commit
+/// checks for it to decide whether a freshly spawning cell's nodes are born with their layers
+/// ([`spawn_layer_stamp`]). Absent without the plugin - a run with streaming alone spawns cells
+/// exactly as it always did, on no layers of anyone's, and stamps nothing.
+#[derive(Resource, Default, Debug)]
+pub struct StreamedCellLayerStamps;
 
 /// The role a cell has this frame.
 fn role_of(identity: CellIdentity, space: &ActiveSpace, destination: &[CellKey]) -> CellRole {
@@ -3158,10 +3249,12 @@ fn set_cell_visibility(
 /// frame it spawns and turn a node with layers of its own into a source ([`PortalLayerSource`]).
 ///
 /// Added by `PortalPlugin` for the runs that are looked at, and by this module's own test app - one
-/// function, so the two cannot drift. `crate::render::add_placed_object_layer_propagation` is the
+/// function, so the two cannot drift. `crate::streaming`'s stamp-parity tests add it too, so the
+/// stamped spawn is compared against the propagation that would have produced the same values
+/// without it. `crate::render::add_placed_object_layer_propagation` is the
 /// engine's wiring of the same plugin for the placed-object layer of a reference's model; the guard
 /// below keeps a merge that carries both from adding the propagation twice.
-fn add_cell_layer_isolation(app: &mut App) {
+pub(crate) fn add_cell_layer_isolation(app: &mut App) {
     if !app.is_plugin_added::<HierarchyPropagatePlugin<RenderLayers>>() {
         app.add_plugins(HierarchyPropagatePlugin::<RenderLayers>::new(PostUpdate));
     }
@@ -3205,15 +3298,15 @@ fn end_layer_propagation(mark: Res<LayerPropagation>, mut profiler: ResMut<Profi
     }
 }
 
-/// What a cell root says about itself the moment it spawns: the identity the isolation classifies,
-/// and the visibility writes of a hidden cell ([`set_cell_visibility`]).
+/// What a cell root says about itself the moment it spawns: the visibility writes of a hidden cell
+/// ([`set_cell_visibility`]). The classification reads only the [`StreamedCellKey`]
+/// ([`classify_streamed_cell`]); the identity fallbacks a keyless root would need do not apply to
+/// a cell that is being spawned.
 type NewCellQuery<'w, 's> = Query<
     'w,
     's,
     (
         &'static StreamedCellKey,
-        &'static CellRef,
-        Option<&'static ExteriorCellGrid>,
         Option<&'static Visibility>,
         Option<&'static PortalHiddenCell>,
     ),
@@ -3222,9 +3315,12 @@ type NewCellQuery<'w, 's> = Query<
 /// Stamps a cell root the moment `streaming::spawn_cell` gives it a [`StreamedCellKey`]: in the
 /// frame it exists in the root already carries its role's source, so the meshes it spawns with - and
 /// every mesh of its references, which the glTF spawner adds frames later - take their layers from
-/// the propagation without anyone walking the cell. [`isolate_cells`] re-classifies every root every
-/// frame and is what corrects this stamp when the space has moved on between the spawn and the
-/// isolation (a crossing in the same frame, a camera a frame ahead).
+/// the propagation without anyone walking the cell. The commit stamped the tree's nodes at birth
+/// ([`spawn_layer_stamp`], [`StreamedCellLayerStamps`]); this confirms the root's source is the one
+/// stamp, so a cell that spawned without it is still correct and a cell that spawned with it costs
+/// a comparison. [`isolate_cells`] re-classifies every root every frame and is what corrects this
+/// stamp when the space has moved on between the spawn and the isolation (a crossing in the same
+/// frame, a camera a frame ahead).
 #[allow(clippy::too_many_arguments)]
 fn stamp_streamed_cell(
     event: On<Add, StreamedCellKey>,
@@ -3244,7 +3340,7 @@ fn stamp_streamed_cell(
     if roots.get(root).is_err() {
         return;
     }
-    let Ok((key, cell, grid, visibility, hidden)) = cells.get(root) else {
+    let Ok((key, visibility, hidden)) = cells.get(root) else {
         return;
     };
     let (Some(active), Some(config), Some(origin)) = (active, config, origin) else {
@@ -3255,16 +3351,16 @@ fn stamp_streamed_cell(
     let Ok(camera) = camera.single() else {
         return;
     };
-    let space = ActiveSpace::of(&active, config.unload_radius, camera.translation, origin.0);
-    let destination = state
-        .map(|state| state.destination.clone())
-        .unwrap_or_default();
-    let role = role_of(
-        CellIdentity::of(cell.0, grid, Some(key)),
-        &space,
-        &destination,
+    let destination = state.as_deref().map_or(&[][..], PortalState::destination);
+    let role = classify_streamed_cell(
+        &key.0,
+        &active,
+        config.unload_radius,
+        camera.translation,
+        origin.0,
+        destination,
     );
-    match role_layers(role) {
+    match root_layers(role) {
         Some(layers) => commands.entity(root).try_insert(Propagate(layers)),
         None => commands
             .entity(root)
@@ -3535,12 +3631,15 @@ fn isolate_cells(
         // A root the stamp already agrees with is left alone: its whole subtree is on the value the
         // propagation gave it and nothing about it has moved. A new root - stamped by
         // [`stamp_streamed_cell`] in the frame it spawned, or here when that had no space to
-        // classify it with - and a changed one take the writes below, in that one frame.
+        // classify it with - and a changed one take the writes below, in that one frame. The root
+        // source has a value in every role ([`root_layers`]): the active space's own world layer
+        // keeps its subtree stamped, so the flip a crossing asks for is a value write on nodes
+        // that carry the components, not a re-stamp of bare ones (impl-1058).
         let stamped = stamps.get(root).ok().flatten().map(|stamp| stamp.0);
         if stamped == Some(role) {
             continue;
         }
-        match role_layers(role) {
+        match root_layers(role) {
             Some(layers) => commands.entity(root).try_insert(Propagate(layers)),
             None => commands
                 .entity(root)
@@ -8751,8 +8850,9 @@ mod tests {
         assert_eq!(stamp(&app, active), Some(CellRole::Active));
         assert_eq!(
             source(&app, active),
-            None,
-            "the active space has no source: its nodes keep the layers they were spawned with"
+            Some(RenderLayers::layer(crate::render::WORLD_LAYER)),
+            "the active space carries the world layer its plain nodes are on anyway, so a \
+             crossing's role flip is a value write, never a re-stamp of bare nodes (impl-1058)"
         );
 
         // The isolation finds the stamps already right: nothing of either cell is written again.
@@ -8763,6 +8863,129 @@ mod tests {
             (cells_before, nodes_before),
             "a stamped cell is never walked, let alone re-layered"
         );
+    }
+
+    /// The layers the commit stamps a cell's nodes with at birth (`streaming::spawn_cell`) are the
+    /// layers the propagation would write them to anyway: a tree built stamped and a tree built
+    /// bare settle onto the same per-node values. The stamped tree costs a comparison where the
+    /// bare one costs the per-node archetype moves of the first pass - the whole point of the
+    /// stamp (impl-1058).
+    #[test]
+    fn a_spawn_stamp_matches_what_the_propagation_would_write() {
+        let mut stamped = portal_app();
+        spawn_camera(&mut stamped, Vec3::ZERO);
+        let stamped_root = spawn_cell_root(&mut stamped, INTERIOR_ALFTAND01);
+        let stamped_mesh = stamped
+            .world_mut()
+            .spawn((Mesh3d(Handle::default()), ChildOf(stamped_root)))
+            .id();
+        // What `streaming::spawn_cell` stamps into the bundles of a plain node and its root.
+        let world_layer = RenderLayers::layer(crate::render::WORLD_LAYER);
+        stamped.world_mut().entity_mut(stamped_root).insert((
+            Propagate(world_layer.clone()),
+            Inherited(world_layer.clone()),
+        ));
+        stamped
+            .world_mut()
+            .entity_mut(stamped_mesh)
+            .insert((Inherited(world_layer.clone()), world_layer));
+        update(&mut stamped, 1);
+
+        // The same tree without the stamp: the root's key lands, the observer stamps it, and the
+        // propagation writes the nodes the long way.
+        let mut bare = portal_app();
+        spawn_camera(&mut bare, Vec3::ZERO);
+        let bare_root = spawn_cell_root(&mut bare, INTERIOR_ALFTAND01);
+        let bare_mesh = bare
+            .world_mut()
+            .spawn((Mesh3d(Handle::default()), ChildOf(bare_root)))
+            .id();
+        update(&mut bare, 1);
+
+        let layers = |app: &App, entity: Entity| {
+            (
+                app.world().entity(entity).get::<RenderLayers>().cloned(),
+                app.world()
+                    .entity(entity)
+                    .get::<Inherited<RenderLayers>>()
+                    .cloned(),
+            )
+        };
+        for (stamped_node, bare_node) in [(stamped_root, bare_root), (stamped_mesh, bare_mesh)] {
+            assert_eq!(
+                layers(&stamped, stamped_node),
+                layers(&bare, bare_node),
+                "the stamped spawn and the propagation agree on every node"
+            );
+        }
+    }
+
+    /// A role change after a stamped spawn still moves every node of the cell in one frame
+    /// (impl-191's one-frame rule): the active space's stamp is a value the whole tree carries, so
+    /// the flip to the portal's destination rewrites it as values, and nothing is left behind.
+    #[test]
+    fn a_role_change_after_a_spawn_stamp_moves_every_node_in_one_frame() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let root = spawn_cell_root(&mut app, INTERIOR_ALFTAND01);
+        let meshes = (0..3)
+            .map(|_| {
+                app.world_mut()
+                    .spawn((Mesh3d(Handle::default()), ChildOf(root)))
+                    .id()
+            })
+            .collect::<Vec<_>>();
+        // The tree is born stamped the way `streaming::spawn_cell` stamps it, and the frame's
+        // propagation confirms rather than writes it.
+        let world_layer = RenderLayers::layer(crate::render::WORLD_LAYER);
+        app.world_mut().entity_mut(root).insert((
+            Propagate(world_layer.clone()),
+            Inherited(world_layer.clone()),
+        ));
+        for mesh in &meshes {
+            app.world_mut()
+                .entity_mut(*mesh)
+                .insert((Inherited(world_layer.clone()), world_layer.clone()));
+        }
+        update(&mut app, 1);
+
+        // The cell becomes the portal's destination: the space moves off it, the way a crossing
+        // leaves the space the player just walked out of, and the next frame it runs, every node
+        // is on the destination layer - in that frame, not one frame after it.
+        let door = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<PortalState>()
+            .draw_destination(door, vec![CellKey::Interior(INTERIOR_ALFTAND01)]);
+        app.world_mut().insert_resource(ActiveCell {
+            worldspace_id: TAMRIEL,
+            interior: Some(INTERIOR_ALFTAND01 + 1),
+        });
+        update(&mut app, 1);
+
+        let destination = RenderLayers::layer(DESTINATION_LAYER);
+        let layers = |app: &App, entity: Entity| {
+            (
+                app.world().entity(entity).get::<RenderLayers>().cloned(),
+                app.world()
+                    .entity(entity)
+                    .get::<Inherited<RenderLayers>>()
+                    .map(|inherited| inherited.0.clone()),
+            )
+        };
+        assert_eq!(
+            app.world()
+                .entity(root)
+                .get::<Propagate<RenderLayers>>()
+                .map(|p| p.0.clone()),
+            Some(destination.clone()),
+        );
+        for mesh in &meshes {
+            assert_eq!(
+                layers(&app, *mesh),
+                (Some(destination.clone()), Some(destination.clone())),
+                "every node moved with the role, in the frame the role changed"
+            );
+        }
     }
 
     /// The role a node takes comes from the classification of the frame, and only from the root's

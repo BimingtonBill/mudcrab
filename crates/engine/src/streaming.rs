@@ -23,9 +23,10 @@ use crate::{
 };
 use bevy::{
     animation::AnimationTargetId,
-    app::SceneSpawnerSystems,
+    app::{Inherited, Propagate, SceneSpawnerSystems},
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::primitives::MeshAabb,
+    camera::visibility::RenderLayers,
     ecs::system::SystemParam,
     gltf::{GltfExtras, GltfMaterialName, GltfSceneExtras},
     image::{ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler},
@@ -1457,13 +1458,27 @@ struct CommitCatalogs<'w> {
     budget: ResMut<'w, StreamingCommitBudget>,
 }
 
+/// What a commit reads to stamp a cell's nodes at birth (`crate::portal`'s spawn stamp,
+/// impl-1058): the classification inputs of the moment - the run's configuration, render origin,
+/// active cell, the portal-installed marker that says a run stamps at all, the portal's
+/// destination cells and the streaming camera. One parameter, for the same reason
+/// [`CommitCatalogs`] is: [`collect_cells`] is at the system-function parameter limit.
+#[derive(SystemParam)]
+struct SpawnStampContext<'w, 's> {
+    config: Res<'w, EngineConfig>,
+    origin: Res<'w, RenderOrigin>,
+    active: Res<'w, ActiveCell>,
+    stamps: Option<Res<'w, crate::portal::StreamedCellLayerStamps>>,
+    state: Option<Res<'w, crate::portal::PortalState>>,
+    camera: Query<'w, 's, &'static Transform, With<StreamingCamera>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_cells(
     mut commands: Commands,
-    config: Res<EngineConfig>,
+    context: SpawnStampContext,
     database: Res<WorldDatabase>,
     cache: Res<CellCache>,
-    origin: Res<RenderOrigin>,
     asset_server: Res<AssetServer>,
     mut catalogs: CommitCatalogs,
     reflection: Res<WaterReflectionTexture>,
@@ -1480,7 +1495,7 @@ fn collect_cells(
     catalogs.budget.frame_started = frame_commit_started;
     // One answer for the whole frame, from the one gate: a walked run's cells carry colliders, and
     // every other run's do not (see [`builds_world_colliders`]).
-    let world_physics = builds_world_colliders(&config);
+    let world_physics = builds_world_colliders(&context.config);
     // Everything the worker has answered this frame, behind whatever the last frame had no room
     // for. Answers are taken out of the channel here rather than inside the commit loop, so a
     // response held over is counted - and timed - exactly once.
@@ -1557,7 +1572,7 @@ fn collect_cells(
                     terrain: terrain_commits,
                     elapsed_micros: elapsed_micros(frame_commit_started),
                 },
-                &config,
+                &context.config,
             )
         {
             deferred.push_back(response);
@@ -1659,6 +1674,30 @@ fn collect_cells(
                 if let Some(replaced) = replaced {
                     commands.entity(replaced).try_despawn();
                 }
+                // The layers the cell is born on (`crate::portal`'s resolver, impl-1058): the commit
+                // classifies the cell from the space of the moment, and the nodes the tree is built
+                // from carry that value in their own bundles - the propagation's first pass over
+                // them is then a comparison, and the crossing's role flips later are value writes.
+                // A terrain-only cell is never isolated and keeps the layers it was spawned with,
+                // as before; a run without the portal has no resolver and stamps nothing.
+                let stamp = match detail {
+                    CellDetail::Full => context.stamps.as_ref().and_then(|_| {
+                        let camera = context.camera.single().ok()?.translation;
+                        let destination = context
+                            .state
+                            .as_deref()
+                            .map_or(&[][..], crate::portal::PortalState::destination);
+                        Some(crate::portal::spawn_layer_stamp(
+                            &response.key,
+                            &context.active,
+                            context.config.unload_radius,
+                            camera,
+                            context.origin.0,
+                            destination,
+                        ))
+                    }),
+                    CellDetail::Terrain => None,
+                };
                 let root = spawn_cell(
                     &mut commands,
                     &asset_server,
@@ -1668,11 +1707,12 @@ fn collect_cells(
                     &mut meshes,
                     &mut terrain_materials,
                     &mut water_materials,
-                    origin.0,
+                    context.origin.0,
                     payload,
                     terrain,
                     detail,
                     world_physics,
+                    stamp,
                     &mut streaming.next_model_sequence,
                     &mut profiler,
                 );
@@ -2011,6 +2051,14 @@ fn spawn_cell(
     // Whether this run builds world colliders ([`builds_world_colliders`]). Only a full cell gets
     // terrain colliders; a ring cell is never walked on.
     world_physics: bool,
+    // The layers the cell is born on, from `crate::portal`'s resolver ([`StreamedCellLayerStamps`]):
+    // the root carries its role's `Propagate` source and every plain node its `Inherited` and
+    // concrete `RenderLayers` in the bundle it is spawned with, so the propagation's first pass
+    // over the tree is a comparison and the crossing's later role flips are value writes, never
+    // the per-node archetype moves that re-stamping a bare subtree costs (impl-1058). `None`
+    // spawns the cell exactly as a run without the portal always did. A node with layers of its
+    // own (the water plane) is left to the adoption that makes it a source.
+    stamp: Option<RenderLayers>,
     model_sequence: &mut u64,
     profiler: &mut ProfilingState,
 ) -> Entity {
@@ -2040,6 +2088,12 @@ fn spawn_cell(
     }
     // The exact key, so portal isolation can tell two worldspaces apart at the same grid.
     root_commands.insert(crate::portal::StreamedCellKey(payload.key));
+    // The role's source and its `Inherited` from the same moment: `stamp_streamed_cell` re-classifies
+    // the root from the same resources this stamp came from, and the isolation re-classifies every
+    // frame, so the stamp can only be confirmed or corrected, never half-applied.
+    if let Some(layers) = stamp.clone() {
+        root_commands.insert((Propagate(layers.clone()), Inherited(layers.clone()), layers));
+    }
     let root = root_commands.id();
     commands.entity(root).with_children(|parent| {
         if let Some(terrain) = terrain {
@@ -2113,6 +2167,10 @@ fn spawn_cell(
                         ColliderDisabled,
                         crate::physics::world_collision_groups(),
                     ));
+                }
+                // Born on the cell's layers, like every other plain node of the tree.
+                if let Some(layers) = stamp.clone() {
+                    patch.insert((Inherited(layers.clone()), layers));
                 }
                 if detail == CellDetail::Terrain {
                     // A ring cell casts no shadow: its own shadows fall on the ring, tens of
@@ -2239,6 +2297,11 @@ fn spawn_cell(
                 ));
                 if let Some(bounds) = bounds.zip(model_bounds) {
                     entity.insert(bounds);
+                }
+                // Born on the cell's layers: the model the loader hangs under this reference
+                // inherits them the frame it arrives.
+                if let Some(layers) = stamp.clone() {
+                    entity.insert((Inherited(layers.clone()), layers));
                 }
                 // A static whose `DNAM` names a `MATO` draws its model with a projected snow
                 // material. The reference carries the coverage from here; the swap itself waits for
@@ -5174,6 +5237,7 @@ mod tests {
                 Some(terrain.clone()),
                 CellDetail::Full,
                 physics.0,
+                None,
                 &mut 0,
                 &mut profiler,
             );
@@ -8249,6 +8313,7 @@ mod tests {
         mut commands: Commands,
         queued: Res<QueuedReferences>,
         mut root: ResMut<SpawnedCellRoot>,
+        context: SpawnStampContext,
         asset_server: Res<AssetServer>,
         catalog: Res<AssetCatalog>,
         snow: Res<DirectionalSnowCatalog>,
@@ -8258,6 +8323,24 @@ mod tests {
         mut water_materials: ResMut<Assets<WaterMaterial>>,
         mut profiler: ResMut<ProfilingState>,
     ) {
+        // The stamp the commit would compute, from the same classification: a test that installs
+        // the portal's marker and a destination gets a stamped cell; every other test gets `None`
+        // and a cell spawned exactly as a run without the portal spawns one.
+        let stamp = context.stamps.as_ref().and_then(|_| {
+            let camera = context.camera.single().ok()?.translation;
+            let destination = context
+                .state
+                .as_deref()
+                .map_or(&[][..], crate::portal::PortalState::destination);
+            Some(crate::portal::spawn_layer_stamp(
+                &CellKey::Interior(99),
+                &context.active,
+                context.config.unload_radius,
+                camera,
+                context.origin.0,
+                destination,
+            ))
+        });
         root.0 = Some(spawn_cell(
             &mut commands,
             &asset_server,
@@ -8277,6 +8360,7 @@ mod tests {
             None,
             CellDetail::Full,
             false,
+            stamp,
             &mut 0,
             &mut profiler,
         ));
@@ -8292,6 +8376,14 @@ mod tests {
         references: Vec<ReferenceRow>,
         snow: DirectionalSnowCatalog,
     ) -> App {
+        let mut app = reference_cell_app(references, snow);
+        app.update();
+        app
+    }
+
+    /// The app [`spawn_reference_cell_app_with`] builds, before its first update: a test installs
+    /// the spawn stamp and the camera the classification reads, then lets the cell commit.
+    fn reference_cell_app(references: Vec<ReferenceRow>, snow: DirectionalSnowCatalog) -> App {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("catalogue.db");
         write_empty_catalogue(&path);
@@ -8316,8 +8408,194 @@ mod tests {
             .init_resource::<SpawnedCellRoot>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, spawn_queued_references);
+        app
+    }
+
+    /// The reference-cell app with the portal's spawn stamp installed and the interior held as the
+    /// portal's destination: the cell commits on `crate::portal::DESTINATION_LAYER`-class layers in its first
+    /// frame, stamped where the tree is built and never walked to get there. `active` decides what
+    /// the stamp classifies the cell into; the destination set always contains cell 99.
+    fn stamped_reference_cell_app(references: Vec<ReferenceRow>, active: ActiveCell) -> App {
+        let mut app = reference_cell_app(references, DirectionalSnowCatalog::default());
+        app.insert_resource(crate::portal::StreamedCellLayerStamps)
+            .insert_resource(active)
+            .init_resource::<crate::portal::PortalState>()
+            // The classification reads the streaming camera; without one the stamp is skipped.
+            .world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        let door = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<crate::portal::PortalState>()
+            .draw_destination(door, vec![CellKey::Interior(99)]);
         app.update();
         app
+    }
+
+    /// The nodes of a cell tree, in traversal order, with the layers each carries: what the stamp
+    /// and the propagation must agree on.
+    fn layer_snapshot(
+        app: &App,
+        root: Entity,
+    ) -> Vec<(Option<RenderLayers>, Option<RenderLayers>)> {
+        let mut out = Vec::new();
+        let mut queue = VecDeque::from([root]);
+        while let Some(entity) = queue.pop_front() {
+            let entity_ref = app.world().entity(entity);
+            out.push((
+                entity_ref
+                    .get::<Inherited<RenderLayers>>()
+                    .map(|inherited| inherited.0.clone()),
+                entity_ref.get::<RenderLayers>().cloned(),
+            ));
+            if let Some(children) = entity_ref.get::<Children>() {
+                for child in children.iter() {
+                    queue.push_back(child);
+                }
+            }
+        }
+        out
+    }
+
+    /// A cell the commit stamps is born on its role's layers, on every node, in its first frame -
+    /// asserted on the stamp itself and not on timing: this app runs no propagation, so the
+    /// `Inherited` and `RenderLayers` on the tree can only have come from the spawn stamp
+    /// (impl-1058). The reference's light child is the one node left to the propagation: a real
+    /// run layers it in the same frame's PostUpdate, and there is one per light to save.
+    #[test]
+    fn a_committed_cell_is_born_on_the_layers_its_role_asks() {
+        let app = stamped_reference_cell_app(
+            vec![lit_reference(
+                0x100,
+                Some(light_row(256.0, [255, 200, 120], 0)),
+                None,
+            )],
+            ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            },
+        );
+        let root = app.world().resource::<SpawnedCellRoot>().0.unwrap();
+        let destination = RenderLayers::layer(crate::portal::DESTINATION_LAYER);
+        // The root carries the role's source - and its `Inherited`, so the propagation that reads
+        // it in a real run has nothing to write on the tree below.
+        let entity = app.world().entity(root);
+        assert_eq!(
+            entity
+                .get::<Propagate<RenderLayers>>()
+                .map(|propagate| propagate.0.clone()),
+            Some(destination.clone()),
+        );
+        assert_eq!(
+            entity
+                .get::<Inherited<RenderLayers>>()
+                .map(|inherited| inherited.0.clone()),
+            Some(destination.clone()),
+        );
+        let mut nodes = VecDeque::from([root]);
+        let mut plain = 0;
+        while let Some(entity) = nodes.pop_front() {
+            let entity_ref = app.world().entity(entity);
+            if entity_ref.get::<crate::lights::SkyrimLight>().is_some() {
+                continue;
+            }
+            // The root is a source, not a plain node: its value lives in its `Propagate` (asserted
+            // above), and the propagation gives a source's own `Inherited` but never its concrete
+            // `RenderLayers` - the bare path leaves the root exactly the same, which is the parity
+            // the other stamp test pins. Everything below it is born carrying both components.
+            if entity != root {
+                plain += 1;
+                assert_eq!(
+                    entity_ref
+                        .get::<Inherited<RenderLayers>>()
+                        .map(|inherited| inherited.0.clone()),
+                    Some(destination.clone()),
+                    "every plain node of the tree is born inherited onto the role's layers"
+                );
+                assert_eq!(
+                    entity_ref.get::<RenderLayers>().cloned(),
+                    Some(destination.clone()),
+                    "and born carrying them, in the frame the cell exists"
+                );
+            }
+            if let Some(children) = entity_ref.get::<Children>() {
+                for child in children.iter() {
+                    nodes.push_back(child);
+                }
+            }
+        }
+        assert!(
+            plain >= 1,
+            "the cell has at least one reference under the root"
+        );
+    }
+
+    /// The stamp and the propagation agree: a cell spawned stamped and a cell spawned bare settle
+    /// onto the same layers on every node. What differs is only the work - the stamped tree costs
+    /// the values where the tree is built, the bare one pays the propagation's per-node archetype
+    /// moves (impl-1058).
+    #[test]
+    fn a_spawn_stamp_matches_what_the_propagation_would_write() {
+        let references = vec![lit_reference(
+            0x100,
+            Some(light_row(256.0, [255, 200, 120], 0)),
+            None,
+        )];
+        // Stamping off: the propagation writes the tree, the frame after the commit.
+        let mut app = reference_cell_app(references.clone(), DirectionalSnowCatalog::default());
+        app.insert_resource(ActiveCell {
+            worldspace_id: 60,
+            interior: None,
+        })
+        .init_resource::<crate::portal::PortalState>();
+        let door = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<crate::portal::PortalState>()
+            .draw_destination(door, vec![CellKey::Interior(99)]);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        crate::portal::add_cell_layer_isolation(&mut app);
+        app.update();
+        app.update();
+        let root = app.world().resource::<SpawnedCellRoot>().0.unwrap();
+        let bare = layer_snapshot(&app, root);
+
+        // Stamping on: born stamped, confirmed by the propagation in the same frame.
+        let mut app = stamped_reference_cell_app(
+            references,
+            ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            },
+        );
+        crate::portal::add_cell_layer_isolation(&mut app);
+        app.update();
+        let root = app.world().resource::<SpawnedCellRoot>().0.unwrap();
+        let stamped = layer_snapshot(&app, root);
+
+        assert_eq!(stamped, bare, "same tree, same layers, different work");
+        assert!(
+            stamped.iter().all(|(inherited, _)| inherited.is_some()),
+            "the propagation had settled every node onto the cell's layers"
+        );
+    }
+
+    /// A run without the portal has no stamp to read: streaming spawns a cell exactly as it always
+    /// did, on no layers of anyone's - the water plane's own excepted, and there is none here.
+    #[test]
+    fn a_run_without_the_portal_stamps_nothing() {
+        let app = spawn_reference_cell_app(vec![lit_reference(
+            0x100,
+            Some(light_row(256.0, [255, 200, 120], 0)),
+            None,
+        )]);
+        let root = app.world().resource::<SpawnedCellRoot>().0.unwrap();
+        let snapshot = layer_snapshot(&app, root);
+        assert!(
+            snapshot
+                .iter()
+                .all(|(inherited, layers)| inherited.is_none() && layers.is_none()),
+            "no node of the cell carries a layer the portal never stamped"
+        );
     }
 
     /// One lit reference, one negative light, one flagged off by default and one plain reference:
