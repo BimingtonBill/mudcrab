@@ -1029,7 +1029,7 @@ mod tests {
     fn names_the_exact_command_that_resumes_a_kept_staging_folder() {
         let cli = Cli {
             data: PathBuf::from("C:/Games/Skyrim/Data"),
-            output: PathBuf::from("C:/Modding/Mudcrab/SkyrimConverted"),
+            output: PathBuf::from("C:/Modding/SkyrimConverted"),
             resume_staging: None,
             reuse_assets: None,
             report_json: None,
@@ -1042,15 +1042,15 @@ mod tests {
             no_lod: false,
             verbose: false,
         };
-        let staging = Path::new("C:/Modding/Mudcrab/SkyrimConverted.staging-1-2");
+        let staging = Path::new("C:/Modding/SkyrimConverted.staging-1-2");
         assert_eq!(
             resume_command("converter.exe", &cli, staging),
-            "converter.exe \"C:/Games/Skyrim/Data\" \"C:/Modding/Mudcrab/SkyrimConverted\" --resume-staging \"C:/Modding/Mudcrab/SkyrimConverted.staging-1-2\""
+            "converter.exe \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\""
         );
         // A renamed binary is named as it is, quoted when its name has a space.
         assert_eq!(
             resume_command("mudcrab converter", &cli, staging),
-            "\"mudcrab converter\" \"C:/Games/Skyrim/Data\" \"C:/Modding/Mudcrab/SkyrimConverted\" --resume-staging \"C:/Modding/Mudcrab/SkyrimConverted.staging-1-2\""
+            "\"mudcrab converter\" \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\""
         );
         // The test binary itself stands in for the running converter.
         assert!(!program_name().is_empty());
