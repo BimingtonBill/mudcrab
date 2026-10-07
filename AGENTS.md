@@ -294,6 +294,8 @@ session** (the user's decision, 2026-09-25): keep it free for them and send it n
   timing run, long script) opens visible and titled, and closes itself when the job ends, success or
   failure: no `-NoExit`, `cmd /k` or `pause`. Its output is teed to a log file and its exit code written
   to an exit file, so nothing is lost. Launch from PowerShell `Start-Process`, not Git Bash `start`.
+  The window title says it is running and must not be closed ("RUNNING - do not close: <what>"), because
+  the user may close a window that looks idle (2026-10-07: a conversion window closed during a silent stage).
 - **Non-measured engine builds use `cargo build --profile quick --bin engine`** (`target/quick/`):
   release without link-time optimisation, incremental. Defined in the untracked
   `C:\Modding\.cargo\config.toml`, so it never reaches upstream. Measured 2026-09-24: a one-file
