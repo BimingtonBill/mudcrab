@@ -119,6 +119,10 @@ pub fn add_placed_object_layer_propagation(app: &mut App) {
 /// wrap period, so every wrap is a one-off visible jump of the waves; 12 hours makes it rare, while
 /// f32 still resolves about 4 ms at that magnitude, no worse than the unwrapped clock the water used
 /// before. Nothing else in the engine reads the wrapped clock.
+///
+/// TEMPORARY. A wrap-safe drive is a follow-up, for example one shared time buffer for all water
+/// materials, written once a frame and not wrapped; until then each wrap is one visible jump of the
+/// waves.
 const WATER_CLOCK_WRAP_PERIOD: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
 
 pub struct VercidiumRendererPlugin;
@@ -613,17 +617,20 @@ pub struct WaterExtension {
     flow_normal: Option<Handle<Image>>,
 }
 
+/// The field order here is the uniform's memory layout and must match `struct WaterSettings` in
+/// `shaders/water.wgsl` (encase writes the fields in declaration order); the test
+/// `water_settings_fields_match_the_shader_struct` pins it.
 #[derive(ShaderType, Reflect, Debug, Clone)]
 struct WaterSettings {
     /// x = wave scale, y = wave speed, z = wave strength. w unused.
     wave_scale_speed_strength: Vec4,
     /// xy = flow direction, z unused, w = 1 when the flow normal texture is present.
     flow_direction: Vec4,
+    /// x = Fresnel Amount (Schlick F0), y = Reflectivity Amount. z/w unused.
+    fresnel_reflectivity: Vec4,
     /// x = the pinned clock in seconds, y = 1 when the water uses it instead of the shared view
     /// clock. z/w unused. See [`WaterExtension::with_pinned_clock`].
     clock: Vec4,
-    /// x = Fresnel Amount (Schlick F0), y = Reflectivity Amount. z/w unused.
-    fresnel_reflectivity: Vec4,
 }
 
 impl Default for WaterExtension {
@@ -1682,6 +1689,33 @@ mod tests {
         harness.frame();
         harness.frame();
         assert_eq!(ticks(&harness), settled);
+    }
+
+    /// The water uniform is written in the Rust struct's declaration order and read in the WGSL
+    /// struct's, so the two lists of fields must be the same, name for name. A reorder on one side
+    /// only makes every water read another field's values (the clock arriving in the fresnel
+    /// slot froze the waves and lost the reflection).
+    #[test]
+    fn water_settings_fields_match_the_shader_struct() {
+        use bevy::reflect::Struct;
+
+        let source = include_str!("shaders/water.wgsl");
+        let block = source
+            .split("struct WaterSettings {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("water.wgsl must declare struct WaterSettings");
+        let shader_fields: Vec<&str> = block
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or("").trim())
+            .filter(|line| !line.is_empty())
+            .map(|line| line.split(':').next().unwrap_or("").trim())
+            .collect();
+        let settings = WaterExtension::default().settings;
+        let rust_fields: Vec<&str> = (0..settings.field_len())
+            .map(|index| settings.name_at(index).expect("field name"))
+            .collect();
+        assert_eq!(rust_fields, shader_fields);
     }
 
     /// A pinned clock gives a reproducible still, and the shared clock is the default.
