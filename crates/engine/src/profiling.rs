@@ -2,6 +2,11 @@ use crate::{
     config::EngineConfig,
     fingerprint::{RendererFingerprint, RunFingerprint},
     render::RendererMetrics,
+    render_timing::{
+        self, CLEANUP, CycleSides, EXTRACT, EXTRACT_COMMANDS_AND_ASSETS, GRAPH_AND_PRESENT,
+        MAIN_WORLD, PREPARE, QUEUE, REMAINDER, RENDER_THREAD, SPECIALIZE_AND_VIEWS,
+        SWAPCHAIN_ACQUIRE, WAIT_FOR_RENDER_THREAD,
+    },
     streaming::StreamingMetrics,
 };
 use bevy::{
@@ -36,6 +41,34 @@ const MAX_TIMELINE_EVENTS: usize = 100_000;
 /// under 64 bytes, so the series costs at most a few megabytes. Past this the oldest row is
 /// dropped, and the rows that carry the frame numbers say which frames the file holds.
 const MAX_FRAME_SERIES_ROWS: usize = 100_000;
+
+/// How many cycles of the per-cycle series are kept: the same order of size as the per-frame
+/// series, and one row is under 200 bytes, so the series costs at most a few megabytes. Past this
+/// the oldest row is dropped.
+const MAX_RENDER_CYCLE_ROWS: usize = MAX_FRAME_SERIES_ROWS;
+
+/// The sides of `render-cycles.csv`'s row, in the order it writes them; the row opens with the
+/// cycle number. The names are the spans the render timings record, imported from there, so the
+/// file's header cannot drift from them.
+const RENDER_CYCLE_SIDES: [&str; 5] = [
+    MAIN_WORLD,
+    EXTRACT,
+    WAIT_FOR_RENDER_THREAD,
+    REMAINDER,
+    RENDER_THREAD,
+];
+
+/// The render schedule's phases, one column each after [`RENDER_CYCLE_SIDES`]. The swapchain wait
+/// sits inside the prepare phase.
+const RENDER_CYCLE_PHASES: [&str; 7] = [
+    EXTRACT_COMMANDS_AND_ASSETS,
+    SPECIALIZE_AND_VIEWS,
+    QUEUE,
+    PREPARE,
+    GRAPH_AND_PRESENT,
+    CLEANUP,
+    SWAPCHAIN_ACQUIRE,
+];
 
 /// The spans the per-frame series keeps a column for, in the order `frame-series.csv` writes them:
 /// the systems that run in every frame after a door crossing (see the analysis in
@@ -201,6 +234,10 @@ impl Plugin for ProfilingPlugin {
             .is_some_and(|config| config.profile_output_dir.is_some());
         if profiling {
             app.add_systems(First, begin_frame_series.after(TimeSystems));
+            app.add_systems(
+                First,
+                drain_render_cycles.after(render_timing::start_main_world),
+            );
         }
     }
 }
@@ -213,6 +250,22 @@ impl Plugin for ProfilingPlugin {
 /// closes that row rather than filling this one.
 fn begin_frame_series(mut profiler: ResMut<ProfilingState>, real_time: Res<Time<Real>>) {
     profiler.begin_frame(real_time.delta_secs_f64() * 1000.0);
+}
+
+/// Moves the render timings' completed cycle records into the per-cycle series (see
+/// [`ProfilingState::render_cycles_csv`]).
+///
+/// Ordered after the main frame's start: a cycle's row is complete only once the next cycle's
+/// `First` has closed its remainder window. Runs only for a run that profiles, and costs nothing
+/// otherwise.
+fn drain_render_cycles(
+    mut profiler: ResMut<ProfilingState>,
+    timings: Option<Res<render_timing::RenderTimings>>,
+) {
+    let Some(timings) = timings else {
+        return;
+    };
+    profiler.extend_render_cycles(timings.take_completed_cycles());
 }
 
 #[derive(Resource)]
@@ -241,6 +294,10 @@ pub struct ProfilingState {
     /// The per-frame series: one row per frame, opened in `First` and written to `frame-series.csv`
     /// (see [`ProfilingState::begin_frame`]). Empty unless the run profiles.
     frame_series: VecDeque<FrameSpans>,
+    /// The per-cycle series: one row per main-thread cycle, drained from the render timings each
+    /// frame and written to `render-cycles.csv` beside `frame-series.csv` (see
+    /// [`ProfilingState::render_cycles_csv`]). Empty unless the run profiles.
+    render_cycles: VecDeque<(u64, CycleSides)>,
 }
 
 impl Default for ProfilingState {
@@ -259,6 +316,7 @@ impl Default for ProfilingState {
             timeline: Vec::new(),
             memory: Vec::new(),
             frame_series: VecDeque::new(),
+            render_cycles: VecDeque::new(),
         }
     }
 }
@@ -442,6 +500,62 @@ impl ProfilingState {
             }
             for value in row.spans {
                 csv.push_str(&format!(",{value:.4}"));
+            }
+            csv.push('\n');
+        }
+        csv
+    }
+
+    /// Appends the completed cycle records the render timings handed over, bounded like the
+    /// per-frame series.
+    fn extend_render_cycles(&mut self, rows: impl IntoIterator<Item = (u64, CycleSides)>) {
+        for (cycle, sides) in rows {
+            if self.render_cycles.len() == MAX_RENDER_CYCLE_ROWS {
+                self.render_cycles.pop_front();
+            }
+            self.render_cycles.push_back((cycle, sides));
+        }
+    }
+
+    /// The per-cycle series as CSV: the header naming every column, then one row per cycle in the
+    /// order the cycles ran.
+    ///
+    /// Row `n` is main-thread cycle `n`: from the start of main frame `n` to the start of frame
+    /// `n + 1`. Its `render_thread` and phase columns are the render schedule that ran *during*
+    /// that cycle — the one fed by extract `n - 1` when rendering is pipelined, because the render
+    /// schedule that follows the extract of main frame `n` runs during cycle `n + 1` — so a row
+    /// reads against the `frame-series.csv` row with the same number, and a crossing frame's
+    /// `render_thread` time is explained by its own row's phases. A side the cycle did not
+    /// measure stays an empty column, and the run's last cycle or two are absent: their remainder
+    /// window never closed.
+    fn render_cycles_csv(&self) -> String {
+        let mut csv = String::with_capacity(192 + self.render_cycles.len() * 160);
+        csv.push_str("cycle");
+        for column in RENDER_CYCLE_SIDES.iter().chain(RENDER_CYCLE_PHASES.iter()) {
+            csv.push(',');
+            csv.push_str(column);
+        }
+        csv.push('\n');
+        for (cycle, sides) in &self.render_cycles {
+            csv.push_str(&cycle.to_string());
+            for value in [
+                sides.main_ms,
+                sides.extract_ms,
+                sides.wait_ms,
+                sides.remainder_ms,
+                sides.render_ms,
+                sides.extract_commands_and_assets_ms,
+                sides.specialize_and_views_ms,
+                sides.queue_ms,
+                sides.prepare_ms,
+                sides.graph_and_present_ms,
+                sides.cleanup_ms,
+                sides.acquire_ms,
+            ] {
+                match value {
+                    Some(value) => csv.push_str(&format!(",{value:.4}")),
+                    None => csv.push(','),
+                }
             }
             csv.push('\n');
         }
@@ -736,6 +850,9 @@ impl ProfilingState {
         // Beside `cpu-spans.json`, which holds the same spans summarised over the whole run: this
         // is the per-frame series, one row per frame, keyed by the timeline's frame number.
         fs::write(root.join("frame-series.csv"), self.frame_series_csv())?;
+        // Beside the per-frame series: the same run's per-cycle series, one row per main-thread
+        // cycle, with the render schedule's phases a per-frame span column cannot hold.
+        fs::write(root.join("render-cycles.csv"), self.render_cycles_csv())?;
         write_json(
             &root.join("gpu-passes.json"),
             &GpuProfile {
@@ -2015,6 +2132,65 @@ lights/budget,physics/step"
         );
     }
 
+    /// `render-cycles.csv` names every column in the documented order and writes each cycle's row
+    /// under them; a side the cycle did not measure stays an empty column.
+    #[test]
+    fn the_render_cycles_csv_names_every_column() {
+        let mut profiler = ProfilingState::default();
+        profiler.extend_render_cycles([(
+            1,
+            CycleSides {
+                main_ms: Some(9.5),
+                extract_ms: Some(0.4),
+                wait_ms: Some(2.0),
+                remainder_ms: Some(0.3),
+                render_ms: Some(6.2),
+                acquire_ms: Some(1.0),
+                extract_commands_and_assets_ms: Some(0.5),
+                ..Default::default()
+            },
+        )]);
+        let csv = profiler.render_cycles_csv();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "cycle,main_world,extract,wait_for_render_thread,frame/remainder,render_thread,\
+        render/extract_commands_and_assets,render/specialize_and_views,render/queue,render/prepare,\
+        render/graph_and_present,render/cleanup,render/swapchain_acquire"
+        );
+        let row: Vec<&str> = lines.next().unwrap().split(',').collect();
+        assert_eq!(
+            row.len(),
+            1 + RENDER_CYCLE_SIDES.len() + RENDER_CYCLE_PHASES.len()
+        );
+        assert_eq!(row[0], "1");
+        assert_eq!(row[1], "9.5000");
+        assert_eq!(row[2], "0.4000");
+        assert_eq!(row[3], "2.0000");
+        assert_eq!(row[4], "0.3000");
+        assert_eq!(row[5], "6.2000");
+        assert_eq!(row[6], "0.5000", "the extract-commands phase was measured");
+        assert_eq!(row[8], "", "no queue phase was measured in this cycle");
+        assert_eq!(row[12], "1.0000", "the swapchain wait closes the row");
+        assert!(lines.next().is_none());
+    }
+
+    /// The per-cycle series is bounded: past the cap the oldest rows go, so a long run cannot
+    /// grow it without limit.
+    #[test]
+    fn the_render_cycles_series_keeps_its_most_recent_rows() {
+        let mut profiler = ProfilingState::default();
+        for cycle in 0..(MAX_RENDER_CYCLE_ROWS + 10) as u64 {
+            profiler.extend_render_cycles([(cycle, CycleSides::default())]);
+        }
+        assert_eq!(profiler.render_cycles.len(), MAX_RENDER_CYCLE_ROWS);
+        assert_eq!(profiler.render_cycles.front().unwrap().0, 10);
+        assert_eq!(
+            profiler.render_cycles.back().unwrap().0,
+            MAX_RENDER_CYCLE_ROWS as u64 + 9
+        );
+    }
+
     #[test]
     fn writes_complete_profile_bundle() {
         let directory = tempfile::tempdir().unwrap();
@@ -2049,6 +2225,8 @@ lights/budget,physics/step"
             "metadata.json",
             "frame-metrics.json",
             "cpu-spans.json",
+            "frame-series.csv",
+            "render-cycles.csv",
             "gpu-passes.json",
             "streaming.json",
             "renderer.json",
