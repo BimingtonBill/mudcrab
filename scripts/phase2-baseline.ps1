@@ -2,8 +2,11 @@
 param(
     # Which scenes to measure. The default is the five the baseline compares: the synthetic scene
     # is the one a machine with no converted data can run, the four world scenes are the walk, the
-    # dense place (Riverwood), the water and the streaming stress. `stability` is left out because it is a soak
-    # window (30 minutes by default), not a baseline; `all` selects it too.
+    # dense place (Riverwood), the water and the streaming stress; with -Assets it also runs `travel`,
+    # the route the frame-time goal is measured on (scripts/routes/travel.json). `stability` is left
+    # out because it is a soak window (30 minutes by default), not a baseline; `all` selects it too.
+    # `check` is the held-out route (scripts/routes/check.json): reported, but never in the defaults
+    # and never tuned against; `all` selects it too.
     #
     # The portal branch adds five scenes, none of them in the default set: `portal-door-tour` (the
     # Riverwood door tour, two crossings), `portal-heavy` (standing at Sven's House door with the
@@ -12,12 +15,14 @@ param(
     # `lod-flythrough` (a fly-through from LOD into full detail). `portal` selects the five. They
     # load the portal's converted assets, so -Assets must name those. Their poses and arguments are in
     # phase2-profile.ps1 (Get-PortalSceneArguments).
-    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability", "portal", "portal-door-tour", "portal-heavy", "lod-far", "lod-far-ring-off", "lod-flythrough")]
+    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability", "travel", "check", "portal", "portal-door-tour", "portal-heavy", "lod-far", "lod-far-ring-off", "lod-flythrough")]
     [string[]]$Scenarios = @(),
     # The converted legal Skyrim asset set every world scenario loads. Not needed for `synthetic`.
     [string]$Assets,
     [int]$Repeats = 3,
-    # Every window runs this long, except `stability`, which uses -StabilitySeconds.
+    # Every window runs this long, except `stability`, which uses -StabilitySeconds. A route window
+    # ends when its route does, so for `travel` and `check` this is the longest it may run: it must
+    # cover the wait for the world to load plus the route's minute.
     [int]$DurationSeconds = 120,
     [int]$StabilitySeconds = 1800,
     # The portal-door-tour window, in seconds: the scripted tour of Sven's House (in and out) takes
@@ -29,6 +34,10 @@ param(
     # is used. The comparison is refused when the two runs' renderer backend or adapter differ.
     [string]$CompareTo,
     [string]$Worldspace = "0x3c",
+    # The frame time the report counts frames over, passed to every window. The default is 6.25 ms,
+    # 160 frames per second; the proposed bar is 99.9 percent of frames within it and none over twice it.
+    [ValidateRange(0.001, 1000)]
+    [double]$FrameBudgetMs = 6.25,
     # The standard places of docs/roadmap/02-acceptance.md, so the three world scenes measure three
     # different places by default: the phase2-profile.ps1 defaults are 0,0 for rural and water.
     # Dense is Riverwood (about 2,900 references within two cells); `dense-legacy` is the old dense
@@ -63,7 +72,7 @@ foreach ($name in $sharedNames) { $requestedValues[$name] = Get-Variable -Name $
 . (Join-Path $PSScriptRoot "phase2-profile.ps1") -AsLibrary
 foreach ($name in $sharedNames) { Set-Variable -Name $name -Value $requestedValues[$name] }
 
-$defaultScenarios = @("synthetic", "rural", "dense", "water", "stress")
+$defaultScenarios = @("synthetic", "rural", "dense", "water", "stress", "travel")
 $portalScenarios = @("portal-door-tour", "portal-heavy", "lod-far", "lod-far-ring-off", "lod-flythrough")
 if ($Scenarios -contains "portal") {
     $Scenarios = @($Scenarios | Where-Object { $_ -ne "portal" }) + $portalScenarios | Select-Object -Unique
@@ -77,9 +86,9 @@ $requested = if ($Scenarios.Count -eq 0) {
     # default it is not narrowed to the scene that needs no converted data: without an asset set it
     # is refused here, naming the missing input, before a campaign is planned.
     if (-not $Assets) {
-        throw "-Scenarios all needs -Assets with a converted legal Skyrim asset set: all six scenarios include the four world scenes. The bare default without -Assets runs 'synthetic' only"
+        throw "-Scenarios all needs -Assets with a converted legal Skyrim asset set: all eight scenarios include the world scenes and the two routes. The bare default without -Assets runs 'synthetic' only"
     }
-    @("synthetic", "rural", "dense", "water", "stress", "stability")
+    @("synthetic", "rural", "dense", "water", "stress", "stability", "travel", "check")
 } else { $Scenarios }
 if ($Repeats -lt 1) { throw "Repeats must be at least 1" }
 if ($requested.Where({ $_ -ne "synthetic" }).Count -gt 0 -and -not $Assets) {
@@ -96,6 +105,38 @@ $env:TEMP = $testTemp
 $env:TMP = $testTemp
 
 $resolvedAssets = Resolve-ConvertedAssetSet -Assets $Assets
+
+# The route scenarios: the camera follows a route file (scripts/routes) at the file's speed, so the
+# window measures travelling. The engine knows no route; the scenario only names the file. Each has
+# one window (the moving one): the scene standing still is the other scenarios' job.
+$routeScenarios = @{ travel = "travel.json"; check = "check.json" }
+
+function Get-RouteFilePath([string]$Name) {
+    return Join-Path $PSScriptRoot "routes\$($routeScenarios[$Name])"
+}
+
+# The engine arguments of one window: the profiling campaign's arguments for the scenario, with the
+# route scenarios built from the rural scene's arguments (the route file, not a grid, says where
+# the run starts), and the frame budget passed to every window.
+function Get-WindowArguments([string]$Name, [hashtable]$Parameters) {
+    if (-not $routeScenarios.ContainsKey($Name)) {
+        $arguments = @(Get-ScenarioArguments -Name $Name @Parameters)
+    } else {
+        $base = @(Get-ScenarioArguments -Name "rural" @Parameters)
+        $arguments = @()
+        for ($index = 0; $index -lt $base.Count; $index++) {
+            if ($base[$index] -in @("--grid-x", "--grid-y")) { $index++; continue }
+            if ($base[$index] -eq "--profile-scenario") {
+                $arguments += @("--profile-scenario", $Name)
+                $index++
+                continue
+            }
+            $arguments += $base[$index]
+        }
+        $arguments += @("--route", (Get-RouteFilePath $Name))
+    }
+    return $arguments + @("--frame-budget-ms", "$FrameBudgetMs")
+}
 
 function Get-WindowDuration([string]$Name) {
     return Get-SceneDuration -Name $Name -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds -PortalTourSeconds $PortalTourSeconds
@@ -254,6 +295,16 @@ function Get-ScenarioInputs($Arguments, $Report, [int]$DurationSeconds) {
     $gridY = Get-ArgumentValue $Arguments "--grid-y"
     $flySpeed = Get-ArgumentValue $Arguments "--auto-fly-speed"
     $syntheticInstances = Get-ArgumentValue $Arguments "--synthetic-instances"
+    # The route is identified by its file name and content, so a window measured on an edited route
+    # is not compared with one measured on the old file. Null for a scenario with no route, which is
+    # also what a window from before routes has.
+    $routeArgument = Get-ArgumentValue $Arguments "--route"
+    $route = if ($null -eq $routeArgument) { $null } else {
+        [ordered]@{
+            file = Split-Path -Leaf $routeArgument
+            sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $routeArgument).Hash
+        }
+    }
     # The portal scenes' own inputs (null for every other scene): the terrain ring, the demo, the
     # pose file or start position, and the tour's length. A window of one of them is only
     # comparable with another that was started the same way.
@@ -265,6 +316,7 @@ function Get-ScenarioInputs($Arguments, $Report, [int]$DurationSeconds) {
         grid = if ($null -eq $gridX -and $null -eq $gridY) { $null } else { [ordered]@{ x = [int]$gridX; y = [int]$gridY } }
         fly_speed = if ($null -eq $flySpeed) { $null } else { [int]$flySpeed }
         synthetic_instances = if ($null -eq $syntheticInstances) { $null } else { [int]$syntheticInstances }
+        route = $route
         assets = Get-ArgumentValue $Arguments "--assets"
         terrain_radius = if ($null -eq $terrainRadius) { $null } else { [int]$terrainRadius }
         demo = Get-ArgumentValue $Arguments "--demo"
@@ -306,6 +358,53 @@ function Get-WindowReport($Reports, [string]$Kind, $Inputs) {
     }
     foreach ($metric in @("count", "mean_ms", "p50_ms", "p95_ms", "p99_ms", "worst_ms", "average_fps")) {
         $window[$metric] = Get-Spread (Get-Values $Reports { param($report) Get-FrameMetric $report $metric })
+    }
+    # The frame-time distribution against the budget: every number is the report's own, reduced to
+    # the median and spread over the repeats. The owners are counts of the frames over the budget,
+    # per run, so they say who the typical run's slow frames belonged to; `unknown` is frames no
+    # side could be named for (the report's owner_rule says how and why).
+    $budgets = @($Reports | ForEach-Object { $_.frame_budget } | Where-Object { $null -ne $_ })
+    if ($budgets.Count -gt 0) {
+        $window.frame_budget = [ordered]@{
+            budget_ms = $budgets[0].budget_ms
+            scope = $budgets[0].scope
+            frames = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.frames })
+            p50_ms = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.p50_ms })
+            p99_ms = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.p99_ms })
+            p99_9_ms = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.p99_9_ms })
+            worst_ms = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.worst_ms })
+            frames_over_budget = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.frames_over_budget })
+            over_budget_per_minute = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.over_budget_per_minute })
+            frames_over_double_budget = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.frames_over_double_budget })
+            share_within_budget = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.share_within_budget })
+            runs_meeting_pass_bar = @($budgets | Where-Object { $_.meets_pass_bar -eq $true }).Count
+            over_budget_owners = [ordered]@{
+                main_world = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.over_budget_owners.main_world })
+                render_thread = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.over_budget_owners.render_thread })
+                gpu = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.over_budget_owners.gpu })
+                upload = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.over_budget_owners.upload })
+                unknown = Get-Spread (Get-Values $Reports { param($report) $report.frame_budget.over_budget_owners.unknown })
+            }
+            owner_rule = $budgets[0].owner_rule
+        }
+    } else {
+        $window.frame_budget = $null
+    }
+    # A route window also says how far the route got: a run that did not finish its route (the
+    # window ran out first) scored only the part it walked.
+    $routes = @($Reports | ForEach-Object { $_.route } | Where-Object { $null -ne $_ })
+    $window.route = if ($routes.Count -eq 0) { $null } else {
+        [ordered]@{
+            file = $routes[0].file
+            runs_completed = @($routes | Where-Object { $_.completed -eq $true }).Count
+            runs_started = @($routes | Where-Object { $_.started -eq $true }).Count
+            length_units = $routes[0].length_units
+            speed_units_per_second = $routes[0].speed_units_per_second
+            distance_travelled_units = Get-Spread (Get-Values $Reports { param($report) $report.route.distance_travelled_units })
+            started_at_run_ms = Get-Spread (Get-Values $Reports { param($report) $report.route.started_at_run_ms })
+            frames_on_route = Get-Spread (Get-Values $Reports { param($report) $report.route.frames_on_route })
+            route_frames_without_ground = Get-Spread (Get-Values $Reports { param($report) $report.route.route_frames_without_ground })
+        }
     }
     $window.gpu_passes = [ordered]@{
         # The frames the window's per-pass numbers rest on, kept beside them so a reader can tell a
@@ -433,7 +532,7 @@ function Get-LaggingPasses($Window) {
 # One short table per scenario window, the window's memory, and the facts a table cannot hold: which
 # counters were unavailable and why, and which passes and spans cost the most.
 function Get-MarkdownTable($Name, $Window, [string]$Kind) {
-    $label = if ($Kind -eq "streaming") { "$Name (streaming)" } else { "$Name (standing still)" }
+    $label = if ($Window.route) { "$Name (route)" } elseif ($Kind -eq "streaming") { "$Name (streaming)" } else { "$Name (standing still)" }
     $lines = @(
         "",
         "## $label",
@@ -454,6 +553,32 @@ function Get-MarkdownTable($Name, $Window, [string]$Kind) {
         "| Terrain patches | $(Format-Spread $Window.scene.terrain_patches '{0:N0}') |",
         "| Water surfaces | $(Format-Spread $Window.scene.water_surfaces '{0:N0}') |"
     )
+    $budget = $Window.frame_budget
+    if ($null -eq $budget) {
+        $lines += "| Frame budget | n/a: the report carries no frame_budget section |"
+    } else {
+        $owners = $budget.over_budget_owners
+        $ownerText = (@("main_world", "render_thread", "gpu", "upload", "unknown") | ForEach-Object {
+                "$_ $(if ($null -eq $owners[$_]) { 'n/a' } else { [string]::Format('{0:N0}', $owners[$_].median) })"
+            }) -join "; "
+        $lines += @(
+            "| Frame budget ms (scored frames) | $($budget.budget_ms) ($(Format-Spread $budget.frames '{0:N0}') frames) |",
+            "| Budget P50 / P99 / P99.9 frame ms | $(Format-Spread $budget.p50_ms) / $(Format-Spread $budget.p99_ms) / $(Format-Spread $budget.p99_9_ms) |",
+            "| Budget worst frame ms | $(Format-Spread $budget.worst_ms) |",
+            "| Frames over budget | $(Format-Spread $budget.frames_over_budget '{0:N0}') (share within budget $(Format-Spread $budget.share_within_budget '{0:P3}')) |",
+            "| Over-budget frames per minute | $(Format-Spread $budget.over_budget_per_minute '{0:N1}') |",
+            "| Frames over twice the budget | $(Format-Spread $budget.frames_over_double_budget '{0:N0}') |",
+            "| Runs meeting the bar (99.9% within budget, none over twice) | $($budget.runs_meeting_pass_bar) of $($Window.runs) |",
+            "| Over-budget frames by owner (median per run) | $ownerText |"
+        )
+    }
+    $route = $Window.route
+    if ($route) {
+        $lines += @(
+            "| Route | $($route.file): $($route.runs_completed) of $($Window.runs) runs completed it ($([string]::Format('{0:N0}', $route.length_units)) units at $($route.speed_units_per_second) units/s); started after $(Format-Spread $route.started_at_run_ms '{0:N0}') ms |",
+            "| Route frames without ground | $(Format-Spread $route.route_frames_without_ground '{0:N0}') of $(Format-Spread $route.frames_on_route '{0:N0}') |"
+        )
+    }
     $lines += "| Draw calls | null: $($Window.scene.unavailable.draw_calls) |"
     if ($Window.scene.pipeline_statistics_supported) {
         $lines += "| Vertex shader invocations | $(Get-SummaryLine $Window.scene.vertex_shader_invocations) |"
@@ -639,11 +764,13 @@ $windowsPerScenario = @{}
 foreach ($name in $requested) {
     $moving = $false
     if ($name -ne "synthetic") {
-        $probe = Get-ScenarioArguments -Name $name -RunDirectory "." -Commit "probe" -Hardware "probe" `
-            -DurationSeconds 0 -ResolvedAssets $resolvedAssets
+        $probe = Get-WindowArguments $name @{
+            RunDirectory = "."; Commit = "probe"; Hardware = "probe"; DurationSeconds = 0; ResolvedAssets = $resolvedAssets
+        }
         $moving = ($probe -contains "--auto-fly-speed")
     }
-    $windowsPerScenario[$name] = if ($moving) { 2 } else { 1 }
+    # A flying scenario gets two windows (still, then flying), a route scenario only the moving one.
+    $windowsPerScenario[$name] = if ($routeScenarios.ContainsKey($name)) { 1 } elseif ($moving) { 2 } else { 1 }
 }
 $totalWindows = ($requested | ForEach-Object { $windowsPerScenario[$_] * $Repeats } | Measure-Object -Sum).Sum
 $totalSeconds = ($requested | ForEach-Object { $windowsPerScenario[$_] * $Repeats * (Get-WindowDuration $_) } | Measure-Object -Sum).Sum
@@ -715,8 +842,9 @@ $scenarioReports = [ordered]@{}
 $campaignFingerprint = $null
 $campaignFingerprintLabel = $null
 foreach ($name in $requested) {
-    $moves = $windowsPerScenario[$name] -eq 2
-    $kinds = if ($moves) { @("standing_still", "streaming") } else { @("standing_still") }
+    $isRoute = $routeScenarios.ContainsKey($name)
+    $moves = $isRoute -or $windowsPerScenario[$name] -eq 2
+    $kinds = if ($isRoute) { @("streaming") } elseif ($moves) { @("standing_still", "streaming") } else { @("standing_still") }
     $reports = @{}
     foreach ($kind in $kinds) {
         $windowReports = @()
@@ -727,14 +855,16 @@ foreach ($name in $requested) {
             $label = if ($kind -eq "streaming") { "baseline $name streaming $run/$Repeats" } else { "baseline $name $run/$Repeats" }
             $reportLabel = "baseline $name/$kind/run-$run"
             $runDirectory = Join-Path $campaignRoot "$name\$($kind -replace '_', '-')\run-$run"
-            $arguments = Get-ScenarioArguments -Name $name -RunDirectory $runDirectory -Commit $identity.commit `
-                -Hardware $hardware -RunId "run-$run" -RunLabel $label -DirtyWorktree:$identity.dirty `
-                -StandingStill:($kind -eq "standing_still") `
-                -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds -PortalTourSeconds $PortalTourSeconds `
-                -ResolvedAssets $resolvedAssets -Worldspace $Worldspace `
-                -RuralGridX $RuralGridX -RuralGridY $RuralGridY -DenseGridX $DenseGridX -DenseGridY $DenseGridY `
-                -DenseLegacyGridX $DenseLegacyGridX -DenseLegacyGridY $DenseLegacyGridY `
-                -WaterGridX $WaterGridX -WaterGridY $WaterGridY
+            $arguments = Get-WindowArguments $name @{
+                RunDirectory = $runDirectory; Commit = $identity.commit
+                Hardware = $hardware; RunId = "run-$run"; RunLabel = $label; DirtyWorktree = [bool]$identity.dirty
+                StandingStill = ($kind -eq "standing_still")
+                DurationSeconds = $DurationSeconds; StabilitySeconds = $StabilitySeconds; PortalTourSeconds = $PortalTourSeconds
+                ResolvedAssets = $resolvedAssets; Worldspace = $Worldspace
+                RuralGridX = $RuralGridX; RuralGridY = $RuralGridY; DenseGridX = $DenseGridX; DenseGridY = $DenseGridY
+                DenseLegacyGridX = $DenseLegacyGridX; DenseLegacyGridY = $DenseLegacyGridY
+                WaterGridX = $WaterGridX; WaterGridY = $WaterGridY
+            }
             if ($null -eq $windowArguments) { $windowArguments = $arguments }
             $report = Invoke-EngineWindow -Engine $engine -Arguments $arguments -RunDirectory $runDirectory `
                 -Label "Baseline run $name/$kind/run-$run" -AsHashtable -AllowGateFailure
@@ -803,6 +933,7 @@ $baselineReport = [ordered]@{
     duration_seconds = $DurationSeconds
     stability_seconds = $StabilitySeconds
     portal_tour_seconds = $PortalTourSeconds
+    frame_budget_ms = $FrameBudgetMs
     # Where this campaign's own report bundles are, so a window's raw evidence can be found again
     # after a later campaign has written to the same -Out.
     run_directory = $campaignRoot
@@ -831,6 +962,7 @@ $markdown = @(
     "- Machine: $hardware",
     "- Renderer: $rendererLine",
     "- Repeats: $Repeats; window: $DurationSeconds s ($StabilitySeconds s for stability)",
+    "- Frame budget: $FrameBudgetMs ms ($([Math]::Round(1000.0 / $FrameBudgetMs, 1)) fps); proposed bar: 99.9% of frames within it, none over twice it",
     "- Generated: $($baselineReport.generated_at)",
     "- Report bundles: $campaignRoot",
     ""

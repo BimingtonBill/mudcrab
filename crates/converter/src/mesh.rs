@@ -1,7 +1,8 @@
 use crate::collision;
 use crate::material::{
     NifAnimationSkips, NifMaterialDisposition, NifShapeMaterial, VertexColourUse,
-    build_nif_material_contract, is_editor_marker_shape, publish_gltf_materials,
+    build_nif_material_contract, declares_editor_marker, is_editor_marker_shape,
+    publish_gltf_materials,
 };
 use crate::texture::TextureSemantic;
 use color_eyre::{
@@ -117,7 +118,7 @@ impl MeshConverter {
             .to_string_lossy()
             .into_owned();
         let output = glb_output_path.as_ref();
-        let dropped_marker_meshes = drop_editor_marker_geometry(&mut model);
+        let dropped_marker_meshes = drop_editor_marker_geometry(&mut model, &nif);
         if model.static_meshes.is_empty() && model.skeletal_meshes.is_empty() {
             ensure!(
                 dropped_marker_meshes > 0
@@ -147,7 +148,7 @@ impl MeshConverter {
             if !distant_lod {
                 apply_vertex_colour_use(&mut static_model, &nif, &material_contract);
             }
-            let dropped_static_marker_meshes = drop_editor_marker_geometry(&mut static_model);
+            let dropped_static_marker_meshes = drop_editor_marker_geometry(&mut static_model, &nif);
             if static_model.static_meshes.is_empty() && static_model.skeletal_meshes.is_empty() {
                 ensure!(
                     dropped_static_marker_meshes > 0,
@@ -807,7 +808,21 @@ fn glb_node_names(glb: &[u8]) -> Result<Vec<String>> {
 /// positionally, so removing one would mis-associate every material after it.
 /// The material contract still excludes marker shapes, which the engine treats as
 /// non-rendering.
-fn drop_editor_marker_geometry(model: &mut project_wormhole_nif::model::all::Model) -> usize {
+///
+/// The name alone does not make a mesh a marker: a visible effect model may name
+/// a shape `EditorMarker` while its `BSXFlags` clear the marker bit (the
+/// `FXDrips01` family), and dropping that mesh deletes real geometry, leaving an
+/// empty GLB with no bounds. The rule is the material contract's
+/// (`material::declares_editor_marker`): the name matches **and** the NIF
+/// declares the marker bit. A NIF with no `BSXFlags` block at all counts as
+/// declaring it, exactly as the contract does.
+fn drop_editor_marker_geometry(
+    model: &mut project_wormhole_nif::model::all::Model,
+    nif: &NifFile,
+) -> usize {
+    if !declares_editor_marker(nif) {
+        return 0;
+    }
     let mut remap = Vec::with_capacity(model.static_meshes.len());
     let mut kept = 0usize;
     for mesh in &model.static_meshes {
@@ -2407,13 +2422,16 @@ mod tests {
     #[test]
     fn drops_editor_marker_geometry_and_renumbers_the_survivors() {
         // `DwePtnDoor01`'s shape list, reduced: two door leaves plus the marker
-        // the editor writes into the file.
+        // the editor writes into the file, in a model whose `BSXFlags` declare it.
         let mut model = fixture_model(
             &["DoorLeft:12", "EditorMarker", "DoorRight:12"],
             &[(23, Some(0)), (40, Some(1)), (35, Some(2))],
         );
 
-        assert_eq!(drop_editor_marker_geometry(&mut model), 1);
+        assert_eq!(
+            drop_editor_marker_geometry(&mut model, &nif_with_bsx_flags(Some(1 << 5))),
+            1
+        );
         assert_eq!(
             model
                 .static_meshes
@@ -2443,23 +2461,120 @@ mod tests {
         // whose only shape is the marker, so the converter's existing empty scene
         // rule applies to them once the marker is gone.
         let mut model = fixture_model(&["EditorMarker"], &[(7, Some(0))]);
-        assert_eq!(drop_editor_marker_geometry(&mut model), 1);
+        assert_eq!(
+            drop_editor_marker_geometry(&mut model, &nif_with_bsx_flags(Some(1 << 5))),
+            1
+        );
         assert!(model.static_meshes.is_empty());
         assert_eq!(model.static_nodes[0].mesh, None);
+
+        // A NIF with no `BSXFlags` block at all counts as declaring the marker,
+        // exactly as the material contract does, so a minimal fixture still drops.
+        let mut bare_model = fixture_model(&["EditorMarker"], &[(7, Some(0))]);
+        assert_eq!(
+            drop_editor_marker_geometry(&mut bare_model, &nif_with_bsx_flags(None)),
+            1
+        );
+        assert!(bare_model.static_meshes.is_empty());
     }
 
     #[test]
     fn keeps_geometry_whose_name_merely_contains_marker() {
         // `MarkerTeleport` and `WayShrinePourMarker` are real models that the
         // engine filters by path; a substring rule would delete real geometry.
+        // A model that does declare the marker bit still keeps these shapes.
         let mut model = fixture_model(
             &["MarkerTeleport:0", "WayShrinePourMarker"],
             &[(3, Some(0)), (4, Some(1))],
         );
-        assert_eq!(drop_editor_marker_geometry(&mut model), 0);
+        assert_eq!(
+            drop_editor_marker_geometry(&mut model, &nif_with_bsx_flags(Some(1 << 5))),
+            0
+        );
         assert_eq!(model.static_meshes.len(), 2);
         assert_eq!(model.static_nodes[0].mesh, Some(0));
         assert_eq!(model.static_nodes[1].mesh, Some(1));
+    }
+
+    #[test]
+    fn keeps_a_marker_named_shape_the_nif_does_not_declare() {
+        // `FXDrips01`'s drip mesh is named `EditorMarker`, but the model's
+        // `BSXFlags` clear the marker bit: the shape is the visible geometry the
+        // model exists for, and the name alone must not delete it.
+        let mut model = fixture_model(&["EditorMarker"], &[(7, Some(0))]);
+        assert_eq!(
+            drop_editor_marker_geometry(&mut model, &nif_with_bsx_flags(Some(0))),
+            0
+        );
+        assert_eq!(model.static_meshes.len(), 1);
+        assert_eq!(model.static_nodes[0].mesh, Some(0));
+    }
+
+    #[test]
+    fn keeps_an_unflagged_marker_named_effect_mesh_and_its_bounds() {
+        // `FXDrips01`, reduced to what the bug turned on: one visible mesh named
+        // `EditorMarker` in a model whose `BSXFlags` leave the marker bit clear.
+        let bytes = with_bsx_flags(&static_nif_named("EditorMarker"), 0);
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("FXDrips01.nif");
+        let output = directory.path().join("FXDrips01.glb");
+        fs::write(&input, bytes).unwrap();
+        MeshConverter::convert_nif_to_glb(&input, &output).unwrap();
+
+        let document = glb_json_from_bytes(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(
+            document["meshes"].as_array().map(Vec::len),
+            Some(1),
+            "the visible mesh is exported: {document}"
+        );
+        // The name-only drop emptied this GLB, so the world database stored
+        // `bounds_valid = 0` beside the effect. The quad's bounds in runtime
+        // space are (x, z, -y) of Creation space, rounded by the basis rotation.
+        let bounds = MeshConverter::glb_bounds(&output).unwrap();
+        let close = |actual: [f32; 3], expected: [f32; 3]| {
+            actual
+                .into_iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() < 1e-5)
+        };
+        assert!(
+            close(bounds.min, [-1.0, 0.0, -1.0]) && close(bounds.max, [1.0, 0.0, 1.0]),
+            "the visible mesh's own bounds, not an empty scene: {bounds:?}"
+        );
+    }
+
+    #[test]
+    fn declared_marker_only_model_converts_to_an_empty_scene() {
+        // The same shape with the NIF's marker bit set is editor-only: it is
+        // dropped, and nothing is left to draw.
+        let bytes = with_bsx_flags(&static_nif_named("EditorMarker"), 1 << 5);
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("dummyitems.nif");
+        let output = directory.path().join("dummyitems.glb");
+        fs::write(&input, bytes).unwrap();
+        MeshConverter::convert_nif_to_glb(&input, &output).unwrap();
+
+        let document = glb_json_from_bytes(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(document["scenes"][0]["nodes"], serde_json::json!([]));
+        assert!(document.get("meshes").is_none());
+    }
+
+    /// A parsed [`static_nif`] fixture carrying a `BSXFlags` block whose
+    /// `integer_data` is `integer_data` (bit 5 is the editor-marker bit), or no
+    /// `BSXFlags` block at all when `None`.
+    fn nif_with_bsx_flags(integer_data: Option<u32>) -> NifFile {
+        use project_wormhole_nif::nif_block::BSXFlags;
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("flags.nif");
+        fs::write(&input, static_nif()).unwrap();
+        let (mut nif, _, _) = open_nif_resilient(&input).unwrap();
+        if let Some(integer_data) = integer_data {
+            nif.blocks.push(NifBlock::BSXFlags(BSXFlags {
+                ni_extra_data: 0,
+                integer_data,
+            }));
+        }
+        nif
     }
 
     /// The converted asset tree named by `MUDCRAB_CONVERTED_DIR`, or `None`
@@ -3534,8 +3649,13 @@ mod tests {
     }
 
     fn static_nif() -> Vec<u8> {
+        static_nif_named("PropertyQuad")
+    }
+
+    /// A [`static_nif`]-style quad whose shape carries `name`.
+    fn static_nif_named(name: &str) -> Vec<u8> {
         dummy_content::nif::static_shape(&dummy_content::nif::StaticShape {
-            name: "PropertyQuad",
+            name,
             positions: &[
                 [-1.0, -1.0, 0.0],
                 [1.0, -1.0, 0.0],
@@ -3549,6 +3669,120 @@ mod tests {
             normal_texture: "textures/generated_normal.dds",
         })
         .unwrap()
+    }
+
+    /// Appends a `BSXFlags` block holding `integer_data` to a dummy-content NIF
+    /// (bit 5 is the editor-marker bit).
+    ///
+    /// `dummy_content::nif` writes no `BSXFlags` block, so the header its writer
+    /// lays down (`crates/dummy-content/src/nif.rs`, `write_nif`) is rebuilt with
+    /// one extra block: the type appended to the type table, one more block index
+    /// and block size, and the eight-byte block at the end.
+    fn with_bsx_flags(nif: &[u8], integer_data: u32) -> Vec<u8> {
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            cursor: usize,
+        }
+        impl Reader<'_> {
+            fn take(&mut self, length: usize) -> &[u8] {
+                let value = &self.bytes[self.cursor..self.cursor + length];
+                self.cursor += length;
+                value
+            }
+            fn u8(&mut self) -> u8 {
+                self.take(1)[0]
+            }
+            fn u16(&mut self) -> u16 {
+                u16::from_le_bytes(self.take(2).try_into().unwrap())
+            }
+            fn u32(&mut self) -> u32 {
+                u32::from_le_bytes(self.take(4).try_into().unwrap())
+            }
+            fn string8(&mut self) -> Vec<u8> {
+                let length = usize::from(self.u8());
+                self.take(length).to_vec()
+            }
+        }
+
+        let signature_end = nif.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let mut header = Reader {
+            bytes: nif,
+            cursor: signature_end,
+        };
+        let version = header.u32();
+        let endianness = header.u8();
+        let user_version = header.u32();
+        let block_count = header.u32();
+        let bethesda_version = header.u32();
+        let author = header.string8();
+        let first = header.string8();
+        let second = header.string8();
+        let type_count = header.u16();
+        let mut types: Vec<Vec<u8>> = (0..type_count)
+            .map(|_| {
+                let length = header.u32() as usize;
+                header.take(length).to_vec()
+            })
+            .collect();
+        let indices: Vec<u16> = (0..block_count).map(|_| header.u16()).collect();
+        let sizes: Vec<u32> = (0..block_count).map(|_| header.u32()).collect();
+        let string_count = header.u32();
+        let max_string_length = header.u32();
+        let strings: Vec<Vec<u8>> = (0..string_count)
+            .map(|_| {
+                let length = header.u32() as usize;
+                header.take(length).to_vec()
+            })
+            .collect();
+        let groups = header.u32();
+        let block_data = &nif[header.cursor..];
+
+        let flags_type = match types
+            .iter()
+            .position(|block_type| block_type == b"BSXFlags")
+        {
+            Some(index) => u16::try_from(index).unwrap(),
+            None => {
+                types.push(b"BSXFlags".to_vec());
+                u16::try_from(types.len() - 1).unwrap()
+            }
+        };
+
+        let mut rebuilt = Vec::with_capacity(nif.len() + 64);
+        rebuilt.extend_from_slice(&nif[..signature_end]);
+        rebuilt.extend_from_slice(&version.to_le_bytes());
+        rebuilt.push(endianness);
+        rebuilt.extend_from_slice(&user_version.to_le_bytes());
+        rebuilt.extend_from_slice(&(block_count + 1).to_le_bytes());
+        rebuilt.extend_from_slice(&bethesda_version.to_le_bytes());
+        for string in [author, first, second] {
+            rebuilt.push(u8::try_from(string.len()).unwrap());
+            rebuilt.extend_from_slice(&string);
+        }
+        rebuilt.extend_from_slice(&u16::try_from(types.len()).unwrap().to_le_bytes());
+        for block_type in &types {
+            rebuilt.extend_from_slice(&(block_type.len() as u32).to_le_bytes());
+            rebuilt.extend_from_slice(block_type);
+        }
+        for index in indices {
+            rebuilt.extend_from_slice(&index.to_le_bytes());
+        }
+        rebuilt.extend_from_slice(&flags_type.to_le_bytes());
+        for size in sizes {
+            rebuilt.extend_from_slice(&size.to_le_bytes());
+        }
+        rebuilt.extend_from_slice(&8u32.to_le_bytes());
+        rebuilt.extend_from_slice(&string_count.to_le_bytes());
+        rebuilt.extend_from_slice(&max_string_length.to_le_bytes());
+        for string in &strings {
+            rebuilt.extend_from_slice(&(string.len() as u32).to_le_bytes());
+            rebuilt.extend_from_slice(string);
+        }
+        rebuilt.extend_from_slice(&groups.to_le_bytes());
+        rebuilt.extend_from_slice(block_data);
+        rebuilt.extend_from_slice(&0u32.to_le_bytes()); // ni_extra_data
+        rebuilt.extend_from_slice(&integer_data.to_le_bytes());
+        rebuilt
     }
 
     fn inspect_and_convert(bytes: &[u8]) {

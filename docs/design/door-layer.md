@@ -84,9 +84,11 @@ Two parts:
   door is the pair's *driver*, its link's other end the *follower*. Static doors keep their native
   drawing. The copy is drawn on layers 0 and `DOOR_LAYER` (3): the main camera, the water
   reflection and the engine sun's shadows read layer 0, the portal camera does not.
-- **Hiding the natives.** Once the copy has drawn, `isolate_cells` puts every node of both natives
-  on no layer at all (they keep their visibility, so the walk probe and the doorway floor probes
-  still hit them). The walk probe skips the copy (`DoorCopyPart`).
+- **Hiding the natives.** Once the copy has drawn, `isolate_cells` makes each native door a
+  render-layer propagation source with no layer at all, so every node of both natives - nodes that
+  appear later included, and nodes with layers of their own - is on no layer (since 2026-10-07: a
+  source per door carried by Bevy's `Propagate<RenderLayers>`, not a walk; they keep their
+  visibility, so the walk probe and the doorway floor probes still hit them). The walk probe skips the copy (`DoorCopyPart`).
 - **Behind the plane.** The quad's depth composite hides source geometry more than a wall's depth
   behind the doorway plane, so a leaf that swings away from the player would vanish there. While
   the portal draws through the pair, a leaf-only copy on the portal camera's layer draws it in the

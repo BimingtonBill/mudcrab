@@ -15,10 +15,11 @@ use bevy::{
         mesh::RenderMesh,
         texture::GpuImage,
     },
+    time::TimeSystems,
 };
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     path::Path,
     sync::{
@@ -30,6 +31,58 @@ use std::{
 
 const MAX_SAMPLES_PER_METRIC: usize = 200_000;
 const MAX_TIMELINE_EVENTS: usize = 100_000;
+
+/// How many frames of the per-frame series are kept: about 28 minutes at 60 fps, and one row is
+/// under 64 bytes, so the series costs at most a few megabytes. Past this the oldest row is
+/// dropped, and the rows that carry the frame numbers say which frames the file holds.
+const MAX_FRAME_SERIES_ROWS: usize = 100_000;
+
+/// The spans the per-frame series keeps a column for, in the order `frame-series.csv` writes them:
+/// the systems that run in every frame after a door crossing (see the analysis in
+/// `local/agents/runs/analysis-642-post-exit-burst-spans.1/report.md`), which is the burst the
+/// 160 fps goal is measured against.
+///
+/// A name here that no system records yet — the portal's five, on a branch where portal.rs does not
+/// span them — still gets its column, and the column stays zero.
+const FRAME_SERIES_COLUMNS: [&str; 11] = [
+    "portal/isolate",
+    "portal/colliders",
+    "portal/update",
+    "portal/floor_probe",
+    "portal/propagate",
+    "streaming/plan_cells",
+    "streaming/frame_commit",
+    "lod/collect",
+    "scene/spawn_batch",
+    "lights/budget",
+    "physics/step",
+];
+
+/// One column per [`FRAME_SERIES_COLUMNS`] entry, so the two cannot drift apart.
+const FRAME_SERIES_COLUMN_COUNT: usize = FRAME_SERIES_COLUMNS.len();
+
+/// Which column a span name has in the per-frame series, or `None` for a span the series does not
+/// follow (it is still sampled into `cpu-spans.json` as before).
+fn frame_series_column(name: &str) -> Option<usize> {
+    FRAME_SERIES_COLUMNS
+        .iter()
+        .position(|column| *column == name)
+}
+
+/// One frame of the per-frame series: the frame number the profile timeline's events carry, the
+/// frame's real-clock duration, and one value per [`FRAME_SERIES_COLUMNS`] span.
+///
+/// A span recorded more than once in one frame adds up: the row is the frame's total for that span,
+/// which is what the physics step needs (a frame can run no fixed step, one, or several).
+#[derive(Clone, Copy, Default)]
+struct FrameSpans {
+    frame: u64,
+    /// The frame's own duration in milliseconds, from the real clock — the same clock the
+    /// benchmark's frame times are sampled from. `None` until the next frame closes it: a cycle's
+    /// duration is only known once it has ended, so the run's last row keeps none.
+    real_ms: Option<f32>,
+    spans: [f32; FRAME_SERIES_COLUMN_COUNT],
+}
 
 /// Why the report has no per-pass GPU times or counters: the run had no renderer, so no device
 /// measured anything. This is not the same as a device that lacks the feature, and a report must
@@ -139,7 +192,27 @@ impl Plugin for ProfilingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ProfilingState>()
             .add_systems(Update, sample_scene_inventory);
+        // The per-frame series is read only by `write_bundle`, and a bundle is written only for a
+        // run with `--profile-output`: every other run installs no system at all and the series
+        // stays empty, which is what leaves `record_ms`'s routing to it a single emptiness check.
+        let profiling = app
+            .world()
+            .get_resource::<EngineConfig>()
+            .is_some_and(|config| config.profile_output_dir.is_some());
+        if profiling {
+            app.add_systems(First, begin_frame_series.after(TimeSystems));
+        }
     }
+}
+
+/// Opens the per-frame series' row for the frame that is starting, and closes the previous row's
+/// duration (see [`ProfilingState::begin_frame`]).
+///
+/// Ordered after Bevy's time system, whose real-clock delta is the time since the previous frame
+/// began: that is the duration of the frame the previous row recorded the spans of, which is why it
+/// closes that row rather than filling this one.
+fn begin_frame_series(mut profiler: ResMut<ProfilingState>, real_time: Res<Time<Real>>) {
+    profiler.begin_frame(real_time.delta_secs_f64() * 1000.0);
 }
 
 #[derive(Resource)]
@@ -165,6 +238,9 @@ pub struct ProfilingState {
     gauges: BTreeMap<String, f64>,
     timeline: Vec<TimelineEvent>,
     memory: Vec<MemorySample>,
+    /// The per-frame series: one row per frame, opened in `First` and written to `frame-series.csv`
+    /// (see [`ProfilingState::begin_frame`]). Empty unless the run profiles.
+    frame_series: VecDeque<FrameSpans>,
 }
 
 impl Default for ProfilingState {
@@ -182,6 +258,7 @@ impl Default for ProfilingState {
             gauges: BTreeMap::new(),
             timeline: Vec::new(),
             memory: Vec::new(),
+            frame_series: VecDeque::new(),
         }
     }
 }
@@ -207,8 +284,24 @@ impl ProfilingState {
         self.record_ms(name, micros as f64 / 1000.0);
     }
 
+    /// Records a span in milliseconds: its own sample, and, for a name with a column in the
+    /// per-frame series, the frame's value for that column as well.
+    ///
+    /// One record, two views of it. The span's samples are the whole-run distribution the report
+    /// summarises (`cpu-spans.json`, `summary.md`); the series is the same record per frame, which
+    /// is what lets a benchmark's slow frames be attributed one frame at a time. A span recorded
+    /// several times in one frame adds up in the frame's row (the physics step, when a frame runs
+    /// more than one fixed step). With no row open — no profiling, or before the first frame — this
+    /// is one emptiness check.
     pub fn record_ms(&mut self, name: impl Into<String>, value: f64) {
-        push_bounded(self.cpu_spans_ms.entry(name.into()).or_default(), value);
+        let name = name.into();
+        if let Some(row) = self.frame_series.back_mut()
+            && let Some(column) = frame_series_column(&name)
+            && value.is_finite()
+        {
+            row.spans[column] += value as f32;
+        }
+        push_bounded(self.cpu_spans_ms.entry(name).or_default(), value);
     }
 
     pub fn increment(&mut self, name: impl Into<String>, amount: u64) {
@@ -299,6 +392,60 @@ impl ProfilingState {
                 process_gib: process_memory_gib,
             });
         }
+    }
+
+    /// Opens the per-frame series' row for the frame that is beginning, and closes the previous
+    /// row's duration with `frame_ms`, the real-clock time since the previous frame began.
+    ///
+    /// Both halves are what keep a row's spans and its duration about the same frame. The row is
+    /// opened in `First` and stays open for the whole frame, so every span recorded between this
+    /// frame's `First` and the next one lands in this row — and the row carries the same frame
+    /// number the timeline's events carry, which `sample_frame` advances at the frame's end. The
+    /// duration is the same story one frame later: the frame time that ends this frame is only
+    /// measured at the *next* frame's `First`, where [`begin_frame_series`] reads it and this
+    /// closes the row it belongs to. The run's last row is therefore left without one.
+    ///
+    /// Past [`MAX_FRAME_SERIES_ROWS`] the oldest row is dropped: a run longer than that keeps its
+    /// most recent frames, and the `frame` column says which.
+    pub fn begin_frame(&mut self, frame_ms: f64) {
+        if let Some(previous) = self.frame_series.back_mut()
+            && previous.real_ms.is_none()
+            && frame_ms.is_finite()
+            && frame_ms > 0.0
+        {
+            previous.real_ms = Some(frame_ms as f32);
+        }
+        if self.frame_series.len() >= MAX_FRAME_SERIES_ROWS {
+            self.frame_series.pop_front();
+        }
+        self.frame_series.push_back(FrameSpans {
+            frame: self.frame,
+            ..FrameSpans::default()
+        });
+    }
+
+    /// The per-frame series as CSV: the header naming every column, then one row per frame in the
+    /// order the frames ran. A row's `real_ms` is empty when no later frame closed it — the run's
+    /// last row, which the benchmark's own last frame time is not measured for either.
+    fn frame_series_csv(&self) -> String {
+        let mut csv = String::with_capacity(128 + self.frame_series.len() * 64);
+        csv.push_str("frame,real_ms");
+        for column in FRAME_SERIES_COLUMNS {
+            csv.push(',');
+            csv.push_str(column);
+        }
+        csv.push('\n');
+        for row in &self.frame_series {
+            match row.real_ms {
+                Some(real_ms) => csv.push_str(&format!("{},{real_ms:.4}", row.frame)),
+                None => csv.push_str(&format!("{},", row.frame)),
+            }
+            for value in row.spans {
+                csv.push_str(&format!(",{value:.4}"));
+            }
+            csv.push('\n');
+        }
+        csv
     }
 
     /// The per-pass GPU times, summarised over the measured window (see [`GpuPassReport`]).
@@ -586,6 +733,9 @@ impl ProfilingState {
                 gauges: self.gauges.clone(),
             },
         )?;
+        // Beside `cpu-spans.json`, which holds the same spans summarised over the whole run: this
+        // is the per-frame series, one row per frame, keyed by the timeline's frame number.
+        fs::write(root.join("frame-series.csv"), self.frame_series_csv())?;
         write_json(
             &root.join("gpu-passes.json"),
             &GpuProfile {
@@ -1745,6 +1895,126 @@ mod tests {
         assert!((memory_slope(&samples).unwrap() - 0.1).abs() < 0.0001);
     }
 
+    /// Runs one frame of the profiler through the paths the app drives it with: `First` opens the
+    /// series row with the frame time of the frame before it, the frame's systems record their
+    /// spans while it is open, and the frame's end samples it and advances the timeline's frame
+    /// counter (`metrics::collect_and_finish` calls `sample_frame` there).
+    fn run_frame(
+        profiler: &mut ProfilingState,
+        diagnostics: &DiagnosticsStore,
+        frame_ms: f64,
+        spans: &[(&str, f64)],
+    ) {
+        profiler.begin_frame(frame_ms);
+        for (name, value) in spans {
+            profiler.record_ms(*name, *value);
+        }
+        profiler.sample_frame(diagnostics, None, true, true);
+    }
+
+    /// A row holds the spans its own frame recorded, not the one before it: rows are opened in
+    /// `First` and stay open for the frame, which is why they are not opened in `sample_frame`.
+    #[test]
+    fn the_series_records_each_span_in_the_frame_that_recorded_it() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        run_frame(
+            &mut profiler,
+            &diagnostics,
+            16.0,
+            &[("portal/isolate", 4.0)],
+        );
+        run_frame(
+            &mut profiler,
+            &diagnostics,
+            9.5,
+            &[("portal/isolate", 7.0), ("streaming/cell_commit", 3.0)],
+        );
+        let rows: Vec<FrameSpans> = profiler.frame_series.iter().copied().collect();
+        assert_eq!(rows.len(), 2);
+        let isolate = frame_series_column("portal/isolate").expect("the series follows the span");
+        assert_eq!(rows[0].spans[isolate], 4.0);
+        assert_eq!(rows[1].spans[isolate], 7.0);
+        assert_eq!(
+            rows[1].spans.iter().sum::<f32>(),
+            7.0,
+            "a span with no column stays out of the row"
+        );
+        assert_eq!(profiler.span_samples("portal/isolate").len(), 2);
+        assert_eq!(profiler.span_samples("streaming/cell_commit"), &[3.0][..]);
+    }
+
+    /// A row is a frame twice over: it holds that frame's spans and it carries the frame number the
+    /// timeline's events of that frame carry.
+    #[test]
+    fn the_series_rows_carry_the_timeline_frame_number() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        for frame in 0..3u64 {
+            profiler.begin_frame(16.0);
+            profiler.event("cell", format!("frame_{frame}"), None);
+            assert_eq!(profiler.timeline.last().unwrap().frame, frame);
+            assert_eq!(profiler.frame_series.back().unwrap().frame, frame);
+            profiler.sample_frame(&diagnostics, None, true, true);
+        }
+    }
+
+    /// The CSV names every column and writes each row's values under them; a frame that recorded a
+    /// span more than once totals it, and the run's last row has no duration because no later frame
+    /// closed it.
+    #[test]
+    fn the_frame_series_csv_names_every_column() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        run_frame(
+            &mut profiler,
+            &diagnostics,
+            16.7,
+            &[("lights/budget", 0.25), ("physics/step", 1.5)],
+        );
+        run_frame(&mut profiler, &diagnostics, 12.0, &[("physics/step", 0.5)]);
+        let csv = profiler.frame_series_csv();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "frame,real_ms,portal/isolate,portal/colliders,portal/update,portal/floor_probe,\
+portal/propagate,streaming/plan_cells,streaming/frame_commit,lod/collect,scene/spawn_batch,\
+lights/budget,physics/step"
+        );
+        let column = |name: &str| frame_series_column(name).unwrap() + 2;
+        let first: Vec<&str> = lines.next().unwrap().split(',').collect();
+        assert_eq!(first.len(), 2 + FRAME_SERIES_COLUMNS.len());
+        assert_eq!(first[0], "0");
+        assert_eq!(
+            first[1], "12.0000",
+            "a row's duration is its own frame's, the one the next frame's start measures"
+        );
+        assert_eq!(first[column("lights/budget")], "0.2500");
+        assert_eq!(first[column("physics/step")], "1.5000");
+        let second: Vec<&str> = lines.next().unwrap().split(',').collect();
+        assert_eq!(second[0], "1");
+        assert_eq!(second[column("physics/step")], "0.5000");
+        assert_eq!(second[1], "");
+        assert!(lines.next().is_none());
+    }
+
+    /// The series is bounded: past the cap the oldest rows go, so a long run cannot grow it without
+    /// limit, and the `frame` column says which frames the file holds.
+    #[test]
+    fn the_frame_series_keeps_its_most_recent_rows() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        for _ in 0..MAX_FRAME_SERIES_ROWS + 10 {
+            run_frame(&mut profiler, &diagnostics, 6.25, &[]);
+        }
+        assert_eq!(profiler.frame_series.len(), MAX_FRAME_SERIES_ROWS);
+        assert_eq!(profiler.frame_series.front().unwrap().frame, 10);
+        assert_eq!(
+            profiler.frame_series.back().unwrap().frame,
+            MAX_FRAME_SERIES_ROWS as u64 + 9
+        );
+    }
+
     #[test]
     fn writes_complete_profile_bundle() {
         let directory = tempfile::tempdir().unwrap();
@@ -1754,7 +2024,9 @@ mod tests {
             ..Default::default()
         };
         let mut profiler = ProfilingState::default();
+        profiler.begin_frame(16.0);
         profiler.record_ms("streaming/test", 2.0);
+        profiler.record_ms("lights/budget", 0.5);
         profiler.increment("test/count", 1);
         profiler.event("cell", "requested", None);
         let frame = serde_json::json!({
@@ -1785,6 +2057,24 @@ mod tests {
         ] {
             assert!(directory.path().join(name).is_file(), "missing {name}");
         }
+        let series = fs::read_to_string(directory.path().join("frame-series.csv")).unwrap();
+        let mut lines = series.lines();
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .starts_with("frame,real_ms,portal/isolate,"),
+            "the bundle's series must name its columns: {series}"
+        );
+        assert_eq!(
+            lines
+                .next()
+                .unwrap()
+                .split(',')
+                .nth(frame_series_column("lights/budget").unwrap() + 2),
+            Some("0.5000"),
+            "the bundle's series must hold the frame's spans"
+        );
         let summary = fs::read_to_string(directory.path().join("summary.md")).unwrap();
         assert!(
             summary.contains("Terrain seam points welded: 0"),

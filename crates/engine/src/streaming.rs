@@ -313,37 +313,47 @@ impl StreamingWorld {
             ) && !retry_failed_interior(key, self.active_interior, self))
     }
 
-    /// The number of cells in the stream window of `radius` around `center`, how many of them are
-    /// resident at full detail ([`StreamingWorld::is_resident`]: a retiring cell inside the window
-    /// is revived by the planner before this is read, so it counts as resident), and how many
-    /// failed their full request ([`StreamingWorld::has_failed`]). A failed cell (map edge,
-    /// missing data) never becomes resident and is not retried, so the world-ready predicate
-    /// counts it as settled rather than waiting for it forever.
+    /// The number of cells the planner wants for `space` (the stream window of `radius` around
+    /// `center` outside, the one active cell inside an interior), how many of them are resident (at
+    /// full detail: a retiring cell inside the window is revived by the planner before this is
+    /// read, so it counts as resident), and how many ended in [`CellStatus::Failed`]. A failed cell
+    /// (map edge, missing data) never becomes resident and is never retried, so the world-ready
+    /// predicate counts it as settled rather than waiting for it forever.
     pub(crate) fn window_residency(
         &self,
-        worldspace_id: u32,
+        space: &ActiveSpace,
+        configured_worldspace: u32,
         center: IVec2,
         radius: i32,
     ) -> (usize, usize, usize) {
-        let radius = radius.max(0);
-        let side = 2 * radius as usize + 1;
+        // Portal's planner (`wanted_cells`) takes the `ActiveCell` and the door pre-stream; the
+        // window this check waits for is the same one, written out for the `ActiveSpace` it reads.
+        let wanted: Vec<CellKey> = match space.interior {
+            Some(cell_id) => vec![CellKey::Interior(cell_id)],
+            None => {
+                let worldspace_id = space.worldspace_id.unwrap_or(configured_worldspace);
+                let radius = radius.max(0);
+                (-radius..=radius)
+                    .flat_map(|y| {
+                        (-radius..=radius).map(move |x| CellKey::Exterior {
+                            worldspace_id,
+                            grid_x: center.x + x,
+                            grid_y: center.y + y,
+                        })
+                    })
+                    .collect()
+            }
+        };
         let mut resident = 0;
         let mut failed = 0;
-        for y in -radius..=radius {
-            for x in -radius..=radius {
-                let key = CellKey::Exterior {
-                    worldspace_id,
-                    grid_x: center.x + x,
-                    grid_y: center.y + y,
-                };
-                if self.is_resident(&key) {
-                    resident += 1;
-                } else if self.has_failed(&key) {
-                    failed += 1;
-                }
+        for key in &wanted {
+            if self.is_resident(key) {
+                resident += 1;
+            } else if self.has_failed(key) {
+                failed += 1;
             }
         }
-        (side * side, resident, failed)
+        (wanted.len(), resident, failed)
     }
 }
 
@@ -2243,6 +2253,10 @@ fn spawn_cell(
                 // `XTEL` arrival point (`crate::doors::DoorAnchor`).
                 if let Some(anchor) = door_anchor(&reference) {
                     entity.insert(anchor);
+                }
+                // Actors, doors and loose objects are never culled by their stored room.
+                if crate::room_culling::exempt_record_type(reference.base_record_type.as_deref()) {
+                    entity.insert(crate::room_culling::RoomCullExempt);
                 }
                 // A child of the reference, so the light sits where the reference is and follows it
                 // through a render-origin rebase - and, because it is a descendant of the cell root,
@@ -4837,6 +4851,73 @@ mod tests {
         world::database::DoorLinkRow,
     };
     use bevy::asset::{AssetApp, AssetPlugin};
+
+    #[test]
+    fn window_residency_counts_only_the_active_interior_inside() {
+        let mut streaming = StreamingWorld::default();
+        let inside = ActiveSpace {
+            worldspace_id: None,
+            interior: Some(77),
+        };
+        // Entering an interior unloads every exterior cell; the window is the one interior cell.
+        assert_eq!(
+            streaming.window_residency(&inside, 0x3c, IVec2::ZERO, 2),
+            (1, 0, 0)
+        );
+        // An exterior cell left in the map does not count towards the interior's window.
+        streaming.set_resident_for_test(
+            CellKey::Exterior {
+                worldspace_id: 0x3c,
+                grid_x: 0,
+                grid_y: 0,
+            },
+            Entity::PLACEHOLDER,
+        );
+        assert_eq!(
+            streaming.window_residency(&inside, 0x3c, IVec2::ZERO, 2),
+            (1, 0, 0)
+        );
+        streaming.set_resident_for_test(CellKey::Interior(77), Entity::PLACEHOLDER);
+        assert_eq!(
+            streaming.window_residency(&inside, 0x3c, IVec2::ZERO, 2),
+            (1, 1, 0)
+        );
+        streaming.set_failed_for_test(CellKey::Interior(77));
+        assert_eq!(
+            streaming.window_residency(&inside, 0x3c, IVec2::ZERO, 2),
+            (1, 0, 1)
+        );
+    }
+
+    #[test]
+    fn window_residency_reads_the_active_exterior_worldspace() {
+        let mut streaming = StreamingWorld::default();
+        let configured = 0x3c;
+        let other = ActiveSpace {
+            worldspace_id: Some(0x1a26f),
+            interior: None,
+        };
+        for (worldspace_id, grid_x) in [(configured, 0), (0x1a26f, 0), (0x1a26f, 1)] {
+            streaming.set_resident_for_test(
+                CellKey::Exterior {
+                    worldspace_id,
+                    grid_x,
+                    grid_y: 0,
+                },
+                Entity::PLACEHOLDER,
+            );
+        }
+        // The default space is the configured worldspace: one of its 9 window cells is resident.
+        assert_eq!(
+            streaming.window_residency(&ActiveSpace::default(), configured, IVec2::ZERO, 1),
+            (9, 1, 0)
+        );
+        // After a crossing into another worldspace, its own cells count, not the configured one's.
+        assert_eq!(
+            streaming.window_residency(&other, configured, IVec2::ZERO, 1),
+            (9, 2, 0)
+        );
+    }
 
     #[test]
     fn terrain_sampler_check_rejects_default_and_clamped_images() {
