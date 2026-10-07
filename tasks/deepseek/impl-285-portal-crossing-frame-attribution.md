@@ -2,12 +2,16 @@
 
 ## Goal
 Make the door-crossing frames' cost attributable. The 2026-10-08 baseline found the two
-crossing frames (door-tour 895: 357.9 ms, 2666: 318 ms) carry ~80 ms that sits OUTSIDE every
-tracked span: tracked maxima sum to at best 277.7 ms of the 357.9. The identity
-`real_ms ≈ main_world + extract + wait_for_render_thread (+ ~0.5 ms)` holds for the p50s, so
-the remainder lives in the main thread's `Last` → next `First` window that nothing laps, and
-in render-thread phases that are distributions, not per-frame rows. Measurement only; no
-behaviour change. Findings note: `local/research/portal-crossing-frames-895-2666-2026-10-08.md`.
+crossing frames (door-tour 895: 357.9 ms, 2666: 318 ms) unattributable — and the follow-up
+analysis found WHY: `real_ms`/`frame_ms` are not main-thread wall time. Under pipelined
+rendering Bevy feeds main-world `Time<Real>` from the render thread via `TimeReceiver`
+(bevy_time 0.19.1 src/lib.rs:146-184, bevy_render 0.19.1 src/lib.rs:425,483), so a row's
+`real_ms` is a render-paced, lagged reading: the 357.9/317.7 rows are catch-up readings of the
+PREVIOUS frame's stall (the materialization frame, which carries the 26-43 ms propagate walk).
+On the stall frame itself, tracked spans sum to ~33 ms and at least ~60-95 ms (plausibly
+150-250) sits outside `app.update()` — the bevy_winit runner region between updates, where
+nothing laps. Full note: `local/research/portal-crossing-frames-2026-10-08.md` (supersedes
+`portal-crossing-frames-895-2666-2026-10-08.md`). Measurement only; no behaviour change.
 
 ## Context
 - `crates/engine/src/render_timing.rs` owns the frame-cost measurement: spans `main_world`
@@ -24,25 +28,32 @@ behaviour change. Findings note: `local/research/portal-crossing-frames-895-2666
   `portal/*`, `streaming/*` or prestream code; this brief adds measurement only.
 
 ## Design (decided; follow unless wrong, report deviations)
-1. **Lap the untracked window directly.** Record an `Instant` at the end of `Last` (after
+1. **Wall clock, not `Time<Real>`.** Because `Time<Real>` is render-thread-fed under pipelined
+   rendering (see Goal), every new measurement here is its own `Instant` lap on the main
+   thread. The wall cycle time is the lap from one `First` to the next. The CSV also carries
+   the cycle's `Time<Real>`-derived delta next to the wall lap, so the next re-profile can
+   quantify the clock skew directly instead of assuming it.
+2. **Lap the untracked window directly.** Record an `Instant` at the end of `Last` (after
    `end_main_world`) and close it at the start of `First` on the next cycle. That raw gap
    includes the extract and the wait, so also record it minus those two when both ran in the
    window — the reported number must be "main-thread time outside main_world, extract and
    wait". Name: `frame/remainder`. Gate: benchmark runs (with `track_cycles`), zero cost
    otherwise.
-2. **Per-frame render phases.** Extend the cycle record with the render phases
+3. **Per-frame render phases.** Extend the cycle record with the render phases
    (`extract_commands_and_assets`, `specialize_and_views`, `queue`, `prepare`,
    `graph_and_present`, `cleanup`, `swapchain_acquire`) — one value per cycle each, not
    distributions. Write them as a second bounded CSV beside `frame-series.csv`, e.g.
-   `render-cycles.csv`, one row per cycle: `cycle`, `main_world`, `extract`,
-   `wait_for_render_thread`, `frame/remainder`, `render_thread`, then the seven phase
-   columns. Leave `frame-series.csv` exactly as it is (other tooling reads it). Document the
-   n → n+1 render offset in the module doc and the CSV's companion doc comment.
-3. **The identity as a test.** A unit test (synthetic timings, no window) asserts
-   `main_world + extract + wait + frame/remainder ≈ cycle time` within a small epsilon, and
-   that the phase columns sum to `render_thread` within epsilon. This is what makes the next
-   re-profile trustworthy: the crossing frames' 357.9 ms must be accounted to within a few ms
-   by the row's columns.
+   `render-cycles.csv`, one row per cycle: `cycle`, `wall_cycle_ms`, `real_ms`,
+   `main_world`, `extract`, `wait_for_render_thread`, `frame/remainder`, `render_thread`,
+   then the seven phase columns. Leave `frame-series.csv` exactly as it is (other tooling
+   reads it). Document the n → n+1 render offset in the module doc and the CSV's companion
+   doc comment.
+4. **The identity as a test.** A unit test (synthetic timings, no window) asserts
+   `main_world + extract + wait + frame/remainder ≈ wall_cycle_ms` within a small epsilon —
+   against the wall lap, never against `real_ms` — and that the phase columns sum to
+   `render_thread` within epsilon. This is what makes the next re-profile trustworthy: the
+   stall frame's true wall time must be accounted to within a few ms by its row before anyone
+   attributes anything.
 
 ## Scope (owned files)
 `crates/engine/src/render_timing.rs`, `crates/engine/src/profiling.rs` (only the parts the
