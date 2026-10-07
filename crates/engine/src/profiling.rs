@@ -4,8 +4,8 @@ use crate::{
     render::RendererMetrics,
     render_timing::{
         self, CLEANUP, CycleSides, EXTRACT, EXTRACT_COMMANDS_AND_ASSETS, GRAPH_AND_PRESENT,
-        MAIN_WORLD, PREPARE, QUEUE, REMAINDER, RENDER_THREAD, SPECIALIZE_AND_VIEWS,
-        SWAPCHAIN_ACQUIRE, WAIT_FOR_RENDER_THREAD,
+        MAIN_WORLD, PREPARE, QUEUE, REAL_MS, REMAINDER, RENDER_THREAD, SPECIALIZE_AND_VIEWS,
+        SWAPCHAIN_ACQUIRE, WAIT_FOR_RENDER_THREAD, WALL_CYCLE_MS,
     },
     streaming::StreamingMetrics,
 };
@@ -43,13 +43,21 @@ const MAX_TIMELINE_EVENTS: usize = 100_000;
 const MAX_FRAME_SERIES_ROWS: usize = 100_000;
 
 /// How many cycles of the per-cycle series are kept: the same order of size as the per-frame
-/// series, and one row is under 200 bytes, so the series costs at most a few megabytes. Past this
+/// series, and one row is under 224 bytes, so the series costs at most a few megabytes. Past this
 /// the oldest row is dropped.
 const MAX_RENDER_CYCLE_ROWS: usize = MAX_FRAME_SERIES_ROWS;
 
+/// The cycle's two clock columns, ahead of the sides: `wall_cycle_ms` is the lap from one `First`
+/// to the next, measured on the main thread — the number the row's own sides account for — and
+/// `real_ms` is the `Time<Real>` delta the next `First` read, which under pipelined rendering is
+/// render-paced and lagged (see `render_timing`), kept beside the wall lap so the skew between
+/// the two clocks is quantifiable per cycle. Both are written by the next cycle's `First`, so the
+/// run's last row keeps neither.
+const RENDER_CYCLE_CLOCKS: [&str; 2] = [WALL_CYCLE_MS, REAL_MS];
+
 /// The sides of `render-cycles.csv`'s row, in the order it writes them; the row opens with the
-/// cycle number. The names are the spans the render timings record, imported from there, so the
-/// file's header cannot drift from them.
+/// cycle number and the two clock columns ([`RENDER_CYCLE_CLOCKS`]). The names are the spans the
+/// render timings record, imported from there, so the file's header cannot drift from them.
 const RENDER_CYCLE_SIDES: [&str; 5] = [
     MAIN_WORLD,
     EXTRACT,
@@ -525,19 +533,33 @@ impl ProfilingState {
     /// that cycle — the one fed by extract `n - 1` when rendering is pipelined, because the render
     /// schedule that follows the extract of main frame `n` runs during cycle `n + 1` — so a row
     /// reads against the `frame-series.csv` row with the same number, and a crossing frame's
-    /// `render_thread` time is explained by its own row's phases. A side the cycle did not
-    /// measure stays an empty column, and the run's last cycle or two are absent: their remainder
-    /// window never closed.
+    /// `render_thread` time is explained by its own row's phases. Its two clock columns are the
+    /// wall lap from one `First` to the next, measured on the main thread, and the `Time<Real>`
+    /// delta the next `First` read — the same render-paced reading the joined `frame-series.csv`
+    /// row's `real_ms` carries, so the skew between the two clocks is quantifiable per cycle
+    /// instead of assumed. A side the cycle did not measure stays an empty column, and the run's
+    /// last cycle or two are absent: their remainder window never closed, and with it neither
+    /// clock column.
     fn render_cycles_csv(&self) -> String {
-        let mut csv = String::with_capacity(192 + self.render_cycles.len() * 160);
+        let mut csv = String::with_capacity(224 + self.render_cycles.len() * 176);
         csv.push_str("cycle");
-        for column in RENDER_CYCLE_SIDES.iter().chain(RENDER_CYCLE_PHASES.iter()) {
+        for column in RENDER_CYCLE_CLOCKS
+            .iter()
+            .chain(RENDER_CYCLE_SIDES.iter())
+            .chain(RENDER_CYCLE_PHASES.iter())
+        {
             csv.push(',');
             csv.push_str(column);
         }
         csv.push('\n');
         for (cycle, sides) in &self.render_cycles {
             csv.push_str(&cycle.to_string());
+            for value in [sides.wall_ms, sides.real_ms] {
+                match value {
+                    Some(value) => csv.push_str(&format!(",{value:.4}")),
+                    None => csv.push(','),
+                }
+            }
             for value in [
                 sides.main_ms,
                 sides.extract_ms,
@@ -2140,6 +2162,8 @@ lights/budget,physics/step"
         profiler.extend_render_cycles([(
             1,
             CycleSides {
+                wall_ms: Some(12.0),
+                real_ms: Some(12.5),
                 main_ms: Some(9.5),
                 extract_ms: Some(0.4),
                 wait_ms: Some(2.0),
@@ -2154,24 +2178,32 @@ lights/budget,physics/step"
         let mut lines = csv.lines();
         assert_eq!(
             lines.next().unwrap(),
-            "cycle,main_world,extract,wait_for_render_thread,frame/remainder,render_thread,\
-        render/extract_commands_and_assets,render/specialize_and_views,render/queue,render/prepare,\
-        render/graph_and_present,render/cleanup,render/swapchain_acquire"
+            "cycle,wall_cycle_ms,real_ms,main_world,extract,wait_for_render_thread,frame/remainder,\
+            render_thread,render/extract_commands_and_assets,render/specialize_and_views,render/queue,\
+            render/prepare,render/graph_and_present,render/cleanup,render/swapchain_acquire"
         );
         let row: Vec<&str> = lines.next().unwrap().split(',').collect();
         assert_eq!(
             row.len(),
-            1 + RENDER_CYCLE_SIDES.len() + RENDER_CYCLE_PHASES.len()
+            1 + RENDER_CYCLE_CLOCKS.len() + RENDER_CYCLE_SIDES.len() + RENDER_CYCLE_PHASES.len()
         );
         assert_eq!(row[0], "1");
-        assert_eq!(row[1], "9.5000");
-        assert_eq!(row[2], "0.4000");
-        assert_eq!(row[3], "2.0000");
-        assert_eq!(row[4], "0.3000");
-        assert_eq!(row[5], "6.2000");
-        assert_eq!(row[6], "0.5000", "the extract-commands phase was measured");
-        assert_eq!(row[8], "", "no queue phase was measured in this cycle");
-        assert_eq!(row[12], "1.0000", "the swapchain wait closes the row");
+        assert_eq!(
+            row[1], "12.0000",
+            "the wall lap the row's sides account for"
+        );
+        assert_eq!(
+            row[2], "12.5000",
+            "the Time<Real> delta the next First read"
+        );
+        assert_eq!(row[3], "9.5000");
+        assert_eq!(row[4], "0.4000");
+        assert_eq!(row[5], "2.0000");
+        assert_eq!(row[6], "0.3000");
+        assert_eq!(row[7], "6.2000");
+        assert_eq!(row[8], "0.5000", "the extract-commands phase was measured");
+        assert_eq!(row[10], "", "no queue phase was measured in this cycle");
+        assert_eq!(row[14], "1.0000", "the swapchain wait closes the row");
         assert!(lines.next().is_none());
     }
 
