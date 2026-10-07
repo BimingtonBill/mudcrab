@@ -20,8 +20,10 @@ every session and worker on this PC:
 Defaults (override in <gate dir>/config.json): 3 slots, at most 2 per session
 (BUILD_GATE_OWNER, else the label's track prefix: p1, p2, p3, portal ...), 8 GB free RAM minimum,
 wait up to 120 minutes for a slot (then exit 4 with the reason). The gate
-lives in %LOCALAPPDATA%\\mudcrab\\build-gate so it survives folder moves and
-is shared by every checkout and worktree.
+lives in %USERPROFILE%\\.mudcrab\\build-gate, not AppData: the Claude desktop
+app is an MSIX package, and Windows redirects its processes' AppData writes to
+a private folder no other process sees. It survives folder moves and is shared
+by every checkout, worktree and process.
 
 Exit codes: the command's own exit code for `run`; 3 bad arguments; 4 gave up
 waiting. Python 3.13, standard library only (ctypes for RAM and PID checks).
@@ -39,7 +41,9 @@ import time
 from ctypes import wintypes
 from datetime import datetime, timedelta
 
-GATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "mudcrab", "build-gate")
+# Not under AppData: the Claude desktop app is an MSIX package, which redirects AppData writes from its own
+# processes to a private folder that every other process (consoles, workers, cargo) cannot see (2026-10-07).
+GATE_DIR = os.environ.get("MUDCRAB_BUILD_GATE") or os.path.join(os.path.expanduser("~"), ".mudcrab", "build-gate")
 DEFAULTS = {"slots": 3, "max_per_owner": 2, "min_free_ram_gb": 8.0, "max_wait_minutes": 120, "poll_seconds": 10}
 GB = 1024**3
 

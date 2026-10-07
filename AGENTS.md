@@ -71,7 +71,7 @@ a conversion's build pause, a review wait) or is about to go idle, it checks:
   per session, the DeepSeek pace.
 - **Builds are the scarce part, not workers (2026-10-07: 26 cargo + 22 rustc at once left 3.3 GB RAM free and
   slowed a conversion to 4 MB/s). Every heavy cargo command goes through the machine-wide build gate:**
-  `python C:/Users/Brannock/AppData/Local/mudcrab/build-gate/build_gate.py run -- cargo nextest run -p <crate>`
+  `python C:/Users/Brannock/.mudcrab/build-gate/build_gate.py run -- cargo nextest run -p <crate>`
   (also for check, clippy, build, test; sessions, Claude subagents and DeepSeek workers alike). It waits for one of
   3 build slots (at most 2 per session: `BUILD_GATE_OWNER`, else the label's track prefix p1/p2/p3/portal), at least 8 GB free RAM and no hold, then runs and frees the slot on any exit. `... status` shows
   slots, holds, free RAM and converters. A conversion (extraction and convert phases) and a timing window set a
