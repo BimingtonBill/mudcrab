@@ -3,6 +3,26 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 (evening) Phase 1 Dev: terrain data published, duplicate LAND, GLM trial, KTX2
+
+All local; nothing published. Phase 1 reports to Team Lead (trial). Task numbers 1900-1999.
+
+- **#186 terrain merge, converter half done:** `phase1/terrain-merge` e06c733e (worktree `C:\Modding\Mudcrab\worktrees\p1-terrain-merge`).
+  - The wiring is DeepSeek #896.1: 9b013eb7, eeaf49dd and 5ce5dcc0. `--merged-terrain`, `--terrain-default-texture`, `--terrain-ini` and `--terrain-allow-downscale` are carried through resume. Only LAND/LTEX/TXST/CELL/WRLD are kept in memory, the metadata route runs the stage, and it runs under spawn_blocking.
+  - Reviews: DeepSeek #1902 and Muse #1902.1 accept.
+  - Converter: 575 tests pass.
+- **Real data:** `D:\Mudcrab\SkyrimConverted-p2main-v24-terrain` (26.5 GB, owner note beside it, class C). 52,181 cells, 3,589 chunk files, 6 arrays, 229 land textures; 0 cells skipped. The terrain stage took 35 s of 54 min. Report: `D:\Mudcrab\evidence\p1-evidence\convert-p2main-v24-terrain-report.json`.
+  - Phase 2 runs the 5-view image diff after its impl-1078.
+  - Finding: 80% of quadrants have no BTXT. The default texture is white today; the game uses Dirt02. Proposed follow-up: `--terrain-default-texture skyrim-ini`.
+- **Duplicate LAND:** 2 vanilla cells (Tamriel 0x18DF and 0x18FD; Dawnguard adds a second LAND). The seam test shows the game draws the later plugin's LAND (`local/research/terrain-merge/duplicate-land-2026-10-08.md`). GLM #1904 fixed it in e06c733e (`land_per_cell`, same rule as Chef's PR #167 `land_by_cell`; swap it in when #167 merges), with the check right after the DB stage. Reviewed by DeepSeek #1905: accept. The upstream note goes to #167 as supporting evidence via Upstream Dev (`local/pr-drafts/phase1-duplicate-land-note-2026-10-08.md`).
+- **Runs that failed first:** try 1 hit the Windows commit limit. The user raised both page files' initial size to 16 GB, so the commit limit is now 63.9 GB, and the gate now checks commit headroom (`build_gate.py preflight`). Try 2 hit the duplicate LAND after 55 min.
+- **KTX2 mip order:** `phase1/ktx2-mip-order` = 54f3403c (GLM #1900) + 93a4ad0b (GPU writer, Claude). Clippy clean, 532 tests pass. Review: DeepSeek #1901 accept. It waits for PR #167 to merge (rebase: #167 rewrites texture.rs) and for the schema-bump batch. The GLM trial report went to Team Lead (`local/review/p1-glm-trial-1900-2026-10-08.md`). Note: `-Resume` and `-Provider glm` ran on glm-5.3-flash.
+- **Collision v3 (Phase 4 design):** answered §8. Pin parry3d to 0.30.2-glamx0.2-b. The cache key includes the schema, so it means a reconvert batched with the schema bump. collision-annotate stays a dev tool only. It stacks on our draft #126.
+- **Queue rows:** B5 needs no rebuild (portal-rooms already has the room tables; engine flag to check). E6, the full load bench (`D:\Mudcrab\scratch\p1-load-bench\run-full.ps1`, paths updated), goes on tomorrow's quiet-slot list.
+- **Deleted with the user's yes (logged):** `D:/Mudcrab/builds/p1-tmp-keyprobe-target`, `D:/Mudcrab/builds/p1-tmp-doorlinks-target`, and `local/impl/impl-1900-p1-ktx2-mip-order/target`.
+- **Pending on the user:** whether SkyrimConverted-p1rooms (D:, 14 GB) can go; the alias dedupe; the heartbeat line; the default-texture follow-up.
+- No worker running.
+
 ## 2026-10-08 evening, Team Lead (day 1 wrap-up)
 
 Track: all. Nothing pushed. The user asked for a slow wrap-up at ~21:00.
