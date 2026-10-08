@@ -80,28 +80,51 @@
 //!   `render/graph/views` (the root
 //!   `Render` set: every view's schedule, the part of the phase that scales with views),
 //!   `render/graph/view_count` (how many view schedules the cycle ran — a count, not a duration),
-//!   the sums over those views of `render/graph/prepass`, `render/graph/main_pass` and
-//!   `render/graph/post_process`, `render/graph/submit` (the graph command buffers' `queue.submit`
-//!   and the uncovered-window clear) and `render/graph/remainder`, which closes the phase:
-//!   everything the laps do not own — the schedule's own `Begin`/`Finish` sets and overhead, and,
-//!   after the schedule, the screenshot and readback submit, the `queue.submit` of their encoder and
-//!   `present` on each window (`bevy_render-0.19.0` `src/renderer/mod.rs:78-110`). Two parts are
-//!   reported as not split rather than guessed: `present` cannot be separated from that remainder
-//!   without patching Bevy or building it with its `trace` feature, and the GPU-driven preprocessing
-//!   has no set of its own inside `Prepass`, so it is inside `render/graph/prepass`. A view that
-//!   runs a graph schedule other than `Core3d` is counted in `views` but not in the per-view laps.
+//!   the sums over those views of `render/graph/prepass`, `render/graph/main_pass`,
+//!   `render/graph/early_post_process` and `render/graph/post_process` (the post-process sum still
+//!   covers `EarlyPostProcess` and `PostProcess` together, as it did before the split; the early
+//!   column is that first stage alone), `render/graph/submit` (the graph command buffers'
+//!   `queue.submit` and the uncovered-window clear) and `render/graph/remainder`, which closes the
+//!   phase: everything the laps do not own — the schedule's own `Begin`/`Finish` sets and overhead,
+//!   and, after the schedule, the screenshot and readback submit, the `queue.submit` of their
+//!   encoder and `present` on each window (`bevy_render-0.19.0` `src/renderer/mod.rs:78-110`). Two
+//!   parts are reported as not split rather than guessed: `present` cannot be separated from that
+//!   remainder without patching Bevy or building it with its `trace` feature, and the GPU-driven
+//!   preprocessing has no set of its own inside `Prepass`, so it is inside `render/graph/prepass`.
+//!
+//!   `render/graph/views` itself is split by the kind of root view `camera_driver` ran, because the
+//!   loop runs two kinds: a **camera** view (an entry of `SortedCameras`) and an **auxiliary** root
+//!   view — `RootNonCameraView`, which in Bevy 0.19 is a point or spot light's shadow map
+//!   (`bevy_core_pipeline-0.19.0` `src/schedule.rs:115-123`, `:136`; `bevy_pbr-0.19.0`
+//!   `src/render/light.rs:2064-2094`, `:2150-2175`). A run is counted as a shadow view when the
+//!   entity the schedule is running for carries `ShadowView` (`bevy_pbr-0.19.0`
+//!   `src/render/light.rs:928`), the marker of a pass that draws a shadow map: the cycle keeps
+//!   `render/graph/shadow_views` and `render/graph/camera_views` (each the view kind's own time,
+//!   the sum of that run's stage laps), `render/graph/shadow_view_count` (how many of
+//!   `render/graph/view_count`'s runs were shadow views) and `render/graph/views_remainder` =
+//!   `views` less those two sums, never negative — what the loop itself spends between runs plus
+//!   whatever a run spends outside the lap windows (its schedule's own setup and teardown, and the
+//!   stage systems the executor orders outside them). A **directional** light's cascade views are
+//!   not root views: they are `ShadowView` entities the camera's own `Core3d` run renders through
+//!   `per_view_shadow_pass` (`bevy_pbr-0.19.0` `src/lib.rs:424-444`, `src/render/light.rs:2784`),
+//!   so their time is inside `render/graph/camera_views` (and inside whichever stage window the
+//!   schedule puts the pass in), not in the shadow-view columns.
+//!
+//!   A view that runs a graph schedule other than `Core3d` is counted in `views` but not in the
+//!   per-view laps, so it is the whole of its cycle's `views_remainder`.
 
 use bevy::{
     app::{First, Last},
     core_pipeline::{Core3d, Core3dSystems},
     ecs::schedule::Schedules,
+    pbr::ShadowView,
     platform::time::Instant,
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
         pipelined_rendering::RenderExtractApp,
         render_resource::PipelineCache,
-        renderer::{RenderGraph, RenderGraphSystems},
+        renderer::{CurrentView, RenderGraph, RenderGraphSystems},
         view::prepare_windows,
     },
     time::TimeSystems,
@@ -147,25 +170,54 @@ pub const CLEANUP: &str = "render/cleanup";
 /// * [`GRAPH_VIEWS`]: the root graph schedule's `Render` set — Bevy's `camera_driver`, which runs
 ///   every camera's and auxiliary view's graph schedule. The part of the phase that scales with
 ///   views.
-/// * [`GRAPH_VIEW_COUNT`] with [`GRAPH_PREPASS`], [`GRAPH_MAIN_PASS`] and [`GRAPH_POST_PROCESS`]:
-///   how many view schedules (`Core3d` runs) the cycle ran, and the sums over them of the
-///   schedule's prepass, main-pass and post-process stages. The GPU-driven binning and
-///   indirect-draw building run inside the `Prepass` set, so their time is in `GRAPH_PREPASS`.
+/// * [`GRAPH_VIEW_COUNT`] with [`GRAPH_PREPASS`], [`GRAPH_MAIN_PASS`], [`GRAPH_EARLY_POST_PROCESS`]
+///   and [`GRAPH_POST_PROCESS`]: how many view schedules (`Core3d` runs) the cycle ran, and the
+///   sums over them of the schedule's prepass, main-pass, early-post-process and post-process
+///   stages. The GPU-driven binning and indirect-draw building run inside the `Prepass` set, so
+///   their time is in `GRAPH_PREPASS`. `GRAPH_POST_PROCESS` still covers `EarlyPostProcess` and
+///   `PostProcess` together, so the 2026-10-08 window's numbers keep their meaning;
+///   `GRAPH_EARLY_POST_PROCESS` is the `EarlyPostProcess` part of it.
+/// * [`GRAPH_SHADOW_VIEWS`] and [`GRAPH_CAMERA_VIEWS`]: the same runs, split by the kind of root
+///   view `camera_driver` ran — a shadow view (an auxiliary root view with the `ShadowView` marker,
+///   a point or spot light's map) or a camera. [`GRAPH_SHADOW_VIEW_COUNT`] says how many of
+///   `GRAPH_VIEW_COUNT`'s runs were shadow views.
 /// * [`GRAPH_SUBMIT`]: the root graph schedule's `Submit` set, where the graph's command buffers go
 ///   to the queue.
 /// * [`GRAPH_REMAINDER`]: `render/graph_and_present` less the laps above — the schedule's own
 ///   overhead and, after it, the screenshot and readback submit, the second `queue.submit` and
 ///   `present` on each window. Present is not isolable without patching Bevy, so the remainder
-///   carries it (see the module doc).
+///   carries it (see the module doc). [`GRAPH_VIEWS_REMAINDER`] is the same idea one level in:
+///   `render/graph/views` less the two view-kind sums.
 pub const GRAPH_VIEWS: &str = "render/graph/views";
-/// How many view schedules the cycle's per-view sums cover. The one column that is a count rather
-/// than milliseconds.
+/// How many view schedules the cycle's per-view sums cover. A count, not a duration. It keeps its
+/// meaning across the view-kind split: every `Core3d` run the cycle made, camera and shadow views
+/// alike (the shadow ones are [`GRAPH_SHADOW_VIEW_COUNT`] of it, the rest are cameras).
 pub const GRAPH_VIEW_COUNT: &str = "render/graph/view_count";
 pub const GRAPH_PREPASS: &str = "render/graph/prepass";
 pub const GRAPH_MAIN_PASS: &str = "render/graph/main_pass";
+/// The `Core3d` `EarlyPostProcess` stage alone, summed over the views: a subset of
+/// [`GRAPH_POST_PROCESS`], split out because the stage is where temporal anti-aliasing lands
+/// (`bevy_anti_alias-0.19.0` `src/taa/mod.rs:72`) and an empty stage if it is off.
+pub const GRAPH_EARLY_POST_PROCESS: &str = "render/graph/early_post_process";
+/// The `EarlyPostProcess` and `PostProcess` stages together, summed over the views (what this
+/// column has covered since impl-1075).
 pub const GRAPH_POST_PROCESS: &str = "render/graph/post_process";
+/// The `Core3d` runs `camera_driver` made for a shadow view: the whole of each such run's stage
+/// laps, summed over the views (see the module doc — a directional light's cascades are inside a
+/// camera run, not here).
+pub const GRAPH_SHADOW_VIEWS: &str = "render/graph/shadow_views";
+/// How many of [`GRAPH_VIEW_COUNT`]'s view schedules were shadow views. A count, not a duration.
+pub const GRAPH_SHADOW_VIEW_COUNT: &str = "render/graph/shadow_view_count";
+/// The `Core3d` runs `camera_driver` made for a camera: the whole of each such run's stage laps,
+/// summed over the views. It carries a directional light's cascade shadow passes, which run inside
+/// the camera's own schedule (see the module doc).
+pub const GRAPH_CAMERA_VIEWS: &str = "render/graph/camera_views";
 pub const GRAPH_SUBMIT: &str = "render/graph/submit";
 pub const GRAPH_REMAINDER: &str = "render/graph/remainder";
+/// `render/graph/views` less [`GRAPH_SHADOW_VIEWS`] and [`GRAPH_CAMERA_VIEWS`], never negative:
+/// what `camera_driver` spends between the runs, plus whatever the runs spend outside the lap
+/// windows (see the module doc).
+pub const GRAPH_VIEWS_REMAINDER: &str = "render/graph/views_remainder";
 
 /// Measures the render side of each frame; shared by the main world, the render world and the
 /// extract wrappers.
@@ -268,6 +320,15 @@ fn add_render_marks(render_app: &mut SubApp, samples_pipelines: bool) {
 /// when that schedule exists (it is registered by `Core3dPlugin`, which a 2D-only or headless app
 /// does not add), so a view that runs another graph schedule is measured by the root
 /// `render/graph/views` lap alone.
+///
+/// The four `Core3d` hooks tile each run into the four stage windows the laps sum: from the run's
+/// start to the end of `Prepass`, on to the end of `MainPass`, on to the end of `EarlyPostProcess`
+/// and on to the end of `PostProcess`. Each window is added to its stage's cycle sum — and its own
+/// view kind's ([`GRAPH_CAMERA_VIEWS`] or [`GRAPH_SHADOW_VIEWS`]), which is what makes a kind's
+/// total the sum of its runs' stages. Systems outside the sets (the GPU preprocessing and the
+/// shadow passes, which Bevy orders against set members with `after`/`before` only) fall in
+/// whichever window the executor runs them in; anything it orders outside the windows is not in
+/// the per-view laps at all and shows up in [`GRAPH_VIEWS_REMAINDER`].
 fn add_graph_marks(render_app: &mut SubApp) {
     render_app.add_systems(
         RenderGraph,
@@ -293,6 +354,9 @@ fn add_graph_marks(render_app: &mut SubApp) {
                 lap_view_main_pass
                     .after(Core3dSystems::MainPass)
                     .before(Core3dSystems::EarlyPostProcess),
+                lap_view_early_post_process
+                    .after(Core3dSystems::EarlyPostProcess)
+                    .before(Core3dSystems::PostProcess),
                 lap_view_post_process.after(Core3dSystems::PostProcess),
             )
                 .run_if(tracks_cycles),
@@ -334,9 +398,13 @@ struct State {
     /// `Render` set and re-armed for the `Submit` lap ([`GRAPH_VIEWS`], [`GRAPH_SUBMIT`]).
     graph_mark: Option<Instant>,
     /// The mark a view's graph schedule opened, re-armed at each of its stage boundaries, so the
-    /// per-view stage laps ([`GRAPH_PREPASS`], [`GRAPH_MAIN_PASS`], [`GRAPH_POST_PROCESS`]) tile
-    /// the view.
+    /// per-view stage laps ([`GRAPH_PREPASS`], [`GRAPH_MAIN_PASS`], [`GRAPH_EARLY_POST_PROCESS`],
+    /// [`GRAPH_POST_PROCESS`]) tile the view.
     view_mark: Option<Instant>,
+    /// Whether the run behind [`State::view_mark`] is a shadow view ([`GRAPH_SHADOW_VIEWS`]) rather
+    /// than a camera ([`GRAPH_CAMERA_VIEWS`]), read off the view's `ShadowView` marker when the run
+    /// started. Each stage lap adds its window to that kind's cycle sum too.
+    view_is_shadow: bool,
     /// Whether rendering is pipelined (the render world runs on its own thread).
     pipelined: bool,
     /// The main frame in progress, counted from one.
@@ -403,24 +471,39 @@ pub struct CycleSides {
     ///
     /// * `graph_views_ms`: the render graph's view schedules (the root `Render` set, Bevy's
     ///   `camera_driver`).
-    /// * `graph_view_count`: how many view schedules the per-view sums below cover. A count, not a
-    ///   duration; zeros and millisecond fields share this record, so the count column is written
-    ///   as an integer.
-    /// * `graph_prepass_ms`, `graph_main_pass_ms`, `graph_post_process_ms`: the sums over those
-    ///   views of the `Core3d` schedule's prepass, main-pass and post-process stages (the
-    ///   post-process sum covers `EarlyPostProcess` and `PostProcess`).
+    /// * `graph_view_count`: how many view schedules the per-view sums below cover — every `Core3d`
+    ///   run of the cycle, camera and shadow views alike. A count, not a duration; zeros and
+    ///   millisecond fields share this record, so the count column is written as an integer.
+    /// * `graph_prepass_ms`, `graph_main_pass_ms`, `graph_early_post_process_ms`,
+    ///   `graph_post_process_ms`: the sums over those views of the `Core3d` schedule's prepass,
+    ///   main-pass, early-post-process and post-process stages. The post-process sum covers
+    ///   `EarlyPostProcess` and `PostProcess` together, as it did before the early stage got its
+    ///   own column, so the two are not added side by side.
+    /// * `graph_shadow_views_ms`, `graph_camera_views_ms` and `graph_shadow_view_count`: the same
+    ///   runs split by kind — a shadow view (a point or spot light's map, which `camera_driver`
+    ///   drives as an auxiliary root view) or a camera — each sum being that kind's stage windows
+    ///   added up. A kind that ran no view in the cycle keeps its columns empty, and
+    ///   `graph_shadow_view_count` counts the shadow runs of `graph_view_count`.
     /// * `graph_submit_ms`: the graph's `queue.submit` (the root `Submit` set) and the
     ///   uncovered-window clear.
     /// * `graph_remainder_ms`: `graph_and_present_ms` less `graph_views_ms` and `graph_submit_ms`,
     ///   never negative: the schedule's own overhead and the region after it, which carries the
     ///   screenshot/readback submit, the second `queue.submit` and `present` on each window.
+    /// * `graph_views_remainder_ms`: `graph_views_ms` less `graph_shadow_views_ms` and
+    ///   `graph_camera_views_ms`, never negative: what `camera_driver` spends between the runs,
+    ///   plus whatever the runs spend outside the per-view lap windows.
     pub graph_views_ms: Option<f64>,
     pub graph_view_count: Option<u32>,
     pub graph_prepass_ms: Option<f64>,
     pub graph_main_pass_ms: Option<f64>,
+    pub graph_early_post_process_ms: Option<f64>,
     pub graph_post_process_ms: Option<f64>,
+    pub graph_shadow_views_ms: Option<f64>,
+    pub graph_shadow_view_count: Option<u32>,
+    pub graph_camera_views_ms: Option<f64>,
     pub graph_submit_ms: Option<f64>,
     pub graph_remainder_ms: Option<f64>,
+    pub graph_views_remainder_ms: Option<f64>,
 }
 
 /// Pipelines (render and compute) in one render frame. Bevy's `PipelineCache` holds both, so these
@@ -744,9 +827,14 @@ impl RenderTimings {
 
     /// Every view's graph schedule has run (the root schedule's `Render` set, Bevy's
     /// `camera_driver`): closes [`GRAPH_VIEWS`] and re-arms the mark
-    /// [`RenderTimings::submit_lapped`] closes.
+    /// [`RenderTimings::submit_lapped`] closes. Every run of the cycle has finished by now — the
+    /// lap is ordered after the `Render` set the loop is in — so the two view-kind sums are
+    /// complete and [`GRAPH_VIEWS_REMAINDER`] can close the split.
     fn views_lapped(&self) {
-        self.graph_lap(|sides, ms| sides.graph_views_ms = Some(ms));
+        self.graph_lap(|sides, ms| {
+            sides.graph_views_ms = Some(ms);
+            sides.graph_views_remainder_ms = Some(views_remainder_ms(ms, sides));
+        });
     }
 
     /// The root schedule's `Submit` set has run (the graph's command buffers are with the queue):
@@ -771,21 +859,29 @@ impl RenderTimings {
     }
 
     /// A view's graph schedule (`Core3d`) has begun, before its `Prepass` set: opens the view's
-    /// mark and counts the view.
-    fn view_started(&self) {
+    /// mark, counts the view and records its kind (`is_shadow`), which the stage laps add their
+    /// windows to.
+    fn view_started(&self, is_shadow: bool) {
         if !self.tracks_cycles() {
             return;
         }
         let mut state = self.state();
         state.view_mark = Some(Instant::now());
+        state.view_is_shadow = is_shadow;
         let render_cycle = state.render_cycle;
         self.write_cycle(&mut state, render_cycle, |sides| {
             sides.graph_view_count = Some(sides.graph_view_count.unwrap_or(0) + 1);
+            if is_shadow {
+                sides.graph_shadow_view_count =
+                    Some(sides.graph_shadow_view_count.unwrap_or(0) + 1);
+            }
         });
     }
 
     /// Closes the view lap opened at the view's previous boundary — the start, then each stage
-    /// boundary — and adds it to the cycle's sum for that stage.
+    /// boundary — and adds it to the cycle's sum for that stage and for the run's kind
+    /// ([`GRAPH_CAMERA_VIEWS`] or [`GRAPH_SHADOW_VIEWS`]). The windows tile the run, so the kind's
+    /// sum ends up as the whole of each run the cycle made of it.
     fn view_lapped(&self, add: fn(&mut CycleSides, f64)) {
         if !self.tracks_cycles() {
             return;
@@ -796,8 +892,12 @@ impl RenderTimings {
             return;
         };
         let ms = (now - mark).as_secs_f64() * 1000.0;
+        let is_shadow = state.view_is_shadow;
         let render_cycle = state.render_cycle;
-        self.write_cycle(&mut state, render_cycle, |sides| add(sides, ms));
+        self.write_cycle(&mut state, render_cycle, |sides| {
+            add(sides, ms);
+            add_view_kind(sides, is_shadow, ms);
+        });
     }
 
     fn end_render(&self) {
@@ -931,8 +1031,28 @@ fn lap_graph_submit(timings: Res<RenderTimings>) {
     timings.submit_lapped();
 }
 
-fn start_view(timings: Res<RenderTimings>) {
-    timings.view_started();
+fn start_view(
+    timings: Res<RenderTimings>,
+    current_view: Option<Res<CurrentView>>,
+    shadow_views: Query<(), With<ShadowView>>,
+) {
+    timings.view_started(view_is_shadow(current_view.as_deref(), &shadow_views));
+}
+
+/// Whether the `Core3d` run that is starting is a shadow view: the entity `camera_driver` inserted
+/// as `CurrentView` before running the schedule (`bevy_render-0.19.0`
+/// `src/renderer/render_context.rs:205`; `bevy_core_pipeline-0.19.0` `src/schedule.rs:194`) carries
+/// bevy_pbr's `ShadowView` marker (`bevy_pbr-0.19.0` `src/render/light.rs:928`), which its
+/// `prepare_lights` puts on the point and spot light views it spawns as root views (`:2064-2094`,
+/// `:2150-2175`) and on the directional cascade views that run inside a camera's own schedule
+/// (`:1869-1896`, so they never reach this test as a root run). A camera's own entity has no
+/// `ShadowView`, and a run with no `CurrentView` (nothing this app does) is counted as a camera
+/// rather than dropped, so no lap is lost to a missing resource.
+fn view_is_shadow(
+    current_view: Option<&CurrentView>,
+    shadow_views: &Query<(), With<ShadowView>>,
+) -> bool {
+    current_view.is_some_and(|current_view| shadow_views.contains(current_view.0))
 }
 
 fn lap_view_prepass(timings: Res<RenderTimings>) {
@@ -941,6 +1061,10 @@ fn lap_view_prepass(timings: Res<RenderTimings>) {
 
 fn lap_view_main_pass(timings: Res<RenderTimings>) {
     timings.view_lapped(add_graph_main_pass);
+}
+
+fn lap_view_early_post_process(timings: Res<RenderTimings>) {
+    timings.view_lapped(add_graph_early_post_process);
 }
 
 fn lap_view_post_process(timings: Res<RenderTimings>) {
@@ -957,8 +1081,26 @@ fn add_graph_main_pass(sides: &mut CycleSides, ms: f64) {
     sides.graph_main_pass_ms = Some(sides.graph_main_pass_ms.unwrap_or(0.0) + ms);
 }
 
+/// Adds the early-post-process window to the cycle's sum for that stage and to
+/// [`GRAPH_POST_PROCESS`], which keeps covering `EarlyPostProcess` and `PostProcess` together the
+/// way it did before the stage got its own column (see [`GRAPH_POST_PROCESS`]).
+fn add_graph_early_post_process(sides: &mut CycleSides, ms: f64) {
+    sides.graph_early_post_process_ms = Some(sides.graph_early_post_process_ms.unwrap_or(0.0) + ms);
+    add_graph_post_process(sides, ms);
+}
+
 fn add_graph_post_process(sides: &mut CycleSides, ms: f64) {
     sides.graph_post_process_ms = Some(sides.graph_post_process_ms.unwrap_or(0.0) + ms);
+}
+
+/// Adds a view lap to the cycle's sum for the run's kind (see [`GRAPH_SHADOW_VIEWS`]).
+fn add_view_kind(sides: &mut CycleSides, is_shadow: bool, ms: f64) {
+    let sum = if is_shadow {
+        &mut sides.graph_shadow_views_ms
+    } else {
+        &mut sides.graph_camera_views_ms
+    };
+    *sum = Some(sum.unwrap_or(0.0) + ms);
 }
 
 /// The main thread's time outside `main_world`, the extract and the wait in one cycle: the raw
@@ -975,6 +1117,16 @@ fn remainder_ms(raw_ms: f64, extract_ms: f64, wait_ms: f64) -> f64 {
 fn graph_remainder_ms(graph_and_present_ms: f64, sides: &CycleSides) -> f64 {
     let parts = sides.graph_views_ms.unwrap_or(0.0) + sides.graph_submit_ms.unwrap_or(0.0);
     (graph_and_present_ms - parts).max(0.0)
+}
+
+/// The part of `render/graph/views` the per-view laps do not own (see [`GRAPH_VIEWS_REMAINDER`]):
+/// the views lap less the two view-kind sums, never negative. The per-view laps are read inside
+/// the `Core3d` runs of the views lap, so like [`graph_remainder_ms`] a small excess is a timer
+/// tick, not a negative remainder.
+fn views_remainder_ms(views_ms: f64, sides: &CycleSides) -> f64 {
+    let parts =
+        sides.graph_shadow_views_ms.unwrap_or(0.0) + sides.graph_camera_views_ms.unwrap_or(0.0);
+    (views_ms - parts).max(0.0)
 }
 
 /// The cycle-record field a render-phase lap writes, by the lap's span name. The swapchain wait
@@ -1416,11 +1568,13 @@ mod tests {
     }
 
     /// The graph laps split `render/graph_and_present` the way R2 asks: the view schedules, the
-    /// graph's queue submit and a remainder that closes the phase. The parts are taken inside the
-    /// outer lap, so they cannot exceed it, and the remainder is what makes the row's graph columns
-    /// add up to `render/graph_and_present`. The per-view stage sums are bounded by the views lap
-    /// that includes every view schedule's own overhead, and the count says how many views they
-    /// cover.
+    /// graph's queue submit and a remainder that closes the phase — and the views lap itself split
+    /// into the camera runs, the shadow-view runs and a remainder. The parts are taken inside the
+    /// outer lap, so they cannot exceed it, and the remainders are what make the row's graph
+    /// columns add up: the view-kind sums and the views remainder to `render/graph/views`, and the
+    /// views lap and the submit lap with their remainder to `render/graph_and_present`. The
+    /// per-view stage sums are bounded by the views lap that includes every view schedule's own
+    /// overhead, and the counts say how many views they cover.
     #[test]
     fn the_graph_laps_account_for_graph_and_present() {
         let timings = RenderTimings::default();
@@ -1430,16 +1584,19 @@ mod tests {
         timings.end_main();
         timings.extracted(Duration::from_millis(1));
         timings.start_render();
-        // The root graph schedule: its `Begin` set, two view schedules, the lap after the `Render`
-        // set, the lap after the `Submit` set, then the phase's own lap (`Set::Render`).
+        // The root graph schedule: its `Begin` set, a camera run and a shadow-view run, the lap
+        // after the `Render` set, the lap after the `Submit` set, then the phase's own lap
+        // (`Set::Render`).
         timings.graph_started();
         std::thread::sleep(Duration::from_millis(1));
-        for _ in 0..2 {
-            timings.view_started();
+        for is_shadow in [false, true] {
+            timings.view_started(is_shadow);
             std::thread::sleep(Duration::from_millis(1));
             timings.view_lapped(add_graph_prepass);
             std::thread::sleep(Duration::from_millis(1));
             timings.view_lapped(add_graph_main_pass);
+            std::thread::sleep(Duration::from_millis(1));
+            timings.view_lapped(add_graph_early_post_process);
             std::thread::sleep(Duration::from_millis(1));
             timings.view_lapped(add_graph_post_process);
         }
@@ -1479,6 +1636,39 @@ mod tests {
             remainder >= 1.0,
             "the sleep between the submit lap and the phase's lap is in the remainder: {remainder}"
         );
+        // The views lap, split by the kind of run and closed by its own remainder.
+        assert_eq!(
+            cycle.graph_shadow_view_count,
+            Some(1),
+            "one of the two runs was a shadow view"
+        );
+        let camera = cycle
+            .graph_camera_views_ms
+            .expect("the camera run was lapped");
+        let shadow = cycle
+            .graph_shadow_views_ms
+            .expect("the shadow run was lapped");
+        let views_remainder = cycle
+            .graph_views_remainder_ms
+            .expect("the views lap writes the remainder");
+        assert!(
+            camera >= 4.0 && shadow >= 4.0,
+            "each kind's sum is its own run's four windows: {camera} camera, {shadow} shadow"
+        );
+        assert!(
+            camera + shadow <= views,
+            "the runs were lapped inside the views lap: {camera} + {shadow} vs {views}"
+        );
+        assert!(
+            (camera + shadow + views_remainder - views).abs() < 1e-9,
+            "the runs and the views remainder are the views lap: {camera} + {shadow} + \
+             {views_remainder} vs {views}"
+        );
+        assert!(
+            views_remainder >= 1.0,
+            "the sleep between the last run and the views lap is in the views remainder: \
+             {views_remainder}"
+        );
         let stages = [
             cycle.graph_prepass_ms.expect("prepass laps ran"),
             cycle.graph_main_pass_ms.expect("main-pass laps ran"),
@@ -1493,6 +1683,19 @@ mod tests {
         assert!(
             stages.iter().sum::<f64>() <= views,
             "the per-view stages are parts of the views lap: {stages:?} vs {views}"
+        );
+        assert!(
+            (stages[0] + stages[1] + stages[2] - (camera + shadow)).abs() < 1e-9,
+            "the stage sums cover the same windows the view-kind sums do"
+        );
+        assert!(
+            cycle.graph_early_post_process_ms.unwrap() >= 2.0
+                && cycle.graph_early_post_process_ms.unwrap()
+                    <= cycle.graph_post_process_ms.unwrap(),
+            "the early stage is a part of the post-process sum, which still covers both stages: \
+             {:?} vs {:?}",
+            cycle.graph_early_post_process_ms,
+            cycle.graph_post_process_ms
         );
         assert!(
             timings.take_samples().contains_key(GRAPH_AND_PRESENT),
@@ -1512,9 +1715,10 @@ mod tests {
         timings.extracted(Duration::from_millis(1));
         timings.start_render();
         timings.graph_started();
-        timings.view_started();
+        timings.view_started(true);
         timings.view_lapped(add_graph_prepass);
         timings.view_lapped(add_graph_main_pass);
+        timings.view_lapped(add_graph_early_post_process);
         timings.view_lapped(add_graph_post_process);
         timings.views_lapped();
         timings.submit_lapped();
@@ -1535,9 +1739,14 @@ mod tests {
             GRAPH_VIEW_COUNT,
             GRAPH_PREPASS,
             GRAPH_MAIN_PASS,
+            GRAPH_EARLY_POST_PROCESS,
             GRAPH_POST_PROCESS,
+            GRAPH_SHADOW_VIEWS,
+            GRAPH_SHADOW_VIEW_COUNT,
+            GRAPH_CAMERA_VIEWS,
             GRAPH_SUBMIT,
             GRAPH_REMAINDER,
+            GRAPH_VIEWS_REMAINDER,
         ] {
             assert!(
                 !samples.contains_key(lap),
@@ -1570,6 +1779,155 @@ mod tests {
             graph_remainder_ms(4.0, &CycleSides::default()),
             4.0,
             "no lap was measured: the whole phase is the remainder"
+        );
+    }
+
+    /// The views remainder is `render/graph/views` less the two view-kind sums, and never negative
+    /// — the per-view laps are read inside the runs the views lap covers, so a small excess is a
+    /// timer tick, not a negative remainder.
+    #[test]
+    fn the_views_remainder_never_goes_negative() {
+        let sides = CycleSides {
+            graph_camera_views_ms: Some(4.0),
+            graph_shadow_views_ms: Some(1.5),
+            ..Default::default()
+        };
+        assert_eq!(views_remainder_ms(6.0, &sides), 0.5);
+        assert_eq!(
+            views_remainder_ms(5.0, &sides),
+            0.0,
+            "the runs can exceed the views lap by less than a timer tick"
+        );
+        assert!(
+            (views_remainder_ms(5.6, &sides) - 0.1).abs() < 1e-9,
+            "the remainder is what the runs leave"
+        );
+        assert_eq!(
+            views_remainder_ms(2.0, &CycleSides::default()),
+            2.0,
+            "no run was measured: the whole views lap is the remainder"
+        );
+    }
+
+    /// A cycle's runs are split by kind: a shadow view's four windows go to the shadow columns and
+    /// a camera's to the camera ones, the count says how many of the cycle's views were shadows,
+    /// and a kind that ran no view keeps its columns empty rather than a zero.
+    #[test]
+    fn the_view_kind_laps_split_the_runs_of_a_cycle() {
+        let timings = RenderTimings::default();
+        timings.set_cycle_tracking(true, false);
+        timings.start_main(0.0);
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.start_render();
+        for is_shadow in [true, false, false] {
+            timings.view_started(is_shadow);
+            std::thread::sleep(Duration::from_millis(1));
+            timings.view_lapped(add_graph_prepass);
+            std::thread::sleep(Duration::from_millis(1));
+            timings.view_lapped(add_graph_main_pass);
+            std::thread::sleep(Duration::from_millis(1));
+            timings.view_lapped(add_graph_early_post_process);
+            std::thread::sleep(Duration::from_millis(1));
+            timings.view_lapped(add_graph_post_process);
+        }
+        timings.views_lapped();
+        timings.end_render();
+        timings.start_main(0.0);
+        let cycle = timings.take_previous_cycle().expect("cycle 1");
+        assert_eq!(cycle.graph_view_count, Some(3), "every run is counted");
+        assert_eq!(
+            cycle.graph_shadow_view_count,
+            Some(1),
+            "one of the three runs was a shadow view"
+        );
+        let camera = cycle.graph_camera_views_ms.expect("two camera runs");
+        let shadow = cycle.graph_shadow_views_ms.expect("one shadow run");
+        assert!(
+            camera >= 4.0 && shadow >= 4.0,
+            "each kind's sum covers every window of its runs' sleeps: {camera} camera, {shadow} \
+             shadow"
+        );
+        // The stage sums are over both kinds together, so they equal the two kind sums added up.
+        let stages = cycle.graph_prepass_ms.unwrap()
+            + cycle.graph_main_pass_ms.unwrap()
+            + cycle.graph_early_post_process_ms.unwrap()
+            + (cycle.graph_post_process_ms.unwrap() - cycle.graph_early_post_process_ms.unwrap());
+        assert!(
+            (stages - (camera + shadow)).abs() < 1e-9,
+            "the per-stage sums cover the same windows the kind sums do: {stages} vs {}",
+            camera + shadow
+        );
+
+        // A cycle of camera runs only: the shadow columns stay empty.
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.start_render();
+        timings.view_started(false);
+        timings.view_lapped(add_graph_prepass);
+        timings.view_lapped(add_graph_main_pass);
+        timings.view_lapped(add_graph_early_post_process);
+        timings.view_lapped(add_graph_post_process);
+        timings.views_lapped();
+        timings.end_render();
+        timings.start_main(0.0);
+        let cycle = timings.take_previous_cycle().expect("cycle 2");
+        assert_eq!(cycle.graph_view_count, Some(1));
+        assert_eq!(
+            cycle.graph_shadow_view_count, None,
+            "no shadow view ran, so the count is not a zero"
+        );
+        assert!(cycle.graph_camera_views_ms.is_some());
+        assert!(
+            cycle.graph_shadow_views_ms.is_none(),
+            "a kind that ran no view keeps its sum empty"
+        );
+    }
+
+    /// The run's kind comes off the entity `camera_driver` filed as `CurrentView`: a view without
+    /// the `ShadowView` marker is a camera run, and a run whose `CurrentView` is missing (nothing
+    /// this app does) is counted as a camera too rather than dropped.
+    ///
+    /// The marker itself cannot be built in a unit test — `ShadowView` carries a wgpu `TextureView`
+    /// (`bevy_render-0.19.0` `src/texture/texture_attachment.rs:88-103`) — so the shadow branch of
+    /// the classification is covered by the tally tests above, which drive the run's kind directly.
+    #[test]
+    fn a_run_without_the_shadow_view_marker_is_counted_as_a_camera() {
+        let timings = RenderTimings::default();
+        timings.set_cycle_tracking(true, false);
+        timings.start_main(0.0);
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.start_render();
+
+        let mut app = App::new();
+        app.insert_resource(timings.clone());
+        app.add_systems(Update, start_view);
+        // No `CurrentView` yet: the run is still counted, as a camera.
+        app.update();
+        let view = app.world_mut().spawn_empty().id();
+        app.world_mut().insert_resource(CurrentView(view));
+        app.update();
+        assert!(
+            timings.state().view_mark.is_some(),
+            "the second run took its own mark"
+        );
+
+        timings.end_render();
+        timings.start_main(0.0);
+        let cycle = timings.take_previous_cycle().expect("cycle 1");
+        assert_eq!(
+            cycle.graph_view_count,
+            Some(2),
+            "both runs are counted, one with no CurrentView at all"
+        );
+        assert_eq!(
+            cycle.graph_shadow_view_count, None,
+            "a view without the marker is not a shadow view"
+        );
+        assert!(
+            cycle.graph_camera_views_ms.is_none(),
+            "no window was lapped"
         );
     }
 
