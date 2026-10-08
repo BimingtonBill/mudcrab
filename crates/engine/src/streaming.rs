@@ -7386,6 +7386,149 @@ mod tests {
         assert_eq!(overflowed.streaming_invariant_failures, 0);
     }
 
+    /// A retiring cell whose subtree is heavy enough that despawning it costs microseconds - far
+    /// more than the time-budget tests' 100 ns - so the drain takes one cell a frame and the frame
+    /// counts in those tests are exact however fast the clock reads.
+    fn spawn_heavy_mock_cell(app: &mut App, grid_x: i32, grid_y: i32, children: usize) -> Entity {
+        let root = app
+            .world_mut()
+            .spawn((
+                CellRef(cell_id_of(grid_x, grid_y)),
+                StreamedCellRoot,
+                ExteriorCellGrid(IVec2::new(grid_x, grid_y)),
+                Transform::default(),
+                Visibility::default(),
+            ))
+            .id();
+        for _ in 0..children {
+            app.world_mut().spawn((Transform::default(), ChildOf(root)));
+        }
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                exterior_cell(grid_x, grid_y),
+                CellStatus::Retiring {
+                    root,
+                    detail: CellDetail::Full,
+                },
+            );
+        root
+    }
+
+    /// A time-budget config at the bound's smallest window: 9 cells, at `unload_radius` 1. The
+    /// budget of 100 ns is spent by any one subtree, so a paced frame takes one heavy cell.
+    fn unload_time_config() -> EngineConfig {
+        EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 1,
+            unload_radius: 1,
+            max_cell_unloads_per_frame: 0,
+            max_unload_ms_per_frame: 0.0001,
+            ..EngineConfig::default()
+        }
+    }
+
+    /// A crossing-shaped backlog - far more retiring cells than the bound's one window - drains
+    /// paced at the time budget: every frame takes one budgeted cell, nothing un-bounds, and the
+    /// crossing-drain frames are counted apart from the overflows, which stay at zero.
+    #[test]
+    fn a_crossing_backlog_drains_over_frames_at_the_time_budget() {
+        let (mut app, _directory) = streaming_test_app(unload_time_config());
+        spawn_camera(&mut app, IVec2::ZERO);
+        // 120 retiring exteriors, more than twice the bound of 9: the shape the old override
+        // unloaded all at once, on the one frame that could least afford it.
+        for grid_x in 10..130 {
+            spawn_heavy_mock_cell(&mut app, grid_x, 0, 200);
+        }
+        let mut frames = 0usize;
+        loop {
+            app.update();
+            let metrics = streaming_metrics(&app);
+            frames += 1;
+            assert_eq!(
+                metrics.despawns_this_frame, 1,
+                "frame {frames} drained {} cells against a 100 ns budget",
+                metrics.despawns_this_frame
+            );
+            assert_eq!(metrics.retire_backlog_overflows, 0, "frame {frames}");
+            assert!(
+                metrics.retiring_cells == 120 - frames,
+                "frame {frames} left {} retiring",
+                metrics.retiring_cells
+            );
+            if metrics.retiring_cells == 0 {
+                break;
+            }
+            assert!(frames < 121, "the backlog never drained");
+        }
+        assert_eq!(frames, 120, "one cell a frame drains the 120 in 120 frames");
+        let metrics = streaming_metrics(&app);
+        assert_eq!(metrics.unloaded_cells, 120);
+        // Every frame whose backlog sat above the bound of 9 counted as a drain frame: the first
+        // 111 of the 120 (the last backlog above it is 10, on frame 111).
+        assert_eq!(metrics.retire_backlog_drains, 111);
+        assert_eq!(metrics.retire_backlog_overflows, 0);
+        assert_eq!(resident_root_count(&mut app), 0);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    /// A backlog that grows across frames - flight retiring cells faster than the budget drains
+    /// them - trips the escape exactly once, and the frame it trips takes the whole backlog at
+    /// once. The burst before it, which shrinks every frame, stays paced.
+    #[test]
+    fn a_backlog_that_grows_across_frames_trips_the_escape_once() {
+        let (mut app, _directory) = streaming_test_app(unload_time_config());
+        spawn_camera(&mut app, IVec2::ZERO);
+        // The burst: 12 retiring cells, above the bound of 9 but never drained before, so there is
+        // no last frame's backlog to have failed against. It drains paced and leaves its remainder
+        // as the next frame's baseline.
+        for grid_x in 10..22 {
+            spawn_heavy_mock_cell(&mut app, grid_x, 0, 200);
+        }
+        app.update();
+        let burst = streaming_metrics(&app);
+        assert_eq!(burst.despawns_this_frame, 1);
+        assert_eq!(burst.retiring_cells, 11);
+        assert_eq!(burst.retire_backlog_overflows, 0);
+        assert_eq!(burst.retire_backlog_drains, 1);
+
+        // The growth: 12 more retire while the drain took one. The backlog is above the bound and
+        // above what the last frame left, so the escape un-bounds and the whole backlog goes now.
+        for grid_x in 22..34 {
+            spawn_heavy_mock_cell(&mut app, grid_x, 0, 200);
+        }
+        app.update();
+        let escaped = streaming_metrics(&app);
+        assert_eq!(
+            escaped.despawns_this_frame, 23,
+            "un-bound: the whole backlog in one frame"
+        );
+        assert_eq!(escaped.retiring_cells, 0);
+        assert_eq!(escaped.retire_backlog_overflows, 1);
+        assert_eq!(
+            escaped.retire_backlog_drains, 1,
+            "the escape frame is not a drain frame"
+        );
+        assert_eq!(resident_root_count(&mut app), 0);
+
+        // After the escape the pacer is paced again: a fresh backlog below the bound drains at the
+        // budget, and no second trip is counted.
+        for grid_x in 40..43 {
+            spawn_heavy_mock_cell(&mut app, grid_x, 0, 200);
+        }
+        app.update();
+        let settled = streaming_metrics(&app);
+        assert_eq!(settled.despawns_this_frame, 1);
+        assert_eq!(settled.retiring_cells, 2);
+        assert_eq!(settled.retire_backlog_overflows, 1);
+        assert_eq!(
+            settled.retire_backlog_drains, 1,
+            "3 cells sit below the bound"
+        );
+        assert_eq!(settled.streaming_invariant_failures, 0);
+    }
+
     /// A space change is not paced: crossing into an interior takes the exterior window and the
     /// space left behind with it in one frame, with nothing left retiring.
     #[test]
