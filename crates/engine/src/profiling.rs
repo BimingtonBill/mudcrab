@@ -4,9 +4,10 @@ use crate::{
     render::RendererMetrics,
     render_timing::{
         self, CLEANUP, CycleSides, EXTRACT, EXTRACT_COMMANDS_AND_ASSETS, GRAPH_AND_PRESENT,
-        GRAPH_MAIN_PASS, GRAPH_POST_PROCESS, GRAPH_PREPASS, GRAPH_REMAINDER, GRAPH_SUBMIT,
-        GRAPH_VIEW_COUNT, GRAPH_VIEWS, MAIN_WORLD, PREPARE, QUEUE, REAL_MS, REMAINDER,
-        RENDER_THREAD, SPECIALIZE_AND_VIEWS, SWAPCHAIN_ACQUIRE, WAIT_FOR_RENDER_THREAD,
+        GRAPH_CAMERA_VIEWS, GRAPH_EARLY_POST_PROCESS, GRAPH_MAIN_PASS, GRAPH_POST_PROCESS,
+        GRAPH_PREPASS, GRAPH_REMAINDER, GRAPH_SHADOW_VIEW_COUNT, GRAPH_SHADOW_VIEWS, GRAPH_SUBMIT,
+        GRAPH_VIEW_COUNT, GRAPH_VIEWS, GRAPH_VIEWS_REMAINDER, MAIN_WORLD, PREPARE, QUEUE, REAL_MS,
+        REMAINDER, RENDER_THREAD, SPECIALIZE_AND_VIEWS, SWAPCHAIN_ACQUIRE, WAIT_FOR_RENDER_THREAD,
         WALL_CYCLE_MS,
     },
     streaming::StreamingMetrics,
@@ -45,8 +46,8 @@ const MAX_TIMELINE_EVENTS: usize = 100_000;
 const MAX_FRAME_SERIES_ROWS: usize = 100_000;
 
 /// How many cycles of the per-cycle series are kept: the same order of size as the per-frame
-/// series, and one row is under 224 bytes, so the series costs at most a few megabytes. Past this
-/// the oldest row is dropped.
+/// series, and one row is under 288 bytes (27 columns of numbers), so the series costs at most a
+/// few megabytes. Past this the oldest row is dropped.
 const MAX_RENDER_CYCLE_ROWS: usize = MAX_FRAME_SERIES_ROWS;
 
 /// The cycle's two clock columns, ahead of the sides: `wall_cycle_ms` is the lap from one `First`
@@ -87,9 +88,14 @@ const RENDER_CYCLE_PHASES: [&str; 7] = [
 /// the remainder that closes the phase (see `render_timing` and
 /// `local/research/portal-heavy-render-thread-2026-10-08.md` §4 R2).
 ///
-/// [`GRAPH_VIEW_COUNT`] is not a duration: the row writes it as a whole number while the columns
-/// around it are milliseconds.
-const RENDER_CYCLE_GRAPH_LAPS: [&str; 7] = [
+/// impl-1088's five columns follow, so the seven above keep the positions and the meaning the
+/// 2026-10-08 window's file gave them: the views lap split into the shadow-view and camera runs it
+/// is made of with the count of the shadow ones, the `EarlyPostProcess` stage split out of
+/// [`GRAPH_POST_PROCESS`] (a subset of that column, not an extra part of the phase), and the
+/// remainder that closes the views lap. [`GRAPH_VIEW_COUNT`] and [`GRAPH_SHADOW_VIEW_COUNT`] are
+/// not durations: the row writes them as whole numbers while the columns around them are
+/// milliseconds.
+const RENDER_CYCLE_GRAPH_LAPS: [&str; 12] = [
     GRAPH_VIEWS,
     GRAPH_VIEW_COUNT,
     GRAPH_PREPASS,
@@ -97,7 +103,36 @@ const RENDER_CYCLE_GRAPH_LAPS: [&str; 7] = [
     GRAPH_POST_PROCESS,
     GRAPH_SUBMIT,
     GRAPH_REMAINDER,
+    GRAPH_SHADOW_VIEWS,
+    GRAPH_SHADOW_VIEW_COUNT,
+    GRAPH_CAMERA_VIEWS,
+    GRAPH_EARLY_POST_PROCESS,
+    GRAPH_VIEWS_REMAINDER,
 ];
+
+/// The value one graph-lap column writes for a cycle's record, or `None` for an empty column (the
+/// cycle did not measure that lap). The counts ([`GRAPH_VIEW_COUNT`], [`GRAPH_SHADOW_VIEW_COUNT`])
+/// are whole numbers; every other column is milliseconds with four decimals, like the rest of the
+/// row. Every name in [`RENDER_CYCLE_GRAPH_LAPS`] is answered here — a test pins that, so a column
+/// added to the list cannot silently write nothing.
+fn graph_lap_value(sides: &CycleSides, column: &str) -> Option<String> {
+    let ms = |value: Option<f64>| value.map(|value| format!("{value:.4}"));
+    match column {
+        GRAPH_VIEWS => ms(sides.graph_views_ms),
+        GRAPH_VIEW_COUNT => sides.graph_view_count.map(|count| count.to_string()),
+        GRAPH_PREPASS => ms(sides.graph_prepass_ms),
+        GRAPH_MAIN_PASS => ms(sides.graph_main_pass_ms),
+        GRAPH_POST_PROCESS => ms(sides.graph_post_process_ms),
+        GRAPH_SUBMIT => ms(sides.graph_submit_ms),
+        GRAPH_REMAINDER => ms(sides.graph_remainder_ms),
+        GRAPH_SHADOW_VIEWS => ms(sides.graph_shadow_views_ms),
+        GRAPH_SHADOW_VIEW_COUNT => sides.graph_shadow_view_count.map(|count| count.to_string()),
+        GRAPH_CAMERA_VIEWS => ms(sides.graph_camera_views_ms),
+        GRAPH_EARLY_POST_PROCESS => ms(sides.graph_early_post_process_ms),
+        GRAPH_VIEWS_REMAINDER => ms(sides.graph_views_remainder_ms),
+        _ => None,
+    }
+}
 
 /// The spans the per-frame series keeps a column for, in the order `frame-series.csv` writes them:
 /// the systems that run in every frame after a door crossing (see the analysis in
@@ -570,14 +605,17 @@ impl ProfilingState {
     /// this window's own extract — so a crossing frame's `render_thread` time is explained by its
     /// own cycle's phases. The graph columns that follow them ([`RENDER_CYCLE_GRAPH_LAPS`]) are the
     /// laps inside `render/graph_and_present`, summed over the render frame: `render/graph/views`
-    /// and `render/graph/submit` are laps of the phase's own window, the three stage columns are
-    /// sums over the views it names in `render/graph/view_count`, and
-    /// `render/graph/remainder` closes the phase (the parts and the remainder add up to
-    /// `render/graph_and_present`; see `render_timing`). A side the cycle did not measure stays an
-    /// empty column, and the run's last cycle or two are absent: their remainder window never
-    /// closed, and with it neither clock column.
+    /// and `render/graph/submit` are laps of the phase's own window, the stage columns are sums
+    /// over the views `render/graph/view_count` names (the post-process one covering the early
+    /// stage too, which has its own column as well), `render/graph/remainder` closes the phase, and
+    /// the views lap is split by the kind of root view `camera_driver` ran —
+    /// `render/graph/shadow_views` and `render/graph/camera_views` with the shadow view count —
+    /// with `render/graph/views_remainder` closing that split. The parts and their remainder add up
+    /// (`render/graph_and_present`, and one level in `render/graph/views`; see `render_timing`). A
+    /// side the cycle did not measure stays an empty column, and the run's last cycle or two are
+    /// absent: their remainder window never closed, and with it neither clock column.
     fn render_cycles_csv(&self) -> String {
-        let mut csv = String::with_capacity(224 + self.render_cycles.len() * 232);
+        let mut csv = String::with_capacity(288 + self.render_cycles.len() * 296);
         csv.push_str("cycle");
         for column in RENDER_CYCLE_CLOCKS
             .iter()
@@ -616,25 +654,14 @@ impl ProfilingState {
                     None => csv.push(','),
                 }
             }
-            // The graph laps, in `RENDER_CYCLE_GRAPH_LAPS` order. `view_count` is the one count:
-            // a whole number, not milliseconds.
-            match sides.graph_views_ms {
-                Some(value) => csv.push_str(&format!(",{value:.4}")),
-                None => csv.push(','),
-            }
-            match sides.graph_view_count {
-                Some(count) => csv.push_str(&format!(",{count}")),
-                None => csv.push(','),
-            }
-            for value in [
-                sides.graph_prepass_ms,
-                sides.graph_main_pass_ms,
-                sides.graph_post_process_ms,
-                sides.graph_submit_ms,
-                sides.graph_remainder_ms,
-            ] {
-                match value {
-                    Some(value) => csv.push_str(&format!(",{value:.4}")),
+            // The graph laps, in `RENDER_CYCLE_GRAPH_LAPS` order: the counts write whole numbers,
+            // every other column milliseconds.
+            for column in RENDER_CYCLE_GRAPH_LAPS {
+                match graph_lap_value(sides, column) {
+                    Some(value) => {
+                        csv.push(',');
+                        csv.push_str(&value);
+                    }
                     None => csv.push(','),
                 }
             }
@@ -2215,8 +2242,9 @@ lights/budget,physics/step"
     }
 
     /// `render-cycles.csv` names every column in the documented order and writes each cycle's row
-    /// under them; a side the cycle did not measure stays an empty column, and the view count is
-    /// the one column written as a whole number rather than milliseconds.
+    /// under them; a side the cycle did not measure stays an empty column, and the counts are
+    /// written as whole numbers rather than milliseconds. The seven graph columns the 2026-10-08
+    /// window was read from keep their positions; impl-1088's five follow them.
     #[test]
     fn the_render_cycles_csv_names_every_column() {
         let mut profiler = ProfilingState::default();
@@ -2236,6 +2264,11 @@ lights/budget,physics/step"
                 graph_view_count: Some(3),
                 graph_prepass_ms: Some(1.5),
                 graph_remainder_ms: Some(1.7),
+                graph_shadow_views_ms: Some(0.6),
+                graph_shadow_view_count: Some(1),
+                graph_camera_views_ms: Some(3.0),
+                graph_early_post_process_ms: Some(0.2),
+                graph_views_remainder_ms: Some(0.4),
                 ..Default::default()
             },
         )]);
@@ -2247,7 +2280,9 @@ lights/budget,physics/step"
             render_thread,render/extract_commands_and_assets,render/specialize_and_views,render/queue,\
             render/prepare,render/graph_and_present,render/cleanup,render/swapchain_acquire,\
             render/graph/views,render/graph/view_count,render/graph/prepass,render/graph/main_pass,\
-            render/graph/post_process,render/graph/submit,render/graph/remainder"
+            render/graph/post_process,render/graph/submit,render/graph/remainder,\
+            render/graph/shadow_views,render/graph/shadow_view_count,render/graph/camera_views,\
+            render/graph/early_post_process,render/graph/views_remainder"
         );
         let row: Vec<&str> = lines.next().unwrap().split(',').collect();
         assert_eq!(
@@ -2290,7 +2325,72 @@ lights/budget,physics/step"
         );
         assert_eq!(row[20], "", "no submit lap was measured in this cycle");
         assert_eq!(row[21], "1.7000", "the remainder closes the row");
+        assert_eq!(
+            row[22], "0.6000",
+            "the shadow-view runs of the views lap, in the position impl-1088 appended"
+        );
+        assert_eq!(
+            row[23], "1",
+            "the shadow view count is a count too: no decimals"
+        );
+        assert_eq!(row[24], "3.0000", "the camera runs of the views lap");
+        assert_eq!(
+            row[25], "0.2000",
+            "the early-post-process stage is its own column"
+        );
+        assert_eq!(
+            row[26], "0.4000",
+            "the views remainder closes the views lap"
+        );
         assert!(lines.next().is_none());
+    }
+
+    /// Every column [`RENDER_CYCLE_GRAPH_LAPS`] names writes a value when the cycle measured it, so
+    /// a column added to the header cannot silently write an empty one: the counts answer with a
+    /// whole number and the durations in milliseconds, which is also the shape the row writer
+    /// relies on.
+    #[test]
+    fn every_graph_lap_column_has_a_value() {
+        let measured = CycleSides {
+            graph_views_ms: Some(1.0),
+            graph_view_count: Some(2),
+            graph_prepass_ms: Some(3.0),
+            graph_main_pass_ms: Some(4.0),
+            graph_post_process_ms: Some(5.0),
+            graph_submit_ms: Some(6.0),
+            graph_remainder_ms: Some(7.0),
+            graph_shadow_views_ms: Some(8.0),
+            graph_shadow_view_count: Some(1),
+            graph_camera_views_ms: Some(9.0),
+            graph_early_post_process_ms: Some(10.0),
+            graph_views_remainder_ms: Some(11.0),
+            ..Default::default()
+        };
+        for column in RENDER_CYCLE_GRAPH_LAPS {
+            assert!(
+                graph_lap_value(&measured, column).is_some(),
+                "the graph column {column} has no value formatter"
+            );
+            assert!(
+                graph_lap_value(&CycleSides::default(), column).is_none(),
+                "the graph column {column} writes an empty column when unmeasured"
+            );
+        }
+        assert_eq!(
+            graph_lap_value(&measured, GRAPH_VIEW_COUNT).as_deref(),
+            Some("2"),
+            "a count column writes a whole number"
+        );
+        assert_eq!(
+            graph_lap_value(&measured, GRAPH_SHADOW_VIEW_COUNT).as_deref(),
+            Some("1"),
+            "a count column writes a whole number"
+        );
+        assert_eq!(
+            graph_lap_value(&measured, GRAPH_VIEWS).as_deref(),
+            Some("1.0000"),
+            "a duration column writes milliseconds with four decimals"
+        );
     }
 
     /// The per-cycle series is bounded: past the cap the oldest rows go, so a long run cannot
