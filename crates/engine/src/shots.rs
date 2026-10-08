@@ -38,6 +38,7 @@ use crate::{
     doors::{DoorAnchor, DoorState, LoadDoor},
     portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, PortalTexture},
     streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld},
+    swap_bridge::{SwapWaiting, pending_drawn},
     transition::{
         OpenDoor, SpaceTarget, destination_is_resident, distance_in_front_of_door, door_is_open,
         heading_to_rotation, source_doorway_centre, source_doorway_frame, switch_space,
@@ -46,7 +47,7 @@ use crate::{
 };
 use bevy::{
     animation::graph::AnimationGraphHandle,
-    camera::RenderTarget,
+    camera::{RenderTarget, visibility::ViewVisibility},
     ecs::system::SystemParam,
     prelude::*,
     render::view::screenshot::{Screenshot, save_to_disk},
@@ -389,30 +390,63 @@ pub struct SettleCounts {
     pub pending_asset_instances: usize,
     /// Terrain and water surfaces whose textures have not finished loading.
     pub pending_surface_instances: usize,
+    /// Surfaces a view can see that the render world has not confirmed drawable: spawned and covered
+    /// by a stand-in, but not confirmed drawn (`crate::swap_bridge::SwapWaiting`). A view is not
+    /// settled while it has one, because the surface may be photographed as a hole (design-1091 §4).
+    /// A waiting surface no view can see is not counted: it is not a hole and holds nothing up.
+    pub pending_drawn: usize,
+    /// LOD queries submitted to the world database but not answered.
+    pub pending_lod_queries: usize,
+    /// LOD chunks requested but not yet spawned.
+    pub pending_lod_chunks: usize,
+    /// LOD chunks whose load failed and was never recovered: a terminal failure, counted so a
+    /// settled view's log shows it, not a pending count that holds the settle (a chunk that will
+    /// never arrive is settled the way a failed cell is, see `space_failed`).
+    pub failed_lod_chunks: u64,
+    /// LOD queries whose load failed and was never recovered.
+    pub unrecovered_lod_queries: usize,
+    /// LOD chunks whose load failed and was never recovered.
+    pub unrecovered_lod_chunks: usize,
     /// Frames the counts have been quiet for, before this frame.
     pub quiet_frames: u32,
 }
 
 impl SettleCounts {
-    /// Nothing is pending: every load the current view asked for has landed.
+    /// Nothing is pending: every load the current view asked for has landed, and every surface a
+    /// view can see is confirmed drawn. The LOD pending counts are part of this: a chunk still on
+    /// its way is work that will change the frame, so a view with one is not settled (design-1091
+    /// §4). The failure counts are not: a chunk that failed for good is as settled as a cell that
+    /// failed for good, and both are reported through `describe`.
     pub fn is_quiet(&self) -> bool {
         (self.space_resident || self.space_failed)
             && self.loading_cells == 0
             && self.active_requests == 0
             && self.pending_asset_instances == 0
             && self.pending_surface_instances == 0
+            && self.pending_drawn == 0
+            && self.pending_lod_queries == 0
+            && self.pending_lod_chunks == 0
     }
 
     /// The pending work, for the log line of a shot that never settled.
     pub fn describe(&self) -> String {
         format!(
-            "cell_resident={} cell_failed={} loading_cells={} active_requests={} pending_assets={} pending_surfaces={}",
+            "cell_resident={} cell_failed={} loading_cells={} active_requests={} \
+             pending_assets={} pending_surfaces={} pending_drawn={} pending_lod_queries={} \
+             pending_lod_chunks={} failed_lod_chunks={} unrecovered_lod_queries={} \
+             unrecovered_lod_chunks={}",
             self.space_resident,
             self.space_failed,
             self.loading_cells,
             self.active_requests,
             self.pending_asset_instances,
-            self.pending_surface_instances
+            self.pending_surface_instances,
+            self.pending_drawn,
+            self.pending_lod_queries,
+            self.pending_lod_chunks,
+            self.failed_lod_chunks,
+            self.unrecovered_lod_queries,
+            self.unrecovered_lod_chunks
         )
     }
 }
@@ -421,6 +455,37 @@ impl SettleCounts {
 /// after that, so the first drawn frames, lights and shadows have caught up.
 pub fn shots_settled(counts: &SettleCounts) -> bool {
     counts.is_quiet() && counts.quiet_frames >= SETTLE_QUIET_FRAMES
+}
+
+/// What the settle phase does with one frame's counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettleStep {
+    /// Still coming: look again next frame.
+    Waiting,
+    /// The view is settled: photograph it.
+    Ready,
+    /// The view has waited out [`SETTLE_TIMEOUT_SECONDS`] and is still not settled. The shot fails
+    /// with this reason - no screenshot is taken, so the run cannot sign off a blank or a hole -
+    /// and the run exits non-zero (design-1091 §4).
+    TimedOut(String),
+}
+
+/// The settle phase's rule (design-1091 §4): settled the moment the view is quiet for
+/// [`SETTLE_QUIET_FRAMES`], failed once [`SETTLE_TIMEOUT_SECONDS`] have passed without it, and
+/// waiting in between. A timeout is a hard failure, never a silent screenshot: the reason carries
+/// the counts so the log says what was still pending.
+pub fn settle_step(shot: &Shot, counts: &SettleCounts, settled: bool, waited: f32) -> SettleStep {
+    if settled {
+        SettleStep::Ready
+    } else if waited >= SETTLE_TIMEOUT_SECONDS {
+        SettleStep::TimedOut(format!(
+            "shot \"{}\": view did not settle within {SETTLE_TIMEOUT_SECONDS:.0} s ({})",
+            shot.name,
+            counts.describe()
+        ))
+    } else {
+        SettleStep::Waiting
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -789,7 +854,6 @@ pub struct ShotsRun {
     settle_seconds: f32,
     quiet_frames: u32,
     resident_meshes: usize,
-    timed_out: bool,
     /// The door sequence of the shot being rendered: the door it names, and how far the sequence
     /// has got with it. `None` for a shot that names no door - the run a file without `open_door`
     /// takes, in which no door is ever asked, watched or closed.
@@ -829,7 +893,6 @@ impl ShotsRun {
             settle_seconds: 0.0,
             quiet_frames: 0,
             resident_meshes: 0,
-            timed_out: false,
             door: None,
             log: String::new(),
             written: false,
@@ -924,6 +987,9 @@ fn run_shots(
     metrics: Option<Res<StreamingMetrics>>,
     meshes: Query<(), With<Mesh3d>>,
     windows: Query<&Window, With<PrimaryWindow>>,
+    // The surfaces the render world has not confirmed drawn while a view can see them: the settle
+    // waits for these ([`crate::swap_bridge::pending_drawn`]).
+    waiting: Query<&ViewVisibility, With<SwapWaiting>>,
     mut exit: MessageWriter<AppExit>,
     mut world: DoorWorld,
 ) {
@@ -971,7 +1037,6 @@ fn run_shots(
             // names none has `None` here and never leaves the settle path.
             run.door = shot.open_door.map(|ref_id| DoorRun::new(ref_id.0));
             run.quiet_frames = 0;
-            run.timed_out = false;
             run.settle_seconds = 0.0;
             run.enter(phase_after_move(&shot));
         }
@@ -1013,6 +1078,7 @@ fn run_shots(
             let counts = settle_counts(
                 shot.space_key(),
                 run.quiet_frames,
+                pending_drawn(&waiting),
                 streaming.as_deref(),
                 metrics.as_deref(),
             );
@@ -1101,6 +1167,7 @@ fn run_shots(
             let counts = settle_counts(
                 shot.space_key(),
                 run.quiet_frames,
+                pending_drawn(&waiting),
                 streaming.as_deref(),
                 metrics.as_deref(),
             );
@@ -1110,55 +1177,66 @@ fn run_shots(
             } else {
                 0
             };
-            if (settled || run.timer >= SETTLE_TIMEOUT_SECONDS) && config.is_benchmark_run() {
+            match settle_step(&shot, &counts, settled, run.timer) {
+                SettleStep::Waiting => {}
                 // A `--shots` run that is also a benchmark (`--benchmark-duration`, the phase 2
                 // baseline's portal scenes) holds this shot's view instead of photographing it: the
                 // benchmark times the settled view, and its own end exits the run. Nothing is
-                // written, and the pose is re-asserted above every frame. Without a benchmark
-                // flag the shot is photographed as it always was.
-                if !run.holding {
-                    run.holding = true;
-                    run.note(format!(
-                        "shot \"{}\" holding its view for the benchmark{}",
-                        shot.name,
-                        if settled {
-                            ""
-                        } else {
-                            " (the view had not settled)"
-                        }
-                    ));
+                // written, and the pose is re-asserted above every frame. A benchmark holds a
+                // timed-out view too - it times what the run produced, and its own run-level
+                // invariant fails the run if the view was a hole; ending the sweep on the first
+                // shot whose pose was slow to settle would stop the timing it exists for.
+                SettleStep::Ready | SettleStep::TimedOut(_) if config.is_benchmark_run() => {
+                    if !run.holding {
+                        run.holding = true;
+                        run.note(format!(
+                            "shot \"{}\" holding its view for the benchmark{}",
+                            shot.name,
+                            if settled {
+                                ""
+                            } else {
+                                " (the view had not settled)"
+                            }
+                        ));
+                    }
                 }
-            } else if settled || run.timer >= SETTLE_TIMEOUT_SECONDS {
-                run.timed_out = !settled;
-                run.settle_seconds = run.timer;
-                run.resident_meshes = meshes.iter().count();
-                if !settled {
-                    run.note(format!(
-                        "shot \"{}\" did not settle within {SETTLE_TIMEOUT_SECONDS:.0} s ({}); \
-                         shooting anyway",
-                        shot.name,
-                        counts.describe()
-                    ));
+                SettleStep::Ready => {
+                    run.settle_seconds = run.timer;
+                    run.resident_meshes = meshes.iter().count();
+                    let path = run.shot_path(&shot);
+                    let logged_path = run.relative_to_output(&path).display().to_string();
+                    run.note(format!("screenshot {logged_path}"));
+                    // A PNG left by an earlier run must not pass for this shot's: with it out of
+                    // the way, the file appearing is proof that this screenshot reached the disk,
+                    // which is what the capture wait (and the exit after the last shot) relies on.
+                    if let Err(error) = std::fs::remove_file(&path)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        warn!(
+                            target: "shots",
+                            "could not remove the previous {logged_path}: {error}; the shot may \
+                             wait for that file instead of this screenshot"
+                        );
+                    }
+                    commands
+                        .spawn(Screenshot::primary_window())
+                        .observe(save_to_disk(path));
+                    run.enter(Phase::Capture);
                 }
-                let path = run.shot_path(&shot);
-                let logged_path = run.relative_to_output(&path).display().to_string();
-                run.note(format!("screenshot {logged_path}"));
-                // A PNG left by an earlier run must not pass for this shot's: with it out of the
-                // way, the file appearing is proof that this screenshot reached the disk, which is
-                // what the capture wait (and the exit after the last shot) relies on.
-                if let Err(error) = std::fs::remove_file(&path)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!(
-                        target: "shots",
-                        "could not remove the previous {logged_path}: {error}; the shot may wait \
-                         for that file instead of this screenshot"
-                    );
+                SettleStep::TimedOut(reason) => {
+                    // A view that has not settled in the window is a hard failure, never a silent
+                    // screenshot: the reason carries the counts, no PNG is written for this shot
+                    // (so a blank or holed frame cannot pass for it), and the run exits non-zero
+                    // ([`ShotsRun::fail`], the run's `AppExit::error`). The shots after it are
+                    // still rendered - one bad pose should not cost the rest of a sweep - and the
+                    // door this shot opened is put back first, exactly as after a shot that worked.
+                    run.fail(reason);
+                    if run.door.is_some() {
+                        run.enter(Phase::CloseDoor);
+                    } else {
+                        run.next_shot();
+                    }
                 }
-                commands
-                    .spawn(Screenshot::primary_window())
-                    .observe(save_to_disk(path));
-                run.enter(Phase::Capture);
             }
         }
         Phase::Capture => {
@@ -1173,12 +1251,9 @@ fn run_shots(
             // moment the file exists: waiting for it is waiting for the shot, not for the request.
             let written = path.is_file();
             if written {
-                let line = log_line(
-                    &shot.name,
-                    run.settle_seconds,
-                    run.timed_out,
-                    run.resident_meshes,
-                );
+                // A shot only reaches the capture after a settle that did not time out (a timeout
+                // fails it), so `timed_out` is always `no` for a line that carries a screenshot.
+                let line = log_line(&shot.name, run.settle_seconds, false, run.resident_meshes);
                 run.note(line);
                 if run.door.is_some() {
                     // Put the door this shot opened back before the next shot: see
@@ -1189,12 +1264,7 @@ fn run_shots(
                     run.next_shot();
                 }
             } else if run.timer >= CAPTURE_TIMEOUT_SECONDS {
-                let line = log_line(
-                    &shot.name,
-                    run.settle_seconds,
-                    run.timed_out,
-                    run.resident_meshes,
-                );
+                let line = log_line(&shot.name, run.settle_seconds, false, run.resident_meshes);
                 let logged_path = run.relative_to_output(&path).display().to_string();
                 run.note(format!(
                     "{line} FAILED: no screenshot at {logged_path} after \
@@ -1338,11 +1408,15 @@ fn place_camera(
 /// What the streaming code says is still pending for a view of the cell `key`.
 ///
 /// The rule is shared: the shot runner reads it to decide when to photograph a pose, the door
-/// sequence to decide when a view is ready to be asked to open its door, and the demo tour's own
-/// settle to decide when a place has streamed in (`crate::demo_tour`).
+/// sequence to decide when a view is ready to be asked to open its door, the demo tour's own settle
+/// to decide when a place has streamed in (`crate::demo_tour`) and the portal bench to decide when a
+/// door state is quiet enough to time. `pending_drawn` is the one count the streaming state cannot
+/// answer - it is a render-world fact the main world reads ([`crate::swap_bridge::pending_drawn`]),
+/// so every caller passes it in.
 pub(crate) fn settle_counts(
     key: Option<CellKey>,
     quiet_frames: u32,
+    pending_drawn: usize,
     streaming: Option<&StreamingWorld>,
     metrics: Option<&StreamingMetrics>,
 ) -> SettleCounts {
@@ -1354,6 +1428,12 @@ pub(crate) fn settle_counts(
         active_requests: metrics.map_or(0, |metrics| metrics.active_requests),
         pending_asset_instances: metrics.map_or(0, |metrics| metrics.pending_asset_instances),
         pending_surface_instances: metrics.map_or(0, |metrics| metrics.pending_surface_instances),
+        pending_drawn,
+        pending_lod_queries: metrics.map_or(0, |metrics| metrics.pending_lod_queries),
+        pending_lod_chunks: metrics.map_or(0, |metrics| metrics.pending_lod_chunks),
+        failed_lod_chunks: metrics.map_or(0, |metrics| metrics.failed_lod_chunks),
+        unrecovered_lod_queries: metrics.map_or(0, |metrics| metrics.unrecovered_lod_queries),
+        unrecovered_lod_chunks: metrics.map_or(0, |metrics| metrics.unrecovered_lod_chunks),
         quiet_frames,
     }
 }
@@ -1783,12 +1863,131 @@ mod tests {
             pending_surface_instances: 1,
             ..quiet_counts()
         }));
+        // A surface a view can see that the render world has not confirmed drawn holds the view: it
+        // may be photographed as a stand-in or a hole (design-1091 §4).
+        assert!(!shots_settled(&SettleCounts {
+            pending_drawn: 1,
+            ..quiet_counts()
+        }));
+        // LOD work in flight does too: a chunk on its way changes the frame.
+        assert!(!shots_settled(&SettleCounts {
+            pending_lod_queries: 1,
+            ..quiet_counts()
+        }));
+        assert!(!shots_settled(&SettleCounts {
+            pending_lod_chunks: 1,
+            ..quiet_counts()
+        }));
+        // A terminal LOD failure is settled, like a failed cell: nothing more is coming, and the
+        // counts that report it (`describe`) do not hold a view that otherwise has everything.
+        assert!(shots_settled(&SettleCounts {
+            failed_lod_chunks: 1,
+            unrecovered_lod_queries: 1,
+            unrecovered_lod_chunks: 1,
+            ..quiet_counts()
+        }));
 
         assert!(
             !SettleCounts::default().is_quiet(),
             "nothing is resident yet"
         );
         assert!(quiet_counts().is_quiet());
+    }
+
+    /// What `pending_drawn` counts: a waiting surface a view can see, and not one it cannot. Built
+    /// from a real query so the visibility rule is the engine's (`ViewVisibility::get`), not a
+    /// re-statement of it.
+    #[test]
+    fn settle_counts_counts_a_visible_waiting_surface_and_ignores_an_off_view_one() {
+        let mut world = World::new();
+        world.spawn((SwapWaiting, ViewVisibility::VISIBLE));
+        world.spawn((SwapWaiting, ViewVisibility::VISIBLE));
+        world.spawn((SwapWaiting, ViewVisibility::HIDDEN));
+        // A visible entity that is not waiting is not a surface at all.
+        world.spawn(ViewVisibility::VISIBLE);
+        let mut state = SystemState::<Query<&ViewVisibility, With<SwapWaiting>>>::new(&mut world);
+        let counts = {
+            let query = state
+                .get(&world)
+                .expect("the state was built from this world");
+            settle_counts(None, SETTLE_QUIET_FRAMES, pending_drawn(&query), None, None)
+        };
+        assert_eq!(
+            counts.pending_drawn, 2,
+            "the two surfaces a view can see, not the hidden one or the entity that is not waiting"
+        );
+        // Those two alone hold the settle: everything else is quiet.
+        assert!(!shots_settled(&SettleCounts {
+            pending_drawn: counts.pending_drawn,
+            ..quiet_counts()
+        }));
+    }
+
+    /// A settle that reaches the window without settling is a hard failure: the reason carries the
+    /// counts, no screenshot is asked for (the settle never reports [`SettleStep::Ready`]), and the
+    /// run exits non-zero. Shaped like the door timeout
+    /// ([`a_door_that_never_opens_fails_that_shot_and_not_the_rest_of_the_file`]).
+    #[test]
+    fn a_settle_timeout_fails_the_shot() {
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).expect("the design example parses");
+        let shot = &file.shots[0];
+        // Every count quiet except a surface the render world never confirms drawn.
+        let never = SettleCounts {
+            space_resident: true,
+            pending_drawn: 1,
+            quiet_frames: SETTLE_QUIET_FRAMES,
+            ..default()
+        };
+        assert!(
+            !shots_settled(&never),
+            "a view with an undrawn visible surface is not settled"
+        );
+
+        // Before the window: the shot waits.
+        assert_eq!(
+            settle_step(shot, &never, false, SETTLE_TIMEOUT_SECONDS - 0.1),
+            SettleStep::Waiting
+        );
+        // A settled view is photographed even once the window has passed.
+        assert_eq!(
+            settle_step(shot, &never, true, SETTLE_TIMEOUT_SECONDS),
+            SettleStep::Ready
+        );
+        // At the window: the shot fails, with the counts in the reason.
+        let step = settle_step(shot, &never, false, SETTLE_TIMEOUT_SECONDS);
+        let SettleStep::TimedOut(reason) = step else {
+            panic!("a view that never settles must time out, not settle: {step:?}");
+        };
+        assert!(reason.contains("did not settle"), "{reason}");
+        assert!(reason.contains("pending_drawn=1"), "{reason}");
+
+        // The run records the failure and moves on; the settle armed no capture, so no PNG is
+        // written for it.
+        let mut run = ShotsRun::new(file, PathBuf::from("out"));
+        run.fail(reason);
+        assert!(run.failed);
+        assert!(run.log.contains("FAILED"), "{}", run.log);
+    }
+
+    /// The blank-PNG path Portal Dev found (2026-10-08): a shot whose own cell never became resident
+    /// used to reach the window, be "shot anyway" and write a blank PNG with the run passing. It
+    /// fails now, and no screenshot is asked for.
+    #[test]
+    fn a_shot_whose_cell_never_arrived_fails_instead_of_writing_a_blank_png() {
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).expect("the design example parses");
+        let shot = &file.shots[0];
+        let never_arrived = SettleCounts {
+            space_resident: false,
+            loading_cells: 1,
+            quiet_frames: 0,
+            ..default()
+        };
+        let step = settle_step(shot, &never_arrived, false, SETTLE_TIMEOUT_SECONDS);
+        let SettleStep::TimedOut(reason) = step else {
+            panic!("a shot whose cell never arrived must fail, not be photographed: {step:?}");
+        };
+        assert!(reason.contains("cell_resident=false"), "{reason}");
+        assert!(reason.contains("loading_cells=1"), "{reason}");
     }
 
     /// The facts of a door shot whose doorway is up: every condition the sequence waits for. The

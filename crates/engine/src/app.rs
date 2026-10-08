@@ -2541,6 +2541,7 @@ fn fly_camera(
     profiler.record_elapsed("world/fly_camera", started);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_acceptance_screenshot(
     mut commands: Commands,
     config: Res<EngineConfig>,
@@ -2549,6 +2550,9 @@ fn capture_acceptance_screenshot(
     world_database: Option<Res<WorldDatabase>>,
     renderer: Res<RendererMetrics>,
     windows: Query<(), With<Window>>,
+    // Surfaces a view can see that the render world has not confirmed drawn: an acceptance
+    // screenshot must not be taken while one is outstanding (design-1091 §4).
+    waiting: Query<&ViewVisibility, With<crate::swap_bridge::SwapWaiting>>,
 ) {
     let Some(path) = &config.acceptance_screenshot else {
         return;
@@ -2566,9 +2570,10 @@ fn capture_acceptance_screenshot(
     {
         return;
     }
-    let assets_ready = streaming
-        .as_deref()
-        .is_none_or(|metrics| screenshot_assets_ready(metrics, world_database.is_some(), &config));
+    let pending_drawn = crate::swap_bridge::pending_drawn(&waiting);
+    let assets_ready = streaming.as_deref().is_none_or(|metrics| {
+        screenshot_assets_ready(metrics, pending_drawn, world_database.is_some(), &config)
+    });
     let renderer_ready = renderer.final_path_active()
         && (!config.renderer_fixture || renderer.renderer_fixture_validated);
     if !assets_ready || !renderer_ready {
@@ -2588,12 +2593,14 @@ fn capture_acceptance_screenshot(
 
 fn screenshot_assets_ready(
     metrics: &StreamingMetrics,
+    pending_drawn: usize,
     world_streaming_active: bool,
     config: &EngineConfig,
 ) -> bool {
     metrics.pending_asset_instances == 0
         && metrics.pending_surface_instances == 0
         && metrics.loading_cells == 0
+        && pending_drawn == 0
         && metrics.pending_lod_queries == 0
         && metrics.pending_lod_chunks == 0
         && metrics.failed_cells == 0
@@ -3210,29 +3217,33 @@ mod tests {
         let metrics = StreamingMetrics::default();
         let config = EngineConfig::default();
 
-        assert!(screenshot_assets_ready(&metrics, false, &config));
-        assert!(!screenshot_assets_ready(&metrics, true, &config));
+        assert!(screenshot_assets_ready(&metrics, 0, false, &config));
+        assert!(!screenshot_assets_ready(&metrics, 0, true, &config));
 
         let mut settled_metrics = metrics;
         settled_metrics.resident_cells = 1;
-        assert!(screenshot_assets_ready(&settled_metrics, true, &config));
+        assert!(screenshot_assets_ready(&settled_metrics, 0, true, &config));
+
+        // A surface waiting on the render world holds the screenshot back until it is confirmed
+        // drawn: the acceptance screenshot must not photograph a stand-in or a hole (design-1091 §4).
+        assert!(!screenshot_assets_ready(&settled_metrics, 1, true, &config));
 
         let mut failed_metrics = settled_metrics.clone();
         failed_metrics.failed_cells = 1;
-        assert!(!screenshot_assets_ready(&failed_metrics, true, &config));
+        assert!(!screenshot_assets_ready(&failed_metrics, 0, true, &config));
 
         let mut pending_lod = settled_metrics.clone();
         pending_lod.pending_lod_queries = 1;
-        assert!(!screenshot_assets_ready(&pending_lod, true, &config));
+        assert!(!screenshot_assets_ready(&pending_lod, 0, true, &config));
 
         let mut failed_lod = settled_metrics;
         failed_lod.failed_lod_chunks = 1;
-        assert!(screenshot_assets_ready(&failed_lod, true, &config));
+        assert!(screenshot_assets_ready(&failed_lod, 0, true, &config));
         failed_lod.unrecovered_lod_chunks = 1;
-        assert!(!screenshot_assets_ready(&failed_lod, true, &config));
+        assert!(!screenshot_assets_ready(&failed_lod, 0, true, &config));
         failed_lod.unrecovered_lod_chunks = 0;
         failed_lod.unrecovered_lod_queries = 1;
-        assert!(!screenshot_assets_ready(&failed_lod, true, &config));
+        assert!(!screenshot_assets_ready(&failed_lod, 0, true, &config));
     }
 
     #[test]
