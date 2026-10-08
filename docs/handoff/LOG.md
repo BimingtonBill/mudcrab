@@ -3,6 +3,39 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Portal Dev (fixes merged, R2 laps read: views not submit/present)
+
+Track: Portal. Nothing pushed.
+- Merged into portal: impl-196 (ring follows worldspace + known LOD far plane restored on re-entry,
+  f973e309), impl-1072 (render-cycles row n joins frame-series row n-1), impl-1073 (prewarm waits on the
+  landing cell) = 2c7a0ea0; batch review-1076 GLM accept all, Muse fix-first on 196 answered. Combined
+  check: clippy clean, nextest -p engine 1158 passed. impl-1075 (graph_and_present laps) merged 48374f26
+  after my fix of 3 compile errors; nextest 1161 passed.
+- Window ~20:10 (hold portal-1075-window, drained, cleared), portal-heavy x3:
+- R2 measured (impl-1075, merged 48374f26). Window 2026-10-08 ~20:10, portal-heavy x3 x60 s, release
+  from portal 2c7a0ea0 + impl-1075; medians over the last 3/4 of each run's cycles (run1/run2/run3):
+  1. graph_and_present 9.95/9.00/9.37 ms; render_thread 17.5/15.5/16.3; prepare 6.3/5.6/6.0;
+     swapchain_acquire 0.05.
+  2. Not submit/present blocking: render/graph/submit (queue.submit) 1.6/2.4/2.5 ms; render/graph/remainder
+     (present + the screenshot/readback submit + the rest) 0.35 ms.
+  3. The view graphs: render/graph/views 7.9/6.2/6.5 ms for view_count 3 (main, reflection, portal), ~2.1-2.6
+     ms per view; the Core3d set laps inside them sum to only ~1.4 ms (prepass 0.4, main_pass 0.8,
+     post_process 0.13).
+  4. So ~5 ms per frame inside render/graph/views is still unattributed: the shadow-light views (they run
+     Core3d too and are not in view_count), EarlyPostProcess, or per-schedule overhead. Follow-up lap
+     impl-1088 (brief 08a5a0e8) splits shadow views from camera views.
+  5. Consequence for the fix: "fewer or cheaper views" (per-view shadow cost; the reflection's own sun
+     shadows are what #187 / phase2/view-policy removes, queue B3), not a submit/present change.
+  Data: local/impl/impl-1075-portal-graph-present-laps/target/profiling/20261008-201005-*/portal-heavy/
+  run-{1,2,3}/render-cycles.csv.
+- Running: impl-1088 (shadow-view laps); impl-1085 (room culling on by default where the DB has rooms,
+  coder timed out, partial edits under acceptance); B3 merge of phase2/view-policy into portal in
+  worktree local/impl/portal-merge-view-policy (Opus helper, 33 conflict hunks). B3, B5 and 1088 read in
+  the next short window.
+- Disk: with the user's yes deleted ~42 GB of merged coders' target/ (190/196/1072/1073); impl-190's
+  worktree stays (only harness logs left in it; no --force).
+- Next: review 1085, 1088 and the B3 merge; image check of room culling on portal-rooms data; the window.
+
 ## 2026-10-08 Phase 4 Dev (new session: track set up, first analysis)
 
 Track: phase 4. The user started a Phase 4 Dev session and chose "set up track, then wait".
