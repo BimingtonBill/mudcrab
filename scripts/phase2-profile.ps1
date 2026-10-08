@@ -27,6 +27,9 @@ param(
     [switch]$UpdateBaseline,
     [switch]$Quick,
     [switch]$SkipBuild,
+    # Engine switches appended to every scene's arguments, for an A/B of one switch
+    # (e.g. -ExtraEngineArgs "--water-reflection-preset","water"); pair it with a distinct run label.
+    [string[]]$ExtraEngineArgs = @(),
     # Import the functions below and stop, instead of running a campaign: phase2-baseline.ps1
     # dot-sources this file with -AsLibrary so both scripts invoke the engine the same way.
     [switch]$AsLibrary
@@ -291,6 +294,8 @@ function Get-ScenarioArguments {
             $arguments += @("--auto-fly-speed", "900")
         }
     }
+    # A variant run (an A/B of one engine switch) appends its switches to every scene.
+    if ($script:ExtraEngineArgs) { $arguments += $script:ExtraEngineArgs }
     return $arguments
 }
 
