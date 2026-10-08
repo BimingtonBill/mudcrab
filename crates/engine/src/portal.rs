@@ -3978,9 +3978,10 @@ enum PrewarmPhase {
     /// running.
     #[default]
     Idle,
-    /// The destination behind the window's door is still streaming in. There is nothing to
-    /// specialize yet, and the prestream wait - the tour's `Phase::Prestream`, which holds while
-    /// [`PortalPrewarm::settled`] is false - lasts until the loads land, so their finalization
+    /// The cell a crossing lands in - the door's destination, or an exterior destination's
+    /// landing cell - is still streaming in. There is nothing to specialize yet, and the
+    /// prestream wait - the tour's `Phase::Prestream`, which holds while
+    /// [`PortalPrewarm::settled`] is false - lasts until that load lands, so its finalization
     /// lands behind the wait instead of on the crossing frame (Stage A §2: the PreUpdate flush is
     /// per-frame and view-independent; the only hold is the load itself).
     WaitingLoad,
@@ -3992,7 +3993,7 @@ enum PrewarmPhase {
 /// What a windowed door's destination still needs from the pre-warm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrewarmNeed {
-    /// Its cells are still streaming in.
+    /// The cell a crossing lands in is still streaming in.
     Load,
     /// Its landing cell is resident: there is something to draw.
     Warm,
@@ -4043,7 +4044,7 @@ impl PortalPrewarm {
     pub(crate) fn describe(&self) -> &'static str {
         match self.phase {
             PrewarmPhase::Idle => "nothing outstanding",
-            PrewarmPhase::WaitingLoad => "the destination is still streaming in",
+            PrewarmPhase::WaitingLoad => "the landing cell is still streaming in",
             PrewarmPhase::Warming => "the destination's warm view is running",
         }
     }
@@ -4075,9 +4076,10 @@ fn take_back_warm_keys(state: &mut PortalState) {
 
 /// Pre-warms the destination behind the prestream window: picks the nearest door of the active
 /// space whose destination the window is streaming and that still has something to warm, holds
-/// while that destination loads ([`PrewarmPhase::WaitingLoad`]), then activates the portal camera
-/// for the destination's own view ([`PrewarmPhase::Warming`]) until the pipeline cache settles
-/// ([`PREWARM_SETTLE_FRAMES`]) - and goes off again the frame it has.
+/// while the cell a crossing lands in loads ([`PrewarmPhase::WaitingLoad`]), then activates the
+/// portal camera for the destination's own view ([`PrewarmPhase::Warming`]) until the pipeline
+/// cache settles ([`PREWARM_SETTLE_FRAMES`]) - and goes off again the frame it has. The rest of an
+/// exterior's grid lands while that view runs, re-opening the readiness count as it commits.
 ///
 /// The camera is placed exactly where [`update_portal`] places it for a door it draws through
 /// (`door_map`'s pose, projected through the destination doorway's clip plane), so the variants
@@ -4196,11 +4198,24 @@ fn prewarm_destination_view(
         if wanted.is_empty() {
             continue;
         }
-        let need = if !destination_is_loaded(&door.destination, anchor, streaming) {
+        // The wait is for the cell a crossing **lands in** and nothing else
+        // ([`destination_is_resident`]): that cell is what the crossing's first frame draws, and
+        // the rest of an exterior's grid - the window's other keys - streams in while the warm
+        // view runs, re-opening the readiness count below as each one commits. Waiting on every
+        // key instead held the view, and with it the tour's `Phase::Prestream`, until a whole
+        // grid was in, none of which the crossing frame needs.
+        let landing_resident = streaming
+            .is_none_or(|streaming| destination_is_resident(&door.destination, anchor, streaming));
+        let need = if !landing_resident {
+            if destination_is_loaded(&door.destination, anchor, streaming) {
+                // Every key settled (a failed cell counts as settled) and the landing cell still
+                // not there: the destination failed for good. Nothing will ever be drawn, so it
+                // is warmed by fiat and never waited on again.
+                prewarm.warmed.extend(wanted);
+                continue;
+            }
             PrewarmNeed::Load
-        } else if streaming
-            .is_none_or(|streaming| destination_is_resident(&door.destination, anchor, streaming))
-        {
+        } else {
             // The view must be on the door's front for its pose to face the destination;
             // anything else is re-tested the frame the walk comes around.
             let map = door_map(
@@ -4217,12 +4232,6 @@ fn prewarm_destination_view(
                 continue;
             }
             PrewarmNeed::Warm
-        } else {
-            // Every cell settled and none of them resident: the destination failed for good
-            // (`destination_is_loaded` counts a failed cell as settled). Nothing will ever be
-            // drawn, so it is warmed by fiat and never waited on again.
-            prewarm.warmed.extend(wanted);
-            continue;
         };
         candidates.push((
             global.translation().distance(camera_position),
@@ -4310,6 +4319,11 @@ fn prewarm_destination_view(
     // Readiness: the warm view stays up until the pipeline cache has stopped growing with
     // nothing left waiting in it, then goes off the same frame. Cells that commit later in the
     // window re-open the count and warm themselves the same way.
+    //
+    // The counts are the pipeline cache's, run-wide: another view compiling in these frames (the
+    // main camera's own loading, an unrelated space) holds `stable` back exactly as much as the
+    // destination's own cells do. That errs towards warming - the view is held longer, never
+    // ended early - and the tour's wait cap bounds it.
     let (created, waiting) = counts.map(|counts| counts.read()).unwrap_or((0, 0));
     if created != prewarm.created {
         prewarm.created = created;
@@ -6623,21 +6637,10 @@ mod tests {
     /// The interior the fixture's door leads into.
     const FIXTURE_INTERIOR_CELL: u32 = 99;
 
-    /// The world database the camera-pose test streams from: one Tamriel cell holding one load
-    /// door, and the interior that door's `XTEL` leads into.
-    ///
-    /// The same two cells as `crate::transition`'s own fixture (`write_fixture`), copied here
-    /// because that one is private to that module's tests: `StreamingWorld`'s map is private to
-    /// `streaming`, so the only way a test in this module can have a *resident* destination - which
-    /// is what `update_portal` selects a door by - is to let the real streamer load one. The door
-    /// reference stands at creation 8200, -12200, 50 of the grid (2, -3) cell, which renders at
-    /// (8, 50, -88) with the origin on that grid.
-    fn write_door_fixture(directory: &Path) -> (PathBuf, PathBuf) {
-        let database_path = directory.join("world.db");
-        let connection = rusqlite::Connection::open(&database_path).unwrap();
-        connection
-            .execute_batch(&format!(
-                r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
+    /// The schema both door fixture databases are written over, with `{version}` for the schema
+    /// row they share (substituted by [`write_fixture_files`]): the tables and indexes
+    /// `WorldDatabase::open`, the streamer and the portal read.
+    const DOOR_FIXTURE_SCHEMA: &str = r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
                 INSERT INTO schema_info VALUES({version});
                 CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,editor_id TEXT NOT NULL,parent_world INTEGER,flags INTEGER NOT NULL);
                 CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT,flags INTEGER NOT NULL);
@@ -6662,16 +6665,76 @@ mod tests {
                     material_type INTEGER,friction REAL,restitution REAL);
                 CREATE TABLE waters(id INTEGER PRIMARY KEY,editor_id TEXT,opacity INTEGER,flags INTEGER NOT NULL,
                     shallow_color INTEGER,deep_color INTEGER,reflection_color INTEGER,flow_normal_path TEXT,data BLOB NOT NULL);
+"#;
 
-                INSERT INTO worldspaces VALUES(60,'Tamriel',0,0);
+    /// The world database the camera-pose test streams from: one Tamriel cell holding one load
+    /// door, and the interior that door's `XTEL` leads into.
+    ///
+    /// The same two cells as `crate::transition`'s own fixture (`write_fixture`), copied here
+    /// because that one is private to that module's tests: `StreamingWorld`'s map is private to
+    /// `streaming`, so the only way a test in this module can have a *resident* destination - which
+    /// is what `update_portal` selects a door by - is to let the real streamer load one. The door
+    /// reference stands at creation 8200, -12200, 50 of the grid (2, -3) cell, which renders at
+    /// (8, 50, -88) with the origin on that grid.
+    fn write_door_fixture(directory: &Path) -> (PathBuf, PathBuf) {
+        write_fixture_files(
+            directory,
+            r#"INSERT INTO worldspaces VALUES(60,'Tamriel',0,0);
                 INSERT INTO cells VALUES(10,60,2,-3,NULL,0);
                 INSERT INTO cells VALUES(99,NULL,NULL,NULL,'Alftand01',0);
                 INSERT INTO "references" VALUES(30,10,60,20,1,8200,-12200,50,8,88,0,0,0,1.0);
                 INSERT INTO exterior_spatial VALUES(30,8200,8200,-12200,-12200,50,50,10,60);
                 INSERT INTO "references" VALUES(31,99,NULL,21,0,-947.038,3958.835,591.917,NULL,NULL,0,0,0,1.0);
                 INSERT INTO door_links VALUES(30,31,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);"#,
-                version = shared::WORLD_DATABASE_SCHEMA_VERSION
-            ))
+        )
+    }
+
+    /// The world database the exterior-gate test streams from: the same source cell and door as
+    /// [`write_door_fixture`], but the door's `XTEL` leads outdoors - to the Tamriel grid at
+    /// [`FIXTURE_DESTINATION_GRID`], the arrival point 21088.559, 18512.045 in Creation units -
+    /// with every cell of the `(2R+1)²` window that destination pre-streams present in the
+    /// database, so the grid takes one commit a frame to arrive and no cell of it fails.
+    fn write_exterior_door_fixture(directory: &Path) -> (PathBuf, PathBuf) {
+        write_fixture_files(
+            directory,
+            r#"INSERT INTO worldspaces VALUES(60,'Tamriel',0,0);
+                INSERT INTO cells VALUES(10,60,2,-3,NULL,0);
+                INSERT INTO cells VALUES(20,60,4,3,NULL,0);
+                INSERT INTO cells VALUES(21,60,5,3,NULL,0);
+                INSERT INTO cells VALUES(22,60,6,3,NULL,0);
+                INSERT INTO cells VALUES(23,60,4,4,NULL,0);
+                INSERT INTO cells VALUES(24,60,5,4,NULL,0);
+                INSERT INTO cells VALUES(25,60,6,4,NULL,0);
+                INSERT INTO cells VALUES(26,60,4,5,NULL,0);
+                INSERT INTO cells VALUES(27,60,5,5,NULL,0);
+                INSERT INTO cells VALUES(28,60,6,5,NULL,0);
+                INSERT INTO "references" VALUES(30,10,60,20,1,8200,-12200,50,8,88,0,0,0,1.0);
+                INSERT INTO exterior_spatial VALUES(30,8200,8200,-12200,-12200,50,50,10,60);
+                INSERT INTO "references" VALUES(31,24,60,21,1,21088.559,18512.045,2434.0,NULL,NULL,0,0,0,1.0);
+                INSERT INTO exterior_spatial VALUES(31,21088.559,21088.559,18512.045,18512.045,2434.0,2434.0,24,60);
+                INSERT INTO "references" VALUES(40,20,60,20,1,18432,14336,0,NULL,NULL,0,0,0,1.0);
+                INSERT INTO "references" VALUES(41,21,60,20,1,22528,14336,0,NULL,NULL,0,0,0,1.0);
+                INSERT INTO "references" VALUES(42,22,60,20,1,26624,14336,0,NULL,NULL,0,0,0,1.0);
+                INSERT INTO "references" VALUES(43,23,60,20,1,18432,18432,0,NULL,NULL,0,0,0,1.0);
+                INSERT INTO "references" VALUES(44,25,60,20,1,26624,18432,0,NULL,NULL,0,0,0,1.0);
+                INSERT INTO "references" VALUES(45,26,60,20,1,18432,22528,0,NULL,NULL,0,0,0,1.0);
+                INSERT INTO "references" VALUES(46,27,60,20,1,22528,22528,0,NULL,NULL,0,0,0,1.0);
+                INSERT INTO "references" VALUES(47,28,60,20,1,26624,22528,0,NULL,NULL,0,0,0,1.0);
+                INSERT INTO door_links VALUES(30,31,21088.559,18512.045,2434.0,0,0,0,NULL,60);"#,
+        )
+    }
+
+    /// Writes [`DOOR_FIXTURE_SCHEMA`] and `rows` into a world database beside an empty cell
+    /// cache, and hands back the two paths a fixture app opens.
+    fn write_fixture_files(directory: &Path, rows: &str) -> (PathBuf, PathBuf) {
+        let database_path = directory.join("world.db");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        let schema = DOOR_FIXTURE_SCHEMA.replace(
+            "{version}",
+            &shared::WORLD_DATABASE_SCHEMA_VERSION.to_string(),
+        );
+        connection
+            .execute_batch(&format!("{schema}{rows}"))
             .unwrap();
         drop(connection);
 
@@ -6688,11 +6751,28 @@ mod tests {
         (database_path, cache_path)
     }
 
+    /// The grid the door of [`write_exterior_door_fixture`] lands in, in Tamriel: the one a
+    /// crossing out of its interior-free destination arrives at.
+    const FIXTURE_DESTINATION_GRID: (i32, i32) = (5, 4);
+
     /// The fixture in an app: the streamer, the crossing that pre-streams the door's destination,
     /// a main camera standing 200 units in front of the door, and the portal's own camera and
     /// quad - the entities `update_portal` writes.
     fn doorway_camera_app(directory: &Path) -> (App, Entity, Entity) {
-        let (database_path, cache_path) = write_door_fixture(directory);
+        doorway_camera_app_over(directory, write_door_fixture)
+    }
+
+    /// The same app over another fixture database: [`write_exterior_door_fixture`]'s exterior
+    /// destination streams in a whole grid instead of one interior cell.
+    fn exterior_doorway_app(directory: &Path) -> (App, Entity, Entity) {
+        doorway_camera_app_over(directory, write_exterior_door_fixture)
+    }
+
+    fn doorway_camera_app_over(
+        directory: &Path,
+        write: fn(&Path) -> (PathBuf, PathBuf),
+    ) -> (App, Entity, Entity) {
+        let (database_path, cache_path) = write(directory);
         let config = EngineConfig {
             worldspace_id: TAMRIEL,
             start_grid: (2, -3),
@@ -9168,6 +9248,180 @@ mod tests {
             app.world().get::<CellRoleStamp>(root).map(|stamp| stamp.0),
             Some(CellRole::Hidden),
             "the cell is the portal's to reveal, which it does through its own destination"
+        );
+    }
+
+    /// Keeps the pipeline cache's created count moving every frame, so no warm view in these
+    /// tests can reach readiness ([`PREWARM_SETTLE_FRAMES`] frames flat): what they are about is
+    /// the gate and the camera, and readiness has its own tests above.
+    fn hold_the_warm_view_open(app: &mut App) {
+        app.insert_resource(PipelineCounts::default());
+        let counts = app.world().resource::<PipelineCounts>().clone();
+        app.add_systems(Update, move || {
+            counts.0.created.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    /// The portal owns the portal camera's `is_active`; the warm view only ever borrows it.
+    /// `update_portal` runs first in the same chain and writes that field for the frame, so a warm
+    /// view whose window closes - the player turns away, the door leaves the candidates - leaves
+    /// the portal's own `false` behind, not a stale view on the destination layer.
+    ///
+    /// This is the half of review-1064's finding 1 the review could not run: the finding read the
+    /// `go_idle()` exits as leaving the camera active, which they would if the warm view owned the
+    /// field alone. It does not own it.
+    #[test]
+    fn a_window_that_empties_mid_warm_leaves_the_camera_to_the_portal() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _camera, portal_camera) = doorway_camera_app(directory.path());
+        // The pre-warm after the portal, in the plugin's own order.
+        app.init_resource::<PortalPrewarm>()
+            .add_systems(Update, prewarm_destination_view.after(update_portal));
+        hold_the_warm_view_open(&mut app);
+
+        run_until(&mut app, "the door's destination to be resident", |app| {
+            app.world()
+                .resource::<StreamingWorld>()
+                .is_resident(&CellKey::Interior(FIXTURE_INTERIOR_CELL))
+        });
+        app.update();
+
+        // The warm view runs - and it is the warm view and nothing else: the door is closed, so
+        // the portal draws no doorway and its own answer for the camera this frame is `false`.
+        assert_eq!(
+            app.world().resource::<PortalPrewarm>().phase,
+            PrewarmPhase::Warming,
+            "the destination is there: the wait is over and the warm view runs"
+        );
+        assert!(
+            app.world().get::<Camera>(portal_camera).unwrap().is_active,
+            "the warm view is on"
+        );
+        assert_eq!(
+            app.world().resource::<PortalState>().open_door,
+            None,
+            "no doorway is drawn: the warm view is the only reason the camera is on"
+        );
+
+        // The player turns away, out of the door's pre-stream radius: the window empties and the
+        // warm view ends mid-warm, with the pipeline cache still counting.
+        app.world_mut()
+            .insert_resource(MoveCamera(Some(Transform::from_translation(Vec3::new(
+                8.0, 50.0, -5_000.0,
+            )))));
+        update(&mut app, 3);
+
+        assert!(
+            !app.world().get::<Camera>(portal_camera).unwrap().is_active,
+            "the camera follows the portal's decision, not the warm view's last frame"
+        );
+        assert!(
+            app.world().resource::<PortalPrewarm>().settled(),
+            "and the warm view is over"
+        );
+        assert!(
+            app.world()
+                .resource::<PortalState>()
+                .destination()
+                .is_empty(),
+            "the keys the warm view published are taken back, the portal's own set left empty"
+        );
+        update(&mut app, 3);
+        assert!(
+            !app.world().get::<Camera>(portal_camera).unwrap().is_active,
+            "and it stays the portal's: no frame of the empty window re-activates it"
+        );
+    }
+
+    /// The warm gate is the **landing cell**, not the whole destination grid: an exterior
+    /// destination starts warming the frame the cell a crossing lands in is resident, while the
+    /// rest of its grid is still committing ([`EngineConfig::max_cell_commits_per_frame`] streams
+    /// one cell a frame, and the fixture's landing cell is asked for before the plan's own pass,
+    /// so the two states are a real frame and not a race).
+    ///
+    /// This is review-1064's finding 2: the gate read `destination_is_loaded` - every key of the
+    /// destination window resident or failed - which for an exterior held the warm view, and with
+    /// it the tour's `Phase::Prestream`, until all `(2R+1)²` cells were in.
+    #[test]
+    fn an_exterior_destination_warms_once_its_landing_cell_is_resident() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _camera, portal_camera) = exterior_doorway_app(directory.path());
+        app.init_resource::<PortalPrewarm>()
+            .add_systems(Update, prewarm_destination_view.after(update_portal));
+        hold_the_warm_view_open(&mut app);
+        let landing = CellKey::Exterior {
+            worldspace_id: TAMRIEL,
+            grid_x: FIXTURE_DESTINATION_GRID.0,
+            grid_y: FIXTURE_DESTINATION_GRID.1,
+        };
+        {
+            let world = app.world_mut();
+            let database = world.remove_resource::<WorldDatabase>().unwrap();
+            let mut metrics = world.remove_resource::<StreamingMetrics>().unwrap();
+            let mut profiler = world.remove_resource::<ProfilingState>().unwrap();
+            world.resource_mut::<StreamingWorld>().request_cell(
+                &database,
+                landing,
+                &mut metrics,
+                &mut profiler,
+            );
+            world.insert_resource(database);
+            world.insert_resource(metrics);
+            world.insert_resource(profiler);
+        }
+        let door = fixture_door(&mut app);
+        let destination = app
+            .world()
+            .get::<LoadDoor>(door)
+            .unwrap()
+            .destination
+            .clone();
+        // The landing cell is already resident before the first frame (it was requested and
+        // pinned above), so the state this test is about is there from the start; what the first
+        // frames are for is the app catching up with it - the door's cell classified Active and
+        // the plan's window filled - which is what makes the warm view due.
+        update(&mut app, 3);
+        let parent = app.world().get::<ChildOf>(door).map(ChildOf::parent);
+
+        let mut frames = 0;
+        let mut saw = false;
+        while frames < 300 {
+            frames += 1;
+            // Read before the frame: the plan commits a cell per frame, so the frame the landing
+            // cell lands in can be the frame the view has to start on.
+            let mid_grid = {
+                let state = app.world().resource::<PortalState>();
+                let classified = parent.is_some_and(|parent| state.roles.contains_key(&parent));
+                let streaming = app.world().resource::<StreamingWorld>();
+                classified
+                    && streaming.is_resident(&landing)
+                    && !destination_is_loaded(&destination, None, Some(streaming))
+            };
+            app.update();
+            if mid_grid {
+                // The landing cell is in and the grid is not: the old gate was still in
+                // `WaitingLoad` on this frame, holding the wait.
+                assert_eq!(
+                    app.world().resource::<PortalPrewarm>().phase,
+                    PrewarmPhase::Warming,
+                    "the landing cell is resident: the warm view is due, grid or no grid"
+                );
+                assert!(
+                    app.world().get::<Camera>(portal_camera).unwrap().is_active,
+                    "and the camera is on the destination"
+                );
+                assert_eq!(
+                    app.world().resource::<PortalState>().open_door,
+                    None,
+                    "the warm view, not a doorway: the fixture's door is closed"
+                );
+                saw = true;
+                break;
+            }
+        }
+        assert!(
+            saw,
+            "the fixture never held the landing cell resident with the grid still streaming"
         );
     }
 
