@@ -41,6 +41,7 @@ use shared::collision::{COLLISION_ASSET_VERSION, CollisionAsset, CollisionShape}
 use shared::lod::LodTier;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub(crate) mod lod;
@@ -247,6 +248,15 @@ impl Plugin for StreamingPlugin {
                 crate::pacing::track_world_ready.after(validate_streaming_lifecycle),
             );
         }
+        // The retire-visibility probe (`--probe-retire-visibility`): a measurement-only run that
+        // checks a draining retiring cell never shows in a view. It installs neither the resource
+        // nor the system unless the flag names a directory.
+        install_retire_visibility_probe(
+            app,
+            app.world()
+                .get_resource::<EngineConfig>()
+                .and_then(|config| config.probe_retire_visibility.clone()),
+        );
     }
 }
 
@@ -1747,6 +1757,237 @@ fn despawn_subtree(world: &mut World, root: Entity) -> usize {
         entity.despawn();
     }
     entities
+}
+
+// -----------------------------------------------------------------------------------------
+// The retire-visibility probe (`--probe-retire-visibility`): a measurement-only run that proves
+// a cell held in the retire backlog - hidden the same frame it retires, drained over several
+// frames under `max_unload_ms_per_frame` - never shows in a view while it drains. Off unless the
+// flag names a directory.
+// -----------------------------------------------------------------------------------------
+
+/// Backlog frames the probe photographs first, whatever the visible count: enough frames of one
+/// drain to see the retiring cell is gone from the drawn image while the table still holds it.
+const PROBE_FIRST_BACKLOG_CAPTURES: usize = 5;
+/// The most PNGs the probe writes overall, so a run that does find hits cannot fill the disk.
+const PROBE_MAX_CAPTURES: usize = 20;
+/// Quiet frames after the backlog empties before the probe writes its JSON and exits, so the
+/// screenshots requested on the last backlog frames have reached the disk.
+const PROBE_QUIET_FRAMES: u32 = 45;
+/// The longest the probe waits for a backlog and its drain before it gives up and reports.
+const PROBE_TIMEOUT_SECONDS: f32 = 120.0;
+
+/// The retire-visibility probe's state: one run's count of whether a retiring cell ever showed in
+/// a view. See [`probe_retire_visibility`].
+#[derive(Resource)]
+struct RetireVisibilityProbe {
+    dir: PathBuf,
+    elapsed: f32,
+    frame: u64,
+    frames_probed: u64,
+    max_backlog: usize,
+    visible_hits: u64,
+    hit_frames: Vec<u64>,
+    captures: Vec<(u64, String)>,
+    backlog_seen: bool,
+    quiet_frames: u32,
+    finished: bool,
+}
+
+impl RetireVisibilityProbe {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            elapsed: 0.0,
+            frame: 0,
+            frames_probed: 0,
+            max_backlog: 0,
+            visible_hits: 0,
+            hit_frames: Vec::new(),
+            captures: Vec::new(),
+            backlog_seen: false,
+            quiet_frames: 0,
+            finished: false,
+        }
+    }
+
+    fn png_name(frame: u64) -> String {
+        format!("retire-frame-{frame:06}.png")
+    }
+
+    /// The run's record, hand-written (no JSON dependency) and small: the numbers the proof
+    /// rests on, and the names of the PNGs beside it.
+    fn json(&self) -> String {
+        let hit_frames = self
+            .hit_frames
+            .iter()
+            .map(|frame| frame.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let pngs = self
+            .captures
+            .iter()
+            .map(|(_, name)| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{{\n  \"frames_probed\": {},\n  \"max_backlog\": {},\n  \
+             \"visible_retiring_hits\": {},\n  \"hit_frames\": [{hit_frames}],\n  \
+             \"pngs\": [{pngs}]\n}}\n",
+            self.frames_probed, self.max_backlog, self.visible_hits,
+        )
+    }
+}
+
+/// Installs the retire-visibility probe when `--probe-retire-visibility` names a directory:
+/// nothing at all - no resource, no system - otherwise, so an ordinary run is exactly as before.
+fn install_retire_visibility_probe(app: &mut App, dir: Option<PathBuf>) {
+    let Some(dir) = dir else {
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        warn!(
+            target: "retire_probe",
+            "could not create {}: {error}",
+            dir.display()
+        );
+    }
+    app.insert_resource(RetireVisibilityProbe::new(dir))
+        .add_systems(Update, probe_retire_visibility.after(despawn_cells));
+}
+
+/// `--probe-retire-visibility`: on each frame after the drain, counts the cells still retiring
+/// (hidden, waiting for the budget) that show in a view, photographs the first backlog frames,
+/// and once the backlog has drained writes `retire-visibility.json` and exits - non-zero on any
+/// hit, or when no backlog ever appeared, since a run that retired nothing proved nothing.
+///
+/// "Shows" is [`ViewVisibility::get`] on a retiring root or on a descendant that carries a
+/// [`Mesh3d`], the same signal the renderer culls on: a cell retired by distance is
+/// [`crate::portal`]'s [`CellRole::Hidden`] the frame it retires, so a root that kept a layer or
+/// its visibility for the drain would read true here, which is the failure this probe exists to
+/// catch. Measurement only: it rewrites no cell that is retiring.
+///
+/// [`CellRole::Hidden`]: crate::portal::CellRole
+#[allow(clippy::too_many_arguments)]
+fn probe_retire_visibility(
+    mut commands: Commands,
+    streaming: Res<StreamingWorld>,
+    metrics: Res<StreamingMetrics>,
+    mut probe: ResMut<RetireVisibilityProbe>,
+    views: Query<&ViewVisibility>,
+    children: Query<&Children>,
+    meshes: Query<(), With<Mesh3d>>,
+    time: Res<Time>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    if probe.finished {
+        return;
+    }
+    probe.elapsed += time.delta_secs();
+    probe.frame += 1;
+    let frame = probe.frame;
+
+    let roots: Vec<Entity> = streaming
+        .cells
+        .values()
+        .filter_map(|status| match status {
+            CellStatus::Retiring { root, .. } => Some(*root),
+            _ => None,
+        })
+        .collect();
+    // The backlog the drain held this frame: the surviving retirees plus the ones this frame's
+    // budget unloaded, which is the count `despawn_cells` paced against.
+    let backlog = roots.len() + metrics.despawns_this_frame as usize;
+
+    let mut visible = 0u64;
+    for root in &roots {
+        let mut stack = vec![*root];
+        while let Some(entity) = stack.pop() {
+            // The root answers for itself; below it only the entities that carry a mesh are
+            // something a view draws, so only those are counted.
+            if (entity == *root || meshes.contains(entity))
+                && views.get(entity).is_ok_and(|view| view.get())
+            {
+                visible += 1;
+            }
+            if let Ok(children) = children.get(entity) {
+                stack.extend(children.iter());
+            }
+        }
+    }
+
+    if backlog > 0 {
+        probe.backlog_seen = true;
+        probe.quiet_frames = 0;
+        probe.frames_probed += 1;
+        probe.max_backlog = probe.max_backlog.max(backlog);
+
+        // Photograph the first few backlog frames, and every frame a hit shows on (capped), so the
+        // frames behind the JSON are on disk beside it.
+        if probe.captures.len() < PROBE_MAX_CAPTURES
+            && (probe.frames_probed as usize <= PROBE_FIRST_BACKLOG_CAPTURES || visible > 0)
+        {
+            let name = RetireVisibilityProbe::png_name(frame);
+            crate::shots::capture_primary_window(&mut commands, probe.dir.join(&name));
+            probe.captures.push((frame, name));
+        }
+
+        if visible > 0 {
+            probe.visible_hits += visible;
+            probe.hit_frames.push(frame);
+            warn!(
+                target: "retire_probe",
+                frame,
+                backlog,
+                visible,
+                "a retiring cell shows in a view while it drains"
+            );
+        }
+    } else if probe.backlog_seen {
+        probe.quiet_frames += 1;
+    }
+
+    let captures_ready = probe
+        .captures
+        .iter()
+        .all(|(_, name)| probe.dir.join(name).is_file());
+    let settled = probe.backlog_seen && probe.quiet_frames >= PROBE_QUIET_FRAMES && captures_ready;
+    if !(settled || probe.elapsed >= PROBE_TIMEOUT_SECONDS) {
+        return;
+    }
+
+    probe.finished = true;
+    let path = probe.dir.join("retire-visibility.json");
+    let write_failed = match std::fs::write(&path, probe.json()) {
+        Ok(()) => {
+            info!(
+                target: "retire_probe",
+                "retire-visibility probe wrote {}: {} backlog frames, max backlog {}, \
+                 {} visible retiring hits",
+                path.display(),
+                probe.frames_probed,
+                probe.max_backlog,
+                probe.visible_hits
+            );
+            false
+        }
+        Err(error) => {
+            error!(
+                target: "retire_probe",
+                "could not write {}: {error}",
+                path.display()
+            );
+            true
+        }
+    };
+    // Fail on a hit, on a JSON that would not write, and on a run that saw no backlog at all -
+    // the last has proven nothing about the drain, so it must not read as a pass.
+    let failed = write_failed || probe.visible_hits > 0 || !probe.backlog_seen;
+    exit.write(if failed {
+        AppExit::error()
+    } else {
+        AppExit::Success
+    });
 }
 
 // -----------------------------------------------------------------------------------------
@@ -12397,5 +12638,117 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(decision, StaticCollisionDecision::Authored(_, _)));
+    }
+
+    /// A minimal app the retire-visibility probe's own tests drive: the resources the probe reads,
+    /// the probe installed against `dir`, and nothing else - no streaming pipeline, so the test
+    /// controls exactly which cells are retiring.
+    fn probe_app(dir: PathBuf) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<AppExit>()
+            .insert_resource(EngineConfig::default())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<StreamingMetrics>();
+        install_retire_visibility_probe(&mut app, Some(dir));
+        app
+    }
+
+    /// How many systems the `Update` schedule carries: the way a test tells whether the probe's
+    /// one system was installed, since a system's own name is only present with the debug feature.
+    fn update_systems_len(app: &App) -> usize {
+        app.get_schedule(Update)
+            .map(|schedule| schedule.systems_len())
+            .unwrap_or(0)
+    }
+
+    /// A bare app with the plugins the probe tests use and no probe installed.
+    fn bare_probe_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins).add_message::<AppExit>();
+        app
+    }
+
+    /// The probe installs nothing at all - no resource, no system - unless the flag names a
+    /// directory, so an ordinary run is exactly as before.
+    #[test]
+    fn the_retire_visibility_probe_installs_only_when_asked() {
+        let mut control = bare_probe_app();
+        control.update();
+        let baseline = update_systems_len(&control);
+
+        let mut off = bare_probe_app();
+        install_retire_visibility_probe(&mut off, None);
+        off.update();
+        assert_eq!(
+            update_systems_len(&off),
+            baseline,
+            "an ordinary run installs no probe system"
+        );
+        assert!(
+            off.world()
+                .get_resource::<RetireVisibilityProbe>()
+                .is_none(),
+            "and no probe resource"
+        );
+
+        let mut on = probe_app(PathBuf::from("nowhere"));
+        on.update();
+        assert_eq!(
+            update_systems_len(&on),
+            baseline + 1,
+            "the flag installs exactly the probe system and nothing else"
+        );
+        assert!(
+            on.world().get_resource::<RetireVisibilityProbe>().is_some(),
+            "and its resource"
+        );
+    }
+
+    /// The probe counts a retiring root that still shows in a view - the failure it hunts - and
+    /// counts nothing for one that is hidden, the state the drain leaves a cell in.
+    #[test]
+    fn the_probe_counts_only_a_retiring_cell_that_shows() {
+        let directory = tempfile::tempdir().unwrap();
+
+        // A retiring root left visible, with one mesh child also visible: both are counted.
+        let mut visible = probe_app(directory.path().join("visible"));
+        let root = visible.world_mut().spawn(ViewVisibility::VISIBLE).id();
+        visible.world_mut().spawn((
+            Mesh3d(Handle::default()),
+            ViewVisibility::VISIBLE,
+            ChildOf(root),
+        ));
+        test_plant_retiring_cell(visible.world_mut(), exterior_cell(9, 0), root);
+        visible.update();
+        let probe = visible.world().resource::<RetireVisibilityProbe>();
+        assert_eq!(
+            probe.visible_hits, 2,
+            "the retiring root and its mesh child both read as visible"
+        );
+        assert_eq!(probe.hit_frames, vec![1], "the frame the hit showed on");
+        assert_eq!(probe.frames_probed, 1);
+        assert_eq!(probe.max_backlog, 1);
+
+        // A retiring root hidden, as a distance retire leaves one: nothing is counted.
+        let mut hidden = probe_app(directory.path().join("hidden"));
+        let root = hidden
+            .world_mut()
+            .spawn((Visibility::Hidden, ViewVisibility::HIDDEN))
+            .id();
+        hidden.world_mut().spawn((
+            Mesh3d(Handle::default()),
+            ViewVisibility::HIDDEN,
+            ChildOf(root),
+        ));
+        test_plant_retiring_cell(hidden.world_mut(), exterior_cell(9, 0), root);
+        hidden.update();
+        let probe = hidden.world().resource::<RetireVisibilityProbe>();
+        assert_eq!(
+            probe.visible_hits, 0,
+            "a hidden retiring cell shows nothing"
+        );
+        assert!(probe.hit_frames.is_empty());
+        assert_eq!(probe.frames_probed, 1, "the backlog frame was still probed");
     }
 }
