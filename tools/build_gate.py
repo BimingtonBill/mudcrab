@@ -47,7 +47,8 @@ from datetime import datetime, timedelta
 # Not under AppData: the Claude desktop app is an MSIX package, which redirects AppData writes from its own
 # processes to a private folder that every other process (consoles, workers, cargo) cannot see (2026-10-07).
 GATE_DIR = os.environ.get("MUDCRAB_BUILD_GATE") or os.path.join(os.path.expanduser("~"), ".mudcrab", "build-gate")
-DEFAULTS = {"slots": 3, "max_per_owner": 2, "min_free_ram_gb": 8.0, "min_commit_headroom_gb": 12.0, "min_free_disk_gb": 15.0, "max_wait_minutes": 120, "poll_seconds": 10}
+DEFAULTS = {"slots": 3, "max_per_owner": 2, "min_free_ram_gb": 8.0, "min_commit_warm_gb": 7.0, "min_commit_cold_gb": 14.0, "preflight_commit_gb": 20.0,
+            "warm_peak_gb": 4.0, "cold_peak_gb": 10.0, "min_free_disk_gb": 15.0, "max_wait_minutes": 120, "poll_seconds": 10}
 GB = 1024**3
 COLD_RLIBS = 150
 
@@ -238,16 +239,37 @@ def try_acquire(config: dict, label: str, command: list[str], weight: int = 1) -
     return None
 
 
-def blocking_reason(config: dict) -> str | None:
+def reserved_commit_gb(config: dict, exclude_pid: int | None = None) -> float:
+    """Expected peak commit of the gated builds already running (one entry per build, not per slot).
+
+    A build that has just started has committed little, so two starts a minute apart could both pass the
+    floor and then collide at their peaks (2026-10-08). This counts the full peak for every running build,
+    which over-reserves for builds already near their peak; that errs on the safe side.
+    """
+    total, seen = 0.0, set()
+    for path in slot_paths(config):
+        info = read_json(path)
+        if info is None or info.get("pid") == exclude_pid or info.get("pid") in seen:
+            continue
+        seen.add(info.get("pid"))
+        total += float(config["cold_peak_gb"] if info.get("cold") else config["warm_peak_gb"])
+    return total
+
+
+def blocking_reason(config: dict, weight: int = 1, exclude_pid: int | None = None) -> str | None:
     holds = active_holds()
     if holds:
         return "hold: " + "; ".join(f"{h['name']} ({h.get('owner', '?')}: {h.get('reason', '')})" for h in holds)
     ram = free_ram_gb()
     if ram < float(config["min_free_ram_gb"]):
         return f"free RAM {ram:.1f} GB < {config['min_free_ram_gb']} GB"
-    commit = commit_headroom_gb()
-    if commit < float(config["min_commit_headroom_gb"]):
-        return f"commit headroom {commit:.1f} GB < {config['min_commit_headroom_gb']} GB"
+    # Tiered (2026-10-08): with the user's normal apps open this PC sits at ~9.5 GB headroom, so a single
+    # 12 GB floor stalled every build. Warm builds peak far lower than cold ones.
+    floor = float(config["min_commit_cold_gb"] if weight > 1 else config["min_commit_warm_gb"])
+    commit, reserved = commit_headroom_gb(), reserved_commit_gb(config, exclude_pid)
+    if commit - reserved < floor:
+        held = f" minus {reserved:.0f} GB reserved for running builds" if reserved else ""
+        return f"commit headroom {commit:.1f} GB{held} < {floor:.0f} GB ({'cold' if weight > 1 else 'warm'} floor)"
     # The drive the build writes to: CARGO_TARGET_DIR if set, else the working folder (2026-10-07: coder
     # worktrees filled C: to 0 GB and builds failed with os error 112).
     target = os.environ.get("CARGO_TARGET_DIR") or os.getcwd()
@@ -267,7 +289,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     deadline = time.monotonic() + float(config["max_wait_minutes"]) * 60
     announced = None
     while True:
-        reason = blocking_reason(config)
+        reason = blocking_reason(config, weight)
         slot = None if reason else try_acquire(config, label, args.command, weight)
         if slot is None and reason is None:
             owner = owner_of(label)
@@ -280,7 +302,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                           else f"all {config['slots']} build slots busy")
         if slot is not None:
             # Re-check after taking the slot: a hold set in between wins.
-            late = blocking_reason(config)
+            late = blocking_reason(config, weight, exclude_pid=os.getpid())
             if late is None:
                 break
             for path in slot:
@@ -312,7 +334,9 @@ def cmd_status(_args: argparse.Namespace) -> int:
     clear_stale_slots(config)
     print(f"gate: {GATE_DIR}")
     print(f"free RAM: {free_ram_gb():.1f} GB (minimum {config['min_free_ram_gb']} GB)")
-    print(f"commit headroom: {commit_headroom_gb():.1f} GB (minimum {config['min_commit_headroom_gb']} GB)")
+    print(f"commit headroom: {commit_headroom_gb():.1f} GB, {reserved_commit_gb(config):.0f} GB reserved for running builds"
+          f" (floors: warm {config['min_commit_warm_gb']}, cold {config['min_commit_cold_gb']},"
+          f" conversion {config['preflight_commit_gb']} GB)")
     for drive in ("C:\\", "D:\\"):
         print(f"free disk {drive}: {shutil.disk_usage(drive).free / GB:.1f} GB (minimum {config['min_free_disk_gb']} GB for builds there)")
     for path in slot_paths(config):
@@ -333,16 +357,18 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     """For jobs that don't run inside a gate slot (a conversion): check memory before starting.
 
     Exit 0 = go; 4 = not now (the reason is printed). A conversion needs more commit room than a build,
-    so it defaults to the commit floor plus 8 GB, and it also refuses while gated cold builds are running.
+    so it needs `preflight_commit_gb` (20 GB) after the running builds' expected peaks, and it also refuses
+    while gated cold builds are running.
     """
     config = load_config()
     clear_stale_slots(config)
-    need_commit = float(config["min_commit_headroom_gb"]) + args.extra_gb
-    commit, ram = commit_headroom_gb(), free_ram_gb()
+    need_commit = float(config["preflight_commit_gb"]) if args.need_gb is None else args.need_gb
+    commit, ram, reserved = commit_headroom_gb(), free_ram_gb(), reserved_commit_gb(config)
     cold = [info["label"] for path in slot_paths(config) if (info := read_json(path)) and info.get("cold")]
     problems = []
-    if commit < need_commit:
-        problems.append(f"commit headroom {commit:.1f} GB < {need_commit:.0f} GB")
+    if commit - reserved < need_commit:
+        held = f" minus {reserved:.0f} GB reserved for running builds" if reserved else ""
+        problems.append(f"commit headroom {commit:.1f} GB{held} < {need_commit:.0f} GB")
     if ram < float(config["min_free_ram_gb"]):
         problems.append(f"free RAM {ram:.1f} GB < {config['min_free_ram_gb']} GB")
     if cold:
@@ -408,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("command", nargs=argparse.REMAINDER)
     sub.add_parser("status", help="show slots, holds, free RAM and converters")
     pre = sub.add_parser("preflight", help="memory check before a job outside the gate (a conversion)")
-    pre.add_argument("--extra-gb", type=float, default=8.0, help="commit room needed above the floor (default 8)")
+    pre.add_argument("--need-gb", type=float, default=None, help="commit room needed (default: preflight_commit_gb, 20)")
     hold = sub.add_parser("hold", help="set or clear a machine-wide hold")
     hold.add_argument("action", choices=["set", "clear"])
     hold.add_argument("name")
