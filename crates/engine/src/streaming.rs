@@ -221,20 +221,41 @@ impl Plugin for StreamingPlugin {
         // command buffer pending at that distance, which on a crossing frame carries the
         // space-change despawns. A run that is not profiling installs none of this, and the
         // explicit `ApplyDeferred` is then the same sync point Bevy's own pass inserts.
+        //
+        // The second bracket spans the frame's **cell commit** apply, the sync point on the
+        // `collect_cells` -> `lod::collect_lod_chunks` edge. A commit queues a cell's root, its
+        // references and their scene spawns as deferred commands, so the frame's spawning cost is
+        // paid at that sync point rather than inside the system - the same shape as the unload
+        // apply, and the other deferred half of a crossing frame's `Update` (analysis-1103 §4
+        // leaves the 140 ms `Update` unattributed; analysis-1074 §2's open item is which part of
+        // it is the apply). Both brackets sit exactly where Bevy's own pass inserts its sync
+        // point, so a profiled run's schedule is the unmeasured one's; only the measurement is
+        // added.
         if app
             .world()
             .get_resource::<EngineConfig>()
             .is_some_and(|config| config.profile_output_dir.is_some())
         {
-            app.init_resource::<SpaceUnloadFlushClock>().add_systems(
-                Update,
-                (
-                    stamp_space_unload_flush.after_ignore_deferred(plan_cells),
-                    bevy::ecs::schedule::ApplyDeferred,
-                    record_space_unload_flush.before(despawn_cells),
+            app.init_resource::<SpaceUnloadFlushClock>()
+                .init_resource::<CellCommitFlushClock>()
+                .add_systems(
+                    Update,
+                    (
+                        stamp_space_unload_flush.after_ignore_deferred(plan_cells),
+                        bevy::ecs::schedule::ApplyDeferred,
+                        record_space_unload_flush.before(despawn_cells),
+                    )
+                        .chain(),
                 )
-                    .chain(),
-            );
+                .add_systems(
+                    Update,
+                    (
+                        stamp_cell_commit_flush.after_ignore_deferred(collect_cells),
+                        bevy::ecs::schedule::ApplyDeferred,
+                        record_cell_commit_flush.before(lod::collect_lod_chunks),
+                    )
+                        .chain(),
+                );
         }
         // The world-ready scan walks the whole stream window every frame and only feeds the pacing
         // report, so an ordinary play session installs none of it.
@@ -1482,12 +1503,16 @@ fn plan_cells(
     // The frame's immediate unload of space-change cells. The span covers only the plan's own
     // bookkeeping for that branch - the despawns ride `Commands` and are applied (and spanned)
     // at the sync point after this system, as `streaming/space_change_unload_apply`.
+    //
+    // The two counts are the run's **maximum**, not its last: this frame unloads a space change
+    // and is zero on every quiet frame after it, so the last value the report would keep is always
+    // zero and a crossing could not be sized from it (see `ProfilingState::set_max_gauge`).
     if measure_space_unload {
-        profiler.set_gauge(
+        profiler.set_max_gauge(
             "streaming/space_change_unload_roots",
             space_unload_roots as f64,
         );
-        profiler.set_gauge(
+        profiler.set_max_gauge(
             "streaming/space_change_unload_entities",
             space_unload_entities as f64,
         );
@@ -1532,6 +1557,48 @@ fn record_space_unload_flush(
         && carried_despawns
     {
         profiler.record_elapsed("streaming/space_change_unload_apply", started);
+    }
+}
+
+/// The apply bracket around the sync point after [`collect_cells`], and whether this frame's plan
+/// committed any cell into it. Held by the bracket systems that span `streaming/commit_apply`,
+/// which only exist on a profiled run; the stamping system reads the frame's commit count out of
+/// [`StreamingCommitBudget`] so the span measures only a sync point that carries a commit, not the
+/// empty one of a quiet frame.
+///
+/// A commit is queued as deferred commands by [`collect_cells`] (cell roots, references, the scene
+/// instances they request), so the sync point is where the frame's spawning is actually paid - the
+/// mirror image of [`SpaceUnloadFlushClock`], which spans the frame's despawns.
+#[derive(Resource, Default)]
+struct CellCommitFlushClock {
+    started: Option<Instant>,
+    pending_commits: usize,
+}
+
+/// Opens the bracket around the schedule's sync point after [`collect_cells`], before the deferred
+/// commands a commit queued (cell roots, references, scene spawns) are applied.
+fn stamp_cell_commit_flush(
+    budget: Res<StreamingCommitBudget>,
+    mut clock: ResMut<CellCommitFlushClock>,
+) {
+    clock.started = Some(Instant::now());
+    clock.pending_commits = budget.commits;
+}
+
+/// Closes the bracket and records `streaming/commit_apply`: the time the executor spent applying
+/// the command buffers pending at that sync point. A frame whose plan committed nothing records
+/// nothing - its sync point is empty.
+fn record_cell_commit_flush(
+    mut clock: ResMut<CellCommitFlushClock>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let started = clock.started.take();
+    let carried_commits = clock.pending_commits > 0;
+    clock.pending_commits = 0;
+    if let Some(started) = started
+        && carried_commits
+    {
+        profiler.record_elapsed("streaming/commit_apply", started);
     }
 }
 
@@ -7588,6 +7655,25 @@ mod tests {
                 .all(|root| app.world().get_entity(*root).is_err()),
             "the despawns the span brackets really removed the roots"
         );
+
+        // The run report keeps a gauge's value at the end of the run, and a crossing's counts are
+        // zero on every frame after it: a plain last-value gauge would read 0 for the whole run
+        // (what the A1 window saw, analysis-1103 §0). Quiet frames after the crossing must not
+        // erase it.
+        for _ in 0..3 {
+            app.update();
+        }
+        let profiler = app.world().resource::<ProfilingState>();
+        assert_eq!(
+            profiler.gauge("streaming/space_change_unload_roots"),
+            Some(3.0),
+            "the gauge keeps the crossing's real root count, not the quiet frame's zero"
+        );
+        assert_eq!(
+            profiler.gauge("streaming/space_change_unload_entities"),
+            Some(9.0),
+            "the gauge keeps the crossing's real entity count, not the quiet frame's zero"
+        );
     }
 
     /// Without profiling, a crossing that unloads cells records no span and no gauge: the counting
@@ -7655,6 +7741,75 @@ mod tests {
                 .all(|root| app.world().get_entity(*root).is_err()),
             "the unload still happens, only unmeasured"
         );
+    }
+
+    /// A stand-in for the cell plan's commit: it queues the deferred spawn work a real one would,
+    /// so the bracket after it has something to apply. The frame's commit count is set by the test
+    /// beforehand, the way `plan_cells` and the commit loop set it in a real frame.
+    fn queue_mock_commits(mut commands: Commands) {
+        commands.queue(|_: &mut World| {});
+        commands.queue(|_: &mut World| {});
+    }
+
+    /// The other deferred half of a frame's work: a cell commit queues the root, its references
+    /// and their scene spawns as commands, so the frame pays for them at the sync point after
+    /// `collect_cells`, not inside the system. The bracket spans that apply, and only on a frame
+    /// that committed anything.
+    #[test]
+    fn a_commit_frame_records_the_apply_at_the_spanned_sync_point() {
+        for (commits, expected) in [(2_usize, 1_usize), (0, 0)] {
+            let mut app = App::new();
+            app.init_resource::<StreamingCommitBudget>()
+                .init_resource::<CellCommitFlushClock>()
+                .init_resource::<ProfilingState>()
+                .add_systems(
+                    Update,
+                    (
+                        queue_mock_commits,
+                        stamp_cell_commit_flush.after_ignore_deferred(queue_mock_commits),
+                        bevy::ecs::schedule::ApplyDeferred,
+                        record_cell_commit_flush,
+                    )
+                        .chain(),
+                );
+            app.world_mut()
+                .resource_mut::<StreamingCommitBudget>()
+                .commits = commits;
+            app.update();
+            assert_eq!(
+                app.world()
+                    .resource::<ProfilingState>()
+                    .span_samples("streaming/commit_apply")
+                    .len(),
+                expected,
+                "the apply is spanned exactly on a frame that committed cells"
+            );
+        }
+    }
+
+    /// The apply brackets are a profiled run's only, and an ordinary run installs none of them:
+    /// the clock resources the bracket systems share exist only behind the plugin's gate.
+    #[test]
+    fn the_flush_brackets_are_installed_only_when_profiling() {
+        let directory = tempfile::tempdir().unwrap();
+        for (profiled, expected) in [(false, false), (true, true)] {
+            let mut app = App::new();
+            app.insert_resource(EngineConfig {
+                profile_output_dir: profiled.then(|| directory.path().join("profiles")),
+                ..EngineConfig::default()
+            })
+            .add_plugins(StreamingPlugin);
+            assert_eq!(
+                app.world().contains_resource::<SpaceUnloadFlushClock>(),
+                expected,
+                "the unload apply bracket follows the profile gate"
+            );
+            assert_eq!(
+                app.world().contains_resource::<CellCommitFlushClock>(),
+                expected,
+                "the commit apply bracket follows the profile gate"
+            );
+        }
     }
 
     // --- The paced unload budget (upstream main's `despawn_cells`) ------------------------------
