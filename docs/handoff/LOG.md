@@ -12,6 +12,19 @@ evening table; Upstream Dev keeps all publishing unchanged. Nothing else changed
 at start: impl-1057-p2-failed-cell-retry.1, impl-1900-p1-ktx2-mip-order.1,
 review-1902-p1-terrain-wiring.1 (all over step budget). Claude plan week 54% (1.23x pace, lean).
 
+Later the same session (the user's answers):
+- GLM workers (`-Provider glm`) may stand in for DeepSeek while DeepSeek is paced.
+- **Claude Phase 2 Dev owns all Phase 2 work.** Hermes finishes impl-1059 only, then hands it
+  over for review; no new Phase 2 jobs for Hermes.
+- **impl-1060 (load-in-flight cap) is HELD** until a design review (review-1062, GLM full)
+  reports and the user decides; it sits on the foundations line "no load caps".
+- Independent reviews of this morning's portal merges (impl-1057, 286, 285, 190, 1058), approved
+  only by Upstream Dev: running on GLM + Muse (review-1063..1067). Nothing from them goes
+  upstream until they report.
+- Cleaned up with the user's yes: stray worktree C:/d/Mudcrab/worktrees/p2-failed-cell-retry
+  (branch kept, already in portal; its port brief copied to local/handover/impl-1057-port-brief.md)
+  and the stash "impl-1057 conflicted 3-way apply" (patch also in Hermes's cache).
+
 ## 2026-10-08 Phase 2 Dev, Hermes (impl-1059 + impl-1060 briefs: the two ranked crossing fixes)
 
 Track: phase 2. Committed `tasks/impl-1059-p2-despawn-time-budget.md` and
