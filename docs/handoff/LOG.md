@@ -59,6 +59,27 @@ Track: all. Nothing pushed. The user asked for a slow wrap-up at ~21:00.
 - **Moved to tomorrow morning:** Phase 2's timing window (binary ready, d1805d12, 35-45 min quiet PC) and Portal's
   1088+1093 laps (~15 min). Collision spans (A12) and the full load bench (E6) go into the same quiet slots.
 
+## 2026-10-09 early Portal Dev (1093 merged; window: not shadows, 4.5 ms outside the camera runs)
+
+Track: Portal. Nothing pushed.
+- impl-1093 (sun shadow-pass laps) merged as ded5e573. review-1097: DeepSeek and Muse both accept; one module-doc
+  sentence still needs rewording as a follow-up.
+- Window about 04:34-04:42 (hold portal-1093-window, drained, then cleared). Release built from the clean worktree
+  local/impl/portal-window-ded5e573 at ded5e573, because the main checkout was mid-merge of 1077. Scene
+  portal-heavy x3 x60 s. Medians over each run's last 3/4 of cycles:
+  - render_thread 14.1-14.3 ms, prepare 5.1, graph_and_present 8.2-8.4, submit 2.3, remainder 0.3.
+  - views 5.7: the three camera runs make up only 1.2 (prepass 0.24, main_pass 0.75, post 0.11).
+  - shadow_passes (sun cascades) 0.12. No point or spot shadow views at all.
+  - views_remainder 4.5 ms: inside the Render set but outside every camera run.
+  So the gap is not shadows. Next: analysis-1106 lists everything in the Render set, and impl-1107 laps around
+  camera_driver itself (briefs 140b9a36). Both are running.
+- fps 64.9 against 55 at the 20:10 window: NOT ATTRIBUTED. The only code changes between the two binaries are the
+  measurement laps (1075 fix, 1088, 1093; render_timing.rs, profiling.rs, frame_budget.rs). Same scene, data
+  and settings. The difference is most likely machine state (other apps or GPU clocks; the user was asked to
+  close heavy apps before this window). Do not quote it as a gain.
+- Data: local/review/portal-1093-window-2026-10-09/.
+- B3: impl-1094 resumed on its old session (WIP 29a6193b) and is in its gated checks.
+
 ## 2026-10-08 late Portal Dev (wrap-up: 1088 merged; B3, B5 fix-first; 1093 and 1092 finishing)
 
 Track: Portal. Nothing pushed. Wrapping up at the user's word (via Team Lead).
