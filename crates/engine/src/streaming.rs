@@ -1384,11 +1384,11 @@ fn plan_cells(
         }
         // The entities the queued despawn will remove. Only counted when profiling, because
         // walking a subtree costs time on the very frame a crossing pays for.
-        if measure_space_unload
-            && let Some(root) = unload_root
-            && children.contains(root)
-        {
-            space_unload_entities += 1 + children.iter_descendants(root).count() as u64;
+        if measure_space_unload && let Some(root) = unload_root {
+            space_unload_entities += 1;
+            if children.contains(root) {
+                space_unload_entities += children.iter_descendants(root).count() as u64;
+            }
         }
         if let Some(started) = unload_started {
             space_unload_ms += started.elapsed().as_secs_f64() * 1000.0;

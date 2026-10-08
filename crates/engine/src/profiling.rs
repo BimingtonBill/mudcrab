@@ -279,7 +279,8 @@ impl Plugin for ProfilingPlugin {
                             begin_extract_commands_apply
                                 .before(bevy::render::RenderSystems::ExtractCommands),
                             end_extract_commands_apply
-                                .after(bevy::render::RenderSystems::ExtractCommands),
+                                .after(bevy::render::RenderSystems::ExtractCommands)
+                                .before(bevy::render::RenderSystems::PrepareAssets),
                         ),
                     );
             }
