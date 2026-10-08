@@ -67,7 +67,10 @@ impl Plugin for SkyDomePlugin {
     }
 }
 
-/// One dome per [`SkyCamera`], on that camera's own render layers.
+/// One dome per [`SkyCamera`], on that camera's own render layers plus the reflection replica layer
+/// when those layers are the world's ([`crate::render::reflectable_layers`]): a sky seen through
+/// layer 0 is reflected on both shadow routes, and a doorway's sky (on
+/// [`crate::portal::DESTINATION_LAYER`]) is reflected by neither.
 ///
 /// The dome starts hidden and repainted by [`colour_sky_domes`] further down the same chain: on the
 /// first frame in an interior there is no space written to the camera yet, and a bright dome for
@@ -88,7 +91,11 @@ fn spawn_sky_domes(
             Visibility::Hidden,
             // The camera's own layers, so this dome is drawn by the camera it follows and by no
             // other view. A camera without any renders layer 0, which is `RenderLayers`' default.
-            layers.cloned().unwrap_or_default(),
+            // A dome of a world camera carries the replica layer beside them
+            // (`crate::render::reflectable_layers`): the shadowed reflection route draws the sky
+            // through the world layer, so the shadowless one has to draw it too, and the portal
+            // camera's dome (the destination's sky) is left on `DESTINATION_LAYER` alone.
+            crate::render::reflectable_layers(&layers.cloned().unwrap_or_default()),
             NotShadowCaster,
             // The dome always surrounds its camera.
             NoFrustumCulling,
@@ -231,7 +238,10 @@ mod tests {
 
     /// The two cameras this branch has - the main camera on layers 0 and 1 and the doorway's on
     /// `DESTINATION_LAYER` - each get a dome of their own, on disjoint layers. One entity on both
-    /// layers would be the main view's sky hanging in the doorway.
+    /// layers would be the main view's sky hanging in the doorway. The world camera's dome also
+    /// carries the reflection replica layer (impl-1094), and the doorway's does not: the sky hangs
+    /// in the water reflection exactly as the rest of the world does, and the destination's sky
+    /// stays inside the doorway.
     #[test]
     fn each_sky_camera_gets_one_dome_on_its_own_layers() {
         let mut app = dome_app();
@@ -253,7 +263,11 @@ mod tests {
         let (_, portal_dome, portal_layers, _) = dome_of(&mut app, portal);
         assert_eq!(main_dome.camera, main);
         assert_eq!(portal_dome.camera, portal);
-        assert_eq!(main_layers, RenderLayers::from_layers(&MAIN_LAYERS));
+        assert_eq!(
+            main_layers,
+            crate::render::reflectable_layers(&RenderLayers::from_layers(&MAIN_LAYERS)),
+            "the world camera's dome is reflected on either shadow route"
+        );
         assert_eq!(portal_layers, RenderLayers::layer(DESTINATION_LAYER));
         assert!(
             !main_layers.intersects(&portal_layers),

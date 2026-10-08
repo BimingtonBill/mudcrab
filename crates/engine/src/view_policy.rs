@@ -142,6 +142,12 @@ impl ViewPolicy {
     /// every other frame, low priority, no shadow cascades of its own, with a hundred milliseconds
     /// and 256 units or ten degrees of staleness allowed before the view is forced.
     ///
+    /// **What it draws, it draws whole** (impl-1094): `shadows: Off` moves the view to the
+    /// shadowless route ([`crate::shadow_route`]), which draws the same content the shadowed route
+    /// does through [`crate::render::UNSHADOWED_REFLECTION_LAYER`] - every producer of world content
+    /// widens its layers with [`crate::render::reflectable_layers`], the portal's cell stamping
+    /// included, so a preset that drew a thinner scene would be a shortcut rather than a saving.
+    ///
     /// These are unverified quality settings, not measured optima. They exist to be compared with
     /// [`ViewPolicy::baseline`] on the same scene.
     pub fn water() -> Self {

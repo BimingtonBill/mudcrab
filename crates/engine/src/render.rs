@@ -375,12 +375,16 @@ pub const MAIN_VIEW_LAYERS: [usize; 2] = [0, WATER_LAYER];
 pub const LIGHT_LAYERS: [usize; 2] = [0, WATER_LAYER];
 
 /// The layer only the unshadowed sun copy and a shadowless reflection view are on; see
-/// [`crate::shadow_route`]. No main view and no source light is ever on it.
+/// [`crate::shadow_route`]. No main view and no source light is ever on it. World content carries
+/// it **beside** [`WORLD_LAYER`] ([`reflectable_layers`]), never instead of it: an entity is on
+/// this layer so the shadowless route still draws it, and on the world layer so every other view
+/// and the source sun keep drawing it exactly as before.
 ///
 /// Main has this as layer 3. The portal already uses 2 for the destination space
 /// ([`crate::portal::DESTINATION_LAYER`]) and 3 for the door layer
-/// ([`crate::door_layer::DOOR_LAYER`]), whose doors are on layer 0 as well: on 3 the shadowless
-/// reflection would draw them lit by the unshadowed copy. So the replica takes the next free layer.
+/// ([`crate::door_layer::DOOR_LAYER`]), whose doors are on layer 0 as well: the replica takes the
+/// next free layer, so a door-layer door's own set and this one stay distinct layers even though
+/// the door is drawn by both routes.
 pub const UNSHADOWED_REFLECTION_LAYER: Layer = 4;
 
 /// What the water reflection camera draws while its policy says shadows off: the reflected world
@@ -388,11 +392,35 @@ pub const UNSHADOWED_REFLECTION_LAYER: Layer = 4;
 /// meant to be the same content as [`REFLECTION_VIEW_LAYERS`] on the other route.
 pub const UNSHADOWED_REFLECTION_VIEW_LAYERS: &[Layer] = &[UNSHADOWED_REFLECTION_LAYER];
 
-/// The layers an entity the reflection draws belongs to: the world layer, which the main view and
-/// the source sun see, and [`UNSHADOWED_REFLECTION_LAYER`], which the shadowless reflection route
-/// sees. Terrain carries it; a water surface never does.
+/// The layers an entity the water reflection draws belongs to, given the layers it belongs to
+/// anyway: `own`, plus [`UNSHADOWED_REFLECTION_LAYER`] whenever the shadowed reflection route draws
+/// `own` ([`REFLECTION_VIEW_LAYERS`]).
+///
+/// The two routes must draw the **same content** - the shadowless one is that picture with the
+/// sun's cascades left out, not a thinner scene - so every producer of content the reflection shows
+/// routes its layers through here: the plain nodes and terrain of a streamed cell
+/// ([`crate::portal`]'s stamping, `crate::streaming`), a sky dome, the LOD ring, the door layer's
+/// doors, a point light. A route that drew less would be a cheaper reflection bought by dropping
+/// content rather than by dropping shadows.
+///
+/// Content no reflection draws is returned untouched, so nothing a doorway alone puts on screen can
+/// leak into a reflection of the space the observer is in: a water surface ([`WATER_LAYER`]), the
+/// destination space ([`crate::portal::DESTINATION_LAYER`]), the portal's quad and the doorway
+/// filler all stay on their own layers.
+pub fn reflectable_layers(own: &RenderLayers) -> RenderLayers {
+    if own.intersects(&RenderLayers::from_layers(REFLECTION_VIEW_LAYERS)) {
+        own.clone().with(UNSHADOWED_REFLECTION_LAYER)
+    } else {
+        own.clone()
+    }
+}
+
+/// The layers an entity of the world belongs to: the world layer, which the main view and the
+/// source sun see, and [`UNSHADOWED_REFLECTION_LAYER`], which the shadowless reflection route
+/// sees. Terrain carries it, and so does every node a streamed cell stamps; a water surface never
+/// does.
 pub fn reflectable_world_layers() -> RenderLayers {
-    RenderLayers::from_layers(&[WORLD_LAYER, UNSHADOWED_REFLECTION_LAYER])
+    reflectable_layers(&RenderLayers::layer(WORLD_LAYER))
 }
 
 /// What a point or spot light belongs to: [`LIGHT_LAYERS`] plus [`UNSHADOWED_REFLECTION_LAYER`].
@@ -2510,7 +2538,8 @@ mod tests {
     }
 
     /// The replica layer is a layer of its own on this branch too: not the water's, not the
-    /// portal destination's and not the door layer's.
+    /// portal destination's and not the door layer's. Content carries it *beside* the world layer,
+    /// not instead of it, so no view gains or loses a thing from either route's membership.
     #[test]
     fn the_replica_layer_is_no_other_layer() {
         for layer in [
@@ -2523,12 +2552,101 @@ mod tests {
         }
         assert!(
             !RenderLayers::from_layers(&MAIN_VIEW_LAYERS)
-                .intersects(&RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER))
+                .intersects(&RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER)),
+            "the main camera is never on the replica layer"
         );
-        assert!(
-            !crate::door_layer::door_layers()
-                .intersects(&RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER))
-        );
+        let world = reflectable_world_layers();
+        assert!(world.intersects(&RenderLayers::layer(WORLD_LAYER)));
+        assert!(world.intersects(&RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER)));
+        // Widening is a union: what a node was already on stays on it.
+        for own in [
+            RenderLayers::layer(WORLD_LAYER),
+            RenderLayers::from_layers(&MAIN_VIEW_LAYERS),
+            crate::door_layer::door_layers(),
+            RenderLayers::none(),
+            RenderLayers::layer(WATER_LAYER),
+            RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+        ] {
+            let widened = reflectable_layers(&own);
+            for layer in own.iter() {
+                assert!(
+                    widened.intersects(&RenderLayers::layer(layer)),
+                    "widening dropped layer {layer} of {own:?}"
+                );
+            }
+        }
+    }
+
+    /// The shadowless route draws the same content the shadowed one does - only without the sun's
+    /// cascades. Every kind of content the world layer holds is here with whether a reflection draws
+    /// it at all, and both routes have to agree: a route whose membership is smaller is a cheaper
+    /// reflection bought by dropping content (impl-1094: the portal stamped its cells with the world
+    /// layer alone, so the shadowless route drew terrain only).
+    #[test]
+    fn both_reflection_routes_draw_the_same_content() {
+        let shadowed = RenderLayers::from_layers(REFLECTION_VIEW_LAYERS);
+        let shadowless = RenderLayers::from_layers(UNSHADOWED_REFLECTION_VIEW_LAYERS);
+        let producers: [(&str, RenderLayers, bool); 8] = [
+            (
+                "terrain and the plain nodes of a cell",
+                reflectable_world_layers(),
+                true,
+            ),
+            (
+                "a reference's model on the placed-object layer",
+                reflectable_layers(&RenderLayers::layer(PLACED_OBJECT_LAYER)),
+                true,
+            ),
+            (
+                "a node a mod put on the world layer",
+                reflectable_layers(&RenderLayers::layer(WORLD_LAYER)),
+                true,
+            ),
+            (
+                "a light's own layers",
+                RenderLayers::from_layers(&POINT_LIGHT_LAYERS),
+                true,
+            ),
+            (
+                "a sky dome on the main camera's layers",
+                reflectable_layers(&RenderLayers::from_layers(&MAIN_VIEW_LAYERS)),
+                true,
+            ),
+            (
+                "the door layer's doors",
+                crate::door_layer::door_layers(),
+                true,
+            ),
+            ("a water surface", RenderLayers::layer(WATER_LAYER), false),
+            (
+                "the portal's destination space",
+                RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+                false,
+            ),
+        ];
+        for (what, layers, drawn) in producers {
+            assert_eq!(
+                layers.intersects(&shadowed),
+                drawn,
+                "the shadowed route and {what}: {layers:?}"
+            );
+            assert_eq!(
+                layers.intersects(&shadowless),
+                drawn,
+                "the shadowless route and {what}: {layers:?} - the two routes must draw the same \
+                 content"
+            );
+        }
+        // Non-vacuous: the content a reflection is supposed to show is drawn by both, so the
+        // agreement above is not two routes agreeing on nothing.
+        assert!(reflection_draws_a_whole_world());
+    }
+
+    /// Whether the shadowed reflection view draws the world layer at all - the fixture check the
+    /// parity test above needs, kept in one place so a change to [`REFLECTION_VIEW_LAYERS`] that
+    /// emptied it would fail the test that leans on it rather than making it vacuous.
+    fn reflection_draws_a_whole_world() -> bool {
+        RenderLayers::from_layers(REFLECTION_VIEW_LAYERS).intersects(&reflectable_world_layers())
     }
 
     #[test]

@@ -586,6 +586,14 @@ pub(super) fn collect_lod_chunks(
                     -(local_grid_y as f32) * CELL_SIZE,
                 ),
                 Visibility::Hidden,
+                // The ring is distant *world* content: the main camera draws it on layer 0, so the
+                // water reflection draws it on either shadow route - `reflectable_world_layers`, and
+                // a `Propagate` source so the chunk's glTF meshes, which appear frames later, pick
+                // the value up exactly as a streamed cell's nodes do (impl-1094). A ring left on
+                // layer 0 alone would be the shadowless route's largest hole: everything past the
+                // streaming radius is all that is left of the world in a wide reflection.
+                crate::render::reflectable_world_layers(),
+                bevy::app::Propagate(crate::render::reflectable_world_layers()),
                 PendingLodChunk {
                     metadata,
                     asset,
