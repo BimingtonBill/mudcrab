@@ -1865,8 +1865,8 @@ mod tests {
         // rewrites the fog (the system above is listening for the horizon) and must not pull the
         // plane it was reached at back in, or the LOD that announced the horizon is clipped away.
         let horizon = cell * 91.0;
-        let Some(mut projection) = app.world_mut().entity_mut(camera).get_mut::<Projection>()
-        else {
+        let mut camera_entity = app.world_mut().entity_mut(camera);
+        let Some(mut projection) = camera_entity.get_mut::<Projection>() else {
             panic!("the streaming camera carries a projection");
         };
         match projection.as_mut() {
