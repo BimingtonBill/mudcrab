@@ -304,6 +304,11 @@ pub struct StreamingWorld {
     /// interior this way and checks it stays. A caller that needs to let a cell go again adds an
     /// unpin here rather than leaving the cell pinned.
     pinned: HashSet<CellKey>,
+    /// The retire backlog [`despawn_cells`] saw on its last run: the backlog at the start of that
+    /// frame's drain, cleared when the drain emptied it. The next frame compares its own backlog
+    /// against this to tell sustained growth (flight retiring cells faster than the budget drains
+    /// them) from a one-frame burst, which a crossing retires all at once.
+    last_retire_backlog: usize,
 }
 
 impl StreamingWorld {
@@ -747,6 +752,11 @@ pub struct StreamingMetrics {
     pub peak_retiring_cells: usize,
     pub revived_cells: u64,
     pub retire_backlog_overflows: u64,
+    /// Frames the retire backlog sat above its bound but stayed paced: a crossing's worldspace
+    /// draining at the budget, one drain frame at a time, instead of un-bounding. Kept apart from
+    /// [`Self::retire_backlog_overflows`], which counts only escape trips, so a pricing window
+    /// can tell a healthy crossing drain from a pacer that lost.
+    pub retire_backlog_drains: u64,
     pub static_colliders_authored: u64,
     pub static_colliders_partial: u64,
     pub static_colliders_proxy: u64,
@@ -1438,13 +1448,14 @@ fn other_detail(detail: CellDetail) -> CellDetail {
     }
 }
 
-/// How many cells may wait for their turn in the unload budget before the pacer gives up on pacing
-/// and unloads every one of them in a single frame.
+/// How many cells may wait for their turn before the unload pacer's escape arms.
 ///
-/// One whole window at the unload radius, `(2 * r + 1)^2` cells: the most a single crossing or
-/// teleport can retire at once. Both are paced, so the overflow path only fires when sustained
-/// flight keeps retiring cells faster than the budget unloads them, the case where holding on to
-/// the backlog costs more than one larger frame.
+/// One whole window at the unload radius, `(2 * r + 1)^2` cells: what a single crossing or
+/// teleport was assumed to retire at once. That assumption does not hold - a worldspace-changing
+/// crossing retires the whole loaded exterior set, several windows' worth - so the bound is not a
+/// cap by itself. [`despawn_cells`] un-bounds the drain only when a backlog above it also failed
+/// to shrink against the last frame's: sustained flight retiring cells faster than the budget
+/// drains them, the case where holding on to the backlog costs more than one larger frame.
 fn retire_backlog_bound(unload_radius: i32) -> usize {
     let side = 2 * unload_radius.max(0) as usize + 1;
     side * side
@@ -1463,20 +1474,35 @@ fn cell_order_key(key: CellKey) -> (u32, i32, i32, u32) {
     }
 }
 
-/// Unloads retiring cells, at most `max_cell_unloads_per_frame` of them per frame.
+/// Unloads retiring cells under the frame's unload budget.
+///
+/// The budget is wall-clock time (`EngineConfig::max_unload_ms_per_frame`): cells go in
+/// [`cell_order_key`] order until the clock is spent, always at least one of them, so a backlog
+/// bigger than the budget drains over several frames instead of landing on one - a catastrophic
+/// crossing retires a whole worldspace at once, far past what a per-frame cell count can pace.
+/// `0` turns the clock off and paces by the old cell count (`max_cell_unloads_per_frame`), as
+/// before the time budget existed.
+///
+/// Whatever paces it, the drain keeps one escape: a backlog above [`retire_backlog_bound`] that
+/// also failed to shrink against the last frame's says the pacer is losing - flight retiring
+/// cells faster than it drains - and un-bounds for that frame. A crossing's burst, which shrinks
+/// every drain frame, never trips it.
 ///
 /// This is an exclusive system on purpose: a command-buffered `despawn` only queues the removal and
 /// the real work happens later at a schedule sync point, where no span can see it - and the whole
 /// point of the budget is to keep that work off one frame.
 fn despawn_cells(world: &mut World) {
-    let (budget, backlog_bound) = {
+    let (count_budget, spent_by, backlog_bound) = {
         let config = world.resource::<EngineConfig>();
         (
-            // `0` is unbudgeted: every retiring cell unloads at once, as before the budget.
+            // The count path's `0` is unbudgeted: every retiring cell unloads at once, as before
+            // the budget. It paces the drain only while the time budget is off.
             match config.max_cell_unloads_per_frame {
                 0 => usize::MAX,
                 budget => budget,
             },
+            (config.max_unload_ms_per_frame > 0.0)
+                .then(|| Duration::from_secs_f64(config.max_unload_ms_per_frame / 1000.0)),
             retire_backlog_bound(config.unload_radius),
         )
     };
@@ -1490,6 +1516,7 @@ fn despawn_cells(world: &mut World) {
         })
         .collect();
     if retiring.is_empty() {
+        world.resource_mut::<StreamingWorld>().last_retire_backlog = 0;
         world.resource_mut::<StreamingMetrics>().despawns_this_frame = 0;
         world
             .resource_mut::<ProfilingState>()
@@ -1498,22 +1525,52 @@ fn despawn_cells(world: &mut World) {
     }
     retiring.sort_by_key(|(key, _)| cell_order_key(*key));
     let backlog = retiring.len();
-    let overflow = backlog > backlog_bound;
-    let budget = if overflow {
-        backlog
-    } else {
-        budget.min(backlog)
-    };
+    // The escape trips on drain failure, not on size: a crossing's burst sits above the bound the
+    // frame it lands and shrinks from then on, while a pacer losing the race leaves the backlog no
+    // smaller than the last frame left it. A first-ever backlog has no last frame to fail against
+    // (`last_retire_backlog` is zero), so it drains paced too.
+    let last_backlog = world.resource::<StreamingWorld>().last_retire_backlog;
+    let overflow = backlog > backlog_bound && last_backlog > 0 && backlog >= last_backlog;
     let started = Instant::now();
     let mut entities = 0usize;
-    for (_, root) in retiring.iter().take(budget) {
-        entities = entities.saturating_add(despawn_subtree(world, *root));
-    }
+    let budget = match spent_by {
+        // The time budget: walk the stable order and read the clock after each subtree. A subtree
+        // that has started always finishes, and at least one cell always goes, so the backlog
+        // always drains.
+        Some(spent) if !overflow => {
+            let mut budget = 0usize;
+            for (_, root) in retiring.iter() {
+                entities = entities.saturating_add(despawn_subtree(world, *root));
+                budget += 1;
+                if started.elapsed() >= spent {
+                    break;
+                }
+            }
+            budget
+        }
+        // The count budget, or the escape: a fixed prefix, the escape taking the whole backlog.
+        _ => {
+            let budget = if overflow {
+                backlog
+            } else {
+                count_budget.min(backlog)
+            };
+            for (_, root) in retiring.iter().take(budget) {
+                entities = entities.saturating_add(despawn_subtree(world, *root));
+            }
+            budget
+        }
+    };
+    let remaining = backlog - budget;
     if budget > 0 {
         world.resource_mut::<lod::LodStreaming>().visibility_dirty = true;
     }
     {
         let mut streaming = world.resource_mut::<StreamingWorld>();
+        // The next frame compares against this frame's backlog - not the remainder, or a drain of
+        // one cell a frame would read as "no shrink" - cleared when the drain emptied it, so a
+        // fresh burst after a finished drain never reads as sustained growth.
+        streaming.last_retire_backlog = if remaining == 0 { 0 } else { backlog };
         for (key, _) in retiring.iter().take(budget) {
             streaming.cells.remove(key);
         }
@@ -1525,7 +1582,6 @@ fn despawn_cells(world: &mut World) {
             .event(format!("{key:?}"), "unloaded", None);
     }
     let cells = budget as u64;
-    let remaining = backlog - budget;
     let max_despawns_per_frame = {
         let mut metrics = world.resource_mut::<StreamingMetrics>();
         metrics.retiring_cells = remaining;
@@ -1536,6 +1592,10 @@ fn despawn_cells(world: &mut World) {
         metrics.max_despawns_per_frame = metrics.max_despawns_per_frame.max(cells);
         if overflow {
             metrics.retire_backlog_overflows = metrics.retire_backlog_overflows.saturating_add(1);
+        } else if backlog > backlog_bound {
+            // A drain frame: the backlog sat above the bound and the pacer kept pacing it, a
+            // crossing's worldspace going out one budgeted frame at a time.
+            metrics.retire_backlog_drains = metrics.retire_backlog_drains.saturating_add(1);
         }
         metrics.max_despawns_per_frame
     };
@@ -1555,8 +1615,11 @@ fn despawn_cells(world: &mut World) {
         warn!(
             backlog,
             bound = backlog_bound,
-            "retire backlog exceeded its bound; unloading every retiring cell at once"
+            "retire backlog outgrew the drain; unloading every retiring cell at once"
         );
+    } else if backlog > backlog_bound {
+        profiler.increment("streaming/retire_backlog_drains", 1);
+        profiler.event("streaming", "retire_backlog_drain", Some(backlog as f64));
     }
 }
 
@@ -6979,6 +7042,9 @@ mod tests {
             terrain_radius: 3,
             unload_radius: 4,
             max_cell_unloads_per_frame: unload_budget,
+            // These tests pace by the cell count, the path the time budget replaces; the wall-clock
+            // budget's own tests set `max_unload_ms_per_frame` instead.
+            max_unload_ms_per_frame: 0.0,
             ..EngineConfig::default()
         }
     }
@@ -7286,6 +7352,8 @@ mod tests {
             terrain_radius: 1,
             unload_radius: 1,
             max_cell_unloads_per_frame: 2,
+            // This test paces by the cell count, the path the time budget replaces.
+            max_unload_ms_per_frame: 0.0,
             ..EngineConfig::default()
         });
         spawn_camera(&mut app, IVec2::ZERO);
@@ -7316,6 +7384,149 @@ mod tests {
         assert_eq!(overflowed.unloaded_cells, 28);
         assert_eq!(resident_root_count(&mut app), 0);
         assert_eq!(overflowed.streaming_invariant_failures, 0);
+    }
+
+    /// A retiring cell whose subtree is heavy enough that despawning it costs microseconds - far
+    /// more than the time-budget tests' 100 ns - so the drain takes one cell a frame and the frame
+    /// counts in those tests are exact however fast the clock reads.
+    fn spawn_heavy_mock_cell(app: &mut App, grid_x: i32, grid_y: i32, children: usize) -> Entity {
+        let root = app
+            .world_mut()
+            .spawn((
+                CellRef(cell_id_of(grid_x, grid_y)),
+                StreamedCellRoot,
+                ExteriorCellGrid(IVec2::new(grid_x, grid_y)),
+                Transform::default(),
+                Visibility::default(),
+            ))
+            .id();
+        for _ in 0..children {
+            app.world_mut().spawn((Transform::default(), ChildOf(root)));
+        }
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                exterior_cell(grid_x, grid_y),
+                CellStatus::Retiring {
+                    root,
+                    detail: CellDetail::Full,
+                },
+            );
+        root
+    }
+
+    /// A time-budget config at the bound's smallest window: 9 cells, at `unload_radius` 1. The
+    /// budget of 100 ns is spent by any one subtree, so a paced frame takes one heavy cell.
+    fn unload_time_config() -> EngineConfig {
+        EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 1,
+            unload_radius: 1,
+            max_cell_unloads_per_frame: 0,
+            max_unload_ms_per_frame: 0.0001,
+            ..EngineConfig::default()
+        }
+    }
+
+    /// A crossing-shaped backlog - far more retiring cells than the bound's one window - drains
+    /// paced at the time budget: every frame takes one budgeted cell, nothing un-bounds, and the
+    /// crossing-drain frames are counted apart from the overflows, which stay at zero.
+    #[test]
+    fn a_crossing_backlog_drains_over_frames_at_the_time_budget() {
+        let (mut app, _directory) = streaming_test_app(unload_time_config());
+        spawn_camera(&mut app, IVec2::ZERO);
+        // 120 retiring exteriors, more than twice the bound of 9: the shape the old override
+        // unloaded all at once, on the one frame that could least afford it.
+        for grid_x in 10..130 {
+            spawn_heavy_mock_cell(&mut app, grid_x, 0, 200);
+        }
+        let mut frames = 0usize;
+        loop {
+            app.update();
+            let metrics = streaming_metrics(&app);
+            frames += 1;
+            assert_eq!(
+                metrics.despawns_this_frame, 1,
+                "frame {frames} drained {} cells against a 100 ns budget",
+                metrics.despawns_this_frame
+            );
+            assert_eq!(metrics.retire_backlog_overflows, 0, "frame {frames}");
+            assert!(
+                metrics.retiring_cells == 120 - frames,
+                "frame {frames} left {} retiring",
+                metrics.retiring_cells
+            );
+            if metrics.retiring_cells == 0 {
+                break;
+            }
+            assert!(frames < 121, "the backlog never drained");
+        }
+        assert_eq!(frames, 120, "one cell a frame drains the 120 in 120 frames");
+        let metrics = streaming_metrics(&app);
+        assert_eq!(metrics.unloaded_cells, 120);
+        // Every frame whose backlog sat above the bound of 9 counted as a drain frame: the first
+        // 111 of the 120 (the last backlog above it is 10, on frame 111).
+        assert_eq!(metrics.retire_backlog_drains, 111);
+        assert_eq!(metrics.retire_backlog_overflows, 0);
+        assert_eq!(resident_root_count(&mut app), 0);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    /// A backlog that grows across frames - flight retiring cells faster than the budget drains
+    /// them - trips the escape exactly once, and the frame it trips takes the whole backlog at
+    /// once. The burst before it, which shrinks every frame, stays paced.
+    #[test]
+    fn a_backlog_that_grows_across_frames_trips_the_escape_once() {
+        let (mut app, _directory) = streaming_test_app(unload_time_config());
+        spawn_camera(&mut app, IVec2::ZERO);
+        // The burst: 12 retiring cells, above the bound of 9 but never drained before, so there is
+        // no last frame's backlog to have failed against. It drains paced and leaves its remainder
+        // as the next frame's baseline.
+        for grid_x in 10..22 {
+            spawn_heavy_mock_cell(&mut app, grid_x, 0, 200);
+        }
+        app.update();
+        let burst = streaming_metrics(&app);
+        assert_eq!(burst.despawns_this_frame, 1);
+        assert_eq!(burst.retiring_cells, 11);
+        assert_eq!(burst.retire_backlog_overflows, 0);
+        assert_eq!(burst.retire_backlog_drains, 1);
+
+        // The growth: 12 more retire while the drain took one. The backlog is above the bound and
+        // above what the last frame left, so the escape un-bounds and the whole backlog goes now.
+        for grid_x in 22..34 {
+            spawn_heavy_mock_cell(&mut app, grid_x, 0, 200);
+        }
+        app.update();
+        let escaped = streaming_metrics(&app);
+        assert_eq!(
+            escaped.despawns_this_frame, 23,
+            "un-bound: the whole backlog in one frame"
+        );
+        assert_eq!(escaped.retiring_cells, 0);
+        assert_eq!(escaped.retire_backlog_overflows, 1);
+        assert_eq!(
+            escaped.retire_backlog_drains, 1,
+            "the escape frame is not a drain frame"
+        );
+        assert_eq!(resident_root_count(&mut app), 0);
+
+        // After the escape the pacer is paced again: a fresh backlog below the bound drains at the
+        // budget, and no second trip is counted.
+        for grid_x in 40..43 {
+            spawn_heavy_mock_cell(&mut app, grid_x, 0, 200);
+        }
+        app.update();
+        let settled = streaming_metrics(&app);
+        assert_eq!(settled.despawns_this_frame, 1);
+        assert_eq!(settled.retiring_cells, 2);
+        assert_eq!(settled.retire_backlog_overflows, 1);
+        assert_eq!(
+            settled.retire_backlog_drains, 1,
+            "3 cells sit below the bound"
+        );
+        assert_eq!(settled.streaming_invariant_failures, 0);
     }
 
     /// A space change is not paced: crossing into an interior takes the exterior window and the
@@ -7366,6 +7577,8 @@ mod tests {
             terrain_radius: 1,
             unload_radius: 1,
             max_cell_unloads_per_frame: 1,
+            // This test paces by the cell count, the path the time budget replaces.
+            max_unload_ms_per_frame: 0.0,
             ..EngineConfig::default()
         });
         spawn_camera(&mut app, IVec2::ZERO);
@@ -7397,10 +7610,12 @@ mod tests {
         assert_eq!(metrics.streaming_invariant_failures, 0);
     }
 
-    /// A full-detail cell that is still drawn while it waits for the pacer counts as resident, so a
-    /// door gate or a `--shots` pose waiting on it does not give up on a cell that is still there -
-    /// including one that is *not* pre-streamed behind a door. A ring cell, which holds only its
-    /// landscape, is not resident in either state.
+    /// A full-detail cell the door gate still counts as resident (`is_resident`) while it waits
+    /// for the pacer, so a gate or a `--shots` pose waiting on it does not give up on a cell that
+    /// is still there - including one that is *not* pre-streamed behind a door. That is gate
+    /// visibility, not render visibility: `isolate_cells` re-classifies the roots every frame and
+    /// a retiring cell renders as `CellRole::Hidden`, drawn by nothing. A ring cell, which holds
+    /// only its landscape, is not resident in either state.
     #[test]
     fn a_retiring_full_destination_is_still_resident() {
         let (mut app, _directory) = streaming_test_app(EngineConfig {
@@ -7408,6 +7623,8 @@ mod tests {
             terrain_radius: 1,
             unload_radius: 1,
             max_cell_unloads_per_frame: 1,
+            // This test paces by the cell count, the path the time budget replaces.
+            max_unload_ms_per_frame: 0.0,
             ..EngineConfig::default()
         });
         spawn_camera(&mut app, IVec2::ZERO);
