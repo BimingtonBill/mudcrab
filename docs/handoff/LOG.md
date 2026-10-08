@@ -53,7 +53,8 @@ Track: Portal. Nothing pushed. Wrapping up at the user's word (via Team Lead).
   per_view_shadow_pass and shared_shadow_pass in each camera's Core3d schedule outside any set
   (bevy_pbr-0.19.0 lib.rs:424-444), so 1088's shadow_views counts only point and spot lights.
 - impl-1093 (brief 4ebcc0df): laps around those four Bevy shadow systems, in a column render/graph/shadow_passes.
-  The coder was in its gated clippy at wrap-up; let it finish. Tomorrow's morning window reads 1088 and 1093
+  Finished at wrap-up: committed 3a9503f6 in local/impl/impl-1093-portal-shadow-pass-laps, ds_impl acceptance
+  passed (clippy, nextest). Not yet reviewed or merged: review it first thing, then merge before the window. Tomorrow's morning window reads 1088 and 1093
   together (portal-heavy x3) to name the ~5 ms gap.
 - B5 room culling: impl-1085 committed at 16fad023 in local/impl/impl-1085-portal-room-culling-default. It turns
   culling on by default where the DB has rooms, adds --room-culling=off and a culled-count counter. Green but NOT
