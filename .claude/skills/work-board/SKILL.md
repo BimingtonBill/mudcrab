@@ -22,6 +22,13 @@ The PostToolUse hook `tools/work_board_hook.py` (in `.claude/settings.local.json
 `current.json` after git commit/merge/push/branch and `gh pr` commands and asks for step 2 when the
 cards changed. It nudges only the session ids listed in `local/board/hook-session.txt`.
 
+## Live updates
+
+While the user wants the board live, run `python tools/work_board_watch.py --every 120` under the
+Monitor tool (timeout 30 min, re-arm on expiry). It prints one line only when the cards change; on
+each line do the Refresh step 2 push, then copy `pending.sha256` over `pushed.sha256` and the
+current cards (column + title) into `pushed-cards.json`. No message to the user for routine pushes.
+
 ## Inline instead
 
 `python tools/work_board.py --widget` prints an HTML fragment for the inline widget tool
