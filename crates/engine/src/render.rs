@@ -398,10 +398,11 @@ pub const UNSHADOWED_REFLECTION_VIEW_LAYERS: &[Layer] = &[UNSHADOWED_REFLECTION_
 ///
 /// The two routes must draw the **same content** - the shadowless one is that picture with the
 /// sun's cascades left out, not a thinner scene - so every producer of content the reflection shows
-/// routes its layers through here: the plain nodes and terrain of a streamed cell
-/// ([`crate::portal`]'s stamping, `crate::streaming`), a sky dome, the LOD ring, the door layer's
-/// doors, a point light. A route that drew less would be a cheaper reflection bought by dropping
-/// content rather than by dropping shadows.
+/// widens its layers through here: the plain nodes and terrain of a streamed cell
+/// ([`crate::portal`]'s stamping, `crate::streaming`), a sky dome, the LOD ring and the door
+/// layer's doors. A point light needs the layer too and names it directly
+/// ([`POINT_LIGHT_LAYERS`]), since a light's layers are not content layers. A route that drew less
+/// would be a cheaper reflection bought by dropping content rather than by dropping shadows.
 ///
 /// Content no reflection draws is returned untouched, so nothing a doorway alone puts on screen can
 /// leak into a reflection of the space the observer is in: a water surface ([`WATER_LAYER`]), the

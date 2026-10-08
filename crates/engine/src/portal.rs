@@ -9866,21 +9866,19 @@ mod tests {
         assert_eq!(layers_of(&app, water), RenderLayers::none());
 
         // The player walks in: in the one frame the new space is seen in, the reference and its
-        // model are back on the placed-object layer and the water surface on the layer of its own.
+        // model are back on the placed-object layer - widened by the reflection replica layer, since
+        // placed objects are world content the water reflection draws (impl-1094) - and the water
+        // surface on the layer of its own.
         *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
             worldspace_id: TAMRIEL,
             interior: Some(PRESTREAMED_CELL),
         };
         update(&mut app, 1);
         assert!(on_main_camera(&app, mesh));
-        assert_eq!(
-            layers_of(&app, reference),
-            crate::render::PLACED_OBJECT_RENDER_LAYERS
-        );
-        assert_eq!(
-            layers_of(&app, model),
-            crate::render::PLACED_OBJECT_RENDER_LAYERS
-        );
+        let placed_objects =
+            crate::render::reflectable_layers(&crate::render::PLACED_OBJECT_RENDER_LAYERS);
+        assert_eq!(layers_of(&app, reference), placed_objects);
+        assert_eq!(layers_of(&app, model), placed_objects);
         assert_eq!(layers_of(&app, water), RenderLayers::layer(1));
 
         // And back behind a doorway: the whole cell, model included, is the portal camera's alone.
@@ -10060,9 +10058,10 @@ mod tests {
     /// The water reflection's two routes draw the same content out of a portal run (impl-1094):
     /// every node of the active space - a plain node through the cell's stamp, a node with layers of
     /// its own through [`source_layers`] - is on the layers the shadowed route draws **and** on the
-    /// replica layer the shadowless one draws. A cell only a doorway puts on screen carries neither:
-    /// the portal camera's destination layer is in no reflection, so the space behind a doorway
-    /// cannot appear in the water of the space the player stands in.
+    /// replica layer the shadowless one draws, for every role a cell can have. A cell only a doorway
+    /// puts on screen carries neither: the portal camera's destination layer, the quad's layer and a
+    /// hidden cell's no-layer are in no reflection, so the space behind a doorway cannot appear in
+    /// the water of the space the player stands in.
     #[test]
     fn an_active_cell_is_reflected_and_a_doorways_cell_is_not() {
         let mut app = portal_app();
@@ -10082,11 +10081,17 @@ mod tests {
         let active_key = CellKey::Interior(INTERIOR_ALFTAND01);
         let (active_root, active_plain) =
             spawn_cell(&mut app, INTERIOR_ALFTAND01, None, Some(active_key), None);
+        // The third role: resident, neither the space the player is in nor the space behind the
+        // doorway. Nothing draws it, so nothing may reflect it.
+        let hidden_key = CellKey::Interior(0x0006_1234);
+        let (hidden_root, hidden_plain) =
+            spawn_cell(&mut app, 0x0006_1234, None, Some(hidden_key), None);
         // A node of each cell with layers of its own, the way a mod's node, a placed reference's
         // model or a light carries them: its own layers are what the role is applied to.
         let world = RenderLayers::layer(crate::render::WORLD_LAYER);
         let (active_own, _) = spawn_mesh(&mut app, active_root, Some(world.clone()));
-        let (destination_own, _) = spawn_mesh(&mut app, destination_root, Some(world));
+        let (destination_own, _) = spawn_mesh(&mut app, destination_root, Some(world.clone()));
+        let (hidden_own, _) = spawn_mesh(&mut app, hidden_root, Some(world));
         update(&mut app, 2);
 
         let shadowed = RenderLayers::from_layers(crate::render::REFLECTION_VIEW_LAYERS);
@@ -10106,14 +10111,41 @@ mod tests {
                 "and the shadowless route draws {what} too: {layers:?}"
             );
         }
-        for (what, entity) in [
-            ("a plain node", destination_plain),
-            ("an own-layer node", destination_own),
+        for (role, what, entity) in [
+            (
+                "the cell a doorway alone draws",
+                "a plain node",
+                destination_plain,
+            ),
+            (
+                "the cell a doorway alone draws",
+                "an own-layer node",
+                destination_own,
+            ),
+            ("a hidden cell", "a plain node", hidden_plain),
+            ("a hidden cell", "an own-layer node", hidden_own),
         ] {
             let layers = layers_of(&app, entity);
             assert!(
                 !layers.intersects(&shadowed) && !layers.intersects(&shadowless),
-                "{what} of the cell a doorway alone draws is in no reflection: {layers:?}"
+                "{what} of {role} is in no reflection: {layers:?}"
+            );
+        }
+        // What the portal puts on screen by itself: the doorway's quad, on the water's own layer,
+        // and the destination layer the portal camera draws. Neither is content of the space the
+        // player stands in, so neither may appear in its reflection.
+        for (what, layer) in [
+            ("the portal quad", crate::portal::PORTAL_QUAD_LAYER),
+            ("the destination layer", DESTINATION_LAYER),
+        ] {
+            let layers = RenderLayers::layer(layer);
+            assert!(
+                !layers.intersects(&shadowed),
+                "the shadowed route never draws {what}"
+            );
+            assert!(
+                !layers.intersects(&shadowless),
+                "and the shadowless route never draws {what} either"
             );
         }
     }
