@@ -41,7 +41,7 @@ fn lod_horizon(distances: &TerrainLodDistances) -> f32 {
 }
 
 /// A far plane that keeps every cell within `reach_cells` of the camera's cell.
-fn lod_camera_far(reach_cells: i32) -> f32 {
+pub(crate) fn lod_camera_far(reach_cells: i32) -> f32 {
     CELL_SIZE * (reach_cells as f32 + 0.5) * std::f32::consts::SQRT_2
 }
 

@@ -338,12 +338,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     }
     let atmosphere = {
         let config = app.world().resource::<EngineConfig>();
-        let has_lod = has_lod_data(config, runtime_data.as_ref().map(|(database, ..)| database));
-        atmosphere_applies(
-            interactive,
-            config.effective_terrain_radius(has_lod),
-            config.stream_radius,
-        )
+        // The *configured* ring, not the one resolved for the worldspace the run starts in: the
+        // ring a run draws follows the worldspace the camera is in
+        // ([`EngineConfig::effective_terrain_radius`]), so a run that starts where LOD exists and
+        // crosses into a worldspace without it draws the ring there - and needs the sky, the fog
+        // and the per-space lighting that ring is looked at with. The question this install answers
+        // is whether the run can draw a ring anywhere, and the benchmark rule's ring-off (set on
+        // `config.terrain_radius`, `config.rs`) is what keeps a measured run's lighting flat.
+        atmosphere_applies(interactive, config.terrain_radius, config.stream_radius)
     };
     if atmosphere {
         // The sky, the fog, the ambient and the per-space lighting, in one call: the plugin owns

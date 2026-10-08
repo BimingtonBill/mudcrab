@@ -461,6 +461,13 @@ impl WorldDatabase {
     /// for every worldspace, and so does a worldspace the conversion compiled no chunks for. Both
     /// keep the ring, which is what they drew before LOD was a thing. The answer is read once in
     /// [`Self::open`] and cached for the run.
+    ///
+    /// The answer is worldspace-granular and says nothing about coverage: *one* chunk turns the ring
+    /// off for the whole worldspace, so a mod worldspace or a partial conversion whose LOD covers
+    /// only part of its grid draws LOD where it has chunks and neither LOD nor ring past them, where
+    /// the ring would have drawn ground. Per-area coverage would need a query per frame and is not
+    /// what this asks; a conversion that compiles LOD for a worldspace is expected to compile it for
+    /// its whole reach (the converter walks the grid), so the assumption is the conversion's.
     pub fn has_lod_for(&self, worldspace_id: u32) -> bool {
         self.lod_worldspaces.contains(&worldspace_id)
     }

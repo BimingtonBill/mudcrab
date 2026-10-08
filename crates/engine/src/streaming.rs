@@ -6123,6 +6123,28 @@ mod tests {
             .unwrap();
     }
 
+    /// [`write_plan_database`] plus the `lod_chunks` table, holding one chunk of `worldspace_id` and
+    /// none of any other worldspace: the ring is off in the first and on in the rest
+    /// ([`WorldDatabase::has_lod_for`], the resolver's second rule). The table's shape is the
+    /// converter's own (`crates/converter/src/lod/terrain.rs`), though the planner only ever reads
+    /// `worldspace_id` out of it.
+    fn write_plan_database_with_lod_for(path: &std::path::Path, worldspace_id: u32) {
+        write_plan_database(path);
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(&format!(
+                r#"CREATE TABLE lod_chunks(
+                    worldspace_id INTEGER NOT NULL,tier INTEGER NOT NULL,anchor_x INTEGER NOT NULL,anchor_y INTEGER NOT NULL,
+                    payload_path TEXT NOT NULL,content_hash TEXT NOT NULL,
+                    bounds_min_x REAL NOT NULL,bounds_min_y REAL NOT NULL,bounds_min_z REAL NOT NULL,
+                    bounds_max_x REAL NOT NULL,bounds_max_y REAL NOT NULL,bounds_max_z REAL NOT NULL,
+                    source_cells TEXT NOT NULL,PRIMARY KEY(worldspace_id,tier,anchor_x,anchor_y));
+                INSERT INTO lod_chunks VALUES({worldspace_id},4,0,0,'lod/0/4/cell_0_0.glb','{hash}',0.0,0.0,0.0,0.0,0.0,0.0,'0,0');"#,
+                hash = "a".repeat(64)
+            ))
+            .unwrap();
+    }
+
     /// A database in which worldspace 60's grid (2,-3) is cell 1 and that cell has landscape. It
     /// carries the reference tables too - empty - so a full request for the same cell resolves to a
     /// cell with no references rather than failing on a missing table.
@@ -6967,6 +6989,103 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// The ring is a property of the worldspace the camera is in, not of the one the run started
+    /// in: a worldspace the database holds LOD chunks for draws none of it and everything to the LOD
+    /// (`EngineConfig::effective_terrain_radius`, whose resolver the plan runs every frame), and one
+    /// without LOD data keeps the configured ring. Both directions of the switch, in one plan.
+    #[test]
+    fn the_terrain_ring_follows_the_active_worldspaces_lod_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database_with_lod_for(&path, 614);
+        let config = EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 2,
+            ..EngineConfig::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, plan_cells);
+        let translation = Vec3::new(100.0, 40.0, -200.0);
+        let center = camera_grid(translation, IVec2::ZERO);
+        app.world_mut()
+            .spawn((Transform::from_translation(translation), StreamingCamera));
+        app.update();
+
+        // Worldspace 60 has no `lod_chunks` row, so the ring is the configured one: two cells deep,
+        // around the full-detail grid of `stream_radius`.
+        let ring = planned_keys(&app);
+        assert_eq!(
+            ring.len(),
+            25,
+            "a worldspace without LOD data plans the 2-cell ring"
+        );
+        assert!(ring.iter().all(|key| matches!(
+            key,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                ..
+            }
+        )));
+        let ring_cell = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: center.x + 2,
+            grid_y: center.y,
+        };
+        assert!(
+            ring.contains(&ring_cell),
+            "the ring's own cells are planned, and {ring_cell:?} is not among the {} planned",
+            ring.len()
+        );
+
+        // Worldspace 614 has one, so it draws its own distant terrain and the plan wants nothing
+        // beyond the full-detail grid - the same crossing the review found the far plane did not
+        // follow, planned from the other side.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 614,
+            interior: None,
+        };
+        app.update();
+
+        let lod = planned_keys(&app);
+        assert_eq!(
+            lod.len(),
+            9,
+            "a worldspace with LOD data plans its full-detail grid and leaves the ring to the LOD"
+        );
+        assert!(lod.iter().all(|key| matches!(
+            key,
+            CellKey::Exterior {
+                worldspace_id: 614,
+                ..
+            }
+        )));
+        assert!(
+            !lod.contains(&CellKey::Exterior {
+                worldspace_id: 614,
+                grid_x: center.x + 2,
+                grid_y: center.y,
+            }),
+            "the cell the LOD draws is not planned as a ring cell"
+        );
+        assert!(
+            !lod.contains(&ring_cell),
+            "the worldspace just left is unloaded, ring and all"
+        );
     }
 
     // --- The paced unload budget (upstream main's `despawn_cells`) ------------------------------
