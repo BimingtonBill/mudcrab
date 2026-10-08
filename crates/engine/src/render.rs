@@ -408,6 +408,10 @@ pub const UNSHADOWED_REFLECTION_VIEW_LAYERS: &[Layer] = &[UNSHADOWED_REFLECTION_
 /// leak into a reflection of the space the observer is in: a water surface ([`WATER_LAYER`]), the
 /// destination space ([`crate::portal::DESTINATION_LAYER`]), the portal's quad and the doorway
 /// filler all stay on their own layers.
+///
+/// This is the one rule: a new producer of content the world layer draws widens its layers here
+/// rather than naming [`UNSHADOWED_REFLECTION_LAYER`] itself, or it ships a thing the shadowless
+/// route silently drops.
 pub fn reflectable_layers(own: &RenderLayers) -> RenderLayers {
     if own.intersects(&RenderLayers::from_layers(REFLECTION_VIEW_LAYERS)) {
         own.clone().with(UNSHADOWED_REFLECTION_LAYER)
