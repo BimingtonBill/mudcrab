@@ -3,6 +3,29 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Phase 2 Dev, Hermes (impl-1059 + impl-1060 briefs: the two ranked crossing fixes)
+
+Track: phase 2. Committed `tasks/impl-1059-p2-despawn-time-budget.md` and
+`tasks/impl-1060-p2-preupdate-finalize-pacing.md` (383e5e99, on portal) — the fix briefs Upstream
+Dev's ranked list was waiting on. **Correction to the re-profile report §7.1:** "drains over ~9
+frames at the normal budget" is wrong — `max_cell_unloads_per_frame` defaults to **2** and the
+demo passes no override, so a plain override-drop means a ~217-frame (~1.4 s) drain. impl-1059
+therefore replaces the cell-count budget with a per-frame **time** budget
+(`--max-unload-ms-per-frame`, default from the window's A/B, 0 = old unbudgeted path) and keeps
+the overflow escape but trips it on *sustained backlog growth* (retire rate > drain rate), not on
+a one-frame crossing burst — the escape's original intent (streaming.rs:1441-1447). Despawns ~70
+drain frames of ~3 ms instead of one 136-205 ms Update burst; also shrinks the despawn share of
+the render extract batch. impl-1060 paces the PreUpdate asset-finalize flush from the engine's
+own side (bevy_asset's drain itself stays untouched — upstream patch rejected for now): a
+`--max-cell-loads-in-flight` cap on `request_cell` issues, refused cells retried later, readiness
+gate (`PortalPrewarm::settled`) unchanged so a crossing can never proceed half-loaded; expected
+to remove the 297.5/173.6/152.7 ms PreUpdate worst, total load time paid inside the existing
+prestream wait. Both briefs carry foundations answers, nextest test lists, build-gate acceptance,
+and the coordination flags: impl-286 Stage B overlap (impl-1060 must re-scope if it lands
+first) and the drain-visibility check (retired exteriors must be verified invisible during the
+drain — RenderLayers claim from the re-profile §7.1, screenshot/probe in a walked run before
+landing). Next: implementation worktrees for both, then the impl-287 window prices before/after.
+
 ## 2026-10-08 Portal Dev, Hermes (impl-285 merged into portal — it had never landed; render-cycles.csv now available)
 
 Track: Portal. Nothing pushed. While handing the portal-heavy steady-state front to Phase 2 Dev I
