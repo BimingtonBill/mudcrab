@@ -1486,7 +1486,7 @@ fn summary_markdown(
     }
     if let Some(streaming) = streaming {
         output.push_str(&format!(
-            "\n## Streaming and assets\n\n- Requests: {}\n- Active requests: {} (peak {})\n- Resident roots: {}\n- Failed cells: {}\n- Stale responses: {}\n- Unloaded cells: {}\n- Max despawns per frame: {}\n- Despawned entities: {}\n- Max instances spawned per frame: {}\n- Max instances armed per frame: {}\n- Arming queue depth: {} (peak {})\n- Max instances completed per scan: {}\n- Retiring cells: {} (peak {})\n- Revived cells: {}\n- Retire backlog overflows: {}\n- Retire backlog crossing-drain frames: {}\n- Origin rebases: {}\n- Lifecycle invariant failures: {}\n- Duplicate/orphaned/missing/out-of-range roots: {}/{}/{}/{}\n- Streaming fixture validated: {}\n- Assets ready: {}\n- Empty model references: {}\n- Model assets pending: {}\n- Surface assets pending: {}\n- Meshes validated: {}\n- Materials validated: {}\n- Images validated: {}\n- Asset failures: {}\n- Material validation failures: {}\n- Diagnostic fallbacks: {}\n- Canonical fixture validated: {}\n- Terrain patches validated: {}\n- Terrain seams validated: {}\n- Terrain seam points welded: {}\n- Terrain edges left as authored: {}\n- Terrain failures: {}\n- Water surfaces validated: {}\n- Water failures: {}\n- Terrain/water fixture validated: {}\n- Max query: {:.3} ms\n- Max cell commit: {:.3} ms\n- Max frame commit: {:.3} ms (budget {:.3} ms, violations {})\n",
+            "\n## Streaming and assets\n\n- Requests: {}\n- Active requests: {} (peak {})\n- Resident roots: {}\n- Failed cells: {}\n- Stale responses: {}\n- Unloaded cells: {}\n- Max despawns per frame: {}\n- Despawned entities: {}\n- Max instances spawned per frame: {}\n- Max instances armed per frame: {}\n- Arming queue depth: {} (peak {})\n- Max instances completed per scan: {}\n- Retiring cells: {} (peak {})\n- Revived cells: {}\n- Retire backlog overflows: {}\n- Retire backlog crossing-drain frames: {}\n- Swap hold timeouts: {}\n- Origin rebases: {}\n- Lifecycle invariant failures: {}\n- Duplicate/orphaned/missing/out-of-range roots: {}/{}/{}/{}\n- Streaming fixture validated: {}\n- Assets ready: {}\n- Empty model references: {}\n- Model assets pending: {}\n- Surface assets pending: {}\n- Meshes validated: {}\n- Materials validated: {}\n- Images validated: {}\n- Asset failures: {}\n- Material validation failures: {}\n- Diagnostic fallbacks: {}\n- Canonical fixture validated: {}\n- Terrain patches validated: {}\n- Terrain seams validated: {}\n- Terrain seam points welded: {}\n- Terrain edges left as authored: {}\n- Terrain failures: {}\n- Water surfaces validated: {}\n- Water failures: {}\n- Terrain/water fixture validated: {}\n- Max query: {:.3} ms\n- Max cell commit: {:.3} ms\n- Max frame commit: {:.3} ms (budget {:.3} ms, violations {})\n",
             streaming.requests_submitted,
             streaming.active_requests,
             streaming.peak_active_requests,
@@ -1506,6 +1506,7 @@ fn summary_markdown(
             streaming.revived_cells,
             streaming.retire_backlog_overflows,
             streaming.retire_backlog_drains,
+            streaming.swap_hold_timeouts,
             streaming.origin_rebases,
             streaming.streaming_invariant_failures,
             streaming.duplicate_cell_roots,
