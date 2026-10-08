@@ -83,7 +83,9 @@
 //!   the sums over those views of `render/graph/prepass`, `render/graph/main_pass`,
 //!   `render/graph/early_post_process` and `render/graph/post_process` (the post-process sum still
 //!   covers `EarlyPostProcess` and `PostProcess` together, as it did before the split; the early
-//!   column is that first stage alone), `render/graph/submit` (the graph command buffers'
+//!   column is that first stage alone), `render/graph/shadow_passes` (the same views' sun-shadow
+//!   pass windows, a column of their own so the stage sums stay exclusive of them — see below),
+//!   `render/graph/submit` (the graph command buffers'
 //!   `queue.submit` and the uncovered-window clear) and `render/graph/remainder`, which closes the
 //!   phase: everything the laps do not own — the schedule's own `Begin`/`Finish` sets and overhead,
 //!   and, after the schedule, the screenshot and readback submit, the `queue.submit` of their
@@ -106,18 +108,49 @@
 //!   whatever a run spends outside the lap windows (its schedule's own setup and teardown, and the
 //!   stage systems the executor orders outside them). A **directional** light's cascade views are
 //!   not root views: they are `ShadowView` entities the camera's own `Core3d` run renders through
-//!   `per_view_shadow_pass` (`bevy_pbr-0.19.0` `src/lib.rs:424-444`, `src/render/light.rs:2784`),
-//!   so their time is inside `render/graph/camera_views` (and inside whichever stage window the
-//!   schedule puts the pass in), not in the shadow-view columns.
+//!   `per_view_shadow_pass` and `shared_shadow_pass` (`bevy_pbr-0.19.0` `src/lib.rs:424-444`,
+//!   `src/render/light.rs:2762-2805`), so a camera's sun-shadow passes run inside its own graph
+//!   schedule and their time is inside `render/graph/camera_views`, not in the shadow-view
+//!   columns. They are lapped there as `render/graph/shadow_passes` ([`GRAPH_SHADOW_PASSES`]).
+//!
+//!   Bevy adds those four shadow-pass systems to `Core3d` with `after`/`before` against systems
+//!   that are *not* in any of its stage sets (`bevy_pbr-0.19.0` `src/lib.rs:424-444`: the early two
+//!   after `early_prepass_build_indirect_parameters` and before `early_downsample_depth`, the late
+//!   two after `late_prepass_build_indirect_parameters` and before `main_build_indirect_parameters`
+//!   and `Core3dSystems::MainPass`), so without our own ordering they are in no lap window: the
+//!   executor may run one before [`start_view`]'s mark — the run's time then lands in
+//!   `render/graph/views_remainder` — or inside the prepass or main-pass window, and which one it
+//!   is may differ from run to run. [`add_graph_marks`] therefore orders [`start_view`] before all
+//!   four and brackets each pair with a mark and a lap of its own, so a camera run's windows are:
+//!   the prepass up to `early_prepass_build_indirect_parameters`, the early sun-shadow pass, the
+//!   rest of the prepass, the main pass up to `late_prepass_build_indirect_parameters`, the late
+//!   sun-shadow pass, and the rest of the main pass (then the two post-process stages, unchanged).
+//!   The two shadow windows are summed into [`GRAPH_SHADOW_PASSES`] and *not* into the prepass and
+//!   main-pass sums, so the stage columns stay exclusive of them and
+//!   `render/graph/prepass + render/graph/main_pass + render/graph/early_post_process + the
+//!   post-process stage + render/graph/shadow_passes` tiles `render/graph/camera_views` exactly. A
+//!   shadow view's own run measures the same two windows (there `shared_shadow_pass` draws the
+//!   point or spot light's map): that is not a camera's sun pass, so those windows are counted in
+//!   the stage the run's window sits in, as they were before, and [`GRAPH_SHADOW_PASSES`] stays a
+//!   camera-run column.
 //!
 //!   A view that runs a graph schedule other than `Core3d` is counted in `views` but not in the
 //!   per-view laps, so it is the whole of its cycle's `views_remainder`.
 
 use bevy::{
     app::{First, Last},
-    core_pipeline::{Core3d, Core3dSystems},
-    ecs::schedule::Schedules,
-    pbr::ShadowView,
+    core_pipeline::{
+        Core3d, Core3dSystems, mip_generation::experimental::depth::early_downsample_depth,
+    },
+    ecs::{
+        schedule::{ScheduleConfigs, Schedules},
+        system::ScheduleSystem,
+    },
+    pbr::{
+        EARLY_SHADOW_PASS, LATE_SHADOW_PASS, ShadowView, early_prepass_build_indirect_parameters,
+        late_prepass_build_indirect_parameters, main_build_indirect_parameters,
+        per_view_shadow_pass, shared_shadow_pass,
+    },
     platform::time::Instant,
     prelude::*,
     render::{
@@ -212,6 +245,17 @@ pub const GRAPH_SHADOW_VIEW_COUNT: &str = "render/graph/shadow_view_count";
 /// summed over the views. It carries a directional light's cascade shadow passes, which run inside
 /// the camera's own schedule (see the module doc).
 pub const GRAPH_CAMERA_VIEWS: &str = "render/graph/camera_views";
+/// The sun (directional light) shadow-pass windows of a cycle's camera runs, summed: the time each
+/// camera's own `Core3d` schedule spent in the early and in the late shadow-pass systems
+/// (`per_view_shadow_pass` and `shared_shadow_pass`, `bevy_pbr-0.19.0` `src/lib.rs:424-444`,
+/// `src/render/light.rs:2762-2805`), which Bevy adds to `Core3d` outside every stage set. The laps
+/// bracket them inside the run ([`add_graph_marks`]), and the windows are *not* added to
+/// [`GRAPH_PREPASS`] or [`GRAPH_MAIN_PASS`], so the stage columns stay exclusive of this one and
+/// `prepass + main_pass + early_post_process + post_process + shadow_passes` tiles
+/// [`GRAPH_CAMERA_VIEWS`]. A shadow view's own run (a point or spot light's map, where
+/// `shared_shadow_pass` draws that map) keeps its windows in the stage it sits in, so this column
+/// is the camera runs' sun passes alone (see the module doc).
+pub const GRAPH_SHADOW_PASSES: &str = "render/graph/shadow_passes";
 pub const GRAPH_SUBMIT: &str = "render/graph/submit";
 pub const GRAPH_REMAINDER: &str = "render/graph/remainder";
 /// `render/graph/views` less [`GRAPH_SHADOW_VIEWS`] and [`GRAPH_CAMERA_VIEWS`], never negative:
@@ -321,14 +365,33 @@ fn add_render_marks(render_app: &mut SubApp, samples_pipelines: bool) {
 /// does not add), so a view that runs another graph schedule is measured by the root
 /// `render/graph/views` lap alone.
 ///
-/// The four `Core3d` hooks tile each run into the four stage windows the laps sum: from the run's
+/// The `Core3d` hooks tile each run into the four stage windows the laps sum: from the run's
 /// start to the end of `Prepass`, on to the end of `MainPass`, on to the end of `EarlyPostProcess`
 /// and on to the end of `PostProcess`. Each window is added to its stage's cycle sum — and its own
 /// view kind's ([`GRAPH_CAMERA_VIEWS`] or [`GRAPH_SHADOW_VIEWS`]), which is what makes a kind's
-/// total the sum of its runs' stages. Systems outside the sets (the GPU preprocessing and the
+/// total the sum of its runs' stages. Systems outside the sets (the GPU preprocessing, and the sun
 /// shadow passes, which Bevy orders against set members with `after`/`before` only) fall in
 /// whichever window the executor runs them in; anything it orders outside the windows is not in
 /// the per-view laps at all and shows up in [`GRAPH_VIEWS_REMAINDER`].
+///
+/// The sun shadow passes are the one part of that outside-the-sets time this file does lap, because
+/// Bevy leaves them unordered against every window: `bevy_pbr-0.19.0` `src/lib.rs:424-444` adds
+/// `per_view_shadow_pass::<EARLY_SHADOW_PASS>`, `shared_shadow_pass::<EARLY_SHADOW_PASS>`,
+/// `per_view_shadow_pass::<LATE_SHADOW_PASS>` and `shared_shadow_pass::<LATE_SHADOW_PASS>` to
+/// `Core3d` with no set membership, each after a `*_build_indirect_parameters` system and before a
+/// `*_downsample_depth` / `main_build_indirect_parameters` one — none of which is in a stage set
+/// either (`bevy_pbr-0.19.0` `src/render/gpu_preprocess.rs:436-475`,
+/// `bevy_core_pipeline-0.19.0` `src/mip_generation/mod.rs:296-304`). So [`start_view`] is ordered
+/// before all four here — without it a pass could run before the run's mark and its time would
+/// land in [`GRAPH_VIEWS_REMAINDER`] — and each pair is bracketed by a mark and a lap of its own
+/// ([`lap_view_prepass_before_early_shadow`] and [`lap_view_early_shadow`], then
+/// [`lap_view_main_pass_before_late_shadow`] and [`lap_view_late_shadow`]). The mark closes the
+/// window it interrupts into the stage it sits in, so the windows still tile the run, and the lap
+/// puts the shadow window in [`GRAPH_SHADOW_PASSES`] instead of the stage: a camera run's prepass
+/// and main-pass sums are therefore *exclusive* of the sun passes, and
+/// `prepass + main_pass + early_post_process + post_process + shadow_passes` is the whole of the
+/// run. Nothing in Bevy is reordered in a way it does not already allow: every constraint added
+/// here sits inside the range Bevy's own `after`/`before` calls leave open.
 fn add_graph_marks(render_app: &mut SubApp) {
     render_app.add_systems(
         RenderGraph,
@@ -344,24 +407,56 @@ fn add_graph_marks(render_app: &mut SubApp) {
             .run_if(tracks_cycles),
     );
     if render_app.world().resource::<Schedules>().contains(Core3d) {
-        render_app.add_systems(
-            Core3d,
-            (
-                start_view.before(Core3dSystems::Prepass),
-                lap_view_prepass
-                    .after(Core3dSystems::Prepass)
-                    .before(Core3dSystems::MainPass),
-                lap_view_main_pass
-                    .after(Core3dSystems::MainPass)
-                    .before(Core3dSystems::EarlyPostProcess),
-                lap_view_early_post_process
-                    .after(Core3dSystems::EarlyPostProcess)
-                    .before(Core3dSystems::PostProcess),
-                lap_view_post_process.after(Core3dSystems::PostProcess),
-            )
-                .run_if(tracks_cycles),
-        );
+        render_app.add_systems(Core3d, core3d_marks().run_if(tracks_cycles));
     }
+}
+
+/// The `Core3d` hooks [`add_graph_marks`] adds, as one set of systems so the schedule test can add
+/// the same tuple to a schedule of its own.
+fn core3d_marks() -> ScheduleConfigs<ScheduleSystem> {
+    (
+        start_view
+            .before(Core3dSystems::Prepass)
+            .before(per_view_shadow_pass::<EARLY_SHADOW_PASS>)
+            .before(shared_shadow_pass::<EARLY_SHADOW_PASS>)
+            .before(per_view_shadow_pass::<LATE_SHADOW_PASS>)
+            .before(shared_shadow_pass::<LATE_SHADOW_PASS>),
+        // Closes the run's prepass window at the early shadow pass's own boundary, so the pass's
+        // window can be lapped on its own: the time from the start of the run to here is prepass
+        // work (the early GPU preprocessing, `early_prepass` itself, the early deferred prepass).
+        lap_view_prepass_before_early_shadow
+            .after(start_view)
+            .after(early_prepass_build_indirect_parameters)
+            .before(per_view_shadow_pass::<EARLY_SHADOW_PASS>)
+            .before(shared_shadow_pass::<EARLY_SHADOW_PASS>),
+        lap_view_early_shadow
+            .after(per_view_shadow_pass::<EARLY_SHADOW_PASS>)
+            .after(shared_shadow_pass::<EARLY_SHADOW_PASS>)
+            .before(early_downsample_depth),
+        lap_view_prepass
+            .after(Core3dSystems::Prepass)
+            .before(Core3dSystems::MainPass),
+        // The same two boundaries in the main pass: the late shadow pass is ordered after the late
+        // GPU preprocessing here, as Bevy's own constraints allow, so its window is the pass alone.
+        lap_view_main_pass_before_late_shadow
+            .after(lap_view_prepass)
+            .after(late_prepass_build_indirect_parameters)
+            .before(per_view_shadow_pass::<LATE_SHADOW_PASS>)
+            .before(shared_shadow_pass::<LATE_SHADOW_PASS>),
+        lap_view_late_shadow
+            .after(per_view_shadow_pass::<LATE_SHADOW_PASS>)
+            .after(shared_shadow_pass::<LATE_SHADOW_PASS>)
+            .after(lap_view_main_pass_before_late_shadow)
+            .before(main_build_indirect_parameters),
+        lap_view_main_pass
+            .after(Core3dSystems::MainPass)
+            .before(Core3dSystems::EarlyPostProcess),
+        lap_view_early_post_process
+            .after(Core3dSystems::EarlyPostProcess)
+            .before(Core3dSystems::PostProcess),
+        lap_view_post_process.after(Core3dSystems::PostProcess),
+    )
+        .into_configs()
 }
 
 /// The shared clock: a handle cloned into both worlds and the extract wrappers.
@@ -484,6 +579,9 @@ pub struct CycleSides {
     ///   drives as an auxiliary root view) or a camera — each sum being that kind's stage windows
     ///   added up. A kind that ran no view in the cycle keeps its columns empty, and
     ///   `graph_shadow_view_count` counts the shadow runs of `graph_view_count`.
+    /// * `graph_shadow_passes_ms`: the camera runs' sun-shadow pass windows alone
+    ///   ([`GRAPH_SHADOW_PASSES`]), the one window of a camera run that is not a stage: it is
+    ///   excluded from the prepass and main-pass sums above, so those stay exclusive of it.
     /// * `graph_submit_ms`: the graph's `queue.submit` (the root `Submit` set) and the
     ///   uncovered-window clear.
     /// * `graph_remainder_ms`: `graph_and_present_ms` less `graph_views_ms` and `graph_submit_ms`,
@@ -501,6 +599,7 @@ pub struct CycleSides {
     pub graph_shadow_views_ms: Option<f64>,
     pub graph_shadow_view_count: Option<u32>,
     pub graph_camera_views_ms: Option<f64>,
+    pub graph_shadow_passes_ms: Option<f64>,
     pub graph_submit_ms: Option<f64>,
     pub graph_remainder_ms: Option<f64>,
     pub graph_views_remainder_ms: Option<f64>,
@@ -879,10 +978,19 @@ impl RenderTimings {
     }
 
     /// Closes the view lap opened at the view's previous boundary — the start, then each stage
-    /// boundary — and adds it to the cycle's sum for that stage and for the run's kind
-    /// ([`GRAPH_CAMERA_VIEWS`] or [`GRAPH_SHADOW_VIEWS`]). The windows tile the run, so the kind's
-    /// sum ends up as the whole of each run the cycle made of it.
+    /// boundary, and the two sun shadow-pass boundaries between them — and adds it to the cycle's
+    /// sum for that stage and for the run's kind ([`GRAPH_CAMERA_VIEWS`] or [`GRAPH_SHADOW_VIEWS`]).
+    /// The windows tile the run, so the kind's sum ends up as the whole of each run the cycle made
+    /// of it.
     fn view_lapped(&self, add: fn(&mut CycleSides, f64)) {
+        self.view_lapped_with(|sides, _is_shadow, ms| add(sides, ms));
+    }
+
+    /// A view lap whose cycle column depends on the kind of run the window is in, beside
+    /// [`RenderTimings::view_lapped`]: `add` gets the run's kind as well, so the sun shadow-pass
+    /// windows ([`GRAPH_SHADOW_PASSES`]) can be a camera-run column while a shadow view's own run
+    /// keeps its window in the stage it sits in (see [`add_shadow_pass`]).
+    fn view_lapped_with(&self, add: impl Fn(&mut CycleSides, bool, f64)) {
         if !self.tracks_cycles() {
             return;
         }
@@ -895,7 +1003,7 @@ impl RenderTimings {
         let is_shadow = state.view_is_shadow;
         let render_cycle = state.render_cycle;
         self.write_cycle(&mut state, render_cycle, |sides| {
-            add(sides, ms);
+            add(sides, is_shadow, ms);
             add_view_kind(sides, is_shadow, ms);
         });
     }
@@ -1059,6 +1167,35 @@ fn lap_view_prepass(timings: Res<RenderTimings>) {
     timings.view_lapped(add_graph_prepass);
 }
 
+/// The boundary between the run's prepass window and its early sun-shadow pass (see
+/// [`add_graph_marks`]): closes the prepass window opened by [`start_view`] and re-arms the mark
+/// for the pass, which [`lap_view_early_shadow`] closes into [`GRAPH_SHADOW_PASSES`].
+fn lap_view_prepass_before_early_shadow(timings: Res<RenderTimings>) {
+    timings.view_lapped(add_graph_prepass);
+}
+
+/// The early sun-shadow passes have run (`per_view_shadow_pass::<EARLY_SHADOW_PASS>` and
+/// `shared_shadow_pass::<EARLY_SHADOW_PASS>`): adds their window and re-arms the mark, so the rest
+/// of the prepass window is closed by [`lap_view_prepass`] as before.
+fn lap_view_early_shadow(timings: Res<RenderTimings>) {
+    timings.view_lapped_with(add_graph_early_shadow_pass);
+}
+
+/// The boundary between the run's main-pass window and its late sun-shadow pass: closes the
+/// main-pass window opened by [`lap_view_prepass`] and re-arms the mark for the pass, which
+/// [`lap_view_late_shadow`] closes into [`GRAPH_SHADOW_PASSES`].
+fn lap_view_main_pass_before_late_shadow(timings: Res<RenderTimings>) {
+    timings.view_lapped(add_graph_main_pass);
+}
+
+/// The late sun-shadow passes have run (`per_view_shadow_pass::<LATE_SHADOW_PASS>` and
+/// `shared_shadow_pass::<LATE_SHADOW_PASS>`): adds their window and re-arms the mark, so the rest
+/// of the main-pass window — the main opaque and transparent passes — is closed by
+/// [`lap_view_main_pass`] as before.
+fn lap_view_late_shadow(timings: Res<RenderTimings>) {
+    timings.view_lapped_with(add_graph_late_shadow_pass);
+}
+
 fn lap_view_main_pass(timings: Res<RenderTimings>) {
     timings.view_lapped(add_graph_main_pass);
 }
@@ -1091,6 +1228,37 @@ fn add_graph_early_post_process(sides: &mut CycleSides, ms: f64) {
 
 fn add_graph_post_process(sides: &mut CycleSides, ms: f64) {
     sides.graph_post_process_ms = Some(sides.graph_post_process_ms.unwrap_or(0.0) + ms);
+}
+
+/// Adds a sun shadow-pass window — the early or the late one — to the cycle's
+/// [`GRAPH_SHADOW_PASSES`] sum when the run is a camera, and to the stage the window sits in
+/// (`stage`) when it is a shadow view. In a camera's run the window holds the directional light's
+/// cascade draw; in a shadow view's own run (a point or spot light's map) it holds
+/// `shared_shadow_pass` drawing that map, which is that run's own work and not a camera's sun pass,
+/// so it stays in the run's stage sums and the column stays a camera-run one (see the module doc).
+fn add_shadow_pass(
+    sides: &mut CycleSides,
+    is_shadow: bool,
+    ms: f64,
+    stage: fn(&mut CycleSides, f64),
+) {
+    if is_shadow {
+        stage(sides, ms);
+    } else {
+        sides.graph_shadow_passes_ms = Some(sides.graph_shadow_passes_ms.unwrap_or(0.0) + ms);
+    }
+}
+
+/// The early sun shadow pass's window: [`add_shadow_pass`] with the prepass stage as the shadow
+/// view's fallback.
+fn add_graph_early_shadow_pass(sides: &mut CycleSides, is_shadow: bool, ms: f64) {
+    add_shadow_pass(sides, is_shadow, ms, add_graph_prepass);
+}
+
+/// The late sun shadow pass's window: [`add_shadow_pass`] with the main pass as the shadow view's
+/// fallback.
+fn add_graph_late_shadow_pass(sides: &mut CycleSides, is_shadow: bool, ms: f64) {
+    add_shadow_pass(sides, is_shadow, ms, add_graph_main_pass);
 }
 
 /// Adds a view lap to the cycle's sum for the run's kind (see [`GRAPH_SHADOW_VIEWS`]).
@@ -1151,6 +1319,7 @@ fn phase_writer(name: &str) -> Option<fn(&mut CycleSides, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::ecs::schedule::Schedule;
 
     #[test]
     fn keeps_samples_only_while_recording() {
@@ -1717,6 +1886,10 @@ mod tests {
         timings.graph_started();
         timings.view_started(true);
         timings.view_lapped(add_graph_prepass);
+        timings.view_lapped_with(add_graph_early_shadow_pass);
+        timings.view_lapped(add_graph_prepass);
+        timings.view_lapped(add_graph_main_pass);
+        timings.view_lapped_with(add_graph_late_shadow_pass);
         timings.view_lapped(add_graph_main_pass);
         timings.view_lapped(add_graph_early_post_process);
         timings.view_lapped(add_graph_post_process);
@@ -1744,6 +1917,7 @@ mod tests {
             GRAPH_SHADOW_VIEWS,
             GRAPH_SHADOW_VIEW_COUNT,
             GRAPH_CAMERA_VIEWS,
+            GRAPH_SHADOW_PASSES,
             GRAPH_SUBMIT,
             GRAPH_REMAINDER,
             GRAPH_VIEWS_REMAINDER,
@@ -1806,6 +1980,222 @@ mod tests {
             views_remainder_ms(2.0, &CycleSides::default()),
             2.0,
             "no run was measured: the whole views lap is the remainder"
+        );
+    }
+
+    /// One view run's windows, in the order [`core3d_marks`] orders them: the mark at the start of
+    /// the run, the prepass up to the early sun shadow pass, the early pass's window, the rest of
+    /// the prepass, the main pass up to the late sun shadow pass, the late pass's window, the rest
+    /// of the main pass, then the two post-process stages. Each window is about a millisecond, so
+    /// a sum says which windows went into it.
+    fn one_run(timings: &RenderTimings, is_shadow: bool) {
+        let sleep = || std::thread::sleep(Duration::from_millis(1));
+        timings.view_started(is_shadow);
+        sleep();
+        timings.view_lapped(add_graph_prepass);
+        sleep();
+        timings.view_lapped_with(add_graph_early_shadow_pass);
+        sleep();
+        timings.view_lapped(add_graph_prepass);
+        sleep();
+        timings.view_lapped(add_graph_main_pass);
+        sleep();
+        timings.view_lapped_with(add_graph_late_shadow_pass);
+        sleep();
+        timings.view_lapped(add_graph_main_pass);
+        sleep();
+        timings.view_lapped(add_graph_early_post_process);
+        sleep();
+        timings.view_lapped(add_graph_post_process);
+    }
+
+    /// The sun shadow-pass column takes a camera run's two windows, and a shadow view's own run
+    /// keeps its windows in the stage they sit in, so the column is the camera runs' passes alone.
+    #[test]
+    fn the_sun_pass_column_takes_camera_runs_only() {
+        let mut camera = CycleSides::default();
+        add_graph_early_shadow_pass(&mut camera, false, 1.5);
+        add_graph_late_shadow_pass(&mut camera, false, 0.5);
+        assert_eq!(
+            camera.graph_shadow_passes_ms,
+            Some(2.0),
+            "both windows are summed into the one column"
+        );
+        assert_eq!(
+            (camera.graph_prepass_ms, camera.graph_main_pass_ms),
+            (None, None),
+            "a camera run's windows are exclusive of the stages around them"
+        );
+
+        let mut shadow_view = CycleSides::default();
+        add_graph_early_shadow_pass(&mut shadow_view, true, 1.5);
+        add_graph_late_shadow_pass(&mut shadow_view, true, 0.5);
+        assert_eq!(
+            shadow_view.graph_shadow_passes_ms, None,
+            "a shadow view's own run is not a camera's sun pass"
+        );
+        assert_eq!(
+            (shadow_view.graph_prepass_ms, shadow_view.graph_main_pass_ms),
+            (Some(1.5), Some(0.5)),
+            "its windows stay in the stage they sit in, as they were before the split"
+        );
+    }
+
+    /// A camera run's sun shadow passes are lapped inside the run and kept out of the prepass and
+    /// main-pass sums, so the five columns tile the run exactly. The identity is the check on the
+    /// exclusivity: a stage sum that also carried a shadow window would count that window twice and
+    /// the five could not add up to the run. (The window sizes themselves are not asserted: this
+    /// test runs beside the rest of the suite, so a window can be descheduled for far longer than
+    /// its sleep.)
+    #[test]
+    fn the_sun_shadow_passes_of_a_camera_run_are_lapped_apart() {
+        let timings = RenderTimings::default();
+        timings.set_cycle_tracking(true, false);
+        timings.start_main(0.0);
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.start_render();
+        one_run(&timings, false);
+        timings.end_render();
+        timings.start_main(0.0);
+        let cycle = timings.take_previous_cycle().expect("cycle 1");
+
+        let shadow = cycle
+            .graph_shadow_passes_ms
+            .expect("the sun pass laps ran in the camera run");
+        let prepass = cycle.graph_prepass_ms.expect("the prepass laps ran");
+        let main_pass = cycle.graph_main_pass_ms.expect("the main-pass laps ran");
+        let early_post = cycle
+            .graph_early_post_process_ms
+            .expect("the early post-process lap ran");
+        let post = cycle
+            .graph_post_process_ms
+            .expect("the post-process lap ran");
+        let camera = cycle
+            .graph_camera_views_ms
+            .expect("the camera run was lapped");
+
+        assert!(
+            shadow >= 2.0,
+            "the column covers both sun pass windows: {shadow}"
+        );
+        assert!(
+            prepass >= 2.0 && main_pass >= 2.0,
+            "each stage sum covers the run's own windows for it: {prepass} prepass, {main_pass} \
+             main pass"
+        );
+        assert!(
+            (prepass + main_pass + early_post + (post - early_post) + shadow - camera).abs() < 1e-9,
+            "the stages and the sun passes tile the camera run: {prepass} + {main_pass} + \
+             {early_post} + {} + {shadow} vs {camera}",
+            post - early_post
+        );
+    }
+
+    /// A shadow view's own run measures the same two windows — there `shared_shadow_pass` draws
+    /// that view's map — and they stay in the stage they sit in, so the run's stage sums still tile
+    /// its kind and the sun pass column stays empty.
+    #[test]
+    fn a_shadow_views_run_tiles_without_the_sun_pass_column() {
+        let timings = RenderTimings::default();
+        timings.set_cycle_tracking(true, false);
+        timings.start_main(0.0);
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.start_render();
+        one_run(&timings, true);
+        timings.end_render();
+        timings.start_main(0.0);
+        let cycle = timings.take_previous_cycle().expect("cycle 1");
+
+        assert_eq!(
+            cycle.graph_shadow_passes_ms, None,
+            "the column is the camera runs' sun passes alone"
+        );
+        let prepass = cycle.graph_prepass_ms.expect("the prepass laps ran");
+        let main_pass = cycle.graph_main_pass_ms.expect("the main-pass laps ran");
+        let early_post = cycle
+            .graph_early_post_process_ms
+            .expect("the early post-process lap ran");
+        let post = cycle
+            .graph_post_process_ms
+            .expect("the post-process lap ran");
+        let shadow_views = cycle
+            .graph_shadow_views_ms
+            .expect("the shadow view run was lapped");
+        assert!(
+            prepass >= 3.0 && main_pass >= 3.0,
+            "the run's own windows sink into the stages around them, one shadow window each: \
+             {prepass} prepass, {main_pass} main pass"
+        );
+        assert!(
+            (prepass + main_pass + early_post + (post - early_post) - shadow_views).abs() < 1e-9,
+            "the stages still tile the shadow view's run"
+        );
+    }
+
+    /// The engine's `Core3d` schedule holds Bevy's four sun shadow-pass systems, each ordered
+    /// against systems that are in no stage set, and [`core3d_marks`] brackets them. This builds
+    /// that schedule — Bevy's own registration, copied from its plugin, plus our marks — and checks
+    /// it initializes, which is Bevy's own check that no ordering names a system or set the schedule
+    /// does not hold and that no two constraints contradict each other (the dependency graph it
+    /// builds is acyclic).
+    ///
+    /// What it cannot check is the order the executor settles on: Bevy 0.19 identifies a system by
+    /// `TypeId::of::<FunctionSystem<M, F>>()`, a type a test cannot name, so a node in the built
+    /// graph cannot be looked up from the system function to compare positions. The constraints
+    /// themselves are pinned instead by the system functions [`core3d_marks`] names — a renamed or
+    /// mistyped system would not compile — and by the windows the laps above measure.
+    #[test]
+    fn the_core3d_marks_agree_with_bevys_shadow_pass_ordering() {
+        fn stub_prepass_chain() {}
+        fn stub_main_pass() {}
+        // One stub per stage set, standing in for the systems Bevy adds to them (`early_prepass`
+        // and the late prepasses in `bevy_core_pipeline-0.19.0` `src/core_3d/mod.rs:145-163`, the
+        // main passes at `:157-159`), so our `.before(Core3dSystems::Prepass)` and
+        // `.after(Core3dSystems::MainPass)` have members to order against.
+        let mut schedule = Schedule::new(Core3d);
+        schedule.configure_sets((Core3dSystems::Prepass, Core3dSystems::MainPass).chain());
+        schedule.add_systems((
+            stub_prepass_chain.in_set(Core3dSystems::Prepass),
+            stub_main_pass.in_set(Core3dSystems::MainPass),
+            // The systems the shadow passes are ordered against, as their own plugins add them
+            // (`bevy_pbr-0.19.0` `src/render/gpu_preprocess.rs:436-475`,
+            // `bevy_core_pipeline-0.19.0` `src/mip_generation/mod.rs:296-304`).
+            early_prepass_build_indirect_parameters,
+            late_prepass_build_indirect_parameters,
+            main_build_indirect_parameters,
+            early_downsample_depth,
+            // Bevy's registration of the four, copied from `bevy_pbr-0.19.0` `src/lib.rs:424-444`.
+            per_view_shadow_pass::<EARLY_SHADOW_PASS>
+                .after(early_prepass_build_indirect_parameters)
+                .before(early_downsample_depth)
+                .before(per_view_shadow_pass::<LATE_SHADOW_PASS>),
+            per_view_shadow_pass::<LATE_SHADOW_PASS>
+                .after(late_prepass_build_indirect_parameters)
+                .before(main_build_indirect_parameters)
+                .before(Core3dSystems::MainPass),
+            shared_shadow_pass::<EARLY_SHADOW_PASS>
+                .after(early_prepass_build_indirect_parameters)
+                .before(early_downsample_depth)
+                .before(shared_shadow_pass::<LATE_SHADOW_PASS>),
+            shared_shadow_pass::<LATE_SHADOW_PASS>
+                .after(late_prepass_build_indirect_parameters)
+                .before(main_build_indirect_parameters)
+                .before(Core3dSystems::MainPass),
+        ));
+        schedule.add_systems(core3d_marks().run_if(tracks_cycles));
+
+        let mut world = World::new();
+        world.insert_resource(RenderTimings::default());
+        if let Err(error) = schedule.initialize(&mut world) {
+            panic!("our Core3d marks do not build with Bevy's own ordering: {error}");
+        }
+        assert!(
+            schedule.systems_len() >= 19,
+            "the two stubs, Bevy's four dependency systems, its four shadow passes and our nine \
+             marks are all in the schedule (Bevy inserts its own sync points around them): {}",
+            schedule.systems_len()
         );
     }
 

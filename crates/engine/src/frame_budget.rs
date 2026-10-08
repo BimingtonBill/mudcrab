@@ -35,8 +35,9 @@
 //!   lower bound for the GPU: a render thread that blocks in submit or present instead is counted as
 //!   `render_thread`, because it is the render schedule's own time. `render-cycles.csv` now splits
 //!   `render/graph_and_present` into the render graph's view schedules, their prepass, main-pass,
-//!   early-post-process and post-process stages, the graph's `queue.submit` and a remainder, and the
-//!   view schedules themselves into the runs of shadow views and of cameras with their own
+//!   early-post-process and post-process stages, the sun shadow-pass windows of the camera runs (out
+//!   of those stages, which are exclusive of them) and the graph's `queue.submit` and a remainder, and
+//!   the view schedules themselves into the runs of shadow views and of cameras with their own
 //!   remainder (`render/graph/*`), so a frame that went over its budget can be read there — but the
 //!   second `queue.submit` and `present` still sit unsplit in that remainder, and this owner rule is
 //!   unchanged by the split: a frame blocked in present still reads as `render_thread` here. GPU pass
