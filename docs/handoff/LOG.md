@@ -66,6 +66,35 @@ first) and the drain-visibility check (retired exteriors must be verified invisi
 drain — RenderLayers claim from the re-profile §7.1, screenshot/probe in a walked run before
 landing). Next: implementation worktrees for both, then the impl-287 window prices before/after.
 
+## 2026-10-08 Phase 2 Dev, Hermes (briefs landed + implementation handed over mid-flight)
+
+Track: phase 2. Morning: committed the two crossing fix briefs (`tasks/impl-1059-p2-despawn-time-budget.md`,
+`tasks/impl-1060-p2-preupdate-finalize-pacing.md`, 383e5e99/667483f2 on portal), including the
+correction to the re-profile's §7.1 (default unload budget is 2 cells/frame, so the report's
+"~9 frame drain" was wrong). Worktrees `D:/Mudcrab/worktrees/p2-impl-1059` (branch
+`phase2/despawn-time-budget`) and `p2-impl-1060` (branch `phase2/preupdate-finalize-pacing`),
+both OWNER.txt'd, cut from portal 667483f2. A native subagent implemented 1059; it was gate-green
+(1149 passed/4 skipped, fmt+clippy clean) at 05d0482c. The C:-full ENOSPC incident (~11:50-12:00)
+killed the 1060 subagent mid-run; I recovered its diff, finished the implementation (config knob
+`--max-cell-loads-in-flight` default 12, `CellLoadTicket` at the commit, caps at plan/commit/
+request_cell, revivals bypass, 4 new tests) and had fmt + gated clippy + gated check green.
+
+**Takeover:** a separate "Phase 2 Dev (Claude)" session (its own Team Lead + GLM workers, not in
+this room's chat) had claimed both tasks in parallel, saved my worker's in-flight files as WIP
+commit 1eaf79eb during the ENOSPC, built its 1059.1 review fixes on the same branch, and merged
+impl-1059 into portal (e2038dc1) — then ordered Hermes to stop ("1059 and 1060 are Claude's",
+team log 13:51). I complied: impl-1060's tree is committed on
+`phase2/preupdate-finalize-pacing` as **18e92a14** (fix(engine): cap concurrent cell loads in
+flight, handover snapshot) — fmt + gated clippy `-D warnings` + gated `cargo check --all-targets`
+clean at that tree; the full engine nextest was still in the gate when committed (result noted in
+the team log when it returns; treat as nextest-pending). The Claude session's coder can rebase,
+review or replace that branch. No further Hermes gate jobs or edits for 1059/1060 after this
+entry; the only live one is my own nextest finishing in the gate. Waiting on the user to confirm
+the session split (two Phase 2 Devs exist; this Hermes session handed over and needs its next
+assignment). Worktree p2-impl-1060's OWNER.txt stays until the other session decides its fate.
+
+
+
 ## 2026-10-08 Portal Dev, Hermes (impl-285 merged into portal — it had never landed; render-cycles.csv now available)
 
 Track: Portal. Nothing pushed. While handing the portal-heavy steady-state front to Phase 2 Dev I
