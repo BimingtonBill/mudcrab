@@ -136,11 +136,30 @@
 //!
 //!   A view that runs a graph schedule other than `Core3d` is counted in `views` but not in the
 //!   per-view laps, so it is the whole of its cycle's `views_remainder`.
+//!
+//!   The level above the view split is lapped too: [`GRAPH_CAMERA_DRIVER`] brackets the whole
+//!   `camera_driver` system inside the root `Render` set — the mark just before it, the lap just
+//!   after it ([`add_graph_marks`]) — so the column is the whole driver: every view's schedule it
+//!   runs, the loop around them, the `CurrentView` it files per run and the `CameraWindows` it
+//!   leaves for the uncovered-window clear.
+//!   [`GRAPH_DRIVER_OVERHEAD`] is that less the two view-kind sums, never negative: what the loop
+//!   spends between the runs plus whatever a run spends outside the per-view lap windows — the
+//!   views remainder read against the driver instead of the `Render` set. [`GRAPH_RENDER_SET_OTHER`]
+//!   closes the level above: `render/graph/views` less `render/graph/camera_driver`, never negative.
+//!   Bevy 0.19 puts no other system in the root `Render` set (`bevy_core_pipeline-0.19.0`
+//!   `src/lib.rs:66` registers `camera_driver` and nothing else), so that column carries the set's
+//!   own executor overhead — the sync points around an exclusive system — rather than another
+//!   system's time; Bevy's diagnostics-encoder resolve (`bevy_render-0.19.0`
+//!   `src/diagnostic/mod.rs:88-90`) sits after the set, in the gap to `Submit` where the views lap
+//!   is taken too. Together the three split the 2026-10-09 04:34 window's 4.5 ms
+//!   `render/graph/views_remainder` into the part inside the driver and the part outside it
+//!   (`local/review/portal-1093-window-2026-10-09/`).
 
 use bevy::{
     app::{First, Last},
     core_pipeline::{
         Core3d, Core3dSystems, mip_generation::experimental::depth::early_downsample_depth,
+        schedule::camera_driver,
     },
     ecs::{
         schedule::{ScheduleConfigs, Schedules},
@@ -203,6 +222,9 @@ pub const CLEANUP: &str = "render/cleanup";
 /// * [`GRAPH_VIEWS`]: the root graph schedule's `Render` set — Bevy's `camera_driver`, which runs
 ///   every camera's and auxiliary view's graph schedule. The part of the phase that scales with
 ///   views.
+/// * [`GRAPH_CAMERA_DRIVER`], [`GRAPH_DRIVER_OVERHEAD`] and [`GRAPH_RENDER_SET_OTHER`]: the same
+///   `Render` set one level in — the whole `camera_driver` system, that less the two view-kind
+///   sums, and the views lap less the driver (see the module doc).
 /// * [`GRAPH_VIEW_COUNT`] with [`GRAPH_PREPASS`], [`GRAPH_MAIN_PASS`], [`GRAPH_EARLY_POST_PROCESS`]
 ///   and [`GRAPH_POST_PROCESS`]: how many view schedules (`Core3d` runs) the cycle ran, and the
 ///   sums over them of the schedule's prepass, main-pass, early-post-process and post-process
@@ -262,6 +284,21 @@ pub const GRAPH_REMAINDER: &str = "render/graph/remainder";
 /// what `camera_driver` spends between the runs, plus whatever the runs spend outside the lap
 /// windows (see the module doc).
 pub const GRAPH_VIEWS_REMAINDER: &str = "render/graph/views_remainder";
+/// The whole `camera_driver` system (`bevy_core_pipeline-0.19.0` `src/schedule.rs:133`), the root
+/// `Render` set's only member (`src/lib.rs:66`): every view's graph schedule it runs, the
+/// `CurrentView` it files per run, the `CameraWindows` it leaves behind and the loop around them.
+/// The mark and the lap bracket the system inside the set ([`add_graph_marks`]), so the window also
+/// holds whatever the executor orders between the two marks.
+pub const GRAPH_CAMERA_DRIVER: &str = "render/graph/camera_driver";
+/// `render/graph/views` less [`GRAPH_CAMERA_DRIVER`], never negative: the root `Render` set's own
+/// overhead, since no other system sits in it in Bevy 0.19 — a Bevy version or a plugin that adds
+/// one puts its time here (see the module doc).
+pub const GRAPH_RENDER_SET_OTHER: &str = "render/graph/render_set_other";
+/// [`GRAPH_CAMERA_DRIVER`] less [`GRAPH_CAMERA_VIEWS`] and [`GRAPH_SHADOW_VIEWS`], never negative:
+/// what the driver spends outside the view schedules — the loop itself, the per-run `CurrentView`
+/// insert and the `CameraWindows` insert — plus whatever a run spends outside the per-view lap
+/// windows.
+pub const GRAPH_DRIVER_OVERHEAD: &str = "render/graph/driver_overhead";
 
 /// Measures the render side of each frame; shared by the main world, the render world and the
 /// extract wrappers.
@@ -354,11 +391,11 @@ fn add_render_marks(render_app: &mut SubApp, samples_pipelines: bool) {
 }
 
 /// The laps inside `render/graph_and_present` (see the module doc and [`GRAPH_VIEWS`]). Bevy 0.19
-/// runs the render graph as schedules, so the boundaries are its own sets — the root schedule's
-/// `Render` and `Submit` sets, and `Core3d`'s stage sets — and ours are the systems ordered
-/// between them, run once per render frame and once per view. Nothing in Bevy is forked or
-/// patched, and every system is gated on cycle tracking, so a run that keeps no cycles pays one
-/// atomic load per boundary and no lock.
+/// runs the render graph as schedules, so the boundaries are its own sets and systems — the root
+/// schedule's `Render` and `Submit` sets, `camera_driver` within the `Render` set, and `Core3d`'s
+/// stage sets — and ours are the systems ordered against them, run once per render frame, once per
+/// driver and once per view. Nothing in Bevy is forked or patched, and every system is gated on
+/// cycle tracking, so a run that keeps no cycles pays one atomic load per boundary and no lock.
 ///
 /// The root hooks are added through the `RenderGraph` schedule itself; the `Core3d` hooks only
 /// when that schedule exists (it is registered by `Core3dPlugin`, which a 2D-only or headless app
@@ -393,22 +430,37 @@ fn add_render_marks(render_app: &mut SubApp, samples_pipelines: bool) {
 /// run. Nothing in Bevy is reordered in a way it does not already allow: every constraint added
 /// here sits inside the range Bevy's own `after`/`before` calls leave open.
 fn add_graph_marks(render_app: &mut SubApp) {
-    render_app.add_systems(
-        RenderGraph,
-        (
-            start_graph_frame.in_set(RenderGraphSystems::Begin),
-            lap_graph_views
-                .after(RenderGraphSystems::Render)
-                .before(RenderGraphSystems::Submit),
-            lap_graph_submit
-                .after(RenderGraphSystems::Submit)
-                .before(RenderGraphSystems::Finish),
-        )
-            .run_if(tracks_cycles),
-    );
+    render_app.add_systems(RenderGraph, render_graph_marks().run_if(tracks_cycles));
     if render_app.world().resource::<Schedules>().contains(Core3d) {
         render_app.add_systems(Core3d, core3d_marks().run_if(tracks_cycles));
     }
+}
+
+/// The root `RenderGraph` hooks [`add_graph_marks`] adds, as one set of systems so the schedule
+/// test can add the same tuple to a schedule of its own.
+///
+/// The `Render` set's mark and lap bracket Bevy's `camera_driver` (`bevy_core_pipeline-0.19.0`
+/// `src/lib.rs:66`, `src/schedule.rs:133`): the mark is ordered just before the system and the lap
+/// just after it, both members of the set, so the window between them is the driver plus whatever
+/// the executor orders between the two marks. Bevy puts nothing else in the set, so the two are
+/// also its only members beside the driver.
+fn render_graph_marks() -> ScheduleConfigs<ScheduleSystem> {
+    (
+        start_graph_frame.in_set(RenderGraphSystems::Begin),
+        start_camera_driver
+            .in_set(RenderGraphSystems::Render)
+            .before(camera_driver),
+        lap_camera_driver
+            .in_set(RenderGraphSystems::Render)
+            .after(camera_driver),
+        lap_graph_views
+            .after(RenderGraphSystems::Render)
+            .before(RenderGraphSystems::Submit),
+        lap_graph_submit
+            .after(RenderGraphSystems::Submit)
+            .before(RenderGraphSystems::Finish),
+    )
+        .into_configs()
 }
 
 /// The `Core3d` hooks [`add_graph_marks`] adds, as one set of systems so the schedule test can add
@@ -492,6 +544,9 @@ struct State {
     /// The mark the root render graph schedule's `Begin` set opened, closed by the lap after its
     /// `Render` set and re-armed for the `Submit` lap ([`GRAPH_VIEWS`], [`GRAPH_SUBMIT`]).
     graph_mark: Option<Instant>,
+    /// The mark the mark system before `camera_driver` opened, closed by the lap after it
+    /// ([`GRAPH_CAMERA_DRIVER`]). Taken, not re-armed: the driver is lapped once per render frame.
+    camera_driver_mark: Option<Instant>,
     /// The mark a view's graph schedule opened, re-armed at each of its stage boundaries, so the
     /// per-view stage laps ([`GRAPH_PREPASS`], [`GRAPH_MAIN_PASS`], [`GRAPH_EARLY_POST_PROCESS`],
     /// [`GRAPH_POST_PROCESS`]) tile the view.
@@ -590,6 +645,14 @@ pub struct CycleSides {
     /// * `graph_views_remainder_ms`: `graph_views_ms` less `graph_shadow_views_ms` and
     ///   `graph_camera_views_ms`, never negative: what `camera_driver` spends between the runs,
     ///   plus whatever the runs spend outside the per-view lap windows.
+    /// * `graph_camera_driver_ms`: the whole `camera_driver` system, lapped between the mark
+    ///   before it and the lap after it inside the root `Render` set ([`GRAPH_CAMERA_DRIVER`]).
+    /// * `graph_render_set_other_ms`: `graph_views_ms` less `graph_camera_driver_ms`, never
+    ///   negative: the `Render` set's own overhead, no other system sitting in it in Bevy 0.19
+    ///   ([`GRAPH_RENDER_SET_OTHER`]).
+    /// * `graph_driver_overhead_ms`: `graph_camera_driver_ms` less `graph_camera_views_ms` and
+    ///   `graph_shadow_views_ms`, never negative: the driver's loop and per-run setup plus whatever
+    ///   a run spends outside the per-view lap windows ([`GRAPH_DRIVER_OVERHEAD`]).
     pub graph_views_ms: Option<f64>,
     pub graph_view_count: Option<u32>,
     pub graph_prepass_ms: Option<f64>,
@@ -603,6 +666,9 @@ pub struct CycleSides {
     pub graph_submit_ms: Option<f64>,
     pub graph_remainder_ms: Option<f64>,
     pub graph_views_remainder_ms: Option<f64>,
+    pub graph_camera_driver_ms: Option<f64>,
+    pub graph_render_set_other_ms: Option<f64>,
+    pub graph_driver_overhead_ms: Option<f64>,
 }
 
 /// Pipelines (render and compute) in one render frame. Bevy's `PipelineCache` holds both, so these
@@ -924,15 +990,47 @@ impl RenderTimings {
         self.state().graph_mark = Some(Instant::now());
     }
 
+    /// `camera_driver` is about to start (the mark system ordered just before it, in the root
+    /// schedule's `Render` set): opens the mark [`RenderTimings::camera_driver_lapped`] closes.
+    fn camera_driver_started(&self) {
+        if !self.tracks_cycles() {
+            return;
+        }
+        self.state().camera_driver_mark = Some(Instant::now());
+    }
+
+    /// `camera_driver` has returned: closes [`GRAPH_CAMERA_DRIVER`] and, the per-view laps inside
+    /// the driver having closed with it, [`GRAPH_DRIVER_OVERHEAD`] against the two view-kind sums.
+    /// The mark is taken rather than re-armed — the driver is lapped once per render frame — so a
+    /// second lap without a new mark records nothing.
+    fn camera_driver_lapped(&self) {
+        if !self.tracks_cycles() {
+            return;
+        }
+        let mut state = self.state();
+        let Some(mark) = state.camera_driver_mark.take() else {
+            return;
+        };
+        let ms = (Instant::now() - mark).as_secs_f64() * 1000.0;
+        let render_cycle = state.render_cycle;
+        self.write_cycle(&mut state, render_cycle, |sides| {
+            sides.graph_camera_driver_ms = Some(ms);
+            sides.graph_driver_overhead_ms = Some(driver_overhead_ms(ms, sides));
+        });
+    }
+
     /// Every view's graph schedule has run (the root schedule's `Render` set, Bevy's
     /// `camera_driver`): closes [`GRAPH_VIEWS`] and re-arms the mark
     /// [`RenderTimings::submit_lapped`] closes. Every run of the cycle has finished by now — the
     /// lap is ordered after the `Render` set the loop is in — so the two view-kind sums are
-    /// complete and [`GRAPH_VIEWS_REMAINDER`] can close the split.
+    /// complete and [`GRAPH_VIEWS_REMAINDER`] can close the split, and so is
+    /// [`GRAPH_CAMERA_DRIVER`]'s lap inside the set, which [`GRAPH_RENDER_SET_OTHER`] is closed
+    /// against.
     fn views_lapped(&self) {
         self.graph_lap(|sides, ms| {
             sides.graph_views_ms = Some(ms);
             sides.graph_views_remainder_ms = Some(views_remainder_ms(ms, sides));
+            sides.graph_render_set_other_ms = Some(render_set_other_ms(ms, sides));
         });
     }
 
@@ -1013,6 +1111,7 @@ impl RenderTimings {
         state.render_mark = None;
         state.graph_mark = None;
         state.view_mark = None;
+        state.camera_driver_mark = None;
         let pipelines = state.pipelines.take();
         let render_cycle = state.render_cycle.take();
         if let Some(started) = state.render_started.take() {
@@ -1137,6 +1236,14 @@ fn lap_graph_views(timings: Res<RenderTimings>) {
 
 fn lap_graph_submit(timings: Res<RenderTimings>) {
     timings.submit_lapped();
+}
+
+fn start_camera_driver(timings: Res<RenderTimings>) {
+    timings.camera_driver_started();
+}
+
+fn lap_camera_driver(timings: Res<RenderTimings>) {
+    timings.camera_driver_lapped();
 }
 
 fn start_view(
@@ -1295,6 +1402,24 @@ fn views_remainder_ms(views_ms: f64, sides: &CycleSides) -> f64 {
     let parts =
         sides.graph_shadow_views_ms.unwrap_or(0.0) + sides.graph_camera_views_ms.unwrap_or(0.0);
     (views_ms - parts).max(0.0)
+}
+
+/// The part of the root `Render` set the `camera_driver` lap does not own (see
+/// [`GRAPH_RENDER_SET_OTHER`]): the views lap less [`GRAPH_CAMERA_DRIVER`], never negative. The
+/// driver is lapped inside the set, so like [`graph_remainder_ms`] a small excess is a timer tick,
+/// not a negative remainder. No other system sits in the set in Bevy 0.19, so the column is the
+/// set's own executor overhead unless a Bevy version or a plugin adds a member.
+fn render_set_other_ms(views_ms: f64, sides: &CycleSides) -> f64 {
+    (views_ms - sides.graph_camera_driver_ms.unwrap_or(0.0)).max(0.0)
+}
+
+/// The time `camera_driver` spends outside the view schedules it runs (see
+/// [`GRAPH_DRIVER_OVERHEAD`]): their lap less [`GRAPH_CAMERA_VIEWS`] and [`GRAPH_SHADOW_VIEWS`],
+/// never negative. The per-view laps are read inside the driver, so a small excess is a timer tick.
+fn driver_overhead_ms(camera_driver_ms: f64, sides: &CycleSides) -> f64 {
+    let runs =
+        sides.graph_shadow_views_ms.unwrap_or(0.0) + sides.graph_camera_views_ms.unwrap_or(0.0);
+    (camera_driver_ms - runs).max(0.0)
 }
 
 /// The cycle-record field a render-phase lap writes, by the lap's span name. The swapchain wait
@@ -1737,13 +1862,15 @@ mod tests {
     }
 
     /// The graph laps split `render/graph_and_present` the way R2 asks: the view schedules, the
-    /// graph's queue submit and a remainder that closes the phase — and the views lap itself split
-    /// into the camera runs, the shadow-view runs and a remainder. The parts are taken inside the
+    /// graph's queue submit and a remainder that closes the phase — the views lap itself split
+    /// into the camera runs, the shadow-view runs and a remainder, and the `Render` set one level
+    /// further into `camera_driver` and the set's own overhead. The parts are taken inside the
     /// outer lap, so they cannot exceed it, and the remainders are what make the row's graph
-    /// columns add up: the view-kind sums and the views remainder to `render/graph/views`, and the
-    /// views lap and the submit lap with their remainder to `render/graph_and_present`. The
-    /// per-view stage sums are bounded by the views lap that includes every view schedule's own
-    /// overhead, and the counts say how many views they cover.
+    /// columns add up: the view-kind sums and the views remainder to `render/graph/views`, the
+    /// driver's lap and the `Render` set's other time to it as well, the runs and the driver's
+    /// overhead to the driver's lap, and the views lap and the submit lap with their remainder to
+    /// `render/graph_and_present`. The per-view stage sums are bounded by the views lap that
+    /// includes every view schedule's own overhead, and the counts say how many views they cover.
     #[test]
     fn the_graph_laps_account_for_graph_and_present() {
         let timings = RenderTimings::default();
@@ -1753,11 +1880,12 @@ mod tests {
         timings.end_main();
         timings.extracted(Duration::from_millis(1));
         timings.start_render();
-        // The root graph schedule: its `Begin` set, a camera run and a shadow-view run, the lap
-        // after the `Render` set, the lap after the `Submit` set, then the phase's own lap
-        // (`Set::Render`).
+        // The root graph schedule: its `Begin` set, the mark before `camera_driver`, a camera run
+        // and a shadow-view run inside it, the lap after the driver, the lap after the `Render`
+        // set, the lap after the `Submit` set, then the phase's own lap (`Set::Render`).
         timings.graph_started();
         std::thread::sleep(Duration::from_millis(1));
+        timings.camera_driver_started();
         for is_shadow in [false, true] {
             timings.view_started(is_shadow);
             std::thread::sleep(Duration::from_millis(1));
@@ -1769,6 +1897,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
             timings.view_lapped(add_graph_post_process);
         }
+        std::thread::sleep(Duration::from_millis(1));
+        timings.camera_driver_lapped();
         timings.views_lapped();
         std::thread::sleep(Duration::from_millis(1));
         timings.submit_lapped();
@@ -1838,6 +1968,42 @@ mod tests {
             "the sleep between the last run and the views lap is in the views remainder: \
              {views_remainder}"
         );
+        // The same level one step out: the driver's own lap, the `Render` set's other time and the
+        // driver's overhead close against the laps they sit in.
+        let driver = cycle
+            .graph_camera_driver_ms
+            .expect("the camera driver lap ran");
+        let set_other = cycle
+            .graph_render_set_other_ms
+            .expect("the views lap writes the set's other time");
+        let overhead = cycle
+            .graph_driver_overhead_ms
+            .expect("the driver lap writes its overhead");
+        assert!(
+            driver >= camera + shadow + 1.0,
+            "the driver lap covers both runs and the sleep after them: {driver} vs {camera} + \
+             {shadow}"
+        );
+        assert!(
+            (driver + set_other - views).abs() < 1e-9,
+            "the driver and the set's other time are the views lap: {driver} + {set_other} vs \
+             {views}"
+        );
+        assert!(
+            (camera + shadow + overhead - driver).abs() < 1e-9,
+            "the runs and the driver's overhead are the driver's lap: {camera} + {shadow} + \
+             {overhead} vs {driver}"
+        );
+        assert!(
+            set_other >= 1.0,
+            "the sleep between the schedule's start and the driver's mark is the set's other \
+             time: {set_other}"
+        );
+        assert!(
+            overhead >= 1.0,
+            "the sleep between the last run and the driver's lap is the driver's overhead: \
+             {overhead}"
+        );
         let stages = [
             cycle.graph_prepass_ms.expect("prepass laps ran"),
             cycle.graph_main_pass_ms.expect("main-pass laps ran"),
@@ -1884,6 +2050,7 @@ mod tests {
         timings.extracted(Duration::from_millis(1));
         timings.start_render();
         timings.graph_started();
+        timings.camera_driver_started();
         timings.view_started(true);
         timings.view_lapped(add_graph_prepass);
         timings.view_lapped_with(add_graph_early_shadow_pass);
@@ -1893,10 +2060,13 @@ mod tests {
         timings.view_lapped(add_graph_main_pass);
         timings.view_lapped(add_graph_early_post_process);
         timings.view_lapped(add_graph_post_process);
+        timings.camera_driver_lapped();
         timings.views_lapped();
         timings.submit_lapped();
         assert!(
-            timings.state().graph_mark.is_none() && timings.state().view_mark.is_none(),
+            timings.state().graph_mark.is_none()
+                && timings.state().view_mark.is_none()
+                && timings.state().camera_driver_mark.is_none(),
             "no mark is taken when cycles are not tracked"
         );
         timings.lap(GRAPH_AND_PRESENT);
@@ -1921,6 +2091,9 @@ mod tests {
             GRAPH_SUBMIT,
             GRAPH_REMAINDER,
             GRAPH_VIEWS_REMAINDER,
+            GRAPH_CAMERA_DRIVER,
+            GRAPH_RENDER_SET_OTHER,
+            GRAPH_DRIVER_OVERHEAD,
         ] {
             assert!(
                 !samples.contains_key(lap),
@@ -1980,6 +2153,90 @@ mod tests {
             views_remainder_ms(2.0, &CycleSides::default()),
             2.0,
             "no run was measured: the whole views lap is the remainder"
+        );
+    }
+
+    /// The `Render` set's other time is `render/graph/views` less the driver's lap, and the
+    /// driver's overhead is that lap less the two view-kind sums — both never negative, since the
+    /// laps inside them can exceed them only by a timer tick.
+    #[test]
+    fn the_driver_overhead_and_the_render_sets_other_time_never_go_negative() {
+        let sides = CycleSides {
+            graph_camera_driver_ms: Some(4.0),
+            graph_camera_views_ms: Some(3.0),
+            graph_shadow_views_ms: Some(0.5),
+            ..Default::default()
+        };
+        assert_eq!(render_set_other_ms(6.0, &sides), 2.0);
+        assert_eq!(
+            render_set_other_ms(3.5, &sides),
+            0.0,
+            "the driver can exceed the views lap by less than a timer tick"
+        );
+        assert_eq!(
+            render_set_other_ms(4.0, &CycleSides::default()),
+            4.0,
+            "no driver lap was measured: the whole views lap is the set's other time"
+        );
+        assert!(
+            (driver_overhead_ms(4.0, &sides) - 0.5).abs() < 1e-9,
+            "the runs leave half a millisecond of driver overhead: {}",
+            driver_overhead_ms(4.0, &sides)
+        );
+        assert_eq!(
+            driver_overhead_ms(3.0, &sides),
+            0.0,
+            "the laps can exceed the driver by less than a timer tick"
+        );
+        assert_eq!(
+            driver_overhead_ms(2.0, &CycleSides::default()),
+            2.0,
+            "no run was measured: the whole driver lap is overhead"
+        );
+    }
+
+    /// The driver's lap needs the mark the system before `camera_driver` opens: a lap with no mark
+    /// (one before the driver started, or a second lap in the same render frame) writes nothing,
+    /// so the record keeps the marked window rather than stretching to the second boundary.
+    #[test]
+    fn the_driver_lap_records_nothing_without_its_mark() {
+        let timings = RenderTimings::default();
+        timings.set_cycle_tracking(true, false);
+        timings.start_main(0.0);
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.start_render();
+        timings.camera_driver_lapped();
+        assert!(
+            timings.state().camera_driver_mark.is_none(),
+            "a lap with no mark takes none"
+        );
+        timings.camera_driver_started();
+        timings.camera_driver_lapped();
+        let recorded = timings
+            .state()
+            .cycles
+            .get(&1)
+            .and_then(|sides| sides.graph_camera_driver_ms)
+            .expect("the marked lap is recorded");
+        assert!(
+            timings
+                .state()
+                .cycles
+                .get(&1)
+                .is_some_and(|sides| sides.graph_driver_overhead_ms.is_some()),
+            "the same lap writes the driver's overhead"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        timings.camera_driver_lapped();
+        assert_eq!(
+            timings
+                .state()
+                .cycles
+                .get(&1)
+                .and_then(|sides| sides.graph_camera_driver_ms),
+            Some(recorded),
+            "the second lap had no mark and wrote nothing"
         );
     }
 
@@ -2195,6 +2452,52 @@ mod tests {
             schedule.systems_len() >= 19,
             "the two stubs, Bevy's four dependency systems, its four shadow passes and our nine \
              marks are all in the schedule (Bevy inserts its own sync points around them): {}",
+            schedule.systems_len()
+        );
+    }
+
+    /// The engine's root `RenderGraph` schedule holds Bevy's `camera_driver` in its `Render` set,
+    /// and [`render_graph_marks`] orders the mark before the system and the lap after it. This
+    /// builds that schedule — Bevy's own registration, copied from its plugin, plus our marks — and
+    /// checks it initializes, which is Bevy's own check that no ordering names a system or set the
+    /// schedule does not hold and that no two constraints contradict each other (the dependency
+    /// graph it builds is acyclic).
+    ///
+    /// What it cannot check is the order the executor settles on, for the reason the `Core3d` test
+    /// gives: a node in the built graph cannot be looked up from the system function.
+    #[test]
+    fn the_render_graph_marks_agree_with_bevys_camera_driver() {
+        fn stub_begin() {}
+        fn stub_finish() {}
+        let mut schedule = Schedule::new(RenderGraph);
+        schedule.configure_sets(
+            (
+                RenderGraphSystems::Begin,
+                RenderGraphSystems::Render,
+                RenderGraphSystems::Submit,
+                RenderGraphSystems::Finish,
+            )
+                .chain(),
+        );
+        schedule.add_systems((
+            stub_begin.in_set(RenderGraphSystems::Begin),
+            stub_finish.in_set(RenderGraphSystems::Finish),
+            // Bevy's registration, copied from `bevy_core_pipeline-0.19.0` `src/lib.rs:66`. The
+            // `Submit` set's two systems are `pub(crate)` there and are not needed here: our laps
+            // order against the set itself, not against them.
+            camera_driver.in_set(RenderGraphSystems::Render),
+        ));
+        schedule.add_systems(render_graph_marks().run_if(tracks_cycles));
+
+        let mut world = World::new();
+        world.insert_resource(RenderTimings::default());
+        if let Err(error) = schedule.initialize(&mut world) {
+            panic!("our RenderGraph marks do not build with Bevy's own registration: {error}");
+        }
+        assert!(
+            schedule.systems_len() >= 8,
+            "the two stubs, Bevy's camera_driver and our five marks are all in the schedule (Bevy \
+             inserts its own sync points around them): {}",
             schedule.systems_len()
         );
     }
