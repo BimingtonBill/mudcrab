@@ -17,7 +17,8 @@ every session and worker on this PC:
         a hold stops NEW gated runs machine-wide (running ones finish). Use it
         for a conversion's extraction/convert phase and for timing windows.
 
-Defaults (override in <gate dir>/config.json): 3 slots, at most 2 per session
+Defaults (override in <gate dir>/config.json): 3 slots (a cold build, one whose target folder has
+no dependency artifacts yet, takes 2), at most 2 per session
 (BUILD_GATE_OWNER, else the label's track prefix: p1, p2, p3, portal ...), 8 GB free RAM minimum,
 15 GB free on the drive the build writes to (CARGO_TARGET_DIR, else the working folder),
 wait up to 120 minutes for a slot (then exit 4 with the reason). The gate
@@ -48,6 +49,7 @@ from datetime import datetime, timedelta
 GATE_DIR = os.environ.get("MUDCRAB_BUILD_GATE") or os.path.join(os.path.expanduser("~"), ".mudcrab", "build-gate")
 DEFAULTS = {"slots": 3, "max_per_owner": 2, "min_free_ram_gb": 8.0, "min_free_disk_gb": 15.0, "max_wait_minutes": 120, "poll_seconds": 10}
 GB = 1024**3
+COLD_RLIBS = 150
 
 
 def load_config() -> dict:
@@ -160,20 +162,65 @@ def owner_slots(config: dict, owner: str) -> int:
                if (info := read_json(path)) is not None and info.get("owner") == owner)
 
 
-def try_acquire(config: dict, label: str, command: list[str]) -> str | None:
+def build_profile_dir(command: list[str]) -> str:
+    """The target sub-folder a cargo command builds into: release, quick, ..., else debug."""
+    for index, arg in enumerate(command):
+        if arg == "--release" or arg == "-r":
+            return "release"
+        if arg in ("--profile", "--cargo-profile") and index + 1 < len(command):
+            return {"dev": "debug", "test": "debug", "bench": "release"}.get(command[index + 1], command[index + 1])
+        if arg.startswith("--profile=") or arg.startswith("--cargo-profile="):
+            name = arg.split("=", 1)[1]
+            return {"dev": "debug", "test": "debug", "bench": "release"}.get(name, name)
+    return "debug"
+
+
+def is_cold_build(command: list[str]) -> bool:
+    """True when a cargo command would compile the dependency tree from scratch.
+
+    2026-10-08: three cold Bevy builds at once (coders run -NoSeed after the C: incident) pushed free RAM
+    past the floor mid-build and rustc died (handle_alloc_error). The floor is only checked at start, so a
+    cold build now takes two slots. Cold = the target folder for this profile has fewer than COLD_RLIBS
+    dependency libraries or metadata files (a warm Mudcrab target has several hundred; clippy/check leave
+    .rmeta only, so both count).
+    """
+    if not command or os.path.basename(command[0]).lower() not in ("cargo", "cargo.exe"):
+        return False
+    target = os.environ.get("CARGO_TARGET_DIR") or os.path.join(os.getcwd(), "target")
+    deps = os.path.join(target, build_profile_dir(command), "deps")
+    try:
+        rlibs = sum(1 for name in os.listdir(deps) if name.endswith((".rlib", ".rmeta")))
+    except OSError:
+        return True
+    return rlibs < COLD_RLIBS
+
+
+def try_acquire(config: dict, label: str, command: list[str], weight: int = 1) -> list[str] | None:
+    """Take `weight` free slots at once (all or none); a cold build takes two."""
     clear_stale_slots(config)
     owner = owner_of(label)
-    if owner_slots(config, owner) >= int(config["max_per_owner"]):
+    if owner_slots(config, owner) + weight > max(int(config["max_per_owner"]), weight):
         return None
+    taken: list[str] = []
     for path in slot_paths(config):
+        if len(taken) == weight:
+            break
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             continue
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump({"pid": os.getpid(), "label": label, "owner": owner, "command": " ".join(command)[:300],
-                       "cwd": os.getcwd(), "since": datetime.now().isoformat(timespec="seconds")}, handle)
-        return path
+                       "cwd": os.getcwd(), "since": datetime.now().isoformat(timespec="seconds"),
+                       "cold": weight > 1}, handle)
+        taken.append(path)
+    if len(taken) == weight:
+        return taken
+    for path in taken:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     return None
 
 
@@ -199,22 +246,28 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 3
     config = load_config()
     label = args.label or os.environ.get("BUILD_GATE_LABEL") or os.path.basename(os.getcwd())
+    weight = 2 if is_cold_build(args.command) else 1
     deadline = time.monotonic() + float(config["max_wait_minutes"]) * 60
     announced = None
     while True:
         reason = blocking_reason(config)
-        slot = None if reason else try_acquire(config, label, args.command)
+        slot = None if reason else try_acquire(config, label, args.command, weight)
         if slot is None and reason is None:
             owner = owner_of(label)
-            reason = (f"{owner} already holds {config['max_per_owner']} slots (max per session)"
-                      if owner_slots(config, owner) >= int(config["max_per_owner"])
-                      else f"all {config['slots']} build slots busy")
+            held = owner_slots(config, owner)
+            if held + weight > max(int(config["max_per_owner"]), weight):
+                reason = f"{owner} holds {held} of its {config['max_per_owner']} slots" + (
+                    " (a cold build needs 2)" if weight > 1 else "")
+            else:
+                reason = (f"a cold build needs 2 free slots of {config['slots']}" if weight > 1
+                          else f"all {config['slots']} build slots busy")
         if slot is not None:
             # Re-check after taking the slot: a hold set in between wins.
             late = blocking_reason(config)
             if late is None:
                 break
-            os.remove(slot)
+            for path in slot:
+                os.remove(path)
             reason = late
         if reason != announced:
             print(f"build_gate: waiting ({reason})", flush=True)
@@ -223,16 +276,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"build_gate: gave up after {config['max_wait_minutes']} min ({reason})", file=sys.stderr)
             return 4
         time.sleep(float(config["poll_seconds"]))
-    print(f"build_gate: running in {os.path.basename(slot)}: {' '.join(args.command)}", flush=True)
+    print(f"build_gate: running in {', '.join(os.path.basename(path) for path in slot)}"
+          f"{' (cold build: 2 slots)' if weight > 1 else ''}: {' '.join(args.command)}", flush=True)
     try:
         return subprocess.call(args.command)
     except KeyboardInterrupt:
         return 130
     finally:
-        try:
-            os.remove(slot)
-        except OSError:
-            pass
+        for path in slot:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def cmd_status(_args: argparse.Namespace) -> int:

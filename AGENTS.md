@@ -73,7 +73,8 @@ a conversion's build pause, a review wait) or is about to go idle, it checks:
   slowed a conversion to 4 MB/s). Every heavy cargo command goes through the machine-wide build gate:**
   `python C:/Users/Brannock/.mudcrab/build-gate/build_gate.py run -- cargo nextest run -p <crate>`
   (also for check, clippy, build, test; sessions, Claude subagents and DeepSeek workers alike). It waits for one of
-  3 build slots (at most 2 per session: `BUILD_GATE_OWNER`, else the label's track prefix p1/p2/p3/portal), at least 8 GB free RAM, at least 15 GB free on the drive the build writes to, and no hold, then runs and frees the slot on any exit. `... status` shows
+  3 build slots (a cold build, whose target folder has no dependency artifacts yet, takes 2 at once, so at most one
+  cold build runs; 2026-10-08: three cold Bevy builds crashed rustc out of memory) (at most 2 per session: `BUILD_GATE_OWNER`, else the label's track prefix p1/p2/p3/portal), at least 8 GB free RAM, at least 15 GB free on the drive the build writes to, and no hold, then runs and frees the slot on any exit. `... status` shows
   slots, holds, free RAM and converters. A conversion (extraction and convert phases) and a timing window set a
   hold (`... hold set conversion --owner <session> --reason <what> --until HH:MM`; timing windows add `--drain`, which lists gated runs still going and waits until they end) and clear it when done;
   this replaces per-session gate files and "no cargo" messages (still announce the job). Source:
