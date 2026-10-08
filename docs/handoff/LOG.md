@@ -44,6 +44,34 @@ Track: all. Nothing pushed. The user asked for a slow wrap-up at ~21:00.
 - **Moved to tomorrow morning:** Phase 2's timing window (binary ready, d1805d12, 35-45 min quiet PC) and Portal's
   1088+1093 laps (~15 min). Collision spans (A12) and the full load bench (E6) go into the same quiet slots.
 
+## 2026-10-08 late Portal Dev (wrap-up: 1088 merged; B3, B5 fix-first; 1093 and 1092 finishing)
+
+Track: Portal. Nothing pushed. Wrapping up at the user's word (via Team Lead).
+- Merged into portal: impl-1088 (d826a6b1): shadow views vs camera views inside render/graph/views, plus
+  early_post_process and a views_remainder identity; nextest 1165. Reviewed in review-1089 (Muse and DeepSeek accept;
+  GLM failed on an API error). Both reviewers: directional sun cascades are NOT separate views. Bevy puts
+  per_view_shadow_pass and shared_shadow_pass in each camera's Core3d schedule outside any set
+  (bevy_pbr-0.19.0 lib.rs:424-444), so 1088's shadow_views counts only point and spot lights.
+- impl-1093 (brief 4ebcc0df): laps around those four Bevy shadow systems, in a column render/graph/shadow_passes.
+  The coder was in its gated clippy at wrap-up; let it finish. Tomorrow's morning window reads 1088 and 1093
+  together (portal-heavy x3) to name the ~5 ms gap.
+- B5 room culling: impl-1085 committed at 16fad023 in local/impl/impl-1085-portal-room-culling-default. It turns
+  culling on by default where the DB has rooms, adds --room-culling=off and a culled-count counter. Green but NOT
+  merged: review-1089 says fix first, because the portal-data image proof is missing and baselines on portal data
+  shift. analysis-1092 (scratch D:/Mudcrab/scratch/portal-roomcull-image, OWNER.txt) ran its 6 engine runs
+  (3 off, 3 on, ~20 interior poses) and is analysing. Its brief has a hold guard: it checks the gate before every
+  engine run.
+- B3 view policy: the merge is c4eb07b6 in local/impl/portal-merge-view-policy (fmt, clippy, nextest 1219). It is
+  NOT in portal: fix first. The water preset's shadowless reflection is near-empty in portal runs, because portal
+  stamps cells with layer 0 only (portal.rs ~2986) and objects, sky, doors and LOD lack layer 4. impl-1094
+  (brief e3feab4e, base c4eb07b6) was stopped at wrap-up. Its WIP is 29a6193b in
+  local/impl/impl-1094-portal-reflection-layer-coverage, unbuilt; resume tomorrow. Applying the policy to the
+  portal and prewarm cameras is blocked: per-frame Camera::is_active toggling rebuilds the view (portal.rs ~5094),
+  so portal needs a skip-at-extract mechanism first.
+- Disk: with the user's yes I deleted target/ of the merged coders 1075 and 1088 (~19 GB). The window data was saved
+  to local/review/portal-1075-window-2026-10-08/.
+- Next: read 1092's verdict, then merge 1085 or fix; the morning window for 1088+1093; resume 1094; then the B3 window.
+
 ## 2026-10-08 Portal Dev (fixes merged, R2 laps read: views not submit/present)
 
 Track: Portal. Nothing pushed.
