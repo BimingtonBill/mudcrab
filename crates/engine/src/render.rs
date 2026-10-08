@@ -1,7 +1,11 @@
 use crate::{
     color_pipeline::{DEFAULT_SCENE_EV100, SceneColorPipeline},
+    config::WaterReflectionPreset,
     lights::EMISSIVE_EXPOSURE,
     profiling::ProfilingState,
+    view_policy::{
+        SecondaryViewTarget, ViewDemand, ViewPolicy, ViewPolicySystems, ViewRequest, ViewShadows,
+    },
     world::{
         cache::{TerrainLayerSnapshot, TerrainSnapshot},
         database::AssetCatalog,
@@ -33,6 +37,7 @@ use bevy::{
         render_resource::{AsBindGroup, ShaderType},
     },
     shader::ShaderRef,
+    transform::helper::TransformHelper,
 };
 use serde::Serialize;
 use shared::LAND_TEXTURE_REPEATS_PER_CELL;
@@ -92,6 +97,13 @@ impl Plugin for VercidiumRendererPlugin {
         app.world_mut()
             .get_resource_or_init::<Time<Virtual>>()
             .set_wrap_period(WATER_CLOCK_WRAP_PERIOD);
+        // The policy owns every secondary camera's activity, and this plugin is what spawns the
+        // first of them, so the two are registered together: without it the reflection camera would
+        // be spawned with a demand and never switched on.
+        app.add_plugins((
+            crate::view_policy::SecondaryViewPolicyPlugin,
+            crate::shadow_route::ShadowRoutePlugin,
+        ));
         app.add_plugins((
             crate::light_falloff::SkyrimLightFalloffPlugin,
             crate::material_animation::MaterialAnimationPlugin,
@@ -105,9 +117,13 @@ impl Plugin for VercidiumRendererPlugin {
         ))
         .init_resource::<RendererMetrics>()
         .add_systems(Startup, setup_water_reflection)
+        .add_systems(Update, sync_renderer_metrics)
+        // The reflection is prepared in `PostUpdate` before transform propagation, not in
+        // `Update`: a camera teleported this frame must be mirrored by *this* frame's pose, and
+        // the pose written just before propagation is the one the frame renders with.
         .add_systems(
-            Update,
-            (update_water_reflection_camera, sync_renderer_metrics),
+            PostUpdate,
+            prepare_water_reflection.in_set(ViewPolicySystems::Prepare),
         );
 
         // `--reflection-cascades N`: the default is 0 (an unshadowed reflection), so the limit is
@@ -328,11 +344,12 @@ pub const REFLECTION_VIEW_LAYERS: &[Layer] = &[WORLD_LAYER];
 /// The value main's placed-object propagation copies onto the meshes below a reference.
 pub const PLACED_OBJECT_RENDER_LAYERS: RenderLayers = RenderLayers::layer(PLACED_OBJECT_LAYER);
 
-/// The render layers for a light spawned below a placed-object reference (main's contract: the
-/// propagated layer must not replace the light's own).
+/// The render layers for a point or spot light spawned below a placed-object reference (main's
+/// contract: the propagated layer must not replace the light's own). The sun uses [`LIGHT_LAYERS`]
+/// instead; see [`POINT_LIGHT_LAYERS`].
 pub fn light_render_layers() -> (RenderLayers, PropagateOver<RenderLayers>) {
     (
-        RenderLayers::from_layers(&LIGHT_LAYERS),
+        RenderLayers::from_layers(&POINT_LIGHT_LAYERS),
         PropagateOver::default(),
     )
 }
@@ -356,6 +373,69 @@ pub const MAIN_VIEW_LAYERS: [usize; 2] = [0, WATER_LAYER];
 
 /// The layers a light of the active space shines on.
 pub const LIGHT_LAYERS: [usize; 2] = [0, WATER_LAYER];
+
+/// The layer only the unshadowed sun copy and a shadowless reflection view are on; see
+/// [`crate::shadow_route`]. No main view and no source light is ever on it. World content carries
+/// it **beside** [`WORLD_LAYER`] ([`reflectable_layers`]), never instead of it: an entity is on
+/// this layer so the shadowless route still draws it, and on the world layer so every other view
+/// and the source sun keep drawing it exactly as before.
+///
+/// Main has this as layer 3. The portal already uses 2 for the destination space
+/// ([`crate::portal::DESTINATION_LAYER`]) and 3 for the door layer
+/// ([`crate::door_layer::DOOR_LAYER`]), whose doors are on layer 0 as well: the replica takes the
+/// next free layer, so a door-layer door's own set and this one stay distinct layers even though
+/// the door is drawn by both routes.
+pub const UNSHADOWED_REFLECTION_LAYER: Layer = 4;
+
+/// What the water reflection camera draws while its policy says shadows off: the reflected world
+/// through [`UNSHADOWED_REFLECTION_LAYER`], lit by the unshadowed sun copy instead of the sun. It is
+/// meant to be the same content as [`REFLECTION_VIEW_LAYERS`] on the other route.
+pub const UNSHADOWED_REFLECTION_VIEW_LAYERS: &[Layer] = &[UNSHADOWED_REFLECTION_LAYER];
+
+/// The layers an entity the water reflection draws belongs to, given the layers it belongs to
+/// anyway: `own`, plus [`UNSHADOWED_REFLECTION_LAYER`] whenever the shadowed reflection route draws
+/// `own` ([`REFLECTION_VIEW_LAYERS`]).
+///
+/// The two routes must draw the **same content** - the shadowless one is that picture with the
+/// sun's cascades left out, not a thinner scene - so every producer of content the reflection shows
+/// widens its layers through here: the plain nodes and terrain of a streamed cell
+/// ([`crate::portal`]'s stamping, `crate::streaming`), a sky dome, the LOD ring and the door
+/// layer's doors. A point light needs the layer too and names it directly
+/// ([`POINT_LIGHT_LAYERS`]), since a light's layers are not content layers. A route that drew less
+/// would be a cheaper reflection bought by dropping content rather than by dropping shadows.
+///
+/// Content no reflection draws is returned untouched, so nothing a doorway alone puts on screen can
+/// leak into a reflection of the space the observer is in: a water surface ([`WATER_LAYER`]), the
+/// destination space ([`crate::portal::DESTINATION_LAYER`]), the portal's quad and the doorway
+/// filler all stay on their own layers.
+///
+/// This is the one rule: a new producer of content the world layer draws widens its layers here
+/// rather than naming [`UNSHADOWED_REFLECTION_LAYER`] itself, or it ships a thing the shadowless
+/// route silently drops.
+pub fn reflectable_layers(own: &RenderLayers) -> RenderLayers {
+    if own.intersects(&RenderLayers::from_layers(REFLECTION_VIEW_LAYERS)) {
+        own.clone().with(UNSHADOWED_REFLECTION_LAYER)
+    } else {
+        own.clone()
+    }
+}
+
+/// The layers an entity of the world belongs to: the world layer, which the main view and the
+/// source sun see, and [`UNSHADOWED_REFLECTION_LAYER`], which the shadowless reflection route
+/// sees. Terrain carries it, and so does every node a streamed cell stamps; a water surface never
+/// does.
+pub fn reflectable_world_layers() -> RenderLayers {
+    reflectable_layers(&RenderLayers::layer(WORLD_LAYER))
+}
+
+/// What a point or spot light belongs to: [`LIGHT_LAYERS`] plus [`UNSHADOWED_REFLECTION_LAYER`].
+///
+/// A view's lights are chosen by layer intersection, so a shadowless reflection view, which draws
+/// the replica layer only, would otherwise lose every lamp the shadowed reflection shows. A
+/// converted point light has no cascades, so lighting that view costs nothing extra. The sun must
+/// not carry the replica layer - that is what keeps its cascades out of the shadowless view - so it
+/// keeps [`LIGHT_LAYERS`].
+pub const POINT_LIGHT_LAYERS: [usize; 3] = [0, WATER_LAYER, UNSHADOWED_REFLECTION_LAYER];
 
 /// The sampler a terrain layer texture needs: the shader tiles every layer `tiling` times across a
 /// cell (`uv * LAND_TEXTURE_REPEATS_PER_CELL`), so the address mode must repeat.
@@ -810,27 +890,56 @@ struct WaterReflectionCamera;
 /// Slack added to a water plane's bounds before the main camera frustum test, in world units (4096
 /// to a cell).
 ///
-/// The frustum carried by the main camera was built at the end of the previous frame, so a fast
-/// turn brings water into a view the gate has already closed for, and the frame that renders it
-/// shows the reflection of the frame before. A plane this far outside the frustum still keeps the
-/// reflection camera on: seen from one cell away, it buys about seven degrees of extra turn per
-/// frame - a flick past 400 degrees a second - or, when the camera moves instead of turning, 512
-/// units of travel between two frames. A plane that far off the edge of a 45 degree view is a
-/// sliver of the frame, so little of the saving is given back.
+/// The frustum is built from the observer's current pose each frame, so the margin is not there to
+/// absorb a stale frustum. It keeps the reflection camera on for a plane just outside the view, so
+/// that a turn or a move between two frames cannot bring water in before the reflection has
+/// rendered once: seen from one cell away, it buys about seven degrees of extra turn per frame - a
+/// flick past 400 degrees a second - or, when the camera moves instead of turning, 512 units of
+/// travel between two frames. A plane that far off the edge of a 45 degree view is a sliver of the
+/// frame, so little of the saving is given back.
 const WATER_REFLECTION_FRUSTUM_MARGIN: f32 = 512.0;
 
+/// Spawns the camera that fills [`WaterReflectionTexture`], and the texture it renders into.
+///
+/// It is the flipped copy of the streaming camera, drawn before the main view, and it renders
+/// [`REFLECTION_VIEW_LAYERS`] - or [`UNSHADOWED_REFLECTION_VIEW_LAYERS`] while its policy says
+/// shadows off ([`crate::shadow_route`]).
+///
+/// The camera is managed by the [`ViewPolicy`] it carries: [`prepare_water_reflection`] fills its
+/// demand and [`apply_view_policies`](crate::view_policy::apply_view_policies) decides each frame
+/// whether it renders, keeping this image alive across the frames it does not.
+///
+/// The policy is the one `--water-reflection-preset` chose ([`water_reflection_policy`]; baseline
+/// when there is no configuration), its target scaled by `--reflection-scale`. The baseline camera
+/// keeps the components the reflection cost flags give it
+/// ([`ReflectionOptions`](crate::config::ReflectionOptions): no depth prepass by default, occlusion
+/// culling only with one). The water preset throttles the camera, and a throttled camera must not keep occlusion
+/// history or multisampling: it is spawned without [`OcclusionCulling`], whatever
+/// `--reflection-occlusion` says, and with [`Msaa::Off`].
 fn setup_water_reflection(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     config: Option<Res<crate::config::EngineConfig>>,
 ) {
     let options = config
+        .as_ref()
         .map(|config| config.reflection.clone())
         .unwrap_or_default();
-    let (width, height) = options.target_size();
+    let preset = config.map_or(WaterReflectionPreset::Baseline, |config| {
+        config.water_reflection_preset
+    });
+    let mut policy = water_reflection_policy(preset);
+    // `--reflection-scale` scales whichever size the preset starts from (1 keeps it).
+    let (width, height) = options.scaled_size((policy.target_size.x, policy.target_size.y));
+    policy.target_size = UVec2::new(width, height);
+    let layers = if policy.shadows == ViewShadows::On {
+        REFLECTION_VIEW_LAYERS
+    } else {
+        UNSHADOWED_REFLECTION_VIEW_LAYERS
+    };
     let image = images.add(Image::new_target_texture(
-        width,
-        height,
+        policy.target_size.x,
+        policy.target_size.y,
         bevy::render::render_resource::TextureFormat::Rgba16Float,
         None,
     ));
@@ -846,9 +955,23 @@ fn setup_water_reflection(
             is_active: false,
             ..default()
         },
-        RenderTarget::Image(image.into()),
+        RenderTarget::Image(image.clone().into()),
         Transform::default(),
-        RenderLayers::layer(0),
+        RenderLayers::from_layers(layers),
+        // The policy's shadow choice picks one of these two layer sets every frame.
+        crate::shadow_route::ViewShadowRoute {
+            shadowed: RenderLayers::from_layers(REFLECTION_VIEW_LAYERS),
+            unshadowed: RenderLayers::from_layers(UNSHADOWED_REFLECTION_VIEW_LAYERS),
+        },
+        // The chosen preset is not yet part of a run's recorded settings; a benchmark comparing
+        // presets has to name the preset it ran with.
+        policy,
+        ViewDemand::default(),
+        crate::view_policy::ViewPolicyState::default(),
+        SecondaryViewTarget {
+            image,
+            allocated: policy.target_size,
+        },
         WaterReflectionCamera,
         // The exposure and shadow filter of the graphics settings; no AA, no SSAO
         // (`crate::graphics_settings`).
@@ -865,8 +988,24 @@ fn setup_water_reflection(
     if options.prepass {
         camera.insert(DepthPrepass);
     }
-    if options.occlusion_culling() {
-        camera.insert(OcclusionCulling);
+    match preset {
+        WaterReflectionPreset::Baseline => {
+            if options.occlusion_culling() {
+                camera.insert(OcclusionCulling);
+            }
+        }
+        // A throttled view keeps neither occlusion history nor multisampling.
+        WaterReflectionPreset::Water => {
+            camera.insert(Msaa::Off);
+        }
+    }
+}
+
+/// The [`ViewPolicy`] a `--water-reflection-preset` stands for.
+pub fn water_reflection_policy(preset: WaterReflectionPreset) -> ViewPolicy {
+    match preset {
+        WaterReflectionPreset::Baseline => ViewPolicy::baseline(),
+        WaterReflectionPreset::Water => ViewPolicy::water(),
     }
 }
 
@@ -972,19 +1111,22 @@ type WaterReflectionObserver = (
     Without<WaterReflectionCamera>,
 );
 
-/// What the gate reads off the world camera: its pose, the [`Frustum`] Bevy keeps in step with it,
-/// the projection whose far distance the frustum itself does not carry, and the layers it draws.
+/// What the adapter reads off the world camera: the entity it can ask for a current pose, the pose
+/// it had at the last propagation, the projection the reflection has to match, and the layers it
+/// draws.
 type WaterReflectionObserverView = (
+    Entity,
     &'static GlobalTransform,
-    Option<&'static Frustum>,
     Option<&'static Projection>,
     Option<&'static Exposure>,
     Option<&'static RenderLayers>,
 );
 
-/// What the gate reads off a water plane: its pose and bounds for the frustum test, and the layers
-/// and inherited visibility that say whether any camera sampling the reflection draws it at all.
+/// What the gate reads off a water plane: the entity it can ask for a current pose, its propagated
+/// pose and bounds for the frustum test, and the layers and inherited visibility that say whether
+/// any camera sampling the reflection draws it at all.
 type WaterSurfaceView = (
+    Entity,
     &'static GlobalTransform,
     Option<&'static Aabb>,
     Option<&'static RenderLayers>,
@@ -997,79 +1139,112 @@ type PortalCameraFilter = (
     Without<WaterReflectionCamera>,
 );
 
-fn update_water_reflection_camera(
+/// Fills the reflection camera's [`ViewDemand`] for this frame.
+///
+/// It picks the water surface nearest the observer for the mirror plane, tests the surfaces against
+/// the observer's *current* pose and projection, and hands the result to the policy - this system
+/// never touches `Camera::is_active`. The pose comes from the observer's `Transform` through
+/// [`TransformHelper`](bevy::transform::helper::TransformHelper) rather than from its
+/// `GlobalTransform`, because the camera follow systems and the streaming fixture write
+/// `Transform` in `Update` and propagation has not run yet when this system does.
+///
+/// No observer, or no water at all, clears the demand: the policy then switches the view off and
+/// keeps the image it last rendered into.
+#[allow(clippy::too_many_arguments)]
+fn prepare_water_reflection(
     mut commands: Commands,
     main_camera: Query<WaterReflectionObserverView, WaterReflectionObserver>,
     water: Query<WaterSurfaceView, With<crate::world::components::WaterSurface>>,
     portal_cameras: Query<&Camera, PortalCameraFilter>,
     mut reflection_camera: Query<
-        (Entity, &mut Transform, &mut Camera, Option<&mut Exposure>),
+        (Entity, &mut ViewDemand, Option<&mut Exposure>),
         With<WaterReflectionCamera>,
     >,
+    transforms: TransformHelper,
     mut profiler: ResMut<ProfilingState>,
+    config: Option<Res<crate::config::EngineConfig>>,
 ) {
     let started = std::time::Instant::now();
-    let (
-        Ok((main, frustum, projection, exposure, main_layers)),
-        Ok((entity, mut reflection, mut camera, reflection_exposure)),
-    ) = (main_camera.single(), reflection_camera.single_mut())
+    // `--water-reflection off`, a measurement switch: no demand, so the policy never admits the
+    // camera and the reflection image keeps the texels it was created with (black), which the
+    // water shader blends in at its Fresnel weight as no reflection at all.
+    if config.is_some_and(|config| !config.water_reflection) {
+        for (_, mut demand, _) in &mut reflection_camera {
+            demand.request = None;
+        }
+        profiler.record_elapsed("render/water_reflection_camera", started);
+        return;
+    }
+    let Ok((observer, observer_pose, projection, exposure, main_layers)) = main_camera.single()
     else {
+        for (_, mut demand, _) in &mut reflection_camera {
+            demand.request = None;
+        }
+        profiler.record_elapsed("render/water_reflection_camera", started);
         return;
     };
+    let observer_pose = current_global_transform(&transforms, observer, observer_pose);
     // PBR lighting is already exposure-scaled when the reflection is sampled by water.
     // Keep both views in the same domain, including explicit diagnostic exposure changes.
     let ev100 = exposure.map_or(DEFAULT_SCENE_EV100, |value| value.ev100);
-    if let Some(mut reflection_exposure) = reflection_exposure {
-        if reflection_exposure.ev100 != ev100 {
-            reflection_exposure.ev100 = ev100;
-        }
-    } else {
-        commands.entity(entity).insert(Exposure { ev100 });
-    }
     let main_layers = main_layers.cloned().unwrap_or_default();
     let portal_drawn = portal_cameras.iter().any(|camera| camera.is_active);
+    // The frustum is built from the pose the observer stands in *now*, not from the one Bevy kept
+    // in step with it at the end of the previous frame: a fast turn or a teleport otherwise leaves
+    // the gate deciding against a view the camera has already left.
+    let frustum = projection.map(|projection| projection.compute_frustum(&observer_pose));
+    let far = projection.map(|projection| projection.far());
+
     // The surface nearest the main camera fixes the mirror plane; a further surface would put the
     // reflection at the wrong height when more than one water level is streamed in.
     let mut mirror_surface = None;
     let mut mirror_distance = f32::INFINITY;
     let mut surface_in_view = false;
-    for (surface, bounds, layers, visibility) in &water {
+    for (entity, surface, bounds, layers, visibility) in &water {
         let Some(seen_by) = water_drawn_by(layers, visibility, &main_layers, portal_drawn) else {
             // Water no camera draws - a pre-streamed exterior's river behind a shut house door -
             // neither fixes the mirror plane nor keeps the reflection rendering.
             continue;
         };
-        let distance = (surface.translation().y - main.translation().y).abs();
+        let surface = current_global_transform(&transforms, entity, surface);
+        let distance = (surface.translation().y - observer_pose.translation().y).abs();
         if distance < mirror_distance {
             mirror_distance = distance;
             mirror_surface = Some(surface);
         }
         surface_in_view |= match seen_by {
-            WaterSeenBy::Main => water_plane_in_view(
-                main,
-                frustum,
-                projection.map(|projection| projection.far()),
-                surface,
-                bounds,
-            ),
+            WaterSeenBy::Main => {
+                water_plane_in_view(&observer_pose, frustum.as_ref(), far, &surface, bounds)
+            }
             // The destination is laid out behind the portal's window, not in the main camera's
             // view, so the main frustum says nothing about it: drawn by the portal is enough.
             WaterSeenBy::Portal => true,
         };
     }
-    let Some(surface) = mirror_surface else {
-        if camera.is_active {
-            camera.is_active = false;
+
+    for (entity, mut demand, reflection_exposure) in &mut reflection_camera {
+        // Compared before it is written, so a still exposure does not mark the camera changed.
+        if let Some(mut reflection_exposure) = reflection_exposure {
+            if reflection_exposure.ev100 != ev100 {
+                reflection_exposure.ev100 = ev100;
+            }
+        } else {
+            commands.entity(entity).insert(Exposure { ev100 });
         }
-        return;
-    };
-    // The mirror plane is refreshed even while the view is gated off, so the frame the gate reopens
-    // reflects the camera as it stands then rather than the last frame water was on screen.
-    // Both writes are skipped when nothing changed, so a still camera does not mark the reflection
-    // camera changed (and re-extract it) every frame.
-    reflection.set_if_neq(reflected_camera_transform(main, surface.translation().y));
-    if camera.is_active != surface_in_view {
-        camera.is_active = surface_in_view;
+        let Some(mirror_surface) = mirror_surface.as_ref().filter(|_| surface_in_view) else {
+            demand.request = None;
+            continue;
+        };
+        let mirror_height = mirror_surface.translation().y;
+        demand.request = Some(ViewRequest {
+            observer_pose,
+            pose: reflected_camera_transform(&observer_pose, mirror_height),
+            projection: projection.cloned(),
+            // The mirror's height, not the pose derived from it: a plane that rises under a still
+            // observer changes nothing else the policy can compare. Water is a flat surface, so two
+            // equal heights give the same mirror however the plane is otherwise placed.
+            domain_revision: u64::from(mirror_height.to_bits()),
+        });
     }
     profiler.record_elapsed("render/water_reflection_camera", started);
 }
@@ -1115,6 +1290,23 @@ fn water_drawn_by(
     }
 }
 
+/// An entity's world transform as it stands this frame.
+///
+/// [`TransformHelper`](bevy::transform::helper::TransformHelper) is what makes "this frame" true -
+/// it walks the entity's `Transform` and its ancestors' rather than reading the propagated
+/// [`GlobalTransform`]. An entity whose chain cannot be walked (one spawned with only a
+/// `GlobalTransform`, or with an ancestor whose `Transform` is missing) keeps the propagated pose:
+/// the last known one is a better mirror than no reflection at all.
+fn current_global_transform(
+    transforms: &TransformHelper<'_, '_>,
+    entity: Entity,
+    propagated: &GlobalTransform,
+) -> GlobalTransform {
+    transforms
+        .compute_global_transform(entity)
+        .unwrap_or(*propagated)
+}
+
 /// Whether a water plane's bounds reach the main camera's view, its bounds grown by
 /// [`WATER_REFLECTION_FRUSTUM_MARGIN`] first.
 ///
@@ -1124,8 +1316,8 @@ fn water_drawn_by(
 /// [`Projection`] is applied here by hand through the plane's bounding sphere.
 ///
 /// Missing pieces mean the test cannot run - a plane whose mesh has not produced an [`Aabb`] yet,
-/// or a main camera without a [`Frustum`] - and the plane then counts as visible, keeping the
-/// reflection camera on rather than risk a stale reflection.
+/// or an observer without a [`Projection`] to build the frustum from - and the plane then counts as
+/// visible, keeping the reflection camera on rather than risk a stale reflection.
 fn water_plane_in_view(
     main: &GlobalTransform,
     frustum: Option<&Frustum>,
@@ -1538,6 +1730,7 @@ fn register_skyrim_material_handler(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view_policy::ViewUpdateRate;
     use crate::world::cache::TerrainLayerSnapshot;
     use crate::world::components::{StreamingCamera, WaterSurface};
     use bevy::app::Propagate;
@@ -1764,9 +1957,10 @@ mod tests {
     /// thickness at all.
     const CELL_WATER_HALF_EXTENTS: Vec3 = Vec3::new(2048.0, 0.0, 2048.0);
 
-    /// The main camera and the reflection camera the gate drives, with no plugins. The gate reads
-    /// the camera's pose, frustum and far distance and writes `Camera::is_active` on the reflection
-    /// camera, so a headless `App` is enough to run its frames.
+    /// The observer and the reflection camera the adapter and the policy drive, with no renderer.
+    /// The observer's pose, projection and the water surfaces are the whole input, so a headless
+    /// `App` is enough to run its frames; the reflection camera's `is_active`, pose and image are
+    /// the whole output.
     struct ReflectionHarness {
         app: App,
         main_camera: Entity,
@@ -1777,16 +1971,33 @@ mod tests {
         fn new(main: Transform) -> Self {
             let mut app = App::new();
             app.init_resource::<ProfilingState>()
-                .add_systems(Update, update_water_reflection_camera);
+                .init_resource::<Assets<Image>>()
+                .init_resource::<Time>()
+                .insert_resource(crate::streaming::RenderOrigin(IVec2::ZERO))
+                .insert_resource(crate::sky::CameraSpace::Exterior)
+                .add_plugins(crate::view_policy::SecondaryViewPolicyPlugin)
+                .add_systems(
+                    PostUpdate,
+                    prepare_water_reflection.in_set(ViewPolicySystems::Prepare),
+                );
             let main_camera = app
                 .world_mut()
                 .spawn((
+                    main,
                     GlobalTransform::from(main),
-                    main_camera_frustum(&main),
                     main_camera_projection(),
                     StreamingCamera,
                 ))
                 .id();
+            let image =
+                app.world_mut()
+                    .resource_mut::<Assets<Image>>()
+                    .add(Image::new_target_texture(
+                        crate::view_policy::BASELINE_TARGET_SIZE.x,
+                        crate::view_policy::BASELINE_TARGET_SIZE.y,
+                        bevy::render::render_resource::TextureFormat::Rgba16Float,
+                        None,
+                    ));
             let reflection_camera = app
                 .world_mut()
                 .spawn((
@@ -1796,9 +2007,19 @@ mod tests {
                         ..default()
                     },
                     Transform::default(),
+                    Projection::default(),
+                    RenderTarget::Image(image.clone().into()),
+                    ViewPolicy::baseline(),
+                    crate::view_policy::ViewPolicyState::default(),
+                    ViewDemand::default(),
+                    SecondaryViewTarget {
+                        image: image.clone(),
+                        allocated: crate::view_policy::BASELINE_TARGET_SIZE,
+                    },
                     WaterReflectionCamera,
                 ))
                 .id();
+            app.insert_resource(WaterReflectionTexture(image));
             Self {
                 app,
                 main_camera,
@@ -1806,20 +2027,48 @@ mod tests {
             }
         }
 
-        /// Turns the main camera and the frustum Bevy keeps in step with it.
+        /// Moves the observer, as the camera follow systems and the streaming fixture do: the
+        /// `Transform` is the new pose and the `GlobalTransform` is left at the last one propagation
+        /// wrote, which is what the adapter has to look past.
         fn aim(&mut self, main: Transform) {
             self.app
                 .world_mut()
                 .entity_mut(self.main_camera)
-                .insert((GlobalTransform::from(main), main_camera_frustum(&main)));
+                .insert(main);
         }
 
-        fn spawn_water(&mut self, translation: Vec3, half_extents: Vec3) {
-            self.app.world_mut().spawn((
-                GlobalTransform::from(Transform::from_translation(translation)),
-                water_bounds(half_extents),
-                WaterSurface,
-            ));
+        fn set_projection(&mut self, projection: Projection) {
+            self.app
+                .world_mut()
+                .entity_mut(self.main_camera)
+                .insert(projection);
+        }
+
+        fn set_policy(&mut self, policy: ViewPolicy) {
+            self.app
+                .world_mut()
+                .entity_mut(self.reflection_camera)
+                .insert(policy);
+        }
+
+        fn spawn_water(&mut self, translation: Vec3, half_extents: Vec3) -> Entity {
+            self.app
+                .world_mut()
+                .spawn((
+                    Transform::from_translation(translation),
+                    GlobalTransform::from_translation(translation),
+                    water_bounds(half_extents),
+                    WaterSurface,
+                ))
+                .id()
+        }
+
+        /// Raises or lowers a surface, as a different water plane streaming in would.
+        fn move_water(&mut self, water: Entity, height: f32) {
+            self.app
+                .world_mut()
+                .entity_mut(water)
+                .insert(Transform::from_translation(Vec3::new(0.0, height, -800.0)));
         }
 
         /// A water plane as a cell's role leaves it: on these layers, and drawn or hidden.
@@ -1854,9 +2103,21 @@ mod tests {
             let world = self.app.world();
             let camera = world.get::<Camera>(self.reflection_camera).unwrap();
             let transform = world.get::<Transform>(self.reflection_camera).unwrap();
+            let projection = world.get::<Projection>(self.reflection_camera).unwrap();
+            let render_target = world.get::<RenderTarget>(self.reflection_camera).unwrap();
+            let RenderTarget::Image(target) = render_target else {
+                panic!("the reflection camera renders into an image");
+            };
+            let image = world
+                .resource::<Assets<Image>>()
+                .get(&target.handle)
+                .expect("the reflection image lives as long as the camera");
             ReflectionFrame {
                 active: camera.is_active,
                 transform: *transform,
+                projection: projection.clone(),
+                image: target.handle.clone(),
+                image_size: image.size(),
             }
         }
     }
@@ -1864,6 +2125,9 @@ mod tests {
     struct ReflectionFrame {
         active: bool,
         transform: Transform,
+        projection: Projection,
+        image: Handle<Image>,
+        image_size: UVec2,
     }
 
     fn main_camera_projection() -> Projection {
@@ -2112,6 +2376,425 @@ mod tests {
             WaterSurface,
         ));
         assert!(harness.frame().active);
+    }
+
+    #[test]
+    fn reflection_mirrors_the_observer_pose_written_this_frame() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        harness.spawn_water(Vec3::new(0.0, 40.0, -800.0), CELL_WATER_HALF_EXTENTS);
+        assert!((harness.frame().transform.translation.y + 40.0).abs() < 1.0e-4);
+
+        // A teleport: the observer's `Transform` is the new pose, and the `GlobalTransform` left
+        // behind by the last propagation is the old one. The mirror has to follow the new pose in
+        // the frame it was written, or the teleport is reflected a frame late.
+        harness.aim(Transform::from_xyz(0.0, 200.0, 0.0));
+        let frame = harness.frame();
+        assert!(frame.active);
+        assert!((frame.transform.translation.y + 120.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn the_spawned_reflection_camera_activates_when_water_is_in_view() {
+        let mut app = App::new();
+        app.init_resource::<ProfilingState>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Time>()
+            .insert_resource(crate::streaming::RenderOrigin(IVec2::ZERO))
+            .insert_resource(crate::sky::CameraSpace::Exterior)
+            .add_plugins(crate::view_policy::SecondaryViewPolicyPlugin)
+            .add_systems(Startup, setup_water_reflection)
+            .add_systems(
+                PostUpdate,
+                prepare_water_reflection.in_set(ViewPolicySystems::Prepare),
+            );
+        let observer = Transform::from_xyz(0.0, 120.0, 0.0);
+        app.world_mut().spawn((
+            observer,
+            GlobalTransform::from(observer),
+            main_camera_projection(),
+            StreamingCamera,
+        ));
+        let water = Vec3::new(0.0, 40.0, -800.0);
+        app.world_mut().spawn((
+            Transform::from_translation(water),
+            GlobalTransform::from_translation(water),
+            water_bounds(CELL_WATER_HALF_EXTENTS),
+            WaterSurface,
+        ));
+        app.update();
+        let world = app.world_mut();
+        let mut cameras = world.query_filtered::<&Camera, With<WaterReflectionCamera>>();
+        let camera = cameras.single(world).unwrap();
+        assert!(
+            camera.is_active,
+            "the camera the real setup spawns is managed by the policy and renders with water in view"
+        );
+    }
+
+    /// The spawned reflection camera switches between the shadowed and the unshadowed route as its
+    /// policy says, and on neither route reaches the source sun and the copy at once, nor the
+    /// water. (On this branch the placed objects share the world layer and are reflected, see
+    /// [`PLACED_OBJECT_LAYER`].)
+    #[test]
+    fn the_spawned_reflection_camera_follows_its_policys_shadow_route() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .add_plugins(crate::shadow_route::ShadowRoutePlugin)
+            .add_systems(Startup, setup_water_reflection);
+        app.update();
+        let camera = app
+            .world_mut()
+            .query_filtered::<Entity, With<WaterReflectionCamera>>()
+            .single(app.world())
+            .unwrap();
+        let layers = |app: &App| {
+            app.world()
+                .entity(camera)
+                .get::<RenderLayers>()
+                .cloned()
+                .unwrap()
+        };
+        let source_sun = RenderLayers::from_layers(&LIGHT_LAYERS);
+        let replica = RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER);
+
+        assert_eq!(
+            layers(&app),
+            RenderLayers::from_layers(REFLECTION_VIEW_LAYERS),
+            "the baseline policy keeps shadows on"
+        );
+        for shadows in [
+            crate::view_policy::ViewShadows::Off,
+            crate::view_policy::ViewShadows::On,
+        ] {
+            app.world_mut().entity_mut(camera).insert(ViewPolicy {
+                shadows,
+                ..ViewPolicy::baseline()
+            });
+            app.update();
+            let layers = layers(&app);
+            assert_ne!(
+                layers.intersects(&source_sun),
+                layers.intersects(&replica),
+                "{shadows:?}: the camera is on exactly one sun's route"
+            );
+            assert!(!layers.intersects(&RenderLayers::layer(WATER_LAYER)));
+            assert!(!layers.intersects(&RenderLayers::layer(crate::portal::DESTINATION_LAYER)));
+            assert!(layers.intersects(&reflectable_world_layers()));
+        }
+    }
+
+    fn spawned_preset_reflection_camera(preset: WaterReflectionPreset) -> (App, Entity) {
+        spawned_reflection_camera(&["--water-reflection-preset", preset.name()])
+    }
+
+    #[test]
+    fn the_baseline_preset_keeps_todays_reflection_camera() {
+        let (app, camera) = spawned_preset_reflection_camera(WaterReflectionPreset::Baseline);
+        let camera = app.world().entity(camera);
+        assert_eq!(camera.get::<ViewPolicy>(), Some(&ViewPolicy::baseline()));
+        assert!(!camera.contains::<DepthPrepass>());
+        assert!(!camera.contains::<OcclusionCulling>());
+        // The spawn sets no `Msaa`; it is not the same as "not multisampled". In the shipped app
+        // `CameraPlugin` registers `Msaa` as a required component of `Camera`
+        // (`bevy_render-0.19.1/src/camera.rs:65`), so this camera gets Bevy's default `Sample4`
+        // (`bevy_render-0.19.1/src/view/mod.rs:240-246`) - a known cost that only
+        // the water preset closes with an explicit `Msaa::Off`. A bare test app has no such plugin.
+        assert_eq!(
+            camera.get::<Msaa>(),
+            None,
+            "the baseline spawn adds no Msaa of its own, and the water preset does"
+        );
+        assert_eq!(
+            camera.get::<RenderLayers>(),
+            Some(&RenderLayers::from_layers(REFLECTION_VIEW_LAYERS))
+        );
+    }
+
+    /// The reflection cost flags still shape the camera under a preset: the prepass brings
+    /// occlusion culling back on the baseline camera, never on the throttled water one, and the
+    /// scale applies to whichever size the preset starts from.
+    #[test]
+    fn the_reflection_flags_apply_on_top_of_the_preset() {
+        let (app, camera) = spawned_reflection_camera(&[
+            "--water-reflection-preset",
+            "baseline",
+            "--reflection-prepass=on",
+        ]);
+        let camera = app.world().entity(camera);
+        assert!(camera.contains::<DepthPrepass>());
+        assert!(camera.contains::<OcclusionCulling>());
+
+        let (app, camera) = spawned_reflection_camera(&[
+            "--water-reflection-preset",
+            "water",
+            "--reflection-prepass=on",
+            "--reflection-scale",
+            "0.5",
+        ]);
+        let half = crate::view_policy::WATER_TARGET_SIZE / 2;
+        assert_eq!(reflection_target_size(&app), half);
+        let camera = app.world().entity(camera);
+        assert!(camera.contains::<DepthPrepass>());
+        assert!(
+            !camera.contains::<OcclusionCulling>(),
+            "a throttled camera must not keep occlusion history"
+        );
+        assert_eq!(camera.get::<ViewPolicy>().unwrap().target_size, half);
+    }
+
+    /// The replica layer is a layer of its own on this branch too: not the water's, not the
+    /// portal destination's and not the door layer's. Content carries it *beside* the world layer,
+    /// not instead of it, so no view gains or loses a thing from either route's membership.
+    #[test]
+    fn the_replica_layer_is_no_other_layer() {
+        for layer in [
+            WORLD_LAYER,
+            WATER_LAYER,
+            crate::portal::DESTINATION_LAYER,
+            crate::door_layer::DOOR_LAYER,
+        ] {
+            assert_ne!(UNSHADOWED_REFLECTION_LAYER, layer);
+        }
+        assert!(
+            !RenderLayers::from_layers(&MAIN_VIEW_LAYERS)
+                .intersects(&RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER)),
+            "the main camera is never on the replica layer"
+        );
+        let world = reflectable_world_layers();
+        assert!(world.intersects(&RenderLayers::layer(WORLD_LAYER)));
+        assert!(world.intersects(&RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER)));
+        // Widening is a union: what a node was already on stays on it.
+        for own in [
+            RenderLayers::layer(WORLD_LAYER),
+            RenderLayers::from_layers(&MAIN_VIEW_LAYERS),
+            crate::door_layer::door_layers(),
+            RenderLayers::none(),
+            RenderLayers::layer(WATER_LAYER),
+            RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+        ] {
+            let widened = reflectable_layers(&own);
+            for layer in own.iter() {
+                assert!(
+                    widened.intersects(&RenderLayers::layer(layer)),
+                    "widening dropped layer {layer} of {own:?}"
+                );
+            }
+        }
+    }
+
+    /// The shadowless route draws the same content the shadowed one does - only without the sun's
+    /// cascades. Every kind of content the world layer holds is here with whether a reflection draws
+    /// it at all, and both routes have to agree: a route whose membership is smaller is a cheaper
+    /// reflection bought by dropping content (impl-1094: the portal stamped its cells with the world
+    /// layer alone, so the shadowless route drew terrain only).
+    #[test]
+    fn both_reflection_routes_draw_the_same_content() {
+        let shadowed = RenderLayers::from_layers(REFLECTION_VIEW_LAYERS);
+        let shadowless = RenderLayers::from_layers(UNSHADOWED_REFLECTION_VIEW_LAYERS);
+        let producers: [(&str, RenderLayers, bool); 8] = [
+            (
+                "terrain and the plain nodes of a cell",
+                reflectable_world_layers(),
+                true,
+            ),
+            (
+                "a reference's model on the placed-object layer",
+                reflectable_layers(&RenderLayers::layer(PLACED_OBJECT_LAYER)),
+                true,
+            ),
+            (
+                "a node a mod put on the world layer",
+                reflectable_layers(&RenderLayers::layer(WORLD_LAYER)),
+                true,
+            ),
+            (
+                "a light's own layers",
+                RenderLayers::from_layers(&POINT_LIGHT_LAYERS),
+                true,
+            ),
+            (
+                "a sky dome on the main camera's layers",
+                reflectable_layers(&RenderLayers::from_layers(&MAIN_VIEW_LAYERS)),
+                true,
+            ),
+            (
+                "the door layer's doors",
+                crate::door_layer::door_layers(),
+                true,
+            ),
+            ("a water surface", RenderLayers::layer(WATER_LAYER), false),
+            (
+                "the portal's destination space",
+                RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+                false,
+            ),
+        ];
+        for (what, layers, drawn) in producers {
+            assert_eq!(
+                layers.intersects(&shadowed),
+                drawn,
+                "the shadowed route and {what}: {layers:?}"
+            );
+            assert_eq!(
+                layers.intersects(&shadowless),
+                drawn,
+                "the shadowless route and {what}: {layers:?} - the two routes must draw the same \
+                 content"
+            );
+        }
+        // Non-vacuous: the content a reflection is supposed to show is drawn by both, so the
+        // agreement above is not two routes agreeing on nothing.
+        assert!(reflection_draws_a_whole_world());
+    }
+
+    /// Whether the shadowed reflection view draws the world layer at all - the fixture check the
+    /// parity test above needs, kept in one place so a change to [`REFLECTION_VIEW_LAYERS`] that
+    /// emptied it would fail the test that leans on it rather than making it vacuous.
+    fn reflection_draws_a_whole_world() -> bool {
+        RenderLayers::from_layers(REFLECTION_VIEW_LAYERS).intersects(&reflectable_world_layers())
+    }
+
+    #[test]
+    fn the_water_preset_drops_occlusion_history_and_multisampling() {
+        let (app, camera) = spawned_preset_reflection_camera(WaterReflectionPreset::Water);
+        let camera = app.world().entity(camera);
+        assert_eq!(camera.get::<ViewPolicy>(), Some(&ViewPolicy::water()));
+        assert!(
+            !camera.contains::<OcclusionCulling>(),
+            "a throttled camera must not keep occlusion history"
+        );
+        assert_eq!(camera.get::<Msaa>(), Some(&Msaa::Off));
+        assert_eq!(
+            camera.get::<RenderLayers>(),
+            Some(&RenderLayers::from_layers(
+                UNSHADOWED_REFLECTION_VIEW_LAYERS
+            )),
+            "the water preset starts on the shadowless route"
+        );
+        let target = app.world().resource::<WaterReflectionTexture>().0.clone();
+        let image = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&target)
+            .unwrap();
+        assert_eq!(
+            image.texture_descriptor.size.width,
+            crate::view_policy::WATER_TARGET_SIZE.x
+        );
+    }
+
+    #[test]
+    fn the_reflection_off_switch_never_activates_the_camera() {
+        let mut app = App::new();
+        app.init_resource::<ProfilingState>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Time>()
+            .insert_resource(crate::config::EngineConfig {
+                water_reflection: false,
+                ..default()
+            })
+            .insert_resource(crate::streaming::RenderOrigin(IVec2::ZERO))
+            .insert_resource(crate::sky::CameraSpace::Exterior)
+            .add_plugins(crate::view_policy::SecondaryViewPolicyPlugin)
+            .add_systems(Startup, setup_water_reflection)
+            .add_systems(
+                PostUpdate,
+                prepare_water_reflection.in_set(ViewPolicySystems::Prepare),
+            );
+        let observer = Transform::from_xyz(0.0, 120.0, 0.0);
+        app.world_mut().spawn((
+            observer,
+            GlobalTransform::from(observer),
+            main_camera_projection(),
+            StreamingCamera,
+        ));
+        let water = Vec3::new(0.0, 40.0, -800.0);
+        app.world_mut().spawn((
+            Transform::from_translation(water),
+            GlobalTransform::from_translation(water),
+            water_bounds(CELL_WATER_HALF_EXTENTS),
+            WaterSurface,
+        ));
+        for _ in 0..5 {
+            app.update();
+            let world = app.world_mut();
+            let mut cameras = world.query_filtered::<&Camera, With<WaterReflectionCamera>>();
+            assert!(
+                !cameras.single(world).unwrap().is_active,
+                "water is in view, but the reflection was switched off"
+            );
+        }
+    }
+
+    #[test]
+    fn reflection_renders_with_the_observer_projection() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        harness.spawn_water(Vec3::new(0.0, 40.0, -800.0), CELL_WATER_HALF_EXTENTS);
+        let narrow = Projection::Perspective(PerspectiveProjection {
+            fov: 0.5,
+            far: 5_000.0,
+            ..default()
+        });
+        harness.set_projection(narrow.clone());
+        let frame = harness.frame();
+        assert!(frame.active);
+        assert_eq!(
+            frame.projection.get_clip_from_view(),
+            narrow.get_clip_from_view(),
+            "the reflection is sampled by screen UV, so its projection has to be the observer's"
+        );
+    }
+
+    #[test]
+    fn a_water_level_change_renders_a_skipped_frame_and_moves_the_mirror() {
+        let mut policy = ViewPolicy::baseline();
+        policy.update_rate = ViewUpdateRate::EveryOtherFrame;
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        harness.set_policy(policy);
+        let water = harness.spawn_water(Vec3::new(0.0, 40.0, -800.0), Vec3::new(200.0, 0.0, 200.0));
+        assert!(
+            harness.frame().active,
+            "the first demanded frame has no schedule"
+        );
+
+        // The next frame is one the cadence would skip; the plane rises a unit, which is a change
+        // neither the observer's pose nor anything else in the demand shows.
+        harness.move_water(water, 41.0);
+        let frame = harness.frame();
+        assert!(frame.active);
+        assert!((frame.transform.translation.y + 38.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn the_reflection_image_keeps_its_handle_across_frames() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        harness.spawn_water(Vec3::new(0.0, 40.0, -800.0), CELL_WATER_HALF_EXTENTS);
+        let shared = harness
+            .app
+            .world()
+            .resource::<WaterReflectionTexture>()
+            .0
+            .clone();
+        for _ in 0..3 {
+            let frame = harness.frame();
+            assert!(frame.active);
+            assert_eq!(frame.image, shared, "the water materials hold this handle");
+            assert_eq!(frame.image_size, crate::view_policy::BASELINE_TARGET_SIZE);
+        }
+    }
+
+    #[test]
+    fn reflection_camera_stops_rendering_when_the_observer_is_gone() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        harness.spawn_water(Vec3::new(0.0, 40.0, -800.0), CELL_WATER_HALF_EXTENTS);
+        assert!(harness.frame().active);
+
+        harness
+            .app
+            .world_mut()
+            .entity_mut(harness.main_camera)
+            .remove::<StreamingCamera>();
+        assert!(!harness.frame().active, "nothing is left to mirror");
     }
 
     /// A cell whose four quadrants each carry a base layer and one overlay with the same `VTXT`
@@ -2450,18 +3133,35 @@ mod tests {
     /// the light.
     #[test]
     fn lights_cover_both_cameras_and_the_placed_objects() {
-        let light = RenderLayers::from_layers(&LIGHT_LAYERS);
-        for view in [MAIN_VIEW_LAYERS.as_slice(), REFLECTION_VIEW_LAYERS] {
+        let light = RenderLayers::from_layers(&POINT_LIGHT_LAYERS);
+        for view in [
+            MAIN_VIEW_LAYERS.as_slice(),
+            REFLECTION_VIEW_LAYERS,
+            UNSHADOWED_REFLECTION_VIEW_LAYERS,
+        ] {
             assert!(
                 light.intersects(&RenderLayers::from_layers(view)),
                 "a light must reach {view:?}"
             );
         }
         assert!(light.intersects(&PLACED_OBJECT_RENDER_LAYERS));
+        // The sun keeps its own contract: both shadowed views and the placed objects it shadows,
+        // and never the replica layer, which is what keeps its cascades out of the shadowless view.
+        let sun = RenderLayers::from_layers(&LIGHT_LAYERS);
+        for view in [MAIN_VIEW_LAYERS.as_slice(), REFLECTION_VIEW_LAYERS] {
+            assert!(
+                sun.intersects(&RenderLayers::from_layers(view)),
+                "the sun must reach {view:?}"
+            );
+        }
+        assert!(sun.intersects(&PLACED_OBJECT_RENDER_LAYERS));
+        assert!(!sun.intersects(&RenderLayers::from_layers(
+            UNSHADOWED_REFLECTION_VIEW_LAYERS
+        )));
     }
 
     /// A point light is a child of its placed-object reference, whose layer propagates down the
-    /// hierarchy; the light must keep [`LIGHT_LAYERS`] anyway, or it stops lighting the terrain
+    /// hierarchy; the light must keep [`POINT_LIGHT_LAYERS`] anyway, or it stops lighting the terrain
     /// and the reflection view.
     #[test]
     fn a_light_below_a_reference_keeps_the_light_layers() {
@@ -2483,7 +3183,7 @@ mod tests {
         );
         assert_eq!(
             app.world().entity(light).get::<RenderLayers>(),
-            Some(&RenderLayers::from_layers(&LIGHT_LAYERS)),
+            Some(&RenderLayers::from_layers(&POINT_LIGHT_LAYERS)),
             "the propagated placed-object layer must not replace the light's layers"
         );
     }

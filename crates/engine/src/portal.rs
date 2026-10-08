@@ -21,7 +21,7 @@
 //!
 //! | role | layers | visibility | seen by |
 //! |---|---|---|---|
-//! | [`CellRole::Active`] | the world layer on the root; its own (0, or 1 for water) on sources | unchanged | main camera, reflection camera |
+//! | [`CellRole::Active`] | the world layer on the root; its own (0, or 1 for water) on sources | unchanged | main camera, both reflection routes |
 //! | [`CellRole::Destination`] | [`DESTINATION_LAYER`] | unchanged | the portal camera only |
 //! | [`CellRole::Hidden`] | none | hidden | nothing |
 //!
@@ -48,6 +48,17 @@
 //! (`streaming::spawn_cell`, [`StreamedCellLayerStamps`]) - so a crossing's role flip is a value
 //! write per node, never the two archetype moves per node that re-stamping a bare subtree costs,
 //! which was the whole `portal/propagate` spike on the door-crossing frames (impl-1058).
+//!
+//! # Reflections
+//!
+//! An active cell's value is [`crate::render::reflectable_world_layers`]: the world layer plus the
+//! replica layer the water reflection's shadowless route draws, so a cell the portal streams is
+//! drawn by that route exactly as the shadowed one draws it (impl-1094). A node that is a source of
+//! its own takes the same widening through [`source_layers`], which is the only place a source's
+//! value is written from - so a reference's model, a light or a mod's node cannot be left out of the
+//! replica route by being given layers of its own. Neither widening touches a role's own value: a
+//! destination space and a hidden cell carry [`DESTINATION_LAYER`] and no layers at all under this
+//! branch, so content only a doorway draws stays out of the observer's reflection.
 //!
 //! # Doors
 //!
@@ -2696,6 +2707,14 @@ fn portal_sun_cascades(count: usize) -> CascadeShadowConfig {
     .build()
 }
 
+/// The engine's sun as [`place_destination_sun`] reads it: not the doorway's own, and not the
+/// unshadowed copy a shadowless view may add (`crate::shadow_route`), which only follows the engine
+/// sun.
+type EngineSunFilter = (
+    Without<PortalDestinationSun>,
+    Without<crate::shadow_route::UnshadowedSun>,
+);
+
 /// Puts the doorway's own sun ([`PortalDestinationSun`]) where the engine's sun is: the same
 /// direction, shadows on when the engine sun's are, and as many cascades as it has.
 ///
@@ -2716,10 +2735,7 @@ fn portal_sun_cascades(count: usize) -> CascadeShadowConfig {
 /// are switched on, so the doorway's sun never casts with a count of its own.
 fn place_destination_sun(
     config: Option<Res<EngineConfig>>,
-    engine: Query<
-        (&Transform, &DirectionalLight, Option<&CascadeShadowConfig>),
-        Without<PortalDestinationSun>,
-    >,
+    engine: Query<(&Transform, &DirectionalLight, Option<&CascadeShadowConfig>), EngineSunFilter>,
     mut sun: Query<
         (
             &mut Transform,
@@ -2959,26 +2975,38 @@ fn role_layers(role: CellRole) -> Option<RenderLayers> {
 /// The layers a cell's role asks of a node that has layers of its own ([`PortalLayerSource`]): the
 /// node keeps them while its cell is active, and takes the cell's value while it is not. A
 /// reference's model, a water plane's surface and a light are all such a node.
+///
+/// The active space's value is [`crate::render::reflectable_layers`] of the node's own layers, not
+/// the layers alone: this is the one place every own-layer source of a cell is written from, so the
+/// shadowless reflection route draws the same content the shadowed one does whatever a node was
+/// given of its own, and no producer of world content can forget the replica layer.
 fn source_layers(role: CellRole, own: &RenderLayers) -> RenderLayers {
-    role_layers(role).unwrap_or_else(|| own.clone())
+    role_layers(role).unwrap_or_else(|| crate::render::reflectable_layers(own))
 }
 
 /// The layers a cell root's own `Propagate<RenderLayers>` source carries for its role. Every role
-/// has one, **the active space included**: its value is the world layer the nodes were on anyway,
-/// so the stamp changes nothing a camera sees, and a crossing's role flips become value writes on
-/// nodes that already carry the components instead of the two archetype moves per node that
-/// stripping the active space's subtrees bare paid again on every door crossing - which is where
-/// the `portal/propagate` spike lived (impl-1058: the frames a crossing re-stamped thousands of
-/// bare nodes in one `PostUpdate`, 25.6-37.7 ms).
+/// has one, **the active space included**: its value is [`crate::render::reflectable_world_layers`],
+/// the layers a plain node of the world is on anyway - the world layer every camera draws and the
+/// replica layer the shadowless reflection route draws - so the stamp changes nothing any camera
+/// saw before, and a crossing's role flips become value writes on nodes that already carry the
+/// components instead of the two archetype moves per node that stripping the active space's
+/// subtrees bare paid again on every door crossing - which is where the `portal/propagate` spike
+/// lived (impl-1058: the frames a crossing re-stamped thousands of bare nodes in one `PostUpdate`,
+/// 25.6-37.7 ms).
 ///
 /// This is deliberately not [`role_layers`]: a node that is a source of its own
-/// ([`PortalLayerSource`]) in the active space keeps the layers it was given ([`source_layers`]),
-/// which is why that one stays `None` there while the root's source is the world layer. A plain
-/// node's default when it carries no `RenderLayers` at all is layer 0 (`bevy_render`'s own
-/// default), so writing [`crate::render::WORLD_LAYER`] over it is the same picture.
+/// ([`PortalLayerSource`]) in the active space keeps the layers it was given ([`source_layers`],
+/// which widens them the same way), which is why that one stays `None` there while the root's
+/// source is the world layers. A plain node's default when it carries no `RenderLayers` at all is
+/// layer 0 (`bevy_render`'s own default), so writing the world layer over it is the same picture -
+/// and the replica layer beside it is what makes the shadowless reflection route draw the cell's
+/// content rather than only the terrain a run without the portal stamps (impl-1094).
+///
+/// A role that is not the active space takes the cell's own value alone: a destination space or a
+/// hidden cell is drawn by no reflection, so nothing under it can leak into one.
 fn root_layers(role: CellRole) -> Option<RenderLayers> {
     match role {
-        CellRole::Active => Some(RenderLayers::layer(crate::render::WORLD_LAYER)),
+        CellRole::Active => Some(crate::render::reflectable_world_layers()),
         CellRole::Destination => Some(RenderLayers::layer(DESTINATION_LAYER)),
         CellRole::Hidden => Some(RenderLayers::none()),
     }
@@ -9744,12 +9772,17 @@ mod tests {
 
         app.update();
 
-        // The active space: Bevy's own layer, and the placed-object layer a reference's model
-        // carries by its own source.
-        assert_eq!(layers_of(&app, active_mesh), RenderLayers::default());
+        // The active space: the world layers - Bevy's own layer beside the reflection replica layer,
+        // so both reflection routes draw the cell (impl-1094) - and the placed-object layer a
+        // reference's model carries by its own source, widened the same way (placed objects sit on
+        // the world layer in the portal).
+        assert_eq!(
+            layers_of(&app, active_mesh),
+            crate::render::reflectable_world_layers()
+        );
         assert_eq!(
             layers_of(&app, active_model),
-            crate::render::PLACED_OBJECT_RENDER_LAYERS
+            crate::render::reflectable_layers(&crate::render::PLACED_OBJECT_RENDER_LAYERS)
         );
         assert!(on_main_camera(&app, active_model));
         // The portal's destination: every mesh of it on the portal camera's layer, the water
@@ -9833,21 +9866,19 @@ mod tests {
         assert_eq!(layers_of(&app, water), RenderLayers::none());
 
         // The player walks in: in the one frame the new space is seen in, the reference and its
-        // model are back on the placed-object layer and the water surface on the layer of its own.
+        // model are back on the placed-object layer - widened by the reflection replica layer, since
+        // placed objects are world content the water reflection draws (impl-1094) - and the water
+        // surface on the layer of its own.
         *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
             worldspace_id: TAMRIEL,
             interior: Some(PRESTREAMED_CELL),
         };
         update(&mut app, 1);
         assert!(on_main_camera(&app, mesh));
-        assert_eq!(
-            layers_of(&app, reference),
-            crate::render::PLACED_OBJECT_RENDER_LAYERS
-        );
-        assert_eq!(
-            layers_of(&app, model),
-            crate::render::PLACED_OBJECT_RENDER_LAYERS
-        );
+        let placed_objects =
+            crate::render::reflectable_layers(&crate::render::PLACED_OBJECT_RENDER_LAYERS);
+        assert_eq!(layers_of(&app, reference), placed_objects);
+        assert_eq!(layers_of(&app, model), placed_objects);
         assert_eq!(layers_of(&app, water), RenderLayers::layer(1));
 
         // And back behind a doorway: the whole cell, model included, is the portal camera's alone.
@@ -9901,8 +9932,8 @@ mod tests {
         );
         assert_eq!(
             layers_of(&app, mesh),
-            RenderLayers::default(),
-            "and the cell's own meshes on Bevy's layer"
+            crate::render::reflectable_world_layers(),
+            "and the cell's own meshes on the world layers, Bevy's own layer beside the replica one"
         );
 
         // Given to a node of the settled cell too: it is adopted where it is given the layers, so
@@ -9920,10 +9951,14 @@ mod tests {
         );
 
         // Taken off it again - what `hide_doorway_filler` does with a door model's filler - the
-        // layer it was given is not the one the cell keeps for it.
+        // layer it was given is not the one the cell keeps for it: the cell's own world layers come
+        // back, the replica layer with them (impl-1094).
         app.world_mut().entity_mut(settled).remove::<RenderLayers>();
         update(&mut app, 1);
-        assert_eq!(layers_of(&app, settled), RenderLayers::default());
+        assert_eq!(
+            layers_of(&app, settled),
+            crate::render::reflectable_world_layers()
+        );
         *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
             worldspace_id: TAMRIEL,
             interior: Some(INTERIOR_ALFTAND01),
@@ -9936,7 +9971,7 @@ mod tests {
         update(&mut app, 1);
         assert_eq!(
             layers_of(&app, settled),
-            RenderLayers::default(),
+            crate::render::reflectable_world_layers(),
             "the layer it was given is not the one its own space gives back"
         );
     }
@@ -10003,9 +10038,11 @@ mod tests {
         assert_eq!(stamp(&app, active), Some(CellRole::Active));
         assert_eq!(
             source(&app, active),
-            Some(RenderLayers::layer(crate::render::WORLD_LAYER)),
-            "the active space carries the world layer its plain nodes are on anyway, so a \
-             crossing's role flip is a value write, never a re-stamp of bare nodes (impl-1058)"
+            Some(crate::render::reflectable_world_layers()),
+            "the active space carries the world layers its plain nodes are on anyway - the world \
+             layer, so a crossing's role flip is a value write and never a re-stamp of bare nodes \
+             (impl-1058), and the reflection replica layer, so the water reflection's shadowless \
+             route draws the cell too (impl-1094)"
         );
 
         // The isolation finds the stamps already right: nothing of either cell is written again.
@@ -10016,6 +10053,101 @@ mod tests {
             (cells_before, nodes_before),
             "a stamped cell is never walked, let alone re-layered"
         );
+    }
+
+    /// The water reflection's two routes draw the same content out of a portal run (impl-1094):
+    /// every node of the active space - a plain node through the cell's stamp, a node with layers of
+    /// its own through [`source_layers`] - is on the layers the shadowed route draws **and** on the
+    /// replica layer the shadowless one draws, for every role a cell can have. A cell only a doorway
+    /// puts on screen carries neither: the portal camera's destination layer, the quad's layer and a
+    /// hidden cell's no-layer are in no reflection, so the space behind a doorway cannot appear in
+    /// the water of the space the player stands in.
+    #[test]
+    fn an_active_cell_is_reflected_and_a_doorways_cell_is_not() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let door = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<PortalState>()
+            .draw_destination(door, vec![CellKey::Interior(PRESTREAMED_CELL)]);
+        let destination_key = CellKey::Interior(PRESTREAMED_CELL);
+        let (destination_root, destination_plain) = spawn_cell(
+            &mut app,
+            PRESTREAMED_CELL,
+            None,
+            Some(destination_key),
+            None,
+        );
+        let active_key = CellKey::Interior(INTERIOR_ALFTAND01);
+        let (active_root, active_plain) =
+            spawn_cell(&mut app, INTERIOR_ALFTAND01, None, Some(active_key), None);
+        // The third role: resident, neither the space the player is in nor the space behind the
+        // doorway. Nothing draws it, so nothing may reflect it.
+        let hidden_key = CellKey::Interior(0x0006_1234);
+        let (hidden_root, hidden_plain) =
+            spawn_cell(&mut app, 0x0006_1234, None, Some(hidden_key), None);
+        // A node of each cell with layers of its own, the way a mod's node, a placed reference's
+        // model or a light carries them: its own layers are what the role is applied to.
+        let world = RenderLayers::layer(crate::render::WORLD_LAYER);
+        let (active_own, _) = spawn_mesh(&mut app, active_root, Some(world.clone()));
+        let (destination_own, _) = spawn_mesh(&mut app, destination_root, Some(world.clone()));
+        let (hidden_own, _) = spawn_mesh(&mut app, hidden_root, Some(world));
+        update(&mut app, 2);
+
+        let shadowed = RenderLayers::from_layers(crate::render::REFLECTION_VIEW_LAYERS);
+        let shadowless =
+            RenderLayers::from_layers(crate::render::UNSHADOWED_REFLECTION_VIEW_LAYERS);
+        for (what, entity) in [
+            ("a plain node", active_plain),
+            ("an own-layer node", active_own),
+        ] {
+            let layers = layers_of(&app, entity);
+            assert!(
+                layers.intersects(&shadowed),
+                "the shadowed route draws {what} of the active cell: {layers:?}"
+            );
+            assert!(
+                layers.intersects(&shadowless),
+                "and the shadowless route draws {what} too: {layers:?}"
+            );
+        }
+        for (role, what, entity) in [
+            (
+                "the cell a doorway alone draws",
+                "a plain node",
+                destination_plain,
+            ),
+            (
+                "the cell a doorway alone draws",
+                "an own-layer node",
+                destination_own,
+            ),
+            ("a hidden cell", "a plain node", hidden_plain),
+            ("a hidden cell", "an own-layer node", hidden_own),
+        ] {
+            let layers = layers_of(&app, entity);
+            assert!(
+                !layers.intersects(&shadowed) && !layers.intersects(&shadowless),
+                "{what} of {role} is in no reflection: {layers:?}"
+            );
+        }
+        // What the portal puts on screen by itself: the doorway's quad, on the water's own layer,
+        // and the destination layer the portal camera draws. Neither is content of the space the
+        // player stands in, so neither may appear in its reflection.
+        for (what, layer) in [
+            ("the portal quad", crate::portal::PORTAL_QUAD_LAYER),
+            ("the destination layer", DESTINATION_LAYER),
+        ] {
+            let layers = RenderLayers::layer(layer);
+            assert!(
+                !layers.intersects(&shadowed),
+                "the shadowed route never draws {what}"
+            );
+            assert!(
+                !layers.intersects(&shadowless),
+                "and the shadowless route never draws {what} either"
+            );
+        }
     }
 
     /// The layers the commit stamps a cell's nodes with at birth (`streaming::spawn_cell`) are the
@@ -10033,15 +10165,15 @@ mod tests {
             .spawn((Mesh3d(Handle::default()), ChildOf(stamped_root)))
             .id();
         // What `streaming::spawn_cell` stamps into the bundles of a plain node and its root.
-        let world_layer = RenderLayers::layer(crate::render::WORLD_LAYER);
+        let world_layers = crate::render::reflectable_world_layers();
         stamped.world_mut().entity_mut(stamped_root).insert((
-            Propagate(world_layer.clone()),
-            Inherited(world_layer.clone()),
+            Propagate(world_layers.clone()),
+            Inherited(world_layers.clone()),
         ));
         stamped
             .world_mut()
             .entity_mut(stamped_mesh)
-            .insert((Inherited(world_layer.clone()), world_layer));
+            .insert((Inherited(world_layers.clone()), world_layers));
         update(&mut stamped, 1);
 
         // The same tree without the stamp: the root's key lands, the observer stamps it, and the
@@ -10090,15 +10222,15 @@ mod tests {
             .collect::<Vec<_>>();
         // The tree is born stamped the way `streaming::spawn_cell` stamps it, and the frame's
         // propagation confirms rather than writes it.
-        let world_layer = RenderLayers::layer(crate::render::WORLD_LAYER);
+        let world_layers = crate::render::reflectable_world_layers();
         app.world_mut().entity_mut(root).insert((
-            Propagate(world_layer.clone()),
-            Inherited(world_layer.clone()),
+            Propagate(world_layers.clone()),
+            Inherited(world_layers.clone()),
         ));
         for mesh in &meshes {
             app.world_mut()
                 .entity_mut(*mesh)
-                .insert((Inherited(world_layer.clone()), world_layer.clone()));
+                .insert((Inherited(world_layers.clone()), world_layers.clone()));
         }
         update(&mut app, 1);
 
@@ -10335,7 +10467,8 @@ mod tests {
             "the cell's role is what moves the light: the stop is off it"
         );
 
-        // The active space gives the light the layers it was spawned with.
+        // The active space gives the light the layers it was spawned with: a point light's, which
+        // reach the shadowless reflection route as well (`crate::render::POINT_LIGHT_LAYERS`).
         *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
             worldspace_id: TAMRIEL,
             interior: Some(PRESTREAMED_CELL),
@@ -10343,7 +10476,7 @@ mod tests {
         update(&mut app, 1);
         assert_eq!(
             layers_of(&app, destination_light),
-            RenderLayers::from_layers(&crate::render::LIGHT_LAYERS)
+            RenderLayers::from_layers(&crate::render::POINT_LIGHT_LAYERS)
         );
     }
 

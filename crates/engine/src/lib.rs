@@ -40,6 +40,7 @@ pub mod room_culling;
 pub mod route;
 pub mod schedule_timing;
 pub mod shadow_layers;
+pub mod shadow_route;
 pub mod shots;
 pub mod sky;
 pub mod sky_dome;
@@ -48,6 +49,7 @@ pub mod snow;
 pub mod streaming;
 pub mod tonemapper;
 pub mod transition;
+pub mod view_policy;
 pub mod window_parking;
 pub mod world;
 

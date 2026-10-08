@@ -1163,7 +1163,15 @@ fn apply_light_settings(
         Option<&mut CascadeShadowConfig>,
         Ref<MainSun>,
     )>,
-    mut lights: Query<&mut DirectionalLight, Without<MainSun>>,
+    // Not the unshadowed copy a shadowless view adds (`crate::shadow_route`), which has contact
+    // shadows off by definition.
+    mut lights: Query<
+        &mut DirectionalLight,
+        (
+            Without<MainSun>,
+            Without<crate::shadow_route::UnshadowedSun>,
+        ),
+    >,
 ) {
     if settings.is_changed() && shadow_map.size != settings.shadow_map_size {
         shadow_map.size = settings.shadow_map_size;

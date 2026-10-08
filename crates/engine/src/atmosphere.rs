@@ -690,7 +690,9 @@ fn update_atmosphere(
     catalog: Option<Res<SpaceLightingCatalog>>,
     mut clear: ResMut<ClearColor>,
     ambient: Option<ResMut<GlobalAmbientLight>>,
-    mut suns: Query<&mut DirectionalLight>,
+    // Not the unshadowed copy a shadowless view adds: `crate::shadow_route` keeps it in step with
+    // its source, and writing its shadows here would switch them back on every frame.
+    mut suns: Query<&mut DirectionalLight, Without<crate::shadow_route::UnshadowedSun>>,
     mut cameras: Query<(Entity, &mut Camera), With<StreamingCamera>>,
     // The same cameras' projections, for the far plane below. A separate query so that this system
     // reads no projection it does not write.
@@ -788,9 +790,11 @@ fn update_atmosphere(
 /// builds a shadowed directional light's cascades - four 2048-texel maps, and a cull of every
 /// shadow caster against each - whatever its illuminance, so an interior's sun (0) spent them on a
 /// shadow nothing could see, in the main view and again in every doorway into an interior
-/// (research-228). `--dark-sun-shadows` keeps them, to time the difference.
+/// (research-228). `--dark-sun-shadows` keeps them, to time the difference. `--shadows off`, the
+/// measurement switch, turns them off whatever the sun gives, as it does at the sun's spawn
+/// (`crate::app::sun_shadow_maps_enabled`): this is what keeps it off once the atmosphere writes.
 pub(crate) fn sun_casts_shadows(illuminance: f32, config: &EngineConfig) -> bool {
-    illuminance > 0.0 || config.portal.dark_sun_shadows
+    config.shadows && (illuminance > 0.0 || config.portal.dark_sun_shadows)
 }
 
 #[cfg(test)]
@@ -809,6 +813,16 @@ mod tests {
             sun_casts_shadows(0.0, &dark),
             "--dark-sun-shadows keeps them, for timing"
         );
+        let off = EngineConfig {
+            shadows: false,
+            ..EngineConfig::default()
+        };
+        assert!(
+            !sun_casts_shadows(10_000.0, &off),
+            "--shadows off is a measurement switch for every sun"
+        );
+        dark.shadows = false;
+        assert!(!sun_casts_shadows(0.0, &dark));
     }
 
     use super::*;

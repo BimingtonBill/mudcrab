@@ -11,8 +11,8 @@
 //!    spawned from the model of that door - its *driver*: frame and leaves, posed node for node from
 //!    the driver's own nodes, which the driver's own clips and [`DoorState`] move
 //!    ([`pose_door_copies`]). It is drawn by the main camera at full resolution on
-//!    [`DOOR_LAYERS`] (layer 0, which the main camera, the water reflection and the engine sun's
-//!    shadows read, plus [`DOOR_LAYER`], which marks it); the portal camera, which draws only
+//!    [`DOOR_LAYERS`] (layer 0, which the main camera, both water-reflection routes and the engine
+//!    sun's shadows read, plus [`DOOR_LAYER`], which marks it); the portal camera, which draws only
 //!    `DESTINATION_LAYER`, never draws it.
 //! 2. **Both native copies are hidden** once the door-layer door has drawn: the driver and its twin
 //!    in the other space (the *follower*), which `crate::portal::isolate_cells` moves onto no layer
@@ -69,12 +69,17 @@ pub const DOOR_LAYER: usize = 3;
 /// The layers every entity of a door-layer door is drawn on: layer 0, which the main camera (0 and
 /// 1), the water reflection camera (0) and the engine sun's shadow cascades (a layer-0 light) all
 /// read and the portal camera (`DESTINATION_LAYER` only) does not, and [`DOOR_LAYER`], which says
-/// what it is.
+/// what it is. The water reflection's replica layer rides along for free
+/// ([`crate::render::reflectable_layers`]): a door-layer door is drawn by the shadowed reflection
+/// route through layer 0, so it has to be drawn by the shadowless one too, or a preset that turns
+/// the sun's cascades off would also delete every near door from the water.
 pub fn door_layers() -> RenderLayers {
-    RenderLayers::from_layers(&[0, DOOR_LAYER])
+    crate::render::reflectable_layers(&RenderLayers::from_layers(&DOOR_LAYERS))
 }
 
-/// [`door_layers`], named for the docs.
+/// The layers [`door_layers`] is built from, named for the docs: the world layer a door-layer door
+/// is drawn on, and [`DOOR_LAYER`], which marks it. The replica layer a reflection route needs is
+/// added by [`door_layers`] itself ([`crate::render::reflectable_layers`]), not named here.
 pub const DOOR_LAYERS: [usize; 2] = [0, DOOR_LAYER];
 
 /// How near the camera a load door of the player's space has to be for the door layer to draw it:
