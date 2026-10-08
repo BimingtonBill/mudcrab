@@ -3,6 +3,27 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 evening, Team Lead (day 1 wrap-up)
+
+Track: all. Nothing pushed. The user asked for a slow wrap-up at ~21:00.
+- **Task board:** `local/plans/task-queue.md` (gitignored) is the project-wide queue: sections by area, every row
+  `| # | Task | Owner | Status | Detail |`, Status = done/active/queued/waiting/parked. The `mudcrab-queue` Claude mod
+  (dev-mods, this session) shows it live with workers, gate, disk and recent runs. Sessions report state changes to
+  Team Lead, who updates the file.
+- **New rules today (AGENTS.md):** workers launch as background tasks, about two reviewers per batch, task numbers come from
+  `tools/next_task_number.py <track> --label <slug>` (ebf64134, cbaffb63).
+- **New sessions:** Phase 4 Dev (gameplay/physics/saves; lay-of-the-land + prebuilt-collision design done, idle until the
+  user picks a first slice); Phase 5 Dev (set up only, PARKED by the user).
+- **Plans written:** `local/plans/mq103-plan.md` (MQ103 Bleak Falls Barrow playable: 3 research steps + 9 milestones;
+  decisions for the user: MQ103 as Phase 4's main track, ownership of the Luau host/audio/navmesh/minimal UI).
+- **160 fps state:** R2 laps read (graph_and_present = the 3 view graphs, not submit/present; ~5 ms/frame still
+  unattributed, sun shadow passes suspected; impl-1093 laps them). Room culling (B5) needs the portal-data image proof.
+  #187 view policy merged in a worktree but not priceable until portal content carries the reflection layer.
+- **Terrain holes (#1055, the user: important):** design-1091 approved; impl-1095 (bridge + gauges) and impl-1096
+  (terrain-less cell counter) coding; lod.rs part waits for Upstream Dev's announce to Chef (user's yes).
+- **Moved to tomorrow morning:** Phase 2's timing window (binary ready, d1805d12, 35-45 min quiet PC) and Portal's
+  1088+1093 laps (~15 min). Collision spans (A12) and the full load bench (E6) go into the same quiet slots.
+
 ## 2026-10-08 Portal Dev (fixes merged, R2 laps read: views not submit/present)
 
 Track: Portal. Nothing pushed.
