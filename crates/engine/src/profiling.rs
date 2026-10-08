@@ -4,8 +4,10 @@ use crate::{
     render::RendererMetrics,
     render_timing::{
         self, CLEANUP, CycleSides, EXTRACT, EXTRACT_COMMANDS_AND_ASSETS, GRAPH_AND_PRESENT,
-        MAIN_WORLD, PREPARE, QUEUE, REAL_MS, REMAINDER, RENDER_THREAD, SPECIALIZE_AND_VIEWS,
-        SWAPCHAIN_ACQUIRE, WAIT_FOR_RENDER_THREAD, WALL_CYCLE_MS,
+        GRAPH_MAIN_PASS, GRAPH_POST_PROCESS, GRAPH_PREPASS, GRAPH_REMAINDER, GRAPH_SUBMIT,
+        GRAPH_VIEW_COUNT, GRAPH_VIEWS, MAIN_WORLD, PREPARE, QUEUE, REAL_MS, REMAINDER,
+        RENDER_THREAD, SPECIALIZE_AND_VIEWS, SWAPCHAIN_ACQUIRE, WAIT_FOR_RENDER_THREAD,
+        WALL_CYCLE_MS,
     },
     streaming::StreamingMetrics,
 };
@@ -76,6 +78,25 @@ const RENDER_CYCLE_PHASES: [&str; 7] = [
     GRAPH_AND_PRESENT,
     CLEANUP,
     SWAPCHAIN_ACQUIRE,
+];
+
+/// The laps inside [`GRAPH_AND_PRESENT`], one column each after [`RENDER_CYCLE_PHASES`], in the
+/// order the row writes them: the render graph's view schedules (the root `Render` set — the part
+/// of the phase that scales with views), the count of view schedules, the per-view sums of the
+/// `Core3d` schedule's prepass, main-pass and post-process stages, the graph's queue submit, and
+/// the remainder that closes the phase (see `render_timing` and
+/// `local/research/portal-heavy-render-thread-2026-10-08.md` §4 R2).
+///
+/// [`GRAPH_VIEW_COUNT`] is not a duration: the row writes it as a whole number while the columns
+/// around it are milliseconds.
+const RENDER_CYCLE_GRAPH_LAPS: [&str; 7] = [
+    GRAPH_VIEWS,
+    GRAPH_VIEW_COUNT,
+    GRAPH_PREPASS,
+    GRAPH_MAIN_PASS,
+    GRAPH_POST_PROCESS,
+    GRAPH_SUBMIT,
+    GRAPH_REMAINDER,
 ];
 
 /// The spans the per-frame series keeps a column for, in the order `frame-series.csv` writes them:
@@ -547,16 +568,22 @@ impl ProfilingState {
     /// under pipelined rendering the one fed by the previous window's extract, because the render
     /// schedule that follows a window's extract runs in the next window; without it the one fed by
     /// this window's own extract — so a crossing frame's `render_thread` time is explained by its
-    /// own cycle's phases. A side the cycle did not measure stays an empty column, and the run's
-    /// last cycle or two are absent: their remainder window never closed, and with it neither clock
-    /// column.
+    /// own cycle's phases. The graph columns that follow them ([`RENDER_CYCLE_GRAPH_LAPS`]) are the
+    /// laps inside `render/graph_and_present`, summed over the render frame: `render/graph/views`
+    /// and `render/graph/submit` are laps of the phase's own window, the three stage columns are
+    /// sums over the views it names in `render/graph/view_count`, and
+    /// `render/graph/remainder` closes the phase (the parts and the remainder add up to
+    /// `render/graph_and_present`; see `render_timing`). A side the cycle did not measure stays an
+    /// empty column, and the run's last cycle or two are absent: their remainder window never
+    /// closed, and with it neither clock column.
     fn render_cycles_csv(&self) -> String {
-        let mut csv = String::with_capacity(224 + self.render_cycles.len() * 176);
+        let mut csv = String::with_capacity(224 + self.render_cycles.len() * 232);
         csv.push_str("cycle");
         for column in RENDER_CYCLE_CLOCKS
             .iter()
             .chain(RENDER_CYCLE_SIDES.iter())
             .chain(RENDER_CYCLE_PHASES.iter())
+            .chain(RENDER_CYCLE_GRAPH_LAPS.iter())
         {
             csv.push(',');
             csv.push_str(column);
@@ -583,6 +610,28 @@ impl ProfilingState {
                 sides.graph_and_present_ms,
                 sides.cleanup_ms,
                 sides.acquire_ms,
+            ] {
+                match value {
+                    Some(value) => csv.push_str(&format!(",{value:.4}")),
+                    None => csv.push(','),
+                }
+            }
+            // The graph laps, in `RENDER_CYCLE_GRAPH_LAPS` order. `view_count` is the one count:
+            // a whole number, not milliseconds.
+            match sides.graph_views_ms {
+                Some(value) => csv.push_str(&format!(",{value:.4}")),
+                None => csv.push(','),
+            }
+            match sides.graph_view_count {
+                Some(count) => csv.push_str(&format!(",{count}")),
+                None => csv.push(','),
+            }
+            for value in [
+                sides.graph_prepass_ms,
+                sides.graph_main_pass_ms,
+                sides.graph_post_process_ms,
+                sides.graph_submit_ms,
+                sides.graph_remainder_ms,
             ] {
                 match value {
                     Some(value) => csv.push_str(&format!(",{value:.4}")),
@@ -2166,7 +2215,8 @@ lights/budget,physics/step"
     }
 
     /// `render-cycles.csv` names every column in the documented order and writes each cycle's row
-    /// under them; a side the cycle did not measure stays an empty column.
+    /// under them; a side the cycle did not measure stays an empty column, and the view count is
+    /// the one column written as a whole number rather than milliseconds.
     #[test]
     fn the_render_cycles_csv_names_every_column() {
         let mut profiler = ProfilingState::default();
@@ -2182,6 +2232,10 @@ lights/budget,physics/step"
                 render_ms: Some(6.2),
                 acquire_ms: Some(1.0),
                 extract_commands_and_assets_ms: Some(0.5),
+                graph_views_ms: Some(4.0),
+                graph_view_count: Some(3),
+                graph_prepass_ms: Some(1.5),
+                graph_remainder_ms: Some(1.7),
                 ..Default::default()
             },
         )]);
@@ -2191,12 +2245,17 @@ lights/budget,physics/step"
             lines.next().unwrap(),
             "cycle,wall_cycle_ms,real_ms,main_world,extract,wait_for_render_thread,frame/remainder,\
             render_thread,render/extract_commands_and_assets,render/specialize_and_views,render/queue,\
-            render/prepare,render/graph_and_present,render/cleanup,render/swapchain_acquire"
+            render/prepare,render/graph_and_present,render/cleanup,render/swapchain_acquire,\
+            render/graph/views,render/graph/view_count,render/graph/prepass,render/graph/main_pass,\
+            render/graph/post_process,render/graph/submit,render/graph/remainder"
         );
         let row: Vec<&str> = lines.next().unwrap().split(',').collect();
         assert_eq!(
             row.len(),
-            1 + RENDER_CYCLE_CLOCKS.len() + RENDER_CYCLE_SIDES.len() + RENDER_CYCLE_PHASES.len()
+            1 + RENDER_CYCLE_CLOCKS.len()
+                + RENDER_CYCLE_SIDES.len()
+                + RENDER_CYCLE_PHASES.len()
+                + RENDER_CYCLE_GRAPH_LAPS.len()
         );
         assert_eq!(row[0], "1");
         assert_eq!(
@@ -2214,7 +2273,23 @@ lights/budget,physics/step"
         assert_eq!(row[7], "6.2000");
         assert_eq!(row[8], "0.5000", "the extract-commands phase was measured");
         assert_eq!(row[10], "", "no queue phase was measured in this cycle");
-        assert_eq!(row[14], "1.0000", "the swapchain wait closes the row");
+        assert_eq!(
+            row[14], "1.0000",
+            "the swapchain wait closes the phase columns"
+        );
+        assert_eq!(row[15], "4.0000", "the view schedules' lap");
+        assert_eq!(
+            row[16], "3",
+            "the view count is a count, not a duration: no decimals"
+        );
+        assert_eq!(row[17], "1.5000", "the prepass sum over the views");
+        assert_eq!(row[18], "", "no main-pass lap was measured in this cycle");
+        assert_eq!(
+            row[19], "",
+            "no post-process lap was measured in this cycle"
+        );
+        assert_eq!(row[20], "", "no submit lap was measured in this cycle");
+        assert_eq!(row[21], "1.7000", "the remainder closes the row");
         assert!(lines.next().is_none());
     }
 
