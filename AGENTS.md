@@ -93,6 +93,9 @@ this duty; see "Team Lead".)
   inside one shell command or from a detached script the panel cannot see. Claude helpers go through the Agent
   tool (background). A worker already running outside the panel gets a background watcher (a Bash loop waiting on
   its PID that prints the report head when it ends).
+- **One target folder per worktree (2026-10-09).** Never point two worktrees at the same `target/` or `CARGO_TARGET_DIR`:
+  cargo gives workspace crates the same hash across worktrees, so a shared target silently reuses stale artifacts and
+  fails or passes builds for the wrong code. A copied seed is fine; sharing is not.
 - **Task numbers (2026-10-08, after four clashes in one day).** Take every new task/worker number from
   `python tools/next_task_number.py <lead|p1|p2|portal|p3|p4|p5> --label <slug>`: it skips every number already used in
   tasks/ or local/agents and records the claim machine-wide under a lock, so two sessions never get the same one.
