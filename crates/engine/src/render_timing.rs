@@ -668,7 +668,7 @@ impl RenderTimings {
         // the `Time<Real>` delta this `First` read — the same render-paced reading the joined
         // `frame-series.csv` row carries, the row numbered one below this cycle, so the two files
         // join clock for clock.
-        if state.track_cycles {
+        if self.tracks_cycles() {
             let cycle = state.cycle;
             if let Some(started) = state.cycle_started.take() {
                 let wall_ms = now.saturating_duration_since(started).as_secs_f64() * 1000.0;
@@ -694,7 +694,7 @@ impl RenderTimings {
         if let Some(started) = state.main_started.take() {
             let elapsed = started.elapsed();
             let cycle = state.cycle;
-            if state.track_cycles {
+            if self.tracks_cycles() {
                 state.remainder_started = Some(Instant::now());
                 state.remainder_extract_ms = 0.0;
                 state.remainder_wait_ms = 0.0;
@@ -1540,7 +1540,7 @@ mod tests {
             GRAPH_REMAINDER,
         ] {
             assert!(
-                !samples.contains_key(*lap),
+                !samples.contains_key(lap),
                 "the graph lap {lap} is a cycle column, not a sample"
             );
         }
