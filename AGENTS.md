@@ -83,7 +83,16 @@ a conversion's build pause, a review wait) or is about to go idle, it checks:
   2026-10-07 17:00 lack it: their lead runs their builds through the gate). Coder briefs write acceptance
   commands in the gated form, since `ds_impl` allows each brief command as written.
 Upstream Dev runs this check across all sessions at least once an hour while the user is working, and at every
-hold and unhold, and messages any session that is idle without a reason.
+hold and unhold, and messages any session that is idle without a reason. (Since 2026-10-08 Team Lead holds
+this duty; see "Team Lead".)
+- **Every worker and helper shows in the app's background tasks (the user, 2026-10-08).** Launch each
+  `ds-agent.ps1` / `ds_impl.ps1` worker (DeepSeek, GLM, Muse, MiMo) as its own Bash call with
+  `run_in_background: true` and a description naming its label, provider and job; never start workers with `&`
+  inside one shell command or from a detached script the panel cannot see. Claude helpers go through the Agent
+  tool (background). A worker already running outside the panel gets a background watcher (a Bash loop waiting on
+  its PID that prints the report head when it ends).
+- **Batch reviews (the user, 2026-10-08).** Several merges or items needing review get about two reviewers in
+  all (e.g. one GLM, one Muse), each covering every item with one verdict section per item, not one worker per item.
 
 ## Two tracks: Phase 2 first, portal second
 
