@@ -145,6 +145,9 @@ The user added a **Team Lead** session above the dev sessions and Upstream Dev, 
 - **Oversight.** Team Lead runs the parallelism check across sessions (taking over the hourly
   duty from Upstream Dev), the morning brief and the evening decision table, and keeps the
   foundations check in every brief and review it hands out.
+- **Task queue:** `local/plans/task-queue.md` (local, not in git) is the one project-wide queue, in lanes ordered
+  by effect on the 160 fps goal. Sessions take work from their lane or a Team Lead message and report state
+  changes to Team Lead, who keeps the file current.
 - Team Lead does not code on track branches itself; it plans, briefs, reviews and integrates
   decisions, and delegates per the DeepSeek level above.
 
