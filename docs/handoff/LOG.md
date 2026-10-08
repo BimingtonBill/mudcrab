@@ -36,6 +36,25 @@ Track: Portal. Nothing pushed.
   worktree stays (only harness logs left in it; no --force).
 - Next: review 1085, 1088 and the B3 merge; image check of room culling on portal-rooms data; the window.
 
+## 2026-10-08 (night) Phase 4 Dev (collision design note out, both owners agree; idle)
+
+Track: phase 4. Team Lead's second hand-out (design only): binary prebuilt collision.
+GLM research-2001 (brief 588b2a2d) collected the code facts: hulls are points only in GLB extras
+JSON; the engine parses it and runs quickhull/trimesh on the main thread at first placement; no
+span covers it (inside `assets/readiness_scan`). Design note:
+`local/research/phase4/p4-binary-prebuilt-collision-design-2026-10-08.md` (indexed) - measure
+first (new collision spans, go if at least 1 ms in a post-door frame), then CollisionAsset v3
+(converter-built hulls with faces in a GLB buffer view, engine `Collider::convex_mesh`,
+v1/v2 readable), invalidation via manifest source/output_hash + #185 keys. Phase 2 Dev agreed
+(spans in its area once handed out, after impl-1060 lands; loud error on rejected hulls; insert_ms
+split; off-thread build keeps the readiness gate). Phase 1 Dev agreed (parry3d pinned
+`=0.30.2-glamx0.2-b`, needs the user's yes; reconvert batched with the planned schema bump;
+stacks on #126). First number (Phase 1 smoke, 10 models, 0 hulls): per-model build median
+0.071 ms / p95 0.90 ms, ~66% JSON; hull cost unmeasured. Asked Team Lead to queue: Phase 2's
+spans (shared timing window) and Phase 1's full load bench. Nothing running; no worktree, no
+build. Next: the user picks Phase 4's first slice tomorrow (MQ103 plan `local/plans/mq103-plan.md`
+or collision).
+
 ## 2026-10-08 Phase 4 Dev (new session: track set up, first analysis)
 
 Track: phase 4. The user started a Phase 4 Dev session and chose "set up track, then wait".
