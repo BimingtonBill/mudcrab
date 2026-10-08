@@ -3,6 +3,18 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Phase 4 Dev (new session: track set up, first analysis)
+
+Track: phase 4. The user started a Phase 4 Dev session and chose "set up track, then wait".
+AGENTS.md now has a Phase 4 track (5f2c22f4): `phase4/*` from main, worktree
+`worktrees/phase4` at the first job, targets on D:, tasks `<kind>-<nnn>-p4-<slug>` 2000-2099,
+STANDBY on Team Lead hand-outs. First hand-out (Team Lead): lay of the land + first-slice
+proposal. GLM analysis-2000 (brief fe875f14) answered it; spot-checked against gh and origin/main.
+Proposal: `local/research/phase4/p4-lay-of-the-land-2026-10-08.md` (indexed). Ranking: binary
+prebuilt collision; #104 grab spring after #125; 4.2 animation design issue. Finding: local `main`
+mirror is stale (6f583cd9) against origin/main f40ca1df. Nothing running; no worktree, no build.
+Next: Team Lead takes the proposal to the user.
+
 ## 2026-10-08 Team Lead (new session, TRIAL)
 
 Track: all. The user started a Team Lead session above the dev sessions and Upstream Dev
