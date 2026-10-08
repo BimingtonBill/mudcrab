@@ -96,6 +96,7 @@ use crate::{
         ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, camera_grid, creation_to_bevy,
         render_position,
     },
+    swap_bridge::{WaitingVisibility, pending_drawn},
     transition::{OpenDoor, distance_in_front_of_door, door_frame, door_is_open},
     world::{components::StreamingCamera, database::CellKey},
 };
@@ -1300,7 +1301,7 @@ fn portal_wait(state: Option<Option<DoorState>>, waited: f32) -> PortalWait {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_demo_tour(
     mut commands: Commands,
     time: Res<Time>,
@@ -1318,10 +1319,11 @@ fn run_demo_tour(
     active: Option<Res<ActiveCell>>,
     origin: Option<Res<RenderOrigin>>,
     // Grouped: a system takes at most sixteen parameters.
-    (real_time, mut open_door, prewarm): (
+    (real_time, mut open_door, prewarm, waiting): (
         Res<Time<Real>>,
         MessageWriter<OpenDoor>,
         Option<Res<crate::portal::PortalPrewarm>>,
+        WaitingVisibility,
     ),
 ) {
     tour.frame += 1;
@@ -1373,6 +1375,7 @@ fn run_demo_tour(
                     camera_space_key(active, origin.as_deref(), camera.translation)
                 }),
                 tour.settle_quiet,
+                pending_drawn(&waiting),
                 streaming.as_deref(),
                 metrics.as_deref(),
             );

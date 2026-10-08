@@ -7,6 +7,7 @@ use crate::{
         TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
     snow::{DirectionalSnow, DirectionalSnowCatalog, SnowMaterial, SnowMaterialCache},
+    swap_bridge::{SwapDrawn, SwapStandIn, SwapSurface, SwapWaiting},
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
@@ -26,7 +27,7 @@ use bevy::{
     app::{Inherited, Propagate, SceneSpawnerSystems},
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::primitives::MeshAabb,
-    camera::visibility::RenderLayers,
+    camera::visibility::{RenderLayers, ViewVisibility},
     ecs::system::SystemParam,
     gltf::{GltfExtras, GltfMaterialName, GltfSceneExtras},
     image::{ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler},
@@ -245,6 +246,18 @@ impl Plugin for StreamingPlugin {
             app.add_systems(
                 Update,
                 crate::pacing::track_world_ready.after(validate_streaming_lifecycle),
+            );
+        }
+        // The hole-risk gauge walks every terrain patch, so it exists only for a run that profiles:
+        // it is measurement data for the bundle, like the frame series.
+        if app
+            .world()
+            .get_resource::<crate::config::EngineConfig>()
+            .is_some_and(|config| config.profile_output_dir.is_some())
+        {
+            app.add_systems(
+                Update,
+                record_terrain_swap_gauge.after(track_surface_readiness),
             );
         }
     }
@@ -672,6 +685,11 @@ pub struct StreamingMetrics {
     /// full-detail grid, and a full cell that left it for the ring.
     pub cells_upgraded: u64,
     pub cells_downgraded: u64,
+    /// Detail changes whose stand-in outlived
+    /// [`MAX_SWAP_HOLD_FRAMES`](crate::swap_bridge::MAX_SWAP_HOLD_FRAMES): the root the cell was
+    /// drawn by was despawned anyway, so what it covered is unguarded from that frame on. A failure
+    /// count, not a wait - every one of them is warned about as well.
+    pub swap_hold_timeouts: u64,
     /// Ring grids that held nothing: the ones a worldspace does not reach, and cells whose
     /// landscape the cell cache does not carry. Deliberately not part of [`Self::failed_cells`]:
     /// see the commit in [`collect_cells`](fn@collect_cells).
@@ -1843,6 +1861,26 @@ struct SpawnStampContext<'w, 's> {
     camera: Query<'w, 's, &'static Transform, With<StreamingCamera>>,
 }
 
+/// Hands the root a detail change replaces over to the stand-in hold (design-1091 §3): the cell
+/// changed detail on the same grid, and until the root that replaced it can be drawn this one keeps
+/// covering the ground, so no frame shows neither.
+///
+/// The root stops being a streamed cell root here: the markers every root scan keys on go with it,
+/// so [`validate_streaming_lifecycle`]'s duplicate/orphaned/missing counts, the portal's isolation,
+/// room culling and the shots' settle see the cell's one root - the new one - and never count this
+/// one as a second. The cell's `CellRef` stays for the log, and its `ExteriorCellGrid` so the
+/// render origin still places the stand-in ([`reposition_cell_roots`]).
+///
+/// The new root's terrain patches name it back ([`SwapSurface::stand_in`], through [`spawn_cell`]),
+/// which is what `crate::swap_bridge`'s detail-change hand-over reads to decide when the hold ends.
+fn hold_replaced_root(commands: &mut Commands, replaced: Entity) {
+    commands
+        .entity(replaced)
+        .try_remove::<StreamedCellRoot>()
+        .try_remove::<DistantTerrainRoot>()
+        .try_insert(SwapStandIn::default());
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_cells(
     mut commands: Commands,
@@ -2053,12 +2091,10 @@ fn collect_cells(
                     );
                     continue;
                 }
-                // The replacement is committed: the root the cell kept drawing goes now, in the
-                // same frame its successor is spawned, so the two are never both drawn and the
-                // cell never has two terrains.
-                if let Some(replaced) = replaced {
-                    commands.entity(replaced).try_despawn();
-                }
+                // The replacement is committed: the root the cell kept drawing does not go now. It
+                // becomes the new root's stand-in (at the end of this arm) and stays drawn until
+                // the new root's terrain is confirmed drawn, so no frame shows neither. See
+                // [`hold_replaced_root`].
                 // The layers the cell is born on (`crate::portal`'s resolver, impl-1058): the commit
                 // classifies the cell from the space of the moment, and the nodes the tree is built
                 // from carry that value in their own bundles - the propagation's first pass over
@@ -2112,6 +2148,7 @@ fn collect_cells(
                     detail,
                     world_physics,
                     stamp,
+                    replaced,
                     &mut streaming.next_model_sequence,
                     &mut profiler,
                 );
@@ -2121,6 +2158,13 @@ fn collect_cells(
                 streaming
                     .cells
                     .insert(response.key, CellStatus::Resident { root, detail });
+                // The root this cell was drawn by until now keeps covering it, and the new root's
+                // patches name it back (`spawn_cell`), so it is despawned the frame the new terrain
+                // is confirmed drawn - in the same frame the two are drawn together, never in
+                // neither - or, loudly and counted, when the hold bound passes.
+                if let Some(replaced) = replaced {
+                    hold_replaced_root(&mut commands, replaced);
+                }
                 // A full commit of a previously failed cell ends its failure record: the rescue is
                 // over, the plan asks for the cell in full again the way it asks for any resident,
                 // and a later failure starts its attempt budget from this success.
@@ -2609,6 +2653,10 @@ fn spawn_cell(
     // spawns the cell exactly as a run without the portal always did. A node with layers of its
     // own (the water plane) is left to the adoption that makes it a source.
     stamp: Option<RenderLayers>,
+    // The root this cell was drawn by until this frame, when the commit is a detail change: every
+    // terrain patch is born naming it as its stand-in ([`SwapSurface::stand_in`]), which is what
+    // keeps it drawn and what the hand-over reads to know when to despawn it.
+    stand_in: Option<Entity>,
     model_sequence: &mut u64,
     profiler: &mut ProfilingState,
 ) -> Entity {
@@ -2684,6 +2732,24 @@ fn spawn_cell(
                     },
                     extension,
                 });
+                // The quadrant declares what its draw needs, for the render→main swap bridge
+                // (`crate::swap_bridge`): the material it draws with and every image that material
+                // binds. The images are the ones the readiness pass validates below, and the
+                // declaration is re-made there if a normal map has to be dropped.
+                let surface = SwapSurface::new(
+                    material.id().untyped(),
+                    images
+                        .color
+                        .iter()
+                        .chain(images.normal.iter())
+                        .map(|handle| handle.id()),
+                );
+                // A detail change's new quadrants name the root that is covering the cell until
+                // they are drawn; the commit keeps that root alive for exactly as long.
+                let surface = match stand_in {
+                    Some(stand_in) => surface.with_stand_in(stand_in),
+                    None => surface,
+                };
                 let mut patch = parent.spawn((
                     Name::new(format!("Terrain quadrant {quadrant}")),
                     Mesh3d(meshes.add(mesh)),
@@ -2697,6 +2763,10 @@ fn spawn_cell(
                         images: images.color,
                         normals: images.normal,
                     },
+                    // Waiting for the render world from birth: the quadrant stays hidden (and its
+                    // grid's LOD tile stays drawn) until the bridge confirms it is drawable.
+                    SwapWaiting,
+                    surface,
                 ));
                 if let Some(grid) = terrain_grid {
                     patch.insert(TerrainCoverage {
@@ -3046,8 +3116,9 @@ struct PendingWaterProfile {
 }
 
 /// Counts the streamer's unfinished-work markers under one cell root: a model not yet armed or
-/// instantiated, and terrain or water whose textures are still loading. Unlike the global
-/// [`StreamingMetrics`] counts these cover only that cell, which is what a load door waits for.
+/// instantiated, terrain or water whose textures are still loading, and a surface the render world
+/// has not confirmed drawn. Unlike the global [`StreamingMetrics`] counts these cover only that
+/// cell, which is what a load door waits for.
 #[derive(bevy::ecs::system::SystemParam)]
 #[allow(clippy::type_complexity)]
 pub(crate) struct PendingUnder<'w, 's> {
@@ -3063,6 +3134,12 @@ pub(crate) struct PendingUnder<'w, 's> {
             With<PendingWaterProfile>,
         )>,
     >,
+    /// The surfaces still waiting on the render world ([`SwapWaiting`]). Counted only while a view
+    /// can see them, the same rule the settle uses ([`crate::swap_bridge::pending_drawn`]): a
+    /// landing interior's own surfaces are in view the moment the camera arrives, so a crossing does
+    /// not finish on textures loaded with nothing yet drawn, and it does not wait on a pre-streamed
+    /// cell's surfaces, which no view can see and which the bridge can never confirm.
+    swapping: Query<'w, 's, &'static ViewVisibility, With<SwapWaiting>>,
 }
 
 impl PendingUnder<'_, '_> {
@@ -3070,7 +3147,13 @@ impl PendingUnder<'_, '_> {
     pub(crate) fn count(&self, root: Entity) -> usize {
         std::iter::once(root)
             .chain(self.children.iter_descendants(root))
-            .filter(|entity| self.pending.contains(*entity))
+            .filter(|entity| {
+                self.pending.contains(*entity)
+                    || self
+                        .swapping
+                        .get(*entity)
+                        .is_ok_and(|visibility| visibility.get())
+            })
             .count()
     }
 }
@@ -3807,6 +3890,16 @@ fn track_surface_readiness(
                         {
                             material.extension.drop_normal_maps();
                         }
+                        // The swap bridge waits on the images the material binds, so the failed
+                        // normal maps leave the quadrant's declaration with them: an image that
+                        // will never reach the render world is one the surface could never stop
+                        // waiting for, and from slice C4 that would fail a settle loudly.
+                        let bound: Vec<_> =
+                            pending.images.iter().map(|handle| handle.id()).collect();
+                        commands
+                            .entity(entity)
+                            .entry::<SwapSurface>()
+                            .and_modify(move |mut surface| surface.set_images(bound));
                         profiler.increment("terrain/normal_map_fallbacks", 1);
                         normals_dropped = true;
                         SurfaceDependencyState::Ready
@@ -3907,6 +4000,33 @@ fn track_surface_readiness(
         "assets/pending_surface_instances",
         metrics.pending_surface_instances as f64,
     );
+}
+
+/// Terrain patches whose surface is ready on the CPU side but not yet drawn.
+type ReadyUndrawnPatches = (
+    With<TerrainPatch>,
+    With<TerrainSurfaceReady>,
+    Without<SwapDrawn>,
+);
+
+/// The hole-risk gauge (design-1091 C5): how many terrain quadrants this world has validated
+/// (`TerrainSurfaceReady`) but the render world has not confirmed drawn (`SwapDrawn`).
+///
+/// This is the number the LOD-hide rule runs ahead of the GPU by. `lod::update_terrain_lod_visibility`
+/// hides a grid's tile the moment its quadrants are surface-ready, and that flag says the textures
+/// are in `Assets<Image>` - nothing about the mesh, the material's bind group or the pipeline.
+///
+/// Read it as an upper bound, not as a leak: a quadrant no view can see is never confirmed drawn,
+/// so an ordinary frame counts every patch behind the camera as well. What it measures is how the
+/// gap moves - when the camera turns, when a cell arrives, when a chunk lands - which is what the
+/// per-frame series column is for.
+///
+/// It walks every terrain patch, so it is installed only for a run that profiles.
+fn record_terrain_swap_gauge(
+    ready: Query<(), ReadyUndrawnPatches>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    profiler.set_gauge("swap/terrain_ready_not_drawn", ready.iter().count() as f64);
 }
 
 enum SurfaceDependencyState {
@@ -5370,6 +5490,29 @@ fn update_render_origin(
     profiler.record_elapsed("streaming/render_origin_rebase", started);
 }
 
+/// Frames a visible full-detail terrain quadrant may wait on the render world before the run-level
+/// invariant counts it as a hole that came back (design-1091 §4).
+///
+/// Derived from what a legitimate wait is made of: the bridge's own latency is two render frames (a
+/// surface is prepared in the extract after the frame that established its assets, and the hand-over
+/// runs in the frame after that), and the upload budget
+/// (`EngineConfig::max_upload_mib_per_frame`, 16 MiB a frame in play, none for a capture) defers a
+/// quadrant's mesh and its LAND layers' images to later frames under one shared counter a cell's own
+/// models also draw on. One full-detail stream window is `(2 * stream_radius + 1)^2` cells of four
+/// quadrants - 100 quadrants at the default `stream_radius` of 2 - whose images are on the order of
+/// the budget's frame, so a whole window turning over is on the order of a hundred frames. 512 is
+/// several times that: generous enough that no healthy run, slow machine or heavy mod cell trips it,
+/// and short enough to catch a bridge that has stopped confirming a visible quadrant within seconds
+/// at any frame rate the engine runs at.
+///
+/// The bound is on the *permanent* condition (never drawn while visible), not the transient one (not
+/// yet drawn): the invariant gates shots and acceptance, so a false positive would cost a run, and
+/// the stall it exists to catch is not one that clears by waiting.
+const MAX_SWAP_WAIT_FRAMES: u64 = 512;
+
+/// Terrain quadrants still waiting on the render world.
+type WaitingTerrainPatches = (With<TerrainPatch>, With<SwapWaiting>);
+
 #[allow(clippy::too_many_arguments)]
 fn validate_streaming_lifecycle(
     config: Res<EngineConfig>,
@@ -5382,6 +5525,13 @@ fn validate_streaming_lifecycle(
     roots: CellRootsQuery,
     full_exteriors: Query<Option<&TerrainLess>, (With<StreamedCellRoot>, With<ExteriorCellGrid>)>,
     terrain_patches: Query<&ChildOf, With<TerrainPatch>>,
+    // A visible terrain quadrant still waiting on the render world, and how long each has waited:
+    // the run-level check below (design-1091 C4). The map holds only the patches waiting now, so a
+    // drawn or despawned patch's entity id cannot be inherited by a later one.
+    parents: Query<&ChildOf>,
+    patches: Query<(Entity, &ViewVisibility), WaitingTerrainPatches>,
+    mut wait_frame: Local<u64>,
+    mut waiting_since: Local<HashMap<Entity, u64>>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -5483,8 +5633,76 @@ fn validate_streaming_lifecycle(
         }
     }
     let terrain_lost_roots = unpatched.len() as u64;
-    let violations =
-        duplicate_roots + orphaned_roots + missing_roots + out_of_range_roots + terrain_lost_roots;
+    // A visible full-detail terrain quadrant the render world has not confirmed drawn past
+    // [`MAX_SWAP_WAIT_FRAMES`] is a hole that came back: the bridge has had the bridge's latency and
+    // the upload budget's worst case and still cannot draw it. Counted only for the resident
+    // full-detail exterior roots inside the stream window - the ground a camera settling on the
+    // active worldspace can see - so a cell on its way out, another worldspace's cells, and the
+    // terrain ring (which the plan does not keep in full detail) are not read as failures. (A
+    // counted terrain-less cell ([`TerrainLess`]) has no `TerrainPatch` at all, so it is never
+    // seen here and needs no exemption: the terrain-lost check above covers it.)
+    *wait_frame = wait_frame.saturating_add(1);
+    let swap_wait_timeouts = if active.interior.is_some() {
+        // No exterior geometry is drawn inside an interior; nothing here can be a hole.
+        waiting_since.clear();
+        0
+    } else {
+        let full_window_roots: HashSet<Entity> = camera.single().map_or_else(
+            |_| HashSet::new(),
+            |camera| {
+                let center = camera_grid(camera.translation, origin.0);
+                streaming
+                    .cells
+                    .iter()
+                    .filter_map(|(key, status)| match (key, status) {
+                        (
+                            CellKey::Exterior {
+                                worldspace_id,
+                                grid_x,
+                                grid_y,
+                            },
+                            CellStatus::Resident {
+                                root,
+                                detail: CellDetail::Full,
+                            },
+                        ) if *worldspace_id == active.worldspace_id
+                            && (grid_x - center.x).abs() <= config.stream_radius
+                            && (grid_y - center.y).abs() <= config.stream_radius =>
+                        {
+                            Some(*root)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            },
+        );
+        let mut stuck = 0u64;
+        for (entity, visibility) in patches.iter() {
+            let visible_under_a_full_window_root = visibility.get()
+                && parents
+                    .iter_ancestors(entity)
+                    .any(|ancestor| full_window_roots.contains(&ancestor));
+            if !visible_under_a_full_window_root {
+                waiting_since.remove(&entity);
+                continue;
+            }
+            let since = *waiting_since.entry(entity).or_insert(*wait_frame);
+            if *wait_frame - since > MAX_SWAP_WAIT_FRAMES {
+                stuck = stuck.saturating_add(1);
+            }
+        }
+        // Forget the patches that drew (their marker is gone) or despawned, so the map covers the
+        // waiting set and nothing else.
+        waiting_since.retain(|entity, _| patches.contains(*entity));
+        stuck
+    };
+
+    let violations = duplicate_roots
+        + orphaned_roots
+        + missing_roots
+        + out_of_range_roots
+        + terrain_lost_roots
+        + swap_wait_timeouts;
 
     metrics.active_requests = active_requests;
     metrics.peak_active_requests = metrics.peak_active_requests.max(active_requests);
@@ -5500,6 +5718,7 @@ fn validate_streaming_lifecycle(
             missing_roots,
             out_of_range_roots,
             terrain_lost_roots,
+            swap_wait_timeouts,
             "streaming lifecycle invariant failed"
         );
         profiler.event("streaming", "invariant_failed", None);
@@ -5507,6 +5726,7 @@ fn validate_streaming_lifecycle(
     metrics.streaming_invariant_failures = metrics.streaming_invariant_failures.max(violations);
     profiler.set_gauge("streaming/active_requests", active_requests as f64);
     profiler.set_gauge("streaming/resident_roots", root_entries.len() as f64);
+    profiler.set_gauge("streaming/swap_wait_timeouts", swap_wait_timeouts as f64);
 }
 
 #[cfg(test)]
@@ -5517,6 +5737,7 @@ mod tests {
         world::database::DoorLinkRow,
     };
     use bevy::asset::{AssetApp, AssetPlugin};
+    use bevy::ecs::system::SystemState;
 
     #[test]
     fn window_residency_counts_only_the_active_interior_inside() {
@@ -5828,6 +6049,7 @@ mod tests {
                 Some(terrain.clone()),
                 CellDetail::Full,
                 physics.0,
+                None,
                 None,
                 &mut 0,
                 &mut profiler,
@@ -9283,8 +9505,12 @@ mod tests {
             )
         });
         assert!(
-            app.world().get_entity(rescue_root).is_err(),
-            "the rescue root is swapped out by the commit, the way a tier change does"
+            app.world().get::<SwapStandIn>(rescue_root).is_some(),
+            "the commit keeps the rescue root, and the new terrain names it as its stand-in"
+        );
+        assert!(
+            app.world().get::<DistantTerrainRoot>(rescue_root).is_none(),
+            "the stand-in is no longer a streamed cell root, so the cell has one root"
         );
         let streaming = app.world().resource::<StreamingWorld>();
         assert!(
@@ -9783,6 +10009,174 @@ mod tests {
         );
     }
 
+    /// The detail-change hand-over end to end through the commit (design-1091 §3, slice C3): the
+    /// ring cell is asked for in full, and the root the cell was drawn by is not despawned - it is
+    /// handed over as the stand-in every patch of the new root names, and stops being a streamed
+    /// cell root, so the cell has one root and the stand-in is never counted as a second.
+    #[test]
+    fn a_detail_change_keeps_the_old_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_terrain_cache(&cache_path, 1);
+        let catalogue_path = directory.path().join("catalogue.db");
+        write_empty_catalogue(&catalogue_path);
+
+        let key = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 2,
+            grid_y: -3,
+        };
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<StandardMaterial>()
+            .init_asset::<TerrainMaterial>()
+            .init_asset::<WaterMaterial>()
+            .insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(CellCache::open(&cache_path).unwrap())
+            .insert_resource(AssetCatalog::open(&catalogue_path).unwrap())
+            .init_resource::<DirectionalSnowCatalog>()
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .insert_resource(WorldDatabase::open(&database_path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, collect_cells);
+        // No `plan_cells` here: the cell's status and its request are handed in, so the test drives
+        // the two commits it needs and nothing else. The commit budget's one slot is given, since
+        // nothing in this app refills it each frame.
+        app.world_mut()
+            .resource_mut::<StreamingCommitBudget>()
+            .remaining = 4;
+
+        let resident = |app: &App, detail: CellDetail| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Resident { detail: resident, .. }) if *resident == detail
+            )
+        };
+        // The ring cell: the tier a worldspace without LOD draws its distance with.
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                key,
+                CellStatus::Loading {
+                    generation: 1,
+                    detail: CellDetail::Terrain,
+                    replaced: None,
+                },
+            );
+        app.world_mut()
+            .resource::<WorldDatabase>()
+            .request(DatabaseRequest::Load {
+                generation: 1,
+                key,
+                detail: CellDetail::Terrain,
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+        run_until(&mut app, "the terrain-only commit", |app| {
+            resident(app, CellDetail::Terrain)
+        });
+        let ring_root = match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Resident { root, .. }) => *root,
+            other => panic!("the terrain-only cell did not commit: {other:?}"),
+        };
+        assert!(app.world().get::<DistantTerrainRoot>(ring_root).is_some());
+
+        // The camera walks in: the same grid is asked for in full, the ring root riding along.
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                key,
+                CellStatus::Loading {
+                    generation: 2,
+                    detail: CellDetail::Full,
+                    replaced: Some(ring_root),
+                },
+            );
+        app.world_mut()
+            .resource::<WorldDatabase>()
+            .request(DatabaseRequest::Load {
+                generation: 2,
+                key,
+                detail: CellDetail::Full,
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+        run_until(&mut app, "the full commit", |app| {
+            resident(app, CellDetail::Full)
+        });
+
+        let full_root = match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Resident { root, detail }) => {
+                assert_eq!(*detail, CellDetail::Full);
+                *root
+            }
+            other => panic!("the full cell did not commit: {other:?}"),
+        };
+        assert_ne!(full_root, ring_root, "the replacement is a new root");
+        // No `cells_upgraded` here: the plan is what counts a tier change, and this app hands the
+        // cell's status in instead of planning it.
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .swap_hold_timeouts,
+            0
+        );
+
+        // The root the cell was drawn by is kept, and it is no longer a streamed cell root: the
+        // markers every root scan keys on are gone, so the lifecycle check counts one root.
+        assert!(
+            app.world().get::<SwapStandIn>(ring_root).is_some(),
+            "the replaced root is held as the stand-in"
+        );
+        assert!(
+            app.world().get::<DistantTerrainRoot>(ring_root).is_none(),
+            "the stand-in is not a streamed cell root"
+        );
+        assert!(app.world().get::<StreamedCellRoot>(ring_root).is_none());
+        assert!(
+            app.world().get::<CellRef>(ring_root).is_some(),
+            "the stand-in still names the cell it covers"
+        );
+        let old_terrain = app
+            .world()
+            .get::<Children>(ring_root)
+            .map(|children| children.iter().collect::<Vec<Entity>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|child| app.world().get::<TerrainPatch>(*child).is_some())
+            .count();
+        assert_eq!(old_terrain, 4, "the stand-in keeps its landscape drawn");
+
+        // Every patch of the new root names it back, which is what the hand-over reads to know when
+        // the hold ends.
+        let named = app
+            .world()
+            .get::<Children>(full_root)
+            .map(|children| children.iter().collect::<Vec<Entity>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|child| app.world().get::<SwapSurface>(child))
+            .map(SwapSurface::stand_in)
+            .collect::<Vec<Option<Entity>>>();
+        assert_eq!(named, vec![Some(ring_root); 4]);
+    }
+
     #[test]
     fn an_interior_reference_keeps_its_camera_relative_position() {
         let mut app = App::new();
@@ -10106,6 +10500,7 @@ mod tests {
             CellDetail::Full,
             false,
             stamp,
+            None,
             &mut 0,
             &mut profiler,
         ));
@@ -10772,6 +11167,112 @@ mod tests {
                 -(-3 - origin.y) as f32 * CELL_SIZE,
             )
         );
+    }
+
+    /// A visible full-detail terrain quadrant the render world has not confirmed drawn past
+    /// [`MAX_SWAP_WAIT_FRAMES`] is the hole coming back, and the run-level invariant says so; one
+    /// within the bound is a quadrant on its way and is not; and a quadrant no view can see is never
+    /// counted, however long it waits (design-1091 §4).
+    #[test]
+    fn lifecycle_validator_flags_a_visible_patch_stuck_past_the_swap_bound() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .init_resource::<PrestreamCells>()
+            .init_resource::<StreamingWorld>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, validate_streaming_lifecycle);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        let root = app
+            .world_mut()
+            .spawn((StreamedCellRoot, CellRef(0), Transform::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                exterior_cell(0, 0),
+                CellStatus::Resident {
+                    root,
+                    detail: CellDetail::Full,
+                },
+            );
+        // One waiting quadrant a view can see and one it cannot.
+        app.world_mut().spawn((
+            TerrainPatch,
+            SwapWaiting,
+            ViewVisibility::VISIBLE,
+            ChildOf(root),
+        ));
+        app.world_mut().spawn((
+            TerrainPatch,
+            SwapWaiting,
+            ViewVisibility::HIDDEN,
+            ChildOf(root),
+        ));
+
+        // Within the bound: a quadrant on its way is not a hole.
+        for _ in 0..MAX_SWAP_WAIT_FRAMES {
+            app.update();
+        }
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .streaming_invariant_failures,
+            0,
+            "a quadrant still inside the bound is not a violation",
+        );
+
+        // Past it: the visible quadrant alone is the violation.
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .streaming_invariant_failures,
+            1,
+            "the stuck visible quadrant, and not the one off-view",
+        );
+    }
+
+    /// `PendingUnder` holds a crossing for a surface the render world has not confirmed drawn only
+    /// while a view can see it: an interior the camera has arrived in has its surfaces in view, and
+    /// a pre-streamed cell's surfaces, which no view can see and the bridge can never confirm, do
+    /// not hold the door the camera is not standing in.
+    #[test]
+    fn pending_under_counts_a_visible_waiting_surface_and_ignores_a_hidden_one() {
+        let mut world = World::new();
+        let root = world.spawn_empty().id();
+        let visible = world
+            .spawn((SwapWaiting, ViewVisibility::VISIBLE, ChildOf(root)))
+            .id();
+        let hidden = world
+            .spawn((SwapWaiting, ViewVisibility::HIDDEN, ChildOf(root)))
+            .id();
+        let mut state = SystemState::<PendingUnder>::new(&mut world);
+
+        let count = state.get(&world).unwrap().count(root);
+        assert_eq!(
+            count, 1,
+            "only the surface a view can see holds the crossing"
+        );
+
+        // The old pending-work markers still count whatever their visibility.
+        world.spawn((pending_marker_for_test(), ChildOf(root)));
+        assert_eq!(state.get(&world).unwrap().count(root), 2);
+
+        // Once the visible surface is drawn (its marker is gone) and the hidden one is not needed,
+        // only the model marker is left.
+        world.entity_mut(visible).remove::<SwapWaiting>();
+        world.entity_mut(hidden).remove::<SwapWaiting>();
+        assert_eq!(state.get(&world).unwrap().count(root), 1);
     }
 
     #[test]

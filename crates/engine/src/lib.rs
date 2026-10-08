@@ -47,6 +47,7 @@ pub mod sky_dome;
 pub mod skyrim_ini;
 pub mod snow;
 pub mod streaming;
+pub mod swap_bridge;
 pub mod tonemapper;
 pub mod transition;
 pub mod view_policy;
