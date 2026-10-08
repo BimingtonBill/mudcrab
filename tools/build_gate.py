@@ -47,7 +47,7 @@ from datetime import datetime, timedelta
 # Not under AppData: the Claude desktop app is an MSIX package, which redirects AppData writes from its own
 # processes to a private folder that every other process (consoles, workers, cargo) cannot see (2026-10-07).
 GATE_DIR = os.environ.get("MUDCRAB_BUILD_GATE") or os.path.join(os.path.expanduser("~"), ".mudcrab", "build-gate")
-DEFAULTS = {"slots": 3, "max_per_owner": 2, "min_free_ram_gb": 8.0, "min_free_disk_gb": 15.0, "max_wait_minutes": 120, "poll_seconds": 10}
+DEFAULTS = {"slots": 3, "max_per_owner": 2, "min_free_ram_gb": 8.0, "min_commit_headroom_gb": 12.0, "min_free_disk_gb": 15.0, "max_wait_minutes": 120, "poll_seconds": 10}
 GB = 1024**3
 COLD_RLIBS = 150
 
@@ -77,11 +77,25 @@ class MEMORYSTATUSEX(ctypes.Structure):
     ]
 
 
-def free_ram_gb() -> float:
+def memory_status() -> MEMORYSTATUSEX:
     status = MEMORYSTATUSEX()
     status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
     ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
-    return status.ullAvailPhys / GB
+    return status
+
+
+def free_ram_gb() -> float:
+    return memory_status().ullAvailPhys / GB
+
+
+def commit_headroom_gb() -> float:
+    """Commit charge left before Windows refuses allocations (commit limit minus committed).
+
+    2026-10-08: a conversion died at start with "memory allocation of 1048576 bytes failed" while free
+    physical RAM looked fine: commit headroom was ~8.3 GB of 42.6 GB. Windows fails allocations at the commit
+    limit, not when physical RAM runs out, so this is the number that predicts the crash.
+    """
+    return memory_status().ullAvailPageFile / GB
 
 
 def pid_alive(pid: int) -> bool:
@@ -231,6 +245,9 @@ def blocking_reason(config: dict) -> str | None:
     ram = free_ram_gb()
     if ram < float(config["min_free_ram_gb"]):
         return f"free RAM {ram:.1f} GB < {config['min_free_ram_gb']} GB"
+    commit = commit_headroom_gb()
+    if commit < float(config["min_commit_headroom_gb"]):
+        return f"commit headroom {commit:.1f} GB < {config['min_commit_headroom_gb']} GB"
     # The drive the build writes to: CARGO_TARGET_DIR if set, else the working folder (2026-10-07: coder
     # worktrees filled C: to 0 GB and builds failed with os error 112).
     target = os.environ.get("CARGO_TARGET_DIR") or os.getcwd()
@@ -295,6 +312,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
     clear_stale_slots(config)
     print(f"gate: {GATE_DIR}")
     print(f"free RAM: {free_ram_gb():.1f} GB (minimum {config['min_free_ram_gb']} GB)")
+    print(f"commit headroom: {commit_headroom_gb():.1f} GB (minimum {config['min_commit_headroom_gb']} GB)")
     for drive in ("C:\\", "D:\\"):
         print(f"free disk {drive}: {shutil.disk_usage(drive).free / GB:.1f} GB (minimum {config['min_free_disk_gb']} GB for builds there)")
     for path in slot_paths(config):
@@ -308,6 +326,31 @@ def cmd_status(_args: argparse.Namespace) -> int:
         print(f"  {hold['name']}: {hold.get('owner', '?')}, {hold.get('reason', '')}, until {hold.get('until') or '-'}{note}")
     pids = converter_processes()
     print(f"converter.exe running: {', '.join(pids) if pids else 'none'}")
+    return 0
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    """For jobs that don't run inside a gate slot (a conversion): check memory before starting.
+
+    Exit 0 = go; 4 = not now (the reason is printed). A conversion needs more commit room than a build,
+    so it defaults to the commit floor plus 8 GB, and it also refuses while gated cold builds are running.
+    """
+    config = load_config()
+    clear_stale_slots(config)
+    need_commit = float(config["min_commit_headroom_gb"]) + args.extra_gb
+    commit, ram = commit_headroom_gb(), free_ram_gb()
+    cold = [info["label"] for path in slot_paths(config) if (info := read_json(path)) and info.get("cold")]
+    problems = []
+    if commit < need_commit:
+        problems.append(f"commit headroom {commit:.1f} GB < {need_commit:.0f} GB")
+    if ram < float(config["min_free_ram_gb"]):
+        problems.append(f"free RAM {ram:.1f} GB < {config['min_free_ram_gb']} GB")
+    if cold:
+        problems.append("cold builds running: " + ", ".join(sorted(set(cold))))
+    if problems:
+        print("build_gate: NOT NOW: " + "; ".join(problems))
+        return 4
+    print(f"build_gate: go (commit headroom {commit:.1f} GB, free RAM {ram:.1f} GB)")
     return 0
 
 
@@ -364,6 +407,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--label", help="who runs it (default: BUILD_GATE_LABEL or the folder name)")
     run.add_argument("command", nargs=argparse.REMAINDER)
     sub.add_parser("status", help="show slots, holds, free RAM and converters")
+    pre = sub.add_parser("preflight", help="memory check before a job outside the gate (a conversion)")
+    pre.add_argument("--extra-gb", type=float, default=8.0, help="commit room needed above the floor (default 8)")
     hold = sub.add_parser("hold", help="set or clear a machine-wide hold")
     hold.add_argument("action", choices=["set", "clear"])
     hold.add_argument("name")
@@ -375,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "run" and args.command and args.command[0] == "--":
         args.command = args.command[1:]
-    return {"run": cmd_run, "status": cmd_status, "hold": cmd_hold}[args.cmd](args)
+    return {"run": cmd_run, "status": cmd_status, "hold": cmd_hold, "preflight": cmd_preflight}[args.cmd](args)
 
 
 if __name__ == "__main__":
