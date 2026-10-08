@@ -132,7 +132,16 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   `crates/engine/**`, `crates/shared/**` or `crates/converter/**` are agreed by message with Phase 2 Dev
   and Phase 1 Dev first. The portal's walking player and door work stays on the Portal track (its
   Phase 4 proposal goes through Upstream Dev, `docs/pr/two-tracks.md`).
-- Changes flow one way: `main`, `phase1/*`, `phase2/*` and `phase4/*` merge into `portal`, never the reverse. A
+- **Phase 5** (added 2026-10-08, the user's Phase 5 Dev session; **SURVEY first**: research and a plan
+  across 5.1-5.4, no code until the plan is agreed with the user and Team Lead): upstream Phase 5
+  (`docs/roadmap/05-multiplatform-and-networking.md`: RT and upscaling, Linux/macOS/Android/WASM, co-op
+  networking, LLM NPCs and OpenXR), sent upstream like Phase 2. Worktree `C:\Modding\Mudcrab\worktrees\phase5`
+  (made at the first coding job), branches `phase5/<topic>` cut from `main`, upstream's commit style, build
+  targets on D: (`D:\Mudcrab\builds\phase5-target`), worker tasks `<kind>-<nnn>-p5-<slug>` numbered 2100-2199.
+  Research in `local/research/phase5/`, plan in `local/plans/phase5-plan.md`. Owns new Phase 5 crates once
+  agreed; edits to `crates/engine/**`, `crates/shared/**` or `crates/converter/**` are agreed by message
+  with Phase 2 Dev and Phase 1 Dev first.
+- Changes flow one way: `main`, `phase1/*`, `phase2/*`, `phase4/*` and `phase5/*` merge into `portal`, never the reverse. A
   Phase 1 or Phase 2 bug found on the portal is fixed on a `phase1/*` or `phase2/*` branch first.
 
 Which work belongs to which track, the PR rules and the reasons: `docs/pr/two-tracks.md`. Read it
