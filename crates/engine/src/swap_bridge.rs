@@ -412,6 +412,9 @@ fn complete_drawn_swaps(
     stats.drawn_this_frame = completed;
 }
 
+/// Waiting surfaces that are prepared but not yet drawn.
+type PreparedNotDrawn = (With<SwapWaiting>, With<SwapPrepared>, Without<SwapDrawn>);
+
 /// The C5 gauges over the swap: how many surfaces are still waiting on the render world, how many
 /// of those it has prepared but not confirmed drawn, and how many it confirmed drawn this frame.
 ///
@@ -424,7 +427,7 @@ fn complete_drawn_swaps(
 /// the same rule [`crate::profiling::ProfilingPlugin`] follows for the per-frame series.
 fn record_swap_gauges(
     waiting: Query<(), (With<SwapWaiting>, Without<SwapDrawn>)>,
-    prepared: Query<(), (With<SwapWaiting>, With<SwapPrepared>, Without<SwapDrawn>)>,
+    prepared: Query<(), PreparedNotDrawn>,
     stats: Res<SwapBridgeStats>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -548,8 +551,10 @@ mod tests {
         let gpu_seen = world.spawn_empty().id();
         let unseen = world.spawn_empty().id();
 
-        let mut class = RenderVisibleEntitiesClass::default();
-        class.entities_cpu_culling = vec![(Entity::PLACEHOLDER, MainEntity::from(seen))];
+        let mut class = RenderVisibleEntitiesClass {
+            entities_cpu_culling: vec![(Entity::PLACEHOLDER, MainEntity::from(seen))],
+            ..Default::default()
+        };
         class
             .entities_gpu_culling
             .insert(MainEntity::from(gpu_seen), Entity::PLACEHOLDER);
@@ -625,15 +630,20 @@ mod tests {
     fn a_surfaces_images_are_deduplicated_and_redeclared() {
         let mut world = World::new();
         world.init_resource::<Assets<Image>>();
-        let mut images = world.resource_mut::<Assets<Image>>();
-        let base = images.add(Image::default());
-        let normal = images.add(Image::default());
-        drop(images);
+        let (base, normal) = {
+            let mut images = world.resource_mut::<Assets<Image>>();
+            (images.add(Image::default()), images.add(Image::default()))
+        };
         assert_ne!(base.id(), normal.id(), "two images, two ids");
 
         let material = Handle::<StandardMaterial>::default().id().untyped();
-        let mut surface = SwapSurface::new(material, [base.id(), normal.id(), base.id(), normal.id()]);
-        assert_eq!(surface.images, vec![base.id(), normal.id()], "each image once");
+        let mut surface =
+            SwapSurface::new(material, [base.id(), normal.id(), base.id(), normal.id()]);
+        assert_eq!(
+            surface.images,
+            vec![base.id(), normal.id()],
+            "each image once"
+        );
         assert_eq!(surface.material, material);
         surface.set_images([normal.id()]);
         assert_eq!(surface.images, vec![normal.id()]);

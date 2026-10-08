@@ -3804,6 +3804,13 @@ fn track_surface_readiness(
     );
 }
 
+/// Terrain patches whose surface is ready on the CPU side but not yet drawn.
+type ReadyUndrawnPatches = (
+    With<TerrainPatch>,
+    With<TerrainSurfaceReady>,
+    Without<SwapDrawn>,
+);
+
 /// The hole-risk gauge (design-1091 C5): how many terrain quadrants this world has validated
 /// (`TerrainSurfaceReady`) but the render world has not confirmed drawn (`SwapDrawn`).
 ///
@@ -3818,14 +3825,7 @@ fn track_surface_readiness(
 ///
 /// It walks every terrain patch, so it is installed only for a run that profiles.
 fn record_terrain_swap_gauge(
-    ready: Query<
-        (),
-        (
-            With<TerrainPatch>,
-            With<TerrainSurfaceReady>,
-            Without<SwapDrawn>,
-        ),
-    >,
+    ready: Query<(), ReadyUndrawnPatches>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     profiler.set_gauge("swap/terrain_ready_not_drawn", ready.iter().count() as f64);
