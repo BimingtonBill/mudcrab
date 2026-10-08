@@ -296,6 +296,9 @@ pub const GRAPH_VIEWS: &str = "render/graph/views";
 /// meaning across the view-kind split: every `Core3d` run the cycle made, camera and shadow views
 /// alike (the shadow ones are [`GRAPH_SHADOW_VIEW_COUNT`] of it, the rest are cameras).
 pub const GRAPH_VIEW_COUNT: &str = "render/graph/view_count";
+/// Comparability: before impl-1107 this column also held the GPU-preprocessing head (now
+/// [`GRAPH_GPU_PREPROCESS`]); compare it with the 2026-10-08 and 2026-10-09 04:34 windows as
+/// `prepass + gpu_preprocess`.
 pub const GRAPH_PREPASS: &str = "render/graph/prepass";
 pub const GRAPH_MAIN_PASS: &str = "render/graph/main_pass";
 /// The `Core3d` `EarlyPostProcess` stage alone, summed over the views: a subset of
@@ -310,7 +313,8 @@ pub const GRAPH_POST_PROCESS: &str = "render/graph/post_process";
 /// Bevy's upscaling system's window alone (`bevy_core_pipeline-0.19.0` `src/upscaling/node.rs:17`;
 /// `src/core_3d/mod.rs:161` places it `after(Core3dSystems::PostProcess)`), summed over the views:
 /// the run's last stage-sized tile, exclusive of [`GRAPH_POST_PROCESS`] as the stage windows are.
-/// Before impl-1107 it sat in no lap window and was inside [`GRAPH_DRIVER_OVERHEAD`].
+/// Before impl-1107 it sat in no lap window of its own: its time fell in [`GRAPH_POST_PROCESS`] or
+/// [`GRAPH_VIEWS_REMAINDER`], depending on where the executor placed it.
 pub const GRAPH_UPSCALING: &str = "render/graph/upscaling";
 /// The `Core3d` runs `camera_driver` made for a shadow view: the whole of each such run's stage
 /// laps, summed over the views (see the module doc — a directional light's cascades are inside a
@@ -553,6 +557,7 @@ fn core3d_marks() -> ScheduleConfigs<ScheduleSystem> {
         lap_view_gpu_preprocess
             .after(start_view)
             .after(early_prepass_build_indirect_parameters)
+            .before(Core3dSystems::Prepass)
             .before(per_view_shadow_pass::<EARLY_SHADOW_PASS>)
             .before(shared_shadow_pass::<EARLY_SHADOW_PASS>),
         lap_view_early_shadow
