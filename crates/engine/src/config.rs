@@ -88,16 +88,33 @@ pub struct EngineConfig {
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
     /// Cells outside the unload radius a frame may despawn. `0` despawns every one at once, which
-    /// is the unbudgeted behaviour unloading used to have. Paces the unload only while
-    /// [`Self::max_unload_ms_per_frame`] is `0`: the wall-clock budget replaces it once set.
+    /// is the unbudgeted behaviour unloading used to have - and, with
+    /// [`Self::max_unload_ms_per_frame`] `0` too, the only setting that reproduces it exactly.
+    /// With this count budget pacing instead, the drain keeps its overflow escape (streaming's
+    /// retire-backlog drain), which un-bounds a frame whose retiring backlog stopped shrinking -
+    /// a trip on drain failure, not on size, that the old unbudgeted path never had. Paces the
+    /// unload only while [`Self::max_unload_ms_per_frame`] is `0`: the wall-clock budget replaces
+    /// it once set.
     pub max_cell_unloads_per_frame: usize,
     /// Wall-clock milliseconds a frame may spend despawning retiring cells. The despawn paces
-    /// itself by the clock: it unloads retiring cells in stable order until
-    /// the budget is spent, always at least one of them, so a backlog bigger than the budget
-    /// drains over several frames instead of landing on one - a catastrophic crossing retires a
-    /// whole worldspace's exteriors at once, far past what a per-frame cell count can pace. `0`
-    /// turns the time budget off and paces by the old cell count
-    /// ([`Self::max_cell_unloads_per_frame`]) instead, as before this knob existed.
+    /// itself by the clock: it unloads retiring cells in stable order until the budget is spent,
+    /// always at least one of them, so a backlog bigger than the budget drains over several frames
+    /// instead of landing on one - fast flight away from the camera retires a whole ring of cells
+    /// at once, far past what a per-frame cell count can pace.
+    ///
+    /// Scope: this paces distance retires only - the far cells of the worldspace the camera stands
+    /// in that flying away leaves behind. A door crossing's unload of the space the camera left
+    /// happens in `plan_cells` in the frame it falls out (`paces_its_unload` is false for it) and
+    /// is not paced here, so this knob does nothing about a crossing's unload stall.
+    ///
+    /// Replay stability: the order the cells unload in is stable (`cell_order_key`), so a replayed
+    /// flight unloads the same cells in the same order; which frame each cell unloads on depends
+    /// on machine speed, because the budget is wall-clock.
+    ///
+    /// `0` turns the time budget off and paces by [`Self::max_cell_unloads_per_frame`]; only that
+    /// count at `0` as well is exactly the old unbudgeted path, since the drain keeps its overflow
+    /// escape (a trip on drain failure, not on size) under the count budget. The default is
+    /// provisional; see the comment on it in `Default for EngineConfig`.
     pub max_unload_ms_per_frame: f64,
     /// Converted models a frame may hand to Bevy's scene spawner. `0` arms every model whose asset
     /// is loaded, which is the unbudgeted behaviour a single spawn batch used to have.
@@ -225,12 +242,16 @@ impl Default for EngineConfig {
             max_cell_commits_per_frame: 1,
             max_commit_micros_per_frame: 16_670,
             max_cell_unloads_per_frame: 2,
-            // The 2026-10-08 crossing re-profile measured ~0.47 ms of despawn per retiring cell
+            // PROVISIONAL until the shared timing-window A/B picks the value: an estimate from
+            // the 2026-10-08 re-profile, which measured ~0.47 ms of despawn per retiring cell
             // (204.5 ms of `Update` unloading 434 cells on one frame). 3 ms of despawn a frame is
-            // therefore about 6 cells, and a 434-cell crossing backlog drains in ~70-100 frames
-            // instead of landing 136-205 ms on one frame; it is still only a few ms on a frame
+            // therefore about 6 cells, so a several-hundred-cell flight backlog drains over
+            // frames instead of landing 136-205 ms on one; it is still only a few ms on a frame
             // that is already over budget, and it shrinks with the work instead of guessing a
-            // cell count. `0` paces by `max_cell_unloads_per_frame` as before this knob existed.
+            // cell count. The 434-cell unload is where the per-cell cost was measured, not a
+            // backlog this budget drains: a crossing's space-change unload runs unpaced in
+            // `plan_cells`, and this budget covers distance retires only. `0` paces by
+            // `max_cell_unloads_per_frame`, with the drain-failure escape the old path never had.
             max_unload_ms_per_frame: 3.0,
             // A cell holds on the order of 15 references with a model and cells commit one per
             // frame, so 15 models is the largest batch a frame can be handed at once. Bevy
@@ -1872,8 +1893,9 @@ mod tests {
         assert_eq!(config.max_cell_commits_per_frame, 1);
         assert_eq!(config.max_commit_micros_per_frame, 16_670);
         assert_eq!(config.max_cell_unloads_per_frame, 2);
-        // The despawn's wall-clock budget, committed at 3.0 from the 2026-10-08 crossing
-        // re-profile's ~0.47 ms per retiring cell.
+        // The despawn's wall-clock budget, committed provisionally at 3.0: an estimate from the
+        // 2026-10-08 re-profile's ~0.47 ms per retiring cell, until the timing-window A/B picks
+        // the value.
         assert_eq!(config.max_unload_ms_per_frame, 3.0);
         assert_eq!(config.max_model_spawns_per_frame, 4);
     }

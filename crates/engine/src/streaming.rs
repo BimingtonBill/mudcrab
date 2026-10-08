@@ -307,7 +307,7 @@ pub struct StreamingWorld {
     /// The retire backlog [`despawn_cells`] saw on its last run: the backlog at the start of that
     /// frame's drain, cleared when the drain emptied it. The next frame compares its own backlog
     /// against this to tell sustained growth (flight retiring cells faster than the budget drains
-    /// them) from a one-frame burst, which a crossing retires all at once.
+    /// them) from a one-frame burst, which a fast flight or a teleport retires all at once.
     last_retire_backlog: usize,
 }
 
@@ -752,10 +752,10 @@ pub struct StreamingMetrics {
     pub peak_retiring_cells: usize,
     pub revived_cells: u64,
     pub retire_backlog_overflows: u64,
-    /// Frames the retire backlog sat above its bound but stayed paced: a crossing's worldspace
+    /// Frames the retire backlog sat above its bound but stayed paced: a flight's backlog
     /// draining at the budget, one drain frame at a time, instead of un-bounding. Kept apart from
     /// [`Self::retire_backlog_overflows`], which counts only escape trips, so a pricing window
-    /// can tell a healthy crossing drain from a pacer that lost.
+    /// can tell a healthy drain from a pacer that lost.
     pub retire_backlog_drains: u64,
     pub static_colliders_authored: u64,
     pub static_colliders_partial: u64,
@@ -1450,12 +1450,12 @@ fn other_detail(detail: CellDetail) -> CellDetail {
 
 /// How many cells may wait for their turn before the unload pacer's escape arms.
 ///
-/// One whole window at the unload radius, `(2 * r + 1)^2` cells: what a single crossing or
-/// teleport was assumed to retire at once. That assumption does not hold - a worldspace-changing
-/// crossing retires the whole loaded exterior set, several windows' worth - so the bound is not a
-/// cap by itself. [`despawn_cells`] un-bounds the drain only when a backlog above it also failed
-/// to shrink against the last frame's: sustained flight retiring cells faster than the budget
-/// drains them, the case where holding on to the backlog costs more than one larger frame.
+/// One whole window at the unload radius, `(2 * r + 1)^2` cells: what a single teleport or one
+/// frame of fast flight was assumed to retire at once. That assumption does not hold - a long
+/// jump away retires the whole ring behind the camera, several windows' worth - so the bound is
+/// not a cap by itself. [`despawn_cells`] un-bounds the drain only when a backlog above it also
+/// failed to shrink against the last frame's: sustained flight retiring cells faster than the
+/// budget drains them, the case where holding on to the backlog costs more than one larger frame.
 fn retire_backlog_bound(unload_radius: i32) -> usize {
     let side = 2 * unload_radius.max(0) as usize + 1;
     side * side
@@ -1478,15 +1478,27 @@ fn cell_order_key(key: CellKey) -> (u32, i32, i32, u32) {
 ///
 /// The budget is wall-clock time (`EngineConfig::max_unload_ms_per_frame`): cells go in
 /// [`cell_order_key`] order until the clock is spent, always at least one of them, so a backlog
-/// bigger than the budget drains over several frames instead of landing on one - a catastrophic
-/// crossing retires a whole worldspace at once, far past what a per-frame cell count can pace.
-/// `0` turns the clock off and paces by the old cell count (`max_cell_unloads_per_frame`), as
-/// before the time budget existed.
+/// bigger than the budget drains over several frames instead of landing on one - fast flight
+/// away from the camera retires a whole ring of cells at once, far past what a per-frame cell
+/// count can pace.
+///
+/// Scope: this paces distance retires only - the far cells of the worldspace the camera stands
+/// in that flying away leaves behind. A door crossing's unload of the space the camera left
+/// happens in [`plan_cells`] in the frame it falls out (`paces_its_unload` is false for it) and
+/// is not paced here; nothing in this budget claims to fix a crossing's unload stall.
+///
+/// Replay stability: the order the cells unload in is [`cell_order_key`]'s, the same across
+/// runs; which frame each cell unloads on depends on machine speed, because the budget is
+/// wall-clock.
+///
+/// `0` turns the clock off and paces by the old cell count (`max_cell_unloads_per_frame`); only
+/// that count at `0` as well is exactly the old unbudgeted path, since the escape below - which
+/// trips on drain failure, not on size - came with the budget.
 ///
 /// Whatever paces it, the drain keeps one escape: a backlog above [`retire_backlog_bound`] that
 /// also failed to shrink against the last frame's says the pacer is losing - flight retiring
-/// cells faster than it drains - and un-bounds for that frame. A crossing's burst, which shrinks
-/// every drain frame, never trips it.
+/// cells faster than it drains - and un-bounds for that frame. A burst that shrinks every drain
+/// frame never trips it.
 ///
 /// This is an exclusive system on purpose: a command-buffered `despawn` only queues the removal and
 /// the real work happens later at a schedule sync point, where no span can see it - and the whole
@@ -1525,7 +1537,7 @@ fn despawn_cells(world: &mut World) {
     }
     retiring.sort_by_key(|(key, _)| cell_order_key(*key));
     let backlog = retiring.len();
-    // The escape trips on drain failure, not on size: a crossing's burst sits above the bound the
+    // The escape trips on drain failure, not on size: a flight's burst sits above the bound the
     // frame it lands and shrinks from then on, while a pacer losing the race leaves the backlog no
     // smaller than the last frame left it. A first-ever backlog has no last frame to fail against
     // (`last_retire_backlog` is zero), so it drains paced too.
@@ -1594,7 +1606,7 @@ fn despawn_cells(world: &mut World) {
             metrics.retire_backlog_overflows = metrics.retire_backlog_overflows.saturating_add(1);
         } else if backlog > backlog_bound {
             // A drain frame: the backlog sat above the bound and the pacer kept pacing it, a
-            // crossing's worldspace going out one budgeted frame at a time.
+            // flight's backlog going out one budgeted frame at a time.
             metrics.retire_backlog_drains = metrics.retire_backlog_drains.saturating_add(1);
         }
         metrics.max_despawns_per_frame
@@ -1640,6 +1652,66 @@ fn despawn_subtree(world: &mut World, root: Entity) -> usize {
         entity.despawn();
     }
     entities
+}
+
+// -----------------------------------------------------------------------------------------
+// The test bridge: `StreamingWorld`'s cell table and the drain are private to this module,
+// and another module's tests have to hold roots against a running drain (the portal's: a
+// retiring cell must be invisible while it drains, and the pre-warm's wait must not be held
+// by a drain). Compiled only under `cfg(test)`.
+// -----------------------------------------------------------------------------------------
+
+/// Plants a retiring full-detail cell with `root` holding it in the world table, the way
+/// [`plan_cells`]' distance fall-out leaves one, for a test outside this module that cannot fill
+/// the private map.
+#[cfg(test)]
+pub(crate) fn test_plant_retiring_cell(world: &mut World, key: CellKey, root: Entity) {
+    world.resource_mut::<StreamingWorld>().cells.insert(
+        key,
+        CellStatus::Retiring {
+            root,
+            detail: CellDetail::Full,
+        },
+    );
+}
+
+/// Plants a resident full-detail cell with `root` in the world table, the way a finished load
+/// commits it, for the same tests.
+#[cfg(test)]
+pub(crate) fn test_plant_resident_cell(world: &mut World, key: CellKey, root: Entity) {
+    world.resource_mut::<StreamingWorld>().cells.insert(
+        key,
+        CellStatus::Resident {
+            root,
+            detail: CellDetail::Full,
+        },
+    );
+}
+
+/// How many cells the table holds as retiring: what a test reads to prove a drain is mid-flight.
+#[cfg(test)]
+pub(crate) fn test_retiring_cells(world: &World) -> usize {
+    world
+        .resource::<StreamingWorld>()
+        .cells
+        .values()
+        .filter(|status| matches!(status, CellStatus::Retiring { .. }))
+        .count()
+}
+
+/// Runs [`despawn_cells`] for a test outside this module, which cannot schedule the private
+/// system by name: the same exclusive system, on the same resources.
+#[cfg(test)]
+pub(crate) fn test_despawn_cells(world: &mut World) {
+    despawn_cells(world);
+}
+
+/// The resources [`despawn_cells`] touches that a foreign test app does not otherwise carry.
+#[cfg(test)]
+pub(crate) fn test_init_despawn_resources(world: &mut World) {
+    world.init_resource::<StreamingMetrics>();
+    world.init_resource::<TerrainContinuity>();
+    world.init_resource::<lod::LodStreaming>();
 }
 
 /// The two read-only catalogues a cell commit reads: the landscape and water texture paths
