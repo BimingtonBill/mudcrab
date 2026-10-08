@@ -14,7 +14,7 @@
 use crate::{
     // The terrain ring's fog and far plane. They are `app.rs`'s today; the step after this one
     // moves them to `crate::terrain_ring`, and then only this line changes.
-    app::{exterior_fog, fog_off},
+    app::{camera_far_plane, exterior_fog, fog_off},
     config::EngineConfig,
     // The space's colours as the sky dome draws them (`crate::sky_dome`), which is the one place
     // the weather's Sky-Upper, Sky-Lower and Fog Far are read.
@@ -67,9 +67,11 @@ impl Plugin for AtmospherePlugin {
 /// colour the frame was cleared with. A measured run therefore asks for the ring by name
 /// (`--terrain-radius`) and takes the fog with it.
 ///
-/// `terrain_radius` is the ring the run draws in its worldspace, not the configured one: an
-/// unnamed ring is off where the world has its own terrain LOD, and a run that draws no ring keeps
-/// the flat lighting its numbers were taken with (`EngineConfig::effective_terrain_radius`).
+/// `terrain_radius` is the *configured* ring and not the one any single worldspace draws: the ring
+/// follows the worldspace the camera is in ([`EngineConfig::effective_terrain_radius`]), so a run
+/// that starts where LOD exists draws no ring there and the default ring in a worldspace without
+/// LOD, and the fog has to be there for the second half of that crossing. The ring a benchmark run
+/// draws is off in `config.terrain_radius` itself (`config.rs`), so its decision is unchanged.
 pub(crate) fn atmosphere_applies(
     interactive: bool,
     terrain_radius: i32,
@@ -690,7 +692,13 @@ fn update_atmosphere(
     ambient: Option<ResMut<GlobalAmbientLight>>,
     mut suns: Query<&mut DirectionalLight>,
     mut cameras: Query<(Entity, &mut Camera), With<StreamingCamera>>,
+    // The same cameras' projections, for the far plane below. A separate query so that this system
+    // reads no projection it does not write.
+    mut projections: Query<&mut Projection, With<StreamingCamera>>,
     mut applied: Local<bool>,
+    // The space the far plane was last written for. A change of *space* writes it; a change of the
+    // LOD horizon, which the fog above follows in the same frame, does not.
+    mut far_space: Local<Option<SpaceKey>>,
 ) {
     let Some(active) = active else {
         return;
@@ -723,12 +731,30 @@ fn update_atmosphere(
     let has_lod = database
         .as_ref()
         .is_some_and(|database| database.has_lod_for(active.worldspace_id));
-    let fog = atmosphere_fog(
-        &atmosphere,
-        config.stream_radius,
-        config.effective_terrain_radius(has_lod),
-        lod_reach,
-    );
+    let terrain_radius = config.effective_terrain_radius(has_lod);
+    let fog = atmosphere_fog(&atmosphere, config.stream_radius, terrain_radius, lod_reach);
+    // The far plane follows the ring, and the ring is not the same in every worldspace: a crossing
+    // from a worldspace whose LOD left the ring off into one without LOD draws the ring there, and
+    // the far plane the starting worldspace set clips it away before the fog this space fades into
+    // ever reaches the camera ([`camera_far_plane`]).
+    //
+    // Written on a change of *space* and not on the horizon change the fog follows: the world's own
+    // LOD extends the same plane past the ring, in the frame it takes the chunks that draw there
+    // (`crate::streaming::lod::collect_lod_chunks`, which is what sets the horizon), and pulling it
+    // back in on the frame the horizon became known would clip the LOD that announced it. An equal
+    // value is not written, so a change of interior cell - every cell a space of its own - marks
+    // nothing.
+    if *far_space != Some(key) {
+        *far_space = Some(key);
+        let far = camera_far_plane(config.stream_radius, terrain_radius);
+        for mut projection in &mut projections {
+            if let Projection::Perspective(perspective) = &mut *projection
+                && perspective.far != far
+            {
+                perspective.far = far;
+            }
+        }
+    }
     for (entity, mut camera) in &mut cameras {
         camera.clear_color = ClearColorConfig::Custom(atmosphere.backdrop);
         commands
@@ -780,53 +806,51 @@ mod tests {
     use crate::app::{camera_far_plane, exterior_fog};
     use rusqlite::Connection;
 
-    /// Which runs get the sky and the fog: the ones that are looked at, and a measured run that
-    /// draws the ring. A benchmark run with the ring off - which is what the Phase 2 gates are
-    /// taken with, and what an unnamed ring is wherever the world has its own terrain LOD - keeps
-    /// the flat lighting its numbers were measured under.
+    /// Which runs get the sky and the fog: the ones that are looked at, and a measured run whose
+    /// *configured* ring is on. A benchmark run with the ring off - which is what the Phase 2 gates
+    /// are taken with - keeps the flat lighting its numbers were measured under.
+    ///
+    /// The decision reads the configured ring and not the one resolved for the worldspace the run
+    /// starts in (impl-196). A run that starts where the world draws its own LOD starts with the ring
+    /// off ([`EngineConfig::effective_terrain_radius`]), and it is exactly that run which crosses a
+    /// door into a mod worldspace without LOD and draws the ring there: it has to have the sky, the
+    /// fog and the per-space lighting that ring is looked at with, or the ring ends in a cliff of
+    /// terrain against the clear colour.
     #[test]
-    fn the_atmosphere_follows_the_interactive_runs_and_the_ring() {
-        let ring = EngineConfig {
-            terrain_radius: 8,
-            ..EngineConfig::default()
-        };
+    fn the_atmosphere_follows_the_interactive_runs_and_the_configured_ring() {
+        let ring = EngineConfig::default();
         assert!(atmosphere_applies(
             true,
-            ring.effective_terrain_radius(false),
-            2
+            ring.terrain_radius,
+            ring.stream_radius
         ));
         assert!(
-            atmosphere_applies(false, ring.effective_terrain_radius(false), 2),
+            atmosphere_applies(false, ring.terrain_radius, ring.stream_radius),
             "a ring fades into the sky"
         );
+        assert_eq!(
+            ring.effective_terrain_radius(true),
+            ring.stream_radius,
+            "and this is the run the old rule read: started where the world has LOD, the ring it \
+             starts with is off, and the worldspace it crosses into draws the configured one"
+        );
+        assert!(ring.terrain_radius > ring.stream_radius);
 
         let no_ring = EngineConfig {
-            terrain_radius: 2,
+            terrain_radius: ring.stream_radius,
             ..EngineConfig::default()
         };
         assert!(atmosphere_applies(
             true,
-            no_ring.effective_terrain_radius(true),
-            2
+            no_ring.terrain_radius,
+            no_ring.stream_radius
         ));
         assert!(
-            !atmosphere_applies(false, no_ring.effective_terrain_radius(true), 2),
-            "a measured run with no ring - which is what an unnamed ring is with LOD - keeps the \
-             lighting the acceptance numbers were taken with"
+            !atmosphere_applies(false, no_ring.terrain_radius, no_ring.stream_radius),
+            "a measured run with no ring - a benchmark run's, which sets the ring to the stream \
+             radius without naming it (config.rs) - keeps the lighting the acceptance numbers were \
+             taken with, whatever worldspace it enters"
         );
-
-        // The auto ring: the default ring where the world has no LOD data, no ring where it has.
-        let auto = EngineConfig::default();
-        assert!(atmosphere_applies(
-            false,
-            auto.effective_terrain_radius(false),
-            auto.stream_radius
-        ));
-        assert!(!atmosphere_applies(
-            false,
-            auto.effective_terrain_radius(true),
-            auto.stream_radius
-        ));
     }
 
     // ---- per-space lighting, fog and sky ----
@@ -1720,6 +1744,143 @@ mod tests {
             fog_end(&app),
             ring_end,
             "a worldspace the LOD answer was not for keeps the ring's fog"
+        );
+    }
+
+    /// A world database holding `lod_chunks` rows for exactly `worldspaces` and no other table
+    /// [`WorldDatabase::has_lod_for`] reads: the worldspaces that draw their own distant terrain,
+    /// which is what decides the ring each of them draws.
+    fn lod_worldspaces_database(path: &std::path::Path, worldspaces: &[u32]) -> WorldDatabase {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(&format!(
+                r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
+                INSERT INTO schema_info VALUES({version});
+                CREATE TABLE lod_chunks(
+                    worldspace_id INTEGER NOT NULL,tier INTEGER NOT NULL,anchor_x INTEGER NOT NULL,anchor_y INTEGER NOT NULL,
+                    payload_path TEXT NOT NULL,content_hash TEXT NOT NULL,
+                    bounds_min_x REAL NOT NULL,bounds_min_y REAL NOT NULL,bounds_min_z REAL NOT NULL,
+                    bounds_max_x REAL NOT NULL,bounds_max_y REAL NOT NULL,bounds_max_z REAL NOT NULL,
+                    source_cells TEXT NOT NULL,PRIMARY KEY(worldspace_id,tier,anchor_x,anchor_y));"#,
+                version = shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+        for worldspace_id in worldspaces {
+            connection
+                .execute(
+                    "INSERT INTO lod_chunks VALUES(?1,4,0,0,'lod/0/4/cell_0_0.glb',?2,\
+                     0.0,0.0,0.0,0.0,0.0,0.0,'0,0')",
+                    rusqlite::params![worldspace_id, "a".repeat(64)],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        WorldDatabase::open(path).unwrap()
+    }
+
+    /// The far plane follows the worldspace the camera is in, on the frame the space changes
+    /// (impl-196): the ring a worldspace without LOD data draws is deeper than the plane a
+    /// ring-off worldspace set, and a crossing into it that left the plane where it was would clip
+    /// the ring's own cells - and the fog that fades them into the sky would be fading toward a
+    /// horizon the camera cannot see.
+    #[test]
+    fn the_far_plane_follows_the_worldspace_the_camera_is_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let database = lod_worldspaces_database(&path, &[614]);
+        let config = EngineConfig::default();
+        let cell = crate::world::components::CELL_SIZE;
+        let mut app = App::new();
+        app.insert_resource(config.clone())
+            .insert_resource(ClearColor(SKY_COLOR))
+            .insert_resource(database)
+            .init_resource::<ActiveCell>()
+            .init_resource::<LodHorizon>();
+        // The run starts where the world draws its own LOD, as a Blackreach tour does: the ring is
+        // off there and the far plane is the one `crate::app::setup_world` sets from that space.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 614,
+            interior: None,
+        };
+        let lod_far = camera_far_plane(config.stream_radius, config.stream_radius);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera3d::default(),
+                Transform::default(),
+                Projection::Perspective(PerspectiveProjection {
+                    far: lod_far,
+                    ..default()
+                }),
+                StreamingCamera,
+            ))
+            .id();
+        app.add_systems(Update, update_atmosphere);
+        let camera_far = |app: &App| match app.world().entity(camera).get::<Projection>() {
+            Some(Projection::Perspective(perspective)) => perspective.far,
+            other => panic!("the streaming camera draws with a perspective projection: {other:?}"),
+        };
+
+        app.update();
+        assert_eq!(
+            camera_far(&app),
+            lod_far,
+            "the worldspace the camera started in keeps its own far plane"
+        );
+
+        // The crossing the review's failure was about: into a worldspace without LOD data, whose
+        // ring is the configured one and reaches past the plane the LOD worldspace set.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 60,
+            interior: None,
+        };
+        app.update();
+        let ring_far =
+            camera_far_plane(config.stream_radius, config.effective_terrain_radius(false));
+        assert_eq!(
+            camera_far(&app),
+            ring_far,
+            "a worldspace without LOD data draws the configured ring"
+        );
+        assert!(
+            ring_far > lod_far,
+            "and its far plane is deeper than the ring-off one it crossed from"
+        );
+        assert!(
+            ring_far > (2.0_f32).sqrt() * (config.terrain_radius as f32 + 1.0) * cell,
+            "the whole ring is inside it, corner included"
+        );
+
+        // The reverse crossing: the ring is off again in the worldspace that draws its own LOD.
+        // Its LOD extends this plane past the ring from its first chunks
+        // (`crate::streaming::lod::collect_lod_chunks`), which is not this system's to do.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 614,
+            interior: None,
+        };
+        app.update();
+        assert_eq!(camera_far(&app), lod_far);
+
+        // And what the LOD extended it to survives the frame the horizon becomes known: that frame
+        // rewrites the fog (the system above is listening for the horizon) and must not pull the
+        // plane it was reached at back in, or the LOD that announced the horizon is clipped away.
+        let horizon = cell * 91.0;
+        let Some(mut projection) = app.world_mut().entity_mut(camera).get_mut::<Projection>()
+        else {
+            panic!("the streaming camera carries a projection");
+        };
+        match projection.as_mut() {
+            Projection::Perspective(perspective) => perspective.far = horizon,
+            other => panic!("the streaming camera draws with a perspective projection: {other:?}"),
+        }
+        app.world_mut()
+            .resource_mut::<LodHorizon>()
+            .set(614, horizon);
+        app.update();
+        assert_eq!(
+            camera_far(&app),
+            horizon,
+            "the LOD's own far plane survives the frame its horizon is written"
         );
     }
 

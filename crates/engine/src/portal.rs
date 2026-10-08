@@ -180,7 +180,9 @@ use crate::{
     // The doorway's own dome: the marker that gives its camera one, and the destination's colours.
     sky::SkyCamera,
     sky_dome::CameraSky,
-    streaming::{ActiveCell, PrestreamCells, RenderOrigin, StreamingWorld, camera_grid},
+    streaming::{
+        ActiveCell, LodHorizon, PrestreamCells, RenderOrigin, StreamingWorld, camera_grid,
+    },
     transition::{
         CrossingHeld, DOOR_PRESTREAM_RADIUS, DoorMap, destination_is_loaded,
         destination_is_resident, destination_keys, distance_in_front_of_door, door_map,
@@ -190,7 +192,7 @@ use crate::{
             CellRef, ExpectedModelBounds, ExteriorCellGrid, InstanceBounds, StreamedCellRoot,
             StreamingCamera, WaterSurface,
         },
-        database::CellKey,
+        database::{CellKey, WorldDatabase},
         lighting::{SpaceKey, SpaceLightingCatalog, space_key},
     },
 };
@@ -2582,10 +2584,13 @@ fn measure_portal_opens(
 /// at all - a daylit street seen from inside a house was drawn with ambient and fog alone. The
 /// destination's own sun is now a light of this camera's own view, which is also the case that
 /// matters: a player at a doorway is in the source space or the destination one, never in both.
+#[allow(clippy::too_many_arguments)]
 fn update_destination_atmosphere(
     state: Res<PortalState>,
     catalog: Option<Res<SpaceLightingCatalog>>,
     config: Option<Res<EngineConfig>>,
+    database: Option<Res<WorldDatabase>>,
+    horizon: Option<Res<LodHorizon>>,
     doors: Query<&LoadDoor>,
     mut camera: Query<
         (
@@ -2608,34 +2613,53 @@ fn update_destination_atmosphere(
     // The door the portal is rendering through, and so the space the camera is standing in. The
     // portal clears it whenever it has no window to draw, which is also when this camera is
     // inactive: there is nothing to keep in step while no doorway is open.
-    let Some(destination) = state
-        .open_door
-        .and_then(|door| doors.get(door).ok())
-        .map(|door| {
-            space_key(
-                door.destination.worldspace_id.unwrap_or_default(),
-                door.destination.interior_cell_id,
-            )
-        })
-    else {
+    let Some(door) = state.open_door.and_then(|door| doors.get(door).ok()) else {
         return;
     };
+    // The destination's *worldspace* and not the key's own id: an interior destination's key holds
+    // the cell id, which is not a worldspace to ask the database about.
+    let destination_worldspace = door.destination.worldspace_id;
+    let destination = space_key(
+        destination_worldspace.unwrap_or_default(),
+        door.destination.interior_cell_id,
+    );
     let atmosphere = crate::atmosphere::space_atmosphere(catalog.as_deref(), destination);
     // The camera's three are written on a change of destination and not every frame: they are read
     // through change detection, and a doorway standing open for a minute would otherwise mark a
-    // camera and its view changed sixty times a second for no reason. Nothing else moves them - the
-    // catalog is read once at startup and the radii are the run's.
+    // camera and its view changed sixty times a second for no reason. Nothing else moves them: the
+    // catalog is read once at startup, the radii are the run's, and the destination's own LOD
+    // horizon is settled before this doorway can open (it is only written while a worldspace is the
+    // one the camera is in, and it is kept through an interior).
     if *applied != Some(destination) {
         *applied = Some(destination);
         camera.clear_color = ClearColorConfig::Custom(atmosphere.backdrop);
         *ambient = crate::atmosphere::ambient_light(&atmosphere);
-        // No LOD reach: distant terrain is not streamed while the player is in an interior, which is
-        // when a doorway shows an exterior, so the ring's own fog is what hides its edge.
+        // The destination worldspace's own ring and LOD horizon, resolved exactly as
+        // `crate::atmosphere::update_atmosphere` resolves them for the space the camera is in: an
+        // unnamed ring is off where the destination draws its own terrain LOD, and the fog then
+        // reaches that world's horizon where the run knows it. This is what the arrived view fogs
+        // with from the frame of the crossing, so the doorway and the room behind it agree.
+        //
+        // What the doorway *draws* of an exterior is the door's pre-streamed grid and nothing more:
+        // the terrain ring and the LOD follow the worldspace the camera is in
+        // (`crate::streaming::plan_cells`, `crate::streaming::lod`), and the camera is in the space
+        // the door opens off. That is the same ground the arrived view opens on before its own ring
+        // or LOD is resident, fogged the same way.
+        let has_lod = destination_worldspace.is_some_and(|worldspace_id| {
+            database
+                .as_ref()
+                .is_some_and(|database| database.has_lod_for(worldspace_id))
+        });
+        let lod_reach = destination_worldspace.and_then(|worldspace_id| {
+            horizon
+                .as_ref()
+                .and_then(|horizon| horizon.reach_in(worldspace_id))
+        });
         *fog = crate::atmosphere::atmosphere_fog(
             &atmosphere,
             config.stream_radius,
-            config.terrain_radius,
-            None,
+            config.effective_terrain_radius(has_lod),
+            lod_reach,
         );
         // And the colours the doorway's own dome is drawn with, from the same destination: this
         // camera draws the space behind the door and nothing of the room the player stands in, so
@@ -11461,6 +11485,164 @@ mod tests {
         portal_shows(&mut app, Some(room_door));
         update(&mut app, 2);
         assert_eq!(sky(&app), None, "an interior behind the door has no sky");
+    }
+
+    /// A world database holding `lod_chunks` rows for exactly `worldspaces`: the worldspaces that
+    /// draw their own distant terrain, which is what turns their ring off
+    /// ([`WorldDatabase::has_lod_for`]).
+    fn lod_world_database(
+        path: &Path,
+        worldspaces: &[u32],
+    ) -> crate::world::database::WorldDatabase {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(&format!(
+                r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
+                INSERT INTO schema_info VALUES({version});
+                CREATE TABLE lod_chunks(
+                    worldspace_id INTEGER NOT NULL,tier INTEGER NOT NULL,anchor_x INTEGER NOT NULL,anchor_y INTEGER NOT NULL,
+                    payload_path TEXT NOT NULL,content_hash TEXT NOT NULL,
+                    bounds_min_x REAL NOT NULL,bounds_min_y REAL NOT NULL,bounds_min_z REAL NOT NULL,
+                    bounds_max_x REAL NOT NULL,bounds_max_y REAL NOT NULL,bounds_max_z REAL NOT NULL,
+                    source_cells TEXT NOT NULL,PRIMARY KEY(worldspace_id,tier,anchor_x,anchor_y));"#,
+                version = shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+        for worldspace_id in worldspaces {
+            connection
+                .execute(
+                    "INSERT INTO lod_chunks VALUES(?1,4,0,0,'lod/0/4/cell_0_0.glb',?2,\
+                     0.0,0.0,0.0,0.0,0.0,0.0,'0,0')",
+                    rusqlite::params![worldspace_id, "a".repeat(64)],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        crate::world::database::WorldDatabase::open(path).unwrap()
+    }
+
+    /// The doorway's fog is the fog of the space behind it, resolved the way the main view resolves
+    /// it on the frame the player steps through (impl-196): the *destination* worldspace's own ring
+    /// and its own LOD horizon, and not the ring the run was configured with. Before this, an open
+    /// door into a worldspace that draws its own LOD was fogged at the ring's edge the arrived view
+    /// does not have.
+    ///
+    /// What the doorway draws of an exterior destination is the door's pre-streamed grid and no ring
+    /// or LOD - the ring and the LOD follow the worldspace the camera is *in*
+    /// (`crate::transition::plan_door_prestream`, `crate::streaming::plan_cells`) - which is the
+    /// ground the arrived view opens on. The main view's own fog for the same space, written by the
+    /// atmosphere plugin in the same frame, is what the doorway is compared against.
+    #[test]
+    fn the_doorway_fog_follows_the_destination_worldspaces_own_ring() {
+        use crate::world::lighting::fixtures::real_spaces;
+        let (_directory, catalog) = real_spaces();
+        let SunApp {
+            mut app,
+            main_camera,
+            portal_camera,
+            ..
+        } = sun_app();
+        app.insert_resource(catalog)
+            .init_resource::<ActiveCell>()
+            .init_resource::<LodHorizon>()
+            .add_plugins(crate::atmosphere::AtmospherePlugin);
+        let fog = |app: &App, camera: Entity| {
+            let fog = app
+                .world()
+                .entity(camera)
+                .get::<DistanceFog>()
+                .expect("each view's camera carries its own space's fog");
+            let DistanceFog {
+                falloff: FogFalloff::Linear { start, end },
+                ..
+            } = fog
+            else {
+                panic!("the engine builds linear fog");
+            };
+            (*start, *end)
+        };
+        let cell = crate::world::components::CELL_SIZE;
+        let (stream_radius, terrain_radius) = {
+            let config = app.world().resource::<EngineConfig>();
+            (config.stream_radius, config.terrain_radius)
+        };
+        // Three exterior destinations, one per case, each a space of its own so the doorway resolves
+        // its fog afresh: no LOD data, LOD data the run has not seen, LOD data whose horizon it
+        // knows.
+        let no_lod = door_to_space(TAMRIEL + 1, None);
+        let lod_new = door_to_space(TAMRIEL, None);
+        let lod_seen = door_to_space(TAMRIEL + 2, None);
+        let (no_lod_door, _) = spawn_scened_door(&mut app, no_lod, DoorState::Opening);
+        let (lod_new_door, _) = spawn_scened_door(&mut app, lod_new, DoorState::Opening);
+        let (lod_seen_door, _) = spawn_scened_door(&mut app, lod_seen, DoorState::Opening);
+        // The database knows two of the three; the third is a mod worldspace converted without LOD.
+        let directory = tempfile::tempdir().unwrap();
+        let database =
+            lod_world_database(&directory.path().join("world.db"), &[TAMRIEL, TAMRIEL + 2]);
+        let horizon = cell * 91.0;
+
+        // A destination the database holds no LOD chunks for keeps the configured ring, and the
+        // doorway fogs it exactly as the view that arrives in it does.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: TAMRIEL + 1,
+            interior: None,
+        };
+        portal_shows(&mut app, Some(no_lod_door));
+        update(&mut app, 2);
+        assert_eq!(
+            fog(&app, portal_camera),
+            (
+                cell * (stream_radius + 1) as f32,
+                cell * (terrain_radius + 1) as f32
+            ),
+            "a destination without LOD data fogs to the ring's far edge"
+        );
+        assert_eq!(
+            fog(&app, portal_camera),
+            fog(&app, main_camera),
+            "and the doorway fogs it as the view that arrives in that space does"
+        );
+
+        // A destination that draws its own LOD has no ring, so there is nothing at the ring's edge
+        // to fog: the doorway resolves that with the destination's own LOD data.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: TAMRIEL,
+            interior: None,
+        };
+        app.insert_resource(database);
+        portal_shows(&mut app, Some(lod_new_door));
+        update(&mut app, 2);
+        assert!(
+            fog(&app, portal_camera).0 > cell * (terrain_radius + 1) as f32,
+            "the fog no longer ends at the ring's edge in a worldspace that draws no ring"
+        );
+        assert_eq!(
+            fog(&app, portal_camera),
+            fog(&app, main_camera),
+            "before its first LOD answer that space's own fog is off, and the doorway's is too"
+        );
+
+        // Once the run knows the destination's horizon, both views reach it: the fog ends where the
+        // destination's LOD does.
+        app.world_mut()
+            .resource_mut::<LodHorizon>()
+            .set(TAMRIEL + 2, horizon);
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: TAMRIEL + 2,
+            interior: None,
+        };
+        portal_shows(&mut app, Some(lod_seen_door));
+        update(&mut app, 2);
+        assert_eq!(
+            fog(&app, portal_camera),
+            (cell * (stream_radius + 1) as f32, horizon),
+            "a destination whose horizon is known fogs to that horizon"
+        );
+        assert_eq!(
+            fog(&app, portal_camera),
+            fog(&app, main_camera),
+            "and again the doorway and the arrived view agree"
+        );
     }
 
     // -----------------------------------------------------------------------------------------
