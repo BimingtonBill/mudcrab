@@ -107,8 +107,8 @@ const RENDER_CYCLE_PHASES: [&str; 7] = [
 /// negative; and [`GRAPH_DRIVER_OVERHEAD`], the driver's lap less the two view-kind sums, never
 /// negative — and, at the two levels inside a view run that used to feed that overhead,
 /// [`GRAPH_GPU_PREPROCESS`] (the camera runs' early GPU-preprocessing head windows, out of the
-/// prepass sum) and [`GRAPH_UPSCALING`] (the upscaling window, a subset of
-/// [`GRAPH_POST_PROCESS`]) (`render_timing`).
+/// prepass sum) and [`GRAPH_UPSCALING`] (the upscaling window, its own tile after the post-process
+/// stage, out of [`GRAPH_POST_PROCESS`]) (`render_timing`).
 const RENDER_CYCLE_GRAPH_LAPS: [&str; 18] = [
     GRAPH_VIEWS,
     GRAPH_VIEW_COUNT,
@@ -781,7 +781,7 @@ impl ProfilingState {
     /// `render/graph/driver_overhead`, the driver's lap less the two view-kind sums; then the two
     /// windows of a run that used to feed that overhead, `render/graph/gpu_preprocess` (the camera
     /// runs' early GPU-preprocessing head windows, out of the prepass sum) and
-    /// `render/graph/upscaling` (the upscaling window, inside the post-process sum). The parts and
+    /// `render/graph/upscaling` (the upscaling window, out of the post-process sum). The parts and
     /// their remainder add up (`render/graph_and_present`, and one level in `render/graph/views`
     /// and one more in `render/graph/camera_driver`; see `render_timing`). A
     /// side the cycle did not measure stays an empty column, and the run's last cycle or two are

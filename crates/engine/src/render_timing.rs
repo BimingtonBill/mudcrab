@@ -83,9 +83,11 @@
 //!   `render/graph/view_count` (how many view schedules the cycle ran — a count, not a duration),
 //!   the sums over those views of `render/graph/prepass`, `render/graph/main_pass`,
 //!   `render/graph/early_post_process` and `render/graph/post_process` (the post-process sum covers
-//!   `EarlyPostProcess`, `PostProcess` and the upscaling window together, as it covered the first
-//!   two before the early stage got its own column; the early column is that first stage alone and
-//!   `render/graph/upscaling` the upscaling window alone),
+//!   `EarlyPostProcess` and `PostProcess` together, as it did before the early stage got its own
+//!   column — so the 2026-10-08 and 2026-10-09 windows' `render/graph/post_process` numbers keep
+//!   their meaning; the early column is that first stage alone), and `render/graph/upscaling` (the
+//!   upscaling window alone, lapped on its own because the system had no window of ours before —
+//!   see below),
 //!   `render/graph/gpu_preprocess` (the camera runs' early GPU-preprocessing windows, a column of
 //!   their own so the prepass sum stays exclusive of them — see below),
 //!   `render/graph/shadow_passes` (the same views' sun-shadow
@@ -135,8 +137,8 @@
 //!   The two shadow windows are summed into [`GRAPH_SHADOW_PASSES`] and *not* into the prepass and
 //!   main-pass sums, so the stage columns stay exclusive of them and
 //!   `render/graph/gpu_preprocess + render/graph/prepass + render/graph/main_pass +
-//!   render/graph/post_process + render/graph/shadow_passes` tiles `render/graph/camera_views`
-//!   exactly.
+//!   render/graph/post_process + render/graph/upscaling + render/graph/shadow_passes` tiles
+//!   `render/graph/camera_views` exactly.
 //!
 //!   The head window is Bevy's early GPU-preprocessing chain: `clear_indirect_parameters_metadata`,
 //!   `unpack_bins`, `early_gpu_preprocess` and `early_prepass_build_indirect_parameters` are added
@@ -153,9 +155,10 @@
 //!
 //!   The tail window is Bevy's upscaling system, placed only `after(Core3dSystems::PostProcess)`
 //!   (`bevy_core_pipeline-0.19.0` `src/core_3d/mod.rs:161`) and so free to run before the
-//!   post-process lap. [`add_graph_marks`] orders that lap `before(upscaling)` and laps the system
-//!   itself, so the upscaling window is summed into [`GRAPH_UPSCALING`] and, like the early
-//!   post-process stage, also into [`GRAPH_POST_PROCESS`], which covers the whole tail of the run.
+//!   post-process lap. [`add_graph_marks`] orders that lap `before(upscaling)` — so
+//!   `render/graph/post_process` keeps covering `EarlyPostProcess` and `PostProcess` alone, as it
+//!   did when the 2026-10-08 and 2026-10-09 windows were read — and laps the system itself, whose
+//!   window is then its own: [`GRAPH_UPSCALING`], a tile of the run like the stages.
 //!   What is left of a run after every lap — and so the whole of [`GRAPH_DRIVER_OVERHEAD`] besides
 //!   the driver's own loop — is `msaa_writeback` (`bevy_post_process-0.19.0`
 //!   `src/msaa_writeback.rs:32`, `pub(crate)`) and `ui_pass` (`bevy_ui_render-0.19.0`
@@ -270,10 +273,9 @@ pub const CLEANUP: &str = "render/cleanup";
 ///   and [`GRAPH_POST_PROCESS`]: how many view schedules (`Core3d` runs) the cycle ran, and the
 ///   sums over them of the schedule's prepass, main-pass, early-post-process and post-process
 ///   stages. The GPU-driven binning and indirect-draw building run inside the `Prepass` set, so
-///   their time is in `GRAPH_PREPASS`. `GRAPH_POST_PROCESS` now covers `EarlyPostProcess`,
-///   `PostProcess` and the upscaling window together, so the 2026-10-08 window's numbers keep
-///   their meaning there; `GRAPH_EARLY_POST_PROCESS` is the `EarlyPostProcess` part of it and
-///   [`GRAPH_UPSCALING`] the upscaling part.
+///   their time is in `GRAPH_PREPASS`. `GRAPH_POST_PROCESS` still covers `EarlyPostProcess` and
+///   `PostProcess` together, so the 2026-10-08 window's numbers keep their meaning there;
+///   `GRAPH_EARLY_POST_PROCESS` is the `EarlyPostProcess` part of it.
 /// * [`GRAPH_SHADOW_PASSES`] and [`GRAPH_GPU_PREPROCESS`]: the two windows of a camera run that are
 ///   not stages — the sun shadow passes and the early GPU-preprocessing chain — each summed over
 ///   the camera runs and each exclusive of the stage sums it would otherwise sit inside
@@ -300,14 +302,15 @@ pub const GRAPH_MAIN_PASS: &str = "render/graph/main_pass";
 /// [`GRAPH_POST_PROCESS`], split out because the stage is where temporal anti-aliasing lands
 /// (`bevy_anti_alias-0.19.0` `src/taa/mod.rs:72`) and an empty stage if it is off.
 pub const GRAPH_EARLY_POST_PROCESS: &str = "render/graph/early_post_process";
-/// The `EarlyPostProcess` and `PostProcess` stages and Bevy's upscaling system together, summed
-/// over the views (what this column has covered since impl-1075, extended by impl-1107 to the
-/// upscaling window, which until then sat outside every lap and in [`GRAPH_DRIVER_OVERHEAD`]): the
-/// whole tail of a run.
+/// The `EarlyPostProcess` and `PostProcess` stages together, summed over the views (what this
+/// column has covered since impl-1075, unmoved by impl-1107 so the 2026-10-08 and 2026-10-09
+/// windows stay comparable). The upscaling system that runs after the stage is not in it — that
+/// window is [`GRAPH_UPSCALING`].
 pub const GRAPH_POST_PROCESS: &str = "render/graph/post_process";
 /// Bevy's upscaling system's window alone (`bevy_core_pipeline-0.19.0` `src/upscaling/node.rs:17`;
 /// `src/core_3d/mod.rs:161` places it `after(Core3dSystems::PostProcess)`), summed over the views:
-/// a subset of [`GRAPH_POST_PROCESS`], as [`GRAPH_EARLY_POST_PROCESS`] is.
+/// the run's last stage-sized tile, exclusive of [`GRAPH_POST_PROCESS`] as the stage windows are.
+/// Before impl-1107 it sat in no lap window and was inside [`GRAPH_DRIVER_OVERHEAD`].
 pub const GRAPH_UPSCALING: &str = "render/graph/upscaling";
 /// The `Core3d` runs `camera_driver` made for a shadow view: the whole of each such run's stage
 /// laps, summed over the views (see the module doc — a directional light's cascades are inside a
@@ -325,7 +328,7 @@ pub const GRAPH_CAMERA_VIEWS: &str = "render/graph/camera_views";
 /// `src/render/light.rs:2762-2805`), which Bevy adds to `Core3d` outside every stage set. The laps
 /// bracket them inside the run ([`add_graph_marks`]), and the windows are *not* added to
 /// [`GRAPH_PREPASS`] or [`GRAPH_MAIN_PASS`], so the stage columns stay exclusive of this one and
-/// `gpu_preprocess + prepass + main_pass + post_process + shadow_passes` tiles
+/// `gpu_preprocess + prepass + main_pass + post_process + upscaling + shadow_passes` tiles
 /// [`GRAPH_CAMERA_VIEWS`]. A shadow view's own run (a point or spot light's map, where
 /// `shared_shadow_pass` draws that map) keeps its windows in the stage it sits in, so this column
 /// is the camera runs' sun passes alone (see the module doc).
@@ -465,7 +468,8 @@ fn add_render_marks(render_app: &mut SubApp, samples_pipelines: bool) {
 /// The `Core3d` hooks tile each run into the windows the laps sum: from the run's start to the end
 /// of Bevy's early GPU-preprocessing chain, on to the end of `Prepass`, on to the end of
 /// `MainPass`, on to the end of `EarlyPostProcess`, on to the end of `PostProcess` and on to the
-/// end of the upscaling system. Each window is added to its stage's cycle sum — and its own
+/// end of the upscaling system. Each window is added to its stage's cycle sum — or, for the two
+/// windows that are not stages, to its own column — and its own
 /// view kind's ([`GRAPH_CAMERA_VIEWS`] or [`GRAPH_SHADOW_VIEWS`]), which is what makes a kind's
 /// total the sum of its runs' stages. Systems outside the sets (the GPU preprocessing, and the sun
 /// shadow passes, which Bevy orders against set members with `after`/`before` only) fall in
@@ -488,9 +492,9 @@ fn add_render_marks(render_app: &mut SubApp, samples_pipelines: bool) {
 /// puts the shadow window in [`GRAPH_SHADOW_PASSES`] instead of the stage: a camera run's prepass
 /// and main-pass sums are therefore *exclusive* of the sun passes, as the prepass sum is of the
 /// GPU-preprocessing head window, and
-/// `gpu_preprocess + prepass + main_pass + post_process + shadow_passes` is the whole of the
-/// run — the upscaling lap closing the tail the same way. Nothing in Bevy is reordered in a way it
-/// does not already allow: every constraint added here sits inside the range Bevy's own
+/// `gpu_preprocess + prepass + main_pass + post_process + upscaling + shadow_passes` is the whole
+/// of the run — the upscaling lap closing the tail the same way. Nothing in Bevy is reordered in a
+/// way it does not already allow: every constraint added here sits inside the range Bevy's own
 /// `after`/`before` calls leave open.
 fn add_graph_marks(render_app: &mut SubApp) {
     render_app.add_systems(RenderGraph, render_graph_marks().run_if(tracks_cycles));
@@ -706,16 +710,16 @@ pub struct CycleSides {
     ///   millisecond fields share this record, so the count column is written as an integer.
     /// * `graph_prepass_ms`, `graph_main_pass_ms`, `graph_early_post_process_ms`,
     ///   `graph_post_process_ms`: the sums over those views of the `Core3d` schedule's prepass,
-    ///   main-pass, early-post-process and post-process stages. The post-process sum now covers
-    ///   `EarlyPostProcess`, `PostProcess` and the upscaling window together, as it covered the
-    ///   first two before the early stage got its own column, so the three are not added side by
-    ///   side. The prepass sum is exclusive of the GPU-preprocessing head window and the main pass
-    ///   of the sun passes (below).
+    ///   main-pass, early-post-process and post-process stages. The post-process sum still covers
+    ///   `EarlyPostProcess` and `PostProcess` together, as it did before the early stage got its
+    ///   own column, so the two are not added side by side; the upscaling window that follows the
+    ///   stage is outside it. The prepass sum is exclusive of the GPU-preprocessing head window and
+    ///   the main pass of the sun passes (below).
     /// * `graph_gpu_preprocess_ms`: the camera runs' early GPU-preprocessing head windows alone
     ///   ([`GRAPH_GPU_PREPROCESS`]), one of the two windows of a camera run that is not a stage: it
     ///   is excluded from the prepass sum above, which would otherwise hold it.
-    /// * `graph_upscaling_ms`: the upscaling window alone ([`GRAPH_UPSCALING`]), a subset of
-    ///   `graph_post_process_ms` as the early stage is.
+    /// * `graph_upscaling_ms`: the upscaling window alone ([`GRAPH_UPSCALING`]), the run's last
+    ///   tile, outside `graph_post_process_ms`.
     /// * `graph_shadow_views_ms`, `graph_camera_views_ms` and `graph_shadow_view_count`: the same
     ///   runs split by kind — a shadow view (a point or spot light's map, which `camera_driver`
     ///   drives as an auxiliary root view) or a camera — each sum being that kind's stage windows
@@ -1408,8 +1412,7 @@ fn lap_view_post_process(timings: Res<RenderTimings>) {
 }
 
 /// Bevy's upscaling system has run (`bevy_core_pipeline-0.19.0` `src/upscaling/node.rs:17`):
-/// closes the upscaling window into [`GRAPH_UPSCALING`] and, through [`add_graph_upscaling`], into
-/// [`GRAPH_POST_PROCESS`], which covers the whole tail of the run.
+/// closes the upscaling window into [`GRAPH_UPSCALING`], its own column.
 fn lap_view_upscaling(timings: Res<RenderTimings>) {
     timings.view_lapped(add_graph_upscaling);
 }
@@ -1425,8 +1428,8 @@ fn add_graph_main_pass(sides: &mut CycleSides, ms: f64) {
 }
 
 /// Adds the early-post-process window to the cycle's sum for that stage and to
-/// [`GRAPH_POST_PROCESS`], which keeps covering `EarlyPostProcess`, `PostProcess` and upscaling
-/// together (see [`GRAPH_POST_PROCESS`]).
+/// [`GRAPH_POST_PROCESS`], which keeps covering `EarlyPostProcess` and `PostProcess` together the
+/// way it did before the stage got its own column (see [`GRAPH_POST_PROCESS`]).
 fn add_graph_early_post_process(sides: &mut CycleSides, ms: f64) {
     sides.graph_early_post_process_ms = Some(sides.graph_early_post_process_ms.unwrap_or(0.0) + ms);
     add_graph_post_process(sides, ms);
@@ -1436,12 +1439,10 @@ fn add_graph_post_process(sides: &mut CycleSides, ms: f64) {
     sides.graph_post_process_ms = Some(sides.graph_post_process_ms.unwrap_or(0.0) + ms);
 }
 
-/// Adds the upscaling window to [`GRAPH_POST_PROCESS`], which covers the whole tail of the run, and
-/// to [`GRAPH_UPSCALING`], its own column — a subset of the former, as the early post-process stage
-/// is (see [`GRAPH_UPSCALING`]).
+/// Adds a view's upscaling window to [`GRAPH_UPSCALING`], its own column, exclusive of
+/// [`GRAPH_POST_PROCESS`] like the other stage windows of the run (see [`GRAPH_UPSCALING`]).
 fn add_graph_upscaling(sides: &mut CycleSides, ms: f64) {
     sides.graph_upscaling_ms = Some(sides.graph_upscaling_ms.unwrap_or(0.0) + ms);
-    add_graph_post_process(sides, ms);
 }
 
 /// Adds a camera run's early GPU-preprocessing window to [`GRAPH_GPU_PREPROCESS`].
@@ -2169,34 +2170,35 @@ mod tests {
             "the per-view stages are parts of the views lap: {stages:?} vs {views}"
         );
         // The head window is a camera-run column, so a shadow view's own run keeps it in its
-        // prepass: the stage sums plus it are the two kind sums, which the six windows of each run
-        // below make up (the post-process sum carrying the early stage and the upscaling window).
+        // prepass: the stage sums plus it and the upscaling tile are the two kind sums, which the
+        // six windows of each run below make up (the post-process sum carrying the early stage).
         let gpu_preprocess = cycle
             .graph_gpu_preprocess_ms
             .expect("the camera run's head window was lapped");
-        assert!(
-            (stages[0] + stages[1] + stages[2] + gpu_preprocess - (camera + shadow)).abs() < 1e-9,
-            "the stage sums and the head window cover the same windows the view-kind sums do: {} + \
-             {} + {} + {gpu_preprocess} vs {camera} + {shadow}",
-            stages[0],
-            stages[1],
-            stages[2]
-        );
         let upscaling = cycle
             .graph_upscaling_ms
             .expect("the camera run's tail window was lapped");
         assert!(
-            upscaling >= 2.0 && upscaling <= cycle.graph_post_process_ms.unwrap(),
-            "the upscaling window is a subset of the post-process sum, as the early stage is: \
-             {upscaling} vs {:?}",
-            cycle.graph_post_process_ms
+            (stages[0] + stages[1] + stages[2] + gpu_preprocess + upscaling - (camera + shadow))
+                .abs()
+                < 1e-9,
+            "the stage sums, the head window and the upscaling tile cover the same windows the \
+             view-kind sums do: {} + {} + {} + {gpu_preprocess} + {upscaling} vs {camera} + \
+             {shadow}",
+            stages[0],
+            stages[1],
+            stages[2]
+        );
+        assert!(
+            upscaling >= 2.0,
+            "the upscaling window is a tile of its own, summed like a stage: {upscaling}"
         );
         assert!(
             cycle.graph_early_post_process_ms.unwrap() >= 2.0
                 && cycle.graph_early_post_process_ms.unwrap()
                     <= cycle.graph_post_process_ms.unwrap(),
-            "the early stage is a part of the post-process sum, which covers the early stage, the \
-             post-process stage and the upscaling window: {:?} vs {:?}",
+            "the early stage is a part of the post-process sum, which still covers both stages: \
+             {:?} vs {:?}",
             cycle.graph_early_post_process_ms,
             cycle.graph_post_process_ms
         );
@@ -2476,8 +2478,7 @@ mod tests {
 
     /// The head window's column takes a camera run's chain, and a shadow view's own run keeps it in
     /// the prepass stage it sits at the head of, so the column is the camera runs' chain alone; the
-    /// upscaling window goes to its own column and, nested like the early stage, into the
-    /// post-process sum.
+    /// upscaling window goes to its own column, outside the post-process sum.
     #[test]
     fn the_head_and_tail_columns_take_camera_runs_only() {
         let mut camera = CycleSides::default();
@@ -2512,9 +2513,8 @@ mod tests {
             "the upscaling window is its own column"
         );
         assert_eq!(
-            tail.graph_post_process_ms,
-            Some(0.5),
-            "the upscaling window is inside the post-process sum as well, as the early stage is"
+            tail.graph_post_process_ms, None,
+            "and outside the post-process sum, which keeps its two-stage meaning"
         );
     }
 
@@ -2568,13 +2568,21 @@ mod tests {
             "each stage sum covers the run's own windows for it: {prepass} prepass, {main_pass} \
              main pass"
         );
+        let upscaling = cycle
+            .graph_upscaling_ms
+            .expect("the upscaling lap ran in the camera run");
+        let tiles = gpu_preprocess
+            + prepass
+            + main_pass
+            + early_post
+            + (post - early_post)
+            + upscaling
+            + shadow;
         assert!(
-            (gpu_preprocess + prepass + main_pass + early_post + (post - early_post) + shadow
-                - camera)
-                .abs()
-                < 1e-9,
-            "the stages, the head window and the sun passes tile the camera run: {gpu_preprocess} + \
-             {prepass} + {main_pass} + {early_post} + {} + {shadow} vs {camera}",
+            (tiles - camera).abs() < 1e-9,
+            "the stages, the head window, the upscaling tile and the sun passes tile the camera \
+             run: {gpu_preprocess} + {prepass} + {main_pass} + {early_post} + {} + {upscaling} + \
+             {shadow} vs {camera}",
             post - early_post
         );
     }
@@ -2620,9 +2628,14 @@ mod tests {
              early shadow pass each, and the late shadow pass: {prepass} prepass, {main_pass} main \
              pass"
         );
+        let upscaling = cycle
+            .graph_upscaling_ms
+            .expect("the upscaling lap ran in the shadow view's run");
         assert!(
-            (prepass + main_pass + early_post + (post - early_post) - shadow_views).abs() < 1e-9,
-            "the stages still tile the shadow view's run"
+            (prepass + main_pass + early_post + (post - early_post) + upscaling - shadow_views)
+                .abs()
+                < 1e-9,
+            "the stages and the upscaling tile still cover the shadow view's run"
         );
     }
 

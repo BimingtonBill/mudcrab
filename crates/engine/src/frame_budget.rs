@@ -35,8 +35,8 @@
 //!   lower bound for the GPU: a render thread that blocks in submit or present instead is counted as
 //!   `render_thread`, because it is the render schedule's own time. `render-cycles.csv` now splits
 //!   `render/graph_and_present` into the render graph's view schedules, their prepass, main-pass and
-//!   post-process stages with the early post-process stage and the upscaling window split out of the
-//!   last, the sun shadow-pass windows and the early GPU-preprocessing chain of the camera runs (out
+//!   post-process stages with the early post-process stage split out of the last and the upscaling
+//!   window lapped after it, the sun shadow-pass windows and the early GPU-preprocessing chain of the camera runs (out
 //!   of the stages they would otherwise sit in, which are exclusive of them) and the graph's
 //!   `queue.submit` and a remainder, the
 //!   view schedules themselves into the runs of shadow views and of cameras with their own
