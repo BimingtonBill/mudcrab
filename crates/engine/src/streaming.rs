@@ -62,22 +62,20 @@ const COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS: u64 = 1_000;
 /// not fit is held for the next frame rather than dropped.
 const MAX_TERRAIN_CELL_COMMITS_PER_FRAME: usize = 16;
 
-/// How many times the plan asks again for an interior cell whose full request failed while the
-/// camera stands in it ([`retry_failed_interior`]).
-///
-/// An interior has one tier and no landscape of its own to fall back to, so a failure would
-/// otherwise leave the camera's own space empty for as long as it stays there. The budget gives a
-/// transient failure - a busy worker, a database hiccup - its chances, and is small enough that a
-/// cell the database really does not have is not re-requested every frame.
-const INTERIOR_FAILED_RETRIES: u32 = 3;
-
 /// Total load attempts a failing cell gets before the streamer gives up on it for this visit of
 /// the camera: the first try plus two retries. The failures that retry at all are transient (a
 /// database or IO error; a load-order race can heal), and two retries spread over a 1 s then 2 s
 /// backoff outlast any such race, while a cell that fails for a real reason is not re-queried -
 /// or re-logged - forever. A cell that leaves the unload radius is forgotten, so its next visit
 /// starts this budget fresh.
+///
+/// The same budget covers every cell, exteriors and interiors alike: the interior the camera
+/// stands in is retried ([`retry_failed_interior`]) until it has spent these attempts, and
+/// [`record_failed_cell`] gives up on any cell at its last one.
 const MAX_CELL_LOAD_ATTEMPTS: u32 = 3;
+
+/// Retries a failing cell gets after its first load: the rest of [`MAX_CELL_LOAD_ATTEMPTS`].
+const MAX_CELL_LOAD_RETRIES: u32 = MAX_CELL_LOAD_ATTEMPTS - 1;
 
 /// How long the streamer waits before the first retry of a failed cell. Every further failure
 /// doubles the wait, so the budget of [`MAX_CELL_LOAD_ATTEMPTS`] waits 1 s and then 2 s. The wait
@@ -288,7 +286,7 @@ pub struct StreamingWorld {
     /// Forgotten when the cell leaves the plan, so a cell the camera comes back to is asked for in
     /// full once more, with a fresh record.
     full_failed: HashMap<CellKey, FullFailure>,
-    /// How much of [`INTERIOR_FAILED_RETRIES`] each failed cell has spent. A budget belongs to one
+    /// How many of its [`MAX_CELL_LOAD_RETRIES`] each failed interior has spent. A budget belongs to one
     /// stay in the plan: it is dropped with the cell, so a cell the camera comes back to is asked
     /// for in full again with its budget whole.
     failed_retries: HashMap<CellKey, u32>,
@@ -344,7 +342,7 @@ impl StreamingWorld {
     /// depend on the answer.
     ///
     /// The interior the camera stands in is the one cell whose failed full request *is* repeated:
-    /// the plan asks for it again up to [`INTERIOR_FAILED_RETRIES`] times
+    /// the plan asks for it again up to [`MAX_CELL_LOAD_RETRIES`] times, the shared attempt budget
     /// ([`retry_failed_interior`]). Between a failed answer and the retry that follows it the cell
     /// reads as failed in the cell table, but a retry is still owed, so it is not failed by this
     /// test until the last of its retries has failed too. A caller that settled on the first
@@ -2003,7 +2001,7 @@ fn fail_cell(
 /// Which attempt the next full-detail failure of `key` would be: one more than the failures the
 /// failure records already hold. An exterior counts the attempts its [`StreamingWorld::full_failed`]
 /// entry carries; an interior counts the retries its `failed_retries` budget has submitted, which
-/// is the same count one off ([`INTERIOR_FAILED_RETRIES`]).
+/// is the same count one off ([`MAX_CELL_LOAD_RETRIES`]).
 fn next_full_attempt(streaming: &StreamingWorld, key: &CellKey) -> u32 {
     match key {
         CellKey::Exterior { .. } => streaming
@@ -2109,8 +2107,9 @@ fn record_failed_cell(
 /// all, and a crossing into it is what turns it into the active interior, a door whose destination
 /// counts as settled once it has failed (`crate::transition::destination_is_loaded`): the player
 /// can walk into that emptiness. So the interior the camera stands in is asked for again, up to
-/// [`INTERIOR_FAILED_RETRIES`] times: a bounded number, so a cell the database really does not
-/// have costs its budget and is then left alone rather than re-requested every frame.
+/// [`MAX_CELL_LOAD_RETRIES`] times, the same [`MAX_CELL_LOAD_ATTEMPTS`] budget every cell gets: a
+/// bounded number, so a cell the database really does not have costs its budget and is then left
+/// alone rather than re-requested every frame.
 ///
 /// Only the interior the camera is *in*: an interior merely pre-streamed behind a nearby door is
 /// not waited on forever either way, and the moment the camera crosses into it, it is the active
@@ -2145,7 +2144,7 @@ fn retry_failed_interior(
     if Instant::now() < *retry_at {
         return false;
     }
-    streaming.failed_retries.get(key).copied().unwrap_or(0) < INTERIOR_FAILED_RETRIES
+    streaming.failed_retries.get(key).copied().unwrap_or(0) < MAX_CELL_LOAD_RETRIES
 }
 
 /// The cells the active cell wants resident, and what it wants of each: the interior the camera is
@@ -7781,7 +7780,7 @@ mod tests {
         };
 
         answer_failed(&mut app);
-        for attempt in 1..=INTERIOR_FAILED_RETRIES {
+        for attempt in 1..=MAX_CELL_LOAD_RETRIES {
             app.update();
             assert_eq!(
                 status(&app),
@@ -7852,15 +7851,15 @@ mod tests {
         // The first request, and every retry, fails: in each gap before the next retry the cell
         // is waited for, not given up on.
         app.update();
-        for attempt in 0..=INTERIOR_FAILED_RETRIES {
+        for attempt in 0..=MAX_CELL_LOAD_RETRIES {
             answer_failed(&mut app);
-            let retries_spent = attempt == INTERIOR_FAILED_RETRIES;
+            let retries_spent = attempt == MAX_CELL_LOAD_RETRIES;
             assert_eq!(
                 has_failed(&app),
                 retries_spent,
                 "after failure {} of {}",
                 attempt + 1,
-                INTERIOR_FAILED_RETRIES + 1
+                MAX_CELL_LOAD_RETRIES + 1
             );
             app.update();
         }
