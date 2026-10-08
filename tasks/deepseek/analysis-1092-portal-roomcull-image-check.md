@@ -29,3 +29,11 @@ describe what is missing (object at a room edge? through an open portal? editor-
 ## Report (under 500 words)
 Table pose | cell | off-off noise px | culling-diff px | culled meshes if known | verdict. Overall verdict: safe to make
 default / not safe (with the failing cases). Paths of the shots JSON, images and diff maps. Scripts you wrote.
+
+## Timing-window guard (added by the lead after launch)
+Other sessions run timing windows tonight. Before EVERY engine run, check the build gate:
+`python C:/Users/Brannock/.mudcrab/build-gate/build_gate.py status` and look at the `holds:` lines. If any hold is listed,
+do not start an engine; wait (re-check every 60 s with `python -c "import time; time.sleep(60)"`) until no hold is listed,
+then run. Never start an engine while a hold is set. Your release build goes through the gate, which already waits.
+A first run of this task (stopped to add this guard) left poses.json / poses.md / probe.txt in the scratch folder:
+read them and reuse what is valid instead of starting over.
