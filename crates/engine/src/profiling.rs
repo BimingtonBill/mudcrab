@@ -5,10 +5,10 @@ use crate::{
     render_timing::{
         self, CLEANUP, CycleSides, EXTRACT, EXTRACT_COMMANDS_AND_ASSETS, GRAPH_AND_PRESENT,
         GRAPH_CAMERA_VIEWS, GRAPH_EARLY_POST_PROCESS, GRAPH_MAIN_PASS, GRAPH_POST_PROCESS,
-        GRAPH_PREPASS, GRAPH_REMAINDER, GRAPH_SHADOW_VIEW_COUNT, GRAPH_SHADOW_VIEWS, GRAPH_SUBMIT,
-        GRAPH_VIEW_COUNT, GRAPH_VIEWS, GRAPH_VIEWS_REMAINDER, MAIN_WORLD, PREPARE, QUEUE, REAL_MS,
-        REMAINDER, RENDER_THREAD, SPECIALIZE_AND_VIEWS, SWAPCHAIN_ACQUIRE, WAIT_FOR_RENDER_THREAD,
-        WALL_CYCLE_MS,
+        GRAPH_PREPASS, GRAPH_REMAINDER, GRAPH_SHADOW_PASSES, GRAPH_SHADOW_VIEW_COUNT,
+        GRAPH_SHADOW_VIEWS, GRAPH_SUBMIT, GRAPH_VIEW_COUNT, GRAPH_VIEWS, GRAPH_VIEWS_REMAINDER,
+        MAIN_WORLD, PREPARE, QUEUE, REAL_MS, REMAINDER, RENDER_THREAD, SPECIALIZE_AND_VIEWS,
+        SWAPCHAIN_ACQUIRE, WAIT_FOR_RENDER_THREAD, WALL_CYCLE_MS,
     },
     streaming::StreamingMetrics,
 };
@@ -95,7 +95,11 @@ const RENDER_CYCLE_PHASES: [&str; 7] = [
 /// remainder that closes the views lap. [`GRAPH_VIEW_COUNT`] and [`GRAPH_SHADOW_VIEW_COUNT`] are
 /// not durations: the row writes them as whole numbers while the columns around them are
 /// milliseconds.
-const RENDER_CYCLE_GRAPH_LAPS: [&str; 12] = [
+///
+/// impl-1093's one column closes the list, so the twelve above keep the positions the 2026-10-08
+/// window's file gave them: [`GRAPH_SHADOW_PASSES`], the sun shadow-pass windows of the cycle's
+/// camera runs, which the prepass and main-pass columns above are exclusive of (`render_timing`).
+const RENDER_CYCLE_GRAPH_LAPS: [&str; 13] = [
     GRAPH_VIEWS,
     GRAPH_VIEW_COUNT,
     GRAPH_PREPASS,
@@ -108,6 +112,7 @@ const RENDER_CYCLE_GRAPH_LAPS: [&str; 12] = [
     GRAPH_CAMERA_VIEWS,
     GRAPH_EARLY_POST_PROCESS,
     GRAPH_VIEWS_REMAINDER,
+    GRAPH_SHADOW_PASSES,
 ];
 
 /// The value one graph-lap column writes for a cycle's record, or `None` for an empty column (the
@@ -130,6 +135,7 @@ fn graph_lap_value(sides: &CycleSides, column: &str) -> Option<String> {
         GRAPH_CAMERA_VIEWS => ms(sides.graph_camera_views_ms),
         GRAPH_EARLY_POST_PROCESS => ms(sides.graph_early_post_process_ms),
         GRAPH_VIEWS_REMAINDER => ms(sides.graph_views_remainder_ms),
+        GRAPH_SHADOW_PASSES => ms(sides.graph_shadow_passes_ms),
         _ => None,
     }
 }
@@ -610,7 +616,10 @@ impl ProfilingState {
     /// stage too, which has its own column as well), `render/graph/remainder` closes the phase, and
     /// the views lap is split by the kind of root view `camera_driver` ran —
     /// `render/graph/shadow_views` and `render/graph/camera_views` with the shadow view count —
-    /// with `render/graph/views_remainder` closing that split. The parts and their remainder add up
+    /// with `render/graph/views_remainder` closing that split, and `render/graph/shadow_passes`
+    /// last: the camera runs' sun shadow-pass windows, which the prepass and main-pass columns are
+    /// exclusive of, so the stages and this column add up to the camera runs. The parts and their
+    /// remainder add up
     /// (`render/graph_and_present`, and one level in `render/graph/views`; see `render_timing`). A
     /// side the cycle did not measure stays an empty column, and the run's last cycle or two are
     /// absent: their remainder window never closed, and with it neither clock column.
@@ -2244,7 +2253,8 @@ lights/budget,physics/step"
     /// `render-cycles.csv` names every column in the documented order and writes each cycle's row
     /// under them; a side the cycle did not measure stays an empty column, and the counts are
     /// written as whole numbers rather than milliseconds. The seven graph columns the 2026-10-08
-    /// window was read from keep their positions; impl-1088's five follow them.
+    /// window was read from keep their positions; impl-1088's five follow them, and impl-1093's one
+    /// (the sun shadow passes of the camera runs) closes the list.
     #[test]
     fn the_render_cycles_csv_names_every_column() {
         let mut profiler = ProfilingState::default();
@@ -2269,6 +2279,7 @@ lights/budget,physics/step"
                 graph_camera_views_ms: Some(3.0),
                 graph_early_post_process_ms: Some(0.2),
                 graph_views_remainder_ms: Some(0.4),
+                graph_shadow_passes_ms: Some(0.5),
                 ..Default::default()
             },
         )]);
@@ -2282,7 +2293,7 @@ lights/budget,physics/step"
             render/graph/views,render/graph/view_count,render/graph/prepass,render/graph/main_pass,\
             render/graph/post_process,render/graph/submit,render/graph/remainder,\
             render/graph/shadow_views,render/graph/shadow_view_count,render/graph/camera_views,\
-            render/graph/early_post_process,render/graph/views_remainder"
+            render/graph/early_post_process,render/graph/views_remainder,render/graph/shadow_passes"
         );
         let row: Vec<&str> = lines.next().unwrap().split(',').collect();
         assert_eq!(
@@ -2342,6 +2353,11 @@ lights/budget,physics/step"
             row[26], "0.4000",
             "the views remainder closes the views lap"
         );
+        assert_eq!(
+            row[27], "0.5000",
+            "the sun shadow passes of the camera runs close the row, in the position impl-1093 \
+             appended"
+        );
         assert!(lines.next().is_none());
     }
 
@@ -2364,6 +2380,7 @@ lights/budget,physics/step"
             graph_camera_views_ms: Some(9.0),
             graph_early_post_process_ms: Some(10.0),
             graph_views_remainder_ms: Some(11.0),
+            graph_shadow_passes_ms: Some(12.0),
             ..Default::default()
         };
         for column in RENDER_CYCLE_GRAPH_LAPS {
