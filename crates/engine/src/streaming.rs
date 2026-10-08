@@ -654,6 +654,12 @@ pub struct StreamingMetrics {
     /// landscape the cell cache does not carry. Deliberately not part of [`Self::failed_cells`]:
     /// see the commit in [`collect_cells`](fn@collect_cells).
     pub ring_cells_empty: u64,
+    /// Full-detail exterior cells whose answer carried no terrain at all: committed as resident,
+    /// with no landscape quadrants and no water, and marked [`TerrainLess`]. The ring's twin is
+    /// [`Self::ring_cells_empty`]; unlike a ring cell this one is held, so it is counted on its own
+    /// and is not a streaming invariant failure ([`validate_streaming_lifecycle`]). Whether such a
+    /// cell should draw nothing or fail for a retry is a data decision this counter feeds.
+    pub full_cells_without_terrain: u64,
     pub total_query_micros: u64,
     pub max_query_micros: u64,
     pub max_commit_micros: u64,
@@ -1980,6 +1986,20 @@ fn collect_cells(
                     }),
                     CellDetail::Terrain => None,
                 };
+                // A full exterior cell answered without terrain is committed as before - no
+                // quadrants, no water - but no longer silently: counted, logged, and marked so the
+                // lifecycle check can tell it from a cell that lost its landscape.
+                let terrain_less = is_terrain_less_full_exterior(payload.key, detail, &terrain);
+                if terrain_less {
+                    debug!(
+                        cell = format_args!("{:08X}", payload.cell_id),
+                        key = ?payload.key,
+                        "full exterior cell has no terrain in its answer"
+                    );
+                    metrics.full_cells_without_terrain =
+                        metrics.full_cells_without_terrain.saturating_add(1);
+                    profiler.increment("streaming/full_cells_without_terrain", 1);
+                }
                 let root = spawn_cell(
                     &mut commands,
                     &asset_server,
@@ -1998,6 +2018,9 @@ fn collect_cells(
                     &mut streaming.next_model_sequence,
                     &mut profiler,
                 );
+                if terrain_less {
+                    commands.entity(root).insert(TerrainLess);
+                }
                 streaming
                     .cells
                     .insert(response.key, CellStatus::Resident { root, detail });
@@ -2444,6 +2467,24 @@ fn cell_within_unload_radius(
 /// a separate change.
 fn terrain_reaches_water(terrain: &TerrainSnapshot, water_height: f32) -> bool {
     terrain.heights.iter().any(|height| *height < water_height)
+}
+
+/// Marks the root of a full-detail exterior cell that was committed with no terrain in its answer
+/// (counted in [`StreamingMetrics::full_cells_without_terrain`]). The lifecycle check expects every
+/// other full exterior root to hold a [`TerrainPatch`], so this is how a counted, known case is told
+/// apart from a cell that lost its landscape after it was spawned.
+#[derive(Component, Debug)]
+pub(crate) struct TerrainLess;
+
+/// Whether this commit is a full-detail exterior cell with no terrain to draw. An interior has no
+/// landscape by nature and a terrain-only cell without one is refused before it gets here, so
+/// neither is this case.
+fn is_terrain_less_full_exterior(
+    key: CellKey,
+    detail: CellDetail,
+    terrain: &Option<TerrainSnapshot>,
+) -> bool {
+    detail == CellDetail::Full && matches!(key, CellKey::Exterior { .. }) && terrain.is_none()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5236,6 +5277,8 @@ fn validate_streaming_lifecycle(
     streaming: Res<StreamingWorld>,
     camera: Query<&Transform, With<StreamingCamera>>,
     roots: CellRootsQuery,
+    full_exteriors: Query<Option<&TerrainLess>, (With<StreamedCellRoot>, With<ExteriorCellGrid>)>,
+    terrain_patches: Query<&ChildOf, With<TerrainPatch>>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -5306,7 +5349,39 @@ fn validate_streaming_lifecycle(
                 .count() as u64
         })
     };
-    let violations = duplicate_roots + orphaned_roots + missing_roots + out_of_range_roots;
+    // A resident full-detail exterior cell draws its landscape: its root holds a `TerrainPatch`
+    // child unless the commit counted it as terrain-less ([`TerrainLess`]). One without either lost
+    // its landscape after it was spawned, which nothing counted. Cost: one pass over the cell map
+    // (as above) with a root lookup per resident full exterior cell, then - only while such a cell
+    // exists - one pass over the `TerrainPatch` entities (about four per resident terrain cell) that
+    // ticks their parents off, stopping as soon as every cell is accounted for. No pass over the
+    // cells' children, which hold every reference of the cell.
+    let mut unpatched: HashSet<Entity> = streaming
+        .cells
+        .iter()
+        .filter_map(|(key, status)| match (key, status) {
+            (
+                CellKey::Exterior { .. },
+                CellStatus::Resident {
+                    root,
+                    detail: CellDetail::Full,
+                },
+            ) => Some(*root),
+            _ => None,
+        })
+        .filter(|root| matches!(full_exteriors.get(*root), Ok(None)))
+        .collect();
+    if !unpatched.is_empty() {
+        for parent in &terrain_patches {
+            unpatched.remove(&parent.parent());
+            if unpatched.is_empty() {
+                break;
+            }
+        }
+    }
+    let terrain_lost_roots = unpatched.len() as u64;
+    let violations =
+        duplicate_roots + orphaned_roots + missing_roots + out_of_range_roots + terrain_lost_roots;
 
     metrics.active_requests = active_requests;
     metrics.peak_active_requests = metrics.peak_active_requests.max(active_requests);
@@ -5321,6 +5396,7 @@ fn validate_streaming_lifecycle(
             orphaned_roots,
             missing_roots,
             out_of_range_roots,
+            terrain_lost_roots,
             "streaming lifecycle invariant failed"
         );
         profiler.event("streaming", "invariant_failed", None);
@@ -7159,9 +7235,11 @@ mod tests {
                 Visibility::default(),
             ))
             .id();
+        // The first child is the cell's landscape, as in a real cell: the lifecycle check expects
+        // every resident full exterior root to hold a terrain patch.
         let child = app
             .world_mut()
-            .spawn((Transform::default(), ChildOf(root)))
+            .spawn((Transform::default(), TerrainPatch, ChildOf(root)))
             .id();
         app.world_mut()
             .spawn((Transform::default(), ChildOf(child)));
@@ -8608,6 +8686,132 @@ mod tests {
             "the full request's failure is not counted as ring noise"
         );
         assert_eq!(metrics.asset_failures.len(), 1);
+    }
+
+    /// The streaming app over a cell cache that holds no landscape, with the camera in the
+    /// fixture's cell: the cell is asked for in full, resolves, and is answered with no terrain.
+    /// The directory is returned so the files outlive the app.
+    fn terrain_less_full_cell_app(validate: bool) -> (App, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_empty_cell_cache(&cache_path);
+        let mut app = terrain_streaming_app(&database_path, &cache_path);
+        if validate {
+            app.add_systems(Update, validate_streaming_lifecycle.after(collect_cells));
+        }
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        run_until(&mut app, "the full cell to be committed", |app| {
+            matches!(
+                app.world()
+                    .resource::<StreamingWorld>()
+                    .cells
+                    .get(&exterior_cell(2, -3)),
+                Some(CellStatus::Resident {
+                    detail: CellDetail::Full,
+                    ..
+                })
+            )
+        });
+        (app, directory)
+    }
+
+    /// A full exterior cell whose answer carries no terrain is still committed as it always was -
+    /// resident, no quadrants - but it is counted, once, and marked.
+    #[test]
+    fn a_full_exterior_cell_without_terrain_is_counted_once_and_stays_resident() {
+        let (mut app, _directory) = terrain_less_full_cell_app(false);
+        // More frames: a counter bumped by anything but the commit would keep climbing.
+        for _ in 0..10 {
+            app.update();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let key = exterior_cell(2, -3);
+        let root = match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Resident {
+                root,
+                detail: CellDetail::Full,
+            }) => *root,
+            other => panic!("the terrain-less cell is not resident in full: {other:?}"),
+        };
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .full_cells_without_terrain,
+            1
+        );
+        assert_eq!(
+            app.world().resource::<StreamingMetrics>().failed_cells,
+            0,
+            "the cell is held, not failed"
+        );
+        assert!(
+            app.world().get::<TerrainLess>(root).is_some(),
+            "the counted root carries the marker the lifecycle check reads"
+        );
+        assert_eq!(roots_of(&mut app, 1), 1);
+        let patches = app
+            .world_mut()
+            .query_filtered::<(), With<TerrainPatch>>()
+            .iter(app.world())
+            .count();
+        assert_eq!(patches, 0, "no terrain was answered, so none is drawn");
+    }
+
+    /// The lifecycle check has no complaint about a counted terrain-less cell: it is a known case,
+    /// not a cell that lost its landscape.
+    #[test]
+    fn the_lifecycle_check_accepts_a_counted_terrain_less_cell() {
+        let (mut app, _directory) = terrain_less_full_cell_app(true);
+        // The validator runs after the commit that made the cell resident.
+        app.update();
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(
+            metrics.resident_roots, 1,
+            "the check saw the terrain-less root"
+        );
+        assert_eq!(metrics.full_cells_without_terrain, 1);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    /// A full exterior root that holds no terrain and was not counted as terrain-less lost its
+    /// landscape after it was spawned: that is a lifecycle violation. The same cell with its
+    /// landscape is not.
+    #[test]
+    fn the_lifecycle_check_flags_a_full_exterior_root_that_lost_its_terrain() {
+        let key = exterior_cell(2, -3);
+        let mut app = spawn_cells_app(
+            vec![(key, untextured_fixture(1, 100.0))],
+            StreamingMetrics::default(),
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .streaming_invariant_failures,
+            0,
+            "a cell holding its landscape is fine"
+        );
+        // The cell is already spawned and recorded; spawn nothing more.
+        app.world_mut().resource_mut::<QueuedCells>().0.clear();
+        let patches: Vec<Entity> = app
+            .world_mut()
+            .query_filtered::<Entity, With<TerrainPatch>>()
+            .iter(app.world())
+            .collect();
+        assert_eq!(patches.len(), 4);
+        for patch in patches {
+            app.world_mut().entity_mut(patch).despawn();
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .streaming_invariant_failures,
+            1,
+            "an uncounted full exterior root without terrain is a violation"
+        );
     }
 
     /// A cell whose upgrade to full fails while the camera stands in it is drawn as terrain again,
