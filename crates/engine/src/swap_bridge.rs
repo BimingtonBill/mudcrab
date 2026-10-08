@@ -19,6 +19,7 @@
 //! marker, never all terrain, and a surface leaves the set the frame it is confirmed drawn
 //! (design-1091 §2.3, §5).
 
+use bevy::camera::visibility::ViewVisibility;
 use bevy::pbr::{PreparedMaterial, SpecializedMaterialPipelineCache};
 use bevy::{
     asset::{AssetId, UntypedAssetId},
@@ -50,6 +51,31 @@ use crate::{config::EngineConfig, profiling::ProfilingState};
 /// leaves the set with it.
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct SwapWaiting;
+
+/// The waiting surfaces with their main-world visibility: what [`pending_drawn`] counts over.
+pub(crate) type WaitingVisibility<'w, 's> =
+    Query<'w, 's, &'static ViewVisibility, With<SwapWaiting>>;
+
+/// How many surfaces are waiting on the render world while a main-world view can see them.
+///
+/// This is the one rule a settle (design-1091 C4), the world-ready predicate, a door prewarm and the
+/// run-level invariant count through, so they cannot disagree about what a hole is: a surface no view
+/// can see is never a hole - the bridge can never confirm it drawn, because Bevy specializes a
+/// pipeline only for the views whose visible set holds the entity, and its stand-in covers it - so it
+/// holds nothing up. A surface the stand-in still hides is not counted either: it is covered, and the
+/// frame the stand-in yields the quadrant is already `Visibility::Inherited`.
+///
+/// `ViewVisibility` is the visibility `check_visibility` wrote in the last `PostUpdate`, so this
+/// reads the visibility of the frame *before* the one that asks: an entity that becomes visible in
+/// this frame's `PostUpdate` is counted from the next frame. That can only delay a settle by one
+/// frame (which [`crate::shots::SETTLE_QUIET_FRAMES`] absorbs), never settle on a surface that was
+/// already visible and undrawn, because a visible surface stays visible.
+///
+/// The set is small: only the entities the engine has marked waiting, which is the same bound the
+/// bridge itself pays (design-1091 §2.3).
+pub(crate) fn pending_drawn(waiting: &Query<&ViewVisibility, With<SwapWaiting>>) -> usize {
+    waiting.iter().filter(|visibility| visibility.get()).count()
+}
 
 /// What a waiting surface's draw needs from the render world, as asset ids.
 ///

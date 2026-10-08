@@ -27,7 +27,7 @@ use bevy::{
     app::{Inherited, Propagate, SceneSpawnerSystems},
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::primitives::MeshAabb,
-    camera::visibility::RenderLayers,
+    camera::visibility::{RenderLayers, ViewVisibility},
     ecs::system::SystemParam,
     gltf::{GltfExtras, GltfMaterialName, GltfSceneExtras},
     image::{ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler},
@@ -2931,8 +2931,9 @@ struct PendingWaterProfile {
 }
 
 /// Counts the streamer's unfinished-work markers under one cell root: a model not yet armed or
-/// instantiated, and terrain or water whose textures are still loading. Unlike the global
-/// [`StreamingMetrics`] counts these cover only that cell, which is what a load door waits for.
+/// instantiated, terrain or water whose textures are still loading, and a surface the render world
+/// has not confirmed drawn. Unlike the global [`StreamingMetrics`] counts these cover only that
+/// cell, which is what a load door waits for.
 #[derive(bevy::ecs::system::SystemParam)]
 #[allow(clippy::type_complexity)]
 pub(crate) struct PendingUnder<'w, 's> {
@@ -2948,6 +2949,12 @@ pub(crate) struct PendingUnder<'w, 's> {
             With<PendingWaterProfile>,
         )>,
     >,
+    /// The surfaces still waiting on the render world ([`SwapWaiting`]). Counted only while a view
+    /// can see them, the same rule the settle uses ([`crate::swap_bridge::pending_drawn`]): a
+    /// landing interior's own surfaces are in view the moment the camera arrives, so a crossing does
+    /// not finish on textures loaded with nothing yet drawn, and it does not wait on a pre-streamed
+    /// cell's surfaces, which no view can see and which the bridge can never confirm.
+    swapping: Query<'w, 's, &'static ViewVisibility, With<SwapWaiting>>,
 }
 
 impl PendingUnder<'_, '_> {
@@ -2955,7 +2962,13 @@ impl PendingUnder<'_, '_> {
     pub(crate) fn count(&self, root: Entity) -> usize {
         std::iter::once(root)
             .chain(self.children.iter_descendants(root))
-            .filter(|entity| self.pending.contains(*entity))
+            .filter(|entity| {
+                self.pending.contains(*entity)
+                    || self
+                        .swapping
+                        .get(*entity)
+                        .is_ok_and(|visibility| visibility.get())
+            })
             .count()
     }
 }
@@ -5292,6 +5305,29 @@ fn update_render_origin(
     profiler.record_elapsed("streaming/render_origin_rebase", started);
 }
 
+/// Frames a visible full-detail terrain quadrant may wait on the render world before the run-level
+/// invariant counts it as a hole that came back (design-1091 §4).
+///
+/// Derived from what a legitimate wait is made of: the bridge's own latency is two render frames (a
+/// surface is prepared in the extract after the frame that established its assets, and the hand-over
+/// runs in the frame after that), and the upload budget
+/// (`EngineConfig::max_upload_mib_per_frame`, 16 MiB a frame in play, none for a capture) defers a
+/// quadrant's mesh and its LAND layers' images to later frames under one shared counter a cell's own
+/// models also draw on. One full-detail stream window is `(2 * stream_radius + 1)^2` cells of four
+/// quadrants - 100 quadrants at the default `stream_radius` of 2 - whose images are on the order of
+/// the budget's frame, so a whole window turning over is on the order of a hundred frames. 512 is
+/// several times that: generous enough that no healthy run, slow machine or heavy mod cell trips it,
+/// and short enough to catch a bridge that has stopped confirming a visible quadrant within seconds
+/// at any frame rate the engine runs at.
+///
+/// The bound is on the *permanent* condition (never drawn while visible), not the transient one (not
+/// yet drawn): the invariant gates shots and acceptance, so a false positive would cost a run, and
+/// the stall it exists to catch is not one that clears by waiting.
+const MAX_SWAP_WAIT_FRAMES: u64 = 512;
+
+/// Terrain quadrants still waiting on the render world.
+type WaitingTerrainPatches = (With<TerrainPatch>, With<SwapWaiting>);
+
 #[allow(clippy::too_many_arguments)]
 fn validate_streaming_lifecycle(
     config: Res<EngineConfig>,
@@ -5302,6 +5338,13 @@ fn validate_streaming_lifecycle(
     streaming: Res<StreamingWorld>,
     camera: Query<&Transform, With<StreamingCamera>>,
     roots: CellRootsQuery,
+    // A visible terrain quadrant still waiting on the render world, and how long each has waited:
+    // the run-level check below (design-1091 C4). The map holds only the patches waiting now, so a
+    // drawn or despawned patch's entity id cannot be inherited by a later one.
+    parents: Query<&ChildOf>,
+    patches: Query<(Entity, &ViewVisibility), WaitingTerrainPatches>,
+    mut wait_frame: Local<u64>,
+    mut waiting_since: Local<HashMap<Entity, u64>>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -5372,7 +5415,72 @@ fn validate_streaming_lifecycle(
                 .count() as u64
         })
     };
-    let violations = duplicate_roots + orphaned_roots + missing_roots + out_of_range_roots;
+    // A visible full-detail terrain quadrant the render world has not confirmed drawn past
+    // [`MAX_SWAP_WAIT_FRAMES`] is a hole that came back: the bridge has had the bridge's latency and
+    // the upload budget's worst case and still cannot draw it. Counted only for the resident
+    // full-detail exterior roots inside the stream window - the ground a camera settling on the
+    // active worldspace can see - so a cell on its way out, another worldspace's cells, and the
+    // terrain ring (which the plan does not keep in full detail) are not read as failures. (A
+    // counted terrain-less cell, `TerrainLess` on `phase2/terrain-less-cell-counter`, has no
+    // `TerrainPatch` at all, so it is never seen here; the merge must exempt it explicitly.)
+    *wait_frame = wait_frame.saturating_add(1);
+    let swap_wait_timeouts = if active.interior.is_some() {
+        // No exterior geometry is drawn inside an interior; nothing here can be a hole.
+        waiting_since.clear();
+        0
+    } else {
+        let full_window_roots: HashSet<Entity> = camera.single().map_or_else(
+            |_| HashSet::new(),
+            |camera| {
+                let center = camera_grid(camera.translation, origin.0);
+                streaming
+                    .cells
+                    .iter()
+                    .filter_map(|(key, status)| match (key, status) {
+                        (
+                            CellKey::Exterior {
+                                worldspace_id,
+                                grid_x,
+                                grid_y,
+                            },
+                            CellStatus::Resident {
+                                root,
+                                detail: CellDetail::Full,
+                            },
+                        ) if *worldspace_id == active.worldspace_id
+                            && (grid_x - center.x).abs() <= config.stream_radius
+                            && (grid_y - center.y).abs() <= config.stream_radius =>
+                        {
+                            Some(*root)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            },
+        );
+        let mut stuck = 0u64;
+        for (entity, visibility) in patches.iter() {
+            let visible_under_a_full_window_root = visibility.get()
+                && parents
+                    .iter_ancestors(entity)
+                    .any(|ancestor| full_window_roots.contains(&ancestor));
+            if !visible_under_a_full_window_root {
+                waiting_since.remove(&entity);
+                continue;
+            }
+            let since = *waiting_since.entry(entity).or_insert(*wait_frame);
+            if *wait_frame - since > MAX_SWAP_WAIT_FRAMES {
+                stuck = stuck.saturating_add(1);
+            }
+        }
+        // Forget the patches that drew (their marker is gone) or despawned, so the map covers the
+        // waiting set and nothing else.
+        waiting_since.retain(|entity, _| patches.contains(*entity));
+        stuck
+    };
+
+    let violations =
+        duplicate_roots + orphaned_roots + missing_roots + out_of_range_roots + swap_wait_timeouts;
 
     metrics.active_requests = active_requests;
     metrics.peak_active_requests = metrics.peak_active_requests.max(active_requests);
@@ -5387,6 +5495,7 @@ fn validate_streaming_lifecycle(
             orphaned_roots,
             missing_roots,
             out_of_range_roots,
+            swap_wait_timeouts,
             "streaming lifecycle invariant failed"
         );
         profiler.event("streaming", "invariant_failed", None);
@@ -5394,6 +5503,7 @@ fn validate_streaming_lifecycle(
     metrics.streaming_invariant_failures = metrics.streaming_invariant_failures.max(violations);
     profiler.set_gauge("streaming/active_requests", active_requests as f64);
     profiler.set_gauge("streaming/resident_roots", root_entries.len() as f64);
+    profiler.set_gauge("streaming/swap_wait_timeouts", swap_wait_timeouts as f64);
 }
 
 #[cfg(test)]
@@ -5404,6 +5514,7 @@ mod tests {
         world::database::DoorLinkRow,
     };
     use bevy::asset::{AssetApp, AssetPlugin};
+    use bevy::ecs::system::SystemState;
 
     #[test]
     fn window_residency_counts_only_the_active_interior_inside() {
@@ -10363,6 +10474,112 @@ mod tests {
                 -(-3 - origin.y) as f32 * CELL_SIZE,
             )
         );
+    }
+
+    /// A visible full-detail terrain quadrant the render world has not confirmed drawn past
+    /// [`MAX_SWAP_WAIT_FRAMES`] is the hole coming back, and the run-level invariant says so; one
+    /// within the bound is a quadrant on its way and is not; and a quadrant no view can see is never
+    /// counted, however long it waits (design-1091 §4).
+    #[test]
+    fn lifecycle_validator_flags_a_visible_patch_stuck_past_the_swap_bound() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .init_resource::<PrestreamCells>()
+            .init_resource::<StreamingWorld>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, validate_streaming_lifecycle);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        let root = app
+            .world_mut()
+            .spawn((StreamedCellRoot, CellRef(0), Transform::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                exterior_cell(0, 0),
+                CellStatus::Resident {
+                    root,
+                    detail: CellDetail::Full,
+                },
+            );
+        // One waiting quadrant a view can see and one it cannot.
+        app.world_mut().spawn((
+            TerrainPatch,
+            SwapWaiting,
+            ViewVisibility::VISIBLE,
+            ChildOf(root),
+        ));
+        app.world_mut().spawn((
+            TerrainPatch,
+            SwapWaiting,
+            ViewVisibility::HIDDEN,
+            ChildOf(root),
+        ));
+
+        // Within the bound: a quadrant on its way is not a hole.
+        for _ in 0..MAX_SWAP_WAIT_FRAMES {
+            app.update();
+        }
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .streaming_invariant_failures,
+            0,
+            "a quadrant still inside the bound is not a violation",
+        );
+
+        // Past it: the visible quadrant alone is the violation.
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .streaming_invariant_failures,
+            1,
+            "the stuck visible quadrant, and not the one off-view",
+        );
+    }
+
+    /// `PendingUnder` holds a crossing for a surface the render world has not confirmed drawn only
+    /// while a view can see it: an interior the camera has arrived in has its surfaces in view, and
+    /// a pre-streamed cell's surfaces, which no view can see and the bridge can never confirm, do
+    /// not hold the door the camera is not standing in.
+    #[test]
+    fn pending_under_counts_a_visible_waiting_surface_and_ignores_a_hidden_one() {
+        let mut world = World::new();
+        let root = world.spawn_empty().id();
+        let visible = world
+            .spawn((SwapWaiting, ViewVisibility::VISIBLE, ChildOf(root)))
+            .id();
+        let hidden = world
+            .spawn((SwapWaiting, ViewVisibility::HIDDEN, ChildOf(root)))
+            .id();
+        let mut state = SystemState::<PendingUnder>::new(&mut world);
+
+        let count = state.get(&world).unwrap().count(root);
+        assert_eq!(
+            count, 1,
+            "only the surface a view can see holds the crossing"
+        );
+
+        // The old pending-work markers still count whatever their visibility.
+        world.spawn((pending_marker_for_test(), ChildOf(root)));
+        assert_eq!(state.get(&world).unwrap().count(root), 2);
+
+        // Once the visible surface is drawn (its marker is gone) and the hidden one is not needed,
+        // only the model marker is left.
+        world.entity_mut(visible).remove::<SwapWaiting>();
+        world.entity_mut(hidden).remove::<SwapWaiting>();
+        assert_eq!(state.get(&world).unwrap().count(root), 1);
     }
 
     #[test]

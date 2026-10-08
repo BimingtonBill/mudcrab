@@ -55,11 +55,15 @@ use crate::{
     streaming::{
         ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, camera_grid, creation_to_bevy,
     },
+    swap_bridge::{SwapWaiting, pending_drawn},
     transition::{OpenDoor, SpaceTarget, switch_space},
     world::{components::StreamingCamera, database::CellKey},
 };
 use bevy::{
-    camera::RenderTarget, diagnostic::DiagnosticsStore, platform::time::Instant, prelude::*,
+    camera::{RenderTarget, visibility::ViewVisibility},
+    diagnostic::DiagnosticsStore,
+    platform::time::Instant,
+    prelude::*,
 };
 use color_eyre::{Result, eyre::WrapErr};
 use serde::Deserialize;
@@ -793,6 +797,9 @@ fn run_portal_bench(
     portal_texture: Option<Res<PortalTexture>>,
     streaming: Option<Res<StreamingWorld>>,
     metrics: Option<Res<StreamingMetrics>>,
+    // Surfaces a view can see that the render world has not confirmed drawn: a door state is not
+    // quiet enough to time until they are drawn (design-1091 §4).
+    waiting: Query<&ViewVisibility, With<SwapWaiting>>,
     (mut open_door, mut exit, render_timings): (
         MessageWriter<OpenDoor>,
         MessageWriter<AppExit>,
@@ -837,6 +844,7 @@ fn run_portal_bench(
     let counts = settle_counts(
         Some(camera_cell(&active, &origin, camera.translation)),
         bench.quiet,
+        pending_drawn(&waiting),
         streaming.as_deref(),
         metrics.as_deref(),
     );

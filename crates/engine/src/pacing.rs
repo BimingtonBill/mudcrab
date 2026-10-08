@@ -19,9 +19,10 @@ use crate::{
     config::EngineConfig,
     profiling::ProfilingState,
     streaming::{ActiveSpace, RenderOrigin, StreamingMetrics, StreamingWorld, window_center},
+    swap_bridge::{SwapWaiting, pending_drawn},
     world::{cache::CellCache, components::CELL_SIZE, components::StreamingCamera},
 };
-use bevy::prelude::*;
+use bevy::{camera::visibility::ViewVisibility, prelude::*};
 use serde::Serialize;
 use std::time::Instant;
 
@@ -44,6 +45,13 @@ pub struct WorldReadyInputs {
     pub arming_queue_depth: usize,
     pub pending_asset_instances: usize,
     pub pending_surface_instances: usize,
+    /// Surfaces a view can see that the render world has not confirmed drawn (design-1091 §4): the
+    /// world is not ready while the ground it shows may be a stand-in or a hole.
+    pub pending_drawn: usize,
+    /// LOD queries submitted but not answered, and LOD chunks requested but not resident: work that
+    /// will still change the frame, so the world is not ready while either is nonzero.
+    pub pending_lod_queries: usize,
+    pub pending_lod_chunks: usize,
 }
 
 impl WorldReadyInputs {
@@ -58,10 +66,14 @@ impl WorldReadyInputs {
             && self.arming_queue_depth == 0
             && self.pending_asset_instances == 0
             && self.pending_surface_instances == 0
+            && self.pending_drawn == 0
+            && self.pending_lod_queries == 0
+            && self.pending_lod_chunks == 0
     }
 
     fn from_streaming(
         metrics: &StreamingMetrics,
+        pending_drawn: usize,
         window_cells: usize,
         resident_window_cells: usize,
         failed_window_cells: usize,
@@ -75,6 +87,9 @@ impl WorldReadyInputs {
             arming_queue_depth: metrics.arming_queue_depth,
             pending_asset_instances: metrics.pending_asset_instances,
             pending_surface_instances: metrics.pending_surface_instances,
+            pending_drawn,
+            pending_lod_queries: metrics.pending_lod_queries,
+            pending_lod_chunks: metrics.pending_lod_chunks,
         }
     }
 }
@@ -425,6 +440,9 @@ pub(crate) fn track_world_ready(
     metrics: Res<StreamingMetrics>,
     cache: Res<CellCache>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    // Surfaces a view can see that the render world has not confirmed drawn: "ready" means drawn,
+    // not validated (design-1091 §4).
+    waiting: Query<&ViewVisibility, With<SwapWaiting>>,
     mut tracker: ResMut<PacingTracker>,
     mut profiler: ResMut<ProfilingState>,
     // The window frame times are real wall-clock deltas. The virtual `Time` Bevy's schedules see is
@@ -439,7 +457,13 @@ pub(crate) fn track_world_ready(
     let center = window_center(&config, camera.translation, origin.0);
     let (window_cells, resident, failed) =
         streaming.window_residency(&space, config.worldspace_id, center, config.stream_radius);
-    let inputs = WorldReadyInputs::from_streaming(&metrics, window_cells, resident, failed);
+    let inputs = WorldReadyInputs::from_streaming(
+        &metrics,
+        pending_drawn(&waiting),
+        window_cells,
+        resident,
+        failed,
+    );
     let elapsed_millis = started.elapsed().as_secs_f64() * 1000.0;
     let ready = inputs.is_ready();
     // Frame-time windows are for benchmark runs; an ordinary session runs unbounded.
@@ -495,15 +519,44 @@ mod tests {
         assert!(ready_inputs().is_ready());
     }
 
+    /// "Ready" means drawn, not validated (design-1091 §4): a surface a view can see that the render
+    /// world has not confirmed drawn holds the mark, so the benchmark does not time a stand-in or a
+    /// hole - and, on its own, nothing else can be the reason.
+    #[test]
+    fn world_ready_waits_for_drawn() {
+        let drawn = ready_inputs();
+        assert!(drawn.is_ready());
+
+        let waiting = WorldReadyInputs {
+            pending_drawn: 1,
+            ..ready_inputs()
+        };
+        assert!(
+            !waiting.is_ready(),
+            "a visible surface the render world has not confirmed drawn holds the world-ready mark"
+        );
+        assert!(
+            WorldReadyInputs {
+                pending_drawn: 0,
+                ..waiting
+            }
+            .is_ready(),
+            "and once it is drawn the mark latches: nothing else about the view changed"
+        );
+    }
+
     #[test]
     fn each_condition_alone_holds_the_world_back() {
-        let holds_back: [fn(&mut WorldReadyInputs); 7] = [
+        let holds_back: [fn(&mut WorldReadyInputs); 10] = [
             |i| i.resident_window_cells = 24,
             |i| i.loading_cells = 1,
             |i| i.active_requests = 1,
             |i| i.arming_queue_depth = 1,
             |i| i.pending_asset_instances = 1,
             |i| i.pending_surface_instances = 1,
+            |i| i.pending_drawn = 1,
+            |i| i.pending_lod_queries = 1,
+            |i| i.pending_lod_chunks = 1,
             |i| i.window_cells = 0,
         ];
         for (index, hold) in holds_back.iter().enumerate() {
