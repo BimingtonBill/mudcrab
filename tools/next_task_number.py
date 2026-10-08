@@ -75,7 +75,7 @@ def locked(fn):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("track", choices=sorted(RANGES))
-    ap.add_argument("--label", default="")
+    ap.add_argument("--label", required=True, help="slug of the task the number is for")
     args = ap.parse_args()
 
     def claim() -> int:
