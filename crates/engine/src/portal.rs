@@ -6237,7 +6237,8 @@ mod tests {
         render::{RendererMetrics, TerrainMaterial, WaterMaterial, WaterReflectionTexture},
         streaming::{
             StreamingMetrics, StreamingPlugin, creation_rotation_to_bevy, creation_to_bevy,
-            render_position,
+            render_position, test_despawn_cells, test_init_despawn_resources,
+            test_plant_resident_cell, test_plant_retiring_cell, test_retiring_cells,
         },
         transition::{
             CrossDoor, OpenDoor, TransitionPlugin, arrival_frame, door_frame, door_is_open,
@@ -6256,6 +6257,8 @@ mod tests {
 
     const INTERIOR_ALFTAND01: u32 = 0x0001_52C3;
     const TAMRIEL: u32 = 60;
+    /// A worldspace the camera is not in: the one a flight leaves cells retiring in.
+    const OLD_WORLDSPACE: u32 = 61;
     /// An interior cell of the demo route that the test camera does not stand in: the pre-streamed
     /// cell the tests below give a role of its own.
     const PRESTREAMED_CELL: u32 = 0x0005_6C1B;
@@ -8714,6 +8717,20 @@ mod tests {
         app.add_systems(Update, prewarm_destination_view.before(isolate_cells));
     }
 
+    /// A heavy retiring exterior cell: its root carries a mesh and 200 empty children, so
+    /// despawning the subtree costs far more than the drain tests' 100 ns budget and the drain
+    /// takes exactly one cell a frame however fast the clock reads - the same trick
+    /// `streaming`'s own time-budget tests use. The cell is planted in the world table through
+    /// `streaming`'s test bridge, the map being private to that module.
+    fn spawn_retiring_heavy_cell(app: &mut App, key: CellKey, cell_id: u32) -> (Entity, Entity) {
+        let (root, mesh) = spawn_cell(app, cell_id, None, Some(key), None);
+        for _ in 0..200 {
+            app.world_mut().spawn((Transform::default(), ChildOf(root)));
+        }
+        test_plant_retiring_cell(app.world_mut(), key, root);
+        (root, mesh)
+    }
+
     #[test]
     fn the_prewarm_draws_the_destination_behind_the_prestream_wait() {
         let mut app = portal_app();
@@ -8835,6 +8852,156 @@ mod tests {
         spawn_windowed_door(&mut app, PRESTREAMED_CELL);
         app.update();
         assert!(app.world().resource::<PortalPrewarm>().settled());
+    }
+
+    /// A despawn drain holding retiring cells mid-flight must not hold the pre-warm's wait with
+    /// them: the wait is for the destination's load and its warm view, and the drain running
+    /// beside it is invisible to both - a retiring full cell still reads as resident
+    /// (`StreamingWorld::is_resident`), so the wait settles on the same frame a drain-free run
+    /// reaches ([`the_prewarm_draws_the_destination_behind_the_prestream_wait`]: frame one
+    /// classifies, frame two warms, frame three settles).
+    #[test]
+    fn the_prewarm_settles_on_the_same_frame_while_a_drain_holds_retiring_cells() {
+        let mut app = portal_app();
+        prewarm_app(&mut app, PRESTREAMED_CELL);
+        // The drain paces on the time budget alone, at one heavy cell a frame.
+        app.world_mut()
+            .resource_mut::<EngineConfig>()
+            .max_unload_ms_per_frame = 0.0001;
+        app.world_mut()
+            .resource_mut::<EngineConfig>()
+            .max_cell_unloads_per_frame = 0;
+        test_init_despawn_resources(app.world_mut());
+        app.insert_resource(StreamingWorld::default());
+        app.add_systems(Update, test_despawn_cells.before(isolate_cells));
+        // The destination the wait would otherwise hold for is already resident; what the drain
+        // holds are six far cells of another worldspace, retired by a flight away from them.
+        let destination_root = app.world_mut().spawn_empty().id();
+        test_plant_resident_cell(
+            app.world_mut(),
+            CellKey::Interior(PRESTREAMED_CELL),
+            destination_root,
+        );
+        for grid_x in 0..6 {
+            spawn_retiring_heavy_cell(
+                &mut app,
+                CellKey::Exterior {
+                    worldspace_id: OLD_WORLDSPACE,
+                    grid_x,
+                    grid_y: 0,
+                },
+                0x0007_0001,
+            );
+        }
+        spawn_prewarm_main_camera(&mut app, Vec3::new(0.0, 0.0, -400.0));
+        let camera = spawn_portal_camera(&mut app);
+        spawn_windowed_door(&mut app, PRESTREAMED_CELL);
+        let retired = |app: &App| test_retiring_cells(app.world());
+
+        app.update();
+        assert!(
+            app.world().resource::<PortalPrewarm>().settled(),
+            "the first frame only classifies the cell, drain or no drain"
+        );
+        assert_eq!(
+            retired(&app),
+            5,
+            "the drain ran beside it and took one cell"
+        );
+
+        app.update();
+        assert!(
+            !app.world().resource::<PortalPrewarm>().settled(),
+            "the warm view is running, exactly as in the drain-free run"
+        );
+        assert!(app.world().get::<Camera>(camera).unwrap().is_active);
+        assert_eq!(retired(&app), 4);
+
+        // The settled frame is the drain-free run's frame three, with the drain still mid-flight:
+        // a slower drain never holds the wait.
+        app.update();
+        assert!(app.world().resource::<PortalPrewarm>().settled());
+        assert!(!app.world().get::<Camera>(camera).unwrap().is_active);
+        assert_eq!(retired(&app), 3, "the drain is still mid-flight");
+    }
+
+    /// A retiring cell drains invisible (the reviews' drain-invisibility finding): the frames the
+    /// unload budget holds it, it is already off every camera and out of the ray casts.
+    /// [`isolate_cells`] stamps the role the cell has *now*, and a cell left behind by distance is
+    /// [`CellRole::Hidden`] the same frame it retires - a root that kept its layers or its
+    /// visibility for the drain would still be drawn.
+    #[test]
+    fn a_retiring_cell_drains_invisible_off_every_layer() {
+        let mut app = portal_app();
+        app.world_mut()
+            .resource_mut::<EngineConfig>()
+            .max_unload_ms_per_frame = 0.0001;
+        app.world_mut()
+            .resource_mut::<EngineConfig>()
+            .max_cell_unloads_per_frame = 0;
+        test_init_despawn_resources(app.world_mut());
+        app.insert_resource(StreamingWorld::default());
+        app.add_systems(Update, test_despawn_cells.before(isolate_cells));
+        spawn_camera(&mut app, Vec3::new(0.0, 0.0, -400.0));
+        // Three fillers ahead of the target in the drain's stable order, so the first budgeted
+        // frame spends itself on a filler and the target is still mid-drain a frame later.
+        for grid_x in 10..13 {
+            spawn_retiring_heavy_cell(
+                &mut app,
+                CellKey::Exterior {
+                    worldspace_id: OLD_WORLDSPACE,
+                    grid_x,
+                    grid_y: 0,
+                },
+                0x0007_0010,
+            );
+        }
+        // The target: an old-worldspace root the drain holds. Its mesh starts on the main camera's
+        // layers, so a run that failed to take the retiring cell off them would leave it drawn -
+        // the failure this test exists to catch.
+        let target_key = CellKey::Exterior {
+            worldspace_id: OLD_WORLDSPACE,
+            grid_x: 10,
+            grid_y: 100,
+        };
+        let (root, mesh) = spawn_cell(
+            &mut app,
+            0x0007_0020,
+            None,
+            Some(target_key),
+            Some(RenderLayers::from_layers(&MAIN_CAMERA_LAYERS)),
+        );
+        for _ in 0..200 {
+            app.world_mut().spawn((Transform::default(), ChildOf(root)));
+        }
+        test_plant_retiring_cell(app.world_mut(), target_key, root);
+
+        app.update();
+
+        assert!(
+            app.world().get_entity(root).is_ok(),
+            "held mid-drain: the budget has not reached it yet"
+        );
+        assert_eq!(
+            test_retiring_cells(app.world()),
+            3,
+            "the drain ran and spent one filler"
+        );
+        assert_eq!(
+            app.world().get::<CellRoleStamp>(root).map(|stamp| stamp.0),
+            Some(CellRole::Hidden),
+            "stamped the role the cell has now: hidden"
+        );
+        assert_eq!(
+            layers_of(&app, mesh),
+            RenderLayers::none(),
+            "propagated off every camera while it drains"
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(root),
+            Some(&Visibility::Hidden),
+            "and out of the ray casts too, as a hidden cell is"
+        );
     }
 
     /// The pre-warm is observable in the cell itself (impl-286): while the warm view runs, the
