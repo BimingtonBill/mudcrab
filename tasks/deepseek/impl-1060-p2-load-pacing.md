@@ -46,3 +46,6 @@ This is a concurrency cap on load starts, so be precise. Is any work skipped, hi
 - Leave these for the lead (do not do them):
   - the A/B that picks the default. On a quiet PC, use impl-285's render-cycles.csv; the worst PreUpdate sample must fall on the crossing run, and the roaming run must show no pop-in regression. Mind the known join offset: cycle n matches frame-series row n-1.
   - two follow-ups to record with numbers: a chunked drain in vendored bevy_asset (deferred), and converter consolidation (fewer assets per cell).
+
+# Note added 2026-10-08 (Team Lead)
+Which work owns the PreUpdate worst is UNPROVEN: bevy_asset's load-finalize drain, or the handle-drop cascade after the crossing's despawn (analysis-1074 §3.6). impl-1077 adds spans that split the two, and they are read in the same timing window as this brief's A/B. The handoff for 1060 must carry this caveat. Its speed claim stands only if `assets/load_finalize` is the PreUpdate owner.
