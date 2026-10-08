@@ -7,6 +7,7 @@ use crate::{
         TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
     snow::{DirectionalSnow, DirectionalSnowCatalog, SnowMaterial, SnowMaterialCache},
+    swap_bridge::{SwapDrawn, SwapSurface, SwapWaiting},
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
@@ -223,6 +224,18 @@ impl Plugin for StreamingPlugin {
             app.add_systems(
                 Update,
                 crate::pacing::track_world_ready.after(validate_streaming_lifecycle),
+            );
+        }
+        // The hole-risk gauge walks every terrain patch, so it exists only for a run that profiles:
+        // it is measurement data for the bundle, like the frame series.
+        if app
+            .world()
+            .get_resource::<crate::config::EngineConfig>()
+            .is_some_and(|config| config.profile_output_dir.is_some())
+        {
+            app.add_systems(
+                Update,
+                record_terrain_swap_gauge.after(track_surface_readiness),
             );
         }
     }
@@ -2546,6 +2559,18 @@ fn spawn_cell(
                     },
                     extension,
                 });
+                // The quadrant declares what its draw needs, for the render→main swap bridge
+                // (`crate::swap_bridge`): the material it draws with and every image that material
+                // binds. The images are the ones the readiness pass validates below, and the
+                // declaration is re-made there if a normal map has to be dropped.
+                let surface = SwapSurface::new(
+                    material.id().untyped(),
+                    images
+                        .color
+                        .iter()
+                        .chain(images.normal.iter())
+                        .map(|handle| handle.id()),
+                );
                 let mut patch = parent.spawn((
                     Name::new(format!("Terrain quadrant {quadrant}")),
                     Mesh3d(meshes.add(mesh)),
@@ -2559,6 +2584,10 @@ fn spawn_cell(
                         images: images.color,
                         normals: images.normal,
                     },
+                    // Waiting for the render world from birth: the quadrant stays hidden (and its
+                    // grid's LOD tile stays drawn) until the bridge confirms it is drawable.
+                    SwapWaiting,
+                    surface,
                 ));
                 if let Some(grid) = terrain_grid {
                     patch.insert(TerrainCoverage {
@@ -3663,6 +3692,16 @@ fn track_surface_readiness(
                         {
                             material.extension.drop_normal_maps();
                         }
+                        // The swap bridge waits on the images the material binds, so the failed
+                        // normal maps leave the quadrant's declaration with them: an image that
+                        // will never reach the render world is one the surface could never stop
+                        // waiting for, and from slice C4 that would fail a settle loudly.
+                        let bound: Vec<_> =
+                            pending.images.iter().map(|handle| handle.id()).collect();
+                        commands
+                            .entity(entity)
+                            .entry::<SwapSurface>()
+                            .and_modify(move |mut surface| surface.set_images(bound));
                         profiler.increment("terrain/normal_map_fallbacks", 1);
                         normals_dropped = true;
                         SurfaceDependencyState::Ready
@@ -3763,6 +3802,33 @@ fn track_surface_readiness(
         "assets/pending_surface_instances",
         metrics.pending_surface_instances as f64,
     );
+}
+
+/// The hole-risk gauge (design-1091 C5): how many terrain quadrants this world has validated
+/// (`TerrainSurfaceReady`) but the render world has not confirmed drawn (`SwapDrawn`).
+///
+/// This is the number the LOD-hide rule runs ahead of the GPU by. `lod::update_terrain_lod_visibility`
+/// hides a grid's tile the moment its quadrants are surface-ready, and that flag says the textures
+/// are in `Assets<Image>` - nothing about the mesh, the material's bind group or the pipeline.
+///
+/// Read it as an upper bound, not as a leak: a quadrant no view can see is never confirmed drawn,
+/// so an ordinary frame counts every patch behind the camera as well. What it measures is how the
+/// gap moves - when the camera turns, when a cell arrives, when a chunk lands - which is what the
+/// per-frame series column is for.
+///
+/// It walks every terrain patch, so it is installed only for a run that profiles.
+fn record_terrain_swap_gauge(
+    ready: Query<
+        (),
+        (
+            With<TerrainPatch>,
+            With<TerrainSurfaceReady>,
+            Without<SwapDrawn>,
+        ),
+    >,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    profiler.set_gauge("swap/terrain_ready_not_drawn", ready.iter().count() as f64);
 }
 
 enum SurfaceDependencyState {

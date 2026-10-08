@@ -134,14 +134,20 @@ fn graph_lap_value(sides: &CycleSides, column: &str) -> Option<String> {
     }
 }
 
-/// The spans the per-frame series keeps a column for, in the order `frame-series.csv` writes them:
+/// The names the per-frame series keeps a column for, in the order `frame-series.csv` writes them:
 /// the systems that run in every frame after a door crossing (see the analysis in
 /// `local/agents/runs/analysis-642-post-exit-burst-spans.1/report.md`), which is the burst the
-/// 160 fps goal is measured against.
+/// 160 fps goal is measured against, and the swap bridge's gauges (`crate::swap_bridge`,
+/// `streaming::record_terrain_swap_gauge`), which are counts rather than durations.
+///
+/// A span column is the frame's total for that span (`record_ms` adds up, so a span recorded more
+/// than once in a frame totals); a gauge column is the frame's last value for that gauge
+/// (`set_gauge` assigns). Both land in the same row, which is what makes a gauge readable frame by
+/// frame instead of as one final number.
 ///
 /// A name here that no system records yet — the portal's five, on a branch where portal.rs does not
 /// span them — still gets its column, and the column stays zero.
-const FRAME_SERIES_COLUMNS: [&str; 11] = [
+const FRAME_SERIES_COLUMNS: [&str; 15] = [
     "portal/isolate",
     "portal/colliders",
     "portal/update",
@@ -153,6 +159,10 @@ const FRAME_SERIES_COLUMNS: [&str; 11] = [
     "scene/spawn_batch",
     "lights/budget",
     "physics/step",
+    "swap/waiting",
+    "swap/prepared_not_drawn",
+    "swap/drawn_this_frame",
+    "swap/terrain_ready_not_drawn",
 ];
 
 /// One column per [`FRAME_SERIES_COLUMNS`] entry, so the two cannot drift apart.
@@ -431,8 +441,22 @@ impl ProfilingState {
         *counter = counter.saturating_add(amount);
     }
 
+    /// Records a gauge: its latest value for the report, and, for a name with a column in the
+    /// per-frame series, the frame's value for that column as well.
+    ///
+    /// A gauge is a count or a level, not a duration, so a column takes the frame's *last* value for
+    /// it (a span column adds up instead): the series shows how `swap/waiting` or
+    /// `swap/terrain_ready_not_drawn` moves frame by frame, which is the whole point of recording
+    /// it. The gauge itself stays in `gauges`, where the report reads the run's final value.
     pub fn set_gauge(&mut self, name: impl Into<String>, value: f64) {
-        self.gauges.insert(name.into(), value);
+        let name = name.into();
+        if let Some(row) = self.frame_series.back_mut()
+            && let Some(column) = frame_series_column(&name)
+            && value.is_finite()
+        {
+            row.spans[column] = value as f32;
+        }
+        self.gauges.insert(name, value);
     }
 
     pub fn event(
@@ -2186,8 +2210,9 @@ mod tests {
     }
 
     /// The CSV names every column and writes each row's values under them; a frame that recorded a
-    /// span more than once totals it, and the run's last row has no duration because no later frame
-    /// closed it.
+    /// span more than once totals it, a frame's gauge column is that frame's last value (an earlier
+    /// value of the same frame is replaced, a later gauge only lands in its own frame), and the
+    /// run's last row has no duration because no later frame closed it.
     #[test]
     fn the_frame_series_csv_names_every_column() {
         let diagnostics = DiagnosticsStore::default();
@@ -2205,7 +2230,8 @@ mod tests {
             lines.next().unwrap(),
             "frame,real_ms,portal/isolate,portal/colliders,portal/update,portal/floor_probe,\
 portal/propagate,streaming/plan_cells,streaming/frame_commit,lod/collect,scene/spawn_batch,\
-lights/budget,physics/step"
+lights/budget,physics/step,swap/waiting,swap/prepared_not_drawn,swap/drawn_this_frame,\
+swap/terrain_ready_not_drawn"
         );
         let column = |name: &str| frame_series_column(name).unwrap() + 2;
         let first: Vec<&str> = lines.next().unwrap().split(',').collect();
@@ -2217,11 +2243,44 @@ lights/budget,physics/step"
         );
         assert_eq!(first[column("lights/budget")], "0.2500");
         assert_eq!(first[column("physics/step")], "1.5000");
+        assert_eq!(
+            first[column("swap/waiting")],
+            "0.0000",
+            "a gauge no system set in a frame leaves its column at zero"
+        );
         let second: Vec<&str> = lines.next().unwrap().split(',').collect();
         assert_eq!(second[0], "1");
         assert_eq!(second[column("physics/step")], "0.5000");
         assert_eq!(second[1], "");
         assert!(lines.next().is_none());
+    }
+
+    /// A gauge with a column in the series lands in the frame that recorded it, and a gauge set
+    /// twice in one frame keeps the last value: a level, not a total, unlike a span.
+    #[test]
+    fn a_gauge_column_records_the_frames_value() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        profiler.begin_frame(16.0);
+        profiler.set_gauge("swap/waiting", 41.0);
+        profiler.set_gauge("swap/waiting", 38.0);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        profiler.begin_frame(16.0);
+        profiler.set_gauge("swap/waiting", 12.0);
+        profiler.sample_frame(&diagnostics, None, true, true);
+
+        let rows: Vec<FrameSpans> = profiler.frame_series.iter().copied().collect();
+        let column = frame_series_column("swap/waiting").expect("the series follows the gauge");
+        assert_eq!(
+            rows[0].spans[column], 38.0,
+            "the frame's last value, not a sum"
+        );
+        assert_eq!(rows[1].spans[column], 12.0);
+        assert_eq!(
+            profiler.gauges.get("swap/waiting").copied(),
+            Some(12.0),
+            "the report still reads the run's latest value"
+        );
     }
 
     /// The series is bounded: past the cap the oldest rows go, so a long run cannot grow it without
