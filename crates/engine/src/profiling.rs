@@ -5,11 +5,11 @@ use crate::{
     render_timing::{
         self, CLEANUP, CycleSides, EXTRACT, EXTRACT_COMMANDS_AND_ASSETS, GRAPH_AND_PRESENT,
         GRAPH_CAMERA_DRIVER, GRAPH_CAMERA_VIEWS, GRAPH_DRIVER_OVERHEAD, GRAPH_EARLY_POST_PROCESS,
-        GRAPH_MAIN_PASS, GRAPH_POST_PROCESS, GRAPH_PREPASS, GRAPH_REMAINDER,
+        GRAPH_GPU_PREPROCESS, GRAPH_MAIN_PASS, GRAPH_POST_PROCESS, GRAPH_PREPASS, GRAPH_REMAINDER,
         GRAPH_RENDER_SET_OTHER, GRAPH_SHADOW_PASSES, GRAPH_SHADOW_VIEW_COUNT, GRAPH_SHADOW_VIEWS,
-        GRAPH_SUBMIT, GRAPH_VIEW_COUNT, GRAPH_VIEWS, GRAPH_VIEWS_REMAINDER, MAIN_WORLD, PREPARE,
-        QUEUE, REAL_MS, REMAINDER, RENDER_THREAD, SPECIALIZE_AND_VIEWS, SWAPCHAIN_ACQUIRE,
-        WAIT_FOR_RENDER_THREAD, WALL_CYCLE_MS,
+        GRAPH_SUBMIT, GRAPH_UPSCALING, GRAPH_VIEW_COUNT, GRAPH_VIEWS, GRAPH_VIEWS_REMAINDER,
+        MAIN_WORLD, PREPARE, QUEUE, REAL_MS, REMAINDER, RENDER_THREAD, SPECIALIZE_AND_VIEWS,
+        SWAPCHAIN_ACQUIRE, WAIT_FOR_RENDER_THREAD, WALL_CYCLE_MS,
     },
     streaming::StreamingMetrics,
 };
@@ -101,12 +101,15 @@ const RENDER_CYCLE_PHASES: [&str; 7] = [
 /// window's file gave them: [`GRAPH_SHADOW_PASSES`], the sun shadow-pass windows of the cycle's
 /// camera runs, which the prepass and main-pass columns above are exclusive of (`render_timing`).
 ///
-/// impl-1107's three close the list, so the thirteen above keep the positions the earlier windows'
+/// impl-1107's five close the list, so the thirteen above keep the positions the earlier windows'
 /// files gave them: the `Render` set one level in — [`GRAPH_CAMERA_DRIVER`], the whole
 /// `camera_driver` system; [`GRAPH_RENDER_SET_OTHER`], the views lap less the driver, never
 /// negative; and [`GRAPH_DRIVER_OVERHEAD`], the driver's lap less the two view-kind sums, never
-/// negative (`render_timing`).
-const RENDER_CYCLE_GRAPH_LAPS: [&str; 16] = [
+/// negative — and, at the two levels inside a view run that used to feed that overhead,
+/// [`GRAPH_GPU_PREPROCESS`] (the camera runs' early GPU-preprocessing head windows, out of the
+/// prepass sum) and [`GRAPH_UPSCALING`] (the upscaling window, a subset of
+/// [`GRAPH_POST_PROCESS`]) (`render_timing`).
+const RENDER_CYCLE_GRAPH_LAPS: [&str; 18] = [
     GRAPH_VIEWS,
     GRAPH_VIEW_COUNT,
     GRAPH_PREPASS,
@@ -123,6 +126,8 @@ const RENDER_CYCLE_GRAPH_LAPS: [&str; 16] = [
     GRAPH_CAMERA_DRIVER,
     GRAPH_RENDER_SET_OTHER,
     GRAPH_DRIVER_OVERHEAD,
+    GRAPH_GPU_PREPROCESS,
+    GRAPH_UPSCALING,
 ];
 
 /// The value one graph-lap column writes for a cycle's record, or `None` for an empty column (the
@@ -149,6 +154,8 @@ fn graph_lap_value(sides: &CycleSides, column: &str) -> Option<String> {
         GRAPH_CAMERA_DRIVER => ms(sides.graph_camera_driver_ms),
         GRAPH_RENDER_SET_OTHER => ms(sides.graph_render_set_other_ms),
         GRAPH_DRIVER_OVERHEAD => ms(sides.graph_driver_overhead_ms),
+        GRAPH_GPU_PREPROCESS => ms(sides.graph_gpu_preprocess_ms),
+        GRAPH_UPSCALING => ms(sides.graph_upscaling_ms),
         _ => None,
     }
 }
@@ -768,10 +775,13 @@ impl ProfilingState {
     /// `render/graph/shadow_views` and `render/graph/camera_views` with the shadow view count —
     /// with `render/graph/views_remainder` closing that split, and `render/graph/shadow_passes`
     /// after it: the camera runs' sun shadow-pass windows, which the prepass and main-pass columns
-    /// are exclusive of, so the stages and this column add up to the camera runs. The three columns
-    /// impl-1107 appended close the list, closing the level above: `render/graph/camera_driver`,
+    /// are exclusive of, so the stages and this column add up to the camera runs. The five columns
+    /// impl-1107 appended close the list, closing the two levels above: `render/graph/camera_driver`,
     /// the whole driver's lap, `render/graph/render_set_other`, the views lap less the driver, and
-    /// `render/graph/driver_overhead`, the driver's lap less the two view-kind sums. The parts and
+    /// `render/graph/driver_overhead`, the driver's lap less the two view-kind sums; then the two
+    /// windows of a run that used to feed that overhead, `render/graph/gpu_preprocess` (the camera
+    /// runs' early GPU-preprocessing head windows, out of the prepass sum) and
+    /// `render/graph/upscaling` (the upscaling window, inside the post-process sum). The parts and
     /// their remainder add up (`render/graph_and_present`, and one level in `render/graph/views`
     /// and one more in `render/graph/camera_driver`; see `render_timing`). A
     /// side the cycle did not measure stays an empty column, and the run's last cycle or two are
@@ -2407,8 +2417,9 @@ lights/budget,physics/step"
     /// under them; a side the cycle did not measure stays an empty column, and the counts are
     /// written as whole numbers rather than milliseconds. The seven graph columns the 2026-10-08
     /// window was read from keep their positions; impl-1088's five follow them, impl-1093's one
-    /// (the sun shadow passes of the camera runs) follows those, and impl-1107's three (the
-    /// `camera_driver` lap and the two parts closed against it) close the list.
+    /// (the sun shadow passes of the camera runs) follows those, and impl-1107's five (the
+    /// `camera_driver` lap, the two parts closed against it and the run's head and tail windows)
+    /// close the list.
     #[test]
     fn the_render_cycles_csv_names_every_column() {
         let mut profiler = ProfilingState::default();
@@ -2437,6 +2448,8 @@ lights/budget,physics/step"
                 graph_camera_driver_ms: Some(3.6),
                 graph_render_set_other_ms: Some(0.4),
                 graph_driver_overhead_ms: Some(0.0),
+                graph_gpu_preprocess_ms: Some(0.9),
+                graph_upscaling_ms: Some(0.3),
                 ..Default::default()
             },
         )]);
@@ -2451,7 +2464,8 @@ lights/budget,physics/step"
             render/graph/post_process,render/graph/submit,render/graph/remainder,\
             render/graph/shadow_views,render/graph/shadow_view_count,render/graph/camera_views,\
             render/graph/early_post_process,render/graph/views_remainder,render/graph/shadow_passes,\
-            render/graph/camera_driver,render/graph/render_set_other,render/graph/driver_overhead"
+            render/graph/camera_driver,render/graph/render_set_other,render/graph/driver_overhead,\
+            render/graph/gpu_preprocess,render/graph/upscaling"
         );
         let row: Vec<&str> = lines.next().unwrap().split(',').collect();
         assert_eq!(
@@ -2525,6 +2539,11 @@ lights/budget,physics/step"
             row[30], "0.0000",
             "a measured zero is written, not left empty"
         );
+        assert_eq!(
+            row[31], "0.9000",
+            "the camera runs' GPU-preprocessing head windows follow"
+        );
+        assert_eq!(row[32], "0.3000", "the upscaling window closes the row");
         assert!(lines.next().is_none());
     }
 
@@ -2551,6 +2570,8 @@ lights/budget,physics/step"
             graph_camera_driver_ms: Some(13.0),
             graph_render_set_other_ms: Some(14.0),
             graph_driver_overhead_ms: Some(15.0),
+            graph_gpu_preprocess_ms: Some(16.0),
+            graph_upscaling_ms: Some(17.0),
             ..Default::default()
         };
         for column in RENDER_CYCLE_GRAPH_LAPS {
