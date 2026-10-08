@@ -93,6 +93,9 @@ this duty; see "Team Lead".)
   inside one shell command or from a detached script the panel cannot see. Claude helpers go through the Agent
   tool (background). A worker already running outside the panel gets a background watcher (a Bash loop waiting on
   its PID that prints the report head when it ends).
+- **Task numbers (2026-10-08, after four clashes in one day).** Take every new task/worker number from
+  `python tools/next_task_number.py <lead|p1|p2|portal|p3|p4|p5> --label <slug>`: it skips every number already used in
+  tasks/ or local/agents and records the claim machine-wide under a lock, so two sessions never get the same one.
 - **Batch reviews (the user, 2026-10-08).** Several merges or items needing review get about two reviewers in
   all (e.g. one GLM, one Muse), each covering every item with one verdict section per item, not one worker per item.
 
