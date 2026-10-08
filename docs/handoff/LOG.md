@@ -24,6 +24,24 @@ Later the same session (the user's answers):
 - Cleaned up with the user's yes: stray worktree C:/d/Mudcrab/worktrees/p2-failed-cell-retry
   (branch kept, already in portal; its port brief copied to local/handover/impl-1057-port-brief.md)
   and the stash "impl-1057 conflicted 3-way apply" (patch also in Hermes's cache).
+- impl-1060 design review (review-1062, GLM full): fix first. The brief counted cells in flight,
+  but an interior destination is one cell, so the cap could never bind. The user chose
+  re-scope then build: counts per issued load, 0 = off. Phase 2 Dev re-briefed it as
+  tasks/deepseek/impl-1060-p2-load-pacing.md (388026bc).
+- Merge reviews done (GLM review-1068 for all 5; Muse review-1063..1066 + 1069):
+  impl-1057 accept (the user: keep 3 attempts for interiors too, fix the stale comments; Phase 2 Dev);
+  impl-1058 accept; impl-190 fix first (far plane, doorway fog, atmosphere plugin install on a
+  worldspace switch, plus the missing switch test); impl-285 doc join key off by one (Muse);
+  impl-286 Muse's "camera left active" judged a false positive by Team Lead (update_portal sets
+  is_active every frame first), to be confirmed by a test; the warm gate vs landing-cell mismatch
+  is real. Portal Dev is fixing 190/285/286 (impl-196, 1072, 1073).
+- New standing rules (AGENTS.md bbfc2957): every worker shows in the background tasks panel;
+  batch reviews get about two reviewers in all.
+- **C: filled to 0 GB at ~11:55.** Cause: ds_impl coder worktrees under local/impl each seed a
+  full ~20 GB copy of target/ (124 GB in all). With the user's yes, Team Lead deleted target/ in
+  impl-1060, impl-1072 and impl-1073 (source kept), which freed C: to 85 GB. Interim rule: at most
+  2 seeded coder worktrees on C: at once across all sessions, -NoSeed beyond that; delete
+  target/ once acceptance passes. Real fix pending: ds_impl putting coder targets on D:.
 
 ## 2026-10-08 Phase 2 Dev, Hermes (impl-1059 + impl-1060 briefs: the two ranked crossing fixes)
 
