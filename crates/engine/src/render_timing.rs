@@ -60,14 +60,49 @@
 //!   `n - 1` — the frame whose window the cycle is — not the row with the same number, which would
 //!   place every crossing spike one frame late. The two files' `real_ms` columns confirm that join:
 //!   both are the `Time<Real>` delta the `First` that closed the window read.
+//!
+//! * `render/graph/*`: the laps inside `render/graph_and_present`, the phase's own decomposition
+//!   (8.85 ms p50 in the 2026-10-08 portal-heavy re-profile, with only 0.94 ms measured inside it;
+//!   `local/research/portal-heavy-render-thread-2026-10-08.md` §4 R2). Bevy 0.19.0 runs the render
+//!   graph as *schedules*: the root `RenderGraph` schedule, run by `render_system`
+//!   (`bevy_render-0.19.0` `src/renderer/mod.rs:69`), runs every camera's and auxiliary view's
+//!   graph schedule in its `Render` set — Bevy's `camera_driver`, which loops over the views and
+//!   runs each one's schedule (`bevy_core_pipeline-0.19.0` `src/schedule.rs:133`, `:200`) — and
+//!   submits the graph's command buffers in its `Submit` set (`:228`). A 3D view's schedule is
+//!   `Core3d`, whose `Prepass`, `MainPass`, `EarlyPostProcess` and `PostProcess` sets hold the GPU
+//!   binning, the mesh unpacking and the indirect-draw building, the shadow and depth prepasses, the
+//!   main opaque and transparent passes and the post-processing
+//!   (`bevy_core_pipeline-0.19.0` `src/core_3d/mod.rs:145`). The *laps* are ours, the boundaries are
+//!   Bevy's sets: they are ordinary systems added to those schedules and ordered between the sets,
+//!   so no Bevy code is forked or patched. (The gap between the root `Render` and `Submit` sets also
+//!   holds Bevy's diagnostics-encoder resolve when `RenderDiagnosticsPlugin` is added — the engine
+//!   always adds it — so the views lap can carry that few microseconds.) Per cycle the record keeps
+//!   `render/graph/views` (the root
+//!   `Render` set: every view's schedule, the part of the phase that scales with views),
+//!   `render/graph/view_count` (how many view schedules the cycle ran — a count, not a duration),
+//!   the sums over those views of `render/graph/prepass`, `render/graph/main_pass` and
+//!   `render/graph/post_process`, `render/graph/submit` (the graph command buffers' `queue.submit`
+//!   and the uncovered-window clear) and `render/graph/remainder`, which closes the phase:
+//!   everything the laps do not own — the schedule's own `Begin`/`Finish` sets and overhead, and,
+//!   after the schedule, the screenshot and readback submit, the `queue.submit` of their encoder and
+//!   `present` on each window (`bevy_render-0.19.0` `src/renderer/mod.rs:78-110`). Two parts are
+//!   reported as not split rather than guessed: `present` cannot be separated from that remainder
+//!   without patching Bevy or building it with its `trace` feature, and the GPU-driven preprocessing
+//!   has no set of its own inside `Prepass`, so it is inside `render/graph/prepass`. A view that
+//!   runs a graph schedule other than `Core3d` is counted in `views` but not in the per-view laps.
 
 use bevy::{
     app::{First, Last},
+    core_pipeline::{Core3d, Core3dSystems},
+    ecs::schedule::Schedules,
     platform::time::Instant,
     prelude::*,
     render::{
-        Render, RenderApp, RenderSystems, pipelined_rendering::RenderExtractApp,
-        render_resource::PipelineCache, view::prepare_windows,
+        Render, RenderApp, RenderSystems,
+        pipelined_rendering::RenderExtractApp,
+        render_resource::PipelineCache,
+        renderer::{RenderGraph, RenderGraphSystems},
+        view::prepare_windows,
     },
     time::TimeSystems,
 };
@@ -104,6 +139,33 @@ pub const QUEUE: &str = "render/queue";
 pub const PREPARE: &str = "render/prepare";
 pub const GRAPH_AND_PRESENT: &str = "render/graph_and_present";
 pub const CLEANUP: &str = "render/cleanup";
+
+/// The laps inside `render/graph_and_present`, as span names and `render-cycles.csv` column names
+/// (see the module doc). Every one is a wall lap on the render thread, taken at a boundary of the
+/// render graph's own schedules, and summed into the cycle's record:
+///
+/// * [`GRAPH_VIEWS`]: the root graph schedule's `Render` set — Bevy's `camera_driver`, which runs
+///   every camera's and auxiliary view's graph schedule. The part of the phase that scales with
+///   views.
+/// * [`GRAPH_VIEW_COUNT`] with [`GRAPH_PREPASS`], [`GRAPH_MAIN_PASS`] and [`GRAPH_POST_PROCESS`]:
+///   how many view schedules (`Core3d` runs) the cycle ran, and the sums over them of the
+///   schedule's prepass, main-pass and post-process stages. The GPU-driven binning and
+///   indirect-draw building run inside the `Prepass` set, so their time is in `GRAPH_PREPASS`.
+/// * [`GRAPH_SUBMIT`]: the root graph schedule's `Submit` set, where the graph's command buffers go
+///   to the queue.
+/// * [`GRAPH_REMAINDER`]: `render/graph_and_present` less the laps above — the schedule's own
+///   overhead and, after it, the screenshot and readback submit, the second `queue.submit` and
+///   `present` on each window. Present is not isolable without patching Bevy, so the remainder
+///   carries it (see the module doc).
+pub const GRAPH_VIEWS: &str = "render/graph/views";
+/// How many view schedules the cycle's per-view sums cover. The one column that is a count rather
+/// than milliseconds.
+pub const GRAPH_VIEW_COUNT: &str = "render/graph/view_count";
+pub const GRAPH_PREPASS: &str = "render/graph/prepass";
+pub const GRAPH_MAIN_PASS: &str = "render/graph/main_pass";
+pub const GRAPH_POST_PROCESS: &str = "render/graph/post_process";
+pub const GRAPH_SUBMIT: &str = "render/graph/submit";
+pub const GRAPH_REMAINDER: &str = "render/graph/remainder";
 
 /// Measures the render side of each frame; shared by the main world, the render world and the
 /// extract wrappers.
@@ -192,6 +254,50 @@ fn add_render_marks(render_app: &mut SubApp, samples_pipelines: bool) {
                 .after(prepare_windows),
         ),
     );
+    add_graph_marks(render_app);
+}
+
+/// The laps inside `render/graph_and_present` (see the module doc and [`GRAPH_VIEWS`]). Bevy 0.19
+/// runs the render graph as schedules, so the boundaries are its own sets — the root schedule's
+/// `Render` and `Submit` sets, and `Core3d`'s stage sets — and ours are the systems ordered
+/// between them, run once per render frame and once per view. Nothing in Bevy is forked or
+/// patched, and every system is gated on cycle tracking, so a run that keeps no cycles pays one
+/// atomic load per boundary and no lock.
+///
+/// The root hooks are added through the `RenderGraph` schedule itself; the `Core3d` hooks only
+/// when that schedule exists (it is registered by `Core3dPlugin`, which a 2D-only or headless app
+/// does not add), so a view that runs another graph schedule is measured by the root
+/// `render/graph/views` lap alone.
+fn add_graph_marks(render_app: &mut SubApp) {
+    render_app.add_systems(
+        RenderGraph,
+        (
+            start_graph_frame.in_set(RenderGraphSystems::Begin),
+            lap_graph_views
+                .after(RenderGraphSystems::Render)
+                .before(RenderGraphSystems::Submit),
+            lap_graph_submit
+                .after(RenderGraphSystems::Submit)
+                .before(RenderGraphSystems::Finish),
+        )
+            .run_if(tracks_cycles),
+    );
+    if render_app.world().resource::<Schedules>().contains(Core3d) {
+        render_app.add_systems(
+            Core3d,
+            (
+                start_view.before(Core3dSystems::Prepass),
+                lap_view_prepass
+                    .after(Core3dSystems::Prepass)
+                    .before(Core3dSystems::MainPass),
+                lap_view_main_pass
+                    .after(Core3dSystems::MainPass)
+                    .before(Core3dSystems::EarlyPostProcess),
+                lap_view_post_process.after(Core3dSystems::PostProcess),
+            )
+                .run_if(tracks_cycles),
+        );
+    }
 }
 
 /// The shared clock: a handle cloned into both worlds and the extract wrappers.
@@ -201,6 +307,11 @@ pub struct RenderTimings(Arc<Shared>);
 #[derive(Default)]
 struct Shared {
     recording: AtomicBool,
+    /// Whether the per-cycle records are kept (a benchmark run). The same flag as before every
+    /// per-cycle hook would lock the state for, readable — and checkable as a system's run
+    /// condition — without the lock, so the per-view laps cost one atomic load when a run keeps no
+    /// cycles.
+    track_cycles: AtomicBool,
     state: Mutex<State>,
 }
 
@@ -219,8 +330,13 @@ struct State {
     /// Pipeline counts for the render frame in progress, set just before it ends.
     pipelines: Option<PipelineFrame>,
     frames: Vec<RenderFrame>,
-    /// Whether the cycle records below are kept (a benchmark run only).
-    track_cycles: bool,
+    /// The mark the root render graph schedule's `Begin` set opened, closed by the lap after its
+    /// `Render` set and re-armed for the `Submit` lap ([`GRAPH_VIEWS`], [`GRAPH_SUBMIT`]).
+    graph_mark: Option<Instant>,
+    /// The mark a view's graph schedule opened, re-armed at each of its stage boundaries, so the
+    /// per-view stage laps ([`GRAPH_PREPASS`], [`GRAPH_MAIN_PASS`], [`GRAPH_POST_PROCESS`]) tile
+    /// the view.
+    view_mark: Option<Instant>,
     /// Whether rendering is pipelined (the render world runs on its own thread).
     pipelined: bool,
     /// The main frame in progress, counted from one.
@@ -282,6 +398,29 @@ pub struct CycleSides {
     pub prepare_ms: Option<f64>,
     pub graph_and_present_ms: Option<f64>,
     pub cleanup_ms: Option<f64>,
+    /// The laps inside `graph_and_present_ms`, each summed over the render frame's views where it
+    /// is a per-view lap (see [`GRAPH_VIEWS`] and the module doc):
+    ///
+    /// * `graph_views_ms`: the render graph's view schedules (the root `Render` set, Bevy's
+    ///   `camera_driver`).
+    /// * `graph_view_count`: how many view schedules the per-view sums below cover. A count, not a
+    ///   duration; zeros and millisecond fields share this record, so the count column is written
+    ///   as an integer.
+    /// * `graph_prepass_ms`, `graph_main_pass_ms`, `graph_post_process_ms`: the sums over those
+    ///   views of the `Core3d` schedule's prepass, main-pass and post-process stages (the
+    ///   post-process sum covers `EarlyPostProcess` and `PostProcess`).
+    /// * `graph_submit_ms`: the graph's `queue.submit` (the root `Submit` set) and the
+    ///   uncovered-window clear.
+    /// * `graph_remainder_ms`: `graph_and_present_ms` less `graph_views_ms` and `graph_submit_ms`,
+    ///   never negative: the schedule's own overhead and the region after it, which carries the
+    ///   screenshot/readback submit, the second `queue.submit` and `present` on each window.
+    pub graph_views_ms: Option<f64>,
+    pub graph_view_count: Option<u32>,
+    pub graph_prepass_ms: Option<f64>,
+    pub graph_main_pass_ms: Option<f64>,
+    pub graph_post_process_ms: Option<f64>,
+    pub graph_submit_ms: Option<f64>,
+    pub graph_remainder_ms: Option<f64>,
 }
 
 /// Pipelines (render and compute) in one render frame. Bevy's `PipelineCache` holds both, so these
@@ -399,9 +538,15 @@ impl RenderTimings {
     /// Keeps a [`CycleSides`] record per main-thread frame from now on (`track`), and says whether
     /// rendering is pipelined, which decides which cycle a render frame is filed under.
     pub fn set_cycle_tracking(&self, track: bool, pipelined: bool) {
-        let mut state = self.state();
-        state.track_cycles = track;
-        state.pipelined = pipelined;
+        self.0.track_cycles.store(track, Ordering::Relaxed);
+        self.state().pipelined = pipelined;
+    }
+
+    /// Whether this run keeps the per-cycle records (a benchmark run). Readable without the lock,
+    /// so the laps inside the render graph can check it per view and, as a run condition, not even
+    /// enter their systems when it is off.
+    fn tracks_cycles(&self) -> bool {
+        self.0.track_cycles.load(Ordering::Relaxed)
     }
 
     /// The record of the cycle before the one in progress, which is the cycle the frame time just
@@ -445,8 +590,8 @@ impl RenderTimings {
     /// Writes into the record of `cycle`, when cycles are tracked and the cycle is known. The
     /// mirror for the per-cycle series gets the same write; rows that can no longer be written or
     /// handed over are dropped, so a run that keeps no per-cycle series does not grow it.
-    fn write_cycle(state: &mut State, cycle: Option<u64>, write: impl Fn(&mut CycleSides)) {
-        if state.track_cycles
+    fn write_cycle(&self, state: &mut State, cycle: Option<u64>, write: impl Fn(&mut CycleSides)) {
+        if self.tracks_cycles()
             && let Some(cycle) = cycle
         {
             write(state.cycles.entry(cycle).or_default());
@@ -479,7 +624,7 @@ impl RenderTimings {
         if state.remainder_started.is_some() {
             state.remainder_extract_ms += extract_ms;
         }
-        Self::write_cycle(&mut state, Some(cycle), |sides| {
+        self.write_cycle(&mut state, Some(cycle), |sides| {
             sides.extract_ms = Some(extract_ms);
         });
         self.record(&mut state, EXTRACT, elapsed);
@@ -495,7 +640,7 @@ impl RenderTimings {
             if state.remainder_started.is_some() {
                 state.remainder_wait_ms += wait_ms;
             }
-            Self::write_cycle(&mut state, Some(cycle), |sides| {
+            self.write_cycle(&mut state, Some(cycle), |sides| {
                 sides.wait_ms = Some(wait_ms);
             });
             self.record(&mut state, WAIT_FOR_RENDER_THREAD, wait);
@@ -512,7 +657,7 @@ impl RenderTimings {
             let raw_ms = started.elapsed().as_secs_f64() * 1000.0;
             let ms = remainder_ms(raw_ms, state.remainder_extract_ms, state.remainder_wait_ms);
             let cycle = state.cycle;
-            Self::write_cycle(&mut state, Some(cycle), |sides| {
+            self.write_cycle(&mut state, Some(cycle), |sides| {
                 sides.remainder_ms = Some(ms);
             });
             self.record(&mut state, REMAINDER, Duration::from_secs_f64(ms / 1000.0));
@@ -527,12 +672,12 @@ impl RenderTimings {
             let cycle = state.cycle;
             if let Some(started) = state.cycle_started.take() {
                 let wall_ms = now.saturating_duration_since(started).as_secs_f64() * 1000.0;
-                Self::write_cycle(&mut state, Some(cycle), |sides| {
+                self.write_cycle(&mut state, Some(cycle), |sides| {
                     sides.wall_ms = Some(wall_ms);
                 });
             }
             if real_ms.is_finite() && real_ms > 0.0 {
-                Self::write_cycle(&mut state, Some(cycle), |sides| {
+                self.write_cycle(&mut state, Some(cycle), |sides| {
                     sides.real_ms = Some(real_ms);
                 });
             }
@@ -554,7 +699,7 @@ impl RenderTimings {
                 state.remainder_extract_ms = 0.0;
                 state.remainder_wait_ms = 0.0;
             }
-            Self::write_cycle(&mut state, Some(cycle), |sides| {
+            self.write_cycle(&mut state, Some(cycle), |sides| {
                 sides.main_ms = Some(elapsed.as_secs_f64() * 1000.0);
             });
             self.record(&mut state, MAIN_WORLD, elapsed);
@@ -583,19 +728,88 @@ impl RenderTimings {
             if let Some(set) = phase_writer(name) {
                 let ms = elapsed.as_secs_f64() * 1000.0;
                 let render_cycle = state.render_cycle;
-                Self::write_cycle(&mut state, render_cycle, |sides| set(sides, ms));
+                self.write_cycle(&mut state, render_cycle, |sides| set(sides, ms));
             }
         }
+    }
+
+    /// The root render graph schedule has begun (its `Begin` set): opens the mark
+    /// [`RenderTimings::views_lapped`] closes. Nothing is recorded before that lap.
+    fn graph_started(&self) {
+        if !self.tracks_cycles() {
+            return;
+        }
+        self.state().graph_mark = Some(Instant::now());
+    }
+
+    /// Every view's graph schedule has run (the root schedule's `Render` set, Bevy's
+    /// `camera_driver`): closes [`GRAPH_VIEWS`] and re-arms the mark
+    /// [`RenderTimings::submit_lapped`] closes.
+    fn views_lapped(&self) {
+        self.graph_lap(|sides, ms| sides.graph_views_ms = Some(ms));
+    }
+
+    /// The root schedule's `Submit` set has run (the graph's command buffers are with the queue):
+    /// closes [`GRAPH_SUBMIT`].
+    fn submit_lapped(&self) {
+        self.graph_lap(|sides, ms| sides.graph_submit_ms = Some(ms));
+    }
+
+    /// Closes the root graph lap the previous boundary opened, re-arming its mark for the next one.
+    fn graph_lap(&self, set: fn(&mut CycleSides, f64)) {
+        if !self.tracks_cycles() {
+            return;
+        }
+        let now = Instant::now();
+        let mut state = self.state();
+        let Some(mark) = state.graph_mark.replace(now) else {
+            return;
+        };
+        let ms = (now - mark).as_secs_f64() * 1000.0;
+        let render_cycle = state.render_cycle;
+        self.write_cycle(&mut state, render_cycle, |sides| set(sides, ms));
+    }
+
+    /// A view's graph schedule (`Core3d`) has begun, before its `Prepass` set: opens the view's
+    /// mark and counts the view.
+    fn view_started(&self) {
+        if !self.tracks_cycles() {
+            return;
+        }
+        let mut state = self.state();
+        state.view_mark = Some(Instant::now());
+        let render_cycle = state.render_cycle;
+        self.write_cycle(&mut state, render_cycle, |sides| {
+            sides.graph_view_count = Some(sides.graph_view_count.unwrap_or(0) + 1);
+        });
+    }
+
+    /// Closes the view lap opened at the view's previous boundary — the start, then each stage
+    /// boundary — and adds it to the cycle's sum for that stage.
+    fn view_lapped(&self, add: fn(&mut CycleSides, f64)) {
+        if !self.tracks_cycles() {
+            return;
+        }
+        let now = Instant::now();
+        let mut state = self.state();
+        let Some(mark) = state.view_mark.replace(now) else {
+            return;
+        };
+        let ms = (now - mark).as_secs_f64() * 1000.0;
+        let render_cycle = state.render_cycle;
+        self.write_cycle(&mut state, render_cycle, |sides| add(sides, ms));
     }
 
     fn end_render(&self) {
         let mut state = self.state();
         state.render_mark = None;
+        state.graph_mark = None;
+        state.view_mark = None;
         let pipelines = state.pipelines.take();
         let render_cycle = state.render_cycle.take();
         if let Some(started) = state.render_started.take() {
             let elapsed = started.elapsed();
-            Self::write_cycle(&mut state, render_cycle, |sides| {
+            self.write_cycle(&mut state, render_cycle, |sides| {
                 sides.render_ms = Some(elapsed.as_secs_f64() * 1000.0);
             });
             self.record(&mut state, RENDER_THREAD, started.elapsed());
@@ -619,7 +833,7 @@ impl RenderTimings {
         if let Some(started) = state.acquire_started.take() {
             let elapsed = started.elapsed();
             let render_cycle = state.render_cycle;
-            Self::write_cycle(&mut state, render_cycle, |sides| {
+            self.write_cycle(&mut state, render_cycle, |sides| {
                 sides.acquire_ms = Some(elapsed.as_secs_f64() * 1000.0);
             });
             self.record(&mut state, SWAPCHAIN_ACQUIRE, started.elapsed());
@@ -698,11 +912,69 @@ fn lap(name: &'static str) -> impl FnMut(Res<RenderTimings>) {
     move |timings: Res<RenderTimings>| timings.lap(name)
 }
 
+/// Whether this run keeps the per-cycle records (a benchmark run): the run condition of every lap
+/// inside the render graph, so an ordinary play session pays one atomic load for them and not even
+/// the system bodies (which check the same flag again).
+fn tracks_cycles(timings: Res<RenderTimings>) -> bool {
+    timings.tracks_cycles()
+}
+
+fn start_graph_frame(timings: Res<RenderTimings>) {
+    timings.graph_started();
+}
+
+fn lap_graph_views(timings: Res<RenderTimings>) {
+    timings.views_lapped();
+}
+
+fn lap_graph_submit(timings: Res<RenderTimings>) {
+    timings.submit_lapped();
+}
+
+fn start_view(timings: Res<RenderTimings>) {
+    timings.view_started();
+}
+
+fn lap_view_prepass(timings: Res<RenderTimings>) {
+    timings.view_lapped(add_graph_prepass);
+}
+
+fn lap_view_main_pass(timings: Res<RenderTimings>) {
+    timings.view_lapped(add_graph_main_pass);
+}
+
+fn lap_view_post_process(timings: Res<RenderTimings>) {
+    timings.view_lapped(add_graph_post_process);
+}
+
+/// Adds a view's stage lap to the cycle's sum for that stage (the record holds one sum per stage,
+/// over every view the cycle ran).
+fn add_graph_prepass(sides: &mut CycleSides, ms: f64) {
+    sides.graph_prepass_ms = Some(sides.graph_prepass_ms.unwrap_or(0.0) + ms);
+}
+
+fn add_graph_main_pass(sides: &mut CycleSides, ms: f64) {
+    sides.graph_main_pass_ms = Some(sides.graph_main_pass_ms.unwrap_or(0.0) + ms);
+}
+
+fn add_graph_post_process(sides: &mut CycleSides, ms: f64) {
+    sides.graph_post_process_ms = Some(sides.graph_post_process_ms.unwrap_or(0.0) + ms);
+}
+
 /// The main thread's time outside `main_world`, the extract and the wait in one cycle: the raw
 /// `Last`→`First` window less the extract and the wait when both ran inside it (pipelined
 /// rendering runs them there), never negative.
 fn remainder_ms(raw_ms: f64, extract_ms: f64, wait_ms: f64) -> f64 {
     (raw_ms - extract_ms - wait_ms).max(0.0)
+}
+
+/// The part of `render/graph_and_present` the graph laps do not own (see [`GRAPH_REMAINDER`]): the
+/// phase less [`GRAPH_VIEWS`] and [`GRAPH_SUBMIT`], never negative. The laps are read inside the
+/// phase's own window on the render thread, so they can exceed it only by a timer tick; a larger
+/// excess would be a bug in the laps, which the lap tests pin down, not something the clamp hides.
+fn graph_remainder_ms(graph_and_present_ms: f64, sides: &CycleSides) -> f64 {
+    let parts = sides.graph_views_ms.unwrap_or(0.0) + sides.graph_submit_ms.unwrap_or(0.0);
+    (graph_and_present_ms - parts).max(0.0)
 }
 
 /// The cycle-record field a render-phase lap writes, by the lap's span name. The swapchain wait
@@ -715,7 +987,10 @@ fn phase_writer(name: &str) -> Option<fn(&mut CycleSides, f64)> {
         SPECIALIZE_AND_VIEWS => Some(|sides, ms| sides.specialize_and_views_ms = Some(ms)),
         QUEUE => Some(|sides, ms| sides.queue_ms = Some(ms)),
         PREPARE => Some(|sides, ms| sides.prepare_ms = Some(ms)),
-        GRAPH_AND_PRESENT => Some(|sides, ms| sides.graph_and_present_ms = Some(ms)),
+        GRAPH_AND_PRESENT => Some(|sides, ms| {
+            sides.graph_and_present_ms = Some(ms);
+            sides.graph_remainder_ms = Some(graph_remainder_ms(ms, sides));
+        }),
         CLEANUP => Some(|sides, ms| sides.cleanup_ms = Some(ms)),
         _ => None,
     }
@@ -1138,6 +1413,164 @@ mod tests {
                 second.render_ms.unwrap()
             );
         }
+    }
+
+    /// The graph laps split `render/graph_and_present` the way R2 asks: the view schedules, the
+    /// graph's queue submit and a remainder that closes the phase. The parts are taken inside the
+    /// outer lap, so they cannot exceed it, and the remainder is what makes the row's graph columns
+    /// add up to `render/graph_and_present`. The per-view stage sums are bounded by the views lap
+    /// that includes every view schedule's own overhead, and the count says how many views they
+    /// cover.
+    #[test]
+    fn the_graph_laps_account_for_graph_and_present() {
+        let timings = RenderTimings::default();
+        timings.set_recording(true);
+        timings.set_cycle_tracking(true, true);
+        timings.start_main(0.0);
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.start_render();
+        // The root graph schedule: its `Begin` set, two view schedules, the lap after the `Render`
+        // set, the lap after the `Submit` set, then the phase's own lap (`Set::Render`).
+        timings.graph_started();
+        std::thread::sleep(Duration::from_millis(1));
+        for _ in 0..2 {
+            timings.view_started();
+            std::thread::sleep(Duration::from_millis(1));
+            timings.view_lapped(add_graph_prepass);
+            std::thread::sleep(Duration::from_millis(1));
+            timings.view_lapped(add_graph_main_pass);
+            std::thread::sleep(Duration::from_millis(1));
+            timings.view_lapped(add_graph_post_process);
+        }
+        timings.views_lapped();
+        std::thread::sleep(Duration::from_millis(1));
+        timings.submit_lapped();
+        std::thread::sleep(Duration::from_millis(1));
+        timings.lap(GRAPH_AND_PRESENT);
+        timings.end_render();
+        // Pipelined: the render frame of extract 1 is filed under cycle 2.
+        timings.start_main(0.0);
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.start_main(0.0);
+        let cycle = timings.take_previous_cycle().expect("cycle 2");
+        let graph = cycle.graph_and_present_ms.expect("the phase was lapped");
+        let views = cycle.graph_views_ms.expect("the views lap ran");
+        let submit = cycle.graph_submit_ms.expect("the submit lap ran");
+        let remainder = cycle
+            .graph_remainder_ms
+            .expect("the phase's lap writes the remainder");
+        assert_eq!(cycle.graph_view_count, Some(2), "two view schedules ran");
+        assert!(
+            views >= 2.0 && submit >= 1.0,
+            "the laps cover the sleeps between their boundaries: {views} views, {submit} submit"
+        );
+        assert!(
+            views + submit <= graph,
+            "the laps were taken inside the phase: {views} + {submit} vs {graph}"
+        );
+        assert!(
+            (views + submit + remainder - graph).abs() < 1e-9,
+            "the parts and the remainder are the phase: {views} + {submit} + {remainder} vs \
+             {graph}"
+        );
+        assert!(
+            remainder >= 1.0,
+            "the sleep between the submit lap and the phase's lap is in the remainder: {remainder}"
+        );
+        let stages = [
+            cycle.graph_prepass_ms.expect("prepass laps ran"),
+            cycle.graph_main_pass_ms.expect("main-pass laps ran"),
+            cycle.graph_post_process_ms.expect("post-process laps ran"),
+        ];
+        for stage in stages {
+            assert!(
+                stage >= 2.0,
+                "each sum covers both views' sleep for its stage: {stage}"
+            );
+        }
+        assert!(
+            stages.iter().sum::<f64>() <= views,
+            "the per-view stages are parts of the views lap: {stages:?} vs {views}"
+        );
+        assert!(
+            timings.take_samples().contains_key(GRAPH_AND_PRESENT),
+            "the phase keeps its sample"
+        );
+    }
+
+    /// The graph laps cost nothing when the run keeps no cycles: no mark is taken, nothing is
+    /// written and nothing is sampled, whatever the recording state (a lap inside the render graph
+    /// has no per-frame sample of its own — its column is the cycle's sum).
+    #[test]
+    fn the_graph_laps_are_kept_only_when_cycles_are_tracked() {
+        let timings = RenderTimings::default();
+        timings.set_recording(true);
+        timings.start_main(0.0);
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.start_render();
+        timings.graph_started();
+        timings.view_started();
+        timings.view_lapped(add_graph_prepass);
+        timings.view_lapped(add_graph_main_pass);
+        timings.view_lapped(add_graph_post_process);
+        timings.views_lapped();
+        timings.submit_lapped();
+        assert!(
+            timings.state().graph_mark.is_none() && timings.state().view_mark.is_none(),
+            "no mark is taken when cycles are not tracked"
+        );
+        timings.lap(GRAPH_AND_PRESENT);
+        timings.end_render();
+        assert!(
+            timings.take_previous_cycle().is_none() && timings.take_completed_cycles().is_empty(),
+            "no cycle record is kept"
+        );
+        let samples = timings.take_samples();
+        assert!(samples.contains_key(GRAPH_AND_PRESENT));
+        for lap in [
+            GRAPH_VIEWS,
+            GRAPH_VIEW_COUNT,
+            GRAPH_PREPASS,
+            GRAPH_MAIN_PASS,
+            GRAPH_POST_PROCESS,
+            GRAPH_SUBMIT,
+            GRAPH_REMAINDER,
+        ] {
+            assert!(
+                !samples.contains_key(*lap),
+                "the graph lap {lap} is a cycle column, not a sample"
+            );
+        }
+    }
+
+    /// The remainder is the phase less the laps inside it, and never negative — the laps are read
+    /// inside the phase's window, so a small excess is a timer tick, not a negative remainder.
+    #[test]
+    fn the_graph_remainder_never_goes_negative() {
+        let sides = CycleSides {
+            graph_views_ms: Some(6.0),
+            graph_submit_ms: Some(3.0),
+            ..Default::default()
+        };
+        assert_eq!(graph_remainder_ms(10.0, &sides), 1.0);
+        assert_eq!(
+            graph_remainder_ms(8.5, &sides),
+            0.0,
+            "the laps can exceed the phase by less than a timer tick"
+        );
+        assert_eq!(
+            graph_remainder_ms(9.5, &sides),
+            0.5,
+            "the remainder is what the laps leave"
+        );
+        assert_eq!(
+            graph_remainder_ms(4.0, &CycleSides::default()),
+            4.0,
+            "no lap was measured: the whole phase is the remainder"
+        );
     }
 
     /// Completed rows are handed over once, oldest first, complete (main, remainder); the
