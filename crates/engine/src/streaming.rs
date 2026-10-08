@@ -7,7 +7,7 @@ use crate::{
         TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
     snow::{DirectionalSnow, DirectionalSnowCatalog, SnowMaterial, SnowMaterialCache},
-    swap_bridge::{SwapDrawn, SwapSurface, SwapWaiting},
+    swap_bridge::{SwapDrawn, SwapStandIn, SwapSurface, SwapWaiting},
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
@@ -663,6 +663,11 @@ pub struct StreamingMetrics {
     /// full-detail grid, and a full cell that left it for the ring.
     pub cells_upgraded: u64,
     pub cells_downgraded: u64,
+    /// Detail changes whose stand-in outlived
+    /// [`MAX_SWAP_HOLD_FRAMES`](crate::swap_bridge::MAX_SWAP_HOLD_FRAMES): the root the cell was
+    /// drawn by was despawned anyway, so what it covered is unguarded from that frame on. A failure
+    /// count, not a wait - every one of them is warned about as well.
+    pub swap_hold_timeouts: u64,
     /// Ring grids that held nothing: the ones a worldspace does not reach, and cells whose
     /// landscape the cell cache does not carry. Deliberately not part of [`Self::failed_cells`]:
     /// see the commit in [`collect_cells`](fn@collect_cells).
@@ -1753,6 +1758,26 @@ struct SpawnStampContext<'w, 's> {
     camera: Query<'w, 's, &'static Transform, With<StreamingCamera>>,
 }
 
+/// Hands the root a detail change replaces over to the stand-in hold (design-1091 §3): the cell
+/// changed detail on the same grid, and until the root that replaced it can be drawn this one keeps
+/// covering the ground, so no frame shows neither.
+///
+/// The root stops being a streamed cell root here: the markers every root scan keys on go with it,
+/// so [`validate_streaming_lifecycle`]'s duplicate/orphaned/missing counts, the portal's isolation,
+/// room culling and the shots' settle see the cell's one root - the new one - and never count this
+/// one as a second. The cell's `CellRef` stays for the log, and its `ExteriorCellGrid` so the
+/// render origin still places the stand-in ([`reposition_cell_roots`]).
+///
+/// The new root's terrain patches name it back ([`SwapSurface::stand_in`], through [`spawn_cell`]),
+/// which is what `crate::swap_bridge`'s detail-change hand-over reads to decide when the hold ends.
+fn hold_replaced_root(commands: &mut Commands, replaced: Entity) {
+    commands
+        .entity(replaced)
+        .try_remove::<StreamedCellRoot>()
+        .try_remove::<DistantTerrainRoot>()
+        .try_insert(SwapStandIn::default());
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_cells(
     mut commands: Commands,
@@ -1963,12 +1988,10 @@ fn collect_cells(
                     );
                     continue;
                 }
-                // The replacement is committed: the root the cell kept drawing goes now, in the
-                // same frame its successor is spawned, so the two are never both drawn and the
-                // cell never has two terrains.
-                if let Some(replaced) = replaced {
-                    commands.entity(replaced).try_despawn();
-                }
+                // The replacement is committed: the root the cell kept drawing does not go now. It
+                // becomes the new root's stand-in (at the end of this arm) and stays drawn until
+                // the new root's terrain is confirmed drawn, so no frame shows neither. See
+                // [`hold_replaced_root`].
                 // The layers the cell is born on (`crate::portal`'s resolver, impl-1058): the commit
                 // classifies the cell from the space of the moment, and the nodes the tree is built
                 // from carry that value in their own bundles - the propagation's first pass over
@@ -2008,12 +2031,20 @@ fn collect_cells(
                     detail,
                     world_physics,
                     stamp,
+                    replaced,
                     &mut streaming.next_model_sequence,
                     &mut profiler,
                 );
                 streaming
                     .cells
                     .insert(response.key, CellStatus::Resident { root, detail });
+                // The root this cell was drawn by until now keeps covering it, and the new root's
+                // patches name it back (`spawn_cell`), so it is despawned the frame the new terrain
+                // is confirmed drawn - in the same frame the two are drawn together, never in
+                // neither - or, loudly and counted, when the hold bound passes.
+                if let Some(replaced) = replaced {
+                    hold_replaced_root(&mut commands, replaced);
+                }
                 // A full commit of a previously failed cell ends its failure record: the rescue is
                 // over, the plan asks for the cell in full again the way it asks for any resident,
                 // and a later failure starts its attempt budget from this success.
@@ -2484,6 +2515,10 @@ fn spawn_cell(
     // spawns the cell exactly as a run without the portal always did. A node with layers of its
     // own (the water plane) is left to the adoption that makes it a source.
     stamp: Option<RenderLayers>,
+    // The root this cell was drawn by until this frame, when the commit is a detail change: every
+    // terrain patch is born naming it as its stand-in ([`SwapSurface::stand_in`]), which is what
+    // keeps it drawn and what the hand-over reads to know when to despawn it.
+    stand_in: Option<Entity>,
     model_sequence: &mut u64,
     profiler: &mut ProfilingState,
 ) -> Entity {
@@ -2571,6 +2606,12 @@ fn spawn_cell(
                         .chain(images.normal.iter())
                         .map(|handle| handle.id()),
                 );
+                // A detail change's new quadrants name the root that is covering the cell until
+                // they are drawn; the commit keeps that root alive for exactly as long.
+                let surface = match stand_in {
+                    Some(stand_in) => surface.with_stand_in(stand_in),
+                    None => surface,
+                };
                 let mut patch = parent.spawn((
                     Name::new(format!("Terrain quadrant {quadrant}")),
                     Mesh3d(meshes.add(mesh)),
@@ -5715,6 +5756,7 @@ mod tests {
                 Some(terrain.clone()),
                 CellDetail::Full,
                 physics.0,
+                None,
                 None,
                 &mut 0,
                 &mut profiler,
@@ -8874,8 +8916,12 @@ mod tests {
             )
         });
         assert!(
-            app.world().get_entity(rescue_root).is_err(),
-            "the rescue root is swapped out by the commit, the way a tier change does"
+            app.world().get::<SwapStandIn>(rescue_root).is_some(),
+            "the commit keeps the rescue root, and the new terrain names it as its stand-in"
+        );
+        assert!(
+            app.world().get::<DistantTerrainRoot>(rescue_root).is_none(),
+            "the stand-in is no longer a streamed cell root, so the cell has one root"
         );
         let streaming = app.world().resource::<StreamingWorld>();
         assert!(
@@ -9374,6 +9420,174 @@ mod tests {
         );
     }
 
+    /// The detail-change hand-over end to end through the commit (design-1091 §3, slice C3): the
+    /// ring cell is asked for in full, and the root the cell was drawn by is not despawned - it is
+    /// handed over as the stand-in every patch of the new root names, and stops being a streamed
+    /// cell root, so the cell has one root and the stand-in is never counted as a second.
+    #[test]
+    fn a_detail_change_keeps_the_old_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_terrain_cache(&cache_path, 1);
+        let catalogue_path = directory.path().join("catalogue.db");
+        write_empty_catalogue(&catalogue_path);
+
+        let key = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 2,
+            grid_y: -3,
+        };
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<StandardMaterial>()
+            .init_asset::<TerrainMaterial>()
+            .init_asset::<WaterMaterial>()
+            .insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(CellCache::open(&cache_path).unwrap())
+            .insert_resource(AssetCatalog::open(&catalogue_path).unwrap())
+            .init_resource::<DirectionalSnowCatalog>()
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .insert_resource(WorldDatabase::open(&database_path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, collect_cells);
+        // No `plan_cells` here: the cell's status and its request are handed in, so the test drives
+        // the two commits it needs and nothing else. The commit budget's one slot is given, since
+        // nothing in this app refills it each frame.
+        app.world_mut()
+            .resource_mut::<StreamingCommitBudget>()
+            .remaining = 4;
+
+        let resident = |app: &App, detail: CellDetail| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Resident { detail: resident, .. }) if *resident == detail
+            )
+        };
+        // The ring cell: the tier a worldspace without LOD draws its distance with.
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                key,
+                CellStatus::Loading {
+                    generation: 1,
+                    detail: CellDetail::Terrain,
+                    replaced: None,
+                },
+            );
+        app.world_mut()
+            .resource::<WorldDatabase>()
+            .request(DatabaseRequest::Load {
+                generation: 1,
+                key,
+                detail: CellDetail::Terrain,
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+        run_until(&mut app, "the terrain-only commit", |app| {
+            resident(app, CellDetail::Terrain)
+        });
+        let ring_root = match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Resident { root, .. }) => *root,
+            other => panic!("the terrain-only cell did not commit: {other:?}"),
+        };
+        assert!(app.world().get::<DistantTerrainRoot>(ring_root).is_some());
+
+        // The camera walks in: the same grid is asked for in full, the ring root riding along.
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                key,
+                CellStatus::Loading {
+                    generation: 2,
+                    detail: CellDetail::Full,
+                    replaced: Some(ring_root),
+                },
+            );
+        app.world_mut()
+            .resource::<WorldDatabase>()
+            .request(DatabaseRequest::Load {
+                generation: 2,
+                key,
+                detail: CellDetail::Full,
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+        run_until(&mut app, "the full commit", |app| {
+            resident(app, CellDetail::Full)
+        });
+
+        let full_root = match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Resident { root, detail }) => {
+                assert_eq!(*detail, CellDetail::Full);
+                *root
+            }
+            other => panic!("the full cell did not commit: {other:?}"),
+        };
+        assert_ne!(full_root, ring_root, "the replacement is a new root");
+        // No `cells_upgraded` here: the plan is what counts a tier change, and this app hands the
+        // cell's status in instead of planning it.
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .swap_hold_timeouts,
+            0
+        );
+
+        // The root the cell was drawn by is kept, and it is no longer a streamed cell root: the
+        // markers every root scan keys on are gone, so the lifecycle check counts one root.
+        assert!(
+            app.world().get::<SwapStandIn>(ring_root).is_some(),
+            "the replaced root is held as the stand-in"
+        );
+        assert!(
+            app.world().get::<DistantTerrainRoot>(ring_root).is_none(),
+            "the stand-in is not a streamed cell root"
+        );
+        assert!(app.world().get::<StreamedCellRoot>(ring_root).is_none());
+        assert!(
+            app.world().get::<CellRef>(ring_root).is_some(),
+            "the stand-in still names the cell it covers"
+        );
+        let old_terrain = app
+            .world()
+            .get::<Children>(ring_root)
+            .map(|children| children.iter().collect::<Vec<Entity>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|child| app.world().get::<TerrainPatch>(*child).is_some())
+            .count();
+        assert_eq!(old_terrain, 4, "the stand-in keeps its landscape drawn");
+
+        // Every patch of the new root names it back, which is what the hand-over reads to know when
+        // the hold ends.
+        let named = app
+            .world()
+            .get::<Children>(full_root)
+            .map(|children| children.iter().collect::<Vec<Entity>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|child| app.world().get::<SwapSurface>(child))
+            .map(SwapSurface::stand_in)
+            .collect::<Vec<Option<Entity>>>();
+        assert_eq!(named, vec![Some(ring_root); 4]);
+    }
+
     #[test]
     fn an_interior_reference_keeps_its_camera_relative_position() {
         let mut app = App::new();
@@ -9697,6 +9911,7 @@ mod tests {
             CellDetail::Full,
             false,
             stamp,
+            None,
             &mut 0,
             &mut profiler,
         ));

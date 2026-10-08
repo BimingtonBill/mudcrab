@@ -11,9 +11,11 @@
 //! render-asset diagnostics publish their counters (`bevy_render::diagnostic`) and as this engine's
 //! [`crate::render::RendererProofBridge`] and [`crate::profiling::RenderMeasurementProbe`] do.
 //!
-//! Nothing here hides, despawns, delays or settles anything. This slice writes the markers and
-//! records the gauges that make the gap visible; slices C2 (the LOD swap), C3 (the unload and
-//! detail-change stand-ins) and C4 (the settles) are what key on the signal.
+//! This slice writes the markers and records the gauges that make the gap visible; the one place a
+//! stand-in is despawned on the drawn signal is slice C3's detail-change hand-over
+//! ([`release_detail_change_stand_ins`] below). Nothing here hides, delays or settles anything;
+//! slices C2 (the LOD swap, the unload side) and C4 (the settles) are what key on the rest of the
+//! signal.
 //!
 //! Cost is O(waiting entities): the bridge iterates exactly the entities carrying the waiting
 //! marker, never all terrain, and a surface leaves the set the frame it is confirmed drawn
@@ -36,7 +38,12 @@ use bevy::{
     },
 };
 
-use crate::{config::EngineConfig, profiling::ProfilingState};
+use crate::{
+    config::EngineConfig,
+    profiling::ProfilingState,
+    streaming::StreamingMetrics,
+    world::components::{CellRef, ExteriorCellGrid},
+};
 
 /// A surface that is waiting for the render world: the engine has spawned it, the stand-in that
 /// covers it is still drawn, and nothing yet knows whether it can be drawn.
@@ -65,8 +72,9 @@ pub struct SwapSurface {
     /// Every image the material's bind group holds, deduplicated.
     images: Vec<AssetId<Image>>,
     /// The entity that covers this surface until it is drawn (the LOD tile under the quadrant, or
-    /// the root a detail change replaces), carried over into [`SwapPrepared`]. This slice inserts
-    /// no stand-in; slice C3 does, and the hand-over that despawns it is C3's.
+    /// the root a detail change replaces), carried over into [`SwapPrepared`]. A detail-change
+    /// commit is what inserts it ([`SwapSurface::with_stand_in`]), and the hand-over that despawns
+    /// that root reads it back ([`release_detail_change_stand_ins`]); the LOD tile's is slice C2's.
     stand_in: Option<Entity>,
 }
 
@@ -95,6 +103,15 @@ impl SwapSurface {
         self.images = images;
     }
 
+    /// Names the entity that covers this surface until it is drawn: the root a detail change
+    /// replaces, which the commit keeps alive as the rule for its hand-over is "the new root's
+    /// surfaces are covered", read back through [`SwapSurface::stand_in`].
+    #[must_use]
+    pub fn with_stand_in(mut self, stand_in: Entity) -> Self {
+        self.stand_in = Some(stand_in);
+        self
+    }
+
     /// The surface's stand-in, if it declares one.
     pub fn stand_in(&self) -> Option<Entity> {
         self.stand_in
@@ -118,6 +135,45 @@ pub struct SwapPrepared {
 /// `Ok` while a view could see it, so that frame's queue pass drew it.
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct SwapDrawn;
+
+/// How long a detail change may keep the root it replaced drawn, in frames of
+/// [`release_detail_change_stand_ins`].
+///
+/// The bound is a safety net, not a deadline. The hand-over itself is the bridge's own latency -
+/// two or three frames (design-1091 §2.2) - and what the hold waits for on top of it is the new
+/// cell's terrain reaching the render world under the 16 MiB-a-frame upload budget. The design's
+/// own figure (§3) is about 120 frames: roughly two seconds at 60 fps and 0.75 s at the portal
+/// demo's 160 fps, one to two orders of magnitude above a normal swap, and short enough that a
+/// stand-in left covering a replacement that never arrives is a visible count rather than a quiet
+/// leak of a drawn cell root. Counted in frames rather than seconds because the swap's state is
+/// counted in frames, so the hold behaves the same whatever the frame rate.
+///
+/// Outliving it is a failure, not a wait: the stand-in is despawned anyway, and the frame is
+/// counted ([`crate::streaming::StreamingMetrics::swap_hold_timeouts`]) and warned about, so the
+/// one way a hold can end without its replacement drawn is never silent.
+pub const MAX_SWAP_HOLD_FRAMES: u32 = 120;
+
+/// A root a detail change keeps drawn: the cell now draws the root that replaced this one, and
+/// this one keeps covering the grid until every surface of the new root is drawn - or has
+/// everything its draw needs and no view can see it, which needs no covering either.
+///
+/// It is carried by the old root, and the new root's surfaces name it back
+/// ([`SwapSurface::stand_in`]). That is what makes "the new root is gone" (the camera left the cell
+/// before the swap completed) and "the new root has no terrain" (nothing to wait for) the same
+/// event for the hand-over - no waiting surface names this root any more - so neither can leave a
+/// stand-in covering a cell nobody asked for.
+///
+/// A stand-in is not a streamed cell root: `streaming`'s commit removes the root markers
+/// (`StreamedCellRoot`/`DistantTerrainRoot`) as it hands the root over, so the lifecycle check, the
+/// settles and every root scan see the cell's one root - the new one - and never this one. It keeps
+/// its `CellRef` and `ExteriorCellGrid`: the first says in a log which cell it covers, the second
+/// keeps the render origin placing it (`streaming::reposition_cell_roots`).
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct SwapStandIn {
+    /// How many frames [`release_detail_change_stand_ins`] has held this root, bounded by
+    /// [`MAX_SWAP_HOLD_FRAMES`].
+    pub held_frames: u32,
+}
 
 /// What the render world holds for one waiting surface, this extract: the plain snapshot
 /// [`swap_readiness`] decides on. Every field is a fact this world has established, so the decision
@@ -398,7 +454,8 @@ fn class_sees(class: &RenderVisibleEntitiesClass, entity: MainEntity) -> bool {
 /// set. Runs in `Update`, so the marker the bridge wrote during the extract between two frames is
 /// visible here, in the frame whose visibility pass follows it.
 ///
-/// What a stand-in does with the release is slice C3's; this slice only releases the count.
+/// The stand-in half of the hand-over is separate: a detail change's stand-in belongs to the whole
+/// new root, not to one surface, so it is [`release_detail_change_stand_ins`] that despawns it.
 fn complete_drawn_swaps(
     mut commands: Commands,
     mut stats: ResMut<SwapBridgeStats>,
@@ -410,6 +467,91 @@ fn complete_drawn_swaps(
         completed = completed.saturating_add(1);
     }
     stats.drawn_this_frame = completed;
+}
+
+/// Every waiting surface's coverage state: what it declares (its stand-in, if any), whether it is
+/// revealed and what a view makes of it, and the two markers that say whether it covers itself.
+type WaitingCoverage<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static SwapSurface,
+        &'static Visibility,
+        Has<SwapDrawn>,
+        Has<SwapPrepared>,
+        &'static ViewVisibility,
+    ),
+    With<SwapWaiting>,
+>;
+
+/// The main-world hand-over of a detail change (design-1091 §3): the root the cell was drawn by
+/// keeps covering it until the surfaces the cell now declares are covered, then goes through the
+/// same `try_despawn` the commit on its own used to do in the frame it committed.
+///
+/// A surface is covered when the render world has confirmed it drawn, or when it has everything its
+/// draw needs and no view can see it. The second half is the visibility rule (design-1091 §2.1): a
+/// surface no view can see is never confirmed drawn, so a new root whose patches are all off-view
+/// would hold its stand-in for ever. Nothing on screen needs covering then, so prepared-and-off-view
+/// counts as covered - but only once the surface is *revealed*: a terrain quadrant is spawned
+/// `Visibility::Hidden` and stays so until its textures are in `Assets<Image>`, which spans the
+/// frames before the render world can have them, and its `ViewVisibility` is false throughout.
+/// Reading that as "off-view" would drop the stand-in before the replacement can be drawn at all.
+///
+/// Cost is one pass over the waiting surfaces plus one over the live holds, and the live holds are
+/// at most the cells crossing a detail boundary in one frame. Nothing is held at all in a settled
+/// run, and the system returns before building the set.
+fn release_detail_change_stand_ins(
+    mut commands: Commands,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+    mut holds: Query<(Entity, &mut SwapStandIn)>,
+    cells: Query<(&CellRef, Option<&ExteriorCellGrid>)>,
+    waiting: WaitingCoverage,
+    mut uncovered: Local<Vec<Entity>>,
+) {
+    if holds.is_empty() {
+        return;
+    }
+    // The stand-ins a waiting surface still needs. Built from the surfaces' own declarations rather
+    // than from the new root: a new root that is despawned, and one that declares no surface at all
+    // (a cell with no terrain), both simply stop naming anything here.
+    uncovered.clear();
+    for (surface, surface_visibility, drawn, prepared, view) in &waiting {
+        if drawn || (prepared && *surface_visibility != Visibility::Hidden && !view.get()) {
+            continue;
+        }
+        if let Some(stand_in) = surface.stand_in()
+            && !uncovered.contains(&stand_in)
+        {
+            uncovered.push(stand_in);
+        }
+    }
+    for (stand_in, mut hold) in &mut holds {
+        hold.held_frames = hold.held_frames.saturating_add(1);
+        let covered = !uncovered.contains(&stand_in);
+        if !covered && hold.held_frames < MAX_SWAP_HOLD_FRAMES {
+            continue;
+        }
+        commands.entity(stand_in).try_despawn();
+        if covered {
+            continue;
+        }
+        metrics.swap_hold_timeouts = metrics.swap_hold_timeouts.saturating_add(1);
+        profiler.increment("streaming/swap_hold_timeouts", 1);
+        match cells.get(stand_in) {
+            Ok((cell, grid)) => warn!(
+                cell = format_args!("{:08X}", cell.0),
+                grid = ?grid.map(|grid| grid.0),
+                held_frames = hold.held_frames,
+                "detail-change stand-in outlived the swap hold bound; despawning it anyway"
+            ),
+            Err(_) => warn!(
+                stand_in = ?stand_in,
+                held_frames = hold.held_frames,
+                "detail-change stand-in outlived the swap hold bound; despawning it anyway"
+            ),
+        }
+    }
 }
 
 /// Waiting surfaces that are prepared but not yet drawn.
@@ -442,8 +584,10 @@ pub struct SwapBridgePlugin;
 
 impl Plugin for SwapBridgePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<SwapBridgeStats>()
-            .add_systems(Update, complete_drawn_swaps);
+        app.init_resource::<SwapBridgeStats>().add_systems(
+            Update,
+            (complete_drawn_swaps, release_detail_change_stand_ins),
+        );
         // The gauges are measurement data: an ordinary play session installs none of them.
         let profiling = app
             .world()
@@ -597,7 +741,11 @@ mod tests {
     #[test]
     fn the_hand_over_releases_a_drawn_surface() {
         let mut app = App::new();
-        app.add_plugins(SwapBridgePlugin);
+        // What the engine's app has before this plugin: the streaming counters the detail-change
+        // hand-over counts into, and the profile it reports them through.
+        app.init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_plugins(SwapBridgePlugin);
         let drawn = app.world_mut().spawn((SwapWaiting, SwapDrawn)).id();
         let waiting = app.world_mut().spawn(SwapWaiting).id();
 
@@ -649,5 +797,258 @@ mod tests {
         assert_eq!(surface.images, vec![normal.id()]);
         assert_eq!(surface.material, material);
         assert_eq!(surface.stand_in(), None);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // The detail-change hand-over (slice C3): the main world's own system, no render world.
+    // -------------------------------------------------------------------------------------
+
+    /// The app the hand-over's tests run in: the resources it reads and the plugin that installs it.
+    fn stand_in_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_plugins(SwapBridgePlugin);
+        app
+    }
+
+    /// The shape a detail-change commit leaves behind: a new root whose four terrain patches all
+    /// wait and name `stand_in`, and the stand-in's own four quadrants. Returns the new root, its
+    /// patches and the stand-in's quadrants. The patches are born revealed and in view but not
+    /// drawn - the state the hold exists for.
+    fn detail_change(app: &mut App, stand_in: Entity) -> (Entity, Vec<Entity>, Vec<Entity>) {
+        let new_root = app.world_mut().spawn_empty().id();
+        let patches = (0..4)
+            .map(|_| {
+                app.world_mut()
+                    .spawn((
+                        surface(&[]).with_stand_in(stand_in),
+                        SwapWaiting,
+                        Visibility::Inherited,
+                        ViewVisibility::VISIBLE,
+                        ChildOf(new_root),
+                    ))
+                    .id()
+            })
+            .collect();
+        let quadrants = (0..4)
+            .map(|_| app.world_mut().spawn(ChildOf(stand_in)).id())
+            .collect();
+        (new_root, patches, quadrants)
+    }
+
+    /// Sets what the main world's visibility pass leaves on a patch: its own `Visibility` (a terrain
+    /// quadrant is `Hidden` until its textures are in `Assets<Image>`) and whether a view saw it.
+    fn set_visibility(app: &mut App, patch: Entity, own: Visibility, seen: bool) {
+        app.world_mut().entity_mut(patch).insert((
+            own,
+            if seen {
+                ViewVisibility::VISIBLE
+            } else {
+                ViewVisibility::HIDDEN
+            },
+        ));
+    }
+
+    /// Whether the entity is still in the world.
+    fn alive(app: &App, entity: Entity) -> bool {
+        app.world().get_entity(entity).is_ok()
+    }
+
+    /// The hold itself (design-1091 §3): while the new root's terrain waits, the root the cell was
+    /// drawn by stays in the world, and the frame the new patches are confirmed drawn it goes -
+    /// through the despawn the commit used to do in the frame the replacement committed.
+    #[test]
+    fn a_detail_change_holds_the_old_root_until_its_replacement_is_drawn() {
+        let mut app = stand_in_app();
+        let stand_in = app.world_mut().spawn(SwapStandIn::default()).id();
+        let (new_root, patches, quadrants) = detail_change(&mut app, stand_in);
+
+        for _ in 0..3 {
+            app.update();
+        }
+        assert!(
+            alive(&app, stand_in),
+            "the stand-in covers the waiting terrain"
+        );
+        assert_eq!(
+            app.world()
+                .get::<SwapStandIn>(stand_in)
+                .unwrap()
+                .held_frames,
+            3,
+            "the hold counts the frames it covers"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .swap_hold_timeouts,
+            0
+        );
+
+        // The bridge confirms all four patches drawn: the next frame the stand-in goes, and its own
+        // quadrants with it - the new root, which is the cell's, stays.
+        for patch in &patches {
+            app.world_mut().entity_mut(*patch).insert(SwapDrawn);
+        }
+        app.update();
+
+        assert!(
+            !alive(&app, stand_in),
+            "a drawn replacement releases the stand-in"
+        );
+        for quadrant in &quadrants {
+            assert!(
+                !alive(&app, *quadrant),
+                "the stand-in's terrain goes with it"
+            );
+        }
+        assert!(alive(&app, new_root), "the cell's own root stays");
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .swap_hold_timeouts,
+            0,
+            "a hand-over that completes is not a failure"
+        );
+    }
+
+    /// The visibility rule: a surface no view can see is never confirmed drawn, so a new root whose
+    /// patches are all off-view would hold its stand-in for ever - while nothing on screen needs
+    /// covering. Prepared and out of view therefore counts as covered, but only once the surface is
+    /// revealed: a patch still `Visibility::Hidden` (its textures are not in `Assets<Image>` yet) is
+    /// not one "no view can see", and its stand-in stays until the render world can draw it.
+    #[test]
+    fn a_prepared_surface_no_view_can_see_releases_its_stand_in() {
+        let mut app = stand_in_app();
+
+        let stand_in = app.world_mut().spawn(SwapStandIn::default()).id();
+        let (_new_root, patches, _) = detail_change(&mut app, stand_in);
+        for patch in &patches {
+            app.world_mut().entity_mut(*patch).insert(SwapPrepared {
+                stand_in: Some(stand_in),
+                since: 1,
+            });
+            set_visibility(&mut app, *patch, Visibility::Inherited, false);
+        }
+        app.update();
+        assert!(
+            !alive(&app, stand_in),
+            "prepared and out of view needs no covering"
+        );
+
+        let stand_in = app.world_mut().spawn(SwapStandIn::default()).id();
+        let (_new_root, patches, _) = detail_change(&mut app, stand_in);
+        for patch in &patches {
+            app.world_mut().entity_mut(*patch).insert(SwapPrepared {
+                stand_in: Some(stand_in),
+                since: 1,
+            });
+            set_visibility(&mut app, *patch, Visibility::Inherited, true);
+        }
+        app.update();
+        assert!(
+            alive(&app, stand_in),
+            "an undrawn surface a view can see keeps its covering"
+        );
+
+        let stand_in = app.world_mut().spawn(SwapStandIn::default()).id();
+        let (_new_root, patches, _) = detail_change(&mut app, stand_in);
+        for patch in &patches {
+            app.world_mut().entity_mut(*patch).insert(SwapPrepared {
+                stand_in: Some(stand_in),
+                since: 1,
+            });
+            set_visibility(&mut app, *patch, Visibility::Hidden, false);
+        }
+        app.update();
+        assert!(
+            alive(&app, stand_in),
+            "a patch that is not revealed yet is not one no view can see"
+        );
+    }
+
+    /// Nothing waits for ever: a hold whose replacement never draws is released at
+    /// [`MAX_SWAP_HOLD_FRAMES`] anyway, counted in the metrics and warned about - the loud end.
+    #[test]
+    fn a_hold_that_outlives_the_bound_is_despawned_and_counted() {
+        let mut app = stand_in_app();
+        let stand_in = app.world_mut().spawn(SwapStandIn::default()).id();
+        // Patches that can never become prepared (they declare no assets at all) and are in view:
+        // only the bound can end this hold.
+        detail_change(&mut app, stand_in);
+
+        for _ in 0..MAX_SWAP_HOLD_FRAMES - 1 {
+            app.update();
+            assert!(alive(&app, stand_in), "held within the bound");
+        }
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .swap_hold_timeouts,
+            0,
+            "the last frame before the bound is not a failure"
+        );
+
+        app.update();
+
+        assert!(!alive(&app, stand_in), "the bound releases the stand-in");
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .swap_hold_timeouts,
+            1,
+            "and the frame is counted"
+        );
+    }
+
+    /// The new root is despawned before its terrain is drawn - the camera left the cell, or the cell
+    /// retired. Nothing waits on the stand-in any more, so it goes with it rather than covering a
+    /// cell nobody asked for. That is a release, not a failure.
+    #[test]
+    fn a_new_root_despawned_releases_the_stand_in() {
+        let mut app = stand_in_app();
+        let stand_in = app.world_mut().spawn(SwapStandIn::default()).id();
+        let (new_root, _patches, _quadrants) = detail_change(&mut app, stand_in);
+        app.update();
+        assert!(alive(&app, stand_in), "the hold is live");
+
+        app.world_mut().entity_mut(new_root).despawn();
+        app.update();
+
+        assert!(
+            !alive(&app, stand_in),
+            "the stand-in follows the root it covered for"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .swap_hold_timeouts,
+            0,
+            "that is a release, not a hold that ran out"
+        );
+    }
+
+    /// A detail change whose new root has no terrain declares no waiting surface, so nothing names
+    /// the stand-in and the hold has nothing to cover: it ends on the first frame the hand-over
+    /// runs, rather than waiting out the bound for a replacement that never comes.
+    #[test]
+    fn a_new_root_without_terrain_releases_at_once() {
+        let mut app = stand_in_app();
+        let stand_in = app.world_mut().spawn(SwapStandIn::default()).id();
+        let _new_root = app.world_mut().spawn_empty().id();
+
+        app.update();
+
+        assert!(
+            !alive(&app, stand_in),
+            "nothing waits, so there is nothing to cover"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .swap_hold_timeouts,
+            0
+        );
     }
 }
