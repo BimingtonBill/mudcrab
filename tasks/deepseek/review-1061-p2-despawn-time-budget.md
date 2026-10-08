@@ -2,13 +2,12 @@
 Review impl-1059, which time-budgets the crossing despawn (Mudcrab engine, Rust/Bevy 0.19, track Phase 2). Decide accept or fix first.
 
 # Context
-- Worktree: D:/Mudcrab/worktrees/p2-impl-1059, branch `phase2/despawn-time-budget`, cut from portal 667483f2. Review `git diff 667483f2..HEAD` plus any uncommitted changes (`git status`, `git diff`).
+- Worktree: D:/Mudcrab/worktrees/p2-impl-1059, branch `phase2/despawn-time-budget`, cut from portal 667483f2. Review `git diff 667483f2..HEAD` (the work is in WIP commit 1eaf79eb, saved after Hermes stopped; later fix commits may follow) plus any uncommitted changes.
 - The brief, which is the contract: C:/Modding/Mudcrab/mudcrab/tasks/impl-1059-p2-despawn-time-budget.md. Measured problem: local/research/portal-crossing-owner-reprofile-2026-10-08.md §3, §4, §7.1.
 - Files: crates/engine/src/streaming.rs (`despawn_cells` around :1471, `retire_backlog_bound` around :1441-1506, `despawn_subtree`, the RenderLayers stamp around :2533, `PortalPrewarm`), config.rs (`max_cell_unloads_per_frame` :218 and the new `max_unload_ms_per_frame` with its CLI flag), profiling.rs.
 
 # Scope
-Read only; change nothing. You may run git read commands and the gated checks:
-`python C:/Users/Brannock/.mudcrab/build-gate/build_gate.py run -- cargo nextest run -p engine --all-targets` (with BUILD_GATE_OWNER=p2, and `df -h /d` first; stop if D: has less than 15 GB free).
+Read only; change nothing. Run git read commands only, and no cargo: the lead runs fmt, clippy and the engine nextest on this head through the build gate at the same time, and will send you their Summary lines if you need them.
 
 # Done when
 You have checked, citing file:line:
