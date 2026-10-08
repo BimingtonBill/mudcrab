@@ -9185,6 +9185,12 @@ mod tests {
             .unwrap()
             .destination
             .clone();
+        // The landing cell is already resident before the first frame (it was requested and
+        // pinned above), so the state this test is about is there from the start; what the first
+        // frames are for is the app catching up with it - the door's cell classified Active and
+        // the plan's window filled - which is what makes the warm view due.
+        update(&mut app, 3);
+        let parent = app.world().get::<ChildOf>(door).map(ChildOf::parent);
 
         let mut frames = 0;
         let mut saw = false;
@@ -9193,8 +9199,11 @@ mod tests {
             // Read before the frame: the plan commits a cell per frame, so the frame the landing
             // cell lands in can be the frame the view has to start on.
             let mid_grid = {
+                let state = app.world().resource::<PortalState>();
+                let classified = parent.is_some_and(|parent| state.roles.contains_key(&parent));
                 let streaming = app.world().resource::<StreamingWorld>();
-                streaming.is_resident(&landing)
+                classified
+                    && streaming.is_resident(&landing)
                     && !destination_is_loaded(&destination, None, Some(streaming))
             };
             app.update();
