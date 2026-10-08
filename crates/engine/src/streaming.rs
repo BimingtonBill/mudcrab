@@ -213,6 +213,28 @@ impl Plugin for StreamingPlugin {
                     end_scene_spawn_batch.after(SceneSpawnerSystems::WorldInstanceSpawn),
                 ),
             );
+        // On a profiled run, the despawns the immediate unload queues through `Commands` are
+        // applied at the schedule's sync point right after `plan_cells` - exactly where Bevy
+        // would insert one on its own (the exclusive `despawn_cells` forces it). These systems
+        // span that apply as `streaming/space_change_unload_apply`: the sync point applies every
+        // command buffer pending at that distance, which on a crossing frame carries the
+        // space-change despawns. A run that is not profiling installs none of this, and the
+        // explicit `ApplyDeferred` is then the same sync point Bevy's own pass inserts.
+        if app
+            .world()
+            .get_resource::<EngineConfig>()
+            .is_some_and(|config| config.profile_output_dir.is_some())
+        {
+            app.init_resource::<SpaceUnloadFlushClock>().add_systems(
+                Update,
+                (
+                    stamp_space_unload_flush.after_ignore_deferred(plan_cells),
+                    bevy::ecs::schedule::ApplyDeferred,
+                    record_space_unload_flush.before(despawn_cells),
+                )
+                    .chain(),
+            );
+        }
         // The world-ready scan walks the whole stream window every frame and only feeds the pacing
         // report, so an ordinary play session installs none of it.
         if app
@@ -1110,13 +1132,23 @@ fn plan_cells(
     prestream: Res<PrestreamCells>,
     origin: Res<RenderOrigin>,
     camera: Query<&Transform, With<StreamingCamera>>,
+    children: Query<&Children>,
     mut streaming: ResMut<StreamingWorld>,
     mut commit_budget: ResMut<StreamingCommitBudget>,
     mut continuity: ResMut<TerrainContinuity>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
+    // Present only on a profiled run, where the plugin installs the apply bracket after this
+    // system: the frame's unloaded-root count tells it whether the sync point carries despawns.
+    unload_flush: Option<ResMut<SpaceUnloadFlushClock>>,
 ) {
     let plan_started = Instant::now();
+    // The immediate-unload span and the subtree counts cost time, so a run that is not
+    // profiling pays none of them (the frame the crossing pays for stays unmeasured there).
+    let measure_space_unload = config.profile_output_dir.is_some();
+    let mut space_unload_ms = 0.0f64;
+    let mut space_unload_roots = 0u64;
+    let mut space_unload_entities = 0u64;
     // Recorded before anything else, so `has_failed` reads the interior the camera is in even on
     // a frame the plan stops early.
     streaming.active_interior = active.interior;
@@ -1348,16 +1380,28 @@ fn plan_cells(
         profiler.event(format!("{key:?}"), "unloaded", None);
         // A loading cell that still draws the root it is replacing loses that root too: it is
         // the only root the cell has. A failed cell that kept its terrain rescue root loses it
-        // the same way - nothing else references it once the entry is gone.
-        match status {
-            CellStatus::Resident { root, .. } => commands.entity(*root).try_despawn(),
-            CellStatus::Retiring { root, .. } => commands.entity(*root).try_despawn(),
-            CellStatus::Loading { replaced, .. } | CellStatus::Failed { replaced, .. } => {
-                if let Some(root) = replaced {
-                    commands.entity(*root).try_despawn();
-                }
+        // the same way - nothing else references it once the entry is gone. Every arm despawns
+        // at most one root, held in one place so the span and the subtree count below see it.
+        let unload_root: Option<Entity> = match status {
+            CellStatus::Resident { root, .. } | CellStatus::Retiring { root, .. } => Some(*root),
+            CellStatus::Loading { replaced, .. } | CellStatus::Failed { replaced, .. } => *replaced,
+        };
+        let unload_started = measure_space_unload.then(Instant::now);
+        if let Some(root) = unload_root {
+            commands.entity(root).try_despawn();
+        }
+        // The entities the queued despawn will remove. Only counted when profiling, because
+        // walking a subtree costs time on the very frame a crossing pays for.
+        if measure_space_unload && let Some(root) = unload_root {
+            space_unload_entities += 1;
+            if children.contains(root) {
+                space_unload_entities += children.iter_descendants(root).count() as u64;
             }
         }
+        if let Some(started) = unload_started {
+            space_unload_ms += started.elapsed().as_secs_f64() * 1000.0;
+        }
+        space_unload_roots += u64::from(unload_root.is_some());
         false
     });
     streaming.pinned = pinned;
@@ -1411,7 +1455,60 @@ fn plan_cells(
     profiler.set_gauge("streaming/loading_cells", metrics.loading_cells as f64);
     profiler.set_gauge("streaming/retiring_cells", metrics.retiring_cells as f64);
     profiler.set_gauge("streaming/terrain_cells", metrics.terrain_cells as f64);
+    // The frame's immediate unload of space-change cells. The span covers only the plan's own
+    // bookkeeping for that branch - the despawns ride `Commands` and are applied (and spanned)
+    // at the sync point after this system, as `streaming/space_change_unload_apply`.
+    if measure_space_unload {
+        profiler.set_gauge(
+            "streaming/space_change_unload_roots",
+            space_unload_roots as f64,
+        );
+        profiler.set_gauge(
+            "streaming/space_change_unload_entities",
+            space_unload_entities as f64,
+        );
+        if space_unload_roots > 0 {
+            profiler.record_ms("streaming/space_change_unload", space_unload_ms);
+        }
+    }
+    if let Some(mut unload_flush) = unload_flush {
+        unload_flush.pending_roots = space_unload_roots;
+    }
     profiler.record_elapsed("streaming/plan_cells", plan_started);
+}
+
+/// The apply bracket around the sync point after [`plan_cells`], and whether this frame's
+/// space-change unload queued despawns into it. Held by the bracket systems that span
+/// `streaming/space_change_unload_apply`, which only exist on a profiled run; [`plan_cells`] fills
+/// `pending_roots` so the span measures only the application that carries despawns, not the empty
+/// sync point of a quiet frame.
+#[derive(Resource, Default)]
+struct SpaceUnloadFlushClock {
+    started: Option<Instant>,
+    pending_roots: u64,
+}
+
+/// Opens the bracket around the schedule's sync point after [`plan_cells`], before its deferred
+/// commands (the space-change despawns among them) are applied.
+fn stamp_space_unload_flush(mut clock: ResMut<SpaceUnloadFlushClock>) {
+    clock.started = Some(Instant::now());
+}
+
+/// Closes the bracket and records `streaming/space_change_unload_apply`: the time the executor
+/// spent applying the pending command buffers at that sync point. A frame whose plan unloaded
+/// nothing records nothing - its sync point is empty.
+fn record_space_unload_flush(
+    mut clock: ResMut<SpaceUnloadFlushClock>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let started = clock.started.take();
+    let carried_despawns = clock.pending_roots > 0;
+    clock.pending_roots = 0;
+    if let Some(started) = started
+        && carried_despawns
+    {
+        profiler.record_elapsed("streaming/space_change_unload_apply", started);
+    }
 }
 
 /// Whether a cell that has left the keep-set leaves it by *distance* - the case the unload pacer
@@ -7085,6 +7182,174 @@ mod tests {
         assert!(
             !lod.contains(&ring_cell),
             "the worldspace just left is unloaded, ring and all"
+        );
+    }
+
+    /// A worldspace change that unloads resident cells records the immediate unload once, with the
+    /// number of roots and the entities in their subtrees, and the queued despawns are applied at
+    /// the explicit sync point the apply bracket spans. The test installs the same bracket the
+    /// plugin installs for a profiled run.
+    #[test]
+    fn a_crossing_frame_records_the_space_change_unload_when_profiling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let config = EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 1,
+            profile_output_dir: Some(directory.path().join("profiles")),
+            ..EngineConfig::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<lod::LodStreaming>()
+            .init_resource::<ActiveSpace>()
+            .init_resource::<ProfilingState>()
+            .init_resource::<SpaceUnloadFlushClock>()
+            .add_systems(
+                Update,
+                (
+                    plan_cells,
+                    stamp_space_unload_flush.after_ignore_deferred(plan_cells),
+                    bevy::ecs::schedule::ApplyDeferred,
+                    record_space_unload_flush.before(despawn_cells),
+                    despawn_cells,
+                )
+                    .chain(),
+            );
+        spawn_camera(&mut app, IVec2::ZERO);
+        let roots: Vec<Entity> = [(0, 0), (1, 0), (0, 1)]
+            .iter()
+            .map(|(grid_x, grid_y)| spawn_mock_cell(&mut app, *grid_x, *grid_y, true))
+            .collect();
+        app.update();
+
+        // The three mock cells are resident inside the camera's keep-set, so the plan leaves them
+        // alone and nothing is unloaded yet.
+        assert!(
+            roots
+                .iter()
+                .all(|root| app.world().get_entity(*root).is_ok())
+        );
+        assert!(
+            app.world()
+                .resource::<ProfilingState>()
+                .span_samples("streaming/space_change_unload")
+                .is_empty()
+        );
+
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 614,
+            interior: None,
+        };
+        app.update();
+
+        let profiler = app.world().resource::<ProfilingState>();
+        assert_eq!(
+            profiler.span_samples("streaming/space_change_unload").len(),
+            1,
+            "the crossing frame records the immediate unload once"
+        );
+        assert_eq!(
+            profiler.gauge("streaming/space_change_unload_roots"),
+            Some(3.0),
+            "the gauge counts the roots the frame unloads"
+        );
+        assert_eq!(
+            profiler.gauge("streaming/space_change_unload_entities"),
+            Some(9.0),
+            "each mock root carries a child and a grandchild"
+        );
+        assert_eq!(
+            profiler
+                .span_samples("streaming/space_change_unload_apply")
+                .len(),
+            1,
+            "the deferred despawns are applied at the spanned sync point"
+        );
+        assert!(
+            roots
+                .iter()
+                .all(|root| app.world().get_entity(*root).is_err()),
+            "the despawns the span brackets really removed the roots"
+        );
+    }
+
+    /// Without profiling, a crossing that unloads cells records no span and no gauge: the counting
+    /// walk and the apply bracket do not exist, and the despawns still happen at Bevy's own sync
+    /// point before the exclusive `despawn_cells`.
+    #[test]
+    fn a_crossing_frame_records_nothing_without_profiling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let config = EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 1,
+            ..EngineConfig::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<lod::LodStreaming>()
+            .init_resource::<ActiveSpace>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, (plan_cells, despawn_cells).chain());
+        spawn_camera(&mut app, IVec2::ZERO);
+        let roots: Vec<Entity> = [(0, 0), (1, 0), (0, 1)]
+            .iter()
+            .map(|(grid_x, grid_y)| spawn_mock_cell(&mut app, *grid_x, *grid_y, true))
+            .collect();
+        app.update();
+
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 614,
+            interior: None,
+        };
+        app.update();
+
+        let profiler = app.world().resource::<ProfilingState>();
+        assert!(
+            profiler
+                .span_samples("streaming/space_change_unload")
+                .is_empty()
+        );
+        assert!(
+            profiler
+                .span_samples("streaming/space_change_unload_apply")
+                .is_empty()
+        );
+        assert!(
+            profiler
+                .gauge("streaming/space_change_unload_roots")
+                .is_none()
+        );
+        assert!(
+            roots
+                .iter()
+                .all(|root| app.world().get_entity(*root).is_err()),
+            "the unload still happens, only unmeasured"
         );
     }
 

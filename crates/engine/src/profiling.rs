@@ -32,7 +32,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -308,7 +308,138 @@ impl Plugin for ProfilingPlugin {
                 First,
                 drain_render_cycles.after(render_timing::start_main_world),
             );
+            // PreUpdate's asset work, split: `assets/load_finalize` brackets Bevy's
+            // `handle_internal_asset_events` (the load-finalize drain), and `assets/handle_drop`
+            // brackets the `AssetTrackingSystems` set (the per-type `track_assets` systems that
+            // process handle drops - all asset types, ours and Bevy's). Only installed for a run
+            // that profiles; an ordinary run's PreUpdate is unchanged.
+            app.init_resource::<AssetSpanClock>().add_systems(
+                PreUpdate,
+                (
+                    begin_asset_load_finalize.before(bevy::asset::handle_internal_asset_events),
+                    end_asset_load_finalize
+                        .after(bevy::asset::handle_internal_asset_events)
+                        .before(bevy::asset::publish_asset_server_diagnostics),
+                    begin_asset_handle_drop.before(bevy::asset::AssetTrackingSystems),
+                    end_asset_handle_drop.after(bevy::asset::AssetTrackingSystems),
+                )
+                    .chain(),
+            );
+            // The render side of a crossing: the `RenderSystems::ExtractCommands` set applies the
+            // extract schedule's commands on the render world - the closest marker-system bracket
+            // around render-world removal. The two markers time it on the render thread into the
+            // bridge below, and `drain_extract_commands_apply` records it here.
+            let bridge = ExtractCommandsApplyBridge::default();
+            app.insert_resource(bridge.clone());
+            if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+                render_app
+                    .insert_resource(bridge)
+                    .init_resource::<ExtractCommandsApplyClock>()
+                    .add_systems(
+                        bevy::render::Render,
+                        (
+                            begin_extract_commands_apply
+                                .before(bevy::render::RenderSystems::ExtractCommands),
+                            end_extract_commands_apply
+                                .after(bevy::render::RenderSystems::ExtractCommands)
+                                .before(bevy::render::RenderSystems::PrepareAssets),
+                        ),
+                    );
+            }
+            app.add_systems(Update, drain_extract_commands_apply);
         }
+    }
+}
+
+/// When the two PreUpdate asset markers opened their brackets. Held by the marker systems that
+/// span `assets/load_finalize` and the two that span `assets/handle_drop`, which only exist on a
+/// profiled run.
+#[derive(Resource, Default)]
+struct AssetSpanClock {
+    load_finalize_started: Option<Instant>,
+    handle_drop_started: Option<Instant>,
+    /// The markers' order within the frame, for the PreUpdate-order test only (compiled out
+    /// otherwise).
+    #[cfg(test)]
+    order: Vec<&'static str>,
+}
+
+/// Opens `assets/load_finalize` before Bevy's `handle_internal_asset_events` runs.
+fn begin_asset_load_finalize(mut clock: ResMut<AssetSpanClock>) {
+    clock.load_finalize_started = Some(Instant::now());
+    #[cfg(test)]
+    clock.order.push("assets/load_finalize/begin");
+}
+
+/// Closes `assets/load_finalize` after Bevy's `handle_internal_asset_events`, which is where
+/// bevy_asset finalizes finished loads (and walks hot-reload ancestors when watching).
+fn end_asset_load_finalize(
+    mut clock: ResMut<AssetSpanClock>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if let Some(started) = clock.load_finalize_started.take() {
+        profiler.record_elapsed("assets/load_finalize", started);
+    }
+    #[cfg(test)]
+    clock.order.push("assets/load_finalize/end");
+}
+
+/// Opens `assets/handle_drop` before the `AssetTrackingSystems` set (the per-type `track_assets`
+/// systems, which process handle drops for every registered asset type) runs.
+fn begin_asset_handle_drop(mut clock: ResMut<AssetSpanClock>) {
+    clock.handle_drop_started = Some(Instant::now());
+    #[cfg(test)]
+    clock.order.push("assets/handle_drop/begin");
+}
+
+/// Closes `assets/handle_drop` after the `AssetTrackingSystems` set.
+fn end_asset_handle_drop(mut clock: ResMut<AssetSpanClock>, mut profiler: ResMut<ProfilingState>) {
+    if let Some(started) = clock.handle_drop_started.take() {
+        profiler.record_elapsed("assets/handle_drop", started);
+    }
+    #[cfg(test)]
+    clock.order.push("assets/handle_drop/end");
+}
+
+/// Nanoseconds the render world's `RenderSystems::ExtractCommands` bracket measured in its latest
+/// frame. The bracket's markers run on the render thread; this bridge carries the number to the
+/// main world, where `drain_extract_commands_apply` records it as a span. Zero once drained, or
+/// while the render app is absent (a run without a renderer).
+#[derive(Resource, Clone, Default)]
+struct ExtractCommandsApplyBridge(Arc<AtomicU64>);
+
+/// When the render-side bracket opened. A resource of the render app only.
+#[derive(Resource, Default)]
+struct ExtractCommandsApplyClock(Option<Instant>);
+
+/// Opens the render-side bracket before the `RenderSystems::ExtractCommands` set applies the
+/// extract schedule's commands on the render world.
+fn begin_extract_commands_apply(mut clock: ResMut<ExtractCommandsApplyClock>) {
+    clock.0 = Some(Instant::now());
+}
+
+/// Closes the render-side bracket and hands the elapsed time to the main world.
+fn end_extract_commands_apply(
+    mut clock: ResMut<ExtractCommandsApplyClock>,
+    bridge: Res<ExtractCommandsApplyBridge>,
+) {
+    if let Some(started) = clock.0.take() {
+        bridge
+            .0
+            .store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Records the render side's latest bracket measurement as `render/extract_commands_apply`.
+/// The render thread measures asynchronously, so a frame's read may describe the previous
+/// render frame's bracket (the same fuzziness the render diagnostics' readback has).
+fn drain_extract_commands_apply(
+    bridge: Res<ExtractCommandsApplyBridge>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let nanos = bridge.0.swap(0, Ordering::Relaxed);
+    if nanos > 0 {
+        profiler.record_ms("render/extract_commands_apply", nanos as f64 / 1_000_000.0);
     }
 }
 
@@ -439,6 +570,12 @@ impl ProfilingState {
 
     pub fn set_gauge(&mut self, name: impl Into<String>, value: f64) {
         self.gauges.insert(name.into(), value);
+    }
+
+    /// The last value a gauge was set to, for the span tests.
+    #[cfg(test)]
+    pub fn gauge(&self, name: &str) -> Option<f64> {
+        self.gauges.get(name).copied()
     }
 
     pub fn event(
@@ -2576,5 +2713,98 @@ lights/budget,physics/step"
             metadata.get("commit").is_none(),
             "the fields the fingerprint duplicates must not be written twice"
         );
+    }
+
+    /// The PreUpdate asset markers run exactly around bevy_asset's systems: `assets/load_finalize`
+    /// brackets `handle_internal_asset_events` and `assets/handle_drop` brackets the
+    /// `AssetTrackingSystems` set. Four probes pin the markers against Bevy's own systems with
+    /// explicit edges, and the frame's marker log must read as the two spans around them.
+    #[test]
+    fn preupdate_asset_markers_run_around_bevy_asset_systems() {
+        /// A probe logs its own name into the same clock record the markers write, so the frame's
+        /// order reads as the spans around bevy_asset's systems. The probes share the markers' two
+        /// resource parameters, so every conflicting pair is ordered by an explicit edge.
+        fn probe(name: &'static str) -> impl FnMut(ResMut<AssetSpanClock>) {
+            move |mut clock: ResMut<AssetSpanClock>| clock.order.push(name)
+        }
+
+        #[derive(Asset, TypePath)]
+        struct TestSpanAsset;
+
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            profile_output_dir: Some(std::path::PathBuf::from("profiles")),
+            ..EngineConfig::default()
+        });
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        // `sample_scene_inventory` reads these two stores, and a registered type puts a real
+        // `track_assets` system in the tracked set for the handle-drop bracket.
+        app.init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<TestSpanAsset>();
+        app.add_plugins(ProfilingPlugin);
+        app.add_systems(
+            PreUpdate,
+            (
+                probe("before_internal")
+                    .after(begin_asset_load_finalize)
+                    .before(bevy::asset::handle_internal_asset_events),
+                probe("after_internal")
+                    .after(bevy::asset::handle_internal_asset_events)
+                    .before(end_asset_load_finalize),
+                probe("before_track")
+                    .after(begin_asset_handle_drop)
+                    .before(bevy::asset::AssetTrackingSystems),
+                probe("after_track")
+                    .after(bevy::asset::AssetTrackingSystems)
+                    .before(end_asset_handle_drop),
+            ),
+        );
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<AssetSpanClock>().order.clone(),
+            [
+                "assets/load_finalize/begin",
+                "before_internal",
+                "after_internal",
+                "assets/load_finalize/end",
+                "assets/handle_drop/begin",
+                "before_track",
+                "after_track",
+                "assets/handle_drop/end",
+            ],
+            "the markers bracket bevy_asset's load finalize and its handle-drop tracking"
+        );
+        assert!(
+            !app.world()
+                .resource::<ProfilingState>()
+                .span_samples("assets/load_finalize")
+                .is_empty(),
+            "the bracket between the markers was measured"
+        );
+        assert!(
+            !app.world()
+                .resource::<ProfilingState>()
+                .span_samples("assets/handle_drop")
+                .is_empty(),
+            "the bracket between the markers was measured"
+        );
+    }
+
+    /// Without profiling, the PreUpdate asset markers do not exist and nothing is recorded: an
+    /// ordinary run's PreUpdate is unchanged.
+    #[test]
+    fn no_asset_spans_without_profiling() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default());
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<Mesh>().init_asset::<Image>();
+        app.add_plugins(ProfilingPlugin);
+        app.update();
+
+        let profiler = app.world().resource::<ProfilingState>();
+        assert!(profiler.span_samples("assets/load_finalize").is_empty());
+        assert!(profiler.span_samples("assets/handle_drop").is_empty());
     }
 }
