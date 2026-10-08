@@ -746,7 +746,16 @@ fn update_atmosphere(
     // nothing.
     if *far_space != Some(key) {
         *far_space = Some(key);
-        let far = camera_far_plane(config.stream_radius, terrain_radius);
+        // A worldspace whose LOD horizon is already known (it is kept through an interior and
+        // across crossings) gets the LOD's own far plane back at once: waiting for the next LOD
+        // query to extend it would clip the distant terrain for the frames in between.
+        let ring_far = camera_far_plane(config.stream_radius, terrain_radius);
+        let far = match lod_reach {
+            Some(_) if active.interior.is_none() => ring_far.max(
+                crate::streaming::lod::lod_camera_far(config.terrain_lod.max_reach_cells()),
+            ),
+            _ => ring_far,
+        };
         for mut projection in &mut projections {
             if let Projection::Perspective(perspective) = &mut *projection
                 && perspective.far != far
@@ -1881,6 +1890,32 @@ mod tests {
             camera_far(&app),
             horizon,
             "the LOD's own far plane survives the frame its horizon is written"
+        );
+
+        // Out into the worldspace without LOD and back: the horizon of the LOD worldspace is
+        // known, so its far plane is the LOD's again on the frame of the crossing, not only once
+        // the next LOD query answers.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 60,
+            interior: None,
+        };
+        app.update();
+        assert_eq!(camera_far(&app), ring_far);
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 614,
+            interior: None,
+        };
+        app.update();
+        let lod_reach_far =
+            crate::streaming::lod::lod_camera_far(config.terrain_lod.max_reach_cells());
+        assert_eq!(
+            camera_far(&app),
+            lod_far.max(lod_reach_far),
+            "crossing back into a worldspace whose horizon is known restores the LOD's far plane"
+        );
+        assert!(
+            lod_reach_far > lod_far,
+            "the LOD reaches past the ring-off plane"
         );
     }
 
