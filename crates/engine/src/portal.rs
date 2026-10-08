@@ -581,6 +581,33 @@ impl Plugin for PortalPlugin {
                     .after(SimulationLightSystems::UpdateDirectionalLightCascades)
                     .before(SimulationLightSystems::UpdateLightFrusta),
             );
+        // On a profiled run only, the sync point after `isolate_cells` is spanned as
+        // `portal/frame_apply`. The classification writes a role flip as deferred commands - a
+        // `Propagate<RenderLayers>` and a `CellRoleStamp` per re-stamped root, a `Propagate` per
+        // own-layer source - so the frame a crossing flips every cell's role pays for those
+        // component writes at that sync point, not inside the system the report already spans as
+        // `portal/isolate`. It is the portal side of what 1077's `streaming/space_change_unload_apply`
+        // measures on the streaming side, and part of the frame analysis-1103 §4 leaves unattributed.
+        //
+        // The bracket sits exactly where Bevy's own pass inserts the sync point on the
+        // `isolate_cells` -> `gate_cell_colliders` edge (`after_ignore_deferred` stops it inserting
+        // a second one there), so a profiled run's schedule is the unmeasured one's - only the
+        // measurement is added. An ordinary run installs none of it.
+        if app
+            .world()
+            .get_resource::<EngineConfig>()
+            .is_some_and(|config| config.profile_output_dir.is_some())
+        {
+            app.init_resource::<PortalFrameFlushClock>().add_systems(
+                Update,
+                (
+                    stamp_portal_frame_flush.after_ignore_deferred(isolate_cells),
+                    bevy::ecs::schedule::ApplyDeferred,
+                    record_portal_frame_flush.before(gate_cell_colliders),
+                )
+                    .chain(),
+            );
+        }
         // The doorway composited by depth (impl-211's spike, the default since impl-227): the quad
         // above gets the composite's material. `--portal-depth-composite=off` keeps the plain
         // quad, for comparison.
@@ -3633,7 +3660,13 @@ fn isolate_cells(
     mut state: ResMut<PortalState>,
     mut registry: ResMut<CellLayerSources>,
     mut profiler: ResMut<ProfilingState>,
+    // Present only on a profiled run, where the plugin installs the apply bracket after this
+    // system: the frame's own write count tells it whether the sync point carries the flip.
+    mut frame_flush: Option<ResMut<PortalFrameFlushClock>>,
 ) {
+    if let Some(clock) = frame_flush.as_deref_mut() {
+        clock.pending_writes = 0;
+    }
     let (Some(active), Some(config), Some(origin)) = (active, config, origin) else {
         return;
     };
@@ -3866,6 +3899,52 @@ fn isolate_cells(
     profiler.increment("portal/cells_relayered", cells_stamped);
     profiler.increment("portal/nodes_relayered", nodes_stamped);
     profiler.record_elapsed("portal/isolate", started);
+    // The writes the bracket after this system applies: the roots whose role was stamped and the
+    // own-layer nodes written for them. Zero on a frame nothing flipped, which is what keeps that
+    // frame's empty sync point out of `portal/frame_apply`.
+    if let Some(mut clock) = frame_flush {
+        clock.pending_writes = cells_stamped.saturating_add(nodes_stamped);
+    }
+}
+
+/// The apply bracket around the sync point after [`isolate_cells`], and how many layer writes that
+/// system queued into it. Held by the bracket systems that span `portal/frame_apply`, which only
+/// exist on a profiled run; [`isolate_cells`] fills `pending_writes` so the span measures only an
+/// apply that carries this frame's role flip, not the empty sync point of a quiet frame.
+///
+/// A role flip is written as deferred commands - one `Propagate<RenderLayers>` and one
+/// [`CellRoleStamp`] per re-stamped root, one `Propagate` per own-layer source - so the frame the
+/// classification changes is the frame those component writes are applied at the sync point, not
+/// the frame the system runs in. A crossing flips every cell's role at once, which is why the
+/// frame it lands on needs its own bracket: it is the portal side of what the 1077 unload apply
+/// measures on the streaming side (analysis-1103 §4 leaves that frame's `Update` unattributed).
+#[derive(Resource, Default)]
+struct PortalFrameFlushClock {
+    started: Option<Instant>,
+    pending_writes: u64,
+}
+
+/// Opens the bracket around the schedule's sync point after [`isolate_cells`], before its deferred
+/// role, visibility and layer writes are applied.
+fn stamp_portal_frame_flush(mut clock: ResMut<PortalFrameFlushClock>) {
+    clock.started = Some(Instant::now());
+}
+
+/// Closes the bracket and records `portal/frame_apply`: the time the executor spent applying the
+/// command buffers pending at that sync point. A frame whose classification stamped nothing
+/// records nothing - its sync point is empty.
+fn record_portal_frame_flush(
+    mut clock: ResMut<PortalFrameFlushClock>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let started = clock.started.take();
+    let carried_writes = clock.pending_writes > 0;
+    clock.pending_writes = 0;
+    if let Some(started) = started
+        && carried_writes
+    {
+        profiler.record_elapsed("portal/frame_apply", started);
+    }
 }
 
 /// The role each cell root's colliders were last left in, so [`gate_cell_colliders`] walks a root's

@@ -572,6 +572,25 @@ impl ProfilingState {
         self.gauges.insert(name.into(), value);
     }
 
+    /// Records a gauge that keeps the **largest** value the run saw, rather than the last.
+    ///
+    /// [`ProfilingState::set_gauge`] is "the value now", and the report keeps the run's last one,
+    /// which is right for a counter that describes the end of the run (the resident, loading and
+    /// retiring cell counts). It is wrong for a per-frame count that is only ever nonzero on a
+    /// spike: a door crossing's unloaded roots and entities are counted on the crossing frame and
+    /// are zero on every frame after it, so the last value the report reads is always zero and the
+    /// crossing cannot be sized from it (analysis-1103 §0: `streaming/space_change_unload_roots`
+    /// and `_entities` read 0.0 in every run of the A1 window). A max keeps the crossing's own size
+    /// whatever the run did afterwards.
+    ///
+    /// The two are the same map, so the report's gauge section reads either without a change; a
+    /// gauge that is only ever set through this method is a run-level maximum, and one set through
+    /// `set_gauge` is a last value. A name must not be set through both: the last write would win.
+    pub fn set_max_gauge(&mut self, name: impl Into<String>, value: f64) {
+        let entry = self.gauges.entry(name.into()).or_insert(f64::NEG_INFINITY);
+        *entry = entry.max(value);
+    }
+
     /// The last value a gauge was set to, for the span tests.
     #[cfg(test)]
     pub fn gauge(&self, name: &str) -> Option<f64> {
