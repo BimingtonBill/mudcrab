@@ -70,7 +70,15 @@ Track: Portal. Nothing pushed. Wrapping up at the user's word (via Team Lead).
   so portal needs a skip-at-extract mechanism first.
 - Disk: with the user's yes I deleted target/ of the merged coders 1075 and 1088 (~19 GB). The window data was saved
   to local/review/portal-1075-window-2026-10-08/.
-- Next: read 1092's verdict, then merge 1085 or fix; the morning window for 1088+1093; resume 1094; then the B3 window.
+- analysis-1092 verdict: room culling is NOT safe as a default on portal data. 24 of 25 poses are pixel-identical, but
+  BleakFallsBarrow01 (cell 0x371DE, pose room1-c) loses 127,216 px (8.7% of the frame): a whole visible structure.
+  It is deterministic, and 3 player-height poses lose 4-13%. Cause: room 234060 is a 6,976-unit hall with no portal
+  and one room_links edge; its neighbour down the hall sits 512 units past its box (> the 8-unit overlap tolerance),
+  so the reachability walk never gets past it. This is a #188 (phase2/room-culling) logic gap: open cave geometry
+  that joins rooms without a door reference. Evidence: D:/Mudcrab/scratch/portal-roomcull-image/diff/ and summary.md.
+  Side finding: a --shots run can time out with cell_resident=false and write blank PNGs after 30 s.
+  1085 stays unmerged.
+- Next: the #188 culling gap goes to Phase 2 Dev (fix on a phase2 branch); the morning window for 1088+1093; resume 1094; then the B3 window.
 
 ## 2026-10-08 Portal Dev (fixes merged, R2 laps read: views not submit/present)
 
