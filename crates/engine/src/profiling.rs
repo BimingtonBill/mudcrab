@@ -466,7 +466,9 @@ impl ProfilingState {
     /// Both halves are what keep a row's spans and its duration about the same frame. The row is
     /// opened in `First` and stays open for the whole frame, so every span recorded between this
     /// frame's `First` and the next one lands in this row — and the row carries the same frame
-    /// number the timeline's events carry, which `sample_frame` advances at the frame's end. The
+    /// number the timeline's events carry, which `sample_frame` advances at the frame's end, which
+    /// is also the join to `render-cycles.csv`: the cycle whose window this row's spans were
+    /// recorded in is numbered one above it (see [`ProfilingState::render_cycles_csv`]). The
     /// duration is the same story one frame later: the frame time that ends this frame is only
     /// measured at the *next* frame's `First`, where [`begin_frame_series`] reads it and this
     /// closes the row it belongs to. The run's last row is therefore left without one.
@@ -528,18 +530,26 @@ impl ProfilingState {
     /// The per-cycle series as CSV: the header naming every column, then one row per cycle in the
     /// order the cycles ran.
     ///
-    /// Row `n` is main-thread cycle `n`: from the start of main frame `n` to the start of frame
-    /// `n + 1`. Its `render_thread` and phase columns are the render schedule that ran *during*
-    /// that cycle — the one fed by extract `n - 1` when rendering is pipelined, because the render
-    /// schedule that follows the extract of main frame `n` runs during cycle `n + 1` — so a row
-    /// reads against the `frame-series.csv` row with the same number, and a crossing frame's
-    /// `render_thread` time is explained by its own row's phases. Its two clock columns are the
-    /// wall lap from one `First` to the next, measured on the main thread, and the `Time<Real>`
-    /// delta the next `First` read — the same render-paced reading the joined `frame-series.csv`
-    /// row's `real_ms` carries, so the skew between the two clocks is quantifiable per cycle
-    /// instead of assumed. A side the cycle did not measure stays an empty column, and the run's
-    /// last cycle or two are absent: their remainder window never closed, and with it neither
-    /// clock column.
+    /// Row `n` is main-thread cycle `n`: the window from the `First` of one main frame to the next
+    /// frame's `First`. Its two clock columns are the wall lap between the two `First`s, measured
+    /// on the main thread — the number the row's own sides account for — and the `Time<Real>` delta
+    /// the closing `First` read, which under pipelined rendering is render-paced and lagged, kept
+    /// beside the wall lap so the skew between the two clocks is quantifiable per cycle instead of
+    /// assumed.
+    ///
+    /// Cycles are counted from one while the per-frame series' rows are counted from zero, so the
+    /// row for cycle `n` joins the `frame-series.csv` row numbered `n - 1` — the frame whose window
+    /// the cycle is — not the row with the same number, which would place every crossing spike one
+    /// frame late. That row's `real_ms` confirms the join: it is the same `Time<Real>` reading,
+    /// taken at the `First` that closed the window.
+    ///
+    /// The `render_thread` and phase columns are the render schedule that ran *during* the cycle —
+    /// under pipelined rendering the one fed by the previous window's extract, because the render
+    /// schedule that follows a window's extract runs in the next window; without it the one fed by
+    /// this window's own extract — so a crossing frame's `render_thread` time is explained by its
+    /// own cycle's phases. A side the cycle did not measure stays an empty column, and the run's
+    /// last cycle or two are absent: their remainder window never closed, and with it neither clock
+    /// column.
     fn render_cycles_csv(&self) -> String {
         let mut csv = String::with_capacity(224 + self.render_cycles.len() * 176);
         csv.push_str("cycle");
@@ -2222,6 +2232,77 @@ lights/budget,physics/step"
             profiler.render_cycles.back().unwrap().0,
             MAX_RENDER_CYCLE_ROWS as u64 + 9
         );
+    }
+
+    /// The join between the two files, driven at the API the two systems sit on: the per-frame
+    /// series opens a row per frame with [`ProfilingState::begin_frame`], passed the frame's
+    /// `Time<Real>` delta as `begin_frame_series` does, and advances the number the next row
+    /// carries in `sample_frame`, as `collect_and_finish` does at the frame's end; the cycles are
+    /// numbered by the render timings' `start_main`/`end_main` — the methods the plugin's systems
+    /// call — and handed over through `take_completed_cycles` and
+    /// [`ProfilingState::extend_render_cycles`], as the drain system does.
+    ///
+    /// Cycle `n` joins the frame row numbered `n - 1`: cycles are counted from one, frame rows from
+    /// zero. The two `real_ms` columns are equal across that join — both are the reading the frame
+    /// that closed the window took — and the rows the same number would match carry neighbouring
+    /// frames' readings instead, so the join cannot be read as equal numbers.
+    #[test]
+    fn a_cycle_row_joins_the_frame_series_row_one_below_it() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        let timings = crate::render_timing::RenderTimings::default();
+        timings.set_cycle_tracking(true, true);
+        // One delta per frame, all different, as a real run's `Time<Real>` readings are: the
+        // same-number mistake would compare two of them.
+        for delta_ms in [16.0, 17.5, 12.25, 21.0] {
+            profiler.begin_frame(delta_ms);
+            timings.start_main(delta_ms);
+            timings.end_main();
+            profiler.sample_frame(&diagnostics, None, true, true);
+            profiler.extend_render_cycles(timings.take_completed_cycles());
+        }
+
+        let rows: Vec<(u64, Option<f32>)> = profiler
+            .frame_series
+            .iter()
+            .map(|row| (row.frame, row.real_ms))
+            .collect();
+        let real_ms_of = |number: u64| {
+            rows.iter()
+                .find(|(frame, _)| *frame == number)
+                .and_then(|(_, real_ms)| *real_ms)
+        };
+        assert_eq!(
+            profiler
+                .render_cycles
+                .iter()
+                .map(|(cycle, _)| *cycle)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "a four-frame run completes three cycles, numbered from one"
+        );
+        for (cycle, sides) in &profiler.render_cycles {
+            let real_ms = sides
+                .real_ms
+                .expect("the `First` that closed the window read the clock");
+            let number = *cycle - 1;
+            let row_real_ms = real_ms_of(number).unwrap_or_else(|| {
+                panic!("no closed frame-series row numbered {number}: {rows:?}")
+            });
+            assert!(
+                (row_real_ms as f64 - real_ms).abs() < 0.1,
+                "cycle {cycle} joins the frame row numbered {number}: {row_real_ms} vs {real_ms}"
+            );
+            // The row the cycle number matches is the next frame's row, or none at all when the run
+            // has not closed it: never this cycle's window.
+            if let Some(same_number) = real_ms_of(*cycle) {
+                assert!(
+                    (same_number as f64 - real_ms).abs() > 0.5,
+                    "the row numbered {cycle} is a neighbouring frame's reading: {same_number} vs \
+                     {real_ms}"
+                );
+            }
+        }
     }
 
     #[test]

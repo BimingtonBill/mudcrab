@@ -11,7 +11,11 @@
 //! * `extract`: the extract step itself, on the main thread.
 //! * `render_thread`: the render schedule, and its phases between Bevy's `RenderSystems` sets:
 //!   `render/extract_commands_and_assets`, `render/specialize_and_views`, `render/queue`,
-//!   `render/prepare`, `render/graph_and_present`, `render/cleanup`.
+//!   `render/prepare`, `render/graph_and_present`, `render/cleanup`. The phases are a lower-bound
+//!   decomposition of `render_thread`, not a partition of it: each is the marked gap between two of
+//!   those sets, so the unmarked time — from the start of the render frame to the first lap and
+//!   between laps — belongs to no phase, and their sum is at most `render_thread`. The swapchain
+//!   wait sits inside `render/prepare`.
 //! * `render/swapchain_acquire`: from just before `prepare_windows` to just after it, an upper
 //!   bound on the wait for a swapchain image (where a GPU-bound frame shows up on the CPU).
 //!
@@ -28,9 +32,11 @@
 //!   the main schedule, the extract, the render schedule and the swapchain wait that ran in that
 //!   cycle, so `frame_budget` can say which side owned a frame that went over its budget. A cycle is
 //!   the time from the start of one main frame to the start of the next, which is what a frame time
-//!   measures. With pipelined rendering the render schedule that follows the extract of main frame
-//!   `n` runs during cycle `n + 1` (alongside main frame `n + 1`), so it is filed under `n + 1`;
-//!   without it the render schedule runs inside cycle `n`. See [`CycleSides`].
+//!   measures; cycles are counted from one, the counter having started at zero with no window open,
+//!   so a run's first recorded window is cycle 1. With pipelined rendering the render schedule that
+//!   follows a window's extract runs during the next window (alongside the frame after the one that
+//!   extracted), so it is filed under the next cycle; without it the render schedule runs inside its
+//!   own window's cycle. See [`CycleSides`].
 //!
 //! * `wall_cycle_ms` and `real_ms`: the per-cycle record carries two clocks. `wall_cycle_ms` is
 //!   the lap from this cycle's `First` to the next's, measured on the main thread — the number
@@ -49,8 +55,11 @@
 //!   (`local/research/portal-crossing-frames-895-2666-2026-10-08.md`). Kept only while cycles are
 //!   tracked (a benchmark run); on top of that it is sampled as `frame/remainder` while recording.
 //!   The per-cycle records are also handed over as rows for the profile bundle's
-//!   `render-cycles.csv` (see `profiling`), which joins a `frame-series.csv` row with the same
-//!   frame number under the `n → n + 1` offset described above.
+//!   `render-cycles.csv` (see `profiling`). Cycles are counted from one while the per-frame series'
+//!   rows are counted from zero, so the row for cycle `n` joins the `frame-series.csv` row numbered
+//!   `n - 1` — the frame whose window the cycle is — not the row with the same number, which would
+//!   place every crossing spike one frame late. The two files' `real_ms` columns confirm that join:
+//!   both are the `Time<Real>` delta the `First` that closed the window read.
 
 use bevy::{
     app::{First, Last},
@@ -493,7 +502,10 @@ impl RenderTimings {
         }
     }
 
-    fn start_main(&self, real_ms: f64) {
+    /// Opens the cycle this `First` begins and closes the previous one's clocks (what
+    /// [`start_main_world`] calls). `pub(crate)` so the join test between the two series' rows can
+    /// drive the cycle numbering directly, without a render app.
+    pub(crate) fn start_main(&self, real_ms: f64) {
         let now = Instant::now();
         let mut state = self.state();
         if let Some(started) = state.remainder_started.take() {
@@ -508,8 +520,9 @@ impl RenderTimings {
         // The cycle that just ended takes its clocks, both closed by this `First` because a
         // cycle's duration is only known once the next one begins (as with the per-frame series'
         // rows): the wall lap from its own `First` to this one, measured on the main thread, and
-        // the `Time<Real>` delta this `First` read — the same render-paced reading the per-frame
-        // series' row carries, so the two files join clock for clock.
+        // the `Time<Real>` delta this `First` read — the same render-paced reading the joined
+        // `frame-series.csv` row carries, the row numbered one below this cycle, so the two files
+        // join clock for clock.
         if state.track_cycles {
             let cycle = state.cycle;
             if let Some(started) = state.cycle_started.take() {
@@ -529,7 +542,9 @@ impl RenderTimings {
         state.cycle += 1;
     }
 
-    fn end_main(&self) {
+    /// Closes the cycle this frame's main schedule ran in (what [`end_main_world`] calls);
+    /// `pub(crate)` beside [`RenderTimings::start_main`].
+    pub(crate) fn end_main(&self) {
         let mut state = self.state();
         if let Some(started) = state.main_started.take() {
             let elapsed = started.elapsed();
@@ -1156,5 +1171,54 @@ mod tests {
         // The ledger still finds its record; the rows are not handed over twice.
         assert!(timings.take_previous_cycle().is_some());
         assert!(timings.take_completed_cycles().is_empty());
+    }
+
+    /// A phase write that lands in a cycle after it was handed over cannot put its row into the
+    /// series a second time: the take starts above the ledger's high-water mark, so the file never
+    /// carries two rows for one cycle and a later take yields the cycles after it alone.
+    #[test]
+    fn a_late_write_to_a_handed_over_cycle_cannot_duplicate_its_row() {
+        let timings = RenderTimings::default();
+        // Not pipelined: the render frame is filed under the cycle its extract belongs to, so the
+        // late laps below reach a cycle that is already handed over. (Pipelined, a render frame is
+        // always filed under the next cycle, which no take has closed yet.)
+        timings.set_cycle_tracking(true, false);
+        timings.start_main(0.0);
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.start_main(0.0); // cycle 2 begins: cycle 1 is complete
+        let rows = timings.take_completed_cycles();
+        assert_eq!(
+            rows.iter().map(|(cycle, _)| *cycle).collect::<Vec<_>>(),
+            vec![1],
+            "cycle 1 is handed over"
+        );
+
+        // A late render frame of cycle 1's extract laps after the hand-over, which writes into
+        // cycle 1 again (the series' mirror takes the row it can still write).
+        timings.start_render();
+        timings.lap(QUEUE);
+        timings.lap(PREPARE);
+        timings.end_render();
+        assert!(
+            timings.take_completed_cycles().is_empty(),
+            "a late write to cycle 1 cannot hand its row over a second time"
+        );
+
+        // The next take yields cycle 2 alone, carrying cycle 2's own record rather than the late
+        // write's, and cycle 1 is not handed over again.
+        timings.end_main();
+        timings.extracted(Duration::from_millis(1));
+        timings.start_main(0.0); // cycle 3 begins: cycle 2 is complete
+        let rows = timings.take_completed_cycles();
+        assert_eq!(
+            rows.iter().map(|(cycle, _)| *cycle).collect::<Vec<_>>(),
+            vec![2],
+            "only the newly completed cycle is handed over"
+        );
+        assert!(
+            rows[0].1.queue_ms.is_none() && rows[0].1.wall_ms.is_some(),
+            "the row is cycle 2's own record, not the late write to cycle 1"
+        );
     }
 }
