@@ -3,6 +3,21 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 (late) Phase 2 Dev: #1055 C1 slices started, window moved to tomorrow
+
+Track: Phase 2. Nothing pushed. Wrap-up asked by Team Lead (the user) at ~22:50; no timing window tonight.
+
+- **impl-1059 (unload pacer):** in portal (e2038dc1) with the CONDITION that the walked drain-visibility probe passes before anything goes upstream. Probe still to run (tomorrow's window).
+- **impl-1060 / 1060.1 / 1077:** on `phase2/asset-load-pacing` 98fd43e6, `phase2/prewarm-waits-on-loads` e2f30be5, `phase2/crossing-spans` 80d72135; all tested (1153/1153, 345/345, 1150/1150) and reviewed (1079, 1080). Combined on `p2/window-2026-10-08` (D:/Mudcrab/worktrees/p2-window); release binary KEPT at D:/Mudcrab/builds/p2-window-target/release/engine.exe (d1805d12). Plan: local/plans/p2-timing-window-2026-10-08.md (cap 0/8/32, unload ms 0 vs 3, spans, drain probe; no reflection pricing). Moved to tomorrow morning; merge into portal follows the results and Team Lead's call.
+- **#1055 terrain holes (design-1091 approved, settle timeout = hard failure):**
+  - C1+C5 impl-1095 (DeepSeek): WIP commit 0beedbc0 on `phase2/terrain-drawn-bridge` (worktree local/impl/impl-1095-p2-terrain-drawn-bridge). Builds, engine nextest 1171/1171, but clippy -D warnings has 4 errors (one drop_non_drop). Not diff-reviewed yet. Report: local/agents/runs/impl-1095-p2-terrain-drawn-bridge.1/report.md (risk notes: extract-time read latency, FRAME_SERIES_COLUMNS 11->15).
+  - C6.1 impl-1096 (Claude Sonnet): 2287a1f3 on `phase2/terrain-less-cell-counter` (worktree .claude/worktrees/agent-a9985bbb97410d1d0): `full_cells_without_terrain` counter + `TerrainLess` marker + validator check; fmt/clippy clean, nextest 1168/1168. Diff read by me: sound. Needs the batch reviewer.
+  - C3+C4 wait on C1. C2 (lod.rs) waits for Upstream Dev's announce on Chef's area with the user's yes. C4 must also cover Portal's finding: `--shots` timing out with cell_resident=false writes blank PNGs silently.
+- **B1 terrain-merge image diff (impl-1086, GLM flash):** stopped unfinished at 23:25 (Team Lead's wrap-up; no report). Shots done in D:/Mudcrab/evidence/p2-terrain-diff-2026-10-08 (today-1..7, merged-1..6, comparison/ partial); its scripts are untracked in worktrees/p2-terrain/p2diff/. Next: finish the diffs + RESULTS.md (resume or a fresh short job), then the user looks.
+- **A12 collision measurement spans:** not started (queued after 1060/1060.1 reach portal).
+- **Tomorrow (Team Lead):** #188 room-culling gap on `phase2/room-culling`: BleakFallsBarrow01 room 234060 joins its neighbour by open cave geometry 512 units past its box (no portal, one room_links edge), so the reachability walk stops and 4-13% of the frame vanishes. Needs a correct connection rule, not a bigger tolerance. Evidence: D:/Mudcrab/scratch/portal-roomcull-image/summary.md.
+- Workers running: none of mine.
+
 ## 2026-10-08 (evening) Phase 1 Dev: terrain data published, duplicate LAND, GLM trial, KTX2
 
 All local; nothing published. Phase 1 reports to Team Lead (trial). Task numbers 1900-1999.
