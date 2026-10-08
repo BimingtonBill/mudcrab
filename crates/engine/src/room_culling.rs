@@ -13,11 +13,21 @@
 //! An `XLRM` link (`room_links`) is an open edge: if one linked room is reached so is the other,
 //! with the region unchanged.
 //!
+//! Whether the walk runs at all is a data fact: the presence of a `PortalMarker`. A camera standing
+//! in a room with no portal of the cell is in one of Skyrim's open halls, whose neighbours are
+//! joined by geometry the room boxes do not describe; walking from there narrows at doorways that
+//! can project off screen and stops short of rooms plainly in view (analysis-1112: at
+//! BleakFallsBarrow01's floor poses the portal-less hall 234060 started a walk that reached 9 of 34
+//! rooms and culled the Nordic backdrop). So when any room containing the camera has no portal, the
+//! whole cell is drawn - the same answer as a camera in no room. A camera whose every start room
+//! carries a portal still walks and culls.
+//!
 //! An object is hidden from the view only when it is contained (pivot inside the box) in exactly
 //! one room and none of the rooms it belongs to - that one, plus any room its bounds merely overlap
 //! (`contained = 0`) - was reached. Every other object is drawn: one that is in no room, one whose
 //! pivot is in several rooms, anything outside the room graph, and everything when the camera is in
-//! no room, when the cell has no rooms, or when the database has no room tables.
+//! no room, in a room with no portal of the cell, when the cell has no rooms, or when the database
+//! has no room tables.
 //!
 //! # How an object is hidden, and why shadows keep it
 //!
@@ -497,8 +507,8 @@ impl RoomGraph {
     }
 
     /// The rooms reachable from the rooms around `camera`, through doorways that lie inside the
-    /// view. `None` when the camera is in no room, which means draw everything. `clip_from_local`
-    /// maps cell-local space to clip space.
+    /// view. `None` when the camera is in no room, or in a room with no portal of the cell, which
+    /// means draw everything. `clip_from_local` maps cell-local space to clip space.
     ///
     /// Every room that contains the camera is a start, which is the deterministic superset of
     /// "pick one": a camera in a doorway is in two boxes and sees into both.
@@ -535,6 +545,15 @@ impl RoomGraph {
         // aperture data at all, so its overlap edges are walked open, like a link (design-1100 §5).
         // `doorways` already drops portals whose two sides are not both rooms of this cell.
         let has_portal: Vec<bool> = doorways.iter().map(|portals| !portals.is_empty()).collect();
+        // A camera standing in a room with no `PortalMarker` of this cell has no aperture data to
+        // bound what it sees: such rooms are open caves and halls whose neighbours are joined by
+        // geometry the room boxes do not describe, so any walk from there can stop short of rooms
+        // in plain view (analysis-1112: BleakFallsBarrow01's portal-less hall loses whole rooms
+        // through portals whose doorways project off screen). Draw the whole cell instead - the
+        // same answer as a camera in no room. The switch is a data fact, not a distance.
+        if starts.iter().any(|&room| !has_portal[room]) {
+            return None;
+        }
         let mut region: Vec<Option<Rect>> = vec![None; self.rooms.len()];
         let mut widenings = vec![0u8; self.rooms.len()];
         let mut pending: Vec<(usize, Rect)> =
@@ -1348,18 +1367,21 @@ mod tests {
     #[test]
     fn a_link_is_an_open_edge() {
         let mut graph = chain(doorway(11, Vec3::new(0.0, 0.0, -30.0), 3.0, [1, 2]));
-        // No portal reaches C from the camera's side, but A is linked to it.
+        // No doorway reaches C from the camera's side, but A is linked to it. A and C carry a
+        // portal of their own (parked behind the camera) so the walk runs from either end - a
+        // start room with none draws the whole cell now.
         graph.portals.clear();
+        park_portals(&mut graph.rooms, &mut graph.portals, &[0, 2]);
         let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
-        assert_eq!(reached, vec![true, false, false]);
+        assert_eq!(reached, vec![true, false, false, false]);
         graph.links.push((0, 2));
         let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
-        assert_eq!(reached, vec![true, false, true]);
+        assert_eq!(reached, vec![true, false, true, false]);
         // The link is symmetric: from C the camera's own room is reached too.
         let reached = graph
             .reached_rooms(Vec3::new(0.0, 0.0, -40.0), clip_from_local())
             .unwrap();
-        assert_eq!(reached, vec![true, false, true]);
+        assert_eq!(reached, vec![true, false, true, false]);
     }
 
     #[test]
@@ -1370,6 +1392,56 @@ mod tests {
                 .reached_rooms(Vec3::new(500.0, 0.0, 0.0), clip_from_local())
                 .is_none()
         );
+    }
+
+    /// The start rule (analysis-1112): a camera in a room that has no `PortalMarker` of the cell
+    /// gets `None` - the whole cell is drawn - because such rooms are open halls whose neighbours
+    /// are joined by geometry the room boxes do not describe, and a walk from there can stop short
+    /// of rooms plainly in view behind doorways that project off screen.
+    #[test]
+    fn a_camera_in_a_room_with_no_portal_draws_the_whole_cell() {
+        let mut graph = chain(doorway(11, Vec3::new(0.0, 0.0, -30.0), 3.0, [1, 2]));
+        assert!(
+            graph.reached_rooms(Vec3::ZERO, clip_from_local()).is_some(),
+            "with a portal of its own the hall walks"
+        );
+        // The hall's only doorway is gone; the far doorway between B and C remains.
+        graph.portals.remove(0);
+        assert!(graph.reached_rooms(Vec3::ZERO, clip_from_local()).is_none());
+    }
+
+    /// Every room containing the camera is a start, and one start without a portal is enough: the
+    /// mixed case draws the whole cell too.
+    #[test]
+    fn a_camera_also_in_a_portal_less_room_draws_the_whole_cell() {
+        let mut rooms = vec![
+            room(1, Vec3::ZERO, 10.0),
+            boxed(2, Vec3::new(0.0, 0.0, -5.0), Vec3::new(10.0, 10.0, 10.0)),
+        ];
+        let mut portals = Vec::new();
+        // Room 0 carries a portal of the cell (parked behind the camera); room 1 has none.
+        park_portals(&mut rooms, &mut portals, &[0]);
+        let graph = RoomGraph {
+            overlaps: overlap_links(&rooms),
+            portals,
+            rooms,
+            ..Default::default()
+        };
+        assert_eq!(
+            graph.rooms_containing(Vec3::ZERO).len(),
+            2,
+            "the camera stands in both boxes"
+        );
+        assert!(graph.reached_rooms(Vec3::ZERO, clip_from_local()).is_none());
+    }
+
+    /// The behaviour the start rule must not lose: a camera in a room that has a portal of the cell
+    /// still walks, and rooms no in-view doorway chain leads to stay culled.
+    #[test]
+    fn a_camera_in_a_room_with_a_portal_still_walks_and_culls() {
+        let graph = chain(side_doorway(11, Vec3::new(10.0, 0.0, -12.0), 1.5, [1, 2]));
+        let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
+        assert_eq!(reached, vec![true, true, false]);
     }
 
     #[test]
@@ -1690,6 +1762,19 @@ mod tests {
     fn the_membership_key_is_the_reference_id_the_loader_delivers() {
         let directory = tempfile::tempdir().unwrap();
         let path = write_world_fixture(directory.path());
+        // Room 1 carries a portal of the cell - a doorway to a room parked behind the camera - so
+        // the walk runs: a start room with no portal draws the whole cell now. The parked doorway
+        // is behind the lens and never taken, so room 2 stays unreachable through the graph.
+        {
+            let connection = Connection::open(&path).unwrap();
+            insert_room(&connection, 3, 7, [0.0, -5000.0, 0.0]);
+            connection
+                .execute(
+                    "INSERT INTO room_portals VALUES (10,7,0,-4999,0,0,0,0,4,6,1,3)",
+                    [],
+                )
+                .unwrap();
+        }
         let database = WorldDatabase::open(&path).unwrap();
         database
             .request(DatabaseRequest::Load {
@@ -1720,8 +1805,8 @@ mod tests {
         assert_eq!(graph.rooms_containing(Vec3::ZERO), vec![0]);
         let reached = graph
             .reached_rooms(Vec3::ZERO, clip_from_local())
-            .expect("the camera is in room 1");
-        assert_eq!(reached, vec![true, false]);
+            .expect("the camera is in room 1, which carries a portal");
+        assert_eq!(reached, vec![true, false, false]);
         for reference in &references {
             // The key the engine uses is the delivered form_id; the base id would hit the wrong row.
             assert_eq!(
@@ -1992,28 +2077,36 @@ mod tests {
         }
     }
 
-    /// Rooms A (camera) and B overlap with no doorway and no link; C sits behind B, joined to B by
-    /// a doorway. The overlap is the only way from A to B.
+    /// Rooms A (camera) and B overlap with no doorway and no link between them; C sits behind B,
+    /// joined to B by a doorway. The overlap is the only way from A to B. A carries a portal of its
+    /// own (parked behind the camera) so the walk runs - a start room with none draws the whole
+    /// cell now.
     #[test]
-    fn overlapping_rooms_with_no_portal_are_one_space() {
-        let rooms = vec![
+    fn overlapping_rooms_without_a_doorway_are_one_space() {
+        let mut rooms = vec![
             room(1, Vec3::ZERO, 10.0),
             room(2, Vec3::new(0.0, 0.0, -15.0), 10.0),
             room(3, Vec3::new(0.0, 0.0, -45.0), 10.0),
         ];
+        let mut portals = vec![doorway(11, Vec3::new(0.0, 0.0, -30.0), 3.0, [1, 2])];
+        park_portals(&mut rooms, &mut portals, &[0]);
         let mut graph = RoomGraph {
-            portals: vec![doorway(11, Vec3::new(0.0, 0.0, -30.0), 3.0, [1, 2])],
+            portals,
             links: vec![],
             overlaps: vec![],
             membership: HashMap::new(),
             rooms: rooms.clone(),
         };
         let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
-        assert_eq!(reached, vec![true, false, false], "no link yet: culled");
+        assert_eq!(
+            reached,
+            vec![true, false, false, false],
+            "no overlap yet: culled"
+        );
         assert_eq!(overlap_links(&rooms), vec![(0, 1)]);
         graph.overlaps = overlap_links(&rooms);
         let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
-        assert_eq!(reached, vec![true, true, true]);
+        assert_eq!(reached, vec![true, true, true, false]);
     }
 
     /// The decision (an epsilon of 8 units): boxes that touch, or lie within the tolerance,
@@ -2218,13 +2311,68 @@ mod tests {
     }
 
     /// The failing shape of BleakFallsBarrow01 (design-1100 §1), in miniature: the camera's hall 0
-    /// has no portal, corridor 1 overlaps it and room 2 overlaps the corridor, so the walk narrows
-    /// to corridor 1's box and then to room 2's, and room 2's doorway to the backdrop 3 falls
-    /// outside what is left. Both overlap edges carry a portal-less room, so both are walked open,
-    /// room 2 arrives with the whole screen and the backdrop is reached. The hall's box is the real
-    /// one's size (3,366 x 1,856 x 6,976 units), so no raised `OVERLAP_TOLERANCE` changes this.
+    /// carries a portal of its own (parked behind the camera, so the walk runs), but the corridor 1
+    /// it overlaps has none. Both overlap edges into the corridor are therefore walked open: room 2
+    /// arrives with the whole screen and its doorway to the backdrop 3 is taken, where two thick
+    /// narrowings would have shrunk the region past it. The hall's box is the real one's size
+    /// (3,366 x 1,856 x 6,976 units), so no raised `OVERLAP_TOLERANCE` changes this.
     #[test]
-    fn a_portal_less_hall_reaches_the_backdrop_behind_its_corridor() {
+    fn an_overlap_edge_past_a_portal_less_room_reaches_the_backdrop_behind_its_corridor() {
+        let mut rooms = vec![
+            boxed(1, Vec3::ZERO, Vec3::new(1683.0, 928.0, 3488.0)),
+            boxed(
+                2,
+                Vec3::new(-1500.0, 0.0, -3588.0),
+                Vec3::new(1000.0, 928.0, 100.0),
+            ),
+            boxed(
+                3,
+                Vec3::new(-3300.0, 0.0, -4300.0),
+                Vec3::new(900.0, 928.0, 1200.0),
+            ),
+            boxed(
+                4,
+                Vec3::new(1500.0, 0.0, -4600.0),
+                Vec3::new(800.0, 928.0, 400.0),
+            ),
+        ];
+        let mut portals = vec![doorway(20, Vec3::new(0.0, 0.0, -4000.0), 150.0, [2, 3])];
+        park_portals(&mut rooms, &mut portals, &[0]);
+        let graph = RoomGraph {
+            rooms: rooms.clone(),
+            portals,
+            links: vec![],
+            overlaps: overlap_links(&rooms),
+            membership: HashMap::new(),
+        };
+        assert_eq!(
+            graph.overlaps,
+            vec![(0, 1), (1, 2)],
+            "the hall touches the corridor and the corridor overlaps room 2"
+        );
+        // Narrowed twice the walk would keep only x -1.17..-0.44, and the doorway sits at
+        // x -0.065..0.065: the backdrop is culled. Open edges carry the whole screen, so it is
+        // reached.
+        let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
+        assert_eq!(
+            &reached[..4],
+            [true, true, true, true],
+            "open edges carry the whole screen, so the backdrop is reached"
+        );
+        assert!(
+            !reached[4],
+            "the parked room behind the camera stays culled"
+        );
+    }
+
+    /// The floor-pose shape of BleakFallsBarrow01 (analysis-1112): the camera's hall 0 has no
+    /// portal at all, corridor 1 and room 2 follow through open overlaps, and room 2's only doorway
+    /// to the backdrop 3 sits 3,000 units below the view axis - at 4,000 units in front of the
+    /// camera the 60-degree view reaches y -2,309, so the aperture projects off screen and the old
+    /// walk died here (9 of 34 rooms reached at the real poses). The start rule draws the whole
+    /// cell instead, so the backdrop cannot be culled.
+    #[test]
+    fn a_portal_less_hall_start_draws_the_whole_cell_behind_an_off_screen_portal() {
         let rooms = vec![
             boxed(1, Vec3::ZERO, Vec3::new(1683.0, 928.0, 3488.0)),
             boxed(
@@ -2245,7 +2393,7 @@ mod tests {
         ];
         let graph = RoomGraph {
             rooms: rooms.clone(),
-            portals: vec![doorway(20, Vec3::new(0.0, 0.0, -4000.0), 150.0, [2, 3])],
+            portals: vec![doorway(20, Vec3::new(0.0, -3000.0, -4000.0), 150.0, [2, 3])],
             links: vec![],
             overlaps: overlap_links(&rooms),
             membership: HashMap::new(),
@@ -2255,11 +2403,10 @@ mod tests {
             vec![(0, 1), (1, 2)],
             "the hall touches the corridor and the corridor overlaps room 2"
         );
-        // Today the walk keeps only x -1.17..-0.44 after the two overlaps, and the doorway sits at
-        // x -0.065..0.065: the backdrop is culled. Open edges carry the whole screen, so it is
-        // reached.
-        let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
-        assert_eq!(reached, vec![true, true, true, true]);
+        assert!(
+            graph.reached_rooms(Vec3::ZERO, clip_from_local()).is_none(),
+            "a portal-less start draws the whole cell"
+        );
     }
 
     /// The same shape with a `PortalMarker` between the hall and the corridor: both rooms then
@@ -2325,10 +2472,13 @@ mod tests {
         assert!(graph.overlaps.contains(&(1, 2)));
         let reached = graph.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
         assert_eq!(&reached[..3], [true, true, false]);
-        // Take the portals away and the same boxes are one space: every edge is open, and the
-        // neighbour is drawn whatever the region was.
+        // Take the pair's portals away and the same boxes are one space: every edge past the
+        // portal-less rooms is open, and the neighbour is drawn whatever the region was. The
+        // camera's own room keeps a parked portal so the walk still runs - a start with none draws
+        // the whole cell now.
         let mut open = graph.clone();
         open.portals.clear();
+        park_portals(&mut open.rooms, &mut open.portals, &[0]);
         let reached = open.reached_rooms(Vec3::ZERO, clip_from_local()).unwrap();
         assert_eq!(&reached[..3], [true, true, true]);
     }
