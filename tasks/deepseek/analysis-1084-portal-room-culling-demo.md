@@ -1,4 +1,4 @@
-# analysis-1078-portal-room-culling-demo (track: Portal; queue item B5). Read-only.
+# analysis-1084-portal-room-culling-demo (track: Portal; queue item B5). Read-only.
 
 Repo C:/Modding/Mudcrab/mudcrab, branch portal (head 2c7a0ea0). Converted data C:/Modding/Mudcrab/SkyrimConverted-portal-rooms
 (skyrim_world.db holds room tables: 4,246 rooms, 3,097 portals per Phase 1). Room culling is opt-in: `--room-culling`
