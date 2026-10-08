@@ -123,7 +123,16 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   900-999. It owns `crates/launcher/**` and `crates/converter-gui/**` (being folded into the
   launcher; the crate is then deleted); converter API changes go through Phase 1 Dev by message.
   Starting brief: `local/handover/phase3-dev.md`.
-- Changes flow one way: `main`, `phase1/*` and `phase2/*` merge into `portal`, never the reverse. A
+- **Phase 4** (added 2026-10-08, the user's Phase 4 Dev session; **STANDBY**: track set up, works only
+  on jobs Team Lead hands out): upstream Phase 4 (`docs/roadmap/04-gameplay-and-physics.md`: Rapier
+  physics, skeletal animation, combat/quest state, save/quick-load), sent upstream like Phase 2.
+  Worktree `C:\Modding\Mudcrab\worktrees\phase4` (made at the first job), branches `phase4/<topic>` cut
+  from `main`, upstream's commit style, build targets on D: (`D:\Mudcrab\builds\phase4-target`), worker
+  tasks `<kind>-<nnn>-p4-<slug>` numbered 2000-2099. Owns new Phase 4 crates once agreed; edits to
+  `crates/engine/**`, `crates/shared/**` or `crates/converter/**` are agreed by message with Phase 2 Dev
+  and Phase 1 Dev first. The portal's walking player and door work stays on the Portal track (its
+  Phase 4 proposal goes through Upstream Dev, `docs/pr/two-tracks.md`).
+- Changes flow one way: `main`, `phase1/*`, `phase2/*` and `phase4/*` merge into `portal`, never the reverse. A
   Phase 1 or Phase 2 bug found on the portal is fixed on a `phase1/*` or `phase2/*` branch first.
 
 Which work belongs to which track, the PR rules and the reasons: `docs/pr/two-tracks.md`. Read it
