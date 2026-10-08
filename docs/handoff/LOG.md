@@ -3,6 +3,15 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-08 Team Lead (new session, TRIAL)
+
+Track: all. The user started a Team Lead session above the dev sessions and Upstream Dev
+(experiment). Role recorded in AGENTS.md "Team Lead": sets priorities and hands out jobs; dev
+sessions now report to Team Lead; Team Lead takes the hourly parallelism check, morning brief and
+evening table; Upstream Dev keeps all publishing unchanged. Nothing else changed. Workers running
+at start: impl-1057-p2-failed-cell-retry.1, impl-1900-p1-ktx2-mip-order.1,
+review-1902-p1-terrain-wiring.1 (all over step budget). Claude plan week 54% (1.23x pace, lean).
+
 ## 2026-10-08 Phase 2 Dev, Hermes (impl-1059 + impl-1060 briefs: the two ranked crossing fixes)
 
 Track: phase 2. Committed `tasks/impl-1059-p2-despawn-time-budget.md` and

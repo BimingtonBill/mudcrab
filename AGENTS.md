@@ -118,6 +118,25 @@ Every task belongs to one track; name it in the brief, the commit and the handof
 Which work belongs to which track, the PR rules and the reasons: `docs/pr/two-tracks.md`. Read it
 before starting any `phase2/*` branch or moving work between tracks.
 
+## Team Lead (TRIAL from 2026-10-08, the user)
+
+The user added a **Team Lead** session above the dev sessions and Upstream Dev, as an experiment
+(kept if it works, reverted if not).
+
+- **Priorities and hand-outs.** Team Lead sets the order of work across tracks and hands jobs to
+  Phase 1 Dev, Phase 2 Dev, Phase 3 Dev, Portal Dev and Upstream Dev. A job the user approved in
+  Team Lead's session and Team Lead hands out is a valid hand-out, like one from Upstream Dev.
+- **Reporting.** Dev sessions report hand-offs, status, ETAs, findings and "I have room" to Team
+  Lead (and the handoff log). Suggestions found in passing go to Team Lead in one line.
+- **Upstream Dev keeps publishing.** The publishing rule below is unchanged: only Upstream Dev
+  publishes, and only with the user's yes in its own session. Team Lead never runs `git push`,
+  `gh pr create` or any GitHub write; it hands publish-ready items to Upstream Dev.
+- **Oversight.** Team Lead runs the parallelism check across sessions (taking over the hourly
+  duty from Upstream Dev), the morning brief and the evening decision table, and keeps the
+  foundations check in every brief and review it hands out.
+- Team Lead does not code on track branches itself; it plans, briefs, reviews and integrates
+  decisions, and delegates per the DeepSeek level above.
+
 ## Working together: Phase 2 Dev, Portal Dev and Upstream Dev
 
 > **Publishing rule (the user, 2026-09-27). Every session reads this, new ones first.**
