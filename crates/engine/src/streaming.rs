@@ -2580,9 +2580,15 @@ fn spawn_cell(
                         crate::physics::world_collision_groups(),
                     ));
                 }
-                // Born on the cell's layers, like every other plain node of the tree.
+                // Born on the cell's layers, like every other plain node of the tree. A run without
+                // the portal's stamps puts the patch on the reflectable world layers instead, so the
+                // water reflection draws the terrain on either shadow route (`crate::shadow_route`).
+                // Not both: layers of the patch's own would make it a layer source of its own under
+                // the portal's cell isolation (`crate::portal`'s `adopt_own_layer_node`).
                 if let Some(layers) = stamp.clone() {
                     patch.insert((Inherited(layers.clone()), layers));
+                } else {
+                    patch.insert(crate::render::reflectable_world_layers());
                 }
                 if detail == CellDetail::Terrain {
                     // A ring cell casts no shadow: its own shadows fall on the ring, tens of

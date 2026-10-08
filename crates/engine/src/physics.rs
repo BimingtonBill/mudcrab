@@ -498,6 +498,7 @@ fn fixture_material(base_color: Color) -> StandardMaterial {
 
 fn setup_physics_fixture(
     mut commands: Commands,
+    config: Option<Res<crate::config::EngineConfig>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -571,7 +572,7 @@ fn setup_physics_fixture(
     commands.spawn((
         DirectionalLight {
             illuminance: 12_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: crate::app::sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),

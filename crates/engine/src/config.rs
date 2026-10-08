@@ -193,6 +193,40 @@ pub struct EngineConfig {
     /// nothing without them.
     pub room_culling: bool,
     pub physics_fixture: bool,
+    /// `--water-reflection-preset <baseline|water>`: which [`crate::view_policy::ViewPolicy`] the
+    /// water reflection camera is given. `baseline` is the full-size, every-frame reflection the
+    /// engine has always drawn.
+    pub water_reflection_preset: WaterReflectionPreset,
+    /// `--water-reflection <on|off>`: whether the water reflection view is drawn at all. A
+    /// measurement switch; see [`HELP_TEXT`].
+    pub water_reflection: bool,
+    /// `--shadows <on|off>`: whether the sun casts shadows. A measurement switch; see
+    /// [`HELP_TEXT`].
+    pub shadows: bool,
+}
+
+/// The view policy the water reflection camera is given (`--water-reflection-preset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaterReflectionPreset {
+    /// [`crate::view_policy::ViewPolicy::baseline`]: today's full-size, every-frame reflection.
+    #[default]
+    Baseline,
+    /// [`crate::view_policy::ViewPolicy::water`]: a quarter of the pixels, every other frame, no
+    /// shadows of its own, and a camera without occlusion history or MSAA.
+    Water,
+}
+
+impl WaterReflectionPreset {
+    /// Every preset, in the order the help lists them.
+    pub const ALL: [Self; 2] = [Self::Baseline, Self::Water];
+
+    /// The spelling the command line and run records use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Water => "water",
+        }
+    }
 }
 
 /// The default reach of the terrain-only ring, in cells: eight cells is 32,768 units of landscape
@@ -307,6 +341,9 @@ impl Default for EngineConfig {
             lights: false,
             room_culling: false,
             physics_fixture: false,
+            water_reflection_preset: WaterReflectionPreset::Baseline,
+            water_reflection: true,
+            shadows: true,
         }
     }
 }
@@ -372,9 +409,14 @@ Benchmark and profiling:
   --profile-commit <hash>               commit recorded in the profile (default: unknown)
   --profile-dirty-worktree              record uncommitted worktree changes in the profile
   --profile-hardware <text>             hardware recorded in the profile (default: unspecified)
+  --water-reflection-preset <name>      water reflection cost: baseline (full size, every frame, shadowed)
+                                        or water (quarter size, every other frame, shadowless) (default: baseline)
 
 Diagnostics:
   --diagnostic-asset-fallbacks          log every fallback asset substitution
+  --water-reflection <on|off>           measurement switch: off never renders the reflection view; the water
+                                        gets darker (a black reflection is blended in), not unreflective (default: on)
+  --shadows <on|off>                    measurement switch: off turns off the sun's shadow maps (default: on)
   --material-fixture                    run the material fixture (no world database)
   --terrain-water-fixture               run the terrain-water fixture (no world database)
   --transform-bounds-fixture            run the transform-bounds fixture (no world database)
@@ -942,6 +984,24 @@ impl EngineConfig {
                 "--lights" => config.lights = true,
                 "--room-culling" => config.room_culling = true,
                 "--physics-fixture" => config.physics_fixture = true,
+                "--water-reflection" => {
+                    config.water_reflection = take_on_off("--water-reflection", args.next())?;
+                }
+                "--shadows" => config.shadows = take_on_off("--shadows", args.next())?,
+                "--water-reflection-preset" => {
+                    const EXPECTED: &str = "baseline or water";
+                    let raw = take_raw("--water-reflection-preset", EXPECTED, args.next())?;
+                    config.water_reflection_preset = WaterReflectionPreset::ALL
+                        .into_iter()
+                        .find(|preset| preset.name() == raw)
+                        .ok_or_else(|| {
+                            ConfigError::invalid_value(
+                                "--water-reflection-preset",
+                                Some(raw),
+                                EXPECTED,
+                            )
+                        })?;
+                }
                 unknown => return Err(ConfigError::unrecognized(unknown)),
             }
         }
@@ -1556,8 +1616,14 @@ impl ReflectionOptions {
 
     /// The reflection target's size in pixels.
     pub fn target_size(&self) -> (u32, u32) {
+        self.scaled_size(REFLECTION_SIZE)
+    }
+
+    /// `full`, a reflection target size in pixels, scaled by [`scale`](Self::scale) per axis: what
+    /// `--reflection-scale` does to whichever size the `--water-reflection-preset` starts from.
+    pub fn scaled_size(&self, full: (u32, u32)) -> (u32, u32) {
         let side = |full: u32| ((full as f32 * self.scale).round() as u32).max(MIN_REFLECTION_SIDE);
-        (side(REFLECTION_SIZE.0), side(REFLECTION_SIZE.1))
+        (side(full.0), side(full.1))
     }
 }
 
@@ -1684,6 +1750,21 @@ fn take_raw(
         // Only `--` marks an option: a path or a negative number may start
         // with a single dash.
         other => Err(ConfigError::invalid_value(option, other, expected)),
+    }
+}
+
+/// An `on` or `off` value, for the measurement switches.
+fn take_on_off(option: &'static str, value: Option<String>) -> Result<bool, ConfigError> {
+    const EXPECTED: &str = "on or off";
+    let raw = take_raw(option, EXPECTED, value)?;
+    // Not a `match` on string literals: the help-drift tests read every `"..." =>` line of this file
+    // as an option arm.
+    if raw == "on" {
+        Ok(true)
+    } else if raw == "off" {
+        Ok(false)
+    } else {
+        Err(ConfigError::invalid_value(option, Some(raw), EXPECTED))
     }
 }
 
@@ -1992,6 +2073,26 @@ mod tests {
     }
 
     #[test]
+    fn the_water_reflection_preset_defaults_to_baseline_and_parses_both_names() {
+        assert_eq!(
+            EngineConfig::default().water_reflection_preset,
+            WaterReflectionPreset::Baseline
+        );
+        assert_eq!(
+            run_config(&[]).water_reflection_preset,
+            WaterReflectionPreset::Baseline
+        );
+        for (name, preset) in [
+            ("baseline", WaterReflectionPreset::Baseline),
+            ("water", WaterReflectionPreset::Water),
+        ] {
+            let config = run_config(&["--water-reflection-preset", name]);
+            assert_eq!(config.water_reflection_preset, preset);
+            assert_eq!(preset.name(), name);
+        }
+    }
+
+    #[test]
     fn parses_the_unload_time_budget_and_lets_zero_mean_the_count_budget() {
         assert_eq!(
             run_config(&["--max-unload-ms-per-frame", "2.5"]).max_unload_ms_per_frame,
@@ -2001,6 +2102,87 @@ mod tests {
             run_config(&["--max-unload-ms-per-frame", "0"]).max_unload_ms_per_frame,
             0.0
         );
+    }
+
+    #[test]
+    fn an_unknown_water_reflection_preset_or_a_missing_value_is_refused() {
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset", "fast"]),
+            ConfigError::InvalidValue { option: "--water-reflection-preset", value: Some(ref value), .. }
+                if value == "fast"
+        ));
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset"]),
+            ConfigError::InvalidValue {
+                option: "--water-reflection-preset",
+                value: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset", "--headless"]),
+            ConfigError::InvalidValue {
+                option: "--water-reflection-preset",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_measurement_switches_default_on_and_take_on_or_off() {
+        let config = run_config(&[]);
+        assert!(config.water_reflection);
+        assert!(config.shadows);
+
+        let config = run_config(&["--water-reflection", "off", "--shadows", "off"]);
+        assert!(!config.water_reflection);
+        assert!(!config.shadows);
+
+        let config = run_config(&["--water-reflection", "off", "--water-reflection", "on"]);
+        assert!(config.water_reflection, "the last value wins");
+        assert!(run_config(&["--shadows", "on"]).shadows);
+    }
+
+    #[test]
+    fn a_measurement_switch_refuses_any_other_value() {
+        for option in ["--water-reflection", "--shadows"] {
+            for value in ["no", "true", "0", "OFF"] {
+                assert!(
+                    matches!(
+                        parse_error(&[option, value]),
+                        ConfigError::InvalidValue { value: Some(ref given), .. } if given == value
+                    ),
+                    "{option} accepted {value}"
+                );
+            }
+            assert!(matches!(
+                parse_error(&[option]),
+                ConfigError::InvalidValue { value: None, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn help_documents_the_measurement_switches_as_such() {
+        assert!(help_names("--water-reflection"));
+        assert!(help_names("--shadows"));
+        let rows: Vec<_> = HELP_TEXT
+            .lines()
+            .filter(|line| {
+                line.trim_start().starts_with("--water-reflection <")
+                    || line.trim_start().starts_with("--shadows <")
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|row| row.contains("measurement switch")),
+            "the A/B switches are for measurement and the help says so"
+        );
+    }
+
+    #[test]
+    fn help_documents_the_water_reflection_preset() {
+        assert!(help_names("--water-reflection-preset"));
     }
 
     #[test]

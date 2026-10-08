@@ -2696,6 +2696,14 @@ fn portal_sun_cascades(count: usize) -> CascadeShadowConfig {
     .build()
 }
 
+/// The engine's sun as [`place_destination_sun`] reads it: not the doorway's own, and not the
+/// unshadowed copy a shadowless view may add (`crate::shadow_route`), which only follows the engine
+/// sun.
+type EngineSunFilter = (
+    Without<PortalDestinationSun>,
+    Without<crate::shadow_route::UnshadowedSun>,
+);
+
 /// Puts the doorway's own sun ([`PortalDestinationSun`]) where the engine's sun is: the same
 /// direction, shadows on when the engine sun's are, and as many cascades as it has.
 ///
@@ -2716,10 +2724,7 @@ fn portal_sun_cascades(count: usize) -> CascadeShadowConfig {
 /// are switched on, so the doorway's sun never casts with a count of its own.
 fn place_destination_sun(
     config: Option<Res<EngineConfig>>,
-    engine: Query<
-        (&Transform, &DirectionalLight, Option<&CascadeShadowConfig>),
-        Without<PortalDestinationSun>,
-    >,
+    engine: Query<(&Transform, &DirectionalLight, Option<&CascadeShadowConfig>), EngineSunFilter>,
     mut sun: Query<
         (
             &mut Transform,
@@ -10335,7 +10340,8 @@ mod tests {
             "the cell's role is what moves the light: the stop is off it"
         );
 
-        // The active space gives the light the layers it was spawned with.
+        // The active space gives the light the layers it was spawned with: a point light's, which
+        // reach the shadowless reflection route as well (`crate::render::POINT_LIGHT_LAYERS`).
         *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
             worldspace_id: TAMRIEL,
             interior: Some(PRESTREAMED_CELL),
@@ -10343,7 +10349,7 @@ mod tests {
         update(&mut app, 1);
         assert_eq!(
             layers_of(&app, destination_light),
-            RenderLayers::from_layers(&crate::render::LIGHT_LAYERS)
+            RenderLayers::from_layers(&crate::render::POINT_LIGHT_LAYERS)
         );
     }
 

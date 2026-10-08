@@ -21,6 +21,7 @@ use crate::{
         AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, StreamingWorld,
         build_terrain_quadrant_mesh, camera_grid, validate_standard_material,
     },
+    view_policy::{InvalidateSecondaryViews, ViewInvalidationReason},
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
@@ -828,6 +829,7 @@ fn setup_streaming_fixture_visual(
 fn drive_streaming_fixture(
     mut state: ResMut<StreamingFixtureState>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    mut invalidations: MessageWriter<InvalidateSecondaryViews>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     if state.finished {
@@ -852,6 +854,18 @@ fn drive_streaming_fixture(
     camera.translation += crate::streaming::grid_translation(IVec2::new(x, y), IVec2::ZERO);
     state.total_x += x;
     state.total_y += y;
+    // Only a move the fixture labels "teleport" is a discontinuity no pose comparison is meant to
+    // catch: the destination pose is committed above, so a secondary view must refresh on this
+    // frame rather than the next one its own cadence allows for. The "rapid_traversal" and
+    // "return_to_origin" moves are fast travel, not a teleport, and the policy's own pose-jump
+    // detection already refreshes a view that moved that far, so they report nothing and keep
+    // exercising that path.
+    if label == "teleport" {
+        invalidations.write(InvalidateSecondaryViews {
+            reason: ViewInvalidationReason::Teleport,
+            target: None,
+        });
+    }
     profiler.event("streaming-fixture", label, None);
 }
 
@@ -1024,8 +1038,17 @@ fn terrain_fixture_image(pixel: [u8; 4]) -> Image {
     image
 }
 
+/// Whether a sun spawned from `config` casts shadows: always, except under `--shadows off`.
+///
+/// Every sun the engine spawns asks this, fixtures included, so the measurement switch means the
+/// same thing in every mode. A run without a configuration keeps the shadows.
+pub(crate) fn sun_shadow_maps_enabled(config: Option<&EngineConfig>) -> bool {
+    config.is_none_or(|config| config.shadows)
+}
+
 fn setup_material_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -1123,7 +1146,7 @@ fn setup_material_fixture(
     commands.spawn((
         DirectionalLight {
             illuminance: 10_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(&LIGHT_LAYERS),
@@ -1297,6 +1320,7 @@ fn terrain_water_fixture_snapshot() -> TerrainSnapshot {
 
 fn setup_terrain_water_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     reflection: Res<WaterReflectionTexture>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
@@ -1347,6 +1371,7 @@ fn setup_terrain_water_fixture(
                 extension: TerrainExtension::fixture(texture_handles.clone()),
             })),
             TerrainWaterFixtureTerrain,
+            crate::render::reflectable_world_layers(),
         ));
     }
     commands.spawn((
@@ -1386,7 +1411,7 @@ fn setup_terrain_water_fixture(
     commands.spawn((
         DirectionalLight {
             illuminance: DAY_SUN_ILLUMINANCE,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(&LIGHT_LAYERS),
@@ -1443,6 +1468,7 @@ struct TransformBoundsFixtureState {
 
 fn setup_transform_bounds_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -1554,7 +1580,7 @@ fn setup_transform_bounds_fixture(
     commands.spawn((
         DirectionalLight {
             illuminance: DAY_SUN_ILLUMINANCE,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(&LIGHT_LAYERS),
@@ -1684,6 +1710,7 @@ struct RendererFixtureState {
 
 fn setup_renderer_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -1761,7 +1788,7 @@ fn setup_renderer_fixture(
     commands.spawn((
         DirectionalLight {
             illuminance: DAY_SUN_ILLUMINANCE,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(&LIGHT_LAYERS),
@@ -2343,7 +2370,7 @@ fn setup_world(
     commands.spawn((
         DirectionalLight {
             illuminance: DAY_SUN_ILLUMINANCE,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: sun_shadow_maps_enabled(Some(&*config)),
             ..default()
         },
         sun_shadow_cascades(config.stream_radius, SUN_SHADOW_CASCADES, None),
@@ -2933,6 +2960,9 @@ mod tests {
         .insert_resource(WaterReflectionTexture(Handle::<Image>::default()))
         .init_resource::<ProfilingState>()
         .init_resource::<StreamingFixtureState>()
+        // No render plugin runs here, so the fixture's invalidation message has no policy reader;
+        // the message itself still has to be registered for the fixture to be able to send it.
+        .add_message::<InvalidateSecondaryViews>()
         .add_plugins(StreamingPlugin)
         .add_systems(
             PreUpdate,
@@ -3266,7 +3296,11 @@ mod tests {
         app.update();
 
         let world = app.world_mut();
-        let mut suns = world.query::<(&DirectionalLight, &CascadeShadowConfig)>();
+        // The source sun, not the unshadowed copy a shadowless view may add.
+        let mut suns = world.query_filtered::<
+            (&DirectionalLight, &CascadeShadowConfig),
+            Without<crate::shadow_route::UnshadowedSun>,
+        >();
         let Ok((light, cascades)) = suns.single(world) else {
             panic!("setup_world spawns one shadow-casting directional light");
         };
@@ -3274,6 +3308,64 @@ mod tests {
         let expected = sun_shadow_cascades(config.stream_radius, SUN_SHADOW_CASCADES, None);
         assert_eq!(cascades.bounds, expected.bounds);
         assert_eq!(cascades.minimum_distance, expected.minimum_distance);
+    }
+
+    /// `--shadows off` is a measurement switch for the sun's shadow maps.
+    #[test]
+    fn the_shadows_off_switch_turns_off_the_source_suns_shadow_maps() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            shadows: false,
+            ..default()
+        })
+        .add_systems(Startup, setup_world);
+        app.update();
+
+        let world = app.world_mut();
+        let mut suns = world
+            .query_filtered::<&DirectionalLight, Without<crate::shadow_route::UnshadowedSun>>();
+        let sun = suns.single(world).expect("one source sun");
+        assert!(!sun.shadow_maps_enabled);
+    }
+
+    /// `--shadows off` has to mean the same in the fixture scenes, which are the measurement scenes.
+    #[test]
+    fn the_shadows_off_switch_reaches_every_fixture_sun() {
+        for (shadows, expected) in [(false, false), (true, true)] {
+            let mut app = App::new();
+            app.insert_resource(EngineConfig {
+                shadows,
+                ..default()
+            })
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<TerrainMaterial>>()
+            .init_resource::<Assets<WaterMaterial>>()
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .add_systems(
+                Startup,
+                (
+                    setup_material_fixture,
+                    setup_terrain_water_fixture,
+                    setup_transform_bounds_fixture,
+                    setup_renderer_fixture,
+                ),
+            );
+            app.update();
+            let world = app.world_mut();
+            let suns: Vec<_> = world
+                .query::<&DirectionalLight>()
+                .iter(world)
+                .map(|sun| sun.shadow_maps_enabled)
+                .collect();
+            assert_eq!(suns.len(), 4, "each fixture spawns one sun");
+            assert!(
+                suns.iter().all(|enabled| *enabled == expected),
+                "--shadows {}: {suns:?}",
+                if shadows { "on" } else { "off" }
+            );
+        }
     }
 
     /// The streaming camera draws the world (layer 0) and the water planes ([`WATER_LAYER`]):
@@ -3305,6 +3397,35 @@ mod tests {
     fn the_world_physics_player_is_off_because_it_knows_nothing_of_doors() {
         assert!(EngineConfig::default().interactive_world_physics());
         assert!(!world_physics_player(&EngineConfig::default()));
+    }
+
+    /// The shadowless reflection route only works while nothing the player sees, and nothing that
+    /// lights the player's world, is on the replica layer.
+    #[test]
+    fn the_main_camera_and_the_source_sun_never_share_the_replica_layer() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .add_systems(Startup, setup_world);
+        app.update();
+
+        let replica = RenderLayers::layer(crate::render::UNSHADOWED_REFLECTION_LAYER);
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&RenderLayers, With<StreamingCamera>>();
+        let camera = cameras.single(app.world()).expect("the streaming camera");
+        assert!(!camera.intersects(&replica));
+
+        // The engine sun may carry no layers at all, which is layer 0.
+        let mut suns = app.world_mut().query_filtered::<Option<&RenderLayers>, (
+            With<DirectionalLight>,
+            Without<crate::shadow_route::UnshadowedSun>,
+        )>();
+        let suns: Vec<_> = suns
+            .iter(app.world())
+            .map(|layers| layers.cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(suns.len(), 1, "setup_world spawns one source sun");
+        assert!(!suns[0].intersects(&replica));
     }
 
     #[test]
