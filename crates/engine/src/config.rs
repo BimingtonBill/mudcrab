@@ -220,6 +220,37 @@ pub struct EngineConfig {
     /// `--shadows <on|off>`: whether the sun casts shadows. A measurement switch; see
     /// [`HELP_TEXT`].
     pub shadows: bool,
+    /// `--render-parallel-finish`: finish the render command encoders in parallel (the Mudcrab
+    /// patch to the vendored `bevy_render`, impl-1132). Off by default, which is stock Bevy.
+    pub render_parallel_finish: bool,
+    /// `--render-backends <all|vulkan>`: which graphics backends wgpu may pick from. `all` is
+    /// Bevy's own choice and the default; `vulkan` is the Plus build's intended default once its
+    /// timing window has run (impl-1132).
+    pub render_backends: RenderBackends,
+}
+
+/// The graphics backends the renderer may use (`--render-backends`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderBackends {
+    /// Bevy's default: every backend wgpu has for the platform (`WGPU_BACKEND` still applies).
+    #[default]
+    All,
+    /// Vulkan only. wgpu then never needs the DX12 indirect-call validation pass, so the engine
+    /// also drops `VALIDATION_INDIRECT_CALL` in release builds (see `render::wgpu_settings`).
+    Vulkan,
+}
+
+impl RenderBackends {
+    /// Every choice, in the order the help lists them.
+    pub const ALL: [Self; 2] = [Self::All, Self::Vulkan];
+
+    /// The spelling the command line and run records use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Vulkan => "vulkan",
+        }
+    }
 }
 
 /// The view policy the water reflection camera is given (`--water-reflection-preset`).
@@ -364,6 +395,8 @@ impl Default for EngineConfig {
             water_reflection_preset: WaterReflectionPreset::Baseline,
             water_reflection: true,
             shadows: true,
+            render_parallel_finish: false,
+            render_backends: RenderBackends::All,
         }
     }
 }
@@ -480,6 +513,10 @@ Portal (this branch's doors, demos and tools):
   --graphics <preset>                   graphics preset
   --graphics-file <file>                graphics settings file
   --graphics-cycle <seconds>            step the anti-aliasing through every setting
+  --render-parallel-finish              finish the render command encoders in parallel on the compute pool
+                                        (the vendored bevy_render patch; same image and submission order) (default: off)
+  --render-backends <all|vulkan>        graphics backends the renderer may use: all (Bevy's default) or vulkan
+                                        only, which also drops the indirect-draw validation pass (default: all)
 
 Help:
   -h, --help                            print this message and exit
@@ -1052,6 +1089,17 @@ impl EngineConfig {
                                 Some(raw),
                                 EXPECTED,
                             )
+                        })?;
+                }
+                "--render-parallel-finish" => config.render_parallel_finish = true,
+                "--render-backends" => {
+                    const EXPECTED: &str = "all or vulkan";
+                    let raw = take_raw("--render-backends", EXPECTED, args.next())?;
+                    config.render_backends = RenderBackends::ALL
+                        .into_iter()
+                        .find(|backends| backends.name() == raw)
+                        .ok_or_else(|| {
+                            ConfigError::invalid_value("--render-backends", Some(raw), EXPECTED)
                         })?;
                 }
                 unknown => return Err(ConfigError::unrecognized(unknown)),
@@ -2716,6 +2764,66 @@ mod tests {
         assert!(!EngineConfig::default().room_culling);
         assert!(!run_config(&["--headless"]).room_culling);
         assert!(run_config(&["--room-culling"]).room_culling);
+    }
+
+    /// The parallel encoder finish (impl-1132) is opt-in: with no flag the run is stock Bevy.
+    #[test]
+    fn parallel_finish_is_off_until_the_flag_is_given() {
+        assert!(!EngineConfig::default().render_parallel_finish);
+        assert!(!run_config(&["--headless"]).render_parallel_finish);
+        assert!(run_config(&["--render-parallel-finish"]).render_parallel_finish);
+        assert!(help_names("--render-parallel-finish"));
+    }
+
+    /// The backends default to every backend (today's behaviour) until a run names one.
+    #[test]
+    fn render_backends_default_to_all_and_parse_both_names() {
+        assert_eq!(EngineConfig::default().render_backends, RenderBackends::All);
+        assert_eq!(run_config(&[]).render_backends, RenderBackends::All);
+        for (name, backends) in [
+            ("all", RenderBackends::All),
+            ("vulkan", RenderBackends::Vulkan),
+        ] {
+            let config = run_config(&["--render-backends", name]);
+            assert_eq!(config.render_backends, backends);
+            assert_eq!(backends.name(), name);
+        }
+        assert_eq!(
+            run_config(&["--render-backends", "vulkan", "--render-backends", "all"])
+                .render_backends,
+            RenderBackends::All,
+            "the last value wins"
+        );
+        assert!(help_names("--render-backends"));
+    }
+
+    #[test]
+    fn an_unknown_render_backend_or_a_missing_value_is_refused() {
+        for value in ["dx12", "Vulkan", "VULKAN", "gl", ""] {
+            assert!(
+                matches!(
+                    parse_error(&["--render-backends", value]),
+                    ConfigError::InvalidValue { option: "--render-backends", value: Some(ref given), .. }
+                        if given == value
+                ),
+                "--render-backends accepted {value:?}"
+            );
+        }
+        assert!(matches!(
+            parse_error(&["--render-backends"]),
+            ConfigError::InvalidValue {
+                option: "--render-backends",
+                value: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_error(&["--render-backends", "--headless"]),
+            ConfigError::InvalidValue {
+                option: "--render-backends",
+                ..
+            }
+        ));
     }
 
     #[test]

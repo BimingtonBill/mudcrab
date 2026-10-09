@@ -41,6 +41,7 @@ use bevy::{
     light::{CascadeShadowConfig, CascadeShadowConfigBuilder},
     log::{Level, LogPlugin},
     prelude::*,
+    render::RenderPlugin,
     render::diagnostic::RenderDiagnosticsPlugin,
     render::occlusion_culling::OcclusionCulling,
     render::render_asset::RenderAssetBytesPerFrame,
@@ -263,29 +264,40 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // pays for the startup system that reads it.
     let records_measurements = crate::fingerprint::records_measurements(&config);
     let room_culling = crate::room_culling::RoomCullingPlugin::from_config(&config);
+    // The two renderer switches of impl-1132 (Mudcrab Plus). Both default to today's behaviour:
+    // every backend, and stock Bevy's serial encoder finish. The finish switch is process-wide and
+    // is set here, once, before the first frame.
+    crate::render_backend::apply_process_switches(&config);
+    let wgpu_settings = crate::render_backend::wgpu_settings(config.render_backends);
+    let mut default_plugins = DefaultPlugins
+        .set(AssetPlugin {
+            file_path: asset_path,
+            ..default()
+        })
+        .set(world_gltf_plugin())
+        .set(WindowPlugin {
+            primary_window: window,
+            ..default()
+        })
+        .set(LogPlugin {
+            level: Level::INFO,
+            // Bevy's default filter plus: gilrs logs an unknown-gamepad-mapping line and
+            // this engine has no gamepad input.
+            filter: "wgpu=error,naga=warn,gilrs=off".to_string(),
+            ..default()
+        });
+    if let Some(settings) = wgpu_settings {
+        default_plugins = default_plugins.set(RenderPlugin {
+            render_creation: settings.into(),
+            ..default()
+        });
+    }
     app.insert_resource(config)
         .insert_resource(origin)
         .insert_resource(render_asset_budget)
         .init_resource::<StreamingMetrics>()
-        .add_plugins(
-            DefaultPlugins
-                .set(AssetPlugin {
-                    file_path: asset_path,
-                    ..default()
-                })
-                .set(world_gltf_plugin())
-                .set(WindowPlugin {
-                    primary_window: window,
-                    ..default()
-                })
-                .set(LogPlugin {
-                    level: Level::INFO,
-                    // Bevy's default filter plus: gilrs logs an unknown-gamepad-mapping line and
-                    // this engine has no gamepad input.
-                    filter: "wgpu=error,naga=warn,gilrs=off".to_string(),
-                    ..default()
-                }),
-        )
+        .add_plugins(default_plugins)
+        .add_plugins(crate::render_backend::RenderBackendLogPlugin)
         .add_plugins((
             FrameTimeDiagnosticsPlugin::default(),
             LogDiagnosticsPlugin {
