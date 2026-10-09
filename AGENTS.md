@@ -98,6 +98,8 @@ this duty; see "Team Lead".)
   changes it. Impact note: research-1119 (Team Lead), filed under local/research/ when it lands.
 - **Timing windows: standing yes (the user, 2026-10-09).** A session with a ready timing binary may start its window
   without asking (gate timing hold with --drain, one hold at a time); tell Team Lead when it starts and ends.
+- **Warm-up run (2026-10-09).** The first engine run after a fresh build is a discarded warm-up (cold page-in made a
+  one-off 63 ms commit, U1). Acceptance and timing reads start from the second run.
 - **GPU check before merging into portal (2026-10-09).** A change touching streaming, visibility, render layers or
   settles merges into `portal` only after a portal-heavy acceptance run on the merged tree passes (world_ready reached,
   0 invariant failures). Unit tests have no lights, cameras or shadows; the #1055 bridge passed them and broke portal.
