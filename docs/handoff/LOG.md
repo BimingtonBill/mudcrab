@@ -3,6 +3,39 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-09 Phase 1 Dev: VG1/VG2 measured, E6 bench, C6 Dirt02 terrain, LOD-chunk answer
+
+All local; nothing published. No worker running, no hold set.
+
+- **VG1 mesh census** (DeepSeek #1906): `local/research/fun/p1-vg1-mesh-census-2026-10-09.md`.
+  - 33,543 GLBs, 45.9M triangles, but 10,782 of them (15.0M triangles) are baked object-LOD meshes under `meshes/terrain/*/objects`.
+  - Source only: 22,761 GLBs, 30.9M triangles.
+  - The converter exports no skinned meshes. The "max cell" is Tamriel's persistent cell; ignore it.
+- **VG2 cluster spike** (GLM #1908, report by Claude): `local/research/fun/p1-vg2-cluster-spike-2026-10-09.md`, data in `D:/Mudcrab/scratch/p1-vg2-cluster-spike`.
+  - meshoptimizer v1.3 clusterlod.h on 75 source meshes (527k triangles): 1.52 s per million triangles single-threaded, 14.2 B per triangle (16% of GLB), 0 failures.
+  - 55% of primitives are under 128 triangles, so a size threshold is needed.
+  - meshopt 0.6.2 lacks what clusterlod needs; 0.7 (git) has it only as raw FFI.
+  - Corrected after Team Lead's review: LOD-output meshes are out of the sample, and there is no comparison with terrain LOD.
+  - Upstream Dev has the corrected numbers for its Chef note.
+- **VG-L**: `local/research/fun/p1-vgl-lod-baseline-2026-10-09.md`. The terrain chunk LOD stage takes 26 min clean / 42 min contended and writes 4,639 chunks, 8.3 GB. It is terrain LOD, not object LOD.
+- **E6 load bench**: `local/research/fun/p1-load-bench-full-2026-10-09.txt`.
+  - Collider build: JSON is 76%, hulls 4.5%. Phase 4 dropped hull precompute and the parry3d dependency from collision v3 as a result.
+  - C zstd decodes 2.6x faster than ruzstd.
+- **C6** (Dirt02 default land texture): `D:/Mudcrab/SkyrimConverted-p2main-v24-terrain-dirt02` (26.5 GB). Entry 0 is Dirt02 diffuse and normal. The white folder `SkyrimConverted-p2main-v24-terrain` stays until Phase 2 says riverwood is done; then remove it under the standing yes.
+  - Lesson: a conversion keeps its gate hold to the end. Clearing it to let builds through broke the 09-23 rule.
+- **Whiterun "hole"**: the data check (`local/research/terrain-merge/view_cone_check.py`) showed full coverage. Phase 2's debug-1122 found capture timing (LOD hidden before the merged mesh draws).
+- **LOD chunk merge question** (Muse #1909, filed by Claude): `local/research/fun/p1-lod-chunk-merge-analysis-2026-10-09.md`.
+  - The ~900 entities per chunk are terrain-LOD glTF nodes, not objects. Interior entry despawns every chunk at once (lod.rs:324-331).
+  - The engine-side fix comes first (impl-1133). A converter merge would be a proposal for Chef inside #106.
+  - When impl-1133's numbers are in, write the #106 paragraph for Upstream Dev.
+- **Portal clippy "break"**: not real. Phase 2's shared target folder was stale (memory saved).
+- **Clean-up under the standing yeses, logged in `local/disk/ledger.txt`**: impl-1900 worktree, p1-keyprobe worktree, `D:/Mudcrab/builds/p1-target` (32 GB), SkyrimConverted-p1rooms (14 GB) and the 10-08 leftover staging folder.
+- **Next tomorrow**:
+  - the #106 paragraph after impl-1133;
+  - remove the white terrain folder once Phase 2 says so;
+  - E9: watch for Chef's schema;
+  - the VG3 decision belongs to the user and Team Lead.
+
 ## 2026-10-09 evening Upstream Dev: #192 merged, #199 and #203 posted, integration worktree ready
 
 Track: upstream. Nothing running (no workers, no gate jobs).
