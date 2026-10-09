@@ -12870,10 +12870,10 @@ mod tests {
         app
     }
 
-    /// How many systems the `Update` schedule carries: the way a test tells whether the probe's
+    /// How many systems the `PostUpdate` schedule carries: the way a test tells whether the probe's
     /// one system was installed, since a system's own name is only present with the debug feature.
-    fn update_systems_len(app: &App) -> usize {
-        app.get_schedule(Update)
+    fn post_update_systems_len(app: &App) -> usize {
+        app.get_schedule(PostUpdate)
             .map(|schedule| schedule.systems_len())
             .unwrap_or(0)
     }
@@ -12891,13 +12891,13 @@ mod tests {
     fn the_retire_visibility_probe_installs_only_when_asked() {
         let mut control = bare_probe_app();
         control.update();
-        let baseline = update_systems_len(&control);
+        let baseline = post_update_systems_len(&control);
 
         let mut off = bare_probe_app();
         install_retire_visibility_probe(&mut off, None);
         off.update();
         assert_eq!(
-            update_systems_len(&off),
+            post_update_systems_len(&off),
             baseline,
             "an ordinary run installs no probe system"
         );
@@ -12911,7 +12911,7 @@ mod tests {
         let mut on = probe_app(PathBuf::from("nowhere"));
         on.update();
         assert_eq!(
-            update_systems_len(&on),
+            post_update_systems_len(&on),
             baseline + 1,
             "the flag installs exactly the probe system and nothing else"
         );
