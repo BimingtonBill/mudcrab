@@ -1829,12 +1829,17 @@ mod tests {
     #[test]
     fn a_world_that_never_becomes_ready_gets_its_pacing_back_at_the_timeout() {
         let mut app = startup_app(configured_pacing());
-        // Two frames from the lift to the timeout, so the lifted state is observable between them.
+        // Virtual time clamps each frame's delta to its 0.25 s maximum, so the timeout is reached
+        // in frames of that length; Bevy's first update advances time by zero.
+        const STEP: f32 = 0.25;
         app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
-            STARTUP_LIFT_TIMEOUT_SECONDS / 2.0,
+            STEP,
         )));
         set_interior(&mut app, 77, false);
-        app.update();
+        let frames_to_timeout = (STARTUP_LIFT_TIMEOUT_SECONDS / STEP).ceil() as usize;
+        for _ in 0..frames_to_timeout {
+            app.update();
+        }
         assert_eq!(
             app.world()
                 .resource::<EngineConfig>()
