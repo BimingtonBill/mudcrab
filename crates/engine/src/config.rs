@@ -87,14 +87,17 @@ pub struct EngineConfig {
     pub terrain_radius_given: bool,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
-    /// Cells outside the unload radius a frame may despawn. `0` despawns every one at once, which
-    /// is the unbudgeted behaviour unloading used to have - and, with
-    /// [`Self::max_unload_ms_per_frame`] `0` too, the only setting that reproduces it exactly.
-    /// With this count budget pacing instead, the drain keeps its overflow escape (streaming's
-    /// retire-backlog drain), which un-bounds a frame whose retiring backlog stopped shrinking -
-    /// a trip on drain failure, not on size, that the old unbudgeted path never had. Paces the
-    /// unload only while [`Self::max_unload_ms_per_frame`] is `0`: the wall-clock budget replaces
-    /// it once set.
+    /// Retiring roots - cell roots and LOD chunks - a frame may despawn. `0` despawns every one at
+    /// once, which is the unbudgeted behaviour unloading used to have - and, with
+    /// [`Self::max_unload_ms_per_frame`] `0` too, the only setting that reproduces it exactly
+    /// (with the retire's hide, which the old path did not do, but no pacing). With this count
+    /// budget pacing instead, the drain keeps its overflow escape (streaming's retire-backlog
+    /// drain), which un-bounds a frame whose retiring backlog stopped shrinking - a trip on drain
+    /// failure, not on size, that the old unbudgeted path never had. The escape counts cells, not
+    /// chunks: it exists for sustained flight retiring cells faster than the drain, and a chunk
+    /// backlog - one entry per LOD window the camera leaves, drained at least one a frame - is
+    /// what it is by the chunk grid, not by speed. Paces the unload only while
+    /// [`Self::max_unload_ms_per_frame`] is `0`: the wall-clock budget replaces it once set.
     pub max_cell_unloads_per_frame: usize,
     /// Wall-clock milliseconds a frame may spend despawning retiring cells. The despawn paces
     /// itself by the clock: it unloads retiring cells in stable order until the budget is spent,
@@ -102,20 +105,34 @@ pub struct EngineConfig {
     /// instead of landing on one - fast flight away from the camera retires a whole ring of cells
     /// at once, far past what a per-frame cell count can pace.
     ///
-    /// Scope: this paces distance retires only - the far cells of the worldspace the camera stands
-    /// in that flying away leaves behind. A door crossing's unload of the space the camera left
-    /// happens in `plan_cells` in the frame it falls out (`paces_its_unload` is false for it) and
-    /// is not paced here, so this knob does nothing about a crossing's unload stall.
+    /// Scope: this paces the *distance* retires of the space the camera stands in - the far cells
+    /// a flight leaves behind - and the LOD chunks that space unloads, including the whole
+    /// exterior's distant terrain when the camera walks through a door into an interior. A door
+    /// crossing's unload of the *cells* of the space the camera left happens in `plan_cells` in
+    /// the frame it falls out (`paces_its_unload` is false for it) and is not paced here.
     ///
-    /// Replay stability: the order the cells unload in is stable (`cell_order_key`), so a replayed
-    /// flight unloads the same cells in the same order; which frame each cell unloads on depends
-    /// on machine speed, because the budget is wall-clock.
+    /// Replay stability: the order the roots unload in is stable (`cell_order_key`, and
+    /// `ChunkKey`'s own order for the chunks), so a replayed crossing unloads the same roots in
+    /// the same order; which frame each one unloads on depends on machine speed, because the
+    /// budget is wall-clock.
     ///
     /// `0` turns the time budget off and paces by [`Self::max_cell_unloads_per_frame`]; only that
     /// count at `0` as well is exactly the old unbudgeted path, since the drain keeps its overflow
     /// escape (a trip on drain failure, not on size) under the count budget. The default is
     /// provisional; see the comment on it in `Default for EngineConfig`.
     pub max_unload_ms_per_frame: f64,
+    /// `--lod-keep-hidden-in-interiors` (off by default): on a move into a space with no distant
+    /// terrain - an interior - the exterior LOD chunks stop being drawn but stay resident and
+    /// hidden instead of retiring under the unload budget, so the return to that exterior shows
+    /// them the frame it happens instead of streaming a whole world's LOD in again. Off, the
+    /// chunks retire under the same paced unload the cells use, and a return revives whatever the
+    /// budget has not reached yet.
+    ///
+    /// The price is memory: the chunks' entities, world assets and meshes stay held for as long
+    /// as the visit lasts. There is deliberately no timeout - a timeout would put the retire cost
+    /// back on whichever frame it fired, which is what this flag exists to keep off the return,
+    /// and a long interior visit is exactly what the measurement prices.
+    pub lod_keep_hidden_in_interiors: bool,
     /// Converted models a frame may hand to Bevy's scene spawner. `0` arms every model whose asset
     /// is loaded, which is the unbudgeted behaviour a single spawn batch used to have.
     pub max_model_spawns_per_frame: usize,
@@ -304,6 +321,10 @@ impl Default for EngineConfig {
             // `plan_cells`, and this budget covers distance retires only. `0` paces by
             // `max_cell_unloads_per_frame`, with the drain-failure escape the old path never had.
             max_unload_ms_per_frame: 3.0,
+            // The alternative to the paced LOD retire itself: hold the exterior's LOD chunks
+            // through an interior visit instead of retiring them. Off by default - the paced
+            // retire is the behaviour every run keeps unless a measurement asks for the other.
+            lod_keep_hidden_in_interiors: false,
             // A cell holds on the order of 15 references with a model and cells commit one per
             // frame, so 15 models is the largest batch a frame can be handed at once. Bevy
             // instantiates a batch like that in an estimated 5-8 ms on the stress scenario, which is
@@ -395,9 +416,14 @@ Streaming:
   --ini <file>                        layer Skyrim INI settings; CLI options override files
   --stream-radius <cells>               cells streamed around the camera (default: 2)
   --max-commit-ms <ms>                  cell commit time allowed per frame (default: 16.67)
-  --max-unloads-per-frame <count>       cells despawned per frame; 0 despawns all at once (default: 2)
-  --max-unload-ms-per-frame <ms>        wall-clock time a frame may spend despawning retiring
-                                        cells; 0 paces by --max-unloads-per-frame instead (default: 3)
+  --max-unloads-per-frame <count>       retiring cell roots and LOD chunks despawned per frame; 0
+                                        despawns all at once (default: 2)
+  --max-unload-ms-per-frame <ms>        wall-clock time a frame may spend despawning retiring roots
+                                        (cell roots and LOD chunks); 0 paces by --max-unloads-per-frame
+                                        instead (default: 3)
+  --lod-keep-hidden-in-interiors        keep exterior LOD chunks resident but hidden across an
+                                        interior visit instead of retiring them; off, they retire
+                                        under the unload budget and a return revives what is left
   --max-model-spawns-per-frame <count>  models spawned per frame; 0 spawns all at once (default: 4)
   --max-upload-mib-per-frame <mib>      render-asset upload budget per frame; 0 is unlimited (default: 16)
   --paced-startup                       pace the first load like any other; the default runs it
@@ -824,6 +850,7 @@ impl EngineConfig {
                         args.next(),
                     )?;
                 }
+                "--lod-keep-hidden-in-interiors" => config.lod_keep_hidden_in_interiors = true,
                 "--max-model-spawns-per-frame" => {
                     config.max_model_spawns_per_frame = take_value(
                         "--max-model-spawns-per-frame",
@@ -2170,6 +2197,14 @@ mod tests {
             run_config(&["--max-unload-ms-per-frame", "0"]).max_unload_ms_per_frame,
             0.0
         );
+    }
+
+    /// The held-LOD alternative is off unless asked for: the paced retire stays the default
+    /// every run gets.
+    #[test]
+    fn the_lod_keep_hidden_flag_is_off_by_default_and_parses_as_a_switch() {
+        assert!(!EngineConfig::default().lod_keep_hidden_in_interiors);
+        assert!(run_config(&["--lod-keep-hidden-in-interiors"]).lod_keep_hidden_in_interiors);
     }
 
     #[test]

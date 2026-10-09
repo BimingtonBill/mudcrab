@@ -70,24 +70,82 @@ pub(super) struct LodStreaming {
 
 #[cfg(test)]
 impl LodStreaming {
-    /// A ready chunk of `worldspace_id` drawn by `root`, at the camera's own anchor.
-    pub(super) fn insert_ready_chunk_for_test(&mut self, worldspace_id: u32, root: Entity) {
-        let key = ChunkKey::new(
-            worldspace_id,
-            LodTier::Tier16,
-            shared::lod::ChunkAnchor::new(0, 0),
-        );
-        self.chunks.insert(
-            key,
-            LodChunkStatus::Ready {
-                root,
-                origin: LodOrigin::new(0, 0),
-            },
-        );
+    /// Spawns a chunk root the way [`collect_lod_chunks`] does - its [`LodChunkRoot`] and the
+    /// visibility a shown root carries - records it as ready, and returns it.
+    pub(super) fn spawn_ready_chunk_for_test(
+        world: &mut World,
+        worldspace_id: u32,
+        anchor: shared::lod::ChunkAnchor,
+        origin: LodOrigin,
+    ) -> Entity {
+        let key = ChunkKey::new(worldspace_id, LodTier::Tier16, anchor);
+        let root = world
+            .spawn((
+                LodChunkRoot {
+                    key,
+                    generation: 0,
+                    origin,
+                    retry_count: 0,
+                },
+                Visibility::Inherited,
+            ))
+            .id();
+        world
+            .resource_mut::<LodStreaming>()
+            .chunks
+            .insert(key, LodChunkStatus::Ready { root, origin });
+        root
     }
 
+    /// The table's entries, whatever state the chunks are in.
     pub(super) fn resident_chunks_for_test(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// Spawns a chunk root in the state [`plan_lod_chunks`] leaves a chunk that fell out of the
+    /// keep-set - hidden, with the marker the revive gives back - and records it as retiring: for
+    /// the unload pacer's tests, which cannot fill the private table themselves.
+    pub(super) fn spawn_retiring_chunk_for_test(
+        world: &mut World,
+        worldspace_id: u32,
+        anchor: shared::lod::ChunkAnchor,
+        origin: LodOrigin,
+    ) -> Entity {
+        let key = ChunkKey::new(worldspace_id, LodTier::Tier16, anchor);
+        let root = world
+            .spawn((
+                LodChunkRoot {
+                    key,
+                    generation: 0,
+                    origin,
+                    retry_count: 0,
+                },
+                super::RetireHidden(Visibility::Inherited),
+                Visibility::Hidden,
+            ))
+            .id();
+        world
+            .resource_mut::<LodStreaming>()
+            .chunks
+            .insert(key, LodChunkStatus::Retiring { root, origin });
+        root
+    }
+
+    /// The number of chunks waiting for their turn in the unload budget.
+    pub(super) fn retiring_chunks_for_test(&self) -> usize {
+        self.chunks
+            .values()
+            .filter(|status| matches!(status, LodChunkStatus::Retiring { .. }))
+            .count()
+    }
+
+    /// The number of chunks kept hidden for the return to their exterior, the state
+    /// `--lod-keep-hidden-in-interiors` leaves them in.
+    pub(super) fn held_chunks_for_test(&self) -> usize {
+        self.chunks
+            .values()
+            .filter(|status| matches!(status, LodChunkStatus::Held { .. }))
+            .count()
     }
 
     /// The worldspace distant terrain is being streamed for, `None` while it is stopped.
@@ -131,6 +189,29 @@ impl LodStreaming {
             })
     }
 
+    /// The chunks waiting for their turn in the unload budget ([`super::despawn_cells`]), in
+    /// [`ChunkKey`]'s own order (worldspace, tier, anchor): stable, so a replayed crossing
+    /// unloads the same chunks on the same frames whatever order the map iterates in. Which
+    /// frame each one falls on depends on machine speed, as it does for cells.
+    pub(super) fn retiring_chunks(&self) -> Vec<(ChunkKey, Entity)> {
+        let mut retiring: Vec<(ChunkKey, Entity)> = self
+            .chunks
+            .iter()
+            .filter_map(|(key, status)| match status {
+                LodChunkStatus::Retiring { root, .. } => Some((*key, *root)),
+                _ => None,
+            })
+            .collect();
+        retiring.sort_by_key(|(key, _)| *key);
+        retiring
+    }
+
+    /// Forgets the chunk whose root the unload pacer has just despawned. Held chunks are not
+    /// touched: they are the flag's to show again, not the pacer's to unload.
+    pub(super) fn chunk_despawned(&mut self, key: ChunkKey) {
+        self.chunks.remove(&key);
+    }
+
     fn move_center(&mut self, center: IVec2, worldspace_id: u32, distances: &TerrainLodDistances) {
         self.generation = self.generation.wrapping_add(1);
         self.requested_queries.clear();
@@ -170,6 +251,31 @@ enum LodChunkStatus {
         root: Entity,
         origin: LodOrigin,
     },
+    /// The chunk has left the keep-set and is waiting for its turn in the unload budget
+    /// ([`super::despawn_cells`], which drains cells and LOD chunks under one budget).
+    ///
+    /// The map entry and the root stay, hidden the frame it retires ([`super::hide_retiring_root`],
+    /// the same hide-and-mark a retiring cell gets), so the teardown is spread over frames instead
+    /// of landing whole on the frame the camera walks through a door - and a chunk the camera
+    /// comes back to is **revived** as it is ([`revive_left_chunk`]) instead of being despawned
+    /// and streamed in again. Nothing draws it while it drains: the root is [`Visibility::Hidden`]
+    /// the frame it retires, exactly as the cell retire is.
+    Retiring {
+        root: Entity,
+        origin: LodOrigin,
+    },
+    /// The active space has no distant terrain (an interior) and `--lod-keep-hidden-in-interiors`
+    /// asked for the chunks to be kept: hidden like a retiring chunk, but with no place in the
+    /// unload queue - the return to the exterior shows them as they are
+    /// ([`revive_left_chunk`]) instead of streaming a whole world's LOD in again.
+    ///
+    /// Only the *space* leaving - an interior, or a stream radius turned off - holds a chunk this
+    /// way. A chunk that leaves the keep-set by distance retires, flag or no flag: the camera that
+    /// left it may never come back, and holding it would hold its memory for nothing.
+    Held {
+        root: Entity,
+        origin: LodOrigin,
+    },
     Failed {
         origin: LodOrigin,
         metadata: LodChunkMetadata,
@@ -183,16 +289,124 @@ impl LodChunkStatus {
         match self {
             Self::Loading { origin, .. }
             | Self::Ready { origin, .. }
+            | Self::Retiring { origin, .. }
+            | Self::Held { origin, .. }
             | Self::Failed { origin, .. } => *origin,
         }
     }
+}
 
-    fn root(&self) -> Option<Entity> {
-        match self {
-            Self::Loading { root, .. } | Self::Ready { root, .. } => Some(*root),
-            Self::Failed { .. } => None,
+/// What [`leave_keep_set`] did with a chunk that is no longer wanted, for the caller's counters
+/// and profile events.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChunkLeave {
+    /// The entry is gone: a failed chunk, which never drew a root to pace.
+    Dropped,
+    /// The chunk started leaving this frame and waits for the unload pacer.
+    Retiring,
+    /// The chunk is kept hidden for the return to its exterior
+    /// (`--lod-keep-hidden-in-interiors`).
+    Held,
+    /// The chunk was leaving already, or is held and stays held.
+    AlreadyLeaving,
+}
+
+/// The unload half of the LOD plan: what a chunk that is no longer wanted does with its root.
+///
+/// It is the cell retire's rule, reused ([`super::hide_retiring_root`]): the root is hidden the
+/// frame the chunk leaves - so a paced unload looks exactly like the unpaced one it replaced,
+/// off every camera from that frame on - the map entry and the root stay, and the unload pacer
+/// ([`super::despawn_cells`]) spreads the teardown over frames under the same budget the cells
+/// drain by. A chunk that comes back before its turn is revived, not spawned again
+/// ([`revive_left_chunk`]).
+///
+/// `hold` keeps the chunk hidden but *out of* the unload queue ([`LodChunkStatus::Held`]): the
+/// caller passes it only where the chunk's own space is not left behind but stops being drawn -
+/// the active space having no distant terrain. A held chunk the plan stops wanting anyway (a
+/// return that lands in another worldspace) starts retiring here, hidden already.
+fn leave_keep_set(
+    commands: &mut Commands,
+    chunk_visibility: &Query<'_, '_, (&Visibility, Option<&super::RetireHidden>)>,
+    status: &mut LodChunkStatus,
+    hold: bool,
+) -> ChunkLeave {
+    match status {
+        // Waiting for its turn in the budget already.
+        LodChunkStatus::Retiring { .. } => ChunkLeave::AlreadyLeaving,
+        LodChunkStatus::Held { root, origin } => {
+            if hold {
+                return ChunkLeave::AlreadyLeaving;
+            }
+            // The exterior it was held for is not the one the camera is in: it starts leaving
+            // now. It is hidden already, marker and all.
+            *status = LodChunkStatus::Retiring {
+                root: *root,
+                origin: *origin,
+            };
+            ChunkLeave::Retiring
         }
+        LodChunkStatus::Loading { root, origin, .. } | LodChunkStatus::Ready { root, origin } => {
+            let (root, origin) = (*root, *origin);
+            super::hide_retiring_root(commands, chunk_visibility, root);
+            *status = if hold {
+                LodChunkStatus::Held { root, origin }
+            } else {
+                LodChunkStatus::Retiring { root, origin }
+            };
+            if hold {
+                ChunkLeave::Held
+            } else {
+                ChunkLeave::Retiring
+            }
+        }
+        // Nothing was spawned, so there is no subtree to pace.
+        LodChunkStatus::Failed { .. } => ChunkLeave::Dropped,
     }
+}
+
+/// A chunk that comes back into the keep-set is revived as it is, the way a cell is: the root it
+/// kept draws the chunk again - the same entity, so nothing is spawned a second time - and the
+/// chunk is never requested again.
+///
+/// A chunk whose content was still loading when it left is revived *as loading*: it never showed
+/// yet, so the revive leaves the hide in place and [`track_lod_readiness`] shows it when its
+/// content is committed. Every other one is ready, and is given back exactly the visibility the
+/// leave took ([`super::RetireHidden`]); a root without that marker - one something else hid, or
+/// one never shown - is left alone.
+///
+/// Returns whether `status` was a state that comes back ([`LodChunkStatus::Retiring`] or
+/// [`LodChunkStatus::Held`]).
+fn revive_left_chunk(
+    commands: &mut Commands,
+    chunk_visibility: &Query<'_, '_, (&Visibility, Option<&super::RetireHidden>)>,
+    chunk_roots: &Query<'_, '_, (&LodChunkRoot, Option<&PendingLodChunk>)>,
+    status: &mut LodChunkStatus,
+) -> bool {
+    let (root, origin) = match *status {
+        LodChunkStatus::Retiring { root, origin } | LodChunkStatus::Held { root, origin } => {
+            (root, origin)
+        }
+        _ => return false,
+    };
+    let (generation, still_loading) =
+        chunk_roots.get(root).map_or((0, false), |(root, pending)| {
+            (root.generation, pending.is_some())
+        });
+    if still_loading {
+        *status = LodChunkStatus::Loading {
+            root,
+            generation,
+            origin,
+        };
+        return true;
+    }
+    *status = LodChunkStatus::Ready { root, origin };
+    if let Ok((_, Some(hidden))) = chunk_visibility.get(root) {
+        let original = hidden.0;
+        commands.entity(root).try_insert(original);
+        commands.entity(root).try_remove::<super::RetireHidden>();
+    }
+    true
 }
 
 #[derive(Component)]
@@ -296,6 +510,8 @@ pub(super) fn plan_lod_chunks(
     database: Res<WorldDatabase>,
     origin: Res<RenderOrigin>,
     camera: Query<&Transform, With<StreamingCamera>>,
+    chunk_visibility: Query<(&Visibility, Option<&super::RetireHidden>)>,
+    chunk_roots: Query<(&LodChunkRoot, Option<&PendingLodChunk>)>,
     mut streaming: ResMut<LodStreaming>,
     mut budget: ResMut<StreamingCommitBudget>,
     mut metrics: ResMut<StreamingMetrics>,
@@ -321,14 +537,40 @@ pub(super) fn plan_lod_chunks(
         streaming.query_retries.clear();
         streaming.pending_chunks.clear();
         streaming.queued_retry_chunks.clear();
+        // The chunks of the space the camera left stop being drawn this frame, in one of two
+        // ways - both off the frame that used to despawn a whole world's LOD in one flush:
+        // the paced retire ([`LodChunkStatus::Retiring`], drained by the unload pacer) by
+        // default, or [`LodChunkStatus::Held`] with `--lod-keep-hidden-in-interiors`, which
+        // keeps them for the return to the exterior.
+        let hold = config.lod_keep_hidden_in_interiors;
         let previous_chunks = streaming.chunks.len();
+        let mut retired = 0u64;
+        let mut held = 0u64;
         streaming.chunks.retain(|key, status| {
-            if let Some(root) = status.root() {
-                commands.entity(root).try_despawn();
+            match leave_keep_set(&mut commands, &chunk_visibility, status, hold) {
+                ChunkLeave::Dropped => {
+                    profiler.event(format!("{key:?}"), "unloaded", None);
+                    false
+                }
+                ChunkLeave::Retiring => {
+                    profiler.event(format!("{key:?}"), "retiring", None);
+                    retired += 1;
+                    true
+                }
+                ChunkLeave::Held => {
+                    profiler.event(format!("{key:?}"), "held", None);
+                    held += 1;
+                    true
+                }
+                ChunkLeave::AlreadyLeaving => true,
             }
-            profiler.event(format!("{key:?}"), "unloaded", None);
-            false
         });
+        if retired > 0 {
+            profiler.increment("lod/chunks_retiring", retired);
+        }
+        if held > 0 {
+            profiler.increment("lod/chunks_held", held);
+        }
         if streaming.chunks.len() != previous_chunks {
             streaming.visibility_dirty = true;
         }
@@ -373,6 +615,8 @@ pub(super) fn plan_lod_chunks(
 
     let center64 = (i64::from(center.x), i64::from(center.y));
     let previous_chunks = streaming.chunks.len();
+    let mut revived = 0u64;
+    let mut retired = 0u64;
     streaming.chunks.retain(|key, status| {
         let keep = keep_resident_chunk(
             *key,
@@ -381,14 +625,35 @@ pub(super) fn plan_lod_chunks(
             center64,
             &config.terrain_lod,
         );
-        if !keep {
-            if let Some(root) = status.root() {
-                commands.entity(root).try_despawn();
+        if keep {
+            // A chunk that comes back before the unload budget reaches it - or that was held
+            // across a visit to an interior - is revived as it is.
+            if revive_left_chunk(&mut commands, &chunk_visibility, &chunk_roots, status) {
+                revived += 1;
+                profiler.event(format!("{key:?}"), "revived", None);
             }
-            profiler.event(format!("{key:?}"), "unloaded", None);
+            return true;
         }
-        keep
+        match leave_keep_set(&mut commands, &chunk_visibility, status, false) {
+            ChunkLeave::Dropped => {
+                profiler.event(format!("{key:?}"), "unloaded", None);
+                false
+            }
+            ChunkLeave::Retiring => {
+                profiler.event(format!("{key:?}"), "retiring", None);
+                retired += 1;
+                true
+            }
+            ChunkLeave::Held | ChunkLeave::AlreadyLeaving => true,
+        }
     });
+    if revived > 0 {
+        metrics.revived_lod_chunks = metrics.revived_lod_chunks.saturating_add(revived);
+        profiler.increment("lod/chunks_revived", revived);
+    }
+    if retired > 0 {
+        profiler.increment("lod/chunks_retiring", retired);
+    }
     if streaming.chunks.len() != previous_chunks {
         streaming.visibility_dirty = true;
     }
@@ -722,24 +987,41 @@ pub(super) fn track_lod_readiness(
         if !patches.is_empty() {
             streaming.visibility_dirty = true;
         }
-        commands.entity(entity).insert(Visibility::Inherited);
-        commands.entity(entity).remove::<PendingLodChunk>();
-        if let Some(LodChunkStatus::Loading {
-            root: expected_root,
-            generation,
-            origin,
-        }) = streaming.chunks.get(&root.key).cloned()
-            && expected_root == entity
-            && generation == root.generation
-        {
-            streaming.chunks.insert(
-                root.key,
-                LodChunkStatus::Ready {
-                    root: entity,
-                    origin,
-                },
-            );
+        // The chunk's content is committed; whether it starts drawing now depends on whether the
+        // plan still wants it. A chunk that left the keep-set while it was loading (or whose load
+        // outlived the space it was in - `--lod-keep-hidden-in-interiors`) stays hidden and
+        // marked, so the revive ([`revive_left_chunk`]) or the return to the exterior shows it;
+        // it may have been hidden since its spawn, so the mark is written here as well as by the
+        // leave - the visibility a *shown* chunk root carries is `Inherited`.
+        let status = streaming.chunks.get(&root.key).cloned();
+        match status {
+            Some(LodChunkStatus::Loading {
+                root: expected_root,
+                generation,
+                origin,
+            }) if expected_root == entity && generation == root.generation => {
+                streaming.chunks.insert(
+                    root.key,
+                    LodChunkStatus::Ready {
+                        root: entity,
+                        origin,
+                    },
+                );
+                commands.entity(entity).insert(Visibility::Inherited);
+            }
+            Some(LodChunkStatus::Retiring { .. } | LodChunkStatus::Held { .. }) => {
+                commands.entity(entity).try_insert((
+                    super::RetireHidden(Visibility::Inherited),
+                    Visibility::Hidden,
+                ));
+            }
+            // A chunk with no entry, or one whose entry is another root's: what the plan did
+            // before the retire states existed - show it and let the map catch up.
+            _ => {
+                commands.entity(entity).insert(Visibility::Inherited);
+            }
         }
+        commands.entity(entity).remove::<PendingLodChunk>();
         metrics.lod_chunks_ready = metrics.lod_chunks_ready.saturating_add(1);
         metrics.ready_lod_terrain_patches = metrics
             .ready_lod_terrain_patches
@@ -884,25 +1166,47 @@ fn fail_chunk(
     metrics.failed_lod_chunks = metrics.failed_lod_chunks.saturating_add(1);
     profiler.increment("lod/chunks_failed", 1);
     profiler.event(format!("{:?}", root.key), "failed", None);
-    if let Some(LodChunkStatus::Loading {
-        root: expected_root,
-        generation,
-        ..
-    }) = streaming.chunks.get(&root.key).cloned()
-        && expected_root == entity
-        && generation == root.generation
-    {
-        streaming.chunks.insert(
-            root.key,
-            LodChunkStatus::Failed {
-                origin: root.origin,
-                metadata: metadata.clone(),
-                retry_count: root.retry_count,
-                retry_at,
-            },
-        );
+    match streaming.chunks.get(&root.key).cloned() {
+        // The chunk the plan still wants: the failure is recorded - a transient one is retried on
+        // its own clock - and the root, which would never draw now, goes.
+        Some(LodChunkStatus::Loading {
+            root: expected_root,
+            generation,
+            ..
+        }) if expected_root == entity && generation == root.generation => {
+            streaming.chunks.insert(
+                root.key,
+                LodChunkStatus::Failed {
+                    origin: root.origin,
+                    metadata: metadata.clone(),
+                    retry_count: root.retry_count,
+                    retry_at,
+                },
+            );
+            commands.entity(entity).try_despawn();
+        }
+        // A chunk that is already leaving: its root is the unload pacer's, not this function's -
+        // despawning it here would put a single despawn back on the frame the retire exists to
+        // keep off it.
+        Some(LodChunkStatus::Retiring { .. }) => {}
+        // A held chunk whose content failed has nothing to hold: it starts retiring (already
+        // hidden, marker and all), and a return to that exterior streams the chunk in afresh.
+        Some(LodChunkStatus::Held {
+            root: held_root,
+            origin,
+        }) if held_root == entity => {
+            streaming.chunks.insert(
+                root.key,
+                LodChunkStatus::Retiring {
+                    root: entity,
+                    origin,
+                },
+            );
+        }
+        _ => {
+            commands.entity(entity).try_despawn();
+        }
     }
-    commands.entity(entity).try_despawn();
 }
 
 fn validate_lod_scene(
@@ -1292,6 +1596,22 @@ fn update_counts(
         .chunks
         .values()
         .filter(|status| matches!(status, LodChunkStatus::Ready { .. }))
+        .count();
+    // Chunks the plan has stopped wanting but the world still holds: retiring ones wait for the
+    // unload pacer's budget, held ones for the return to their exterior
+    // (`--lod-keep-hidden-in-interiors`). Neither draws.
+    metrics.retiring_lod_chunks = streaming
+        .chunks
+        .values()
+        .filter(|status| matches!(status, LodChunkStatus::Retiring { .. }))
+        .count();
+    metrics.peak_retiring_lod_chunks = metrics
+        .peak_retiring_lod_chunks
+        .max(metrics.retiring_lod_chunks);
+    metrics.held_lod_chunks = streaming
+        .chunks
+        .values()
+        .filter(|status| matches!(status, LodChunkStatus::Held { .. }))
         .count();
     let mut pending_keys: HashSet<_> = streaming
         .chunks

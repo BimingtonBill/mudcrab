@@ -3247,6 +3247,13 @@ fn adopt_layer_source(
     } else {
         role.map_or_else(|| own.clone(), |role| source_layers(role, &own))
     };
+    // The node watches for its own `RenderLayers` being taken off again ([`release_layer_source`])
+    // from its own entity, not through an app-wide observer every removal in the world would pay:
+    // the watcher is attached here, before the component the guard reads, so exactly the nodes
+    // that become sources carry one (`watch_source_removal`).
+    commands
+        .entity(entity)
+        .queue_handled(watch_source_removal(), no_node_to_watch);
     // `PropagateOver` would keep the node's own layers whatever its cell's role is - it is
     // `crate::render::light_render_layers`'s way of keeping a light's layers under a reference whose
     // model is moved to the placed-object layer - and `PropagateStop` would cut everything under the
@@ -3275,6 +3282,36 @@ fn adopt_layer_source(
         }
     }
     registry.pending.push(entity);
+}
+
+/// Attaches [`release_layer_source`] to the node itself - an entity observer, which the engine
+/// delivers only the removals that target this node - instead of one app-wide observer that every
+/// `RenderLayers` removal in the world pays for, sources or not. On a door crossing that was
+/// 158,468 dispatches of a handler whose first line returns (analysis-1130: ~60 ms traced, one per
+/// despawned LOD entity), all for nodes that were never sources.
+///
+/// Once per node: it is queued where a node becomes a source ([`adopt_layer_source`]) and does
+/// nothing when the node is one already, which is what every later adoption - new layers of its
+/// own, a door the door layer takes over or gives back - finds. A node the portal never made a
+/// source carries no observer at all. Nothing is removed with it: the handler keeps its own
+/// `PortalLayerSource` guard, so a node that is not a source at the moment of a removal is still
+/// left alone.
+fn watch_source_removal() -> impl EntityCommand {
+    move |mut entity: EntityWorldMut| {
+        if entity.contains::<PortalLayerSource>() {
+            return;
+        }
+        entity.observe(release_layer_source);
+    }
+}
+
+/// A node that became a source and was despawned again before the watcher's command reached it:
+/// there is nothing left to watch. Queued through [`EntityCommands::queue_handled`] rather than
+/// `queue`, which would report it as an error - an adoption and a despawn in the same frame are
+/// ordinary (a door's model taken over and released, a cell spawned and unloaded), and the app
+/// never sees the node at all.
+fn no_node_to_watch(error: bevy::ecs::error::BevyError, _context: bevy::ecs::error::ErrorContext) {
+    debug!("a layer source was despawned before its removal watcher could be attached: {error}");
 }
 
 /// Adopts `entity` where it stands, from the layers it keeps of its own: the walk up finds the cell
@@ -3338,7 +3375,9 @@ fn set_cell_visibility(
 
 /// The wiring the cell isolation is: Bevy's own hierarchy propagation of [`RenderLayers`], run in
 /// `PostUpdate` before the visibility that reads the layers, and the observers that stamp a cell the
-/// frame it spawns and turn a node with layers of its own into a source ([`PortalLayerSource`]).
+/// frame it spawns and turn a node with layers of its own into a source ([`PortalLayerSource`]) -
+/// the last of them attached per node, where the node becomes a source ([`watch_source_removal`]),
+/// not app-wide.
 ///
 /// Added by `PortalPlugin` for the runs that are looked at, and by this module's own test app - one
 /// function, so the two cannot drift. `crate::streaming`'s stamp-parity tests add it too, so the
@@ -3368,7 +3407,9 @@ pub(crate) fn add_cell_layer_isolation(app: &mut App) {
     .add_observer(stamp_streamed_cell)
     .add_observer(adopt_own_layer_node)
     .add_observer(adopt_layer_source_node)
-    .add_observer(release_layer_source)
+    // `release_layer_source` is not registered here: it is attached per node, the moment the node
+    // becomes a source ([`watch_source_removal`]), so a removal anywhere else in the world - the
+    // 158k of a LOD-chunk unload on a door crossing - pays nothing for it.
     .add_observer(clear_propagate_stop);
 }
 
@@ -3542,6 +3583,10 @@ fn adopt_own_layer_node(
 /// hid a door model's filler for is gone. The node has no layers of its own any more, so Bevy's
 /// default is what it keeps in the active space - and the removal does not leave the layers it was
 /// given behind as the ones a later role change would restore.
+///
+/// An entity observer on each node that became a layer source, attached by
+/// [`watch_source_removal`] - not an app-wide observer: the guard below is what a world-wide
+/// registration made every *other* entity's removal pay for as well.
 fn release_layer_source(
     event: On<Remove, RenderLayers>,
     mut commands: Commands,
@@ -10060,6 +10105,65 @@ mod tests {
             layers_of(&app, settled),
             crate::render::reflectable_world_layers(),
             "the layer it was given is not the one its own space gives back"
+        );
+    }
+
+    /// The removal watcher ([`release_layer_source`]) belongs to the nodes that became layer
+    /// sources and to no one else. A source's removal is still adopted - it keeps being a source,
+    /// with what it has now - and a node that never was a source is not even told about its own
+    /// removal: the app-wide observer this replaced ran for every `RenderLayers` removal in the
+    /// world, which on a door crossing was 158k LOD entities whose handler returned on its first
+    /// line (analysis-1130).
+    #[test]
+    fn the_layer_source_removal_watcher_belongs_to_the_source_node_alone() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let (root, _) = spawn_cell(&mut app, PRESTREAMED_CELL, None, None, None);
+        update(&mut app, 2);
+
+        // A plain mesh: no layers of its own, so the portal never adopted it.
+        let (plain, _) = spawn_mesh(&mut app, root, None);
+        update(&mut app, 1);
+        assert!(
+            app.world().get::<PortalLayerSource>(plain).is_none(),
+            "a plain mesh is no source"
+        );
+        app.world_mut().entity_mut(plain).remove::<RenderLayers>();
+        update(&mut app, 1);
+        assert!(
+            app.world().get::<PortalLayerSource>(plain).is_none(),
+            "and its own removal does not make it one"
+        );
+        let registry = app.world().resource::<CellLayerSources>();
+        assert!(
+            registry
+                .by_root
+                .values()
+                .flatten()
+                .all(|source| *source != plain),
+            "the portal never adopted it"
+        );
+        assert!(!registry.pending.contains(&plain));
+
+        // A node a mod gave layers to is a source, and taking those layers off it again is
+        // adopted: it stays a source, now keeping Bevy's default for the activation its cell
+        // asks for.
+        let (source, _) = spawn_mesh(&mut app, root, Some(RenderLayers::layer(1)));
+        update(&mut app, 1);
+        assert!(
+            app.world().get::<PortalLayerSource>(source).is_some(),
+            "a node with layers of its own is adopted"
+        );
+        app.world_mut().entity_mut(source).remove::<RenderLayers>();
+        update(&mut app, 1);
+        let adopted = app
+            .world()
+            .get::<PortalLayerSource>(source)
+            .expect("a source stays one when its own layers are taken off");
+        assert_eq!(
+            adopted.own,
+            RenderLayers::default(),
+            "and keeps what it has now, which is Bevy's default"
         );
     }
 
