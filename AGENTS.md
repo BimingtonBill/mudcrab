@@ -422,6 +422,16 @@ Deleting data is the risk here, so these rules lean towards keeping. Step 1 (now
 read-only report; nothing is deleted automatically. A standing yes for class A may follow later,
 only if the user gives one.
 
+- **Standing yes: clearing finished folders (the user, 2026-10-09).** The owning session may remove, without
+  asking, a coder or hand-made worktree whose work is merged into portal or committed on a branch (check: the
+  head is on a branch, and `git status --untracked-files=no` shows nothing but ds_impl's generated
+  `.deepseek-agents.json`), and the build folder of finished work. Use `ds_impl.ps1 -Discard` or
+  `git worktree remove`; keep every branch; put a branch on a branchless head before removing anything; log each
+  removal in `local/disk/ledger.txt`. Do it the same day the work is integrated or abandoned: on 2026-10-09
+  finished coder worktrees had piled up to 148 GB on C:. Not covered: uncommitted or branchless work,
+  converted data (`SkyrimConverted*`, its asset caches: class C, always the user's call), reference shots,
+  run records and anything another session is using.
+
 - **One build folder per session**, never shared between sessions; combined or branch-vs-main
   checks use a throwaway folder deleted afterwards. A shared folder mixed worktrees on 2026-10-02
   (an engine built against another branch's `shared` crate).
