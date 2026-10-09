@@ -613,6 +613,13 @@ fn release_detail_change_stand_ins(
 /// Waiting surfaces that are prepared but not yet drawn.
 type PreparedNotDrawn = (With<SwapWaiting>, With<SwapPrepared>, Without<SwapDrawn>);
 
+/// Waiting surfaces a camera can see that are not yet drawn: the ones a settle waits on.
+type InCameraViewNotDrawn = (
+    With<SwapWaiting>,
+    With<SwapInCameraView>,
+    Without<SwapDrawn>,
+);
+
 /// The C5 gauges over the swap: how many surfaces are still waiting on the render world, how many
 /// of those it has prepared but not confirmed drawn, and how many it confirmed drawn this frame.
 ///
@@ -626,12 +633,20 @@ type PreparedNotDrawn = (With<SwapWaiting>, With<SwapPrepared>, Without<SwapDraw
 fn record_swap_gauges(
     waiting: Query<(), (With<SwapWaiting>, Without<SwapDrawn>)>,
     prepared: Query<(), PreparedNotDrawn>,
+    in_camera_view: Query<(), InCameraViewNotDrawn>,
     stats: Res<SwapBridgeStats>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     profiler.set_gauge("swap/waiting", waiting.iter().count() as f64);
     profiler.set_gauge("swap/prepared_not_drawn", prepared.iter().count() as f64);
     profiler.set_gauge("swap/drawn_this_frame", f64::from(stats.drawn_this_frame));
+    // The split of `swap/waiting` the settles depend on: of the surfaces still waiting, how many a
+    // camera can see (what `pending_drawn` counts - near 0 once a view has settled) against the rest,
+    // which no camera sees and so are never confirmed drawn (off camera, or in a shadow view only).
+    profiler.set_gauge(
+        "swap/in_camera_view_not_drawn",
+        in_camera_view.iter().count() as f64,
+    );
 }
 
 /// Registers the render→main swap bridge: the extract system in the render app, the main-world
