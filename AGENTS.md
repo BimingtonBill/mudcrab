@@ -93,6 +93,8 @@ this duty; see "Team Lead".)
   inside one shell command or from a detached script the panel cannot see. Claude helpers go through the Agent
   tool (background). A worker already running outside the panel gets a background watcher (a Bash loop waiting on
   its PID that prints the report head when it ends).
+- **Timing windows: standing yes (the user, 2026-10-09).** A session with a ready timing binary may start its window
+  without asking (gate timing hold with --drain, one hold at a time); tell Team Lead when it starts and ends.
 - **GPU check before merging into portal (2026-10-09).** A change touching streaming, visibility, render layers or
   settles merges into `portal` only after a portal-heavy acceptance run on the merged tree passes (world_ready reached,
   0 invariant failures). Unit tests have no lights, cameras or shadows; the #1055 bridge passed them and broke portal.
