@@ -429,8 +429,13 @@ only if the user gives one.
   `git worktree remove`; keep every branch; put a branch on a branchless head before removing anything; log each
   removal in `local/disk/ledger.txt`. Do it the same day the work is integrated or abandoned: on 2026-10-09
   finished coder worktrees had piled up to 148 GB on C:. Not covered: uncommitted or branchless work,
-  converted data (`SkyrimConverted*`, its asset caches: class C, always the user's call), reference shots,
-  run records and anything another session is using.
+  reference shots, run records and anything another session is using.
+- **Standing yes: clearing converted data with no use (the user, 2026-10-09).** The owner (its OWNER file) may
+  remove a converted-data folder (`SkyrimConverted*`, its `.assets-cache`, leftover `.staging-*`) that no open
+  work, PR (`keep-until`), benchmark or evidence set still needs, without asking. Links first: another folder may
+  hard-link or junction into it (p118mirror and p2main-doors into p2main). Remove or retire the dependants
+  first, remove junctions with rmdir on the link only, never recursively through one. Log each removal in
+  `local/disk/ledger.txt`. In doubt about a use, ask Team Lead; the current reference conversions stay.
 
 - **One build folder per session**, never shared between sessions; combined or branch-vs-main
   checks use a throwaway folder deleted afterwards. A shared folder mixed worktrees on 2026-10-02
