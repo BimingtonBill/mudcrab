@@ -98,6 +98,8 @@ this duty; see "Team Lead".)
   changes it. Impact note: research-1119 (Team Lead), filed under local/research/ when it lands.
 - **Timing windows: standing yes (the user, 2026-10-09).** A session with a ready timing binary may start its window
   without asking (gate timing hold with --drain, one hold at a time); tell Team Lead when it starts and ends.
+  Since 2026-10-09 the gate refuses a timing hold (named `timing*`/`*window*`, or `--quiet-disk`) while any other
+  hold is set (exit 4); wait for it to clear. `--allow-overlap` only when the other hold's owner agreed.
 - **Warm-up run (2026-10-09).** The first engine run after a fresh build is a discarded warm-up (cold page-in made a
   one-off 63 ms commit, U1). Acceptance and timing reads start from the second run.
 - **GPU check before merging into portal (2026-10-09).** A change touching streaming, visibility, render layers or
