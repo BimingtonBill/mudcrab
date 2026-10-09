@@ -19,10 +19,10 @@ use crate::{
     config::EngineConfig,
     profiling::ProfilingState,
     streaming::{ActiveSpace, RenderOrigin, StreamingMetrics, StreamingWorld, window_center},
-    swap_bridge::{SwapWaiting, pending_drawn},
+    swap_bridge::{SwapInCameraView, SwapWaiting, pending_drawn},
     world::{cache::CellCache, components::CELL_SIZE, components::StreamingCamera},
 };
-use bevy::{camera::visibility::ViewVisibility, prelude::*};
+use bevy::prelude::*;
 use serde::Serialize;
 use std::time::Instant;
 
@@ -442,7 +442,7 @@ pub(crate) fn track_world_ready(
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     // Surfaces a view can see that the render world has not confirmed drawn: "ready" means drawn,
     // not validated (design-1091 §4).
-    waiting: Query<&ViewVisibility, With<SwapWaiting>>,
+    waiting: Query<Has<SwapInCameraView>, With<SwapWaiting>>,
     mut tracker: ResMut<PacingTracker>,
     mut profiler: ResMut<ProfilingState>,
     // The window frame times are real wall-clock deltas. The virtual `Time` Bevy's schedules see is

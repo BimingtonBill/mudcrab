@@ -32,5 +32,8 @@
   "delegationLevel": 4,
   "implAllowTools": "Bash(python C:/Users/Brannock/.mudcrab/build-gate/build_gate.py *),Bash(cargo fmt *),Bash(cargo tree *),Bash(python *),Bash(python -m unittest *),Bash(target/release/engine.exe *),Bash(./target/release/engine.exe *),Bash(target/quick/engine.exe *),Bash(./target/quick/engine.exe *)",
   "_implAllowToolsNote": "implAllowTools replaces ds_impl's cargo+python default; cargo build and the release engine were added 2026-09-22 for --shots render tasks (impl-019).",
-  "_buildGateNote": "2026-10-07 (the user: learn from the PC clash): heavy cargo (check/test/nextest/clippy/build) runs only through the machine-wide build gate: python C:/Users/Brannock/.mudcrab/build-gate/build_gate.py run -- cargo ... (max 3 slots, >= 8 GB free RAM, waits for conversion/timing holds). Direct heavy cargo is no longer allowed for workers."
+  "_buildGateNote": "2026-10-07 (the user: learn from the PC clash): heavy cargo (check/test/nextest/clippy/build) runs only through the machine-wide build gate: python C:/Users/Brannock/.mudcrab/build-gate/build_gate.py run -- cargo ... (max 3 slots, >= 8 GB free RAM, waits for conversion/timing holds). Direct heavy cargo is no longer allowed for workers.",
+  "implTargetRoot": "D:/Mudcrab/builds/impl-targets",
+  "implTargetMinFreeGB": 30,
+  "_implTargetNote": "2026-10-09: ds_impl puts each coder's target/ in D:/Mudcrab/builds/impl-targets/<task>-target (junctioned into the worktree) so seeds no longer fill C:. The seed (about 20 GB) is skipped below 30 GB free there; -Discard removes the folder."
 }

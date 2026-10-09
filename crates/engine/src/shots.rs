@@ -38,7 +38,7 @@ use crate::{
     doors::{DoorAnchor, DoorState, LoadDoor},
     portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, PortalTexture},
     streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld},
-    swap_bridge::{SwapWaiting, pending_drawn},
+    swap_bridge::{SwapInCameraView, SwapWaiting, pending_drawn},
     transition::{
         OpenDoor, SpaceTarget, destination_is_resident, distance_in_front_of_door, door_is_open,
         heading_to_rotation, source_doorway_centre, source_doorway_frame, switch_space,
@@ -47,7 +47,7 @@ use crate::{
 };
 use bevy::{
     animation::graph::AnimationGraphHandle,
-    camera::{RenderTarget, visibility::ViewVisibility},
+    camera::RenderTarget,
     ecs::system::SystemParam,
     prelude::*,
     render::view::screenshot::{Screenshot, save_to_disk},
@@ -989,7 +989,7 @@ fn run_shots(
     windows: Query<&Window, With<PrimaryWindow>>,
     // The surfaces the render world has not confirmed drawn while a view can see them: the settle
     // waits for these ([`crate::swap_bridge::pending_drawn`]).
-    waiting: Query<&ViewVisibility, With<SwapWaiting>>,
+    waiting: Query<Has<SwapInCameraView>, With<SwapWaiting>>,
     mut exit: MessageWriter<AppExit>,
     mut world: DoorWorld,
 ) {
@@ -1894,18 +1894,24 @@ mod tests {
         assert!(quiet_counts().is_quiet());
     }
 
-    /// What `pending_drawn` counts: a waiting surface a view can see, and not one it cannot. Built
-    /// from a real query so the visibility rule is the engine's (`ViewVisibility::get`), not a
-    /// re-statement of it.
+    /// What `pending_drawn` counts: a waiting surface a camera can see ([`SwapInCameraView`]), and
+    /// not one it cannot - including one Bevy's light passes marked `ViewVisibility` visible because
+    /// it is in a shadow cascade, which no camera draws (the portal-heavy break of 2026-10-09).
     #[test]
     fn settle_counts_counts_a_visible_waiting_surface_and_ignores_an_off_view_one() {
         let mut world = World::new();
-        world.spawn((SwapWaiting, ViewVisibility::VISIBLE));
-        world.spawn((SwapWaiting, ViewVisibility::VISIBLE));
-        world.spawn((SwapWaiting, ViewVisibility::HIDDEN));
-        // A visible entity that is not waiting is not a surface at all.
-        world.spawn(ViewVisibility::VISIBLE);
-        let mut state = SystemState::<Query<&ViewVisibility, With<SwapWaiting>>>::new(&mut world);
+        world.spawn((SwapWaiting, SwapInCameraView));
+        world.spawn((SwapWaiting, SwapInCameraView));
+        world.spawn(SwapWaiting);
+        // Visible only to a shadow view: `ViewVisibility` says visible, no camera sees it.
+        world.spawn((
+            SwapWaiting,
+            bevy::camera::visibility::ViewVisibility::VISIBLE,
+        ));
+        // A camera-visible entity that is not waiting is not a surface at all.
+        world.spawn(SwapInCameraView);
+        let mut state =
+            SystemState::<Query<Has<SwapInCameraView>, With<SwapWaiting>>>::new(&mut world);
         let counts = {
             let query = state
                 .get(&world)
