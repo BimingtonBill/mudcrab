@@ -159,6 +159,14 @@ pub struct EngineConfig {
     pub profile_commit: String,
     pub profile_dirty_worktree: bool,
     pub profile_hardware: String,
+    /// `--probe-retire-visibility <dir>`: a measurement-only run that records whether a cell held
+    /// in the retire backlog - already hidden, draining over frames under the unload budget - ever
+    /// shows in a view. On each frame with a nonzero backlog it counts the retiring roots (and
+    /// their mesh descendants) whose `ViewVisibility` is set, photographs the first few backlog
+    /// frames, then writes `retire-visibility.json` and exits when the backlog has drained
+    /// (non-zero on any hit, or if no backlog ever appeared). `None` (the default) installs no
+    /// probe system, so an ordinary run is unchanged. See [`crate::streaming`].
+    pub probe_retire_visibility: Option<PathBuf>,
     pub acceptance_screenshot: Option<PathBuf>,
     /// The water reflection camera's cost options ([`ReflectionOptions`]).
     pub reflection: ReflectionOptions,
@@ -322,6 +330,7 @@ impl Default for EngineConfig {
             profile_commit: "unknown".into(),
             profile_dirty_worktree: false,
             profile_hardware: "unspecified".into(),
+            probe_retire_visibility: None,
             acceptance_screenshot: None,
             reflection: ReflectionOptions::default(),
             screenshot_camera_offset: None,
@@ -411,6 +420,7 @@ Benchmark and profiling:
   --profile-hardware <text>             hardware recorded in the profile (default: unspecified)
   --water-reflection-preset <name>      water reflection cost: baseline (full size, every frame, shadowed)
                                         or water (quarter size, every other frame, shadowless) (default: baseline)
+  --probe-retire-visibility <dir>       record whether a draining retiring cell ever shows, write retire-visibility.json and PNGs here, then exit
 
 Diagnostics:
   --diagnostic-asset-fallbacks          log every fallback asset substitution
@@ -927,6 +937,13 @@ impl EngineConfig {
                 "--profile-commit" => {
                     config.profile_commit =
                         take_value("--profile-commit", "a commit hash", args.next())?;
+                }
+                "--probe-retire-visibility" => {
+                    config.probe_retire_visibility = Some(take_value(
+                        "--probe-retire-visibility",
+                        "a directory for the retire-visibility probe's JSON and PNGs",
+                        args.next(),
+                    )?);
                 }
                 "--profile-dirty-worktree" => config.profile_dirty_worktree = true,
                 "--profile-hardware" => {

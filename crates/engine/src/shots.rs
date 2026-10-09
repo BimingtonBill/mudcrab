@@ -59,6 +59,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Requests a one-shot capture of the primary window into `path`, the same mechanism a `--shots`
+/// run photographs a pose with: the [`Screenshot`] entity's observer writes the file after that
+/// frame renders. Used by the retire-visibility probe (`crate::streaming`) to photograph a frame
+/// that is draining retiring cells - a small hook so the probe reuses this capture path rather
+/// than a second one.
+pub(crate) fn capture_primary_window(commands: &mut Commands, path: PathBuf) {
+    commands
+        .spawn(Screenshot::primary_window())
+        .observe(save_to_disk(path));
+}
+
 /// The steepest pitch a shot may ask for, in degrees, negative looking up: Skyrim's player X angle
 /// stops just short of straight down and straight up.
 pub const MIN_PITCH_DEGREES: f32 = -89.0;
