@@ -3,6 +3,36 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-09 evening Portal Dev: water SSR merged (flag off), B2d answered, bevy_render patch started
+
+Track: Portal / Mudcrab Plus. Nothing pushed by this session (Upstream Dev posted the SSR numbers on #203).
+
+- **impl-1128 water SSR (B13): merged into portal (bca24157), `--water-reflection ssr`, default planar.** Shader march in
+  water.wgsl + self-contained water_ssr.rs (opaque copy in the view transmission slot; one portal hook
+  `portal_water_ssr_hook`). Reviews: DeepSeek + Muse (review-1129), all fix-first items fixed (0b659956). Integration:
+  fmt, clippy, nextest 1326/1326; GPU check passed (world_ready, 0 invariants, max commit 9.5 ms). Window (x3 interleaved):
+  portal-heavy planar 56.9 / preset 61.1 / ssr 82.4 fps; render_thread 15.63 / 14.65 / 10.28 ms; GPU 2.41 / 1.72 / 1.36 ms.
+  Sheet: local/review/portal-water-ssr-image-2026-10-09/USER-SHEET.png (default = the user's call). Water preset (B3) is
+  now likely superseded: keep, no more work.
+- **Water-scenario failures (Phase 2's):** 2 of 3 rounds fine; round 3 planar and preset runs missed world_ready (2
+  invariant failures). Phase 2 suspects the terrain swap bridge counting patches only the planar reflection view sees.
+  Repro with stderr is queued (see first steps).
+- **B2d answered:** Phase 2's A14 trace shows ~70% of each Core3d run is the serial encoder finish
+  (RenderContextState::apply) on the render thread (local/research/engine-foundations/trace-1125-render-flush-2026-10-09.md).
+  analysis-1131 (Opus): no engine-only route; ~55-line bevy_render render_context.rs patch, est. 2.5-3.5 ms/frame.
+  The user said YES to vendoring bevy_render 0.19.0 into portal only, and YES to Vulkan-only (separate A/B row).
+- **impl-1132 (vendor + parallel finish + --render-backends):** Claude Sonnet coder, brought to a committed state tonight
+  (see its branch portal-impl-1132-parallel-finish); not reviewed, not built for timing.
+- **impl-1125 (flush lap):** branch portal-impl-1125-flush-lap 4dfebe5f (duplicate lap fixed, nextest 1274/1274),
+  NOT merged; worktree local/impl/impl-1125-portal-flush-lap-and-skip-test kept for the re-measure.
+- **B13b (probe fallback, parallax-corrected cubemaps):** approved as a later step, not started.
+- **First steps tomorrow:** (1) the SSR in-motion capture (motion_poses.json + run_motion.py ready in
+  local/review/portal-water-ssr-motion-2026-10-09; run with the integration build, planar vs ssr, then ffmpeg) for the
+  user's default decision; (2) Phase 2's water-planar repro x3 with stderr (script: w1128m.sh pattern; send the error!
+  lines and in_camera_view_not_drawn series); (3) review impl-1132 (two reviewers), build, window: stock vs
+  --render-parallel-finish and all vs vulkan, against the 1131 go bar; then Upstream Dev drafts the Bevy PR/issue;
+  (4) re-measure impl-1125 and batch it into a merge.
+
 ## 2026-10-09 Phase 1 Dev: VG1/VG2 measured, E6 bench, C6 Dirt02 terrain, LOD-chunk answer
 
 All local; nothing published. No worker running, no hold set.
