@@ -2552,7 +2552,10 @@ fn capture_acceptance_screenshot(
     windows: Query<(), With<Window>>,
     // Surfaces a view can see that the render world has not confirmed drawn: an acceptance
     // screenshot must not be taken while one is outstanding (design-1091 §4).
-    waiting: Query<&ViewVisibility, With<crate::swap_bridge::SwapWaiting>>,
+    waiting: Query<
+        Has<crate::swap_bridge::SwapInCameraView>,
+        With<crate::swap_bridge::SwapWaiting>,
+    >,
 ) {
     let Some(path) = &config.acceptance_screenshot else {
         return;

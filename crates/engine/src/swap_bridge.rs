@@ -21,7 +21,6 @@
 //! marker, never all terrain, and a surface leaves the set the frame it is confirmed drawn
 //! (design-1091 §2.3, §5).
 
-use bevy::camera::visibility::ViewVisibility;
 use bevy::pbr::{PreparedMaterial, SpecializedMaterialPipelineCache};
 use bevy::{
     asset::{AssetId, UntypedAssetId},
@@ -59,11 +58,24 @@ use crate::{
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct SwapWaiting;
 
-/// The waiting surfaces with their main-world visibility: what [`pending_drawn`] counts over.
-pub(crate) type WaitingVisibility<'w, 's> =
-    Query<'w, 's, &'static ViewVisibility, With<SwapWaiting>>;
+/// A waiting surface that a *camera* view can see, as the render world reports it: the entity is in
+/// some camera's `RenderVisibleEntities`. The bridge writes it every frame (inserted or removed only
+/// when it changes) for the waiting set.
+///
+/// This, not Bevy's `ViewVisibility`, is what "a view can see it" means for the swap. `ViewVisibility`
+/// is also set by the light passes for a mesh inside a shadow cascade or cubemap
+/// (bevy_light-0.19.0 lib.rs:489-493, :629, :634), and such a mesh is never in a camera's visible set,
+/// so the bridge can never confirm it drawn: read through `ViewVisibility`, every off-camera terrain
+/// patch in sun-shadow range would wait for ever (the portal-heavy break of 2026-10-09). The marker
+/// asks the same question the bridge's drawn check asks, so the two cannot disagree.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct SwapInCameraView;
 
-/// How many surfaces are waiting on the render world while a main-world view can see them.
+/// The waiting surfaces and whether a camera can see each: what [`pending_drawn`] counts over.
+pub(crate) type WaitingVisibility<'w, 's> = Query<'w, 's, Has<SwapInCameraView>, With<SwapWaiting>>;
+
+/// How many surfaces are waiting on the render world while a camera can see them
+/// ([`SwapInCameraView`]).
 ///
 /// This is the one rule a settle (design-1091 C4), the world-ready predicate, a door prewarm and the
 /// run-level invariant count through, so they cannot disagree about what a hole is: a surface no view
@@ -72,16 +84,15 @@ pub(crate) type WaitingVisibility<'w, 's> =
 /// holds nothing up. A surface the stand-in still hides is not counted either: it is covered, and the
 /// frame the stand-in yields the quadrant is already `Visibility::Inherited`.
 ///
-/// `ViewVisibility` is the visibility `check_visibility` wrote in the last `PostUpdate`, so this
-/// reads the visibility of the frame *before* the one that asks: an entity that becomes visible in
-/// this frame's `PostUpdate` is counted from the next frame. That can only delay a settle by one
-/// frame (which [`crate::shots::SETTLE_QUIET_FRAMES`] absorbs), never settle on a surface that was
-/// already visible and undrawn, because a visible surface stays visible.
+/// [`SwapInCameraView`] is written during extract from the render world's visible sets of the frame
+/// before, so an entity that becomes visible is counted one or two frames late. That can only delay
+/// a settle by that much (which [`crate::shots::SETTLE_QUIET_FRAMES`] absorbs), never settle on a
+/// surface that was already visible and undrawn, because a visible surface stays visible.
 ///
 /// The set is small: only the entities the engine has marked waiting, which is the same bound the
 /// bridge itself pays (design-1091 §2.3).
-pub(crate) fn pending_drawn(waiting: &Query<&ViewVisibility, With<SwapWaiting>>) -> usize {
-    waiting.iter().filter(|visibility| visibility.get()).count()
+pub(crate) fn pending_drawn(waiting: &Query<Has<SwapInCameraView>, With<SwapWaiting>>) -> usize {
+    waiting.iter().filter(|in_view| *in_view).count()
 }
 
 /// What a waiting surface's draw needs from the render world, as asset ids.
@@ -299,6 +310,7 @@ type WaitingSurfaces = Query<
         &'static Mesh3d,
         &'static SwapSurface,
         Option<&'static SwapPrepared>,
+        Has<SwapInCameraView>,
     ),
     With<SwapWaiting>,
 >;
@@ -340,7 +352,10 @@ fn swap_bridge(
         let query = state
             .get(&main_world)
             .expect("the cached query state was built from the main world");
-        for (entity, mesh, surface, prepared) in query.iter() {
+        for (entity, mesh, surface, prepared, in_view) in query.iter() {
+            let seen = views
+                .iter()
+                .any(|(_, visible)| view_sees(visible, MainEntity::from(entity)));
             let facts = if prepared.is_some() {
                 SwapSurfaceFacts::assets_ready()
             } else {
@@ -362,14 +377,16 @@ fn swap_bridge(
                 ),
                 ..facts
             };
-            match swap_readiness(&facts) {
-                SwapReadiness::Waiting => {}
-                readiness => decisions.push(SwapDecision {
+            let readiness = swap_readiness(&facts);
+            let in_view_changed = (seen != in_view).then_some(seen);
+            if readiness != SwapReadiness::Waiting || in_view_changed.is_some() {
+                decisions.push(SwapDecision {
                     entity,
-                    insert_prepared: prepared.is_none(),
+                    insert_prepared: readiness != SwapReadiness::Waiting && prepared.is_none(),
                     drawn: readiness == SwapReadiness::Drawn,
                     stand_in: surface.stand_in(),
-                }),
+                    in_view: in_view_changed,
+                });
             }
         }
     }
@@ -385,6 +402,15 @@ fn swap_bridge(
         if decision.drawn {
             entity.insert(SwapDrawn);
         }
+        match decision.in_view {
+            Some(true) => {
+                entity.insert(SwapInCameraView);
+            }
+            Some(false) => {
+                entity.remove::<SwapInCameraView>();
+            }
+            None => {}
+        }
     }
 }
 
@@ -397,6 +423,8 @@ struct SwapDecision {
     insert_prepared: bool,
     drawn: bool,
     stand_in: Option<Entity>,
+    /// `Some(seen)` when whether a camera can see the surface changed this frame.
+    in_view: Option<bool>,
 }
 
 /// Reads the render world's state for one surface: the five lookups of design-1091 §2.1 minus the
@@ -489,7 +517,9 @@ fn complete_drawn_swaps(
 ) {
     let mut completed = 0u32;
     for entity in &drawn {
-        commands.entity(entity).try_remove::<SwapWaiting>();
+        commands
+            .entity(entity)
+            .try_remove::<(SwapWaiting, SwapInCameraView)>();
         completed = completed.saturating_add(1);
     }
     stats.drawn_this_frame = completed;
@@ -505,7 +535,7 @@ type WaitingCoverage<'w, 's> = Query<
         &'static Visibility,
         Has<SwapDrawn>,
         Has<SwapPrepared>,
-        &'static ViewVisibility,
+        Has<SwapInCameraView>,
     ),
     With<SwapWaiting>,
 >;
@@ -520,7 +550,7 @@ type WaitingCoverage<'w, 's> = Query<
 /// would hold its stand-in for ever. Nothing on screen needs covering then, so prepared-and-off-view
 /// counts as covered - but only once the surface is *revealed*: a terrain quadrant is spawned
 /// `Visibility::Hidden` and stays so until its textures are in `Assets<Image>`, which spans the
-/// frames before the render world can have them, and its `ViewVisibility` is false throughout.
+/// frames before the render world can have them, and no camera's visible set holds it throughout.
 /// Reading that as "off-view" would drop the stand-in before the replacement can be drawn at all.
 ///
 /// Cost is one pass over the waiting surfaces plus one over the live holds, and the live holds are
@@ -542,8 +572,8 @@ fn release_detail_change_stand_ins(
     // than from the new root: a new root that is despawned, and one that declares no surface at all
     // (a cell with no terrain), both simply stop naming anything here.
     uncovered.clear();
-    for (surface, surface_visibility, drawn, prepared, view) in &waiting {
-        if drawn || (prepared && *surface_visibility != Visibility::Hidden && !view.get()) {
+    for (surface, surface_visibility, drawn, prepared, in_view) in &waiting {
+        if drawn || (prepared && *surface_visibility != Visibility::Hidden && !in_view) {
             continue;
         }
         if let Some(stand_in) = surface.stand_in()
@@ -851,7 +881,7 @@ mod tests {
                         surface(&[]).with_stand_in(stand_in),
                         SwapWaiting,
                         Visibility::Inherited,
-                        ViewVisibility::VISIBLE,
+                        SwapInCameraView,
                         ChildOf(new_root),
                     ))
                     .id()
@@ -864,16 +894,16 @@ mod tests {
     }
 
     /// Sets what the main world's visibility pass leaves on a patch: its own `Visibility` (a terrain
-    /// quadrant is `Hidden` until its textures are in `Assets<Image>`) and whether a view saw it.
+    /// quadrant is `Hidden` until its textures are in `Assets<Image>`) and whether a camera saw it
+    /// ([`SwapInCameraView`], which the bridge writes).
     fn set_visibility(app: &mut App, patch: Entity, own: Visibility, seen: bool) {
-        app.world_mut().entity_mut(patch).insert((
-            own,
-            if seen {
-                ViewVisibility::VISIBLE
-            } else {
-                ViewVisibility::HIDDEN
-            },
-        ));
+        let mut patch = app.world_mut().entity_mut(patch);
+        patch.insert(own);
+        if seen {
+            patch.insert(SwapInCameraView);
+        } else {
+            patch.remove::<SwapInCameraView>();
+        }
     }
 
     /// Whether the entity is still in the world.

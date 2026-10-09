@@ -7,7 +7,7 @@ use crate::{
         TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
     snow::{DirectionalSnow, DirectionalSnowCatalog, SnowMaterial, SnowMaterialCache},
-    swap_bridge::{SwapDrawn, SwapStandIn, SwapSurface, SwapWaiting},
+    swap_bridge::{SwapDrawn, SwapInCameraView, SwapStandIn, SwapSurface, SwapWaiting},
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
@@ -27,7 +27,7 @@ use bevy::{
     app::{Inherited, Propagate, SceneSpawnerSystems},
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::primitives::MeshAabb,
-    camera::visibility::{RenderLayers, ViewVisibility},
+    camera::visibility::RenderLayers,
     ecs::system::SystemParam,
     gltf::{GltfExtras, GltfMaterialName, GltfSceneExtras},
     image::{ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler},
@@ -2995,7 +2995,7 @@ pub(crate) struct PendingUnder<'w, 's> {
     /// landing interior's own surfaces are in view the moment the camera arrives, so a crossing does
     /// not finish on textures loaded with nothing yet drawn, and it does not wait on a pre-streamed
     /// cell's surfaces, which no view can see and which the bridge can never confirm.
-    swapping: Query<'w, 's, &'static ViewVisibility, With<SwapWaiting>>,
+    swapping: Query<'w, 's, Has<SwapInCameraView>, With<SwapWaiting>>,
 }
 
 impl PendingUnder<'_, '_> {
@@ -3005,10 +3005,7 @@ impl PendingUnder<'_, '_> {
             .chain(self.children.iter_descendants(root))
             .filter(|entity| {
                 self.pending.contains(*entity)
-                    || self
-                        .swapping
-                        .get(*entity)
-                        .is_ok_and(|visibility| visibility.get())
+                    || self.swapping.get(*entity).is_ok_and(|in_view| in_view)
             })
             .count()
     }
@@ -5383,7 +5380,7 @@ fn validate_streaming_lifecycle(
     // the run-level check below (design-1091 C4). The map holds only the patches waiting now, so a
     // drawn or despawned patch's entity id cannot be inherited by a later one.
     parents: Query<&ChildOf>,
-    patches: Query<(Entity, &ViewVisibility), WaitingTerrainPatches>,
+    patches: Query<(Entity, Has<SwapInCameraView>), WaitingTerrainPatches>,
     mut wait_frame: Local<u64>,
     mut waiting_since: Local<HashMap<Entity, u64>>,
     mut metrics: ResMut<StreamingMetrics>,
@@ -5500,8 +5497,8 @@ fn validate_streaming_lifecycle(
             },
         );
         let mut stuck = 0u64;
-        for (entity, visibility) in patches.iter() {
-            let visible_under_a_full_window_root = visibility.get()
+        for (entity, in_view) in patches.iter() {
+            let visible_under_a_full_window_root = in_view
                 && parents
                     .iter_ancestors(entity)
                     .any(|ancestor| full_window_roots.contains(&ancestor));
@@ -10726,18 +10723,10 @@ mod tests {
                 },
             );
         // One waiting quadrant a view can see and one it cannot.
-        app.world_mut().spawn((
-            TerrainPatch,
-            SwapWaiting,
-            ViewVisibility::VISIBLE,
-            ChildOf(root),
-        ));
-        app.world_mut().spawn((
-            TerrainPatch,
-            SwapWaiting,
-            ViewVisibility::HIDDEN,
-            ChildOf(root),
-        ));
+        app.world_mut()
+            .spawn((TerrainPatch, SwapWaiting, SwapInCameraView, ChildOf(root)));
+        app.world_mut()
+            .spawn((TerrainPatch, SwapWaiting, ChildOf(root)));
 
         // Within the bound: a quadrant on its way is not a hole.
         for _ in 0..MAX_SWAP_WAIT_FRAMES {
@@ -10773,11 +10762,9 @@ mod tests {
         let mut world = World::new();
         let root = world.spawn_empty().id();
         let visible = world
-            .spawn((SwapWaiting, ViewVisibility::VISIBLE, ChildOf(root)))
+            .spawn((SwapWaiting, SwapInCameraView, ChildOf(root)))
             .id();
-        let hidden = world
-            .spawn((SwapWaiting, ViewVisibility::HIDDEN, ChildOf(root)))
-            .id();
+        let hidden = world.spawn((SwapWaiting, ChildOf(root))).id();
         let mut state = SystemState::<PendingUnder>::new(&mut world);
 
         let count = state.get(&world).unwrap().count(root);
