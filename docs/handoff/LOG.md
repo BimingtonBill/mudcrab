@@ -3,6 +3,17 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-09 afternoon Portal Dev: impl-1121 merged, water preset now faster; U1 check window
+
+Track: Portal. Nothing pushed.
+
+- **U1 check window (Phase 2's p2/u1-check 2f00169a, 12:37-12:44):** portal-heavy passed (0 invariant failures, max commit 9.3 ms, swap/in_camera_view_not_drawn 0 on every frame after world_ready while prepared_not_drawn stays 915). Door tour passed; the arrival shots show the arriving cell drawn and the cell just left hidden. The flythrough probe first showed 15 hits on one frame; Phase 2 traced that to the probe reading the previous frame's visibility (fixed 018a6154), and the rerun shows 0. Evidence: local/review/portal-u1-check-window-2026-10-09. Entering an interior still costs one ~315 ms frame (as in the 10-07 baseline; analysis-1074).
+- **impl-1121 (shared render-schedule skip, render_skip.rs):** view-policy cadence skips now drop the camera from SortedCameras like portal's cadence instead of toggling Camera::is_active; portal's skip uses the same code. Merged via portal-integration (8d4954dc); reviews: Muse merge, DeepSeek accept (note: no test covers extract_skipped_views). GPU check 8/8 passed. Re-pricing, portal-heavy x4 interleaved: water preset 65.5 vs default 61.0 fps, p95 18.0 vs 19.3 (was -7.3 fps before 1121). Evidence: local/review/portal-1121-window-2026-10-09.
+- **B3 look decision:** picture sheet for the user at local/review/portal-water-preset-image-2026-10-09/USER-SHEET.png (sent to Team Lead). At these poses the look difference is within shot-to-shot noise.
+- **scripts/phase2-profile.ps1:** -ExtraEngineArgs is split on commas and spaces under `pwsh -File`; values starting with "-" need the colon form `"-ExtraEngineArgs:--flag value"` (501ca496).
+- **Clean-up:** impl-1121 worktree and target discarded (branch portal-impl-1121-render-skip kept); window worktree portal-bisect-b70dad72 removed. Logged in local/disk/ledger.txt.
+- **Next:** B3a follow-ups (spill-light layer, LOD layer test, layer 4 reserved); a test for the render-world skip join; impl-1085 room culling waits on Phase 2's room-connection fix.
+
 ## 2026-10-08 (late) Phase 2 Dev: #1055 C1 slices started, window moved to tomorrow
 
 Track: Phase 2. Nothing pushed. Wrap-up asked by Team Lead (the user) at ~22:50; no timing window tonight.
