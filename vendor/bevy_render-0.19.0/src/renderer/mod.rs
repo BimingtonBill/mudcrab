@@ -5,7 +5,8 @@ mod render_device;
 mod wgpu_wrapper;
 
 pub use render_context::{
-    CurrentView, FlushCommands, PendingCommandBuffers, RenderContext, RenderContextState, ViewQuery,
+    parallel_finish, set_parallel_finish, CurrentView, FlushCommands, PendingCommandBuffers,
+    RenderContext, RenderContextState, ViewQuery,
 };
 pub use render_device::*;
 pub use wgpu_wrapper::WgpuWrapper;
