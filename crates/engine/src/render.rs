@@ -99,10 +99,14 @@ impl Plugin for VercidiumRendererPlugin {
             .set_wrap_period(WATER_CLOCK_WRAP_PERIOD);
         // The policy owns every secondary camera's activity, and this plugin is what spawns the
         // first of them, so the two are registered together: without it the reflection camera would
-        // be spawned with a demand and never switched on.
+        // be spawned with a demand and never switched on. The shared render-schedule skip
+        // (`crate::render_skip`) goes with them: it is the render-world half of a cadence skip,
+        // for the policy's views and for the portal's camera alike, so a run that renders at all
+        // has it.
         app.add_plugins((
             crate::view_policy::SecondaryViewPolicyPlugin,
             crate::shadow_route::ShadowRoutePlugin,
+            crate::render_skip::RenderSkipPlugin,
         ));
         app.add_plugins((
             crate::light_falloff::SkyrimLightFalloffPlugin,

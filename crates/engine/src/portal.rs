@@ -5196,34 +5196,17 @@ fn skip_occluded_doorway(
 /// frames between. A setting, off by default (the user's decision, 2026-09-26): `N = 1` renders
 /// every frame and never skips, and the setting is read every frame, so the panel changes it live.
 ///
-/// # Why not `Camera::is_active`
+/// # The skip: the shared mechanism
 ///
-/// The obvious skip - `is_active = false` on the frames between - tears the view down in the render
-/// world every time, and the next rendered frame rebuilds it from nothing, which costs more than a
-/// skipped frame saves:
+/// A skipped frame does not switch the camera off. It marks the camera in
+/// [`crate::render_skip::SkippedViews`], and that module - one implementation, for this cadence and
+/// for the view policy's - takes the camera's render schedule out of the frame: `camera_driver`
+/// runs one `Core3d` schedule per entry of `SortedCameras`, and a marked camera's entry is dropped
+/// before it, while the camera stays active so extraction, specialization, queuing and the
+/// per-view prepare keep their retained state and do only their usual incremental work. See that
+/// module for the why-not-`is_active` in full (the teardown and rebuild an inactive camera pays)
+/// and for the exact ordering against `sort_cameras` and `prepare_lights`.
 ///
-/// * `bevy_render-0.19.0/src/camera.rs` `extract_cameras` removes `ExtractedCamera`,
-///   `ExtractedView` and `RenderVisibleEntities` from an inactive camera's render entity, so the
-///   next active frame starts from an empty visible set and every visible mesh is "added";
-/// * `bevy_core_pipeline-0.19.0/src/core_3d/mod.rs` `extract_core_3d_camera_phases` skips an
-///   inactive camera and then `retain`s only live views, dropping the view's retained
-///   opaque/alpha-mask/transparent bins;
-/// * `bevy_pbr-0.19.0/src/material.rs` `specialize_material_meshes` (and `prepass/mod.rs`'s twin)
-///   `retain` their per-view `SpecializedMaterialPipelineCache` to the live views, so every mesh of
-///   the destination is specialized and queued again the frame the camera comes back.
-///
-/// That teardown is what the off-screen and occluded-doorway skips already pay, once per
-/// transition; paid every other frame it would be the cost of a newly opened doorway on every
-/// frame the portal does render.
-///
-/// # The skip: the camera's render schedule, not its extraction
-///
-/// The camera stays active, so extraction, specialization, queuing and the per-view prepare keep
-/// their retained state and do only their usual incremental work. What is skipped is the camera's
-/// render schedule: `bevy_core_pipeline-0.19.0/src/schedule.rs` `camera_driver` runs one `Core3d`
-/// schedule per entry of `SortedCameras`, so the portal camera's entry is taken out of that list
-/// on a skipped frame ([`drop_skipped_portal_view`], after `sort_cameras` and `prepare_lights` -
-/// `bevy_pbr-0.19.0/src/render/light.rs` iterates `SortedCameras` - and before `render_system`).
 /// Everything the portal camera's `Core3d` schedule encodes goes with it: the GPU mesh
 /// preprocessing and indirect-parameter dispatches for its view, the shadow passes of its cascades
 /// (`per_view_shadow_pass`, in `Core3d` in `bevy_pbr-0.19.0/src/lib.rs`), its depth prepass, main
@@ -5254,22 +5237,16 @@ pub(crate) mod cadence {
     use super::{
         PortalCamera, PortalState, PortalTexture, resize_portal_target, skip_occluded_doorway,
     };
-    use crate::graphics_settings::GraphicsSettings;
-    use bevy::{
-        prelude::*,
-        render::{
-            Extract, ExtractSchedule, Render, RenderApp, RenderSystems, camera::SortedCameras,
-            renderer::render_system, sync_world::RenderEntity,
-        },
-    };
+    use crate::{graphics_settings::GraphicsSettings, render_skip::SkippedViews};
+    use bevy::prelude::*;
 
     /// What the portal camera showed on a frame: the door it looked through and the target image
     /// it rendered into. `None` while the camera is off.
     pub(crate) type Shown = Option<(Entity, AssetId<Image>)>;
 
     /// The portal camera's frame-by-frame cadence under `portal_every`: whether it renders this
-    /// frame, and what it showed last frame. Main world; the render world reads
-    /// [`skips_this_frame`](Self::skips_this_frame) at extraction.
+    /// frame, and what it showed last frame. Main world; [`register_portal_skip`] copies a skipped
+    /// frame into [`SkippedViews`], which the render world reads at extraction.
     #[derive(Resource, Debug, Default)]
     pub(crate) struct PortalCadence {
         /// Render one frame in this many while a doorway stays in view; `0` and `1` both mean every
@@ -5326,13 +5303,19 @@ pub(crate) mod cadence {
         }
     }
 
-    /// Adds the cadence. It starts at every frame and follows [`GraphicsSettings::portal_every`]
-    /// from the first frame on.
+    /// Adds the cadence: the state machine, and the system that hands a skipped frame to the
+    /// shared [`SkippedViews`] (`crate::render_skip`). It starts at every frame and follows
+    /// [`GraphicsSettings::portal_every`] from the first frame on.
     pub(crate) struct PortalCadencePlugin;
 
     impl Plugin for PortalCadencePlugin {
         fn build(&self, app: &mut App) {
             app.insert_resource(PortalCadence::new(1))
+                // The skip resource is brought in here so a portal app runs without the renderer;
+                // `crate::render_skip::RenderSkipPlugin`, registered by
+                // `crate::render::VercidiumRendererPlugin`, is what carries the marks to the
+                // render thread.
+                .init_resource::<SkippedViews>()
                 // After both systems that switch the camera off and after the target is resized,
                 // so this frame's `is_active` and target are final.
                 .add_systems(
@@ -5340,18 +5323,8 @@ pub(crate) mod cadence {
                     pace_portal_camera
                         .after(skip_occluded_doorway)
                         .after(resize_portal_target),
-                );
-            if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-                render_app
-                    .init_resource::<SkippedPortalView>()
-                    .add_systems(ExtractSchedule, extract_portal_skip)
-                    .add_systems(
-                        Render,
-                        drop_skipped_portal_view
-                            .in_set(RenderSystems::Render)
-                            .before(render_system),
-                    );
-            }
+                )
+                .add_systems(Update, register_portal_skip.after(pace_portal_camera));
         }
     }
 
@@ -5394,29 +5367,24 @@ pub(crate) mod cadence {
         }
     }
 
-    /// The render entity of the portal camera when its render schedule is skipped this frame.
-    #[derive(Resource, Default)]
-    struct SkippedPortalView(Option<Entity>);
-
-    fn extract_portal_skip(
-        mut skipped: ResMut<SkippedPortalView>,
-        cadence: Extract<Option<Res<PortalCadence>>>,
-        camera: Extract<Query<RenderEntity, With<PortalCamera>>>,
+    /// Hands this frame's skip to the shared mechanism: the portal camera is marked in
+    /// [`SkippedViews`], and `crate::render_skip` takes its entry out of `SortedCameras` on the
+    /// render thread, which is what keeps its `Core3d` schedule from running while the camera
+    /// itself stays active.
+    ///
+    /// Runs after [`pace_portal_camera`], so the mark is this frame's decision; the camera is
+    /// active whenever the cadence skips (a cadence only skips a doorway it showed, which needs an
+    /// active camera).
+    fn register_portal_skip(
+        cadence: Res<PortalCadence>,
+        camera: Query<Entity, With<PortalCamera>>,
+        mut skipped: ResMut<SkippedViews>,
     ) {
-        skipped.0 = cadence
-            .as_ref()
-            .is_some_and(|cadence| cadence.skips_this_frame())
-            .then(|| camera.single().ok())
-            .flatten();
-    }
-
-    /// Takes the skipped portal camera out of the list `camera_driver` runs render schedules for.
-    fn drop_skipped_portal_view(
-        skipped: Res<SkippedPortalView>,
-        mut sorted: ResMut<SortedCameras>,
-    ) {
-        if let Some(entity) = skipped.0 {
-            sorted.0.retain(|camera| camera.entity != entity);
+        if !cadence.skips_this_frame() {
+            return;
+        }
+        if let Ok(entity) = camera.single() {
+            skipped.add(entity);
         }
     }
 
@@ -5516,6 +5484,46 @@ pub(crate) mod cadence {
             assert_eq!(app.world().resource::<PortalCadence>().every, 3);
             // No camera, so nothing is shown and nothing is skipped.
             assert!(!app.world().resource::<PortalCadence>().skips_this_frame());
+        }
+
+        /// A skipped frame hands the portal camera to the shared render-schedule skip, the mark
+        /// lasts exactly that frame, and the camera stays active throughout.
+        #[test]
+        fn a_skipped_frame_marks_the_portal_camera_for_the_shared_skip() {
+            let mut app = App::new();
+            app.add_plugins(crate::render_skip::RenderSkipPlugin)
+                .insert_resource(PortalCadence::new(2))
+                .add_systems(Update, register_portal_skip);
+            let camera = app
+                .world_mut()
+                .spawn((Camera::default(), PortalCamera))
+                .id();
+            let marked = |app: &App| app.world().resource::<SkippedViews>().contains(camera);
+            let shown = Some((door(1), target(1)));
+
+            // The frame the cadence renders: the camera is not marked.
+            app.world_mut().resource_mut::<PortalCadence>().step(shown);
+            app.update();
+            assert!(!marked(&app));
+
+            // The frame it skips: the camera is marked, and it is still active.
+            app.world_mut().resource_mut::<PortalCadence>().step(shown);
+            app.update();
+            assert!(
+                marked(&app),
+                "a skipped frame hands the camera to the shared render-schedule skip"
+            );
+            assert!(app.world().get::<Camera>(camera).unwrap().is_active);
+
+            // The mark lasts one frame: the next render is unmarked again.
+            app.world_mut().resource_mut::<PortalCadence>().step(shown);
+            app.update();
+            assert!(!marked(&app));
+
+            // Nothing is skipped while the camera shows no doorway.
+            app.world_mut().resource_mut::<PortalCadence>().step(None);
+            app.update();
+            assert!(!marked(&app));
         }
 
         #[test]
