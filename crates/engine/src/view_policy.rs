@@ -4,7 +4,10 @@
 //! its [`Camera::is_active`], it keeps the camera render target's image handle for the camera's
 //! whole life (so water samples the last frame the view rendered rather than a cleared texture),
 //! and it resizes that image only when the policy's `target_size` changes. The camera renders on
-//! the frames the policy admits it and is switched off on the others.
+//! the frames the policy admits it; on a frame it is demanded but not admitted (a cadence skip) the
+//! camera stays active and its render schedule is skipped instead ([`crate::render_skip`]), so its
+//! target keeps the last image and its retained render state survives; it is switched off only
+//! while nothing demands it.
 //!
 //! Nothing here knows what a view shows. The view's own adapter - the water reflection in
 //! `render.rs` today, a portal view later - runs in [`ViewPolicySystems::Prepare`] and fills the
@@ -33,7 +36,9 @@
 //!    `max_staleness` is admitted now. Otherwise it is admitted when its [`ViewUpdateRate`] is due:
 //!    every frame, every other *admission* rather than on a global parity, or not at all on demand.
 //! 5. An admitted view gets the demanded pose and projection, and the frame's values are recorded
-//!    as the new scheduled state. Every other demanded view is switched off for this frame.
+//!    as the new scheduled state. Every other demanded view is skipped for this frame: it stays
+//!    active and its render schedule does not run ([`crate::render_skip::SkippedViews`]). A view
+//!    nothing demands is switched off (that is what [`Camera::is_active`] is for here).
 
 use crate::{sky::CameraSpace, streaming::RenderOrigin};
 use bevy::{
@@ -393,16 +398,23 @@ pub struct InvalidateSecondaryViews {
 pub enum ViewPolicySystems {
     /// Adapters fill their camera's [`ViewDemand`] here.
     Prepare,
-    /// [`apply_view_policies`] decides here, and is the only writer of `Camera::is_active`.
+    /// [`apply_view_policies`] decides here, and is the only writer of `Camera::is_active`: it
+    /// clears it only for a view nothing demands, and marks a cadence skip in
+    /// [`crate::render_skip::SkippedViews`] instead.
     Apply,
 }
 
-/// Registers the policy: the invalidation message, and the ordered systems it runs.
+/// Registers the policy: the invalidation message, and the ordered systems it runs. The shared
+/// skip resource is brought in with it, so a policy app runs without
+/// [`RenderSkipPlugin`](crate::render_skip::RenderSkipPlugin), which the renderer registers
+/// ([`crate::render::VercidiumRendererPlugin`]) and which is what takes a marked camera's
+/// schedule out of the frame.
 pub struct SecondaryViewPolicyPlugin;
 
 impl Plugin for SecondaryViewPolicyPlugin {
     fn build(&self, app: &mut App) {
-        app.add_message::<InvalidateSecondaryViews>()
+        app.init_resource::<crate::render_skip::SkippedViews>()
+            .add_message::<InvalidateSecondaryViews>()
             .configure_sets(
                 PostUpdate,
                 (ViewPolicySystems::Prepare, ViewPolicySystems::Apply)
@@ -422,7 +434,9 @@ impl Plugin for SecondaryViewPolicyPlugin {
 ///
 /// See the module documentation for the rules. Everything it compares comes from the view's own
 /// [`ViewDemand`] or from the engine-wide values a view can be invalidated by; it never reads a
-/// view's contents.
+/// view's contents. A demanded view this frame does not admit is marked in
+/// [`crate::render_skip::SkippedViews`] rather than switched off, so its view keeps its retained
+/// render state and its target keeps the last image.
 #[allow(clippy::type_complexity)]
 pub fn apply_view_policies(
     time: Res<Time>,
@@ -430,6 +444,7 @@ pub fn apply_view_policies(
     space: Option<Res<CameraSpace>>,
     mut invalidations: MessageReader<InvalidateSecondaryViews>,
     mut images: ResMut<Assets<Image>>,
+    mut skipped: ResMut<crate::render_skip::SkippedViews>,
     mut views: Query<(
         Entity,
         &ViewPolicy,
@@ -573,7 +588,18 @@ pub fn apply_view_policies(
                 });
                 state.dirty = DirtyReasons::default();
             }
-            _ => {
+            // Demanded but not admitted: a cadence skip, not a switch-off. The camera stays
+            // active so extraction, specialization, queuing and the per-view prepare keep their
+            // retained state, and the skip takes its render schedule out of the frame instead
+            // ([`crate::render_skip`]); the image keeps the last frame it drew.
+            Some(_) => {
+                set_active(&mut camera, true);
+                skipped.add(entity);
+                state.dirty = dirty;
+            }
+            // Nothing demands the view: it is really off, at the price of the teardown the shared
+            // skip exists to avoid - worth it for a view nothing needs, not for one merely paced.
+            None => {
                 set_active(&mut camera, false);
                 state.dirty = dirty;
             }
@@ -675,11 +701,16 @@ mod tests {
     impl ViewHarness {
         fn new(policy: ViewPolicy) -> Self {
             let mut app = App::new();
+            // `RenderSkipPlugin` is the per-frame clear of the skip list, which the engine's
+            // renderer registers; a headless harness needs it to see a skip last one frame.
             app.init_resource::<Assets<Image>>()
                 .init_resource::<Time>()
                 .insert_resource(RenderOrigin(IVec2::ZERO))
                 .insert_resource(CameraSpace::Exterior)
-                .add_plugins(SecondaryViewPolicyPlugin);
+                .add_plugins((
+                    SecondaryViewPolicyPlugin,
+                    crate::render_skip::RenderSkipPlugin,
+                ));
             let image =
                 app.world_mut()
                     .resource_mut::<Assets<Image>>()
@@ -752,6 +783,9 @@ mod tests {
             let target = world.get::<SecondaryViewTarget>(self.camera).unwrap();
             ViewFrame {
                 active: camera.is_active,
+                skipped: world
+                    .resource::<crate::render_skip::SkippedViews>()
+                    .contains(self.camera),
                 pose: *world.get::<Transform>(self.camera).unwrap(),
                 projection: world.get::<Projection>(self.camera).unwrap().clone(),
                 image_size: world
@@ -769,7 +803,12 @@ mod tests {
     }
 
     struct ViewFrame {
+        /// [`Camera::is_active`]: true while the view is demanded, whether it renders this frame
+        /// or is skipped.
         active: bool,
+        /// Whether this frame's render schedule is skipped ([`crate::render_skip::SkippedViews`]):
+        /// true on a demanded frame the policy did not admit, and never true while the view is off.
+        skipped: bool,
         pose: Transform,
         projection: Projection,
         image_size: UVec2,
@@ -824,28 +863,79 @@ mod tests {
         };
 
         demand(&mut harness);
-        assert!(
-            harness.frame().active,
-            "the first demanded frame has no schedule yet"
-        );
+        let first = harness.frame();
+        assert!(first.active, "the first demanded frame has no schedule yet");
+        assert!(!first.skipped);
         demand(&mut harness);
+        let skipped = harness.frame();
         assert!(
-            !harness.frame().active,
-            "one frame after an admission is not due"
+            skipped.active,
+            "a skipped frame keeps the camera active: its retained render state has to survive"
         );
+        assert!(skipped.skipped, "one frame after an admission is not due");
         demand(&mut harness);
-        assert!(
-            harness.frame().active,
-            "two frames after an admission is due"
-        );
+        let rendered = harness.frame();
+        assert!(rendered.active, "two frames after an admission is due");
+        assert!(!rendered.skipped, "a rendered frame is not skipped");
         demand(&mut harness);
-        assert!(!harness.frame().active);
+        assert!(harness.frame().skipped);
         // The demand is carried on to the fifth frame, which is two frames after the third
         // admission and so is due again.
         let counters = harness.frame().counters;
         assert_eq!(counters.requested, 5);
         assert_eq!(counters.rendered, 3);
         assert_eq!(counters.skipped, 2);
+    }
+
+    /// The cadence skip is the shared mechanism's, not a switch-off: a skipped frame marks the
+    /// camera in [`crate::render_skip::SkippedViews`] (what takes its `SortedCameras` entry out of
+    /// the frame) and leaves it active, the mark lasts exactly that frame, and a view nothing
+    /// demands is switched off and never marked.
+    #[test]
+    fn a_cadence_skip_is_marked_in_the_shared_list_and_a_switch_off_is_not() {
+        let mut policy = ViewPolicy::baseline();
+        policy.update_rate = ViewUpdateRate::EveryOtherFrame;
+        let mut harness = ViewHarness::new(policy);
+        let demand = |harness: &mut ViewHarness| {
+            harness.demand(Some(still(Transform::from_xyz(0.0, 100.0, 0.0))));
+        };
+
+        demand(&mut harness);
+        assert!(harness.frame().active);
+
+        demand(&mut harness);
+        let paced = harness.frame();
+        assert!(paced.active && paced.skipped, "paced by the rate, not off");
+        assert!(
+            harness
+                .app
+                .world()
+                .resource::<crate::render_skip::SkippedViews>()
+                .contains(harness.camera),
+            "the skipped camera is marked for the render-schedule skip"
+        );
+
+        demand(&mut harness);
+        let rendered = harness.frame();
+        assert!(
+            rendered.active && !rendered.skipped,
+            "the mark lasts one frame"
+        );
+        assert!(
+            !harness
+                .app
+                .world()
+                .resource::<crate::render_skip::SkippedViews>()
+                .contains(harness.camera),
+            "a rendered frame is not marked"
+        );
+
+        harness.demand(None);
+        let off = harness.frame();
+        assert!(
+            !off.active && !off.skipped,
+            "nothing demands the view: it is switched off, not skipped"
+        );
     }
 
     #[test]
@@ -855,11 +945,18 @@ mod tests {
         policy.max_staleness = Duration::MAX;
         let mut harness = ViewHarness::new(policy);
         let mut last = None;
-        for _ in 0..5 {
+        for frame in 0..5 {
             harness.demand(Some(still(Transform::from_xyz(0.0, 100.0, 0.0))));
             // A minute of wall clock between frames: with no deadline, age alone never admits one.
             harness.advance(60_000);
-            last = Some(harness.frame());
+            let paced = harness.frame();
+            if frame > 0 {
+                assert!(
+                    paced.active && paced.skipped,
+                    "frame {frame} is paced by the rate, not switched off"
+                );
+            }
+            last = Some(paced);
         }
         let counters = last.unwrap().counters;
         assert_eq!(counters.requested, 5);
@@ -881,7 +978,11 @@ mod tests {
 
         harness.advance(50);
         harness.demand(Some(still(observer)));
-        assert!(!harness.frame().active, "half the deadline has not passed");
+        let paced = harness.frame();
+        assert!(
+            paced.active && paced.skipped,
+            "half the deadline has not passed: the frame is skipped, not switched off"
+        );
 
         harness.advance(60);
         harness.demand(Some(still(observer)));
@@ -904,7 +1005,8 @@ mod tests {
         for _ in 0..3 {
             harness.demand(None);
             let frame = harness.frame();
-            assert!(!frame.active);
+            assert!(!frame.active, "nothing demands the view, so it is off");
+            assert!(!frame.skipped, "an off view has no schedule to skip");
             assert_eq!(frame.handle, rendered.handle);
             assert_eq!(frame.image_size, rendered.image_size);
         }
@@ -928,7 +1030,8 @@ mod tests {
             "the first demanded frame has no schedule"
         );
         harness.demand(None);
-        assert!(!harness.frame().active);
+        let off = harness.frame();
+        assert!(!off.active && !off.skipped, "nothing demands the view");
 
         harness.demand(Some(still(observer)));
         let frame = harness.frame();
@@ -974,8 +1077,13 @@ mod tests {
 
         // The next admission, two frames on, has nothing left to resize.
         harness.demand(Some(still(Transform::from_xyz(0.0, 100.0, 0.0))));
+        let paced = harness.frame();
         assert!(
-            !harness.frame().active,
+            paced.active,
+            "the water preset paces the view, it does not switch it off"
+        );
+        assert!(
+            paced.skipped,
             "the water preset skips a frame between renders"
         );
         harness.demand(Some(still(Transform::from_xyz(0.0, 100.0, 0.0))));
@@ -1022,7 +1130,7 @@ mod tests {
         harness.invalidate(ViewInvalidationReason::Teleport, Some(other_view));
         let frame = harness.frame();
         assert!(
-            !frame.active,
+            frame.active && frame.skipped,
             "the message named a different view, and the cadence skips this frame"
         );
         assert!(!frame.dirty.invalidated);
@@ -1056,7 +1164,8 @@ mod tests {
         harness.demand(Some(still(observer)));
         assert!(harness.frame().active);
         harness.demand(Some(still(observer)));
-        assert!(!harness.frame().active);
+        let paced = harness.frame();
+        assert!(paced.active && paced.skipped, "the rate has not come due");
 
         // A door can land a consumer in the same pose in a new space; nothing else in the demand
         // moved, so only the message can refresh the view.
@@ -1078,12 +1187,19 @@ mod tests {
         harness.demand(Some(still(observer)));
         assert!(harness.frame().active);
         harness.demand(Some(still(observer)));
-        assert!(!harness.frame().active);
+        let paced = harness.frame();
+        assert!(
+            paced.active && paced.skipped,
+            "nothing changed, so the second demanded frame is paced"
+        );
 
         harness.demand(None);
         harness.set_origin(IVec2::new(3, -2));
         let hidden = harness.frame();
-        assert!(!hidden.active);
+        assert!(
+            !hidden.active && !hidden.skipped,
+            "nothing demands the view"
+        );
         assert!(
             hidden.dirty.origin,
             "the change is remembered while nothing needs the view"
@@ -1092,7 +1208,7 @@ mod tests {
         // Still hidden, and still dirty: nothing refreshes an unseen view.
         harness.demand(None);
         let still_hidden = harness.frame();
-        assert!(!still_hidden.active);
+        assert!(!still_hidden.active && !still_hidden.skipped);
         assert!(still_hidden.dirty.origin);
 
         harness.demand(Some(still(observer)));
@@ -1113,7 +1229,8 @@ mod tests {
         harness.demand(Some(still(observer)));
         harness.frame();
         harness.demand(Some(still(observer)));
-        assert!(!harness.frame().active);
+        let paced = harness.frame();
+        assert!(paced.active && paced.skipped, "nothing has changed yet");
 
         harness.set_space(CameraSpace::Interior);
         harness.demand(Some(still(observer)));
@@ -1209,7 +1326,10 @@ mod tests {
             harness.demand(Some(still(walked)));
             let frame = harness.frame();
             if step < 5 {
-                assert!(!frame.active, "step {step} is still inside the threshold");
+                assert!(
+                    frame.active && frame.skipped,
+                    "step {step} is still inside the threshold"
+                );
                 assert!(!frame.last_forced.pose_jump);
             } else {
                 assert!(
@@ -1234,7 +1354,7 @@ mod tests {
         harness.demand(Some(still(turned)));
         let frame = harness.frame();
         assert!(
-            !frame.active,
+            frame.active && frame.skipped,
             "five degrees is inside the ten degree threshold"
         );
         assert!(!frame.last_forced.pose_jump);
@@ -1263,7 +1383,11 @@ mod tests {
         harness.set_policy(broken);
         harness.demand(Some(still(Transform::from_xyz(0.0, 100.0, 0.0))));
         let frame = harness.frame();
-        assert!(!frame.active);
+        assert!(
+            !frame.active,
+            "an invalid policy is a view that is really off"
+        );
+        assert!(!frame.skipped);
         assert_eq!(
             harness
                 .app
@@ -1349,7 +1473,11 @@ mod tests {
         broken.target_size = UVec2::new(0, 576);
         harness.set_policy(broken);
         harness.demand(Some(still(observer)));
-        assert!(!harness.frame().active);
+        let invalid = harness.frame();
+        assert!(
+            !invalid.active && !invalid.skipped,
+            "an invalid policy is off"
+        );
 
         harness.set_policy(policy);
         harness.demand(Some(still(observer)));
@@ -1400,13 +1528,18 @@ mod tests {
         harness.demand(Some(still(observer)));
         harness.frame();
         harness.demand(Some(still(observer)));
-        assert!(!harness.frame().active, "nothing forces an on-demand view");
+        let paced = harness.frame();
+        assert!(
+            paced.active && paced.skipped,
+            "nothing forces an on-demand view, so the frame is paced"
+        );
 
         let mut broken = policy;
         broken.target_size = UVec2::new(0, 576);
         harness.set_policy(broken);
         harness.demand(None);
-        assert!(!harness.frame().active);
+        let invalid = harness.frame();
+        assert!(!invalid.active && !invalid.skipped);
 
         harness.set_policy(policy);
         harness.demand(Some(still(observer)));
@@ -1437,7 +1570,8 @@ mod tests {
     fn a_policy_without_a_demand_still_counts_its_frames() {
         let mut harness = ViewHarness::new(ViewPolicy::baseline());
         for _ in 0..3 {
-            assert!(!harness.frame().active);
+            let frame = harness.frame();
+            assert!(!frame.active && !frame.skipped, "nothing demands the view");
         }
         let state = harness
             .app
