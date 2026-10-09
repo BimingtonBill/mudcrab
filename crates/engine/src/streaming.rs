@@ -203,7 +203,15 @@ impl Plugin for StreamingPlugin {
                     // nearby door pre-streams, both of which the plan below has to see this frame.
                     // They are added by `crate::portal::PortalPlugin`, which this plugin is always
                     // added with; an ordering edge onto a set with no members is not an error.
-                    .after(crate::transition::DoorTransition),
+                    .after(crate::transition::DoorTransition)
+                    // The portal isolation hides every cell outside the active space in the same
+                    // frame's `PortalFrame` ([`crate::portal::isolate_cells`]); a cell a distance
+                    // unload retires is outside that space too, so the plan must read the
+                    // isolation's hide before writing its own ([`hide_retiring_root`]). Ordered
+                    // after, the isolation always gets there first and the plan never hides a root
+                    // the isolation owns. An edge onto a set with no members is not an error, so a
+                    // run without the portal is unaffected.
+                    .after(crate::portal::PortalFrame),
             )
             // Bevy instantiates every ready converted model in one unbudgeted pass inside
             // `SceneSpawnerSystems::WorldInstanceSpawn`; these two systems bracket that pass so the
@@ -898,9 +906,13 @@ enum CellStatus {
     /// unload budget ([`despawn_cells`]). The map entry, the tier it holds and the root stay, so a
     /// cell that comes back into range before its turn is **revived** as it is instead of being
     /// despawned and requested again - the same root entity keeps drawing the cell throughout, so
-    /// there is no flicker and nothing is spawned twice. A retiring cell is still drawn until its
-    /// turn; that is harmless for the ones the pacer covers, because they are the far cells of the
-    /// worldspace the camera is standing in.
+    /// there is no flicker and nothing is spawned twice.
+    ///
+    /// A cell that retires is hidden the frame it does so ([`plan_cells`]): the pacer spreads the
+    /// *unload* over several frames, never the drawing, so the drain looks exactly like an unpaced
+    /// one that left in a single frame - the cell is off every camera the frame it leaves the
+    /// keep-set, then despawned when the budget reaches it. The visibility it had is recorded in
+    /// [`RetireHidden`] and given back on revive.
     ///
     /// Only a cell that falls out by *distance* retires. A space change - an interior that is
     /// neither active nor pre-streamed, or the exterior of a worldspace the camera just left on a
@@ -935,6 +947,16 @@ enum CellStatus {
         replaced: Option<Entity>,
     },
 }
+
+/// A cell root whose visibility the unload pacer hid when the cell retired ([`CellStatus::Retiring`]),
+/// carrying the visibility to give back when the cell revives.
+///
+/// It exists so the hide is undone exactly - and only that hide. A root something else already hid,
+/// from [`crate::portal::isolate_cells`]'s role of a cell outside the active space to a cell an
+/// unpaced unload would have taken the same frame, carries no such marker and is left alone, its own
+/// restore untouched. Set in [`plan_cells`], read and removed there on the revive.
+#[derive(Component, Debug, Clone, Copy)]
+struct RetireHidden(Visibility);
 
 #[derive(Resource, Reflect, Debug, Clone, Copy)]
 #[reflect(Resource)]
@@ -1112,6 +1134,9 @@ fn plan_cells(
     prestream: Res<PrestreamCells>,
     origin: Res<RenderOrigin>,
     camera: Query<&Transform, With<StreamingCamera>>,
+    // The visibility a retiring root is hidden at, and the marker of a hide this plan itself made
+    // ([`RetireHidden`]). Read, never written here directly: the writes go through `commands`.
+    roots: Query<(&Visibility, Option<&RetireHidden>)>,
     mut streaming: ResMut<StreamingWorld>,
     mut commit_budget: ResMut<StreamingCommitBudget>,
     mut continuity: ResMut<TerrainContinuity>,
@@ -1289,11 +1314,15 @@ fn plan_cells(
             // A cell that comes back before the unload budget reaches it is revived as it is: the
             // root it kept starts drawing it again - the same entity, so nothing is spawned a
             // second time - and it is never requested again.
-            if let CellStatus::Retiring { root, detail } = status {
-                *status = CellStatus::Resident {
-                    root: *root,
-                    detail: *detail,
-                };
+            if let CellStatus::Retiring { root, detail } = *status {
+                *status = CellStatus::Resident { root, detail };
+                // Give back the visibility the retire took, and only that: a root the portal
+                // isolation hid carries no marker of ours, and the isolation restores its own.
+                if let Ok((_, Some(hidden))) = roots.get(root) {
+                    let original = hidden.0;
+                    commands.entity(root).try_insert(original);
+                    commands.entity(root).try_remove::<RetireHidden>();
+                }
                 revived += 1;
             }
             return true;
@@ -1305,6 +1334,7 @@ fn plan_cells(
         if paces_its_unload(*key, &active) {
             match status {
                 CellStatus::Resident { root, detail } => {
+                    hide_retiring_root(&mut commands, &roots, *root);
                     *status = CellStatus::Retiring {
                         root: *root,
                         detail: *detail,
@@ -1326,6 +1356,7 @@ fn plan_cells(
                     detail,
                     ..
                 } => {
+                    hide_retiring_root(&mut commands, &roots, *root);
                     *status = CellStatus::Retiring {
                         root: *root,
                         detail: other_detail(*detail),
@@ -1433,6 +1464,32 @@ fn paces_its_unload(key: CellKey, active: &ActiveCell) -> bool {
         }
         CellKey::Interior(_) => false,
     }
+}
+
+/// Hides the root of a cell that has just fallen out of the keep-set by distance, so the cell stops
+/// being drawn the frame it retires instead of every frame until the unload budget reaches it
+/// ([`CellStatus::Retiring`]). The visibility the root had is kept in [`RetireHidden`] for the
+/// revive to give back.
+///
+/// A root that is already hidden is left alone, marker and all: the portal isolation hides a cell
+/// outside the active space the same frame a distance unload retires it, and that hide is the
+/// isolation's to undo, not this plan's. Skipping it is what keeps the two from fighting - a marker
+/// written over an isolation's hide would restore `Hidden` onto a cell the isolation had just made
+/// active again.
+fn hide_retiring_root(
+    commands: &mut Commands,
+    roots: &Query<'_, '_, (&Visibility, Option<&RetireHidden>)>,
+    root: Entity,
+) {
+    let Ok((visibility, hidden)) = roots.get(root) else {
+        return;
+    };
+    if hidden.is_some() || *visibility == Visibility::Hidden {
+        return;
+    }
+    commands
+        .entity(root)
+        .try_insert((RetireHidden(*visibility), Visibility::Hidden));
 }
 
 /// The tier a cell holds while it is being replaced: a cell loading a full replacement still draws
@@ -7217,6 +7274,157 @@ mod tests {
         );
         assert_eq!(resident_root_count(&mut app), roots_after_crossing);
         assert_eq!(after_reversal.streaming_invariant_failures, 0);
+    }
+
+    /// A cell left behind by distance is drawn no longer the frame it retires: the pacer spreads
+    /// the *unload* over frames, never the drawing, so a paced unload looks like an unpaced one -
+    /// off every camera the frame the cell leaves the keep-set, then despawned when the budget
+    /// reaches it. The root's visibility is hidden and marked for the revive to undo.
+    #[test]
+    fn a_distance_retired_root_is_hidden_the_frame_it_retires() {
+        let (mut app, _directory) = streaming_test_app(crossing_config(2));
+        spawn_camera(&mut app, IVec2::ZERO);
+        spawn_steady_window(&mut app, IVec2::ZERO);
+        app.update();
+
+        move_camera(&mut app, IVec2::X);
+        app.update();
+
+        let world = app.world();
+        let streaming = world.resource::<StreamingWorld>();
+        let mut retiring = 0;
+        for status in streaming.cells.values() {
+            match status {
+                CellStatus::Retiring { root, .. } => {
+                    retiring += 1;
+                    assert_eq!(
+                        world.get::<Visibility>(*root),
+                        Some(&Visibility::Hidden),
+                        "a retiring root is still drawn the frame it retires"
+                    );
+                    assert!(
+                        world.get::<RetireHidden>(*root).is_some(),
+                        "the hide is marked, so the revive can undo exactly it"
+                    );
+                }
+                CellStatus::Resident { root, .. } => assert_ne!(
+                    world.get::<Visibility>(*root),
+                    Some(&Visibility::Hidden),
+                    "a resident cell beside the retirees keeps drawing"
+                ),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            retiring, 5,
+            "the crossing rode the column out in the same frame, as the budget path says"
+        );
+    }
+
+    /// The visibility a retire took is given back the frame the cell revives - and only it: the
+    /// marker goes with it, so a later retire hides the root afresh rather than trusting a stale
+    /// original.
+    #[test]
+    fn a_revived_distance_retired_root_draws_again() {
+        let (mut app, _directory) = streaming_test_app(crossing_config(2));
+        spawn_camera(&mut app, IVec2::ZERO);
+        spawn_steady_window(&mut app, IVec2::ZERO);
+        app.update();
+
+        move_camera(&mut app, IVec2::X);
+        app.update();
+        let retiring: Vec<Entity> = {
+            let streaming = app.world().resource::<StreamingWorld>();
+            streaming
+                .cells
+                .values()
+                .filter_map(|status| match status {
+                    CellStatus::Retiring { root, .. } => Some(*root),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(retiring.len(), 5);
+        for root in &retiring {
+            assert_eq!(
+                app.world().get::<Visibility>(*root),
+                Some(&Visibility::Hidden),
+                "hidden while it waits for the budget"
+            );
+        }
+
+        move_camera(&mut app, IVec2::NEG_X);
+        app.update();
+
+        assert_eq!(streaming_metrics(&app).revived_cells, 5);
+        for root in &retiring {
+            assert_eq!(
+                app.world().get::<Visibility>(*root),
+                Some(&Visibility::Inherited),
+                "the visibility the root had comes back on the revive"
+            );
+            assert!(
+                app.world().get::<RetireHidden>(*root).is_none(),
+                "and the marker with it, so a later retire hides afresh"
+            );
+        }
+    }
+
+    /// Every retiree is off the picture on *every* frame it waits, not just the frame it retires:
+    /// under a one-a-frame count budget a three-cell backlog drains over three frames, and none of
+    /// the cells the budget holds is ever still drawn.
+    #[test]
+    fn every_retiree_stays_hidden_until_the_budget_despawns_it() {
+        let (mut app, _directory) = streaming_test_app(EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 1,
+            unload_radius: 1,
+            max_cell_unloads_per_frame: 1,
+            max_unload_ms_per_frame: 0.0,
+            ..EngineConfig::default()
+        });
+        spawn_camera(&mut app, IVec2::ZERO);
+        // Three resident roots well outside the keep-set, so the plan retires all three at once.
+        let roots: Vec<Entity> = (10..13)
+            .map(|grid_x| spawn_mock_cell(&mut app, grid_x, 0, true))
+            .collect();
+
+        app.update();
+        assert_eq!(
+            streaming_metrics(&app).retiring_cells,
+            2,
+            "the budget rode one of the three out the same frame they retired"
+        );
+
+        let mut frames = 0;
+        loop {
+            let world = app.world();
+            let mut present = 0;
+            for root in &roots {
+                if let Some(visibility) = world.get::<Visibility>(*root) {
+                    present += 1;
+                    assert_eq!(
+                        *visibility,
+                        Visibility::Hidden,
+                        "frame {frames}: a retiree is still drawn while the budget holds it"
+                    );
+                }
+            }
+            if present == 0 {
+                break;
+            }
+            frames += 1;
+            assert!(
+                frames <= roots.len(),
+                "the backlog never drained: {present} still waiting"
+            );
+            app.update();
+        }
+        assert!(
+            frames >= 2,
+            "the drain took more than one frame, as the pacer is meant to"
+        );
+        assert_eq!(streaming_metrics(&app).unloaded_cells, 3);
     }
 
     /// The revival keeps the very entity that was drawing the cell: not a despawn and a respawn.
