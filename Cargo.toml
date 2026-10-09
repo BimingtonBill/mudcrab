@@ -44,6 +44,12 @@ ktx2 = "0.5"
 project-wormhole-nif = { path = "vendor/project-wormhole-nif" }
 project-wormhole-esm = "0.1.0"
 
+# Mudcrab Plus (portal branch only): bevy_render 0.19.0 vendored for the parallel command-encoder finish
+# (impl-1132, analysis-1131). See vendor/bevy_render-0.19.0/MUDCRAB-README.md. Remove this line and the
+# folder to go back to the crates.io crate.
+[patch.crates-io]
+bevy_render = { path = "vendor/bevy_render-0.19.0" }
+
 # Workspace profile optimization
 [profile.dev]
 opt-level = 1
