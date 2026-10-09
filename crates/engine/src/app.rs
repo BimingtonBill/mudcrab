@@ -369,9 +369,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
         // The first load runs with the streaming pacing lifted, behind a black cover, until the
-        // world is first ready (`crate::door_crossing::StartupLoadPlugin`); `--paced-startup`
+        // world is first ready (`crate::pacing::startup::StartupLoadPlugin`); `--paced-startup`
         // and a capture run install nothing.
-        app.add_plugins(crate::door_crossing::StartupLoadPlugin);
+        app.add_plugins(crate::pacing::startup::StartupLoadPlugin);
         if let (Some(plan), Some(ground)) = (route, route_ground) {
             info!(
                 route = %plan.source,

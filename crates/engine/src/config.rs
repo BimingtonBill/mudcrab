@@ -121,10 +121,13 @@ pub struct EngineConfig {
     pub max_model_spawns_per_frame: usize,
     /// `--paced-startup`: keep the streaming pacing budgets - [`Self::max_model_spawns_per_frame`],
     /// the two unload budgets and the render-asset upload budget - in force from the first frame.
-    /// Off by default: until the world is first ready the first load runs with all three lifted,
-    /// behind a black cover, so the burst frames of the load are paid for at load speed and never
-    /// seen ([`crate::door_crossing::StartupLoadPlugin`]).
+    /// Off by default: until the world is first ready the first load runs with all three lifted, so
+    /// it is paid for at load speed ([`crate::pacing::startup::StartupLoadPlugin`]).
     pub paced_startup: bool,
+    /// `--startup-cover`: hold a black cover over the unpaced first load and fade it out once the
+    /// world is ready, as a door crossing does. Off by default (the user, 2026-10-09: a dev build
+    /// shows the world while it loads); kept for a release build.
+    pub startup_cover: bool,
     /// MiB of newly loaded render assets (meshes, textures) the renderer may
     /// prepare per frame. `0` prepares every asset the frame extracted.
     pub max_upload_mib_per_frame: usize,
@@ -301,6 +304,7 @@ impl Default for EngineConfig {
             // as the engine did before this budget existed.
             max_model_spawns_per_frame: 4,
             paced_startup: false,
+            startup_cover: false,
             // Three 2K BC7/UASTC textures with a full mip chain (~5.3 MiB each):
             // a cell's new textures spread over a few frames instead of landing
             // in one 13 ms upload burst, and at 60 fps the budget still admits
@@ -388,7 +392,9 @@ Streaming:
   --max-model-spawns-per-frame <count>  models spawned per frame; 0 spawns all at once (default: 4)
   --max-upload-mib-per-frame <mib>      render-asset upload budget per frame; 0 is unlimited (default: 16)
   --paced-startup                       pace the first load like any other; the default runs it
-                                        unpaced behind a black cover until the world is first ready
+                                        unpaced until the world is first ready
+  --startup-cover                       hide the unpaced first load behind a black cover that fades out
+                                        once the world is ready
   --auto-fly-speed <units/s>            fly the camera forward at this speed; 0 holds it still
   --terrain-radius <cells>              terrain-only ring around the streamed cells (default: 8, off
                                         where the worldspace has terrain LOD data; vanilla's view)
@@ -660,19 +666,21 @@ impl EngineConfig {
     }
 
     /// Whether the first load runs with the streaming pacing lifted
-    /// ([`crate::door_crossing::StartupLoadPlugin`]): the default; `--paced-startup` runs the old
+    /// ([`crate::pacing::startup::StartupLoadPlugin`]): the default; `--paced-startup` runs the old
     /// way. A capture run is lifted too - the spawn cap binds on its startup like any run's (the
-    /// `portal-heavy` window: 342 frames to ready) - but never covered, see
-    /// [`Self::covers_startup_load`].
+    /// `portal-heavy` window: 342 frames to ready).
     pub fn unpaced_startup(&self) -> bool {
         !self.paced_startup
     }
 
-    /// Whether the first load is also hidden behind the black cover. A capture run (`--shots`,
-    /// `--demo-tour`) is not: its own settle gate already holds it past the load, and a cover still
-    /// up when a photograph is taken would black it out.
+    /// Whether the unpaced first load is also hidden behind the black cover: only with
+    /// `--startup-cover`, and never in a capture run (`--shots`, `--demo-tour`), whose own settle
+    /// gate already holds it past the load and whose photographs a cover still up would black out.
     pub fn covers_startup_load(&self) -> bool {
-        self.unpaced_startup() && self.portal.shots.is_none() && self.portal.demo_tour.is_none()
+        self.unpaced_startup()
+            && self.startup_cover
+            && self.portal.shots.is_none()
+            && self.portal.demo_tour.is_none()
     }
 
     /// Whether the run moves the camera on its own: `--auto-fly-speed` or `--route`.
@@ -821,6 +829,7 @@ impl EngineConfig {
                     )?;
                 }
                 "--paced-startup" => config.paced_startup = true,
+                "--startup-cover" => config.startup_cover = true,
                 "--max-commit-ms" => {
                     let millis: f64 = take_number(
                         "--max-commit-ms",
@@ -2037,9 +2046,11 @@ mod tests {
         let shots = run_config(&["--shots", "poses.json"]);
         assert!(shots.unpaced_startup());
         assert!(!shots.covers_startup_load());
-        assert!(!run_config(&["--demo-tour", "out"]).covers_startup_load());
-        assert!(EngineConfig::default().covers_startup_load());
-        assert!(!run_config(&["--paced-startup"]).covers_startup_load());
+        assert!(!run_config(&["--demo-tour", "out", "--startup-cover"]).covers_startup_load());
+        // The cover is opt-in.
+        assert!(!EngineConfig::default().covers_startup_load());
+        assert!(run_config(&["--startup-cover"]).covers_startup_load());
+        assert!(!run_config(&["--paced-startup", "--startup-cover"]).covers_startup_load());
     }
 
     #[test]

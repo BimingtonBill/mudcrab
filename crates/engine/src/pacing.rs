@@ -14,6 +14,7 @@
 //! * **Lag at speed** (`--auto-fly-speed`): the horizontal distance from the camera at which each
 //!   model finished loading ([`FlyLag`]). A model that completes close to the camera arrived late.
 
+pub(crate) mod startup;
 use crate::{
     app::benchmark_jump_position,
     config::EngineConfig,
@@ -105,7 +106,7 @@ struct Mark {
 /// committed is resident while its references are still in the command buffer, so the first frame
 /// it holds can be one frame early; the second cannot.
 ///
-/// The startup load lift ([`crate::door_crossing::StartupLoadPlugin`]) waits for the same two
+/// The startup load lift ([`startup::StartupLoadPlugin`]) waits for the same two
 /// frames, so the pacing budgets come back on the frame this report latches the world ready.
 pub(crate) const READY_FRAMES_REQUIRED: u32 = 2;
 
@@ -439,7 +440,7 @@ pub fn horizontal_distance(a: Vec3, b: Vec3) -> f32 {
 ///
 /// One evaluation for both callers, so they cannot disagree about the frame the world was first
 /// ready: [`track_world_ready`] (the pacing report's latch) and the startup load lift
-/// ([`crate::door_crossing`]), which restores the configured pacing on that frame.
+/// ([`startup`]), which restores the configured pacing on that frame.
 pub(crate) fn world_ready_at_frame_end(
     config: &EngineConfig,
     origin: IVec2,
