@@ -1910,7 +1910,15 @@ fn install_retire_visibility_probe(app: &mut App, dir: Option<PathBuf>) {
         );
     }
     app.insert_resource(RetireVisibilityProbe::new(dir))
-        .add_systems(Update, probe_retire_visibility.after(despawn_cells));
+        // PostUpdate, after every pass that sets `ViewVisibility` (the camera's and the light
+        // passes'): read in Update it is the previous frame's value, so a cell retired and hidden
+        // this frame still read as shown on its first backlog frame (15 false hits, u1-check).
+        .add_systems(
+            PostUpdate,
+            probe_retire_visibility
+                .after(bevy::camera::visibility::VisibilitySystems::CheckVisibility)
+                .after(bevy::light::SimulationLightSystems::CheckLightVisibility),
+        );
 }
 
 /// `--probe-retire-visibility`: on each frame after the drain, counts the cells still retiring
