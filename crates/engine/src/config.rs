@@ -214,12 +214,87 @@ pub struct EngineConfig {
     /// water reflection camera is given. `baseline` is the full-size, every-frame reflection the
     /// engine has always drawn.
     pub water_reflection_preset: WaterReflectionPreset,
-    /// `--water-reflection <on|off>`: whether the water reflection view is drawn at all. A
-    /// measurement switch; see [`HELP_TEXT`].
+    /// `--water-reflection <on|off|planar|ssr>`: whether the water reflection view is drawn at
+    /// all (`off` is the measurement switch; `on` and `planar` draw it, and `ssr` is the Water Plus
+    /// reflection of [`Self::water_reflection_mode`]). See [`HELP_TEXT`].
     pub water_reflection: bool,
+    /// `--water-reflection <planar|ssr>`: how the water reflects. `planar` (the default) is the
+    /// mirrored reflection view the engine has always drawn; `ssr` marches the screen in the water
+    /// shader instead, and the reflection camera is never demanded ([`crate::water_ssr`]).
+    pub water_reflection_mode: WaterReflectionMode,
+    /// `--water-ssr-steps <linear>[,<bisection>]`: how many steps the `ssr` march takes per water
+    /// pixel. Only read with `--water-reflection ssr`.
+    pub water_ssr_steps: WaterSsrSteps,
     /// `--shadows <on|off>`: whether the sun casts shadows. A measurement switch; see
     /// [`HELP_TEXT`].
     pub shadows: bool,
+}
+
+/// How the water reflects (`--water-reflection`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaterReflectionMode {
+    /// The mirrored reflection camera the engine has always drawn.
+    #[default]
+    Planar,
+    /// Water Plus: a screen-space ray march in the water shader ([`crate::water_ssr`]). The
+    /// reflection camera is never demanded.
+    Ssr,
+}
+
+impl WaterReflectionMode {
+    /// The spelling the command line and run records use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Planar => "planar",
+            Self::Ssr => "ssr",
+        }
+    }
+}
+
+/// The step counts of the screen-space water reflection's ray march (`--water-ssr-steps`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaterSsrSteps {
+    /// Equal steps along the ray to find the first place it passes behind the depth buffer.
+    pub linear: u32,
+    /// Halvings of the last linear step that refine that place.
+    pub bisection: u32,
+}
+
+impl WaterSsrSteps {
+    /// 16 linear and 6 bisection steps.
+    pub const DEFAULT: Self = Self {
+        linear: 16,
+        bisection: 6,
+    };
+    /// The most linear steps `--water-ssr-steps` accepts. The counts are shader definitions, so
+    /// the loops have constant bounds and this bounds the variants a run can ask for.
+    pub const MAX_LINEAR: u32 = 128;
+    /// The most bisection steps it accepts: each halves the last linear step, and 32 halvings are
+    /// past what an `f32` can tell apart.
+    pub const MAX_BISECTION: u32 = 32;
+
+    /// Parses `<linear>` or `<linear>,<bisection>`; an omitted bisection count keeps the default.
+    /// `None` for a count that is not a number, 0 or more than [`Self::MAX_LINEAR`] linear steps,
+    /// or more than [`Self::MAX_BISECTION`] bisection steps.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (linear, bisection) = match raw.split_once(',') {
+            Some((linear, bisection)) => (linear, Some(bisection)),
+            None => (raw, None),
+        };
+        let linear: u32 = linear.parse().ok()?;
+        let bisection: u32 = match bisection {
+            Some(bisection) => bisection.parse().ok()?,
+            None => Self::DEFAULT.bisection,
+        };
+        ((1..=Self::MAX_LINEAR).contains(&linear) && bisection <= Self::MAX_BISECTION)
+            .then_some(Self { linear, bisection })
+    }
+}
+
+impl Default for WaterSsrSteps {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 /// The view policy the water reflection camera is given (`--water-reflection-preset`).
@@ -363,6 +438,8 @@ impl Default for EngineConfig {
             physics_fixture: false,
             water_reflection_preset: WaterReflectionPreset::Baseline,
             water_reflection: true,
+            water_reflection_mode: WaterReflectionMode::Planar,
+            water_ssr_steps: WaterSsrSteps::DEFAULT,
             shadows: true,
         }
     }
@@ -434,13 +511,19 @@ Benchmark and profiling:
   --profile-dirty-worktree              record uncommitted worktree changes in the profile
   --profile-hardware <text>             hardware recorded in the profile (default: unspecified)
   --water-reflection-preset <name>      water reflection cost: baseline (full size, every frame, shadowed)
-                                        or water (quarter size, every other frame, shadowless) (default: baseline)
+                                        or water (quarter size, every other frame, shadowless) (default: baseline);
+                                        ignored with --water-reflection ssr
   --probe-retire-visibility <dir>       record whether a draining retiring cell ever shows, write retire-visibility.json and PNGs here, then exit
 
 Diagnostics:
   --diagnostic-asset-fallbacks          log every fallback asset substitution
-  --water-reflection <on|off>           measurement switch: off never renders the reflection view; the water
-                                        gets darker (a black reflection is blended in), not unreflective (default: on)
+  --water-reflection <planar|ssr|on|off>  measurement switch and Water Plus: planar (default, the same as on) renders
+                                        the mirrored reflection view; ssr marches the screen in the water shader
+                                        instead, never renders that view and copies the opaque colour once per view
+                                        that draws water; off never renders the reflection view, and the water gets
+                                        darker (a black reflection is blended in), not unreflective
+  --water-ssr-steps <n>[,<m>]           ssr only: n linear (1-128) and m bisection (0-32) march steps per water
+                                        pixel (default: 16,6); ignored with planar
   --shadows <on|off>                    measurement switch: off turns off the sun's shadow maps (default: on)
   --material-fixture                    run the material fixture (no world database)
   --terrain-water-fixture               run the terrain-water fixture (no world database)
@@ -1037,7 +1120,35 @@ impl EngineConfig {
                 "--room-culling" => config.room_culling = true,
                 "--physics-fixture" => config.physics_fixture = true,
                 "--water-reflection" => {
-                    config.water_reflection = take_on_off("--water-reflection", args.next())?;
+                    const EXPECTED: &str = "on, off, planar or ssr";
+                    let raw = take_raw("--water-reflection", EXPECTED, args.next())?;
+                    // Not a `match` on string literals: the help-drift tests read every
+                    // `"..." =>` line of this file as an option arm. `on` is `planar` under its
+                    // older name, so the measurement switch keeps working as it was written.
+                    if raw == "on" || raw == "planar" {
+                        config.water_reflection = true;
+                        config.water_reflection_mode = WaterReflectionMode::Planar;
+                    } else if raw == "off" {
+                        config.water_reflection = false;
+                        config.water_reflection_mode = WaterReflectionMode::Planar;
+                    } else if raw == "ssr" {
+                        config.water_reflection = true;
+                        config.water_reflection_mode = WaterReflectionMode::Ssr;
+                    } else {
+                        return Err(ConfigError::invalid_value(
+                            "--water-reflection",
+                            Some(raw),
+                            EXPECTED,
+                        ));
+                    }
+                }
+                "--water-ssr-steps" => {
+                    const EXPECTED: &str =
+                        "<linear>[,<bisection>], 1 to 128 linear and 0 to 32 bisection steps";
+                    let raw = take_raw("--water-ssr-steps", EXPECTED, args.next())?;
+                    config.water_ssr_steps = WaterSsrSteps::parse(&raw).ok_or_else(|| {
+                        ConfigError::invalid_value("--water-ssr-steps", Some(raw), EXPECTED)
+                    })?;
                 }
                 "--shadows" => config.shadows = take_on_off("--shadows", args.next())?,
                 "--water-reflection-preset" => {
@@ -2251,6 +2362,166 @@ mod tests {
     #[test]
     fn help_documents_the_water_reflection_preset() {
         assert!(help_names("--water-reflection-preset"));
+    }
+
+    #[test]
+    fn the_water_reflection_is_planar_unless_asked_otherwise() {
+        let config = run_config(&[]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Planar);
+        assert!(config.water_reflection);
+        assert_eq!(config.water_ssr_steps, WaterSsrSteps::DEFAULT);
+        assert_eq!(
+            (
+                config.water_ssr_steps.linear,
+                config.water_ssr_steps.bisection
+            ),
+            (16, 6)
+        );
+
+        let config = run_config(&["--water-reflection", "planar"]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Planar);
+        assert!(config.water_reflection);
+
+        let config = run_config(&["--water-reflection", "ssr"]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Ssr);
+        assert!(config.water_reflection);
+    }
+
+    #[test]
+    fn the_last_water_reflection_value_wins_across_the_spellings() {
+        let config = run_config(&["--water-reflection", "ssr", "--water-reflection", "planar"]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Planar);
+        let config = run_config(&["--water-reflection", "ssr", "--water-reflection", "off"]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Planar);
+        assert!(!config.water_reflection);
+        let config = run_config(&["--water-reflection", "off", "--water-reflection", "ssr"]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Ssr);
+        assert!(config.water_reflection);
+    }
+
+    #[test]
+    fn a_bad_water_reflection_value_is_an_error() {
+        for value in ["screen", "SSR", "Planar", "true", ""] {
+            assert!(
+                matches!(
+                    parse_error(&["--water-reflection", value]),
+                    ConfigError::InvalidValue {
+                        option: "--water-reflection",
+                        value: Some(ref given),
+                        ..
+                    } if given == value
+                ),
+                "--water-reflection accepted {value:?}"
+            );
+        }
+        assert!(matches!(
+            parse_error(&["--water-reflection"]),
+            ConfigError::InvalidValue {
+                option: "--water-reflection",
+                value: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_preset_flag_still_parses_beside_ssr() {
+        let config = run_config(&[
+            "--water-reflection",
+            "ssr",
+            "--water-reflection-preset",
+            "water",
+        ]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Ssr);
+        assert_eq!(config.water_reflection_preset, WaterReflectionPreset::Water);
+    }
+
+    #[test]
+    fn water_ssr_steps_take_a_linear_count_and_an_optional_bisection_count() {
+        let steps = |raw: &str| run_config(&["--water-ssr-steps", raw]).water_ssr_steps;
+        assert_eq!(steps("16,6"), WaterSsrSteps::DEFAULT);
+        assert_eq!(
+            steps("32"),
+            WaterSsrSteps {
+                linear: 32,
+                bisection: 6
+            },
+            "an omitted bisection count keeps the default"
+        );
+        assert_eq!(
+            steps("1,0"),
+            WaterSsrSteps {
+                linear: 1,
+                bisection: 0
+            }
+        );
+        assert_eq!(
+            steps("128,32"),
+            WaterSsrSteps {
+                linear: 128,
+                bisection: 32
+            }
+        );
+    }
+
+    #[test]
+    fn water_ssr_steps_refuse_zero_too_many_and_nonsense() {
+        for value in [
+            "0", "129", "0,6", "129,6", "16,33", "-1", "16,-1", "1.5", "16,", ",6", "16,6,2", "x",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    parse_error(&["--water-ssr-steps", value]),
+                    ConfigError::InvalidValue {
+                        option: "--water-ssr-steps",
+                        value: Some(ref given),
+                        ..
+                    } if given == value
+                ),
+                "--water-ssr-steps accepted {value:?}"
+            );
+        }
+        assert!(matches!(
+            parse_error(&["--water-ssr-steps"]),
+            ConfigError::InvalidValue {
+                option: "--water-ssr-steps",
+                value: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_error(&["--water-ssr-steps", "--shadows"]),
+            ConfigError::InvalidValue {
+                option: "--water-ssr-steps",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn help_says_the_ssr_flags_only_apply_with_ssr() {
+        assert!(help_names("--water-ssr-steps"));
+        let steps: Vec<_> = HELP_TEXT
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("--water-ssr-steps"))
+            .take(2)
+            .collect();
+        assert!(
+            steps.iter().any(|line| line.contains("ssr only")),
+            "the steps row says it only applies with ssr: {steps:?}"
+        );
+        let preset: Vec<_> = HELP_TEXT
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("--water-reflection-preset"))
+            .take(3)
+            .collect();
+        assert!(
+            preset
+                .iter()
+                .any(|line| line.contains("ignored with --water-reflection ssr")),
+            "the preset row says ssr ignores it: {preset:?}"
+        );
     }
 
     #[test]

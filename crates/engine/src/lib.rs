@@ -52,6 +52,7 @@ pub mod swap_bridge;
 pub mod tonemapper;
 pub mod transition;
 pub mod view_policy;
+pub mod water_ssr;
 pub mod window_parking;
 pub mod world;
 
