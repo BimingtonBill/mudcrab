@@ -103,6 +103,12 @@ this duty; see "Team Lead".)
 - **GPU check before merging into portal (2026-10-09).** A change touching streaming, visibility, render layers or
   settles merges into `portal` only after a portal-heavy acceptance run on the merged tree passes (world_ready reached,
   0 invariant failures). Unit tests have no lights, cameras or shadows; the #1055 bridge passed them and broke portal.
+- **Portal merges happen in the integration worktree (the user, 2026-10-09).** `D:/Mudcrab/merge/portal-integration`, branch
+  `portal-integration`, its own `target/` there. Steps: `git merge --ff-only portal` (catch up), merge the branch, resolve, run the
+  checks and the GPU check there (through the gate), then fast-forward the main checkout once: `git -C C:/Modding/Mudcrab/mudcrab
+  merge --ff-only portal-integration`. Never merge or resolve conflicts in the main checkout: half-done merges there change files
+  under every session that builds from it and invalidate their builds. Its first build is cold (about 20 GB on D:): check
+  `tools/disk_guard.py --drive D:` first.
 - **One target folder per worktree (2026-10-09).** Never point two worktrees at the same `target/` or `CARGO_TARGET_DIR`:
   cargo gives workspace crates the same hash across worktrees, so a shared target silently reuses stale artifacts and
   fails or passes builds for the wrong code. A copied seed is fine; sharing is not.
