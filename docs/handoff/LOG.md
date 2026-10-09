@@ -3,6 +3,20 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-09 (wrap-up) Phase 4 Dev: where Phase 4 stands
+
+Track: phase 4. Nothing pushed, nothing running; no worktree or build folder was ever made, so
+nothing to discard. All Phase 4 files are committed or in `local/` (not tracked).
+- **Collision v3 design** (`local/research/phase4/p4-binary-prebuilt-collision-design-2026-10-08.md`):
+  revised 2026-10-09 on Phase 1's full load bench (300 models: collider build 69.5 ms; JSON 76%,
+  trimesh BVH 19%, quickhull 4.5%). Binary geometry in a GLB buffer view kept; converter hull
+  precompute and the parry3d converter dependency dropped. Go/no-go still waits on Phase 2's
+  in-engine collision spans in a timing window (gate: at least 1 ms in a post-door frame).
+- **MQ103** waits on Chef's project schema (queue E9); the plan `local/plans/mq103-plan.md` is
+  revisited then. No MQ103 research done.
+- **P4-3** waits on the user.
+- Next: a Team Lead hand-out once the user decides.
+
 ## 2026-10-09 afternoon Portal Dev: impl-1121 merged, water preset now faster; U1 check window
 
 Track: Portal. Nothing pushed.
