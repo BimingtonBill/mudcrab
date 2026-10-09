@@ -107,7 +107,13 @@ impl Plugin for VercidiumRendererPlugin {
             crate::view_policy::SecondaryViewPolicyPlugin,
             crate::shadow_route::ShadowRoutePlugin,
             crate::render_skip::RenderSkipPlugin,
+            // `--water-reflection ssr`: the screen-space reflection of the water, a module that
+            // knows nothing of this branch (see [`portal_water_ssr_hook`] for what joins it to
+            // the portal's views). Under `planar` (the default) it registers nothing at all.
+            crate::water_ssr::WaterSsrPlugin,
         ));
+        // The one place this branch's planar reflection and the screen-space one meet.
+        let planar_replaced = portal_water_ssr_hook(app);
         app.add_plugins((
             crate::light_falloff::SkyrimLightFalloffPlugin,
             crate::material_animation::MaterialAnimationPlugin,
@@ -127,7 +133,9 @@ impl Plugin for VercidiumRendererPlugin {
         // the pose written just before propagation is the one the frame renders with.
         .add_systems(
             PostUpdate,
-            prepare_water_reflection.in_set(ViewPolicySystems::Prepare),
+            prepare_water_reflection
+                .in_set(ViewPolicySystems::Prepare)
+                .run_if(move || !planar_replaced),
         );
 
         // `--reflection-cascades N`: the default is 0 (an unshadowed reflection), so the limit is
@@ -883,6 +891,21 @@ impl MaterialExtension for WaterExtension {
     fn fragment_shader() -> ShaderRef {
         "embedded://engine/shaders/water.wgsl".into()
     }
+
+    /// Under `--water-reflection ssr` the shader is compiled with the march and its step counts
+    /// ([`crate::water_ssr::push_shader_defs`]); under `planar` it gets no definition at all and
+    /// is the shader it has always been.
+    fn specialize(
+        _pipeline: &bevy::pbr::MaterialExtensionPipeline,
+        descriptor: &mut bevy::render::render_resource::RenderPipelineDescriptor,
+        _layout: &bevy::mesh::MeshVertexBufferLayoutRef,
+        _key: bevy::pbr::MaterialExtensionKey<Self>,
+    ) -> Result<(), bevy::render::render_resource::SpecializedMeshPipelineError> {
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            crate::water_ssr::push_shader_defs(&mut fragment.shader_defs);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Resource, Clone)]
@@ -1105,6 +1128,59 @@ fn limit_water_reflection_cascades(
         };
         if let Some(view_cascades) = cascades.cascades.get_mut(&camera) {
             view_cascades.truncate(keep);
+        }
+    }
+}
+
+/// PORTAL-SIDE HOOK of the screen-space water reflection (`--water-reflection ssr`,
+/// [`crate::water_ssr`]). Everything that joins that module to this branch is here; the module
+/// itself, and the `ssr_reflect` function of `shaders/water.wgsl`, know nothing of the portal, the
+/// view policy or the planar camera and port to another branch unchanged.
+///
+/// Under `ssr` it does two things, and returns `true` so the caller leaves
+/// [`prepare_water_reflection`] out of the schedule:
+///
+/// * **The planar camera is never demanded.** Without that system nothing fills the reflection
+///   camera's [`ViewDemand`], so the policy never admits it: it is not active, renders nothing and
+///   builds no shadow cascades, and its preparation costs nothing either.
+///   `--water-reflection-preset` is not consulted.
+/// * **The sky is the camera's own.** The water's misses fall back to the sky the camera's dome
+///   draws, and the dome's colours are this branch's per-camera [`CameraSky`]
+///   ([`crate::sky_dome`]): [`feed_water_ssr_sky`] hands each camera's palette to the module.
+///
+/// Under `planar` it does nothing and returns `false`.
+fn portal_water_ssr_hook(app: &mut App) -> bool {
+    let ssr = app
+        .world()
+        .get_resource::<crate::config::EngineConfig>()
+        .is_some_and(|config| {
+            config.water_reflection_mode == crate::config::WaterReflectionMode::Ssr
+        });
+    if ssr {
+        app.add_systems(
+            PostUpdate,
+            feed_water_ssr_sky.before(crate::water_ssr::WaterSsrSystems::Mark),
+        );
+    }
+    ssr
+}
+
+/// Part of [`portal_water_ssr_hook`]: copies each camera's sky palette to the component the
+/// screen-space reflection reads, writing only when it changed.
+fn feed_water_ssr_sky(
+    mut commands: Commands,
+    cameras: Query<(
+        Entity,
+        &crate::sky_dome::CameraSky,
+        Option<&crate::water_ssr::WaterSsrSky>,
+    )>,
+) {
+    for (camera, sky, current) in &cameras {
+        let wanted = crate::water_ssr::WaterSsrSky {
+            palette: sky.palette,
+        };
+        if current != Some(&wanted) {
+            commands.entity(camera).insert(wanted);
         }
     }
 }
@@ -2728,6 +2804,141 @@ mod tests {
                 "water is in view, but the reflection was switched off"
             );
         }
+    }
+
+    /// A spawned reflection camera, a main camera and a plane in front of it, run for a few frames
+    /// under this configuration; every frame's `is_active` of the reflection camera.
+    fn reflection_activity_under(config: crate::config::EngineConfig) -> Vec<bool> {
+        let mut app = App::new();
+        app.init_resource::<ProfilingState>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Time>()
+            .insert_resource(config)
+            .insert_resource(crate::streaming::RenderOrigin(IVec2::ZERO))
+            .insert_resource(crate::sky::CameraSpace::Exterior)
+            .add_plugins(crate::view_policy::SecondaryViewPolicyPlugin)
+            .add_systems(Startup, setup_water_reflection);
+        // As `VercidiumRendererPlugin` registers it: the hook decides whether the planar
+        // preparation is in the schedule at all.
+        let planar_replaced = portal_water_ssr_hook(&mut app);
+        app.add_systems(
+            PostUpdate,
+            prepare_water_reflection
+                .in_set(ViewPolicySystems::Prepare)
+                .run_if(move || !planar_replaced),
+        );
+        let observer = Transform::from_xyz(0.0, 120.0, 0.0);
+        app.world_mut().spawn((
+            observer,
+            GlobalTransform::from(observer),
+            main_camera_projection(),
+            StreamingCamera,
+        ));
+        let water = Vec3::new(0.0, 40.0, -800.0);
+        app.world_mut().spawn((
+            Transform::from_translation(water),
+            GlobalTransform::from_translation(water),
+            water_bounds(CELL_WATER_HALF_EXTENTS),
+            WaterSurface,
+        ));
+        (0..5)
+            .map(|_| {
+                app.update();
+                let world = app.world_mut();
+                let mut cameras = world.query_filtered::<&Camera, With<WaterReflectionCamera>>();
+                cameras.single(world).unwrap().is_active
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ssr_never_demands_or_activates_the_reflection_camera() {
+        use crate::config::{EngineConfig, WaterReflectionMode};
+        for preset in [
+            WaterReflectionPreset::Baseline,
+            WaterReflectionPreset::Water,
+        ] {
+            let activity = reflection_activity_under(EngineConfig {
+                water_reflection_mode: WaterReflectionMode::Ssr,
+                water_reflection_preset: preset,
+                ..default()
+            });
+            assert_eq!(
+                activity, [false; 5],
+                "water is in view, but --water-reflection ssr marches the screen instead ({preset:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn planar_still_demands_the_reflection_camera_when_water_is_in_view() {
+        use crate::config::{EngineConfig, WaterReflectionMode};
+        let planar = reflection_activity_under(EngineConfig {
+            water_reflection_mode: WaterReflectionMode::Planar,
+            ..default()
+        });
+        assert!(planar.iter().all(|active| *active), "{planar:?}");
+        // The default configuration is planar: no flag, same behaviour.
+        let default_run = reflection_activity_under(EngineConfig::default());
+        assert!(default_run.iter().all(|active| *active), "{default_run:?}");
+    }
+
+    #[test]
+    fn the_portal_hook_hands_each_cameras_sky_to_the_water_module_only_under_ssr() {
+        use crate::{
+            config::{EngineConfig, WaterReflectionMode},
+            sky::SkyPalette,
+            sky_dome::CameraSky,
+            water_ssr::WaterSsrSky,
+        };
+        for mode in [WaterReflectionMode::Ssr, WaterReflectionMode::Planar] {
+            let mut app = App::new();
+            app.insert_resource(EngineConfig {
+                water_reflection_mode: mode,
+                ..default()
+            });
+            let replaced = portal_water_ssr_hook(&mut app);
+            assert_eq!(replaced, mode == WaterReflectionMode::Ssr);
+            let palette = SkyPalette::SKYRIM_CLEAR_DAY;
+            let sky = app
+                .world_mut()
+                .spawn(CameraSky {
+                    palette: Some(palette),
+                })
+                .id();
+            let none = app.world_mut().spawn(CameraSky { palette: None }).id();
+            app.update();
+            let fed = |entity| app.world().get::<WaterSsrSky>(entity).copied();
+            if replaced {
+                assert_eq!(
+                    fed(sky),
+                    Some(WaterSsrSky {
+                        palette: Some(palette)
+                    })
+                );
+                assert_eq!(fed(none), Some(WaterSsrSky { palette: None }));
+            } else {
+                assert_eq!(fed(sky), None, "planar hands the water module nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn ssr_leaves_the_reflection_camera_spawned_but_off() {
+        // The camera, its image and its policy exist exactly as under planar (the material still
+        // binds the image), so `--water-reflection-preset` is simply not consulted for a demand.
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .insert_resource(crate::config::EngineConfig {
+                water_reflection_mode: crate::config::WaterReflectionMode::Ssr,
+                ..default()
+            });
+        app.add_systems(Startup, setup_water_reflection);
+        app.update();
+        let world = app.world_mut();
+        let mut cameras = world.query_filtered::<&Camera, With<WaterReflectionCamera>>();
+        assert!(!cameras.single(world).unwrap().is_active);
+        assert!(world.get_resource::<WaterReflectionTexture>().is_some());
     }
 
     #[test]
