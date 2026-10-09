@@ -20,18 +20,26 @@
 //! would move it) while the screen is black.
 //!
 //! There is no preload: the fade simply holds until the destination is resident and uploaded.
+//!
+//! The module also owns the same trade for a run's first load ([`StartupLoadPlugin`]): behind a
+//! black cover the world streams with its pacing budgets lifted until it is first ready, then the
+//! configured pacing comes back and the cover fades. Same lift, same fade, one startup rather
+//! than one crossing; on by default, `--paced-startup` turns it off.
 
 use crate::{
+    config::EngineConfig,
     doors::LoadDoor,
+    pacing::{READY_FRAMES_REQUIRED, world_ready_at_frame_end},
     physics::{
         CursorCapture, MovementTuning, PlayerBody, TeleportPlayer, body_and_camera_for_feet,
     },
     render::{TerrainMaterial, WaterMaterial},
     sky::CameraSpace,
     streaming::{
-        ActiveSpace, PendingUnder, RenderOrigin, StreamingWorld, camera_grid,
+        ActiveSpace, PendingUnder, RenderOrigin, StreamingMetrics, StreamingWorld, camera_grid,
         creation_rotation_to_bevy, creation_to_bevy, unload_all_cells_now,
     },
+    swap_bridge::{WaitingVisibility, pending_drawn},
     world::{
         components::{CELL_SIZE, ExpectedModelBounds, StreamingCamera, WorldPosition},
         database::CellKey,
@@ -560,7 +568,9 @@ fn set_upload_budget(
     }
 }
 
-fn set_alpha(overlay: &mut Query<&mut BackgroundColor, With<FadeOverlay>>, alpha: f32) {
+/// Sets the alpha of a full-screen black overlay: the crossing's [`FadeOverlay`] and the startup
+/// cover ([`StartupCover`]) are blacked and faded by the one rule.
+fn set_alpha<C: Component>(overlay: &mut Query<&mut BackgroundColor, With<C>>, alpha: f32) {
     for mut colour in overlay.iter_mut() {
         colour.0 = Color::srgba(0.0, 0.0, 0.0, alpha.clamp(0.0, 1.0));
     }
@@ -784,6 +794,239 @@ fn drive_door_crossing(
                 active.stage = Stage::FadeIn { elapsed };
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// The startup load lift
+// ------------------------------------------------------------------------------------------------
+
+/// Longest the pacing budgets stay lifted without the world becoming ready, in seconds. A safety
+/// net, not a working limit: the portal-heavy start is ready in about 5-7 s (`--benchmark-jump`
+/// runs: 342 frames), and the lift is a load-time measure that must never outlive the load. A run
+/// that trips this continues exactly as it did before the lift existed.
+pub const STARTUP_LIFT_TIMEOUT_SECONDS: f32 = 60.0;
+
+/// The full-screen black cover the first load happens behind: spawned full black on the first frame
+/// and faded out (over [`FADE_SECONDS`], the crossing's own fade) once the pacing budgets are back.
+///
+/// Its own node, not the crossing's [`FadeOverlay`]: that overlay is the crossing's (and this build
+/// does not register the crossing), and two writers on one node would fight over its alpha.
+#[derive(Component)]
+pub struct StartupCover;
+
+/// The configured pacing values the startup lift puts aside, restored as one when the world is
+/// first ready.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ConfiguredPacing {
+    spawns_per_frame: usize,
+    unload_ms_per_frame: f64,
+    unloads_per_frame: usize,
+    upload_bytes_per_frame: Option<usize>,
+}
+
+/// The startup lift's own state, advanced once a frame by [`drive_startup_load`].
+#[derive(Resource, Default)]
+struct StartupLoad {
+    /// Whether this run hides the load behind the cover
+    /// ([`EngineConfig::covers_startup_load`]): false for a capture run, whose frames are the
+    /// deliverable and whose own settle gate already holds it past the load.
+    covers: bool,
+    /// `Some` while the lift is in force, holding the configured values to restore.
+    configured: Option<ConfiguredPacing>,
+    /// Consecutive frames the world-ready predicate has held;
+    /// [`crate::pacing::READY_FRAMES_REQUIRED`] of them latch it, the rule the pacing report's own
+    /// first-ready latch uses.
+    ready_frames: u32,
+    /// Seconds since the first frame, for [`STARTUP_LIFT_TIMEOUT_SECONDS`].
+    elapsed: f32,
+    /// `Some(elapsed)` once the lift is over and the cover is fading out; `None` before.
+    fade: Option<f32>,
+    /// The cover node, despawned when the fade ends.
+    cover: Option<Entity>,
+    /// The cover has faded out and gone: the lift is over for the rest of the run.
+    finished: bool,
+}
+
+/// Lifts the streaming pacing for the first load and, unless this is a capture run, holds a black
+/// cover over it. On by default; `--paced-startup` installs nothing
+/// ([`EngineConfig::unpaced_startup`] / [`EngineConfig::covers_startup_load`]).
+///
+/// The lift is the crossing's own kind of trade - behind black a stutter is invisible, so the load
+/// may spend its bursts - with the same mechanism, [`set_upload_budget`], extended to the two
+/// streaming budgets:
+///
+/// * the render-asset upload budget to `None`,
+/// * the model spawn cap to `0` (every ready model armed each frame),
+/// * the unload budgets to `0` and `0` (the one pair that is exactly the unbudgeted path, see
+///   [`EngineConfig::max_unload_ms_per_frame`]).
+///
+/// All three are restored to the configured values on the frame the world-ready latch fires (two
+/// consecutive ready frames, the pacing report's own predicate and rule) or after
+/// [`STARTUP_LIFT_TIMEOUT_SECONDS`], whichever comes first; the cover then fades and is despawned.
+/// The latch happens once: a later loss of ready never lifts again.
+pub struct StartupLoadPlugin;
+
+impl Plugin for StartupLoadPlugin {
+    fn build(&self, app: &mut App) {
+        let (lifts, covers) = app
+            .world()
+            .get_resource::<EngineConfig>()
+            .map_or((false, false), |config| {
+                (config.unpaced_startup(), config.covers_startup_load())
+            });
+        if !lifts {
+            return;
+        }
+        app.insert_resource(StartupLoad {
+            covers,
+            ..default()
+        })
+        .add_systems(Startup, begin_startup_load)
+        .add_systems(PostUpdate, drive_startup_load);
+    }
+}
+
+/// Takes the three budgets down and spawns the cover, on the first frame.
+fn begin_startup_load(
+    mut commands: Commands,
+    mut config: ResMut<EngineConfig>,
+    mut budget: Option<ResMut<RenderAssetBytesPerFrame>>,
+    mut load: ResMut<StartupLoad>,
+) {
+    let configured = ConfiguredPacing {
+        spawns_per_frame: config.max_model_spawns_per_frame,
+        unload_ms_per_frame: config.max_unload_ms_per_frame,
+        unloads_per_frame: config.max_cell_unloads_per_frame,
+        upload_bytes_per_frame: config.max_upload_bytes_per_frame(),
+    };
+    config.max_model_spawns_per_frame = 0;
+    config.max_unload_ms_per_frame = 0.0;
+    config.max_cell_unloads_per_frame = 0;
+    set_upload_budget(&mut budget, None);
+    if load.covers {
+        load.cover = Some(
+            commands
+                .spawn((
+                    Name::new("Startup cover"),
+                    StartupCover,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        width: Val::Percent(100.0),
+                        height: Val::Percent(100.0),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 1.0)),
+                    // Under the crossing's own fade (`i32::MAX - 1`): the more specific cover wins.
+                    GlobalZIndex(i32::MAX - 2),
+                ))
+                .id(),
+        );
+    }
+    load.configured = Some(configured);
+    info!(
+        spawns_per_frame = configured.spawns_per_frame,
+        unload_ms_per_frame = configured.unload_ms_per_frame,
+        unloads_per_frame = configured.unloads_per_frame,
+        upload_bytes_per_frame = ?configured.upload_bytes_per_frame,
+        "startup load: streaming pacing lifted until the world is first ready"
+    );
+}
+
+/// Puts the configured pacing back, as one: the two streaming budgets and the upload budget.
+fn restore_startup_pacing(
+    config: &mut EngineConfig,
+    budget: &mut Option<ResMut<RenderAssetBytesPerFrame>>,
+    configured: ConfiguredPacing,
+) {
+    config.max_model_spawns_per_frame = configured.spawns_per_frame;
+    config.max_unload_ms_per_frame = configured.unload_ms_per_frame;
+    config.max_cell_unloads_per_frame = configured.unloads_per_frame;
+    set_upload_budget(budget, configured.upload_bytes_per_frame);
+}
+
+/// Holds the cover, watches the world-ready predicate, restores the configured pacing on the frame
+/// it latches (or at the timeout), then fades the cover out.
+///
+/// The predicate is read at frame end, through [`world_ready_at_frame_end`] - the same function
+/// [`crate::pacing::track_world_ready`] reads it through a moment earlier in the frame's `Update`,
+/// so the two latch on the same frame.
+#[allow(clippy::too_many_arguments)]
+fn drive_startup_load(
+    time: Res<Time>,
+    mut config: ResMut<EngineConfig>,
+    origin: Res<RenderOrigin>,
+    streaming: Res<StreamingWorld>,
+    space: Res<ActiveSpace>,
+    metrics: Res<StreamingMetrics>,
+    camera: Query<&Transform, With<StreamingCamera>>,
+    waiting: WaitingVisibility,
+    mut overlay: Query<&mut BackgroundColor, With<StartupCover>>,
+    mut budget: Option<ResMut<RenderAssetBytesPerFrame>>,
+    mut commands: Commands,
+    mut load: ResMut<StartupLoad>,
+) {
+    if load.finished {
+        return;
+    }
+    let delta = time.delta_secs();
+    load.elapsed += delta;
+
+    // The lift is over; the cover is on its way out.
+    if let Some(fade) = load.fade {
+        let fade = fade + delta;
+        if fade >= FADE_SECONDS {
+            if let Some(cover) = load.cover.take() {
+                commands.entity(cover).despawn();
+            }
+            load.finished = true;
+        } else {
+            set_alpha(&mut overlay, 1.0 - fade / FADE_SECONDS);
+            load.fade = Some(fade);
+        }
+        return;
+    }
+
+    // Loading: full black over the burst frames the lift is paying for.
+    let Some(configured) = load.configured else {
+        return;
+    };
+    set_alpha(&mut overlay, 1.0);
+    let ready = camera.single().ok().is_some_and(|camera| {
+        world_ready_at_frame_end(
+            &config,
+            origin.0,
+            &streaming,
+            &space,
+            &metrics,
+            camera.translation,
+            pending_drawn(&waiting),
+        )
+        .0
+    });
+    load.ready_frames = if ready { load.ready_frames + 1 } else { 0 };
+    let latched = load.ready_frames >= READY_FRAMES_REQUIRED;
+    if !latched && load.elapsed < STARTUP_LIFT_TIMEOUT_SECONDS {
+        return;
+    }
+    restore_startup_pacing(&mut config, &mut budget, configured);
+    load.configured = None;
+    if load.covers {
+        load.fade = Some(0.0);
+    } else {
+        load.finished = true;
+    }
+    if latched {
+        info!(
+            seconds = load.elapsed,
+            "startup load: the world is ready; the configured streaming pacing is back"
+        );
+    } else {
+        warn!(
+            seconds = load.elapsed,
+            timeout_seconds = STARTUP_LIFT_TIMEOUT_SECONDS,
+            "startup load: the world was not ready in time; the configured streaming pacing is back"
+        );
     }
 }
 
@@ -1381,6 +1624,239 @@ mod tests {
         assert!(ray_hits_door(Vec3::new(0.0, 20.0, 0.0), Vec3::Z, &door, &bounds, 200.0).is_none());
         assert!(
             ray_hits_door(Vec3::new(0.0, 20.0, 0.0), Vec3::NEG_Z, &door, &bounds, 50.0).is_none()
+        );
+    }
+
+    // -- the startup load lift ------------------------------------------------------------------
+
+    /// The configured pacing the lift must put back: all three values differ from the defaults, so
+    /// a restore to the wrong ones cannot pass.
+    fn configured_pacing() -> EngineConfig {
+        EngineConfig {
+            max_model_spawns_per_frame: 7,
+            max_unload_ms_per_frame: 2.5,
+            max_cell_unloads_per_frame: 3,
+            ..default()
+        }
+    }
+
+    /// A headless app with the startup lift registered, one camera, and the default interior
+    /// window (the camera's own cell, so residency alone decides readiness).
+    fn startup_app(config: EngineConfig) -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, TransformPlugin));
+        app.init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingWorld>()
+            .insert_resource(ActiveSpace::default())
+            .insert_resource(RenderAssetBytesPerFrame {
+                max_bytes: config.max_upload_bytes_per_frame(),
+            })
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                DT,
+            )))
+            .insert_resource(config)
+            .add_plugins(StartupLoadPlugin);
+        app.world_mut().spawn((
+            StreamingCamera,
+            Transform::default(),
+            GlobalTransform::default(),
+        ));
+        app.finish();
+        app
+    }
+
+    /// Puts the camera inside interior `cell`, whose cell is resident (the world reads ready) or
+    /// still loading (it does not).
+    fn set_interior(app: &mut App, cell: u32, resident: bool) {
+        app.world_mut().resource_mut::<ActiveSpace>().interior = Some(cell);
+        if resident {
+            let root = app.world_mut().spawn_empty().id();
+            app.world_mut()
+                .resource_mut::<StreamingWorld>()
+                .set_resident_for_test(CellKey::Interior(cell), root);
+        }
+    }
+
+    fn cover_alpha(app: &mut App) -> Option<f32> {
+        let mut query = app
+            .world_mut()
+            .query_filtered::<&BackgroundColor, With<StartupCover>>();
+        query
+            .iter(app.world())
+            .next()
+            .map(|colour| colour.0.to_srgba().alpha)
+    }
+
+    fn frames_until_faded() -> u32 {
+        (FADE_SECONDS / DT).ceil() as u32 + 1
+    }
+
+    #[test]
+    fn the_first_frame_lifts_the_pacing_and_raises_the_cover() {
+        let mut app = startup_app(configured_pacing());
+        set_interior(&mut app, 77, false);
+        app.update();
+        let config = app.world().resource::<EngineConfig>();
+        assert_eq!(config.max_model_spawns_per_frame, 0);
+        assert_eq!(config.max_unload_ms_per_frame, 0.0);
+        assert_eq!(config.max_cell_unloads_per_frame, 0);
+        assert_eq!(
+            app.world().resource::<RenderAssetBytesPerFrame>().max_bytes,
+            None,
+            "the upload budget is the crossing's own lift"
+        );
+        assert_eq!(
+            cover_alpha(&mut app),
+            Some(1.0),
+            "the cover is up from the first frame"
+        );
+        assert!(app.world().resource::<StartupLoad>().configured.is_some());
+    }
+
+    #[test]
+    fn the_configured_pacing_is_back_on_the_ready_frame() {
+        let mut app = startup_app(configured_pacing());
+        set_interior(&mut app, 77, true);
+        app.update();
+        // One ready frame is not the latch: the report's own rule wants two consecutive ones.
+        assert_eq!(
+            app.world()
+                .resource::<EngineConfig>()
+                .max_model_spawns_per_frame,
+            0
+        );
+        app.update();
+        let config = app.world().resource::<EngineConfig>();
+        assert_eq!(config.max_model_spawns_per_frame, 7);
+        assert_eq!(config.max_unload_ms_per_frame, 2.5);
+        assert_eq!(config.max_cell_unloads_per_frame, 3);
+        assert_eq!(
+            app.world().resource::<RenderAssetBytesPerFrame>().max_bytes,
+            Some(16 * 1024 * 1024)
+        );
+        assert_eq!(
+            cover_alpha(&mut app),
+            Some(1.0),
+            "still black on the restore frame"
+        );
+        // The fade runs out over FADE_SECONDS and takes the cover with it.
+        for _ in 0..frames_until_faded() {
+            app.update();
+        }
+        assert_eq!(cover_alpha(&mut app), None, "the cover is gone");
+        assert!(app.world().resource::<StartupLoad>().finished);
+    }
+
+    #[test]
+    fn a_later_loss_of_ready_never_lifts_again() {
+        let mut app = startup_app(configured_pacing());
+        set_interior(&mut app, 77, true);
+        for _ in 0..frames_until_faded() + 2 {
+            app.update();
+        }
+        assert_eq!(app.world().resource::<StartupLoad>().configured, None);
+        // The world falls out of ready and comes back: the latch has happened, so nothing lifts.
+        set_interior(&mut app, 78, false);
+        app.update();
+        set_interior(&mut app, 77, true);
+        for _ in 0..3 {
+            app.update();
+        }
+        let config = app.world().resource::<EngineConfig>();
+        assert_eq!(config.max_model_spawns_per_frame, 7);
+        assert_eq!(config.max_unload_ms_per_frame, 2.5);
+        assert_eq!(config.max_cell_unloads_per_frame, 3);
+        assert_eq!(
+            app.world().resource::<RenderAssetBytesPerFrame>().max_bytes,
+            Some(16 * 1024 * 1024)
+        );
+        assert_eq!(cover_alpha(&mut app), None);
+    }
+
+    #[test]
+    fn a_capture_run_lifts_without_a_cover() {
+        // `--shots` (and `--demo-tour`): the load is faster, but nothing is drawn over the frames,
+        // because a photograph must never find a black cover up.
+        let mut app = startup_app(EngineConfig {
+            portal: crate::config::PortalOptions {
+                shots: Some("poses.json".into()),
+                ..default()
+            },
+            ..configured_pacing()
+        });
+        set_interior(&mut app, 77, false);
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<EngineConfig>()
+                .max_model_spawns_per_frame,
+            0,
+            "the lift is on"
+        );
+        assert_eq!(cover_alpha(&mut app), None, "and no cover with it");
+        set_interior(&mut app, 77, true);
+        app.update();
+        app.update();
+        let config = app.world().resource::<EngineConfig>();
+        assert_eq!(config.max_model_spawns_per_frame, 7);
+        assert_eq!(config.max_unload_ms_per_frame, 2.5);
+        assert_eq!(config.max_cell_unloads_per_frame, 3);
+        assert!(app.world().resource::<StartupLoad>().finished);
+        assert_eq!(cover_alpha(&mut app), None);
+    }
+
+    #[test]
+    fn paced_startup_keeps_the_budgets_in_force_from_the_first_frame() {
+        let mut app = startup_app(EngineConfig {
+            paced_startup: true,
+            ..configured_pacing()
+        });
+        set_interior(&mut app, 77, false);
+        app.update();
+        let config = app.world().resource::<EngineConfig>();
+        assert_eq!(config.max_model_spawns_per_frame, 7);
+        assert_eq!(config.max_unload_ms_per_frame, 2.5);
+        assert_eq!(config.max_cell_unloads_per_frame, 3);
+        assert_eq!(
+            app.world().resource::<RenderAssetBytesPerFrame>().max_bytes,
+            Some(16 * 1024 * 1024)
+        );
+        assert_eq!(cover_alpha(&mut app), None);
+        assert!(app.world().get_resource::<StartupLoad>().is_none());
+    }
+
+    #[test]
+    fn a_world_that_never_becomes_ready_gets_its_pacing_back_at_the_timeout() {
+        let mut app = startup_app(configured_pacing());
+        // Two frames from the lift to the timeout, so the lifted state is observable between them.
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+            STARTUP_LIFT_TIMEOUT_SECONDS / 2.0,
+        )));
+        set_interior(&mut app, 77, false);
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<EngineConfig>()
+                .max_model_spawns_per_frame,
+            0,
+            "still lifted before the timeout"
+        );
+        app.update();
+        let config = app.world().resource::<EngineConfig>();
+        assert_eq!(config.max_model_spawns_per_frame, 7);
+        assert_eq!(config.max_unload_ms_per_frame, 2.5);
+        assert_eq!(config.max_cell_unloads_per_frame, 3);
+        assert_eq!(
+            app.world().resource::<RenderAssetBytesPerFrame>().max_bytes,
+            Some(16 * 1024 * 1024),
+            "the timeout path restores every budget too"
+        );
+        app.update();
+        assert_eq!(
+            cover_alpha(&mut app),
+            None,
+            "and the cover still comes down"
         );
     }
 }
