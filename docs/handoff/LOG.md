@@ -3,6 +3,32 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-09 evening, Team Lead (day 2 wrap-up)
+
+Board: `local/plans/task-queue.md` (quieted today: done rows go to `task-archive.md`, parked rows in one section, one-line details).
+
+Key findings today:
+- Per-view cost owner: about 70% of each Core3d view run is the serial end-of-run encoder finish (RenderContextState::apply), shown by the A14 chrome trace (trace-1125, analysis-1131). An earlier "flush is not the owner" read was a duplicate-lap bug (review-1129).
+- The door-crossing freeze is a single command flush that despawns 158,292 terrain-LOD chunk entities, with 4 observers each (analysis-1130; Phase 1's #1909 corrected "object LOD": these are terrain LOD chunks).
+- The B1 whiterun hole was capture timing: the merged path hides LOD before its mesh draws (#1055 pattern); the data is complete (debug-1122).
+- VG2 cluster LOD spike (corrected): 1.52 s per million triangles, 16% added size, 0 failures; no comparison with object-LOD time (unmeasured).
+- Bevy 0.20 does not fix the per-view cost (analysis-1123); the comment on #199 needed no correction.
+
+Merged into portal today: the U1 fix (8403b0f5, via fa0a4638), impl-1121 view-policy skip (water preset faster), the gauge + 1117 hide-on-retire + 1116 (cd3593de), impl-1124 unpaced startup (e1b6d05f: 7.10 to 5.43 s; cover opt-in), with 1128 SSR water (flag off) finishing tonight.
+
+Measured: SSR water on portal-heavy 56.9 to 82.4 fps (render thread -5.35 ms, GPU -1.05 ms).
+
+User decisions: the portal branch is Mudcrab Plus (4ad2e960); standing yes for clearing finished folders and unused converted data (1e031624, 4936c039); vendored bevy_render parallel-finish patch (Plus only, flagged) and Vulkan-only portal builds; willing to help build cluster LOD for base if Chef wants it (#203 posted); web searches go to DeepSeek or GLM; no startup cover in dev builds.
+
+Tooling: ds_impl puts coder targets on D: (implTargetRoot), and -Resume keeps provider and tier. The portal integration worktree is at D:/Mudcrab/merge/portal-integration (87058c0c). The gate refuses overlapping timing holds (50ca9ee7). Disk recovered from C: 21 / D: 32 GB to about 100 / 47 GB.
+
+Lesson: in the shared checkout, commit with an explicit path list (fa0a4638 swept in Phase 2's staged merge).
+
+First tomorrow:
+- Portal: the SSR in-motion capture for the user's default call, then the impl-1132 window (parallel finish + Vulkan-only A/B).
+- Phase 2: the impl-1133 door-tour window and review, the C8 reflection-camera world_ready bug, the flattened LOD-chunk spawn.
+- The user: SSR default, B1 pictures, the 160 bar, the #177/#167/#154 calls.
+
 ## 2026-10-09 (wrap-up) Phase 4 Dev: where Phase 4 stands
 
 Track: phase 4. Nothing pushed, nothing running; no worktree or build folder was ever made, so
