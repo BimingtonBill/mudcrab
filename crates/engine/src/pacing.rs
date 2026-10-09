@@ -14,6 +14,7 @@
 //! * **Lag at speed** (`--auto-fly-speed`): the horizontal distance from the camera at which each
 //!   model finished loading ([`FlyLag`]). A model that completes close to the camera arrived late.
 
+pub(crate) mod startup;
 use crate::{
     app::benchmark_jump_position,
     config::EngineConfig,
@@ -104,7 +105,10 @@ struct Mark {
 /// How many consecutive frames the predicate must hold before it counts. A cell that just
 /// committed is resident while its references are still in the command buffer, so the first frame
 /// it holds can be one frame early; the second cannot.
-const READY_FRAMES_REQUIRED: u32 = 2;
+///
+/// The startup load lift ([`startup::StartupLoadPlugin`]) waits for the same two
+/// frames, so the pacing budgets come back on the frame this report latches the world ready.
+pub(crate) const READY_FRAMES_REQUIRED: u32 = 2;
 
 /// Latches "ready" once the predicate has held on [`READY_FRAMES_REQUIRED`] consecutive frames,
 /// remembering the first frame of that run.
@@ -429,6 +433,33 @@ pub fn horizontal_distance(a: Vec3, b: Vec3) -> f32 {
     Vec2::new(a.x - b.x, a.z - b.z).length()
 }
 
+/// The world-ready predicate, read from a frame's end state: the stream window around the camera,
+/// the streaming counters, and the surfaces a view can see that the render world has not confirmed
+/// drawn ([`WorldReadyInputs::is_ready`], design-1091 §4). Returns the predicate and the window's
+/// failed-cell count (which the report records next to the ready time).
+///
+/// One evaluation for both callers, so they cannot disagree about the frame the world was first
+/// ready: [`track_world_ready`] (the pacing report's latch) and the startup load lift
+/// ([`startup`]), which restores the configured pacing on that frame.
+pub(crate) fn world_ready_at_frame_end(
+    config: &EngineConfig,
+    origin: IVec2,
+    streaming: &StreamingWorld,
+    space: &ActiveSpace,
+    metrics: &StreamingMetrics,
+    camera: Vec3,
+    pending_drawn: usize,
+) -> (bool, usize) {
+    let center = window_center(config, camera, origin);
+    let (window_cells, resident, failed) =
+        streaming.window_residency(space, config.worldspace_id, center, config.stream_radius);
+    (
+        WorldReadyInputs::from_streaming(metrics, pending_drawn, window_cells, resident, failed)
+            .is_ready(),
+        failed,
+    )
+}
+
 /// Evaluates the world-ready predicate each frame, runs the benchmark jump, and keeps the tracker.
 /// Runs at the end of the streaming chain, after the planner and the readiness scans.
 #[allow(clippy::too_many_arguments)]
@@ -454,18 +485,16 @@ pub(crate) fn track_world_ready(
         return;
     };
     let started = *tracker.started.get_or_insert_with(Instant::now);
-    let center = window_center(&config, camera.translation, origin.0);
-    let (window_cells, resident, failed) =
-        streaming.window_residency(&space, config.worldspace_id, center, config.stream_radius);
-    let inputs = WorldReadyInputs::from_streaming(
+    let (ready, failed) = world_ready_at_frame_end(
+        &config,
+        origin.0,
+        &streaming,
+        &space,
         &metrics,
+        camera.translation,
         pending_drawn(&waiting),
-        window_cells,
-        resident,
-        failed,
     );
     let elapsed_millis = started.elapsed().as_secs_f64() * 1000.0;
-    let ready = inputs.is_ready();
     // Frame-time windows are for benchmark runs; an ordinary session runs unbounded.
     tracker.record_frame_windows = config.is_benchmark_run();
     tracker.window_failed_cells = failed;

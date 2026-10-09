@@ -20,6 +20,8 @@
 //! would move it) while the screen is black.
 //!
 //! There is no preload: the fade simply holds until the destination is resident and uploaded.
+//!
+//! A run's first load makes the same trade behind its own cover: [`crate::pacing::startup`].
 
 use crate::{
     doors::LoadDoor,
@@ -551,7 +553,7 @@ impl LandingAssets<'_, '_> {
 }
 
 /// Sets the per-frame render-asset upload budget, if the engine has one.
-fn set_upload_budget(
+pub(crate) fn set_upload_budget(
     budget: &mut Option<ResMut<RenderAssetBytesPerFrame>>,
     max_bytes: Option<usize>,
 ) {
@@ -560,7 +562,12 @@ fn set_upload_budget(
     }
 }
 
-fn set_alpha(overlay: &mut Query<&mut BackgroundColor, With<FadeOverlay>>, alpha: f32) {
+/// Sets the alpha of a full-screen black overlay: the crossing's [`FadeOverlay`] and the startup
+/// cover ([`crate::pacing::startup::StartupCover`]) are blacked and faded by the one rule.
+pub(crate) fn set_alpha<C: Component>(
+    overlay: &mut Query<&mut BackgroundColor, With<C>>,
+    alpha: f32,
+) {
     for mut colour in overlay.iter_mut() {
         colour.0 = Color::srgba(0.0, 0.0, 0.0, alpha.clamp(0.0, 1.0));
     }
