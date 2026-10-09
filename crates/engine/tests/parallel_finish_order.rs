@@ -28,16 +28,14 @@ const BUFFER_COUNT: usize = 7;
 #[derive(Resource)]
 struct Chain(Vec<bevy::render::render_resource::Buffer>);
 
-/// Records `chain[from] -> chain[to]` into a standalone encoder and finishes it.
-fn finished_copy(
-    device: &RenderDevice,
-    chain: &Chain,
-    from: usize,
-    to: usize,
-) -> bevy::render::render_resource::CommandBuffer {
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+/// Records `chain[from] -> chain[to]` into a standalone encoder, finishes it, and adds it to the context
+/// with `add_command_buffer`.
+fn add_finished_copy(context: &mut RenderContext, chain: &Chain, from: usize, to: usize) {
+    let mut encoder = context
+        .render_device()
+        .create_command_encoder(&CommandEncoderDescriptor::default());
     encoder.copy_buffer_to_buffer(&chain.0[from], 0, &chain.0[to], 0, 4);
-    encoder.finish()
+    context.add_command_buffer(encoder.finish());
 }
 
 /// Step 1: the context encoder, left for the deferred apply to finish (or to queue unfinished).
@@ -49,8 +47,7 @@ fn copy_0_to_1(mut context: RenderContext, chain: Res<Chain>) {
 
 /// Step 2: a command buffer finished by the system itself and added with `add_command_buffer`.
 fn copy_1_to_2(mut context: RenderContext, chain: Res<Chain>) {
-    let buffer = finished_copy(context.render_device(), &chain, 1, 2);
-    context.add_command_buffer(buffer);
+    add_finished_copy(&mut context, &chain, 1, 2);
 }
 
 /// Step 3: the context encoder again.
@@ -66,8 +63,7 @@ fn copy_3_to_4_and_4_to_5(mut context: RenderContext, chain: Res<Chain>) {
     context
         .command_encoder()
         .copy_buffer_to_buffer(&chain.0[3], 0, &chain.0[4], 0, 4);
-    let buffer = finished_copy(context.render_device(), &chain, 4, 5);
-    context.add_command_buffer(buffer);
+    add_finished_copy(&mut context, &chain, 4, 5);
 }
 
 fn gpu() -> Option<RenderResources> {
@@ -78,10 +74,7 @@ fn gpu() -> Option<RenderResources> {
             &WgpuSettings::default(),
         ))
     });
-    match created {
-        Ok(resources) => Some(resources),
-        Err(_) => None,
-    }
+    created.ok()
 }
 
 /// Runs the four systems, then the diagnostics-style `push_encoder` step 6, takes the pending list,
