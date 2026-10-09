@@ -390,8 +390,11 @@ pub struct SettleCounts {
     /// Whether the cell the shot's camera stands in is streamed in and spawned.
     pub space_resident: bool,
     /// Whether that cell's request failed and is not repeated (its landscape failed validation,
-    /// say): it will never be resident, so the view is photographed with what did load instead of
-    /// waiting out [`SETTLE_TIMEOUT_SECONDS`].
+    /// say): it will never be resident. A `--shots` pose whose own cell is failed is a terminal
+    /// failure ([`SettleStep::Failed`]): it is never photographed, because a photo of the ground
+    /// that is missing is exactly what must not sign off. The demo tour and the portal bench read
+    /// the same count through [`is_quiet`] and still treat it as quiet - nothing more is coming for
+    /// it - so a failed cell there does not hang them.
     pub space_failed: bool,
     /// Cells of any space submitted to the database but not yet resident.
     pub loading_cells: usize,
@@ -427,7 +430,9 @@ impl SettleCounts {
     /// view can see is confirmed drawn. The LOD pending counts are part of this: a chunk still on
     /// its way is work that will change the frame, so a view with one is not settled (design-1091
     /// §4). The failure counts are not: a chunk that failed for good is as settled as a cell that
-    /// failed for good, and both are reported through `describe`.
+    /// failed for good, and both are reported through `describe`. A quiet view whose own cell is
+    /// failed is still a hard failure for a `--shots` pose ([`SettleStep::Failed`]), which reads
+    /// `space_failed` ahead of this.
     pub fn is_quiet(&self) -> bool {
         (self.space_resident || self.space_failed)
             && self.loading_cells == 0
@@ -479,14 +484,28 @@ pub enum SettleStep {
     /// with this reason - no screenshot is taken, so the run cannot sign off a blank or a hole -
     /// and the run exits non-zero (design-1091 §4).
     TimedOut(String),
+    /// The cell the shot's camera stands in failed to load and is not retried: it will never be
+    /// resident, so the view would photograph missing ground. A terminal failure at once, never a
+    /// silent screenshot - no PNG is taken and the run exits non-zero. Only the shot's *own* cell
+    /// fails it: a failed neighbour is outside the pose and is still photographed (the pose draws
+    /// what is there, and the acceptance path reports the cell separately).
+    Failed(String),
 }
 
 /// The settle phase's rule (design-1091 §4): settled the moment the view is quiet for
 /// [`SETTLE_QUIET_FRAMES`], failed once [`SETTLE_TIMEOUT_SECONDS`] have passed without it, and
-/// waiting in between. A timeout is a hard failure, never a silent screenshot: the reason carries
-/// the counts so the log says what was still pending.
+/// waiting in between. The shot's own cell having failed is checked first and fails the shot at
+/// once ([`SettleStep::Failed`]): a cell that will never be resident is not worth waiting a window
+/// for, and photographing where it should be would sign off missing ground. Either failure is hard,
+/// never a silent screenshot: the reason carries the counts so the log says what was wrong.
 pub fn settle_step(shot: &Shot, counts: &SettleCounts, settled: bool, waited: f32) -> SettleStep {
-    if settled {
+    if counts.space_failed {
+        SettleStep::Failed(format!(
+            "shot \"{}\": the cell it stands in failed to load ({})",
+            shot.name,
+            counts.describe()
+        ))
+    } else if settled {
         SettleStep::Ready
     } else if waited >= SETTLE_TIMEOUT_SECONDS {
         SettleStep::TimedOut(format!(
@@ -1194,20 +1213,25 @@ fn run_shots(
                 // baseline's portal scenes) holds this shot's view instead of photographing it: the
                 // benchmark times the settled view, and its own end exits the run. Nothing is
                 // written, and the pose is re-asserted above every frame. A benchmark holds a
-                // timed-out view too - it times what the run produced, and its own run-level
-                // invariant fails the run if the view was a hole; ending the sweep on the first
-                // shot whose pose was slow to settle would stop the timing it exists for.
-                SettleStep::Ready | SettleStep::TimedOut(_) if config.is_benchmark_run() => {
+                // timed-out or failed-cell view too - it times what the run produced, and its own
+                // run-level invariant fails the run if the view was a hole; ending the sweep on the
+                // first shot whose pose was slow to settle or whose cell failed would stop the
+                // timing it exists for.
+                step @ (SettleStep::Ready | SettleStep::TimedOut(_) | SettleStep::Failed(_))
+                    if config.is_benchmark_run() =>
+                {
                     if !run.holding {
                         run.holding = true;
+                        let why = if matches!(step, SettleStep::Failed(_)) {
+                            " (the view's own cell failed)"
+                        } else if settled {
+                            ""
+                        } else {
+                            " (the view had not settled)"
+                        };
                         run.note(format!(
-                            "shot \"{}\" holding its view for the benchmark{}",
+                            "shot \"{}\" holding its view for the benchmark{why}",
                             shot.name,
-                            if settled {
-                                ""
-                            } else {
-                                " (the view had not settled)"
-                            }
                         ));
                     }
                 }
@@ -1241,6 +1265,20 @@ fn run_shots(
                     // ([`ShotsRun::fail`], the run's `AppExit::error`). The shots after it are
                     // still rendered - one bad pose should not cost the rest of a sweep - and the
                     // door this shot opened is put back first, exactly as after a shot that worked.
+                    run.fail(reason);
+                    if run.door.is_some() {
+                        run.enter(Phase::CloseDoor);
+                    } else {
+                        run.next_shot();
+                    }
+                }
+                SettleStep::Failed(reason) => {
+                    // The shot's own cell failed to load and will never be resident: a photograph
+                    // of the pose would be of missing ground, so this is a hard failure with no
+                    // PNG, the reason carries the counts, and the run exits non-zero
+                    // ([`ShotsRun::fail`]). Exactly the timeout path's shape: the shots after it
+                    // are still rendered (one bad cell should not cost the rest of a sweep), and
+                    // the door this shot opened is put back first.
                     run.fail(reason);
                     if run.door.is_some() {
                         run.enter(Phase::CloseDoor);
@@ -2005,6 +2043,72 @@ mod tests {
         };
         assert!(reason.contains("cell_resident=false"), "{reason}");
         assert!(reason.contains("loading_cells=1"), "{reason}");
+    }
+
+    /// A shot whose own cell FAILED to load must fail the run, not settle and photograph whatever
+    /// is there (review-1111, the C4 follow-up): the cell will never be resident, so the pose would
+    /// be a photo of missing ground, and the acceptance path already fails on any failed cell. The
+    /// settle fails at once, before the window, shaped like the timeout.
+    #[test]
+    fn a_shot_whose_own_cell_failed_fails_the_run_without_a_screenshot() {
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).expect("the design example parses");
+        let shot = &file.shots[0];
+        // Everything quiet except the shot's own cell, which failed for good.
+        let failed = SettleCounts {
+            space_resident: false,
+            space_failed: true,
+            quiet_frames: SETTLE_QUIET_FRAMES,
+            ..default()
+        };
+        // This is a settled, quiet view by `is_quiet` alone: the failed-cell rule is the only thing
+        // that stops it being photographed.
+        assert!(shots_settled(&failed), "the failure is what must stop it");
+
+        // A failed cell is terminal at once, not at the window: it will never arrive.
+        let step = settle_step(shot, &failed, false, 0.0);
+        let SettleStep::Failed(reason) = step else {
+            panic!("a shot whose own cell failed must fail, not settle or time out: {step:?}");
+        };
+        assert!(reason.contains("failed to load"), "{reason}");
+        assert!(reason.contains("cell_failed=true"), "{reason}");
+
+        // The run records the failure and moves on; the settle armed no capture (it never reported
+        // `Ready`), so no PNG is written for it.
+        let mut run = ShotsRun::new(file, PathBuf::from("out"));
+        run.fail(reason);
+        assert!(run.failed);
+        assert!(run.log.contains("FAILED"), "{}", run.log);
+    }
+
+    /// A failed cell *elsewhere* in the stream window is not what the shot photographs: its own
+    /// cell is resident, so the view is settled and photographed, and the neighbour does not fail
+    /// the shot. Built from a real `StreamingWorld` so `space_failed` is the engine's own answer
+    /// for the camera's key, not a restatement of it.
+    #[test]
+    fn a_failed_neighbour_cell_does_not_fail_the_shot() {
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).expect("the design example parses");
+        let shot = &file.shots[0];
+        let own = shot.space_key().expect("the shot names a space");
+        let neighbour = CellKey::Exterior {
+            worldspace_id: 0x3C,
+            grid_x: 1,
+            grid_y: 1,
+        };
+        let mut world = StreamingWorld::default();
+        world.set_resident_for_test(own, Entity::PLACEHOLDER);
+        world.set_failed_for_test(neighbour);
+        assert!(world.has_failed(&neighbour), "the neighbour really failed");
+        assert!(!world.has_failed(&own), "the shot's own cell did not");
+
+        let counts = settle_counts(Some(own), SETTLE_QUIET_FRAMES, 0, Some(&world), None);
+        assert!(
+            counts.space_resident && !counts.space_failed,
+            "{}",
+            counts.describe()
+        );
+        // The view is settled and photographed: the failed neighbour neither holds nor fails it.
+        assert!(shots_settled(&counts));
+        assert_eq!(settle_step(shot, &counts, true, 0.0), SettleStep::Ready);
     }
 
     /// The facts of a door shot whose doorway is up: every condition the sequence waits for. The
