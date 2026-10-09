@@ -6,7 +6,7 @@
 #import bevy_pbr::mesh_view_bindings::{view, globals}
 #ifdef WATER_SSR
 #import bevy_pbr::{
-    mesh_view_bindings::{view_transmission_texture, view_transmission_sampler},
+    mesh_view_bindings::{fog, view_transmission_texture, view_transmission_sampler},
     view_transformations::{ndc_to_uv, perspective_camera_near, position_ndc_to_world},
 }
 #ifdef DEPTH_PREPASS
@@ -37,10 +37,15 @@ struct WaterSettings {
 // Screen-space reflection (`--water-reflection ssr`, crates/engine/src/water_ssr.rs).
 //
 // The view's `view_transmission_texture` is, for a view that draws water, a copy of the opaque
-// colour taken after the opaque pass (rows 0..height) plus one extra row at the bottom that holds
-// the sky ramp and a sentinel (`water_ssr.rs`, `prepare_water_ssr_textures`). The march reads the
-// opaque depth prepass, so water a view draws sees that view's own depth and colour, whichever
-// view that is.
+// colour taken after the opaque pass. Two shapes of it reach this shader (`water_ssr.rs`):
+//   * the module's own: the target's size plus ONE EXTRA ROW at the bottom holding the sky ramp
+//     and a sentinel. The opaque colour is the texture without that row, so every pixel position
+//     is divided by `(width, height - 1)`, not by the texture's size, and the ramp is read with
+//     `textureLoad` at row `height - 1`;
+//   * Bevy's own, in a frame in which glass is drawn in the same view: the target's size, no
+//     ramp row, no sentinel. The opaque colour is the whole texture.
+// The march reads the opaque depth prepass, so water a view draws sees that view's own depth and
+// colour, whichever view that is.
 
 // Texels in the sky ramp; the sentinel is the texel after it. Must equal `SKY_RAMP_TEXELS`.
 const WATER_SSR_RAMP_TEXELS: u32 = 32u;
@@ -69,8 +74,8 @@ const WATER_SSR_FACING_FULL: f32 = 0.3;
 // with. A branch with another fill (a planar reflection texture) leaves this section out.
 
 // True when this view's transmission texture is the one `water_ssr.rs` made: it ends in a ramp row
-// whose texel after the ramp is the sentinel. Bevy's own transmission texture (a view with glass
-// that nothing marked) and the 1x1 fallback fail the test, and the water then has no reflection.
+// whose texel after the ramp is the sentinel. Bevy's own transmission texture (a frame with glass
+// in the view) and the 1x1 fallback fail the test.
 fn water_ssr_has_ramp(size: vec2<u32>) -> bool {
     if size.x <= WATER_SSR_RAMP_TEXELS || size.y < 2u {
         return false;
@@ -151,13 +156,14 @@ fn water_ssr_sample(ndc: vec3<f32>) -> WaterSsrSample {
 // Returns the reflected colour in rgb and how sure the hit is in a: 0 for a miss (a ray that left
 // the screen, went behind something, pointed back at the camera or ran too far; rgb is 0), up to 1
 // for a hit nothing fades. A caller blends it over whatever it fills misses with:
-// `mix(fill, reflected.rgb, reflected.a)`. `copy_size` is the size of the opaque copy texture in
-// texels; its top rows are the opaque colour of the target, pixel for pixel.
+// `mix(fill, reflected.rgb, reflected.a)`. `content_size` is the size in texels of the opaque
+// colour inside the copy texture, pixel for pixel with the target: the texture's size without any
+// extra row.
 fn water_ssr_reflect(
     world_position: vec3<f32>,
     ray_direction: vec3<f32>,
     fragment_xy: vec2<f32>,
-    copy_size: vec2<f32>,
+    content_size: vec2<f32>,
 ) -> vec4<f32> {
     var result = vec4<f32>(0.0);
 #ifdef DEPTH_PREPASS
@@ -171,7 +177,10 @@ fn water_ssr_reflect(
 
     // The ray's line in normalized device space. Where it ends is found in clip space: the clip
     // position of the start plus the clip-space direction, divided through, is a point on the
-    // same line, and a line is all the march needs.
+    // same line, and a line is all the march needs. Along that line `ndc.z` (the near distance
+    // over the depth) is affine in the screen position, so interpolating it linearly is the
+    // perspective-correct interpolation of 1 / depth: the depth compared at a sample is the depth
+    // of the point of the ray that projects there, not an average of the end depths.
     let clip_start = view.clip_from_world * vec4<f32>(world_position, 1.0);
     if clip_start.w <= 1.0e-6 {
         return result;
@@ -252,7 +261,7 @@ fn water_ssr_reflect(
     let colour = textureSampleLevel(
         view_transmission_texture,
         view_transmission_sampler,
-        hit.pixel / copy_size,
+        hit.pixel / content_size,
         0.0,
     ).rgb;
     result = vec4<f32>(colour, facing * edge_fade * length_fade * penetration_fade);
@@ -284,16 +293,26 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // copy has no reflection, as with the planar reflection switched off.
     var reflection_color = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     let copy_size = textureDimensions(view_transmission_texture);
-    if water_ssr_has_ramp(copy_size) {
+    // The 1x1 fallback is no copy at all. Anything bigger is the opaque colour: this module's
+    // (with a ramp row under it) or Bevy's own (a frame with glass in the view; no ramp row).
+    if copy_size.x > 1u && copy_size.y > 1u {
+        let has_ramp = water_ssr_has_ramp(copy_size);
+        // The opaque colour is the texture without the ramp row, so a pixel position is divided
+        // by the size of that, and the ramp row is the texture's last.
+        let content_size = vec2<f32>(f32(copy_size.x), f32(select(copy_size.y, copy_size.y - 1u, has_ramp)));
         let ray_direction = normalize(reflect(-normalize(pbr_input.V), pbr_input.N));
         let traced = water_ssr_reflect(
             in.world_position.xyz,
             ray_direction,
             in.position.xy,
-            vec2<f32>(copy_size),
+            content_size,
         );
-        // The one place a miss is filled: with the sky.
-        let miss_fill = water_ssr_sky(ray_direction, i32(copy_size.y) - 1);
+        // The one place a miss is filled: with the sky the camera's dome draws, or, where the
+        // view has no ramp (glass in the view this frame), with the view's fog colour.
+        var miss_fill = fog.base_color.rgb;
+        if has_ramp {
+            miss_fill = water_ssr_sky(ray_direction, i32(copy_size.y) - 1);
+        }
         reflection_color = vec4<f32>(mix(miss_fill, traced.rgb, traced.a), 1.0);
     }
 #else

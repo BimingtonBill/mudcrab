@@ -22,12 +22,23 @@
 //! view that draws it, and the copy is per view (a second camera, a render-to-texture view, has its
 //! own depth and colour).
 //! A view with no glass has no transmission texture of its own, so this module puts one there:
-//! [`prepare_water_ssr_textures`] replaces it with a texture one row taller than the target. The
+//! [`prepare_water_ssr_textures`] gives the view a texture one row taller than the target. The
 //! copy fills the top rows; the extra row holds the sky colours the march falls back to
-//! ([`sky_ramp`]) and a sentinel the shader checks, because a view that is not marked can still
-//! carry Bevy's own transmission texture and the shader must not read a ramp out of that.
-//! Bevy's transmissive pass copies into whatever texture the view carries, so glass keeps working
-//! (it overwrites the opaque copy with its own steps, which the water then also reflects).
+//! ([`sky_ramp`]) and a sentinel the shader checks. The shader divides by the size of the opaque
+//! colour (the texture without the ramp row), not by the texture's.
+//!
+//! # Glass in the same view
+//!
+//! Bevy samples the transmission texture over its whole UV range for a transmissive material, so a
+//! texture one row taller than the target would shift every glass lookup and could read the ramp
+//! row. The texture is therefore this module's **only in a frame in which nothing samples it for
+//! glass**: when the view has `Transmissive3d` items and `ScreenSpaceTransmission::steps > 0`
+//! (Bevy's own condition for making the texture, [`bevy_owns_the_transmission_texture`]) this
+//! module does not touch it, and glass reads exactly the texture it would read without this
+//! feature. The water in such a frame reflects Bevy's copy (the opaque scene plus the glass layers
+//! drawn before it; it is full-size and has no ramp row, which the shader sees from the sentinel)
+//! and fills its misses with the view's fog colour instead of the sky gradient. That is the
+//! whole cost to a glass-and-water view; transmissive materials, mods' included, are not changed.
 //!
 //! # What only `ssr` pays for
 //!
@@ -51,9 +62,23 @@
 //!
 //! `--water-ssr-steps` reaches the shader as shader definitions
 //! (`WATER_SSR_LINEAR_STEPS`, `WATER_SSR_BISECTION_STEPS`), not uniforms, so both loops have
-//! constant bounds. The settings are read at pipeline specialization, where the material extension
-//! has no access to the world, through one process-wide cell written when the plugin is built
-//! ([`shader_settings`]). The configuration never changes during a run.
+//! constant bounds. A material extension's `specialize` gets neither the world nor anything of the
+//! material the settings could ride on (its pipeline key is built from each material, and the
+//! constructors are called all over the engine without a world), so the settings are read there
+//! through one process-wide cell written when the plugin is built ([`shader_settings`]).
+//!
+//! **One configuration per process.** The cell assumes every `App` of the process is built from
+//! the same `EngineConfig`, which is true of a run. A second plugin build with different settings
+//! is logged as an error ([`store_shader_settings`]); the unit tests that build the plugin hold a
+//! lock and reset the cell.
+//!
+//! # The march
+//!
+//! The ray's line is marched in normalized device space. Reverse-Z with the far plane at infinity
+//! makes the NDC `z` of a point `near / depth`, which is affine along the projection of a 3D line,
+//! so interpolating it linearly along the screen line is the perspective-correct interpolation of
+//! `1 / depth` (`ndc_z_is_affine_along_the_screen_line_of_a_ray` shows it numerically); the depth
+//! the march compares is its inverse. This is the same arithmetic as Bevy's `ssr/raymarch.wgsl`.
 
 use crate::{
     config::{EngineConfig, WaterReflectionMode, WaterSsrSteps},
@@ -68,13 +93,16 @@ use bevy::{
     },
     core_pipeline::{Core3d, Core3dSystems, core_3d::main_opaque_pass_3d, prepass::DepthPrepass},
     image::ToExtents,
-    pbr::{ViewTransmissionTexture, main_transmissive_pass_3d},
+    pbr::{
+        ScreenSpaceTransmission, Transmissive3d, ViewTransmissionTexture, main_transmissive_pass_3d,
+    },
     prelude::*,
     render::{
         GpuResourceAppExt, Render, RenderApp, RenderSystems,
         camera::ExtractedCamera,
         diagnostic::RecordDiagnostics,
         extract_component::{ExtractComponent, ExtractComponentPlugin},
+        render_phase::ViewSortedRenderPhases,
         render_resource::{
             Extent3d, FilterMode, Origin3d, Sampler, SamplerDescriptor, TexelCopyBufferLayout,
             TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor, TextureDimension,
@@ -93,9 +121,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// the zenith. `shaders/water.wgsl` has the same number, `WATER_SSR_RAMP_TEXELS`.
 pub const SKY_RAMP_TEXELS: usize = 32;
 
-/// The texel after the ramp. The shader reads it first and uses the ramp only when it finds this
-/// value, so a view whose transmission texture is Bevy's own (a glass view this module did not
-/// mark) is never read as a ramp. Every component is exact in half precision.
+/// The texel after the ramp. The shader reads it first and uses the ramp row only when it finds
+/// this value; a transmission texture that is Bevy's own (a frame with glass) has no such texel at
+/// that place, bar a coincidence of four exact half-precision components, and is read as a plain
+/// copy with no ramp row. Every component is exact in half precision.
 pub const RAMP_SENTINEL: [f32; 4] = [1.0, 0.5, 0.25, 0.125];
 
 /// The ramp row's width in texels: the ramp and the sentinel.
@@ -142,14 +171,45 @@ impl WaterSsrSettings {
     }
 }
 
+/// The value of [`SHADER_SETTINGS`] before any plugin was built. No packed settings equal it.
+const SETTINGS_UNSET: u32 = u32::MAX;
+
 /// The settings the water pipeline is specialized with. A material extension's `specialize` has no
 /// world to ask, and the settings are fixed for a run, so [`WaterSsrPlugin`] writes them here when
-/// it is built.
-static SHADER_SETTINGS: AtomicU32 = AtomicU32::new(WaterSsrSettings::OFF.pack());
+/// it is built. See the module documentation for why this is a cell and for its one-configuration
+/// assumption.
+static SHADER_SETTINGS: AtomicU32 = AtomicU32::new(SETTINGS_UNSET);
 
 /// The settings the plugin was built with ([`WaterSsrSettings::OFF`] before it is).
 pub fn shader_settings() -> WaterSsrSettings {
-    WaterSsrSettings::unpack(SHADER_SETTINGS.load(Ordering::Relaxed))
+    match SHADER_SETTINGS.load(Ordering::Relaxed) {
+        SETTINGS_UNSET => WaterSsrSettings::OFF,
+        bits => WaterSsrSettings::unpack(bits),
+    }
+}
+
+/// Writes the cell, and says so when it already held other settings: two `App`s of one process
+/// built from different configurations would otherwise compile each other's water pipelines.
+fn store_shader_settings(settings: WaterSsrSettings) {
+    let previous = SHADER_SETTINGS.swap(settings.pack(), Ordering::Relaxed);
+    if previous != SETTINGS_UNSET && previous != settings.pack() {
+        bevy::log::error!(
+            "--water-reflection: the water shader settings were {:?} and are now {settings:?}; \
+             they are one value for the whole process, so water pipelines compiled before this \
+             build and after it differ",
+            WaterSsrSettings::unpack(previous)
+        );
+    }
+}
+
+/// The settings the run's `EngineConfig` asks for. A missing configuration is a bug in the order
+/// the app is built in, not a request for `planar`.
+fn configured_settings(app: &App) -> WaterSsrSettings {
+    WaterSsrSettings::from_config(app.world().get_resource::<EngineConfig>().expect(
+        "--water-reflection <planar|ssr> is read from the EngineConfig resource when \
+         WaterSsrPlugin is built; insert it before adding the plugin (a missing one would \
+         silently run the planar reflection)",
+    ))
 }
 
 /// The shader definitions `settings` gives `water.wgsl`: none under `planar`, so the shader is the
@@ -229,11 +289,8 @@ pub struct WaterSsrPlugin;
 
 impl Plugin for WaterSsrPlugin {
     fn build(&self, app: &mut App) {
-        let settings = app
-            .world()
-            .get_resource::<EngineConfig>()
-            .map_or(WaterSsrSettings::OFF, WaterSsrSettings::from_config);
-        SHADER_SETTINGS.store(settings.pack(), Ordering::Relaxed);
+        let settings = configured_settings(app);
+        store_shader_settings(settings);
         if !settings.enabled {
             return;
         }
@@ -264,7 +321,8 @@ impl Plugin for WaterSsrPlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        if !shader_settings().enabled {
+        // From the app's own configuration, not the process-wide cell another app may have written.
+        if !configured_settings(app).enabled {
             return;
         }
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
@@ -400,13 +458,33 @@ pub fn sky_ramp(palette: Option<&SkyPalette>, clear: LinearRgba) -> [Vec4; SKY_R
     })
 }
 
+/// What [`prepare_water_ssr_textures`] reads of a marked view.
+type MarkedView = (
+    Entity,
+    &'static ExtractedCamera,
+    &'static ExtractedView,
+    &'static WaterSsrView,
+    Option<&'static ScreenSpaceTransmission>,
+    Option<&'static WaterSsrCopy>,
+);
+
+/// Whether Bevy makes (and glass samples) the view's transmission texture this frame: it has
+/// `Transmissive3d` items and `ScreenSpaceTransmission::steps` above 0, which is the condition of
+/// `bevy_pbr-0.19.0/src/transmission/texture.rs`. In such a frame the texture is Bevy's and this
+/// module leaves it alone (see the module documentation, "Glass in the same view").
+pub fn bevy_owns_the_transmission_texture(steps: usize, transmissive_items: usize) -> bool {
+    steps > 0 && transmissive_items > 0
+}
+
 /// Gives every marked view the texture it copies into, and takes it back from a view that is no
 /// longer marked.
 ///
 /// Runs after Bevy's own transmission textures are prepared (`PrepareResources`), so the texture
-/// inserted here is the one the view bind group binds. The texture is [`TextureFormat::Rgba16Float`]
-/// like the HDR target it copies; a view in another format is left alone, and its water has no
-/// reflection (the shader finds no sentinel), which is also what a camera nothing marked gets.
+/// inserted here is the one the view bind group binds, except in a frame in which glass samples
+/// Bevy's ([`bevy_owns_the_transmission_texture`]): there nothing is inserted and our copy system
+/// does not run for the view. The texture is [`TextureFormat::Rgba16Float`] like the HDR target it
+/// copies; a view in another format, or one narrower than the ramp row, is left alone with an
+/// error in the log, and its water has no reflection.
 #[allow(clippy::too_many_arguments)]
 fn prepare_water_ssr_textures(
     mut commands: Commands,
@@ -414,7 +492,8 @@ fn prepare_water_ssr_textures(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     sampler: Res<WaterSsrSampler>,
-    marked: Query<(Entity, &ExtractedCamera, &ExtractedView, &WaterSsrView)>,
+    transmissive_phases: Res<ViewSortedRenderPhases<Transmissive3d>>,
+    marked: Query<MarkedView>,
     unmarked: Query<
         (Entity, &WaterSsrCopy, Option<&ViewTransmissionTexture>),
         Without<WaterSsrView>,
@@ -428,14 +507,24 @@ fn prepare_water_ssr_textures(
             view.remove::<ViewTransmissionTexture>();
         }
     }
-    for (entity, camera, view, mark) in &marked {
+    for (entity, camera, view, mark, transmission_settings, copy) in &marked {
         let Some(size) = camera.physical_target_size else {
             continue;
         };
+        let glass_items = transmissive_phases
+            .get(&view.retained_view_entity)
+            .map_or(0, |phase| phase.items.len());
+        let steps =
+            transmission_settings.map_or(ScreenSpaceTransmission::default().steps, |s| s.steps);
+        if bevy_owns_the_transmission_texture(steps, glass_items) {
+            if copy.is_some() {
+                commands.entity(entity).remove::<WaterSsrCopy>();
+            }
+            continue;
+        }
         if view.target_format != TextureFormat::Rgba16Float || size.x < RAMP_ROW_TEXELS as u32 {
-            bevy::log::warn_once!(
-                "--water-reflection ssr: a view of {}x{} in {:?} cannot carry the sky ramp, so its \
-                 water has no reflection",
+            bevy::log::error_once!(
+                "--water-reflection ssr: view {entity:?} ({}x{}, {:?}) cannot carry the sky ramp                  (it needs an Rgba16Float target at least {RAMP_ROW_TEXELS} texels wide), so its                  water has no reflection; switch to --water-reflection planar for this view",
                 size.x,
                 size.y,
                 view.target_format
@@ -578,6 +667,16 @@ fn water_ssr_copy(
 mod tests {
     use super::*;
     use bevy::app::SubApp;
+
+    /// Serialises the tests that build the plugin, which writes the process-wide settings cell, and
+    /// starts each from an unset cell. (Under nextest every test has a process of its own; under
+    /// `cargo test` they share one.)
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        SHADER_SETTINGS.store(SETTINGS_UNSET, Ordering::Relaxed);
+        guard
+    }
 
     fn ssr_config() -> EngineConfig {
         EngineConfig {
@@ -749,7 +848,8 @@ mod tests {
     // --- what the plugin installs -----------------------------------------------------------
 
     /// An app with a stand-in render sub-app that has the two schedules the plugin adds to.
-    fn app_with_render_stub(config: EngineConfig) -> App {
+    fn app_with_render_stub(config: EngineConfig) -> (App, std::sync::MutexGuard<'static, ()>) {
+        let serial = serial();
         let mut app = App::new();
         app.insert_resource(config);
         let mut render = SubApp::new();
@@ -757,7 +857,7 @@ mod tests {
         render.add_schedule(Core3d::base_schedule());
         app.insert_sub_app(RenderApp, render);
         app.add_plugins(WaterSsrPlugin);
-        app
+        (app, serial)
     }
 
     /// The identities of the systems a schedule of this world holds (a schedule nothing was added
@@ -790,7 +890,7 @@ mod tests {
 
     #[test]
     fn water_ssr_plugin_installs_nothing_under_planar() {
-        let mut app = app_with_render_stub(EngineConfig::default());
+        let (mut app, _serial) = app_with_render_stub(EngineConfig::default());
         let core3d = scheduled_systems(render_world(&mut app), Core3d);
         assert!(
             core3d.is_empty(),
@@ -810,7 +910,7 @@ mod tests {
 
     #[test]
     fn water_ssr_plugin_schedules_the_copy_and_the_texture_under_ssr() {
-        let mut app = app_with_render_stub(ssr_config());
+        let (mut app, _serial) = app_with_render_stub(ssr_config());
         let core3d = scheduled_systems(render_world(&mut app), Core3d);
         assert_eq!(core3d, [identity(water_ssr_copy)], "the copy is scheduled");
         let render = scheduled_systems(render_world(&mut app), bevy::render::Render);
@@ -821,11 +921,12 @@ mod tests {
 
     // --- marking the views that draw water --------------------------------------------------
 
-    fn marking_app(config: EngineConfig) -> App {
+    fn marking_app(config: EngineConfig) -> (App, std::sync::MutexGuard<'static, ()>) {
+        let serial = serial();
         let mut app = App::new();
         app.insert_resource(config);
         app.add_plugins(WaterSsrPlugin);
-        app
+        (app, serial)
     }
 
     /// A `Camera3d` with a depth prepass at (0, 120, 0) looking down -Z, with the frustum Bevy's
@@ -874,7 +975,7 @@ mod tests {
 
     #[test]
     fn a_camera_with_water_in_view_is_marked_and_one_without_is_not() {
-        let mut app = marking_app(ssr_config());
+        let (mut app, _serial) = marking_app(ssr_config());
         let camera = spawn_observer(&mut app, None);
         app.update();
         assert!(
@@ -897,7 +998,7 @@ mod tests {
 
     #[test]
     fn water_behind_the_camera_does_not_mark_it() {
-        let mut app = marking_app(ssr_config());
+        let (mut app, _serial) = marking_app(ssr_config());
         let camera = spawn_observer(&mut app, None);
         spawn_water(
             &mut app,
@@ -910,7 +1011,7 @@ mod tests {
 
     #[test]
     fn hidden_water_does_not_mark_the_camera() {
-        let mut app = marking_app(ssr_config());
+        let (mut app, _serial) = marking_app(ssr_config());
         let camera = spawn_observer(&mut app, None);
         let water = spawn_water(
             &mut app,
@@ -926,7 +1027,7 @@ mod tests {
 
     #[test]
     fn planar_marks_nothing_even_with_water_in_view() {
-        let mut app = marking_app(EngineConfig::default());
+        let (mut app, _serial) = marking_app(EngineConfig::default());
         let camera = spawn_observer(&mut app, None);
         spawn_water(
             &mut app,
@@ -944,7 +1045,7 @@ mod tests {
 
     #[test]
     fn the_mark_carries_the_cameras_own_sky() {
-        let mut app = marking_app(ssr_config());
+        let (mut app, _serial) = marking_app(ssr_config());
         let palette = SkyPalette {
             brightness: 0.25,
             ..SkyPalette::SKYRIM_CLEAR_DAY
@@ -968,7 +1069,7 @@ mod tests {
 
     #[test]
     fn a_camera_clearing_to_a_custom_colour_falls_back_to_it() {
-        let mut app = marking_app(ssr_config());
+        let (mut app, _serial) = marking_app(ssr_config());
         let camera = spawn_observer(&mut app, None);
         app.world_mut()
             .entity_mut(camera)
@@ -988,7 +1089,7 @@ mod tests {
     #[test]
     fn a_second_view_is_marked_by_the_water_on_its_own_layers_while_it_is_active() {
         const OTHER_LAYER: usize = 5;
-        let mut app = marking_app(ssr_config());
+        let (mut app, _serial) = marking_app(ssr_config());
         let first = spawn_observer(&mut app, None);
         let second = spawn_observer(&mut app, None);
         {
@@ -1028,7 +1129,7 @@ mod tests {
 
     #[test]
     fn a_camera_without_a_depth_prepass_is_never_marked() {
-        let mut app = marking_app(ssr_config());
+        let (mut app, _serial) = marking_app(ssr_config());
         let camera = spawn_observer(&mut app, None);
         app.world_mut().entity_mut(camera).remove::<DepthPrepass>();
         spawn_water(
@@ -1042,7 +1143,7 @@ mod tests {
 
     #[test]
     fn water_this_module_has_never_met_a_bounds_for_still_counts_as_in_view() {
-        let mut app = marking_app(ssr_config());
+        let (mut app, _serial) = marking_app(ssr_config());
         let camera = spawn_observer(&mut app, None);
         let water = spawn_water(
             &mut app,
@@ -1054,8 +1155,121 @@ mod tests {
         assert!(marked(&app, camera));
     }
 
+    // --- glass, the settings cell, the configuration ------------------------------------------
+
+    #[test]
+    fn bevy_keeps_its_transmission_texture_when_glass_is_drawn() {
+        // Bevy's condition, `bevy_pbr-0.19.0/src/transmission/texture.rs`: items, and steps > 0.
+        assert!(bevy_owns_the_transmission_texture(1, 1));
+        assert!(bevy_owns_the_transmission_texture(3, 40));
+        assert!(
+            !bevy_owns_the_transmission_texture(1, 0),
+            "no glass drawn: ours"
+        );
+        assert!(
+            !bevy_owns_the_transmission_texture(0, 5),
+            "with 0 steps glass samples no copy: ours"
+        );
+        assert!(!bevy_owns_the_transmission_texture(0, 0));
+    }
+
+    #[test]
+    fn the_settings_cell_reads_planar_until_a_plugin_is_built_and_then_what_it_stored() {
+        let _serial = serial();
+        assert_eq!(shader_settings(), WaterSsrSettings::OFF);
+        let settings = WaterSsrSettings::from_config(&EngineConfig {
+            water_reflection_mode: WaterReflectionMode::Ssr,
+            water_ssr_steps: WaterSsrSteps {
+                linear: 20,
+                bisection: 3,
+            },
+            ..default()
+        });
+        store_shader_settings(settings);
+        assert_eq!(shader_settings(), settings);
+        // A second store of the same value is not a conflict; a different one is logged and wins.
+        store_shader_settings(settings);
+        store_shader_settings(WaterSsrSettings::OFF);
+        assert_eq!(shader_settings(), WaterSsrSettings::OFF);
+    }
+
+    #[test]
+    #[should_panic(expected = "--water-reflection")]
+    fn building_the_plugin_without_a_configuration_is_an_error_not_planar() {
+        let _serial = serial();
+        let mut app = App::new();
+        app.add_plugins(WaterSsrPlugin);
+    }
+
+    #[test]
+    fn finishing_the_plugin_reads_the_apps_own_configuration() {
+        // `finish` must not look at the process-wide cell: a planar app finishing after an ssr app
+        // was built must install nothing. (It has no render sub-app here, so nothing can be
+        // installed; what is pinned is that it does not panic on the other app's settings.)
+        let (mut ssr, _serial) = marking_app(ssr_config());
+        assert!(shader_settings().enabled);
+        let mut planar = App::new();
+        planar.insert_resource(EngineConfig::default());
+        WaterSsrPlugin.finish(&mut planar);
+        WaterSsrPlugin.finish(&mut ssr);
+    }
+
+    // --- the march ------------------------------------------------------------------------------
+
+    #[test]
+    fn ndc_z_is_affine_along_the_screen_line_of_a_ray() {
+        // The shader marches `start + (end - start) * t` in NDC and reads the depth as 1 / z. For
+        // that to be perspective-correct, z (= near / depth in reverse-Z with the far plane at
+        // infinity) must be an affine function of the screen position along the ray's projected
+        // line. Check it against the true depth of the world point that projects to each sample.
+        let near = 0.1;
+        let projection = Mat4::perspective_infinite_reverse_rh(1.0, 16.0 / 9.0, near);
+        let view = Mat4::look_at_rh(
+            Vec3::new(5.0, 80.0, 20.0),
+            Vec3::new(0.0, 60.0, -400.0),
+            Vec3::Y,
+        );
+        let clip_from_world = projection * view;
+        for (origin, direction) in [
+            (Vec3::new(10.0, 40.0, -300.0), Vec3::new(0.3, 0.5, -1.0)),
+            (Vec3::new(-60.0, 40.0, -90.0), Vec3::new(0.8, 0.2, -0.4)),
+            (Vec3::new(0.0, 40.0, -50.0), Vec3::new(-0.5, 0.6, -0.1)),
+        ] {
+            let direction = direction.normalize();
+            let clip_start = clip_from_world * origin.extend(1.0);
+            let start = clip_start.truncate() / clip_start.w;
+            let clip_direction = clip_from_world * direction.extend(0.0);
+            let line_end = start.extend(1.0) + clip_direction;
+            let end = line_end.truncate() / line_end.w;
+            for t in [0.1f32, 0.37, 0.5, 0.9] {
+                let screen = start + (end - start) * t;
+                // The world point of the ray that lands on this screen x: solve
+                // (c0.x + u d.x) / (w0 + u dw) = screen.x for u.
+                let u = (screen.x * clip_start.w - clip_start.x)
+                    / (clip_direction.x - screen.x * clip_direction.w);
+                let world = origin + direction * u;
+                let true_depth = -(view * world.extend(1.0)).z;
+                let marched_depth = near / screen.z;
+                assert!(
+                    (marched_depth - true_depth).abs() <= 1.0e-3 * true_depth,
+                    "t = {t}: marched {marched_depth}, true {true_depth}"
+                );
+                // And the point really is where the screen line says it is.
+                let check = clip_from_world * world.extend(1.0);
+                assert!(((check.truncate() / check.w).y - screen.y).abs() < 1.0e-3);
+            }
+        }
+    }
+
     // --- the shader ---------------------------------------------------------------------------
 
+    /// A **stub smoke check**, not a compile of the shader Bevy runs. `water.wgsl` is composed with
+    /// `naga_oil` (0.22.0, the one version in `Cargo.lock`, which `bevy_shader` resolves to as
+    /// well) against hand-written stand-ins for the `bevy_pbr` modules it imports. It proves the
+    /// water shader's own code parses, type-checks and validates, with and without the
+    /// screen-space reflection and for any step counts. It cannot see a change in the real Bevy
+    /// modules (a moved import, a changed signature) and keeps passing after one: the real gate is
+    /// a `--water-reflection ssr` run in which the pipeline compiles and the water draws.
     mod shader {
         use naga_oil::compose::{
             ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderDefValue,
@@ -1092,7 +1306,9 @@ struct View {
     viewport: vec4<f32>,
 }
 struct Globals { time: f32, delta_time: f32, frame_count: u32 }
+struct Fog { base_color: vec4<f32> }
 @group(0) @binding(0) var<uniform> view: View;
+@group(0) @binding(13) var<uniform> fog: Fog;
 @group(0) @binding(11) var<uniform> globals: Globals;
 @group(0) @binding(24) var view_transmission_texture: texture_2d<f32>;
 @group(0) @binding(25) var view_transmission_sampler: sampler;
