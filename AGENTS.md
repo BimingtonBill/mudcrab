@@ -93,6 +93,9 @@ this duty; see "Team Lead".)
   inside one shell command or from a detached script the panel cannot see. Claude helpers go through the Agent
   tool (background). A worker already running outside the panel gets a background watcher (a Bash loop waiting on
   its PID that prints the report head when it ends).
+- **Bevy 0.20.0 is released (crates.io, confirmed 2026-10-09).** We stay on 0.19.0 (Cargo.toml) until upstream main
+  upgrades; no track upgrades Bevy on its own. When a design, bug or fix depends on Bevy internals, say whether 0.20
+  changes it. Impact note: research-1119 (Team Lead), filed under local/research/ when it lands.
 - **Timing windows: standing yes (the user, 2026-10-09).** A session with a ready timing binary may start its window
   without asking (gate timing hold with --drain, one hold at a time); tell Team Lead when it starts and ends.
 - **GPU check before merging into portal (2026-10-09).** A change touching streaming, visibility, render layers or
