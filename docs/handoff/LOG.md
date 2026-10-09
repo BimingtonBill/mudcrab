@@ -3,6 +3,31 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-09 evening Upstream Dev: #192 merged, #199 and #203 posted, integration worktree ready
+
+Track: upstream. Nothing running (no workers, no gate jobs).
+
+- **Published with the user's yes:** PR #192 (Chef: human CODEOWNERS approval required) approved and squash-merged, main 0a781368;
+  comment on Chef's issue #199 (Bevy 0.20: render-thread relevance, extra compile items, offer to prep the port once rapier pairs);
+  new issue **#203** (virtualized geometry + probe/screen-space reflections replacing Skyrim's baked LOD and reflection setup; the
+  #103 cluster-LOD note to Chef and the Solstheim terrain-chunk observation folded in). Under the standing yes (own item): #203
+  comment with the water SSR prototype numbers, portal-heavy only (56.9 -> 82.4 fps, render thread 15.6 -> 10.3 ms, GPU 2.41 -> 1.36 ms).
+- **#192 changes our PRs:** every upstream PR now needs an Approve from a CODEOWNERS human other than its last pusher; stale
+  approvals are dismissed on push; CodeRabbit is a required check; no bypass. Our #121-#128 each need Chef, Lucas, MonoPT or Haziel.
+  The user can approve others' PRs (#177).
+- **Portal integration worktree:** D:/Mudcrab/merge/portal-integration (branch portal-integration), target/ junctioned to
+  C:/Modding/Mudcrab/builds/portal-integration-target (seeded from portal-target/debug, warm: nextest --workspace --all-targets
+  --no-run 3 min 31 s). Rule in AGENTS.md 87058c0c: portal merges happen there, then one ff of the main checkout.
+- **Build gate (deployed):** tiered commit floors 5c413b1f; disk-quiet check for timing holds and per-drive disk activity in
+  `status` 3b5b182f. Coder brief template: iterate on `-p engine --lib`, full checks at handoff (a6f3fdd6). Opt-level-0 `accept`
+  profile measured and NOT adopted (rebuild 15-17 s vs 28-36 s, but engine lib tests 153 s vs 53 s): local/plans/check-profile-proposal-2026-10-09.md.
+- **Work board:** side-pane artifact fed by the local MCP server `mudcrab-board` (tools/work_board_mcp.py, user MCP config);
+  watcher and hook retired; skill rewritten (68289b0e).
+- **Waiting for the user's yes:** merge eclepso's PR #177 (approve first under #192); supporting comment on Chef's PR #167
+  (local/pr-drafts/167-comment-land-evidence.md); AI label on Hermes' 10-07 reply on #154; #203 picture sheet (needs a push to
+  the fork's pr-assets); #203 water-scene numbers once Phase 2 confirms the planar-run failures (draft, hold for the yes).
+- **Next:** the morning upstream check; when Portal Dev confirms the water scene, draft the #203 update and hold it.
+
 ## 2026-10-09 evening, Team Lead (day 2 wrap-up)
 
 Board: `local/plans/task-queue.md` (quieted today: done rows go to `task-archive.md`, parked rows in one section, one-line details).
