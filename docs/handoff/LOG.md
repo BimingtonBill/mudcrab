@@ -21,15 +21,20 @@ Track: Portal / Mudcrab Plus. Nothing pushed by this session (Upstream Dev poste
   (RenderContextState::apply) on the render thread (local/research/engine-foundations/trace-1125-render-flush-2026-10-09.md).
   analysis-1131 (Opus): no engine-only route; ~55-line bevy_render render_context.rs patch, est. 2.5-3.5 ms/frame.
   The user said YES to vendoring bevy_render 0.19.0 into portal only, and YES to Vulkan-only (separate A/B row).
-- **impl-1132 (vendor + parallel finish + --render-backends):** Claude Sonnet coder, brought to a committed state tonight
-  (see its branch portal-impl-1132-parallel-finish); not reviewed, not built for timing.
+- **impl-1132 (vendor + parallel finish + --render-backends):** branch portal-impl-1132-parallel-finish (from 87c2bd85):
+  9f6e9982 pristine vendor + [patch] + MUDCRAB-README.md, 15153aee render_context.rs patch (+3-line re-export in
+  renderer/mod.rs: the README still says "one patched file", fix it), 43023c1c engine flags + real-device order test,
+  3295ffc5 test/clippy fix. fmt + clippy pass; nextest and release NOT run (cold builds skipped at wrap-up). Worktree
+  .claude/worktrees/agent-aaf665a522c69fbac, target D:/Mudcrab/builds/impl-targets/claude-impl-1132-target. Finding:
+  setting backends=VULKAN alone does not drop VALIDATION_INDIRECT_CALL (Bevy decides it from its default list), so
+  the engine clears the flag explicitly for vulkan in release; unit-tested, needs review.
 - **impl-1125 (flush lap):** branch portal-impl-1125-flush-lap 4dfebe5f (duplicate lap fixed, nextest 1274/1274),
   NOT merged; worktree local/impl/impl-1125-portal-flush-lap-and-skip-test kept for the re-measure.
 - **B13b (probe fallback, parallax-corrected cubemaps):** approved as a later step, not started.
 - **First steps tomorrow:** (1) the SSR in-motion capture (motion_poses.json + run_motion.py ready in
   local/review/portal-water-ssr-motion-2026-10-09; run with the integration build, planar vs ssr, then ffmpeg) for the
   user's default decision; (2) Phase 2's water-planar repro x3 with stderr (script: w1128m.sh pattern; send the error!
-  lines and in_camera_view_not_drawn series); (3) review impl-1132 (two reviewers), build, window: stock vs
+  lines and in_camera_view_not_drawn series); (3) impl-1132: run nextest + release build in its worktree, review (two reviewers), window: stock vs
   --render-parallel-finish and all vs vulkan, against the 1131 go bar; then Upstream Dev drafts the Bevy PR/issue;
   (4) re-measure impl-1125 and batch it into a merge.
 
