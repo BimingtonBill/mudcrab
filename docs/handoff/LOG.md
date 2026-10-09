@@ -3,6 +3,116 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-09 Phase 1 Dev: VG1/VG2 measured, E6 bench, C6 Dirt02 terrain, LOD-chunk answer
+
+All local; nothing published. No worker running, no hold set.
+
+- **VG1 mesh census** (DeepSeek #1906): `local/research/fun/p1-vg1-mesh-census-2026-10-09.md`.
+  - 33,543 GLBs, 45.9M triangles, but 10,782 of them (15.0M triangles) are baked object-LOD meshes under `meshes/terrain/*/objects`.
+  - Source only: 22,761 GLBs, 30.9M triangles.
+  - The converter exports no skinned meshes. The "max cell" is Tamriel's persistent cell; ignore it.
+- **VG2 cluster spike** (GLM #1908, report by Claude): `local/research/fun/p1-vg2-cluster-spike-2026-10-09.md`, data in `D:/Mudcrab/scratch/p1-vg2-cluster-spike`.
+  - meshoptimizer v1.3 clusterlod.h on 75 source meshes (527k triangles): 1.52 s per million triangles single-threaded, 14.2 B per triangle (16% of GLB), 0 failures.
+  - 55% of primitives are under 128 triangles, so a size threshold is needed.
+  - meshopt 0.6.2 lacks what clusterlod needs; 0.7 (git) has it only as raw FFI.
+  - Corrected after Team Lead's review: LOD-output meshes are out of the sample, and there is no comparison with terrain LOD.
+  - Upstream Dev has the corrected numbers for its Chef note.
+- **VG-L**: `local/research/fun/p1-vgl-lod-baseline-2026-10-09.md`. The terrain chunk LOD stage takes 26 min clean / 42 min contended and writes 4,639 chunks, 8.3 GB. It is terrain LOD, not object LOD.
+- **E6 load bench**: `local/research/fun/p1-load-bench-full-2026-10-09.txt`.
+  - Collider build: JSON is 76%, hulls 4.5%. Phase 4 dropped hull precompute and the parry3d dependency from collision v3 as a result.
+  - C zstd decodes 2.6x faster than ruzstd.
+- **C6** (Dirt02 default land texture): `D:/Mudcrab/SkyrimConverted-p2main-v24-terrain-dirt02` (26.5 GB). Entry 0 is Dirt02 diffuse and normal. The white folder `SkyrimConverted-p2main-v24-terrain` stays until Phase 2 says riverwood is done; then remove it under the standing yes.
+  - Lesson: a conversion keeps its gate hold to the end. Clearing it to let builds through broke the 09-23 rule.
+- **Whiterun "hole"**: the data check (`local/research/terrain-merge/view_cone_check.py`) showed full coverage. Phase 2's debug-1122 found capture timing (LOD hidden before the merged mesh draws).
+- **LOD chunk merge question** (Muse #1909, filed by Claude): `local/research/fun/p1-lod-chunk-merge-analysis-2026-10-09.md`.
+  - The ~900 entities per chunk are terrain-LOD glTF nodes, not objects. Interior entry despawns every chunk at once (lod.rs:324-331).
+  - The engine-side fix comes first (impl-1133). A converter merge would be a proposal for Chef inside #106.
+  - When impl-1133's numbers are in, write the #106 paragraph for Upstream Dev.
+- **Portal clippy "break"**: not real. Phase 2's shared target folder was stale (memory saved).
+- **Clean-up under the standing yeses, logged in `local/disk/ledger.txt`**: impl-1900 worktree, p1-keyprobe worktree, `D:/Mudcrab/builds/p1-target` (32 GB), SkyrimConverted-p1rooms (14 GB) and the 10-08 leftover staging folder.
+- **Next tomorrow**:
+  - the #106 paragraph after impl-1133;
+  - remove the white terrain folder once Phase 2 says so;
+  - E9: watch for Chef's schema;
+  - the VG3 decision belongs to the user and Team Lead.
+
+## 2026-10-09 evening Phase 2 Dev: U1 settled, 1124 unpaced startup in portal, A14 crossing read, A16 started
+
+Track: Phase 2 (portal-based engine work). Running at hand-off: impl-1133 (DeepSeek coder, finishing build and acceptance; commit on its branch only, NOT merged) and possibly analysis-1134. No holds of mine.
+
+- **Merged into portal today (integration worktree, checks + GPU check each):** swap/in_camera_view_not_drawn gauge; impl-1117 hide-retiring-root with the flag-gated retire probe (probe fix 018a6154: read ViewVisibility in PostUpdate; the 15 "hits" were a stale read); impl-1116; impl-1124 unpaced startup load (e1b6d05f: world ready 7.10 -> 5.43 s on portal-heavy, frames after ready unchanged; cover opt-in `--startup-cover` per the user's look; `--paced-startup` restores the old path). Evidence: D:/Mudcrab/evidence/p2-unpaced-startup-2026-10-09/.
+- **A14 (crossing trace, analysis-1130):** the crossing's c+1 frame is one command flush from `lod::plan_lod_chunks` despawning ~158k entities on the main thread (4 observers each); c+2 is the asset handle drops beside render removal. Phase 1 #1909: those are terrain LOD chunks spawned as full glTF scenes (161/641/2,561 entities per chunk at tier 4/8/16). Note: local/research/engine-foundations/analysis-1130-a14-crossing-trace-2026-10-09.md. Portal Dev's portal-heavy read: Core3d ~70% in RenderContextState::apply (serial encoder finish).
+- **A16 (A4 cheaper despawn), started:** impl-1133 (paced, hidden LOD-chunk retire through the cells' budget; option B `--lod-keep-hidden-in-interiors` measured for memory and entities held; Portal Dev's change: `release_layer_source` becomes a per-entity observer, diff to Portal Dev before merge). analysis-1134 (done): world entities carry no UI components; the bevy_ui observers (and our own HierarchyPropagatePlugin::<RenderLayers>, portal.rs:3349) watch Remove<ChildOf> and fire for every despawned child, so the lever is the entity count and the ChildOf hierarchy. That makes the flattened LOD-chunk spawn (no ChildOf per mesh) the strong follow-up; note local/research/engine-foundations/analysis-1134-ui-components-on-world-entities-2026-10-09.md. Queued after 1133: spawn LOD chunks flattened (entities per chunk before/after).
+- **C8 (water runs failing, world_ready never reached, 2 invariant failures):** hypothesis is the planar reflection view sees terrain patches it never draws, so the drawn bridge times them out (swap_wait_timeouts). Portal Dev reruns planar x3 with stderr and the gauge on portal-integration 6e1b0971; the fix is mine once confirmed (count only views that draw terrain into the main image).
+- **B1 terrain-merge diff:** debug-1122 showed the whiterun-fourcorner hole was capture timing (merged path hides LOD on mesh insert, before it draws; terrain-merge lacks the drawn bridge, so the bridge must cover PendingMergedTerrain when it meets portal). 4/5 views match; riverwood-bridge undecided (4-12% run-to-run noise). **White-terrain folder** D:/Mudcrab/SkyrimConverted-p2main-v24-terrain (Phase 1's) stays until Team Lead decides on a quiet-capture riverwood re-diff on white vs dirt02 (D:/Mudcrab/SkyrimConverted-p2main-v24-terrain-dirt02).
+- **Cleanup:** removed p2-u1-check, p2-probe-fix, p2-terrain-c4check, p2-trace, p2-roomcull-check-1104 (branch p2/roomcull-check-1104 kept) and their build folders; impl-1124 and impl-1095 coder worktrees discarded (branches kept). All logged in local/disk/ledger.txt.
+- **First steps tomorrow:** (1) review impl-1133 (full diff; send the portal.rs diff to Portal Dev), then a door-tour window for its frame-cost read (A vs B vs today), then the integration merge with a portal-heavy GPU check; (2) read analysis-1134; (3) C8 from Portal Dev's rerun: brief the bridge fix; (4) brief the flattened LOD-chunk spawn; (5) B5 room culling still waits for its GPU check (portal-heavy + one interior) before the portal merge.
+
+## 2026-10-09 evening Upstream Dev: #192 merged, #199 and #203 posted, integration worktree ready
+
+Track: upstream. Nothing running (no workers, no gate jobs).
+
+- **Published with the user's yes:** PR #192 (Chef: human CODEOWNERS approval required) approved and squash-merged, main 0a781368;
+  comment on Chef's issue #199 (Bevy 0.20: render-thread relevance, extra compile items, offer to prep the port once rapier pairs);
+  new issue **#203** (virtualized geometry + probe/screen-space reflections replacing Skyrim's baked LOD and reflection setup; the
+  #103 cluster-LOD note to Chef and the Solstheim terrain-chunk observation folded in). Under the standing yes (own item): #203
+  comment with the water SSR prototype numbers, portal-heavy only (56.9 -> 82.4 fps, render thread 15.6 -> 10.3 ms, GPU 2.41 -> 1.36 ms).
+- **#192 changes our PRs:** every upstream PR now needs an Approve from a CODEOWNERS human other than its last pusher; stale
+  approvals are dismissed on push; CodeRabbit is a required check; no bypass. Our #121-#128 each need Chef, Lucas, MonoPT or Haziel.
+  The user can approve others' PRs (#177).
+- **Portal integration worktree:** D:/Mudcrab/merge/portal-integration (branch portal-integration), target/ junctioned to
+  C:/Modding/Mudcrab/builds/portal-integration-target (seeded from portal-target/debug, warm: nextest --workspace --all-targets
+  --no-run 3 min 31 s). Rule in AGENTS.md 87058c0c: portal merges happen there, then one ff of the main checkout.
+- **Build gate (deployed):** tiered commit floors 5c413b1f; disk-quiet check for timing holds and per-drive disk activity in
+  `status` 3b5b182f. Coder brief template: iterate on `-p engine --lib`, full checks at handoff (a6f3fdd6). Opt-level-0 `accept`
+  profile measured and NOT adopted (rebuild 15-17 s vs 28-36 s, but engine lib tests 153 s vs 53 s): local/plans/check-profile-proposal-2026-10-09.md.
+- **Work board:** side-pane artifact fed by the local MCP server `mudcrab-board` (tools/work_board_mcp.py, user MCP config);
+  watcher and hook retired; skill rewritten (68289b0e).
+- **Waiting for the user's yes:** merge eclepso's PR #177 (approve first under #192); supporting comment on Chef's PR #167
+  (local/pr-drafts/167-comment-land-evidence.md); AI label on Hermes' 10-07 reply on #154; #203 picture sheet (needs a push to
+  the fork's pr-assets); #203 water-scene numbers once Phase 2 confirms the planar-run failures (draft, hold for the yes).
+- **Next:** the morning upstream check; when Portal Dev confirms the water scene, draft the #203 update and hold it.
+
+## 2026-10-09 evening, Team Lead (day 2 wrap-up)
+
+Board: `local/plans/task-queue.md` (quieted today: done rows go to `task-archive.md`, parked rows in one section, one-line details).
+
+Key findings today:
+- Per-view cost owner: about 70% of each Core3d view run is the serial end-of-run encoder finish (RenderContextState::apply), shown by the A14 chrome trace (trace-1125, analysis-1131). An earlier "flush is not the owner" read was a duplicate-lap bug (review-1129).
+- The door-crossing freeze is a single command flush that despawns 158,292 terrain-LOD chunk entities, with 4 observers each (analysis-1130; Phase 1's #1909 corrected "object LOD": these are terrain LOD chunks).
+- The B1 whiterun hole was capture timing: the merged path hides LOD before its mesh draws (#1055 pattern); the data is complete (debug-1122).
+- VG2 cluster LOD spike (corrected): 1.52 s per million triangles, 16% added size, 0 failures; no comparison with object-LOD time (unmeasured).
+- Bevy 0.20 does not fix the per-view cost (analysis-1123); the comment on #199 needed no correction.
+
+Merged into portal today: the U1 fix (8403b0f5, via fa0a4638), impl-1121 view-policy skip (water preset faster), the gauge + 1117 hide-on-retire + 1116 (cd3593de), impl-1124 unpaced startup (e1b6d05f: 7.10 to 5.43 s; cover opt-in), with 1128 SSR water (flag off) finishing tonight.
+
+Measured: SSR water on portal-heavy 56.9 to 82.4 fps (render thread -5.35 ms, GPU -1.05 ms).
+
+User decisions: the portal branch is Mudcrab Plus (4ad2e960); standing yes for clearing finished folders and unused converted data (1e031624, 4936c039); vendored bevy_render parallel-finish patch (Plus only, flagged) and Vulkan-only portal builds; willing to help build cluster LOD for base if Chef wants it (#203 posted); web searches go to DeepSeek or GLM; no startup cover in dev builds.
+
+Tooling: ds_impl puts coder targets on D: (implTargetRoot), and -Resume keeps provider and tier. The portal integration worktree is at D:/Mudcrab/merge/portal-integration (87058c0c). The gate refuses overlapping timing holds (50ca9ee7). Disk recovered from C: 21 / D: 32 GB to about 100 / 47 GB.
+
+Lesson: in the shared checkout, commit with an explicit path list (fa0a4638 swept in Phase 2's staged merge).
+
+First tomorrow:
+- Portal: the SSR in-motion capture for the user's default call, then the impl-1132 window (parallel finish + Vulkan-only A/B).
+- Phase 2: the impl-1133 door-tour window and review, the C8 reflection-camera world_ready bug, the flattened LOD-chunk spawn.
+- The user: SSR default, B1 pictures, the 160 bar, the #177/#167/#154 calls.
+
+## 2026-10-09 (wrap-up) Phase 4 Dev: where Phase 4 stands
+
+Track: phase 4. Nothing pushed, nothing running; no worktree or build folder was ever made, so
+nothing to discard. All Phase 4 files are committed or in `local/` (not tracked).
+- **Collision v3 design** (`local/research/phase4/p4-binary-prebuilt-collision-design-2026-10-08.md`):
+  revised 2026-10-09 on Phase 1's full load bench (300 models: collider build 69.5 ms; JSON 76%,
+  trimesh BVH 19%, quickhull 4.5%). Binary geometry in a GLB buffer view kept; converter hull
+  precompute and the parry3d converter dependency dropped. Go/no-go still waits on Phase 2's
+  in-engine collision spans in a timing window (gate: at least 1 ms in a post-door frame).
+- **MQ103** waits on Chef's project schema (queue E9); the plan `local/plans/mq103-plan.md` is
+  revisited then. No MQ103 research done.
+- **P4-3** waits on the user.
+- Next: a Team Lead hand-out once the user decides.
+
 ## 2026-10-09 afternoon Portal Dev: impl-1121 merged, water preset now faster; U1 check window
 
 Track: Portal. Nothing pushed.
