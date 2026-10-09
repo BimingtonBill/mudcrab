@@ -93,6 +93,9 @@ this duty; see "Team Lead".)
   inside one shell command or from a detached script the panel cannot see. Claude helpers go through the Agent
   tool (background). A worker already running outside the panel gets a background watcher (a Bash loop waiting on
   its PID that prints the report head when it ends).
+- **GPU check before merging into portal (2026-10-09).** A change touching streaming, visibility, render layers or
+  settles merges into `portal` only after a portal-heavy acceptance run on the merged tree passes (world_ready reached,
+  0 invariant failures). Unit tests have no lights, cameras or shadows; the #1055 bridge passed them and broke portal.
 - **One target folder per worktree (2026-10-09).** Never point two worktrees at the same `target/` or `CARGO_TARGET_DIR`:
   cargo gives workspace crates the same hash across worktrees, so a shared target silently reuses stale artifacts and
   fails or passes builds for the wrong code. A copied seed is fine; sharing is not.
