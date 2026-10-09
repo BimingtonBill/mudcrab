@@ -127,7 +127,14 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   `phase2/<topic>` cut from `main` (a mirror of `origin/main`), assets
   `C:\Modding\Mudcrab\SkyrimConverted-p2main-v24-doors` (since 2026-10-07 evening: p2main-v24's assets plus door_links from phase1/door-links-export 723c0c39; `C:\Modding\Mudcrab\SkyrimConverted-p2main-v24`, a full conversion with main f40ca1df, schema 24, stays for now; the older pre-#142 `D:\Mudcrab\SkyrimConverted-p2main` stays until the user decides), upstream's commit style, worker tasks `<kind>-<nnn>-p2-<slug>` numbered 500-599.
 - **Portal** (parked 2026-09-28; **ACTIVE again since 2026-10-01** (the user): catch up with main and
-  build a showcase of where the project and the portals are now): the user's seamless-door feature and demos. This checkout, branch `portal`, assets
+  build a showcase of where the project and the portals are now): the user's seamless-door feature and demos.
+  **Since 2026-10-09 (the user): branch `portal` is Mudcrab Plus**, the home of optional "Plus" features kept
+  separate from Mudcrab proper: portal doors (now one Plus feature, not the whole branch), Water Plus, Flora Plus,
+  Seasons Plus, the Modern lighting extras and other modern rendering. Every Plus feature has its own on/off
+  setting and is priced against the 160 fps budget on the portal bench before it becomes a default. Upstream
+  contributions still come only from `phase1/*`/`phase2/*` branches cut from `main`. The branch, folders and
+  tools keep the name `portal` for now (renaming is cosmetic and touches about 20 scripts).
+  This checkout, branch `portal`, assets
   `C:\Modding\Mudcrab\SkyrimConverted-portal-rooms` (since 2026-10-07: full reconversion with room_graph, fresh UASTC/BC7 textures, #105 LOD; load check passed on portal-rooms 5dc5c9a2; the older `SkyrimConverted-portal-lod` is on the can-go list), `[claude]`/`[deepseek]` prefixes, worker tasks `<kind>-<nnn>-portal-<slug>` numbered 100-199 (then 600+).
   Portal schema numbers = 100_000 + main_version*100 + portal_revision (converter 102_401, world DB 100_701 at
   main 24/7); a main bump merged into portal moves the hundreds and resets the revision; never take main's raw numbers.
