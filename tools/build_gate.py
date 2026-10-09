@@ -34,9 +34,11 @@ waiting. Python 3.13, standard library only (ctypes for RAM and PID checks).
 from __future__ import annotations
 
 import argparse
+import csv
 import ctypes
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -97,6 +99,68 @@ def commit_headroom_gb() -> float:
     limit, not when physical RAM runs out, so this is the number that predicts the crash.
     """
     return memory_status().ullAvailPageFile / GB
+
+
+def disk_activity(seconds: int = 2) -> dict[str, dict[str, float]]:
+    """Per drive letter: average % idle time and MB/s over `seconds` one-second samples (Windows typeperf).
+
+    Asset streaming reads from disk, so a timing window needs a quiet disk as well as free RAM and CPU
+    (the user, 2026-10-09). Returns {} when the counters can't be read.
+    """
+    try:
+        out = subprocess.run(["typeperf", r"\PhysicalDisk(*)\% Idle Time", r"\PhysicalDisk(*)\Disk Bytes/sec",
+                              "-si", "1", "-sc", str(max(1, seconds))],
+                             capture_output=True, text=True, timeout=seconds + 15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    rows = list(csv.reader(line for line in out.splitlines() if line.startswith('"')))
+    if len(rows) < 2:
+        return {}
+    result: dict[str, dict[str, list[float]]] = {}
+    for column, name in enumerate(rows[0][1:], start=1):
+        match = re.search(r"PhysicalDisk\(([^)]*)\)\\(.+)$", name)
+        if not match or match.group(1) == "_Total":
+            continue
+        values = []
+        for row in rows[1:]:
+            try:
+                values.append(float(row[column]))
+            except (IndexError, ValueError):
+                pass
+        if not values:
+            continue
+        key = "idle" if "Idle" in match.group(2) else "mbps"
+        average = sum(values) / len(values) / (1 if key == "idle" else 1024**2)
+        for letter in re.findall(r"([A-Z]):", match.group(1)):
+            result.setdefault(letter + ":", {})[key] = min(average, 100.0) if key == "idle" else average
+    return result
+
+
+def format_disk(sample: dict[str, dict[str, float]]) -> str:
+    return ", ".join(f"{drive} {v.get('idle', 0):.0f}% idle {v.get('mbps', 0):.1f} MB/s" for drive, v in sorted(sample.items())) or "unavailable"
+
+
+def wait_for_quiet_disk(drives: list[str], idle_pct: float, quiet_seconds: int, timeout_minutes: float) -> tuple[bool, dict]:
+    """Wait until every drive in `drives` stays at >= idle_pct % idle for quiet_seconds in a row."""
+    deadline = time.monotonic() + timeout_minutes * 60
+    streak, last = 0, {}
+    while time.monotonic() < deadline:
+        last = disk_activity(1)
+        if not last:
+            return False, {}
+        if all(last.get(d, {}).get("idle", 100.0) >= idle_pct for d in drives):
+            streak += 1
+            if streak >= quiet_seconds:
+                return True, last
+        else:
+            if streak or not wait_for_quiet_disk.announced:
+                print(f"build_gate: waiting for quiet disks ({format_disk(last)})", flush=True)
+                wait_for_quiet_disk.announced = True
+            streak = 0
+    return False, last
+
+
+wait_for_quiet_disk.announced = False
 
 
 def pid_alive(pid: int) -> bool:
@@ -337,6 +401,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
     print(f"commit headroom: {commit_headroom_gb():.1f} GB, {reserved_commit_gb(config):.0f} GB reserved for running builds"
           f" (floors: warm {config['min_commit_warm_gb']}, cold {config['min_commit_cold_gb']},"
           f" conversion {config['preflight_commit_gb']} GB)")
+    print(f"disk activity (2 s): {format_disk(disk_activity(2))}")
     for drive in ("C:\\", "D:\\"):
         print(f"free disk {drive}: {shutil.disk_usage(drive).free / GB:.1f} GB (minimum {config['min_free_disk_gb']} GB for builds there)")
     for path in slot_paths(config):
@@ -348,6 +413,9 @@ def cmd_status(_args: argparse.Namespace) -> int:
     for hold in holds:
         note = " (past its END-by time: owner, clear or extend it)" if hold.get("expired") else ""
         print(f"  {hold['name']}: {hold.get('owner', '?')}, {hold.get('reason', '')}, until {hold.get('until') or '-'}{note}")
+        if hold.get("io_at_start"):
+            quiet = hold.get("io_quiet") or {}
+            print(f"    disk at start: {format_disk(hold['io_at_start'])}" + (f"; quiet wait {'ok' if quiet.get('ok') else 'TIMED OUT'}" if quiet else ""))
     pids = converter_processes()
     print(f"converter.exe running: {', '.join(pids) if pids else 'none'}")
     return 0
@@ -399,9 +467,14 @@ def cmd_hold(args: argparse.Namespace) -> int:
         if until_dt < datetime.now():
             until_dt += timedelta(days=1)
         until = until_dt.isoformat(timespec="minutes")
+    record = {"name": args.name, "owner": args.owner, "reason": args.reason, "until": until,
+              "since": datetime.now().isoformat(timespec="seconds")}
     with open(path, "w", encoding="utf-8") as handle:
-        json.dump({"name": args.name, "owner": args.owner, "reason": args.reason, "until": until,
-                   "since": datetime.now().isoformat(timespec="seconds")}, handle)
+        json.dump(record, handle)
+    # The disk load at hold start, kept in the hold record so a timing window's results can cite it.
+    record["io_at_start"] = disk_activity(2)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle)
     print(f"build_gate: hold '{args.name}' set by {args.owner}" + (f" until {until}" if until else ""))
     # A hold stops new runs only; a run that took its slot just before keeps going (2026-10-08: a cargo check
     # compiled into the first seconds of a timing window). List them, and with --drain wait until they end.
@@ -412,7 +485,7 @@ def cmd_hold(args: argparse.Namespace) -> int:
         busy = [info for path in slot_paths(config) if (info := read_json(path)) is not None]
         if not busy:
             print("build_gate: no gated runs in progress")
-            return 0
+            break
         for info in busy:
             print(f"build_gate: still running: {info['label']} ({info.get('owner', '?')}) pid {info['pid']}: "
                   f"{info['command'][:100]}")
@@ -423,6 +496,21 @@ def cmd_hold(args: argparse.Namespace) -> int:
             print("build_gate: tell their owners, or re-run with --drain to wait for them")
             return 0
         time.sleep(float(config["poll_seconds"]))
+    print(f"build_gate: disk at hold start: {format_disk(record['io_at_start'])}")
+    # A timing window also needs quiet disks: streaming reads assets, and a big grep, DB dump or copy on the
+    # same drive slows it (the user, 2026-10-09). Wait with a timeout and warn rather than block forever.
+    if args.drain and (args.quiet_disk or "timing" in args.name.lower()):
+        drives = [d.upper().rstrip(":") + ":" for d in args.disk_drives.split(",") if d.strip()]
+        quiet, sample = wait_for_quiet_disk(drives, args.disk_idle, args.disk_quiet_seconds, args.disk_minutes)
+        record["io_quiet"] = {"ok": quiet, "at": datetime.now().isoformat(timespec="seconds"), "sample": sample}
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+        if quiet:
+            print(f"build_gate: disks quiet ({format_disk(sample)})")
+        else:
+            print(f"build_gate: WARNING: disks not quiet after {args.disk_minutes:g} min ({format_disk(sample)}); "
+                  "find the reader (a worker scan, an indexer, a copy) or note it in the window's results", file=sys.stderr)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -443,6 +531,11 @@ def main(argv: list[str] | None = None) -> int:
     hold.add_argument("--until", help="END-by time HH:MM (shown; the owner still clears the hold)")
     hold.add_argument("--drain", action="store_true", help="after setting, wait until running gated jobs end")
     hold.add_argument("--drain-minutes", type=float, default=30.0, help="how long --drain waits (default 30)")
+    hold.add_argument("--quiet-disk", action="store_true", help="with --drain, also wait for quiet disks (automatic for holds named timing*)")
+    hold.add_argument("--disk-drives", default="C:,D:", help="drives that must be quiet (default C:,D:)")
+    hold.add_argument("--disk-idle", type=float, default=90.0, help="%% idle each drive needs (default 90)")
+    hold.add_argument("--disk-quiet-seconds", type=int, default=5, help="seconds in a row the drives must stay quiet (default 5)")
+    hold.add_argument("--disk-minutes", type=float, default=3.0, help="how long to wait for quiet disks before warning (default 3)")
     args = parser.parse_args(argv)
     if args.cmd == "run" and args.command and args.command[0] == "--":
         args.command = args.command[1:]
