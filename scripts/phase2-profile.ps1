@@ -28,7 +28,9 @@ param(
     [switch]$Quick,
     [switch]$SkipBuild,
     # Engine switches appended to every scene's arguments, for an A/B of one switch
-    # (e.g. -ExtraEngineArgs "--water-reflection-preset","water"); pair it with a distinct run label.
+    # (e.g. -ExtraEngineArgs "--water-reflection-preset water"); pair it with a distinct run label.
+    # Under `pwsh -File`, a value starting with "-" must use the colon form, or it is read as a
+    # parameter name: "-ExtraEngineArgs:--max-unload-ms-per-frame 0".
     [string[]]$ExtraEngineArgs = @(),
     # Import the functions below and stop, instead of running a campaign: phase2-baseline.ps1
     # dot-sources this file with -AsLibrary so both scripts invoke the engine the same way.
@@ -295,7 +297,8 @@ function Get-ScenarioArguments {
         }
     }
     # A variant run (an A/B of one engine switch) appends its switches to every scene.
-    if ($script:ExtraEngineArgs) { $arguments += $script:ExtraEngineArgs }
+    # `pwsh -File` hands a comma list over as one string, so split on commas and spaces.
+    if ($script:ExtraEngineArgs) { $arguments += @($script:ExtraEngineArgs | ForEach-Object { $_ -split '[ ,]+' } | Where-Object { $_ }) }
     return $arguments
 }
 
