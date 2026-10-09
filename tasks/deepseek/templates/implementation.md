@@ -24,6 +24,12 @@ so the first `cargo` command does not recompile Bevy from scratch. That is why y
 Your brief names acceptance commands. They are run for you after you stop, in this checkout, and
 their exit codes decide whether the task passed. Run them yourself first and fix what they report.
 
+While you iterate, build and test only what your change touches: for the engine,
+`cargo nextest run -p engine --lib` (or `--test <name>` for one integration test), through the build
+gate. Each `--all-targets` run also rebuilds every example, bench and integration test, which costs
+minutes per edit. Run the full `--workspace --all-targets` check (and doctests) once, at the end,
+before you hand over.
+
 Your own tests passing does not establish correctness - a reviewer with the same evidence checks
 your work afterwards. So write the test that would **catch you being wrong**, not the one that
 confirms what you wrote. Where the brief fixes an interface, keep it exactly: the lead's
