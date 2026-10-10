@@ -3,6 +3,15 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-11 early, Upstream Dev
+
+- Installed KTX-Software 4.4.2 (Khronos-signed) at C:\Tools\KTX-Softwarein, on the user PATH (the user's ask). Phase 1 asked
+  to `ktx validate` old- and new-order files per writer for the ktx2-mip-order PR.
+- #123: Phase 2's fix pushed under the standing yes, fast-forward 3a90e53e..763047ae on phase2/dev-console (diff read).
+  Reply to Chef drafted (local/pr-drafts/123-reply-chef-capture-gate.md), held for the user's yes and Phase 2's workspace
+  run (stopped at wrap-up, first item next session).
+- The 3 new PR bodies are complete (Phase 1's workspace checks green; door_links 2,204 rows, all resolved); waiting for the user's yes.
+
 ## 2026-10-11 Phase 1 Dev: upstream-prep checks green; ktx validate run stopped at wrap-up
 
 All local; nothing published.
