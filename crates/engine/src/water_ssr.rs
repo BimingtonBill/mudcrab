@@ -685,6 +685,14 @@ mod tests {
         }
     }
 
+    /// Named, not `EngineConfig::default()`: the Plus default is ssr.
+    fn planar_config() -> EngineConfig {
+        EngineConfig {
+            water_reflection_mode: WaterReflectionMode::Planar,
+            ..default()
+        }
+    }
+
     // --- half precision ---------------------------------------------------------------------
 
     #[test]
@@ -818,7 +826,7 @@ mod tests {
 
     #[test]
     fn planar_gives_the_shader_no_definitions() {
-        let planar = WaterSsrSettings::from_config(&EngineConfig::default());
+        let planar = WaterSsrSettings::from_config(&planar_config());
         assert!(!planar.enabled);
         assert!(
             shader_defs_for(planar).is_empty(),
@@ -890,7 +898,7 @@ mod tests {
 
     #[test]
     fn water_ssr_plugin_installs_nothing_under_planar() {
-        let (mut app, _serial) = app_with_render_stub(EngineConfig::default());
+        let (mut app, _serial) = app_with_render_stub(planar_config());
         let core3d = scheduled_systems(render_world(&mut app), Core3d);
         assert!(
             core3d.is_empty(),
@@ -1027,7 +1035,7 @@ mod tests {
 
     #[test]
     fn planar_marks_nothing_even_with_water_in_view() {
-        let (mut app, _serial) = marking_app(EngineConfig::default());
+        let (mut app, _serial) = marking_app(planar_config());
         let camera = spawn_observer(&mut app, None);
         spawn_water(
             &mut app,
@@ -1209,7 +1217,7 @@ mod tests {
         let (mut ssr, _serial) = marking_app(ssr_config());
         assert!(shader_settings().enabled);
         let mut planar = App::new();
-        planar.insert_resource(EngineConfig::default());
+        planar.insert_resource(planar_config());
         WaterSsrPlugin.finish(&mut planar);
         WaterSsrPlugin.finish(&mut ssr);
     }

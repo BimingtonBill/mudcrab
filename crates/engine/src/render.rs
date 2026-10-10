@@ -2878,9 +2878,9 @@ mod tests {
             ..default()
         });
         assert!(planar.iter().all(|active| *active), "{planar:?}");
-        // The default configuration is planar: no flag, same behaviour.
+        // The Plus default is ssr, so a run with no flag never demands the reflection camera.
         let default_run = reflection_activity_under(EngineConfig::default());
-        assert!(default_run.iter().all(|active| *active), "{default_run:?}");
+        assert_eq!(default_run, [false; 5], "{default_run:?}");
     }
 
     #[test]
