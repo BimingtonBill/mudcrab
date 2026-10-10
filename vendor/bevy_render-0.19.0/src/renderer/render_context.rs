@@ -17,12 +17,12 @@ use bevy_ecs::world::DeferredWorld;
 use bevy_log::info_span;
 use bevy_tasks::ComputeTaskPool;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use wgpu::CommandBuffer;
 
 // MUDCRAB PATCH (impl-1132, analysis-1131; see MUDCRAB-README.md at the crate root). Everything in this file
-// that mentions `Pending`, `PARALLEL_FINISH`, `finish_or_defer` or `finish_pending` is Mudcrab's; the rest is
-// stock bevy_render 0.19.0.
+// that mentions `Pending`, `PARALLEL_FINISH`, `LAST_PARALLEL_FINISH_COUNT`, `finish_or_defer`, `finish_pending` or
+// `finish_in_order` is Mudcrab's; the rest is stock bevy_render 0.19.0.
 
 /// Whether render systems hand their command encoders over unfinished, so that
 /// [`PendingCommandBuffers::take`] can finish them in parallel. Off (the default) is stock Bevy.
@@ -45,11 +45,24 @@ pub fn parallel_finish() -> bool {
     PARALLEL_FINISH.load(Ordering::Relaxed)
 }
 
+/// How many encoders the most recent [`PendingCommandBuffers::take`] (or [`RenderContextState::finish`])
+/// finished through the task pool. 0 when it finished serially: the switch off, fewer than two encoders, or
+/// no compute task pool. A cheap proof that the parallel path ran; it is not a metric.
+static LAST_PARALLEL_FINISH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// The number of encoders the last submission list finished in parallel (see [`set_parallel_finish`]).
+pub fn last_parallel_finish_count() -> usize {
+    LAST_PARALLEL_FINISH_COUNT.load(Ordering::Relaxed)
+}
+
 /// One entry of the ordered submission list: an already finished command buffer, or an encoder whose
 /// `finish()` is still to be done (only queued unfinished while [`parallel_finish`] is on).
-enum Pending {
-    Buffer(CommandBuffer),
-    Encoder(CommandEncoder),
+///
+/// Generic only so the ordering logic ([`finish_in_order`]) can be tested without a GPU device.
+#[doc(hidden)]
+pub enum Pending<B = CommandBuffer, E = CommandEncoder> {
+    Buffer(B),
+    Encoder(E),
 }
 
 /// Queues `encoder` unfinished when parallel finishing is on, finished (the stock behaviour) otherwise.
@@ -65,21 +78,35 @@ fn finish_or_defer(encoder: CommandEncoder) -> Pending {
 /// on the compute task pool when parallel finishing is on, there are at least two, and the pool exists;
 /// otherwise one after another, in order.
 fn finish_pending(pending: Vec<Pending>) -> Vec<CommandBuffer> {
+    finish_in_order(pending, parallel_finish(), |encoder| encoder.finish())
+}
+
+/// The ordering logic of [`finish_pending`], over any buffer and encoder types: returns one buffer per
+/// entry, in the order of `pending`. With `use_pool` true, at least two encoders and a compute task pool,
+/// the encoders are finished concurrently on the pool; the results go back into their own places.
+#[doc(hidden)]
+pub fn finish_in_order<B, E, F>(pending: Vec<Pending<B, E>>, use_pool: bool, finish: F) -> Vec<B>
+where
+    B: Send + 'static,
+    E: Send,
+    F: Fn(E) -> B + Sync,
+{
     let encoder_count = pending
         .iter()
         .filter(|entry| matches!(entry, Pending::Encoder(_)))
         .count();
-    let pool = if encoder_count >= 2 && parallel_finish() {
+    let pool = if use_pool && encoder_count >= 2 {
         ComputeTaskPool::try_get()
     } else {
         None
     };
     let Some(pool) = pool else {
+        LAST_PARALLEL_FINISH_COUNT.store(0, Ordering::Relaxed);
         return pending
             .into_iter()
             .map(|entry| match entry {
                 Pending::Buffer(buffer) => buffer,
-                Pending::Encoder(encoder) => encoder.finish(),
+                Pending::Encoder(encoder) => finish(encoder),
             })
             .collect();
     };
@@ -87,35 +114,33 @@ fn finish_pending(pending: Vec<Pending>) -> Vec<CommandBuffer> {
     #[cfg(feature = "trace")]
     let _span = info_span!("finish_pending_parallel", encoders = encoder_count).entered();
 
-    // `None` marks the place of an encoder. `scope` returns its results in spawn order, which is the order
-    // the encoders were taken out of `pending`, so each result goes back into its own place.
-    let mut slots = Vec::with_capacity(pending.len());
+    // `None` marks the place of an encoder; each task returns its place with its buffer.
+    let mut slots: Vec<Option<B>> = Vec::with_capacity(pending.len());
     let mut encoders = Vec::with_capacity(encoder_count);
-    for entry in pending {
+    for (index, entry) in pending.into_iter().enumerate() {
         match entry {
             Pending::Buffer(buffer) => slots.push(Some(buffer)),
             Pending::Encoder(encoder) => {
                 slots.push(None);
-                encoders.push(encoder);
+                encoders.push((index, encoder));
             }
         }
     }
+    let finish = &finish;
     let finished = pool.scope(|scope| {
-        for encoder in encoders {
-            scope.spawn(async move { encoder.finish() });
+        for (index, encoder) in encoders {
+            scope.spawn(async move { (index, finish(encoder)) });
         }
     });
-    let mut finished = finished.into_iter();
-    slots
-        .into_iter()
-        .map(|slot| {
-            slot.unwrap_or_else(|| {
-                finished
-                    .next()
-                    .expect("one finished buffer per queued encoder")
-            })
-        })
-        .collect()
+    for (index, buffer) in finished {
+        slots[index] = Some(buffer);
+    }
+    debug_assert!(
+        slots.iter().all(Option::is_some),
+        "every queued encoder must come back finished"
+    );
+    LAST_PARALLEL_FINISH_COUNT.store(encoder_count, Ordering::Relaxed);
+    slots.into_iter().flatten().collect()
 }
 
 #[derive(Default)]

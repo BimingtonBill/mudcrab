@@ -33,12 +33,17 @@ and `trace-1125-render-flush-2026-10-09.md`.
 
 - Commit 1 (this folder as first added): the pristine published crate plus this README. Everything else is
   byte-identical to the registry copy (`.cargo-ok`, a cargo bookkeeping marker, is not copied).
-- Commit 2: `src/renderer/render_context.rs` only (an ordered list of finished buffers and unfinished encoders,
-  and a public `set_parallel_finish(bool)` switch, off by default).
+- The patch touches exactly two files:
+  - `src/renderer/render_context.rs`: an ordered list of finished buffers and unfinished encoders in
+    `PendingCommandBuffers` and `RenderContextState`, the public `set_parallel_finish(bool)` / `parallel_finish()`
+    switch (off by default), `last_parallel_finish_count()` (how many encoders the last take finished through the
+    pool; a proof that the parallel path ran), and the doc-hidden `finish_in_order` / `Pending` pair that holds the
+    ordering logic generically so it can be tested without a GPU device.
+  - `src/renderer/mod.rs`: a 3-line change to the existing `pub use render_context::{...}`, re-exporting those items.
 
 To verify the rest is untouched:
-`diff -r <cargo registry>/bevy_render-0.19.0 vendor/bevy_render-0.19.0` lists only this README, the patched file
-and the missing `.cargo-ok`.
+`diff -r <cargo registry>/bevy_render-0.19.0 vendor/bevy_render-0.19.0` lists only this README, the two patched
+files above and the missing `.cargo-ok`.
 
 ## How to drop it
 
@@ -49,4 +54,4 @@ engine's `--render-parallel-finish` flag and its call to `set_parallel_finish` m
 ## Plan
 
 Offer the change to Bevy upstream through Upstream Dev (with the user's yes), so this fork has a planned end.
-On a Bevy bump: 0.19.1 should apply as is; 0.20 conflicts (WgpuWrapper removal) and needs a rebase of the one file.
+On a Bevy bump: 0.19.1 should apply as is; 0.20 conflicts (WgpuWrapper removal) and needs a rebase of the two files.
