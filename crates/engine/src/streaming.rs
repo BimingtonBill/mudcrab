@@ -834,6 +834,23 @@ pub struct StreamingMetrics {
     pub retiring_cells: usize,
     pub peak_retiring_cells: usize,
     pub revived_cells: u64,
+    /// LOD chunks waiting for their turn in the same unload budget ([`despawn_cells`]) and the
+    /// ones it has despawned ([`Self::unloaded_lod_chunks`]). A whole exterior's distant terrain
+    /// retires at once on a move into an interior, so this is the counter a door crossing moves.
+    pub retiring_lod_chunks: usize,
+    pub peak_retiring_lod_chunks: usize,
+    pub unloaded_lod_chunks: u64,
+    pub revived_lod_chunks: u64,
+    /// Chunks kept hidden for the return to their exterior instead of retiring
+    /// (`--lod-keep-hidden-in-interiors`): memory the flag holds, priced by its measurement.
+    pub held_lod_chunks: usize,
+    /// Entities the LOD chunk unloads removed, kept apart from [`Self::despawned_entities`] so
+    /// the cell numbers stay comparable with the runs before the chunks were paced.
+    pub despawned_lod_entities: u64,
+    /// LOD chunks the unload pacer despawned this frame, beside [`Self::despawns_this_frame`]'s
+    /// cells: the two together are the roots the frame's budget spent itself on.
+    pub lod_despawns_this_frame: usize,
+    pub max_lod_despawns_per_frame: usize,
     pub retire_backlog_overflows: u64,
     /// Frames the retire backlog sat above its bound but stayed paced: a flight's backlog
     /// draining at the budget, one drain frame at a time, instead of un-bounding. Kept apart from
@@ -1023,13 +1040,17 @@ enum CellStatus {
     },
 }
 
-/// A cell root whose visibility the unload pacer hid when the cell retired ([`CellStatus::Retiring`]),
-/// carrying the visibility to give back when the cell revives.
+/// A root whose visibility the plan hid when it stopped wanting it - a cell retiring
+/// ([`CellStatus::Retiring`]) or a LOD chunk that retired or was held
+/// ([`lod::LodChunkStatus::Retiring`], [`lod::LodChunkStatus::Held`]) - carrying the visibility to
+/// give back when the root is wanted again.
 ///
 /// It exists so the hide is undone exactly - and only that hide. A root something else already hid,
 /// from [`crate::portal::isolate_cells`]'s role of a cell outside the active space to a cell an
 /// unpaced unload would have taken the same frame, carries no such marker and is left alone, its own
-/// restore untouched. Set in [`plan_cells`], read and removed there on the revive.
+/// restore untouched. Set in [`plan_cells`] and in the LOD plan
+/// ([`lod::plan_lod_chunks`] through [`hide_retiring_root`]), read and removed on the revive in
+/// each.
 #[derive(Component, Debug, Clone, Copy)]
 struct RetireHidden(Visibility);
 
@@ -1662,10 +1683,11 @@ fn paces_its_unload(key: CellKey, active: &ActiveCell) -> bool {
     }
 }
 
-/// Hides the root of a cell that has just fallen out of the keep-set by distance, so the cell stops
-/// being drawn the frame it retires instead of every frame until the unload budget reaches it
-/// ([`CellStatus::Retiring`]). The visibility the root had is kept in [`RetireHidden`] for the
-/// revive to give back.
+/// Hides the root of a cell - or a LOD chunk, which retires and is held the same way - that has
+/// just fallen out of the keep-set, so it stops being drawn the frame it leaves instead of every
+/// frame until the unload budget reaches it ([`CellStatus::Retiring`],
+/// [`lod::LodChunkStatus::Retiring`]). The visibility the root had is kept in [`RetireHidden`] for
+/// the revive to give back.
 ///
 /// A root that is already hidden is left alone, marker and all: the portal isolation hides a cell
 /// outside the active space the same frame a distance unload retires it, and that hide is the
@@ -1727,31 +1749,36 @@ fn cell_order_key(key: CellKey) -> (u32, i32, i32, u32) {
     }
 }
 
-/// Unloads retiring cells under the frame's unload budget.
+/// Unloads retiring cell roots and LOD chunks under the frame's one unload budget.
 ///
-/// The budget is wall-clock time (`EngineConfig::max_unload_ms_per_frame`): cells go in
-/// [`cell_order_key`] order until the clock is spent, always at least one of them, so a backlog
-/// bigger than the budget drains over several frames instead of landing on one - fast flight
-/// away from the camera retires a whole ring of cells at once, far past what a per-frame cell
-/// count can pace.
+/// The budget is wall-clock time (`EngineConfig::max_unload_ms_per_frame`): roots go in stable
+/// order until the clock is spent, always at least one of them, so a backlog bigger than the
+/// budget drains over several frames instead of landing on one - fast flight away from the camera
+/// retires a whole ring of cells at once, and a move into an interior retires a whole exterior's
+/// distant terrain at once, both far past what a per-frame count can pace. Cells go first, in
+/// [`cell_order_key`] order, then LOD chunks in [`lod::LodStreaming::retiring_chunks`]'s order
+/// ([`ChunkKey`]'s own), all off the same clock: one budget, not two.
 ///
-/// Scope: this paces distance retires only - the far cells of the worldspace the camera stands
-/// in that flying away leaves behind. A door crossing's unload of the space the camera left
-/// happens in [`plan_cells`] in the frame it falls out (`paces_its_unload` is false for it) and
-/// is not paced here; nothing in this budget claims to fix a crossing's unload stall.
+/// Scope: this paces the *distance* retires of the space the camera stands in, and the LOD chunk
+/// unload - including the whole exterior ring when the camera walks through a door into an
+/// interior. A door crossing's unload of the *cells* of the space the camera left happens in
+/// [`plan_cells`] in the frame it falls out (`paces_its_unload` is false for it) and is not paced
+/// here.
 ///
-/// Replay stability: the order the cells unload in is [`cell_order_key`]'s, the same across
-/// runs; which frame each cell unloads on depends on machine speed, because the budget is
-/// wall-clock.
+/// Replay stability: the order the roots unload in is stable across runs; which frame each one
+/// unloads on depends on machine speed, because the budget is wall-clock.
 ///
-/// `0` turns the clock off and paces by the old cell count (`max_cell_unloads_per_frame`); only
-/// that count at `0` as well is exactly the old unbudgeted path, since the escape below - which
-/// trips on drain failure, not on size - came with the budget.
+/// `0` turns the clock off and paces by the old count (`max_cell_unloads_per_frame`, now counting
+/// cells and chunk roots together); only that count at `0` as well is exactly the old unbudgeted
+/// path, since the escape below - which trips on drain failure, not on size - came with the
+/// budget.
 ///
-/// Whatever paces it, the drain keeps one escape: a backlog above [`retire_backlog_bound`] that
-/// also failed to shrink against the last frame's says the pacer is losing - flight retiring
-/// cells faster than it drains - and un-bounds for that frame. A burst that shrinks every drain
-/// frame never trips it.
+/// Whatever paces it, the drain keeps one escape: a *cell* backlog above
+/// [`retire_backlog_bound`] that also failed to shrink against the last frame's says the pacer is
+/// losing - flight retiring cells faster than it drains - and un-bounds for that frame. A burst
+/// that shrinks every drain frame never trips it. The escape counts cells only: a chunk backlog is
+/// what the chunk grid holds and shrinks by at least one root a frame, so sustained flight is not
+/// what grows it.
 ///
 /// This is an exclusive system on purpose: a command-buffered `despawn` only queues the removal and
 /// the real work happens later at a schedule sync point, where no span can see it - and the whole
@@ -1760,7 +1787,7 @@ fn despawn_cells(world: &mut World) {
     let (count_budget, spent_by, backlog_bound) = {
         let config = world.resource::<EngineConfig>();
         (
-            // The count path's `0` is unbudgeted: every retiring cell unloads at once, as before
+            // The count path's `0` is unbudgeted: every retiring root unloads at once, as before
             // the budget. It paces the drain only while the time budget is off.
             match config.max_cell_unloads_per_frame {
                 0 => usize::MAX,
@@ -1780,111 +1807,172 @@ fn despawn_cells(world: &mut World) {
             _ => None,
         })
         .collect();
-    if retiring.is_empty() {
+    let retiring_chunks = world.resource::<lod::LodStreaming>().retiring_chunks();
+    if retiring.is_empty() && retiring_chunks.is_empty() {
         world.resource_mut::<StreamingWorld>().last_retire_backlog = 0;
-        world.resource_mut::<StreamingMetrics>().despawns_this_frame = 0;
-        world
-            .resource_mut::<ProfilingState>()
-            .set_gauge("streaming/despawns_this_frame", 0.0);
+        let mut metrics = world.resource_mut::<StreamingMetrics>();
+        metrics.despawns_this_frame = 0;
+        metrics.lod_despawns_this_frame = 0;
+        let mut profiler = world.resource_mut::<ProfilingState>();
+        profiler.set_gauge("streaming/despawns_this_frame", 0.0);
+        profiler.set_gauge("streaming/lod_despawns_this_frame", 0.0);
         return;
     }
     retiring.sort_by_key(|(key, _)| cell_order_key(*key));
-    let backlog = retiring.len();
+    let cell_backlog = retiring.len();
+    let chunk_backlog = retiring_chunks.len();
     // The escape trips on drain failure, not on size: a flight's burst sits above the bound the
     // frame it lands and shrinks from then on, while a pacer losing the race leaves the backlog no
     // smaller than the last frame left it. A first-ever backlog has no last frame to fail against
     // (`last_retire_backlog` is zero), so it drains paced too.
     let last_backlog = world.resource::<StreamingWorld>().last_retire_backlog;
-    let overflow = backlog > backlog_bound && last_backlog > 0 && backlog >= last_backlog;
+    let overflow = cell_backlog > backlog_bound && last_backlog > 0 && cell_backlog >= last_backlog;
     let started = Instant::now();
-    let mut entities = 0usize;
-    let budget = match spent_by {
+    let mut cell_entities = 0usize;
+    let mut chunk_entities = 0usize;
+    let mut cells = 0usize;
+    let mut chunks = 0usize;
+    match spent_by {
         // The time budget: walk the stable order and read the clock after each subtree. A subtree
-        // that has started always finishes, and at least one cell always goes, so the backlog
-        // always drains.
+        // that has started always finishes, and at least one root always goes, so the backlog
+        // always drains. Cells and chunks share the one clock - the chunks only see what the
+        // cells left of it.
         Some(spent) if !overflow => {
-            let mut budget = 0usize;
             for (_, root) in retiring.iter() {
-                entities = entities.saturating_add(despawn_subtree(world, *root));
-                budget += 1;
+                cell_entities = cell_entities.saturating_add(despawn_subtree(world, *root));
+                cells += 1;
                 if started.elapsed() >= spent {
                     break;
                 }
             }
-            budget
+            if cells == cell_backlog {
+                for (_, root) in retiring_chunks.iter() {
+                    chunk_entities = chunk_entities.saturating_add(despawn_subtree(world, *root));
+                    chunks += 1;
+                    if started.elapsed() >= spent {
+                        break;
+                    }
+                }
+            }
         }
-        // The count budget, or the escape: a fixed prefix, the escape taking the whole backlog.
+        // The count budget, or the escape: a fixed prefix of cells-then-chunks, the escape taking
+        // the whole cell backlog.
         _ => {
             let budget = if overflow {
-                backlog
+                cell_backlog
             } else {
-                count_budget.min(backlog)
+                count_budget.min(cell_backlog + chunk_backlog)
             };
-            for (_, root) in retiring.iter().take(budget) {
-                entities = entities.saturating_add(despawn_subtree(world, *root));
+            cells = budget.min(cell_backlog);
+            chunks = budget - cells;
+            for (_, root) in retiring.iter().take(cells) {
+                cell_entities = cell_entities.saturating_add(despawn_subtree(world, *root));
             }
-            budget
+            for (_, root) in retiring_chunks.iter().take(chunks) {
+                chunk_entities = chunk_entities.saturating_add(despawn_subtree(world, *root));
+            }
         }
-    };
-    let remaining = backlog - budget;
-    if budget > 0 {
+    }
+    let remaining = cell_backlog - cells;
+    let remaining_chunks = chunk_backlog - chunks;
+    if cells > 0 {
         world.resource_mut::<lod::LodStreaming>().visibility_dirty = true;
     }
     {
         let mut streaming = world.resource_mut::<StreamingWorld>();
         // The next frame compares against this frame's backlog - not the remainder, or a drain of
         // one cell a frame would read as "no shrink" - cleared when the drain emptied it, so a
-        // fresh burst after a finished drain never reads as sustained growth.
-        streaming.last_retire_backlog = if remaining == 0 { 0 } else { backlog };
-        for (key, _) in retiring.iter().take(budget) {
+        // fresh burst after a finished drain never reads as sustained growth. Cells only: the
+        // escape it feeds is the cells' ([`retire_backlog_bound`]).
+        streaming.last_retire_backlog = if remaining == 0 { 0 } else { cell_backlog };
+        for (key, _) in retiring.iter().take(cells) {
             streaming.cells.remove(key);
         }
     }
-    for (key, _) in retiring.iter().take(budget) {
+    {
+        let mut lod = world.resource_mut::<lod::LodStreaming>();
+        for (key, _) in retiring_chunks.iter().take(chunks) {
+            lod.chunk_despawned(*key);
+        }
+    }
+    for (key, _) in retiring.iter().take(cells) {
         world.resource_mut::<TerrainContinuity>().edges.remove(key);
         world
             .resource_mut::<ProfilingState>()
             .event(format!("{key:?}"), "unloaded", None);
     }
-    let cells = budget as u64;
+    for (key, _) in retiring_chunks.iter().take(chunks) {
+        world
+            .resource_mut::<ProfilingState>()
+            .event(format!("{key:?}"), "unloaded", None);
+    }
     let max_despawns_per_frame = {
         let mut metrics = world.resource_mut::<StreamingMetrics>();
         metrics.retiring_cells = remaining;
-        metrics.peak_retiring_cells = metrics.peak_retiring_cells.max(backlog);
-        metrics.unloaded_cells = metrics.unloaded_cells.saturating_add(cells);
-        metrics.despawns_this_frame = cells;
-        metrics.despawned_entities = metrics.despawned_entities.saturating_add(entities as u64);
-        metrics.max_despawns_per_frame = metrics.max_despawns_per_frame.max(cells);
+        metrics.peak_retiring_cells = metrics.peak_retiring_cells.max(cell_backlog);
+        metrics.unloaded_cells = metrics.unloaded_cells.saturating_add(cells as u64);
+        metrics.despawns_this_frame = cells as u64;
+        metrics.despawned_entities = metrics
+            .despawned_entities
+            .saturating_add(cell_entities as u64);
+        metrics.max_despawns_per_frame = metrics.max_despawns_per_frame.max(cells as u64);
+        metrics.retiring_lod_chunks = remaining_chunks;
+        metrics.peak_retiring_lod_chunks = metrics.peak_retiring_lod_chunks.max(chunk_backlog);
+        metrics.unloaded_lod_chunks = metrics.unloaded_lod_chunks.saturating_add(chunks as u64);
+        metrics.lod_despawns_this_frame = chunks;
+        metrics.despawned_lod_entities = metrics
+            .despawned_lod_entities
+            .saturating_add(chunk_entities as u64);
+        metrics.max_lod_despawns_per_frame = metrics.max_lod_despawns_per_frame.max(chunks);
         if overflow {
             metrics.retire_backlog_overflows = metrics.retire_backlog_overflows.saturating_add(1);
-        } else if backlog > backlog_bound {
+        } else if cell_backlog > backlog_bound {
             // A drain frame: the backlog sat above the bound and the pacer kept pacing it, a
             // flight's backlog going out one budgeted frame at a time.
             metrics.retire_backlog_drains = metrics.retire_backlog_drains.saturating_add(1);
         }
-        metrics.max_despawns_per_frame
+        (
+            metrics.max_despawns_per_frame,
+            metrics.max_lod_despawns_per_frame,
+        )
     };
     let mut profiler = world.resource_mut::<ProfilingState>();
     profiler.record_elapsed("streaming/cell_despawn", started);
-    profiler.increment("streaming/despawned_cells", cells);
-    profiler.increment("streaming/despawned_entities", entities as u64);
+    profiler.increment("streaming/despawned_cells", cells as u64);
+    profiler.increment("streaming/despawned_entities", cell_entities as u64);
+    profiler.increment("streaming/despawned_lod_chunks", chunks as u64);
+    profiler.increment("streaming/despawned_lod_entities", chunk_entities as u64);
     profiler.set_gauge("streaming/despawns_this_frame", cells as f64);
+    profiler.set_gauge("streaming/lod_despawns_this_frame", chunks as f64);
     profiler.set_gauge(
         "streaming/max_despawns_per_frame",
-        max_despawns_per_frame as f64,
+        max_despawns_per_frame.0 as f64,
+    );
+    profiler.set_gauge(
+        "streaming/max_lod_despawns_per_frame",
+        max_despawns_per_frame.1 as f64,
     );
     profiler.set_gauge("streaming/retiring_cells", remaining as f64);
+    profiler.set_gauge("streaming/retiring_lod_chunks", remaining_chunks as f64);
     if overflow {
         profiler.increment("streaming/retire_backlog_overflows", 1);
-        profiler.event("streaming", "retire_backlog_overflow", Some(backlog as f64));
+        profiler.event(
+            "streaming",
+            "retire_backlog_overflow",
+            Some(cell_backlog as f64),
+        );
         warn!(
-            backlog,
+            backlog = cell_backlog,
             bound = backlog_bound,
             "retire backlog outgrew the drain; unloading every retiring cell at once"
         );
-    } else if backlog > backlog_bound {
+    } else if cell_backlog > backlog_bound {
         profiler.increment("streaming/retire_backlog_drains", 1);
-        profiler.event("streaming", "retire_backlog_drain", Some(backlog as f64));
+        profiler.event(
+            "streaming",
+            "retire_backlog_drain",
+            Some(cell_backlog as f64),
+        );
     }
 }
 
@@ -2012,22 +2100,25 @@ fn install_retire_visibility_probe(app: &mut App, dir: Option<PathBuf>) {
         );
 }
 
-/// `--probe-retire-visibility`: on each frame after the drain, counts the cells still retiring
-/// (hidden, waiting for the budget) that show in a view, photographs the first backlog frames,
-/// and once the backlog has drained writes `retire-visibility.json` and exits - non-zero on any
-/// hit, or when no backlog ever appeared, since a run that retired nothing proved nothing.
+/// `--probe-retire-visibility`: on each frame after the drain, counts the roots still retiring
+/// (cells and LOD chunks - hidden, waiting for the budget) that show in a view, photographs the
+/// first backlog frames, and once the backlog has drained writes `retire-visibility.json` and
+/// exits - non-zero on any hit, or when no backlog ever appeared, since a run that retired
+/// nothing proved nothing.
 ///
 /// "Shows" is [`ViewVisibility::get`] on a retiring root or on a descendant that carries a
 /// [`Mesh3d`], the same signal the renderer culls on: a cell retired by distance is
-/// [`crate::portal`]'s [`CellRole::Hidden`] the frame it retires, so a root that kept a layer or
-/// its visibility for the drain would read true here, which is the failure this probe exists to
-/// catch. Measurement only: it rewrites no cell that is retiring.
+/// [`crate::portal`]'s [`CellRole::Hidden`] the frame it retires, and a chunk root is given
+/// [`Visibility::Hidden`] by its own retire, so a root that kept a layer or its visibility for
+/// the drain would read true here, which is the failure this probe exists to catch. Measurement
+/// only: it rewrites no root that is retiring.
 ///
 /// [`CellRole::Hidden`]: crate::portal::CellRole
 #[allow(clippy::too_many_arguments)]
 fn probe_retire_visibility(
     mut commands: Commands,
     streaming: Res<StreamingWorld>,
+    lod: Option<Res<lod::LodStreaming>>,
     metrics: Res<StreamingMetrics>,
     mut probe: ResMut<RetireVisibilityProbe>,
     views: Query<&ViewVisibility>,
@@ -2043,7 +2134,7 @@ fn probe_retire_visibility(
     probe.frame += 1;
     let frame = probe.frame;
 
-    let roots: Vec<Entity> = streaming
+    let mut roots: Vec<Entity> = streaming
         .cells
         .values()
         .filter_map(|status| match status {
@@ -2051,9 +2142,19 @@ fn probe_retire_visibility(
             _ => None,
         })
         .collect();
+    // The retiring LOD chunk roots are probed the same way: they are hidden the frame they retire
+    // and drained by the same budget, so the same question - does one show while it drains - has
+    // the same answer to check. `Option` because the probe's own test apps carry no LOD plan.
+    roots.extend(
+        lod.as_deref()
+            .into_iter()
+            .flat_map(|lod| lod.retiring_chunks())
+            .map(|(_, root)| root),
+    );
     // The backlog the drain held this frame: the surviving retirees plus the ones this frame's
     // budget unloaded, which is the count `despawn_cells` paced against.
-    let backlog = roots.len() + metrics.despawns_this_frame as usize;
+    let backlog =
+        roots.len() + metrics.despawns_this_frame as usize + metrics.lod_despawns_this_frame;
 
     let mut visible = 0u64;
     for root in &roots {
@@ -7624,10 +7725,261 @@ mod tests {
     }
 
     /// The connection end to end: a portal door that switches `ActiveCell` into an interior takes
-    /// distant terrain with it - its chunks are despawned and nothing streams - and an exterior
+    /// distant terrain with it - its chunks stop being drawn and nothing streams - and an exterior
     /// arrival brings it back. Nothing but `ActiveCell` is written in the test.
+    ///
+    /// A chunk leaving that way is the *paced* retire, not a despawn: hidden the frame it leaves
+    /// ([`RetireHidden`] and all), kept until the unload budget reaches it, and drained by the
+    /// pacer ([`despawn_cells`]) - which the test drives by hand, at the two budgets at `0` that
+    /// are exactly the old one-flush path (`pacing::startup` lifts them the same way).
     #[test]
     fn distant_terrain_follows_the_portal_active_cell_into_and_out_of_an_interior() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let config = EngineConfig {
+            max_cell_unloads_per_frame: 0,
+            max_unload_ms_per_frame: 0.0,
+            ..EngineConfig::default()
+        };
+        let worldspace = config.worldspace_id;
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: worldspace,
+                interior: None,
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<ActiveSpace>()
+            .init_resource::<lod::LodStreaming>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingWorld>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, (sync_active_space, lod::plan_lod_chunks).chain());
+        app.world_mut().spawn((
+            Transform::from_translation(Vec3::new(100.0, 40.0, -200.0)),
+            StreamingCamera,
+        ));
+        let chunk_root = lod::LodStreaming::spawn_ready_chunk_for_test(
+            app.world_mut(),
+            worldspace,
+            shared::lod::ChunkAnchor::new(0, 0),
+            shared::lod::LodOrigin::new(0, 0),
+        );
+
+        app.update();
+        let lod = |app: &App| {
+            let lod = app.world().resource::<lod::LodStreaming>();
+            (
+                lod.streamed_worldspace_for_test(),
+                lod.resident_chunks_for_test(),
+                lod.retiring_chunks_for_test(),
+            )
+        };
+        assert_eq!(
+            lod(&app),
+            (Some(worldspace), 1, 0),
+            "outside, distant terrain streams for the active worldspace and keeps its chunk"
+        );
+        assert!(app.world().get_entity(chunk_root).is_ok());
+        assert_ne!(
+            app.world().get::<Visibility>(chunk_root),
+            Some(&Visibility::Hidden),
+            "a chunk the plan wants draws"
+        );
+
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(99);
+        app.update();
+        assert_eq!(
+            lod(&app),
+            (None, 1, 1),
+            "inside an interior nothing is streamed: the chunk stops drawing and waits for the \
+             unload budget instead of being despawned on the crossing's frame"
+        );
+        assert!(
+            app.world().get_entity(chunk_root).is_ok(),
+            "a retiring chunk keeps its root until the budget reaches it"
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(chunk_root),
+            Some(&Visibility::Hidden),
+            "and it is hidden the frame it retires, so nothing of it can show through the interior"
+        );
+        assert!(
+            app.world().get::<RetireHidden>(chunk_root).is_some(),
+            "the hide is marked, so a revive gives back exactly it"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .resident_lod_chunks,
+            0
+        );
+
+        // The unpaced drain: both budgets at `0` unloads every retiring root at once, the path
+        // the pacer replaced.
+        despawn_cells(app.world_mut());
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.unloaded_lod_chunks, 1);
+        assert_eq!(metrics.lod_despawns_this_frame, 1);
+        assert_eq!(metrics.retiring_lod_chunks, 0);
+        assert_eq!(metrics.despawned_lod_entities, 1);
+        assert!(
+            app.world().get_entity(chunk_root).is_err(),
+            "the drained chunk's entities are despawned"
+        );
+
+        app.world_mut().resource_mut::<ActiveCell>().interior = None;
+        app.update();
+        assert_eq!(
+            lod(&app).0,
+            Some(worldspace),
+            "an exterior arrival streams distant terrain again"
+        );
+    }
+
+    /// `--lod-keep-hidden-in-interiors` (Option B, off by default): the exterior's chunks stay
+    /// resident and hidden through the interior visit instead of retiring, the unload pacer has
+    /// nothing of them to take, and the return shows the same roots - nothing is streamed in
+    /// again. A return that lands in another worldspace is not a return: the held chunks start
+    /// retiring then.
+    #[test]
+    fn the_held_lod_flag_keeps_chunks_through_an_interior_visit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let config = EngineConfig {
+            lod_keep_hidden_in_interiors: true,
+            ..EngineConfig::default()
+        };
+        let worldspace = config.worldspace_id;
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: worldspace,
+                interior: None,
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<ActiveSpace>()
+            .init_resource::<lod::LodStreaming>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingWorld>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, (sync_active_space, lod::plan_lod_chunks).chain());
+        app.world_mut().spawn((
+            Transform::from_translation(Vec3::new(100.0, 40.0, -200.0)),
+            StreamingCamera,
+        ));
+        let chunk_root = lod::LodStreaming::spawn_ready_chunk_for_test(
+            app.world_mut(),
+            worldspace,
+            shared::lod::ChunkAnchor::new(0, 0),
+            shared::lod::LodOrigin::new(0, 0),
+        );
+        app.update();
+
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(99);
+        app.update();
+        let lod = app.world().resource::<lod::LodStreaming>();
+        assert_eq!(lod.held_chunks_for_test(), 1, "kept for the return");
+        assert_eq!(lod.retiring_chunks_for_test(), 0, "and not the pacer's");
+        assert_eq!(
+            app.world().get::<Visibility>(chunk_root),
+            Some(&Visibility::Hidden),
+            "hidden for as long as the visit lasts"
+        );
+        assert!(
+            app.world().get::<RetireHidden>(chunk_root).is_some(),
+            "the hide is marked, so the return gives back exactly it"
+        );
+        assert_eq!(
+            app.world().resource::<StreamingMetrics>().held_lod_chunks,
+            1
+        );
+
+        // The unload pacer has nothing to take: a held chunk is the flag's to show again, not a
+        // retiree waiting for the budget.
+        despawn_cells(app.world_mut());
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .unloaded_lod_chunks,
+            0
+        );
+        assert!(app.world().get_entity(chunk_root).is_ok());
+
+        // Back out the same door: the chunk is shown in the frame the exterior is entered.
+        app.world_mut().resource_mut::<ActiveCell>().interior = None;
+        app.update();
+        let lod = app.world().resource::<lod::LodStreaming>();
+        assert_eq!(lod.held_chunks_for_test(), 0);
+        assert_eq!(lod.resident_chunks_for_test(), 1);
+        assert!(
+            app.world().get_entity(chunk_root).is_ok(),
+            "the same root draws it again: nothing was spawned a second time"
+        );
+        assert_ne!(
+            app.world().get::<Visibility>(chunk_root),
+            Some(&Visibility::Hidden),
+            "shown at once, with no stream-in"
+        );
+        assert!(
+            app.world().get::<RetireHidden>(chunk_root).is_none(),
+            "and the marker goes with the show"
+        );
+        assert_eq!(
+            app.world().resource::<StreamingMetrics>().held_lod_chunks,
+            0
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .revived_lod_chunks,
+            1,
+            "the return is a revive of a held chunk"
+        );
+
+        // Held again, then a door into another worldspace: not its exterior any more, so the
+        // chunk starts retiring and the budget takes it.
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(99);
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<lod::LodStreaming>()
+                .held_chunks_for_test(),
+            1
+        );
+        app.world_mut().resource_mut::<ActiveCell>().worldspace_id = 61;
+        app.world_mut().resource_mut::<ActiveCell>().interior = None;
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<lod::LodStreaming>()
+                .retiring_chunks_for_test(),
+            1,
+            "a held chunk the plan stops wanting starts retiring"
+        );
+        despawn_cells(app.world_mut());
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .unloaded_lod_chunks,
+            1
+        );
+        assert!(app.world().get_entity(chunk_root).is_err());
+    }
+
+    /// A camera that reverses before the unload budget has reached the chunks revives them: the
+    /// same roots draw again - nothing is spawned or streamed a second time - and the marker the
+    /// retire wrote is given back with it.
+    #[test]
+    fn a_reversal_on_an_interior_crossing_revives_retiring_lod_chunks() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
         write_plan_database(&path);
@@ -7651,51 +8003,53 @@ mod tests {
             Transform::from_translation(Vec3::new(100.0, 40.0, -200.0)),
             StreamingCamera,
         ));
-        let chunk_root = app.world_mut().spawn_empty().id();
-        app.world_mut()
-            .resource_mut::<lod::LodStreaming>()
-            .insert_ready_chunk_for_test(worldspace, chunk_root);
-
-        app.update();
-        let lod = |app: &App| {
-            let lod = app.world().resource::<lod::LodStreaming>();
-            (
-                lod.streamed_worldspace_for_test(),
-                lod.resident_chunks_for_test(),
-            )
-        };
-        assert_eq!(
-            lod(&app),
-            (Some(worldspace), 1),
-            "outside, distant terrain streams for the active worldspace and keeps its chunk"
+        let chunk_root = lod::LodStreaming::spawn_ready_chunk_for_test(
+            app.world_mut(),
+            worldspace,
+            shared::lod::ChunkAnchor::new(0, 0),
+            shared::lod::LodOrigin::new(0, 0),
         );
-        assert!(app.world().get_entity(chunk_root).is_ok());
+        app.update();
 
         app.world_mut().resource_mut::<ActiveCell>().interior = Some(99);
         app.update();
         assert_eq!(
-            lod(&app),
-            (None, 0),
-            "inside an interior nothing is streamed and no chunk stays resident"
-        );
-        assert!(
-            app.world().get_entity(chunk_root).is_err(),
-            "the chunk's entities are despawned, so nothing of it can show through the interior"
-        );
-        assert_eq!(
             app.world()
-                .resource::<StreamingMetrics>()
-                .resident_lod_chunks,
-            0
+                .resource::<lod::LodStreaming>()
+                .retiring_chunks_for_test(),
+            1
         );
 
+        // Turn around before the budget has reached the chunk.
         app.world_mut().resource_mut::<ActiveCell>().interior = None;
         app.update();
+        let lod = app.world().resource::<lod::LodStreaming>();
+        assert_eq!(lod.retiring_chunks_for_test(), 0);
         assert_eq!(
-            lod(&app).0,
-            Some(worldspace),
-            "an exterior arrival streams distant terrain again"
+            lod.resident_chunks_for_test(),
+            1,
+            "the entry is the one it was"
         );
+        assert!(
+            app.world().get_entity(chunk_root).is_ok(),
+            "a revived chunk keeps the root it had: nothing is spawned a second time"
+        );
+        assert_ne!(
+            app.world().get::<Visibility>(chunk_root),
+            Some(&Visibility::Hidden),
+            "and the visibility the retire took is given back"
+        );
+        assert!(
+            app.world().get::<RetireHidden>(chunk_root).is_none(),
+            "the marker goes with it, so a later retire hides afresh instead of trusting it"
+        );
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.revived_lod_chunks, 1);
+        assert_eq!(
+            metrics.unloaded_lod_chunks, 0,
+            "the budget never reached it, so nothing was unloaded"
+        );
+        assert_eq!(metrics.resident_lod_chunks, 1);
     }
 
     #[test]
@@ -8364,6 +8718,129 @@ mod tests {
         );
         assert_eq!(resident_root_count(&mut app), roots_after_crossing);
         assert_eq!(after_reversal.streaming_invariant_failures, 0);
+    }
+
+    /// A LOD chunk backlog leaves under the *same* budget the cells drain by, cells first: the
+    /// crossing that retires a whole exterior's distant terrain unloads a couple of chunks a frame
+    /// instead of the one flush that put a whole world's LOD on the crossing frame.
+    #[test]
+    fn cells_and_lod_chunks_drain_under_the_one_unload_budget() {
+        let (mut app, _directory) = streaming_test_app(crossing_config(2));
+        spawn_camera(&mut app, IVec2::ZERO);
+        app.update();
+        // Two cells far behind the camera, retiring but not reached by the budget's first frame:
+        // what a flight leaves. They are planted out of the keep radius, so `plan_cells` revives
+        // neither.
+        spawn_mock_cell(&mut app, 20, 20, false);
+        spawn_mock_cell(&mut app, 21, 20, false);
+        // Three chunks of an exterior the camera has just walked inside.
+        let chunks: Vec<Entity> = [(0, 0), (1, 0), (2, 0)]
+            .into_iter()
+            .map(|(x, y)| {
+                lod::LodStreaming::spawn_retiring_chunk_for_test(
+                    app.world_mut(),
+                    60,
+                    shared::lod::ChunkAnchor::new(x, y),
+                    shared::lod::LodOrigin::new(0, 0),
+                )
+            })
+            .collect();
+
+        app.update();
+        let mut per_frame = Vec::new();
+        for frame in 1..=3 {
+            let metrics = streaming_metrics(&app);
+            let roots_this_frame =
+                metrics.despawns_this_frame + metrics.lod_despawns_this_frame as u64;
+            per_frame.push((
+                metrics.despawns_this_frame,
+                metrics.lod_despawns_this_frame as u64,
+            ));
+            assert!(
+                roots_this_frame <= 2,
+                "frame {frame} unloaded {roots_this_frame} roots against a budget of 2"
+            );
+            assert_eq!(metrics.streaming_invariant_failures, 0, "frame {frame}");
+            if frame < 3 {
+                app.update();
+            }
+        }
+        assert_eq!(
+            per_frame,
+            vec![(2, 0), (0, 2), (0, 1)],
+            "cells go first off the one clock, and the chunks take what is left of it"
+        );
+        let metrics = streaming_metrics(&app);
+        assert_eq!(metrics.unloaded_cells, 2);
+        assert_eq!(metrics.unloaded_lod_chunks, 3);
+        assert_eq!(metrics.retiring_cells, 0);
+        assert_eq!(metrics.retiring_lod_chunks, 0);
+        assert_eq!(metrics.peak_retiring_lod_chunks, 3);
+        assert_eq!(metrics.max_lod_despawns_per_frame, 2);
+        for chunk in &chunks {
+            assert!(
+                app.world().get_entity(*chunk).is_err(),
+                "a drained chunk's root is despawned"
+            );
+        }
+        assert_eq!(
+            app.world()
+                .resource::<lod::LodStreaming>()
+                .retiring_chunks_for_test(),
+            0
+        );
+    }
+
+    /// The wall-clock budget paces the chunks the same way it paces cells: a backlog drains a
+    /// piece a frame - always at least one root, never all of it - so no single frame pays a
+    /// whole world's LOD.
+    #[test]
+    fn the_time_budget_spreads_a_lod_chunk_backlog_over_frames() {
+        let (mut app, _directory) = streaming_test_app(EngineConfig {
+            max_unload_ms_per_frame: 0.0001,
+            ..crossing_config(0)
+        });
+        spawn_camera(&mut app, IVec2::ZERO);
+        app.update();
+        for x in 0..4 {
+            let root = lod::LodStreaming::spawn_retiring_chunk_for_test(
+                app.world_mut(),
+                60,
+                shared::lod::ChunkAnchor::new(x, 0),
+                shared::lod::LodOrigin::new(0, 0),
+            );
+            // A chunk's root carries a subtree in the real world; a handful of children is what
+            // makes a single despawn cost more than the 100 ns budget below.
+            for _ in 0..200 {
+                app.world_mut().spawn((Transform::default(), ChildOf(root)));
+            }
+        }
+        let mut per_frame = Vec::new();
+        loop {
+            app.update();
+            let metrics = streaming_metrics(&app);
+            per_frame.push(metrics.lod_despawns_this_frame);
+            assert!(
+                metrics.lod_despawns_this_frame >= 1,
+                "the drain always goes forward, got {per_frame:?}"
+            );
+            assert_eq!(metrics.streaming_invariant_failures, 0);
+            if metrics.retiring_lod_chunks == 0 {
+                break;
+            }
+            assert!(
+                per_frame.len() < 10,
+                "a 100 ns budget must still finish a four-chunk backlog: {per_frame:?}"
+            );
+        }
+        assert_eq!(per_frame.iter().sum::<usize>(), 4);
+        assert!(
+            per_frame.len() > 1,
+            "the budget must spread the backlog, not unload it in one frame: {per_frame:?}"
+        );
+        let metrics = streaming_metrics(&app);
+        assert_eq!(metrics.unloaded_lod_chunks, 4);
+        assert_eq!(metrics.retiring_lod_chunks, 0);
     }
 
     /// A cell left behind by distance is drawn no longer the frame it retires: the pacer spreads
