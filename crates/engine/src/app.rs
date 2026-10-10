@@ -268,7 +268,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // every backend, and stock Bevy's serial encoder finish. The finish switch is process-wide and
     // is set here, once, before the first frame.
     crate::render_backend::apply_process_switches(&config);
-    let wgpu_settings = crate::render_backend::wgpu_settings(config.render_backends);
+    // `vulkan` is checked against the machine first: Bevy's renderer setup panics when it finds no
+    // adapter, so a machine without Vulkan falls back to `all` and the run says so.
+    let backend_choice = crate::render_backend::resolve_backends(
+        config.render_backends,
+        crate::render_backend::vulkan_adapter_present,
+    );
+    let wgpu_settings = crate::render_backend::wgpu_settings(backend_choice.effective);
     let mut default_plugins = DefaultPlugins
         .set(AssetPlugin {
             file_path: asset_path,
@@ -297,7 +303,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .insert_resource(render_asset_budget)
         .init_resource::<StreamingMetrics>()
         .add_plugins(default_plugins)
-        .add_plugins(crate::render_backend::RenderBackendLogPlugin)
+        .add_plugins(crate::render_backend::RenderBackendLogPlugin {
+            problem: backend_choice.problem,
+        })
         .add_plugins((
             FrameTimeDiagnosticsPlugin::default(),
             LogDiagnosticsPlugin {

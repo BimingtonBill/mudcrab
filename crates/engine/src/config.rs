@@ -516,7 +516,8 @@ Portal (this branch's doors, demos and tools):
   --render-parallel-finish              finish the render command encoders in parallel on the compute pool
                                         (the vendored bevy_render patch; same image and submission order) (default: off)
   --render-backends <all|vulkan>        graphics backends the renderer may use: all (Bevy's default) or vulkan
-                                        only, which also drops the indirect-draw validation pass (default: all)
+                                        only, which also drops the indirect-draw validation pass; with no Vulkan
+                                        adapter the run logs an error and falls back to all (default: all)
 
 Help:
   -h, --help                            print this message and exit

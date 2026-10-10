@@ -7,8 +7,13 @@
 //! moves data if the copy before it already ran, so the last buffer holds the marker only if every
 //! command buffer was submitted in order. It is run with the switch off (stock) and on.
 //!
-//! It needs a GPU adapter. Where none can be created (a machine with no Vulkan or DX12 device) the
-//! test says so and returns; it does not pass silently on the ordering logic alone.
+//! It needs a GPU adapter and fails loudly without one, so a green run always means the submission
+//! order was exercised on a device. A machine that really has no adapter sets
+//! `MUDCRAB_ALLOW_NO_GPU=1` to let the test skip (with a message). The ordering logic itself is
+//! covered without a device by `finish_order_logic.rs`.
+//!
+//! With the switch on, the test also checks that the encoders really went through the task pool
+//! (`last_parallel_finish_count`), so it cannot pass on the serial fallback.
 
 use bevy::ecs::schedule::{Schedule, ScheduleBuildSettings};
 use bevy::prelude::*;
@@ -16,8 +21,8 @@ use bevy::render::render_resource::{
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, MapMode, PollType,
 };
 use bevy::render::renderer::{
-    PendingCommandBuffers, RenderContext, RenderDevice, RenderQueue, parallel_finish,
-    set_parallel_finish,
+    PendingCommandBuffers, RenderContext, RenderDevice, RenderQueue, last_parallel_finish_count,
+    parallel_finish, set_parallel_finish,
 };
 use bevy::render::settings::{Backends, RenderResources, WgpuSettings};
 use bevy::tasks::{ComputeTaskPool, TaskPool};
@@ -78,8 +83,9 @@ fn gpu() -> Option<RenderResources> {
 }
 
 /// Runs the four systems, then the diagnostics-style `push_encoder` step 6, takes the pending list,
-/// submits it, and returns the marker byte that arrived in the last buffer plus the buffer count.
-fn run_chain(device: &RenderDevice, queue: &RenderQueue) -> (u8, usize) {
+/// submits it, and returns the marker byte that arrived in the last buffer, the buffer count, and how
+/// many encoders `take()` finished through the task pool.
+fn run_chain(device: &RenderDevice, queue: &RenderQueue) -> (u8, usize, usize) {
     let buffers = (0..BUFFER_COUNT)
         .map(|index| {
             device.create_buffer(&BufferDescriptor {
@@ -130,6 +136,7 @@ fn run_chain(device: &RenderDevice, queue: &RenderQueue) -> (u8, usize) {
 
     let taken = world.resource_mut::<PendingCommandBuffers>().take();
     let count = taken.len();
+    let pooled = last_parallel_finish_count();
     queue.submit(taken);
 
     let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
@@ -143,18 +150,33 @@ fn run_chain(device: &RenderDevice, queue: &RenderQueue) -> (u8, usize) {
         .expect("the device polls to completion");
     let marker = readback.slice(..).get_mapped_range()[0];
     readback.unmap();
-    (marker, count)
+    (marker, count, pooled)
+}
+
+/// Puts the process-wide switch back to stock when the test ends, also when an assertion fails.
+struct SwitchGuard;
+
+impl Drop for SwitchGuard {
+    fn drop(&mut self) {
+        set_parallel_finish(false);
+    }
 }
 
 #[test]
 fn command_buffers_reach_the_queue_in_system_order_with_the_switch_off_and_on() {
     let Some(RenderResources(device, queue, ..)) = gpu() else {
+        assert!(
+            std::env::var_os("MUDCRAB_ALLOW_NO_GPU").is_some_and(|value| value == "1"),
+            "no GPU adapter could be created, so the submission order cannot be exercised; \
+             set MUDCRAB_ALLOW_NO_GPU=1 to allow skipping on a machine that has none"
+        );
         eprintln!(
-            "SKIPPED: no GPU adapter could be created; the submission order was not exercised"
+            "SKIPPED (MUDCRAB_ALLOW_NO_GPU=1): no GPU adapter; the submission order was not exercised"
         );
         return;
     };
     ComputeTaskPool::get_or_init(TaskPool::default);
+    let _guard = SwitchGuard;
 
     set_parallel_finish(false);
     assert!(!parallel_finish());
@@ -164,9 +186,9 @@ fn command_buffers_reach_the_queue_in_system_order_with_the_switch_off_and_on() 
     assert!(parallel_finish());
     let parallel = run_chain(&device, &queue);
 
-    set_parallel_finish(false);
-
-    // Steps 1, 2, 3, 4, 5 and the pushed encoder are six command buffers either way.
-    assert_eq!(stock, (MARKER, 6), "stock path");
-    assert_eq!(parallel, (MARKER, 6), "parallel-finish path");
+    // Steps 1, 2, 3, 4, 5 and the pushed encoder are six command buffers either way. With the switch
+    // on, the encoders of steps 1, 3 and 4 and the pushed one (four) are finished through the pool;
+    // with it off none are.
+    assert_eq!(stock, (MARKER, 6, 0), "stock path");
+    assert_eq!(parallel, (MARKER, 6, 4), "parallel-finish path");
 }
