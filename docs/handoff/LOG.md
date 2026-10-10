@@ -3,6 +3,32 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-10/11 night Portal Dev: parallel encoder finish merged, Plus defaults on (parallel finish, SSR water)
+
+Track: Portal / Mudcrab Plus. Nothing pushed or posted by this session.
+
+- **impl-1132 parallel encoder finish (B2e): merged into portal.** Vendored `vendor/bevy_render-0.19.0` (pristine
+  9f6e9982, patch 15153aee, review fixes 47fa885b/1322a3d3) with `[patch.crates-io]`. It is a 0.19 backport of
+  bevyengine/bevy#24957 (0.20): drop the crate and the patch line at the 0.20 upgrade, do not rebase it
+  (MUDCRAB-README says so). Window 2026-10-10 (portal-heavy x3, local/review/portal-1132-window-2026-10-10):
+  58.0 -> 73.4 fps, render_thread -3.81 ms, camera_driver 6.25 -> 1.44 ms, GPU and main unchanged, images within noise.
+  Vulkan alone -0.56 ms and nothing on top, so backends stay `all` (`--render-backends vulkan` optional).
+- **Plus defaults (the user's call 2026-10-10):** parallel finish ON (`--no-render-parallel-finish` = stock Bevy),
+  SSR water ON (`--water-reflection planar` = old view). Commits 06a2db8f + 5d11a3ed (tests that meant planar now name it).
+- **Checks on the combined tree** (#201 c8e51b21 + 1132 + defaults): Phase 2's timing-p2-201-window on 18e9efac passed
+  (door tour x3 and water x3, 0 invariants, 0 swap timeouts). Mine at new defaults: fmt, clippy, nextest 2239/2239,
+  release OK; GPU check portal-heavy x2, door tour, water: all world_ready, 0 invariants, passed (not a timing window).
+  Portal fast-forwarded to 8e3edfb6 (after merging two handoff-doc commits into integration).
+- **Play build for the user:** `local/bin/play-plus-demo.cmd` (branch plus-demo, `D:/Mudcrab/worktrees/plus-demo`,
+  target `D:/Mudcrab/builds/plus-demo-target`). Same defaults plus `--pace-crossing-unload` on (play build only, not
+  on portal). Keep the worktree while the user plays it.
+- **Launch (portal):** `C:/Modding/Mudcrab/builds/portal-integration-target/release/engine.exe --assets
+  C:/Modding/Mudcrab/SkyrimConverted-portal-rooms --demo riverwood --walk`. Sent to Team Lead with the perf-defaults list.
+- **Cleared:** 1132 agent worktree and its target (11 GiB), ledger logged. No holds.
+- **First tomorrow:** combined timing window (new defaults vs all-stock pinned, portal-heavy x3); impl-1125 flush-lap
+  remeasure (worktree local/impl/impl-1125-portal-flush-lap-and-skip-test, commit 4dfebe5f, unmerged); B3a follow-ups;
+  B13b probes later. Open: a crossing's own cell unload is still unpaced on portal.
+
 ## 2026-10-10 Phase 1 Dev: portal merged-terrain data (B1), upstream prep of three branches
 
 All local; nothing published.
