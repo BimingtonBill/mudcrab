@@ -17,6 +17,9 @@ rusqlite.workspace = true
 rkyv.workspace = true
 memmap2.workspace = true
 color-eyre.workspace = true
+# Only for the `--render-backends vulkan` pre-check (render_backend.rs); the version and features Bevy already
+# unifies, so nothing new is compiled.
+wgpu = { version = "29.0.4", default-features = false }
 crossbeam-channel.workspace = true
 serde.workspace = true
 serde_json.workspace = true

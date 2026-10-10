@@ -36,6 +36,7 @@ pub mod prepass_vertex_alpha;
 pub mod profiling;
 pub mod remote;
 pub mod render;
+pub mod render_backend;
 pub mod render_skip;
 pub mod render_timing;
 pub mod room_culling;
