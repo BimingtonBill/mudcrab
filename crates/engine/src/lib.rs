@@ -19,6 +19,7 @@ pub mod graphics_settings;
 pub mod light_falloff;
 pub mod lights;
 pub mod material_animation;
+pub mod mesh_preparation_retry;
 pub mod metrics;
 pub mod model_animation;
 pub mod nif_material;

@@ -298,6 +298,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
         .add_plugins((
             VercidiumRendererPlugin,
+            crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
             crate::nif_material::NifMaterialPlugin,
         ))
         // The render→main "prepared and drawable" bridge (design-1091 C1). Registered for every
