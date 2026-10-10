@@ -39,9 +39,16 @@ In the order I'd review them: small and independent first, then the ones that to
 
 | # | Branch | Issue | What it does | Notes |
 |---|---|---|---|---|
-| D1 | phase1/door-links-export (723c0c39) | #112, feeds #128 | the converter writes an optional `door_links` table from XTEL (destination door, arrival point, destination cell and worldspace); no schema bump | body: local/pr-drafts/pr-door-links-export.md |
-| D2 | phase1/room-graph-pr (b7488c1c) | #188 converter half | interior room boxes, portal doorways, room links and room membership into four optional tables; fixes the room/portal marker FormID remap | body: local/pr-drafts/draft-188-room-graph-body.md (refresh numbers on the new head) |
-| D3 | phase1/ktx2-mip-order (93a4ad0b), as a draft | none yet (spec fix) | KTX2 mip level data stored smallest-first as KTX 2.0 section 3.7 requires, in every writer | conflicts with #167's texture.rs rewrite; changes output bytes, so it may need the converter schema bump Chef is planning (E9): ask in the PR |
+| D1 | phase1/door-links-export (743b93a0, main merged) | #112, feeds #128 | the converter writes an optional `door_links` table from XTEL (destination door, arrival point, destination cell and worldspace); no schema bump | body: local/pr-drafts/pr-door-links-export.md |
+| D2 | phase1/room-graph-pr (a9e9be15, main merged) | #188 converter half | interior room boxes, portal doorways, room links and room membership into four optional tables; fixes the room/portal marker FormID remap | body: local/pr-drafts/draft-188-room-graph-body.md (refresh numbers on the new head) |
+| D3 | phase1/ktx2-mip-order (649fc45e, main merged), as a draft | none yet (spec fix) | KTX2 mip level data stored smallest-first as KTX 2.0 section 3.7 requires, in every writer | conflicts with #167's texture.rs rewrite; changes output bytes, so it may need the converter schema bump Chef is planning (E9): ask in the PR |
+
+**Refresh (Phase 1, 2026-10-10):** main c39449b5 merged into all three, clean; no schema bump on any (door-links and room-graph add
+optional tables). D1 vs D2: one trivial conflict at the end of the full-load-order export in `esm/exporter.rs` (keep both
+blocks, room graph first); whichever lands second resolves it. Against open upstream PRs: D1 conflicts with #209
+(exporter.rs); D2 conflicts with #209 (exporter.rs + pipeline-report snapshot) and #204 (snapshot only); D3 is textually clean
+with #167/#204/#208/#209 but must rerun its KTX2 tests and snapshot after #167 merges. Workspace checks queued after Phase 1's
+conversion hold (~22:58, cold builds, ~30-40 min each): D:/Mudcrab/evidence/p1-evidence/upstream-prep-checks-2026-10-10.txt.
 
 Soft cap check: ours open = 4 ready (#122, #123, #124, #128) + 2 drafts (#125, #126). Adding D1 and D2 ready and D3 as a
 draft gives 6 ready + 3 drafts, inside the 5-6 ready + 7-8 drafts cap.
