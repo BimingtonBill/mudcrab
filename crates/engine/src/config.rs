@@ -235,9 +235,10 @@ pub struct EngineConfig {
     /// all (`off` is the measurement switch; `on` and `planar` draw it, and `ssr` is the Water Plus
     /// reflection of [`Self::water_reflection_mode`]). See [`HELP_TEXT`].
     pub water_reflection: bool,
-    /// `--water-reflection <planar|ssr>`: how the water reflects. `planar` (the default) is the
-    /// mirrored reflection view the engine has always drawn; `ssr` marches the screen in the water
-    /// shader instead, and the reflection camera is never demanded ([`crate::water_ssr`]).
+    /// `--water-reflection <planar|ssr>`: how the water reflects. `ssr` (the Plus default, the
+    /// user's call 2026-10-10) marches the screen in the water shader, and the reflection camera is
+    /// never demanded ([`crate::water_ssr`]); `planar` is the mirrored reflection view the engine
+    /// drew before.
     pub water_reflection_mode: WaterReflectionMode,
     /// `--water-ssr-steps <linear>[,<bisection>]`: how many steps the `ssr` march takes per water
     /// pixel. Only read with `--water-reflection ssr`.
@@ -246,11 +247,12 @@ pub struct EngineConfig {
     /// [`HELP_TEXT`].
     pub shadows: bool,
     /// `--render-parallel-finish`: finish the render command encoders in parallel (the Mudcrab
-    /// patch to the vendored `bevy_render`, impl-1132). Off by default, which is stock Bevy.
+    /// patch to the vendored `bevy_render`, impl-1132). On by default in Plus (the user's call
+    /// 2026-10-10); `--no-render-parallel-finish` is stock Bevy.
     pub render_parallel_finish: bool,
     /// `--render-backends <all|vulkan>`: which graphics backends wgpu may pick from. `all` is
-    /// Bevy's own choice and the default; `vulkan` is the Plus build's intended default once its
-    /// timing window has run (impl-1132).
+    /// Bevy's own choice and the default; `vulkan` is optional (its window gained 0.56 ms alone and
+    /// nothing on top of the parallel finish, so it stayed off, impl-1132).
     pub render_backends: RenderBackends,
 }
 
@@ -490,10 +492,10 @@ impl Default for EngineConfig {
             physics_fixture: false,
             water_reflection_preset: WaterReflectionPreset::Baseline,
             water_reflection: true,
-            water_reflection_mode: WaterReflectionMode::Planar,
+            water_reflection_mode: WaterReflectionMode::Ssr,
             water_ssr_steps: WaterSsrSteps::DEFAULT,
             shadows: true,
-            render_parallel_finish: false,
+            render_parallel_finish: true,
             render_backends: RenderBackends::All,
         }
     }
@@ -576,10 +578,10 @@ Benchmark and profiling:
 
 Diagnostics:
   --diagnostic-asset-fallbacks          log every fallback asset substitution
-  --water-reflection <planar|ssr|on|off>  measurement switch and Water Plus: planar (default, the same as on) renders
-                                        the mirrored reflection view; ssr marches the screen in the water shader
-                                        instead, never renders that view and copies the opaque colour once per view
-                                        that draws water; off never renders the reflection view, and the water gets
+  --water-reflection <planar|ssr|on|off>  measurement switch and Water Plus: ssr (default) marches the screen in the
+                                        water shader, never renders the reflection view and copies the opaque colour
+                                        once per view that draws water; planar (the same as on) renders the mirrored
+                                        reflection view; off never renders the reflection view, and the water gets
                                         darker (a black reflection is blended in), not unreflective
   --water-ssr-steps <n>[,<m>]           ssr only: n linear (1-128) and m bisection (0-32) march steps per water
                                         pixel (default: 16,6); ignored with planar
@@ -623,7 +625,8 @@ Portal (this branch's doors, demos and tools):
   --graphics-file <file>                graphics settings file
   --graphics-cycle <seconds>            step the anti-aliasing through every setting
   --render-parallel-finish              finish the render command encoders in parallel on the compute pool
-                                        (the vendored bevy_render patch; same image and submission order) (default: off)
+                                        (the vendored bevy_render patch; same image and submission order) (default: on)
+  --no-render-parallel-finish           finish them one by one on the render thread, as stock Bevy does
   --render-backends <all|vulkan>        graphics backends the renderer may use: all (Bevy's default) or vulkan
                                         only, which also drops the indirect-draw validation pass; with no Vulkan
                                         adapter the run logs an error and falls back to all (default: all)
@@ -1231,6 +1234,7 @@ impl EngineConfig {
                         })?;
                 }
                 "--render-parallel-finish" => config.render_parallel_finish = true,
+                "--no-render-parallel-finish" => config.render_parallel_finish = false,
                 "--render-backends" => {
                     const EXPECTED: &str = "all or vulkan";
                     let raw = take_raw("--render-backends", EXPECTED, args.next())?;
@@ -2449,9 +2453,9 @@ mod tests {
     }
 
     #[test]
-    fn the_water_reflection_is_planar_unless_asked_otherwise() {
+    fn the_water_reflection_is_ssr_unless_asked_otherwise() {
         let config = run_config(&[]);
-        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Planar);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Ssr);
         assert!(config.water_reflection);
         assert_eq!(config.water_ssr_steps, WaterSsrSteps::DEFAULT);
         assert_eq!(
@@ -3073,13 +3077,19 @@ mod tests {
         assert!(run_config(&["--room-culling"]).room_culling);
     }
 
-    /// The parallel encoder finish (impl-1132) is opt-in: with no flag the run is stock Bevy.
+    /// The parallel encoder finish (impl-1132) is the Plus default; `--no-render-parallel-finish`
+    /// is stock Bevy, and the last of the two spellings wins.
     #[test]
-    fn parallel_finish_is_off_until_the_flag_is_given() {
-        assert!(!EngineConfig::default().render_parallel_finish);
-        assert!(!run_config(&["--headless"]).render_parallel_finish);
-        assert!(run_config(&["--render-parallel-finish"]).render_parallel_finish);
+    fn parallel_finish_is_on_until_turned_off() {
+        assert!(EngineConfig::default().render_parallel_finish);
+        assert!(run_config(&["--headless"]).render_parallel_finish);
+        assert!(!run_config(&["--no-render-parallel-finish"]).render_parallel_finish);
+        assert!(
+            run_config(&["--no-render-parallel-finish", "--render-parallel-finish"])
+                .render_parallel_finish
+        );
         assert!(help_names("--render-parallel-finish"));
+        assert!(help_names("--no-render-parallel-finish"));
     }
 
     /// The backends default to every backend (today's behaviour) until a run names one.

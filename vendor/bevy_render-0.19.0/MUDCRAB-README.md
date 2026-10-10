@@ -54,4 +54,4 @@ engine's `--render-parallel-finish` flag and its call to `set_parallel_finish` m
 ## Plan
 
 Offer the change to Bevy upstream through Upstream Dev (with the user's yes), so this fork has a planned end.
-On a Bevy bump: 0.19.1 should apply as is; 0.20 conflicts (WgpuWrapper removal) and needs a rebase of the two files.
+On a Bevy bump: 0.19.1 should apply as is. At 0.20, drop this crate and the `[patch.crates-io]` line instead: upstream bevyengine/bevy#24957 (in 0.20) has the same parallel finish, so this patch is a 0.19 backport. Do not rebase it.
