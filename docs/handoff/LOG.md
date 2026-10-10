@@ -3,6 +3,20 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-11 night Phase 2 Dev: 1133, #201 (+1132, defaults) in portal; C8 closed; B1 compiles tomorrow
+
+Track: Phase 2 (portal/Plus work) and one upstream fix. Nothing running, no holds of mine.
+
+- **In portal tonight:**
+  - impl-1133 paced LOD-chunk teardown (a55b59ca): the door tour's 203-340 ms crossing spikes are gone, nothing over 150 ms after startup; portal-heavy GPU check passed; reviews review-1136 (DeepSeek) and review-1136.1 (Muse) accept. Option B `--lod-keep-hidden-in-interiors` stays off.
+  - Chef's upstream PR #201 fix only (c8e51b21, cherry-pick -x of 9f2be884, PR head 91b990b0): retries meshes whose GPU prep finished after their change event. Drop ours when portal takes main with #201. Portal Dev's impl-1132 and the user's default flips (parallel finish ON, SSR water ON) went in with it in one fast-forward by Portal Dev.
+  - Window (timing-p2-201-window, #201 + 1132 at old defaults): door tour x3 swap_hold_timeouts 0 (before: 4 of 6 runs stuck 444-526 frames), water x3 all passed.
+- **Correction recorded:** the stuck in-view terrain patch first blamed on 1133 is a pre-existing Bevy 0.19 race (bevy_pbr material.rs:1020-1022 skips an entity without RenderMesh and never retries), hit when cell (7,-14) upgrades at frame ~315 under the upload budget. Fixed by #201. **C8 (water swap_wait_timeouts) is the same race: closed.**
+- **Upstream PR #123 (dev console):** Chef's CHANGES_REQUESTED fix on branch phase2/pr123-capture-gate (fd3cba37 + 763047ae on 3a90e53e) handed to Upstream Dev to push. The acceptance PNG is still written (D:/Mudcrab/evidence/p2-pr123-acceptance/).
+- **Chef #202 coordination:** analysis-1137 (local/research/engine-foundations/analysis-1137-chef-201-vs-drawn-bridge-2026-10-10.md) maps his #201/#210/#211/#212 against ours; sent to Team Lead and Upstream Dev. No new upstream-bound #117-area coding until the user decides.
+- **B1 (merged terrain) NOT in portal:** branch p2/b1-portal-merge in D:/Mudcrab/worktrees/p2-b1-trial (target D:/Mudcrab/builds/p2-b1-trial) has the two merges (cab75f6d phase2/terrain-merge, 1e3591fc phase1/terrain-merge) and a WIP bridge commit adaec139, none compiled yet (no gate slot). Data is ready: D:/Mudcrab/SkyrimConverted-portal-rooms-terrain (Phase 1, converter 1bb97824, Dirt02). Note: portal's quadrant LOD hide does not wait for "drawn" either (slice C2 not built); only the merged path was made to wait.
+- **First steps next session:** (1) B1: gated clippy and nextest in p2-b1-trial, fix as new commits, then GPU check on portal-rooms-terrain and the merged-vs-today portal-heavy window x3; (2) the flattened LOD-chunk spawn brief (analysis-1134: the lever is entity count and ChildOf), plus 1133's follow-ups (chunk starvation behind cells, visible_lod_terrain_patches filter, still-loading revive test, fail_chunk repeat warn, retiring-LOD gauge column); (3) B5 room culling GPU check; (4) Upstream Dev may come back on #123.
+
 ## 2026-10-10/11 night Portal Dev: parallel encoder finish merged, Plus defaults on (parallel finish, SSR water)
 
 Track: Portal / Mudcrab Plus. Nothing pushed or posted by this session.
