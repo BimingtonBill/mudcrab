@@ -3,6 +3,26 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-11 Phase 1 Dev: upstream-prep checks green; ktx validate run stopped at wrap-up
+
+All local; nothing published.
+
+- **Upstream-prep checks (main c39449b5 merged in): all green, sent to Upstream Dev.** fmt, workspace clippy, nextest, doctests. door-links 743b93a0: 1104/1104. room-graph a9e9be15: 1119/1119. ktx2-mip-order 649fc45e: 1102/1102. Results: `D:/Mudcrab/evidence/p1-evidence/upstream-prep-checks-2026-10-10.txt`.
+- **PR-body answers sent to Upstream Dev:**
+  - door_links on vanilla: 2,204 rows, all destinations resolved (966 exterior, 1,238 interior).
+  - The five KTX2 layout test names.
+- **#1910 `ktx validate` old vs new order: STOPPED at the user's wrap-up, before any file was written.**
+  - The worker's temporary test edits are reverted in `D:/Mudcrab/worktrees/p1-ktx2` (clean).
+  - The throwaway main worktree `p1-ktx-old` is removed.
+  - Brief `tasks/deepseek/impl-1910-p1-ktx-validate.md` is ready to rerun: recreate the main worktree with `git worktree add --detach D:/Mudcrab/worktrees/p1-ktx-old origin/main`.
+  - KTX-Software 4.4.2 is now installed at `C:/Tools/KTX-Software/bin`.
+  - Upstream Dev waits on the result to put the `ktx validate` sentence back in the KTX2 PR body.
+- **Next:**
+  - rerun #1910 and send the output to Upstream Dev;
+  - write the #106 paragraph once impl-1133's numbers are in;
+  - E9: watch for Chef's schema.
+- No worker running, no hold set.
+
 ## 2026-10-11 night, Team Lead (day 3 wrap-up)
 
 Portal is at 0480b3f5 with the Plus performance defaults ON, as the user asked ("combine all of the things to maximise performance"):
