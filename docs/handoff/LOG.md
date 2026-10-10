@@ -3,6 +3,24 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-10 late, Upstream Dev (wrap-up)
+
+- **Reference package for Chef:** local/share/chef-reference-shots-2026-10-10 (84 poses in main's `--shots` format,
+  78 UESP screenshots with SOURCES.txt, 3 pose docs, README), zipped in 3 parts under 10 MB, sent to the user to post
+  on Discord themselves. Class A, OWNER beside it, keep-until 2026-10-24.
+- **Bevy parallel encoder finish (impl-1132):** draft local/pr-drafts/bevy-issue-parallel-encoder-finish.md marked
+  DO NOT POST. websearch-1139 found, and I checked with curl, that bevyengine/bevy#24957 (merged 2026-07-14, in 0.20)
+  already finishes encoders in parallel (`finish_parallel`). Our vendored patch is a 0.19 backport; the fork ends at
+  our 0.20 move. Bevy's AI policy bans AI-written issues/PR text and AI co-authors: any Bevy post must be the user's
+  own words. Portal Dev told (to pass to Team Lead).
+- **Nothing posted tonight.** #123: impl-1135 not handed over (its run stopped at 90 min, partial; a gated nextest
+  for it was still running at 23:40), so no fix push; tomorrow.
+- **Still waiting on the user's yes:** #202 coordination comment, merge #198, #167 supporting comment, AI label on
+  #154 reply, #203 picture sheet, the 3 new PRs (door links, room graph, ktx2 as draft; Phase 1's workspace checks
+  were running at 23:40, results in D:/Mudcrab/evidence/p1-evidence/upstream-prep-checks-2026-10-10.txt, then fill
+  the Verification lines). Queue: docs/pr/merge-queue-2026-10-10.md.
+- No worker of mine running.
+
 ## 2026-10-09 evening Portal Dev: water SSR merged (flag off), B2d answered, bevy_render patch started
 
 Track: Portal / Mudcrab Plus. Nothing pushed by this session (Upstream Dev posted the SSR numbers on #203).
