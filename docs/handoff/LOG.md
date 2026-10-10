@@ -3,6 +3,26 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-11 night, Team Lead (day 3 wrap-up)
+
+Portal is at 0480b3f5 with the Plus performance defaults ON, as the user asked ("combine all of the things to maximise performance"):
+- SSR water: 57 to 82 fps on portal-heavy (planar via --water-reflection planar).
+- Parallel encoder finish, a backport of Bevy #24957; the fork drops at 0.20: 58 to 73 fps (off via --no-render-parallel-finish).
+- Chef's #201 mesh-prep retry: it fixes the stuck-patch race behind C8/C9.
+- 1133 paced LOD-chunk teardown: crossing worst frames 200-340 to under 150 ms.
+- 1124 unpaced startup.
+Backends stay 'all'; the user reversed Vulkan-only on the numbers.
+
+Not in tonight:
+- B1 terrain merge: both merges plus a WIP bridge on p2/b1-portal-merge, not compiled. The gate gave that worktree no slot for 1h40m; look at gate fairness. Its data is ready at D:/Mudcrab/SkyrimConverted-portal-rooms-terrain.
+- The #123 fix push (763047ae awaits one acceptance run).
+- impl-1125 remeasure.
+
+Open for the user: the #117/#202 coordination with Chef (analysis-1137: #201 complementary, #211 overlaps 1124, teardown is ours alone).
+
+First tomorrow: the combined timing window (new defaults vs stock), B1 compile and check and window, the #123 push, and gate fairness.
+Claude weekly plan is at 90%: lean on DeepSeek tomorrow.
+
 ## 2026-10-11 night Phase 2 Dev: 1133, #201 (+1132, defaults) in portal; C8 closed; B1 compiles tomorrow
 
 Track: Phase 2 (portal/Plus work) and one upstream fix. Nothing running, no holds of mine.
