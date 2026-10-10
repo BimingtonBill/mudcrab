@@ -3,6 +3,44 @@
 Newest entry first. Add a dated entry at the top at the end of every session. Read the newest
 entries at session start; older ones are history.
 
+## 2026-10-10 Phase 1 Dev: portal merged-terrain data (B1), upstream prep of three branches
+
+All local; nothing published.
+
+- **B1 portal data:** `D:/Mudcrab/SkyrimConverted-portal-rooms-terrain` (27.3 GB, owner note beside it). It is a `--reuse-assets` metadata rebuild of portal-rooms with `--merged-terrain --terrain-default-texture skyrim-ini`.
+  - Converter: branch `phase1/portal-terrain-converter` 1bb97824 = portal 9538790d + phase1/terrain-merge e06c733e. One conflict, the `esm/mod.rs` module list: keep both. Converter clippy clean, nextest 708/708. Exe in `D:/Mudcrab/evidence/p1-portal-terrain-converter`.
+  - Output: portal schema kept (converter 102401, world DB 100701). Rooms, portals and LOD chunks are identical to portal-rooms; door_links 2,204. Merged terrain for all 52,181 cells, 0 skipped, Dirt02 at entry 0. Took 54 min.
+  - Phase 2 merges phase1/terrain-merge together with phase2/terrain-merge into portal; then its GPU check and the merged-vs-today window.
+- **Upstream prep for Upstream Dev:** main c39449b5 merged into three branches.
+  - Branches: `phase1/door-links-export` 743b93a0 (worktree D:/Mudcrab/worktrees/up-doorlinks), `phase1/room-graph-pr` a9e9be15 (D:/Mudcrab/worktrees/p1-main-ro), `phase1/ktx2-mip-order` 649fc45e (D:/Mudcrab/worktrees/p1-ktx2).
+  - No schema bump on any of them.
+  - Conflicts: door-links with room-graph, in exporter.rs (keep both blocks). Door-links with #209. Room-graph with #209 and #204 (snapshot). KTX2 is textually clean with #167, but rerun its tests after #167 merges.
+- **Workspace checks still RUNNING at wrap-up**, as Team Lead allowed: `bash D:/Mudcrab/evidence/p1-evidence/upstream-prep-checks.sh` (background, gated). Each branch runs in its own throwaway target, deleted after. Results: `D:/Mudcrab/evidence/p1-evidence/upstream-prep-checks-2026-10-10.txt`; logs in `checks-<worktree>/`. At wrap-up, door-links had fmt and clippy ok, with nextest running. **Next session: read that file and send the results to Upstream Dev.**
+- **Removed (standing yes, logged in `local/disk/ledger.txt`):** the white terrain folder `D:/Mudcrab/SkyrimConverted-p2main-v24-terrain` (Phase 2 released it), and worktree `D:/Mudcrab/worktrees/p1-portal-terrain` (branch kept).
+- **Slip (logged, Team Lead told):** for a few seconds I ran `git checkout --detach origin/main` in the main checkout and switched straight back to portal. Never check out in the main checkout; use worktrees.
+- **Next:**
+  - send the check results to Upstream Dev;
+  - the #106 paragraph once impl-1133's numbers are in;
+  - E9: watch for Chef's schema.
+
+## 2026-10-10 late, Upstream Dev (wrap-up)
+
+- **Reference package for Chef:** local/share/chef-reference-shots-2026-10-10 (84 poses in main's `--shots` format,
+  78 UESP screenshots with SOURCES.txt, 3 pose docs, README), zipped in 3 parts under 10 MB, sent to the user to post
+  on Discord themselves. Class A, OWNER beside it, keep-until 2026-10-24.
+- **Bevy parallel encoder finish (impl-1132):** draft local/pr-drafts/bevy-issue-parallel-encoder-finish.md marked
+  DO NOT POST. websearch-1139 found, and I checked with curl, that bevyengine/bevy#24957 (merged 2026-07-14, in 0.20)
+  already finishes encoders in parallel (`finish_parallel`). Our vendored patch is a 0.19 backport; the fork ends at
+  our 0.20 move. Bevy's AI policy bans AI-written issues/PR text and AI co-authors: any Bevy post must be the user's
+  own words. Portal Dev told (to pass to Team Lead).
+- **Nothing posted tonight.** #123: impl-1135 not handed over (its run stopped at 90 min, partial; a gated nextest
+  for it was still running at 23:40), so no fix push; tomorrow.
+- **Still waiting on the user's yes:** #202 coordination comment, merge #198, #167 supporting comment, AI label on
+  #154 reply, #203 picture sheet, the 3 new PRs (door links, room graph, ktx2 as draft; Phase 1's workspace checks
+  were running at 23:40, results in D:/Mudcrab/evidence/p1-evidence/upstream-prep-checks-2026-10-10.txt, then fill
+  the Verification lines). Queue: docs/pr/merge-queue-2026-10-10.md.
+- No worker of mine running.
+
 ## 2026-10-09 evening Portal Dev: water SSR merged (flag off), B2d answered, bevy_render patch started
 
 Track: Portal / Mudcrab Plus. Nothing pushed by this session (Upstream Dev posted the SSR numbers on #203).
