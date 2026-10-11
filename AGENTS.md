@@ -240,6 +240,10 @@ The user added a **Team Lead** session above the dev sessions and Upstream Dev, 
 >   noise, listed in the evening table). Comments only: not reviews, body edits, new issues or PRs,
 >   or pushes. Comments on anyone else's items, and anything that answers a person (even a new
 >   top-level comment on our own item), still need the user's yes.
+> - **Standing yes for pushes to the user's own fork (the user, 2026-10-11).** Any session may push branches to
+>   `myfork` (BimingtonBill/mudcrab) without asking each time, after a scan of the outgoing history for game data,
+>   secret tokens and large files. Not covered: anything on `origin` (Mudcrab-Team/mudcrab), any PR or comment, and
+>   deleting remote branches (`public/portal` stays until the user decides).
 > - Reading GitHub (`gh pr view`, `gh api` GETs, `git fetch`) is fine for every session.
 
 > **Handed-out jobs only (the user, 2026-09-30).** Dev sessions work only on jobs the user or
