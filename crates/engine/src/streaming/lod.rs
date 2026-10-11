@@ -11,7 +11,9 @@ use crate::{
     },
 };
 use bevy::{
+    app::Propagate,
     asset::{AssetLoadError, LoadState, RecursiveDependencyLoadState, io::AssetReaderError},
+    camera::visibility::RenderLayers,
     gltf::GltfAssetLabel,
     mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
     prelude::*,
@@ -674,6 +676,22 @@ pub(super) fn plan_lod_chunks(
     profiler.record_elapsed("lod/plan", started);
 }
 
+/// The layers a LOD ring chunk root carries, and the [`Propagate`] source the chunk's meshes pick
+/// up: the ring is distant *world* content, so the main camera draws it on the world layer and
+/// the water reflection draws it on either shadow route
+/// ([`crate::render::reflectable_world_layers`]). A ring left on the world layer alone would be
+/// the shadowless route's largest hole - everything past the streaming radius is all that is left
+/// of the world in a wide reflection (impl-1094). The propagation source carries the same set, so
+/// the chunk's glTF meshes, which appear frames later, pick it up exactly as a streamed cell's
+/// nodes do.
+///
+/// One function so the layer choice is testable without standing up [`collect_lod_chunks`]'s
+/// database, asset server and budget; see `the_lod_ring_is_on_both_reflection_routes`.
+fn lod_ring_layers() -> (RenderLayers, Propagate<RenderLayers>) {
+    let layers = crate::render::reflectable_world_layers();
+    (layers.clone(), Propagate(layers))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn collect_lod_chunks(
     mut commands: Commands,
@@ -828,6 +846,7 @@ pub(super) fn collect_lod_chunks(
             IoTaskPool::get().spawn(async move { verify_payload_hash(hash_path, expected_hash) });
         let local_grid_x = min_grid.0 - i64::from(origin.0.x);
         let local_grid_y = min_grid.1 - i64::from(origin.0.y);
+        let (ring_layers, ring_propagation) = lod_ring_layers();
         let root = commands
             .spawn((
                 Name::new(format!(
@@ -851,14 +870,8 @@ pub(super) fn collect_lod_chunks(
                     -(local_grid_y as f32) * CELL_SIZE,
                 ),
                 Visibility::Hidden,
-                // The ring is distant *world* content: the main camera draws it on layer 0, so the
-                // water reflection draws it on either shadow route - `reflectable_world_layers`, and
-                // a `Propagate` source so the chunk's glTF meshes, which appear frames later, pick
-                // the value up exactly as a streamed cell's nodes do (impl-1094). A ring left on
-                // layer 0 alone would be the shadowless route's largest hole: everything past the
-                // streaming radius is all that is left of the world in a wide reflection.
-                crate::render::reflectable_world_layers(),
-                bevy::app::Propagate(crate::render::reflectable_world_layers()),
+                ring_layers,
+                ring_propagation,
                 PendingLodChunk {
                     metadata,
                     asset,
@@ -2443,5 +2456,33 @@ mod tests {
             (22, 0),
             side_reach().max_reach_cells() + LOD_UNLOAD_MARGIN_CELLS,
         ));
+    }
+
+    /// The LOD ring is on both reflection routes' layers. The water reflection's shadowless route
+    /// draws the replica layer only, so a ring left on the world layer alone would drop out of a
+    /// wide reflection - and the ring is everything past the streaming radius there (impl-1094;
+    /// this is its follow-up, impl-1141). `collect_lod_chunks` spawns the ring with a database,
+    /// asset server and budget in hand, so the test holds the one layer choice it spawns with
+    /// ([`lod_ring_layers`]) instead of standing the spawn up.
+    #[test]
+    fn the_lod_ring_is_on_both_reflection_routes() {
+        let (layers, propagated) = lod_ring_layers();
+        let shadowed = RenderLayers::from_layers(crate::render::REFLECTION_VIEW_LAYERS);
+        let shadowless =
+            RenderLayers::from_layers(crate::render::UNSHADOWED_REFLECTION_VIEW_LAYERS);
+        assert!(
+            layers.intersects(&shadowed),
+            "the shadowed reflection must draw the LOD ring: {layers:?}"
+        );
+        assert!(
+            layers.intersects(&shadowless),
+            "the shadowless reflection must draw the LOD ring: {layers:?}"
+        );
+        // The chunk's meshes are stamped from the propagation source, so it must carry the same
+        // set as the root itself or the widening would stop at the root.
+        assert_eq!(
+            propagated.0, layers,
+            "the ring's meshes must be stamped with the root's own layers"
+        );
     }
 }
