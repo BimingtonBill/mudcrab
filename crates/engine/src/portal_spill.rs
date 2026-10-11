@@ -21,8 +21,10 @@
 //! * **into the destination**, on the portal camera's layer
 //!   ([`DESTINATION_LAYER`](crate::portal::DESTINATION_LAYER)), standing a little outside the
 //!   destination doorway and aimed in through it, in the *source* side's light;
-//! * **into the source**, on the main camera's layers (0 and 1), standing a little inside the
-//!   source doorway and aimed out through it, in the *destination* side's light.
+//! * **into the source**, on a point light's layers ([`POINT_LIGHT_LAYERS`]: the main camera's 0
+//!   and 1 and the shadowless reflection layer 4, so the room's water reflection is lit too),
+//!   standing a little inside the source doorway and aimed out through it, in the *destination*
+//!   side's light.
 //!
 //! A side's light ([`side_light`]) is measured where the seam is seen: on the threshold floor,
 //! [`THRESHOLD_PATCH_DEPTH`] into that side from the bottom edge of the doorway quad (which stands
@@ -72,6 +74,7 @@ use crate::{
     doors::{DoorState, LoadDoor},
     lights::SkyrimLight,
     portal::{DESTINATION_LAYER, OpenDoorway, PortalFrame, PortalQuad, PortalState},
+    render::POINT_LIGHT_LAYERS,
     streaming::ActiveCell,
     world::lighting::{SpaceAtmosphere, SpaceKey, SpaceLightingCatalog, luma, space_key},
 };
@@ -202,7 +205,29 @@ pub(crate) enum SpillLight {
 }
 
 impl SpillLight {
+    /// The layers of the side each spill belongs to: a light only lights the views whose layers
+    /// it carries (`bevy_light`'s clustered assignment filters per view), so this is both the
+    /// layers the side's floor is measured on and the layers its spill light is placed on.
+    ///
+    /// The light into the source is on [`POINT_LIGHT_LAYERS`] - the main camera's layers plus the
+    /// shadowless reflection's replica layer, exactly as a converted point light - so the room's
+    /// water reflection, which draws the replica layer only while its policy says shadows off,
+    /// keeps the spill's light (impl-1141). The light into the destination stays on
+    /// [`DESTINATION_LAYER`] alone: it lights the doorway image, and destination content - a light
+    /// among it - must not reach the reflection of the source space
+    /// ([`crate::render::reflectable_layers`]).
     fn layers(self) -> RenderLayers {
+        match self {
+            Self::IntoDestination => RenderLayers::layer(DESTINATION_LAYER),
+            Self::IntoSource => RenderLayers::from_layers(&POINT_LIGHT_LAYERS),
+        }
+    }
+
+    /// The layers the side is measured on: the sun and the lights a side's threshold receives. The
+    /// same as [`Self::layers`] except that the source side does not take the replica layer, so
+    /// the measurement never picks up the shadowless sun copy ([`crate::shadow_route::UnshadowedSun`])
+    /// that also sits on it (impl-1141 review).
+    fn measured_layers(self) -> RenderLayers {
         match self {
             Self::IntoDestination => RenderLayers::layer(DESTINATION_LAYER),
             Self::IntoSource => RenderLayers::from_layers(&[0, 1]),
@@ -637,7 +662,7 @@ fn measure_threshold_sun(
     }
     let sides = DoorwaySides::of(&doorway);
     let mut lit = |side: SpillLight, floor: Vec3| -> f32 {
-        let wanted = side.layers();
+        let wanted = side.measured_layers();
         let Some((_, towards_sun)) = side_sun(suns.iter(), &wanted) else {
             return 0.0;
         };
@@ -720,7 +745,7 @@ fn update_spill(
             })
             .map_or((0.0, 0.0), |shade| (shade.source, shade.destination));
         let floor_light = |side: SpillLight, floor: Vec3, lit: f32, key: SpaceKey| {
-            let layers = side.layers();
+            let layers = side.measured_layers();
             let sun = side_sun(suns.iter(), &layers).map_or(LinearRgba::BLACK, |(sun, toward)| {
                 sun_on_floor(sun, toward, lit)
             });
@@ -937,6 +962,39 @@ mod tests {
             !SpillLight::IntoSource
                 .layers()
                 .intersects(&RenderLayers::layer(DESTINATION_LAYER))
+        );
+        // The light into the source lights the room the player stands in *and its water
+        // reflection*: the shadowless route draws the replica layer only, and a light without it
+        // goes missing there (impl-1141). A light names that layer directly - the point/spot
+        // layers (`POINT_LIGHT_LAYERS`), never widened through `reflectable_layers`.
+        assert_eq!(
+            SpillLight::IntoSource.layers(),
+            RenderLayers::from_layers(&POINT_LIGHT_LAYERS)
+        );
+        assert!(
+            SpillLight::IntoSource
+                .layers()
+                .intersects(&RenderLayers::layer(
+                    crate::render::UNSHADOWED_REFLECTION_LAYER
+                ))
+        );
+        // The measurement stays on the main camera's layers: the replica layer also carries the
+        // shadowless sun copy, which a measured sun must never be taken from.
+        assert!(
+            !SpillLight::IntoSource
+                .measured_layers()
+                .intersects(&RenderLayers::layer(
+                    crate::render::UNSHADOWED_REFLECTION_LAYER
+                ))
+        );
+        // The doorway image is its own view: the light into the destination must not light the
+        // reflection of the source space.
+        assert!(
+            !SpillLight::IntoDestination
+                .layers()
+                .intersects(&RenderLayers::layer(
+                    crate::render::UNSHADOWED_REFLECTION_LAYER
+                ))
         );
     }
 
