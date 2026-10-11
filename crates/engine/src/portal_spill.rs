@@ -222,6 +222,17 @@ impl SpillLight {
             Self::IntoSource => RenderLayers::from_layers(&POINT_LIGHT_LAYERS),
         }
     }
+
+    /// The layers the side is measured on: the sun and the lights a side's threshold receives. The
+    /// same as [`Self::layers`] except that the source side does not take the replica layer, so
+    /// the measurement never picks up the shadowless sun copy ([`crate::shadow_route::UnshadowedSun`])
+    /// that also sits on it (impl-1141 review).
+    fn measured_layers(self) -> RenderLayers {
+        match self {
+            Self::IntoDestination => RenderLayers::layer(DESTINATION_LAYER),
+            Self::IntoSource => RenderLayers::from_layers(&[0, 1]),
+        }
+    }
 }
 
 /// The doorway the spill was last lit for, and how far it has faded in.
@@ -651,7 +662,7 @@ fn measure_threshold_sun(
     }
     let sides = DoorwaySides::of(&doorway);
     let mut lit = |side: SpillLight, floor: Vec3| -> f32 {
-        let wanted = side.layers();
+        let wanted = side.measured_layers();
         let Some((_, towards_sun)) = side_sun(suns.iter(), &wanted) else {
             return 0.0;
         };
@@ -734,7 +745,7 @@ fn update_spill(
             })
             .map_or((0.0, 0.0), |shade| (shade.source, shade.destination));
         let floor_light = |side: SpillLight, floor: Vec3, lit: f32, key: SpaceKey| {
-            let layers = side.layers();
+            let layers = side.measured_layers();
             let sun = side_sun(suns.iter(), &layers).map_or(LinearRgba::BLACK, |(sun, toward)| {
                 sun_on_floor(sun, toward, lit)
             });
@@ -963,6 +974,15 @@ mod tests {
         assert!(
             SpillLight::IntoSource
                 .layers()
+                .intersects(&RenderLayers::layer(
+                    crate::render::UNSHADOWED_REFLECTION_LAYER
+                ))
+        );
+        // The measurement stays on the main camera's layers: the replica layer also carries the
+        // shadowless sun copy, which a measured sun must never be taken from.
+        assert!(
+            !SpillLight::IntoSource
+                .measured_layers()
                 .intersects(&RenderLayers::layer(
                     crate::render::UNSHADOWED_REFLECTION_LAYER
                 ))
