@@ -398,12 +398,12 @@ pub const LIGHT_LAYERS: [usize; 2] = [0, WATER_LAYER];
 /// next free layer, so a door-layer door's own set and this one stay distinct layers even though
 /// the door is drawn by both routes.
 ///
-/// **Engine-reserved: mods must not put content or lights on this layer directly.** It belongs to
+/// **Engine-reserved: mods must not put content or lights on this layer by hand.** It belongs to
 /// the engine's reflection routes. A mod's own world content goes on the world layer
 /// ([`WORLD_LAYER`]), which the engine widens through [`reflectable_layers`] so the main view and
-/// both reflection routes draw it; a mod's lights carry [`POINT_LIGHT_LAYERS`], which names this
-/// layer itself. A mod entity put on this layer alone is drawn by the shadowless reflection route
-/// and by no other view.
+/// both reflection routes draw it. A mod's point or spot light takes the engine's
+/// [`POINT_LIGHT_LAYERS`], which already include this layer. Content put here alone is drawn by the
+/// shadowless reflection route and by no other view.
 pub const UNSHADOWED_REFLECTION_LAYER: Layer = 4;
 
 /// What the water reflection camera draws while its policy says shadows off: the reflected world
