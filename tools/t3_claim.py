@@ -88,6 +88,15 @@ def set_row(text, task_id, state, thread=None):
     sys.exit(f"no task row '{task_id}' in {QUEUE}")
 
 
+def thread_title(task_id, task, limit=70):
+    """Thread title: the task id, then the queue's own description, cut at a word."""
+    head = f"{task_id} "
+    if len(head + task) <= limit:
+        return head + task
+    cut = task[: limit - len(head) - 3].rsplit(" ", 1)[0]
+    return f"{head}{cut}..."
+
+
 def cmd_list(_args):
     text = QUEUE.read_text(encoding="utf-8")
     found = 0
@@ -111,18 +120,22 @@ def cmd_claim(args):
             prior = status_path(task_id).read_text(encoding="utf-8").splitlines()[0]
             sys.exit(f"{task_id} already claimed: {prior}")
         text = QUEUE.read_text(encoding="utf-8")
-        queued = {c[1].strip(): c[4].strip() for _, c in task_rows(text)}
-        if task_id not in queued:
+        rows = {c[1].strip(): c for _, c in task_rows(text)}
+        if task_id not in rows:
             sys.exit(f"no task row '{task_id}' in the queue")
-        if queued[task_id] != "queued":
-            sys.exit(f"{task_id} is '{queued[task_id]}' in the queue, not queued")
-        header = f"# {task_id}\n\n- Claimed by: {args.thread}\n- Claimed at: {now()}\n- State: active\n\n"
+        task = rows[task_id][2].strip()
+        if rows[task_id][4].strip() != "queued":
+            sys.exit(f"{task_id} is '{rows[task_id][4].strip()}' in the queue, not queued")
+        title = thread_title(task_id, task)
+        header = (f"# {task_id}\n\n- Task: {task}\n- Claimed by: {args.thread}\n"
+                  f"- Claimed at: {now()}\n- State: active\n\n")
         with status_path(task_id).open("x", encoding="utf-8") as f:
             f.write(header + "## Now\n\n## Done\n\n## Next\n\n## Evidence\n")
         QUEUE.write_text(set_row(text, task_id, "active", args.thread), encoding="utf-8")
     finally:
         release_lock()
     print(f"claimed {task_id} for {args.thread}; status file {status_path(task_id)}")
+    print(f"Thread title: {title}")
 
 
 def cmd_set(args):
