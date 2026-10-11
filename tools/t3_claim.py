@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 QUEUE = ROOT / "local" / "plans" / "task-queue.md"
 STATUS_DIR = ROOT / "local" / "task-threads"
 ARCHIVE_DIR = STATUS_DIR / "archive"
+SPECS = ROOT / "local" / "plans" / "task-specs.md"
 LOCK = STATUS_DIR / ".lock"
 STATES = {"active", "waiting", "parked", "done", "queued"}
 ROW = re.compile(r"^\|\s*([^|]+?)\s*\|")
@@ -88,8 +89,19 @@ def set_row(text, task_id, state, thread=None):
     sys.exit(f"no task row '{task_id}' in {QUEUE}")
 
 
+def original_text(task_id):
+    """Full queue text from before the plain titles (task-specs.md), or an empty string."""
+    if not SPECS.exists():
+        return ""
+    for line in SPECS.read_text(encoding="utf-8").split("\n"):
+        cells = line.split("|")
+        if len(cells) == 5 and cells[1].strip() == task_id:
+            return f"{cells[2].strip()} | {cells[3].strip()}"
+    return ""
+
+
 def thread_title(task_id, task, limit=70):
-    """Thread title: the task id, then the queue's own description, cut at a word."""
+    """Thread title: the task id, then the queue's plain title, cut at a word."""
     head = f"{task_id} "
     if len(head + task) <= limit:
         return head + task
@@ -127,8 +139,10 @@ def cmd_claim(args):
         if rows[task_id][4].strip() != "queued":
             sys.exit(f"{task_id} is '{rows[task_id][4].strip()}' in the queue, not queued")
         title = thread_title(task_id, task)
-        header = (f"# {task_id}\n\n- Task: {task}\n- Claimed by: {args.thread}\n"
-                  f"- Claimed at: {now()}\n- State: active\n\n")
+        full = original_text(task_id)
+        header = (f"# {task_id} {task}\n\n- Claimed by: {args.thread}\n"
+                  f"- Claimed at: {now()}\n- State: active\n"
+                  + (f"- Full queue text: {full}\n" if full else "") + "\n")
         with status_path(task_id).open("x", encoding="utf-8") as f:
             f.write(header + "## Now\n\n## Done\n\n## Next\n\n## Evidence\n")
         QUEUE.write_text(set_row(text, task_id, "active", args.thread), encoding="utf-8")
