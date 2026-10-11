@@ -305,7 +305,13 @@ pub const OVERLAP_TOLERANCE: f32 = 8.0;
 pub fn rooms_overlap(a: &Room, b: &Room) -> bool {
     // A box with a non-finite number has no geometry to test. Joining it keeps the neighbours
     // drawn; "not overlapping" would drop an edge and cull more.
-    if !(a.center.is_finite() && b.center.is_finite() && a.half.is_finite() && b.half.is_finite()) {
+    if !(a.center.is_finite()
+        && b.center.is_finite()
+        && a.half.is_finite()
+        && b.half.is_finite()
+        && a.rotation.is_finite()
+        && b.rotation.is_finite())
+    {
         return true;
     }
     // The tolerance is in units only if the rotations are unit quaternions, which
