@@ -1,0 +1,411 @@
+{
+  "root": "C:\\Modding\\SkyrimConverted-upstream\\vfs\\meshes",
+  "files_scanned": 22761,
+  "parse_failures": 0,
+  "parse_failure_samples": [],
+  "family_counts": {
+    "BSDynamicTriShape": 3727,
+    "BSLODTriShape": 34,
+    "BSTriShape": 18601,
+    "NiTriShape": 134,
+    "NiTriShapeData": 158,
+    "NiTriStripsData": 17
+  },
+  "files_with_strips": 17,
+  "strips_files": [
+    {
+      "path": "architecture/windhelm/whprison02.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkTransformShape",
+        "bhkListShape",
+        "bhkRigidBody",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet"
+      ]
+    },
+    {
+      "path": "architecture/windhelm/whvalunstrad21.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkTransformShape",
+        "bhkListShape",
+        "bhkRigidBody",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet",
+        "NiAlphaProperty"
+      ]
+    },
+    {
+      "path": "architecture/windhelm/whvalunstrad27.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkTransformShape",
+        "bhkListShape",
+        "bhkRigidBody",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet",
+        "NiAlphaProperty"
+      ]
+    },
+    {
+      "path": "clutter/coffins/nordiccoffinstatic03.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiNode",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkListShape",
+        "bhkRigidBody",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet",
+        "NiAlphaProperty"
+      ]
+    },
+    {
+      "path": "clutter/goatskin/goatpeltstatic.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkRigidBodyT",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet",
+        "NiAlphaProperty"
+      ]
+    },
+    {
+      "path": "clutter/nightmother/nmbody01.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSBehaviorGraphExtraData",
+        "BSXFlags",
+        "NiControllerManager",
+        "NiMultiTargetTransformController",
+        "NiControllerSequence",
+        "NiFloatInterpolator",
+        "NiFloatData",
+        "BSLightingShaderPropertyFloatController",
+        "NiBlendFloatInterpolator",
+        "NiTextKeyExtraData",
+        "NiDefaultAVObjectPalette",
+        "NiNode",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkTransformShape",
+        "bhkListShape",
+        "bhkRigidBody",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet",
+        "NiAlphaProperty"
+      ]
+    },
+    {
+      "path": "clutter/weaponrack/wrplaqueleft01.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkTransformShape",
+        "bhkSimpleShapePhantom",
+        "bhkSPCollisionObject",
+        "NiNode",
+        "bhkCompressedMeshShapeData",
+        "bhkCompressedMeshShape",
+        "bhkRigidBodyT",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet"
+      ]
+    },
+    {
+      "path": "clutter/weaponrack/wrplaqueright01.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkTransformShape",
+        "bhkSimpleShapePhantom",
+        "bhkSPCollisionObject",
+        "NiNode",
+        "bhkCompressedMeshShapeData",
+        "bhkCompressedMeshShape",
+        "bhkRigidBodyT",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet"
+      ]
+    },
+    {
+      "path": "clutter/weaponrack/wrplaqueshield01.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkTransformShape",
+        "bhkSimpleShapePhantom",
+        "bhkSPCollisionObject",
+        "NiNode",
+        "bhkCompressedMeshShapeData",
+        "bhkCompressedMeshShape",
+        "bhkRigidBodyT",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet"
+      ]
+    },
+    {
+      "path": "dlc02/architecture/ravenrock/bulwark/rrbulwarkintend03.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkListShape",
+        "bhkRigidBody",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet"
+      ]
+    },
+    {
+      "path": "dlc02/clutter/levers/expspidercraftinglever/expspidercraftinglever.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSBehaviorGraphExtraData",
+        "BSXFlags",
+        "NiNode",
+        "NiTransformController",
+        "NiTransformInterpolator",
+        "NiTransformData",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkListShape",
+        "bhkRigidBody",
+        "bhkCollisionObject"
+      ]
+    },
+    {
+      "path": "dungeons/caves/blackreach/blackreacheceiling01.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkTransformShape",
+        "bhkListShape",
+        "bhkRigidBody",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet"
+      ]
+    },
+    {
+      "path": "dungeons/caves/green/epic/cavegemid01.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkTransformShape",
+        "bhkListShape",
+        "bhkRigidBody",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet"
+      ]
+    },
+    {
+      "path": "dungeons/nordic/levers/pullbar/genpullbar01.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSBehaviorGraphExtraData",
+        "BSXFlags",
+        "NiNode",
+        "NiTransformController",
+        "NiTransformInterpolator",
+        "NiTransformData",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkListShape",
+        "bhkRigidBody",
+        "bhkCollisionObject"
+      ]
+    },
+    {
+      "path": "furniture/laddertall.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSFurnitureMarkerNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkTransformShape",
+        "bhkSimpleShapePhantom",
+        "bhkSPCollisionObject",
+        "NiNode",
+        "bhkBoxShape",
+        "bhkRigidBodyT",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet"
+      ]
+    },
+    {
+      "path": "landscape/trees/treepineforestuprooted01.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSXFlags",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkTransformShape",
+        "bhkCapsuleShape",
+        "bhkListShape",
+        "bhkRigidBody",
+        "bhkCollisionObject",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSShaderTextureSet",
+        "NiAlphaProperty"
+      ]
+    },
+    {
+      "path": "traps/magiccaster02/trapmagiccaster02.nif",
+      "strips_blocks": [
+        "NiTriStripsData"
+      ],
+      "all_block_types": [
+        "BSFadeNode",
+        "BSBehaviorGraphExtraData",
+        "BSXFlags",
+        "NiNode",
+        "NiFloatExtraData",
+        "NiFloatExtraDataController",
+        "NiVisController",
+        "NiTransformController",
+        "NiTransformInterpolator",
+        "NiTransformData",
+        "NiBoolInterpolator",
+        "NiBoolData",
+        "NiFloatInterpolator",
+        "NiFloatData",
+        "BSTriShape",
+        "BSLightingShaderProperty",
+        "BSLightingShaderPropertyColorController",
+        "BSLightingShaderPropertyFloatController",
+        "NiPoint3Interpolator",
+        "NiPosData",
+        "BSShaderTextureSet",
+        "NiTriStripsData",
+        "bhkNiTriStripsShape",
+        "bhkMoppBvTreeShape",
+        "bhkConvexVerticesShape",
+        "bhkListShape",
+        "bhkSimpleShapePhantom",
+        "bhkSPCollisionObject"
+      ]
+    }
+  ]
+}
