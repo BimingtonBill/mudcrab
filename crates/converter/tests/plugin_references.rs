@@ -1432,6 +1432,88 @@ fn load_order_export_writes_the_room_graph_with_remapped_marker_ids() {
     );
 }
 
+/// `XPOD` is an array of (origin, destination) pairs (xEdit 4.1.5f defs): a mod's portal with
+/// two pairs has all four FormIDs remapped from a non-first plugin.
+#[test]
+fn a_two_pair_xpod_is_remapped_in_every_pair() {
+    let word = |value: u32| value.to_le_bytes().to_vec();
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let payload = [
+        word(0x0100_0801),
+        word(0x0100_0802),
+        word(0x0100_0803),
+        word(0x0100_0804),
+    ]
+    .concat();
+    assert_eq!(payload.len(), 16);
+    let patch = plugin(
+        dir.path(),
+        "Patch.esm",
+        &["Base.esm"],
+        1,
+        record(b"REFR", 0x0100_0900, 0, sub(b"XPOD", &payload)),
+    );
+    let merged = EsmParser::merge_plugins(&[base, filler, patch]).unwrap();
+    let data = &merged[&0x0200_0900]
+        .subrecords
+        .iter()
+        .find(|(name, _)| name.as_slice() == b"XPOD")
+        .expect("XPOD kept")
+        .1;
+    let expected = [
+        word(0x0200_0801),
+        word(0x0200_0802),
+        word(0x0200_0803),
+        word(0x0200_0804),
+    ]
+    .concat();
+    assert_eq!(data, &expected);
+
+    // A 12-byte XPOD (a pair and a half) is a whole number of FormIDs: kept, all three remapped.
+    // The old fixed 8-byte layout dropped it.
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let patch = plugin(
+        dir.path(),
+        "Patch.esm",
+        &["Base.esm"],
+        1,
+        record(b"REFR", 0x0100_0900, 0, sub(b"XPOD", &payload[..12])),
+    );
+    let merged = EsmParser::merge_plugins(&[base, filler, patch]).unwrap();
+    let data = &merged[&0x0200_0900]
+        .subrecords
+        .iter()
+        .find(|(name, _)| name.as_slice() == b"XPOD")
+        .expect("12-byte XPOD kept")
+        .1;
+    assert_eq!(
+        data,
+        &[word(0x0200_0801), word(0x0200_0802), word(0x0200_0803)].concat()
+    );
+
+    // A length that is not a multiple of four is dropped, like any other array.
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+    let patch = plugin(
+        dir.path(),
+        "Patch.esm",
+        &["Base.esm"],
+        1,
+        record(b"REFR", 0x0100_0900, 0, sub(b"XPOD", &payload[..14])),
+    );
+    let merged = EsmParser::merge_plugins(&[base, patch]).unwrap();
+    assert!(
+        merged[&0x0100_0900]
+            .subrecords
+            .iter()
+            .all(|(name, _)| name.as_slice() != b"XPOD")
+    );
+}
+
 /// Exterior cells are told apart in the real export by a grid position or a worldspace; markers
 /// in them write no room rows.
 #[test]

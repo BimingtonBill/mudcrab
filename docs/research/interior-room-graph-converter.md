@@ -1,7 +1,7 @@
 # Interior room graph: converter design (#188, converter half)
 
-Status: implemented on branch `phase1/room-graph` (2026-10-06); this note is the design it follows. The engine half (culling) is Phase 2's and
-is only sketched here where the table shape depends on it.
+Status: implemented in the converter (2026-10-06); this note is the design it follows. The engine
+half (culling) is a later PR and is only sketched here where the table shape depends on it.
 
 ## Summary
 
@@ -29,7 +29,7 @@ Subrecords on a marker reference, besides the usual `NAME` and `DATA` (position,
 |---|---|---|---|
 | `XPRM` | 32 | `float[3]` half-extents, `float[3]` colour/255, `float` unknown (0.2 room, 0.25 portal), `u32` shape (1 box, 2 sphere, 3 portal box) | every room, 2,611 portals |
 | `XMBO` | 12 | `float[3]`, equal to `XPRM[0..12]` on every room (the Creation Kit rejects a mismatch) | every room |
-| `XPOD` | 8 | two `u32` FormIDs: the rooms on either side | 2,592 portals (121 with the second id 0, 20 without `XPOD`) |
+| `XPOD` | 8 per pair | array of (origin, destination) `u32` FormID pairs (xEdit 4.1.5f defs, `wbArray` of a two-FormID struct): the rooms on either side; the masters only have one pair | 2,592 portals (121 with the second id 0, 20 without `XPOD`) |
 | `XRMR` | 4 | `u8` count of `XLRM` that follow, `u8` flags, `u16` unknown (0 or 1) | 1,991 rooms |
 | `LNAM` | 4 | `u32` FormID: lighting template for the room | follows `XRMR` when flag `0x80` is set |
 | `INAM` | 4 | `u32` FormID: image space for the room | follows `XRMR` when flag `0x40` is set |
@@ -40,7 +40,7 @@ Checked against bytes:
 - The `XRMR` count equals the number of `XLRM` on every one of the 1,991 rooms.
 - The flags match the public names exactly: `0x80` with `LNAM` on 537 + 81 rooms, `0x40` with
   `INAM` on 5 + 81, never one without the other. So rooms can carry their own lighting template
-  and image space (618 and 86 rooms). That is lighting data, worth passing to Chef's lighting plan
+  and image space (618 and 86 rooms). That is lighting data, worth passing to the lighting plan
   (#129-#135); the converter can keep it at no cost.
 - The `u16` is 1 on 667 rooms and 0 on 1,324; no public source names it. Kept raw, not used.
 - `XLRM` links: all 1,965 point to a room in the same cell, 1,950 are mirrored by a link back, and
@@ -49,11 +49,12 @@ Checked against bytes:
   treat a link as an open edge: if one room is visible, so is the other, with no narrowing.
 - Room membership is not stored on objects. The Creation Kit wiki gives the rule as the bound
   "in which its pivot point is contained" (ck.uesp.net, Room Bounds and Portal Basics; seen only
-  through a search snippet, as the page refused our fetcher). The September study measured that
-  rule: 90.6% and 99.8% of references fall in at least one room in two large interiors, 13.2% and
-  1.2% in more than one (`local/research/interior-room-culling-design.md` §1.4).
+  through a search snippet, as the page refused automated fetching). An earlier byte scan of
+  Skyrim.esm measured that rule: in Ansilvund01 and KilkreathRuins03, 90.6% and 99.8% of
+  references fall in at least one room, and 13.2% and 1.2% in more than one.
 - `XPRM` holds half-extents. A portal's `XPRM.y` is always 1.0 (a thickness placeholder), and its
-  doorway is the marker's local X-Z rectangle (normal along local +Y), from the September study.
+  doorway is the marker's local X-Z rectangle (normal along local +Y), from the same
+  earlier byte scan.
 
 Coverage: 246 of 590 interiors in Skyrim.esm have room markers, 94 have 16 or more. In the
 all-plugins conversion, 4,246 room markers and 3,098 portals sit in interiors; 159 rooms and 133
@@ -78,14 +79,16 @@ CREATE TABLE IF NOT EXISTS room_bounds (       -- one row per interior RoomMarke
 );
 CREATE INDEX IF NOT EXISTS idx_room_bounds_cell ON room_bounds(cell_id);
 
-CREATE TABLE IF NOT EXISTS room_portals (      -- one row per interior PortalMarker
-    ref_id INTEGER PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS room_portals (      -- one row per XPOD pair of an interior PortalMarker
+    ref_id INTEGER NOT NULL,                   -- not unique: one row per XPOD pair
+    pair_index INTEGER NOT NULL DEFAULT 0,
     cell_id INTEGER NOT NULL,
     pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
     rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
     half_x REAL NOT NULL, half_z REAL NOT NULL, -- doorway half-width and half-height
-    room_a INTEGER,                            -- XPOD[0]; NULL when 0, absent or not a room_bounds row of the same cell
-    room_b INTEGER                             -- XPOD[1]; same
+    room_a INTEGER,                            -- the pair's origin; NULL when 0, absent or not a room_bounds row of the same cell
+    room_b INTEGER,                            -- the pair's destination; same
+    PRIMARY KEY (ref_id, pair_index)
 );
 CREATE INDEX IF NOT EXISTS idx_room_portals_cell ON room_portals(cell_id);
 
@@ -129,7 +132,8 @@ Why this shape:
    layouts today (`crates/converter/src/esm/mod.rs`, `form_id_layout`), so they keep plugin-local
    numbering. That is invisible for Skyrim.esm (slot 0) and wrong for any mod's markers. Add them
    to the layout table, with a test beside `every_covered_reference_and_cell_field_is_remapped_at_its_offsets`
-   (`crates/converter/tests/plugin_references.rs`).
+   (`crates/converter/tests/plugin_references.rs`). `XPOD` is an array of pairs, so it is an
+   `Array { stride: 4 }` layout and a mod's portal with several pairs is remapped in full.
 2. **Graph tables.** In `export_records` (`crates/converter/src/esm/exporter.rs`), after the
    reference loop, read the markers from the parsed subrecords (not from the stored blob, which is
    rkyv's layout). Rebuild the tables each export, as the grass tables are.
@@ -148,11 +152,11 @@ membership pass (inside, outside, two rooms, rotated room); `plugin_references.r
 
 ## Fallbacks (conservative)
 
-| Case | Converter writes | Engine (Phase 2's half) |
+| Case | Converter writes | Engine (the engine half, a later PR) |
 |---|---|---|
 | Interior without room markers | no rows | draw everything, as today |
 | Old database, tables absent | n/a | feature off, no error |
-| Portal side 0, missing or not a room | `room_a`/`room_b` NULL | ignore that edge; the September study suggests a geometric fallback |
+| Portal side 0, missing or not a room | `room_a`/`room_b` NULL | ignore that edge, or fall back to the rooms whose box contains the portal's centre |
 | Object in no room / several | no row / several rows | always drawn |
 | Camera outside every room | n/a | draw everything |
 | Non-box room shape | skipped, counted | its objects are in no room, so drawn |

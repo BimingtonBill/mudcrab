@@ -31,11 +31,13 @@ pub const ROOM_TABLES_SQL: &str = r#"
          );
          CREATE INDEX IF NOT EXISTS idx_room_bounds_cell ON room_bounds(cell_id);
          CREATE TABLE IF NOT EXISTS room_portals (
-             ref_id INTEGER PRIMARY KEY, cell_id INTEGER NOT NULL,
+             ref_id INTEGER NOT NULL, pair_index INTEGER NOT NULL DEFAULT 0,
+             cell_id INTEGER NOT NULL,
              pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
              rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
              half_x REAL NOT NULL, half_z REAL NOT NULL,
-             room_a INTEGER, room_b INTEGER
+             room_a INTEGER, room_b INTEGER,
+             PRIMARY KEY (ref_id, pair_index)
          );
          CREATE INDEX IF NOT EXISTS idx_room_portals_cell ON room_portals(cell_id);
          CREATE TABLE IF NOT EXISTS room_links (
@@ -53,14 +55,90 @@ pub const ROOM_TABLES_SQL: &str = r#"
          );
 "#;
 
+/// Migrates a `room_portals` table of the older shape (`ref_id` alone as the key, no
+/// `pair_index`) to the current one in place: every existing row is copied with `pair_index` 0.
+/// `CREATE TABLE IF NOT EXISTS` cannot change an existing table's key, and dropping the table
+/// would leave it empty beside `room_bounds` after a subset export or a failed full export.
+/// Runs in one savepoint, so it is atomic whether or not a transaction is already open. Call
+/// before executing `ROOM_TABLES_SQL`.
+pub fn migrate_room_portals(conn: &Connection) -> Result<()> {
+    let has_table: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='room_portals'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if has_table.is_none() {
+        return Ok(());
+    }
+    let has_pair_index: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('room_portals') WHERE name='pair_index'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if has_pair_index.is_some() {
+        return Ok(());
+    }
+    // Outside a transaction the savepoint opens one, and RELEASE then commits it; that
+    // commit can fail (SQLITE_BUSY while another connection reads the file).
+    let outermost = conn.is_autocommit();
+    conn.execute_batch("SAVEPOINT room_portals_migration")?;
+    let migrated = conn.execute_batch(
+        "DROP TABLE IF EXISTS room_portals_new;
+         CREATE TABLE room_portals_new (
+             ref_id INTEGER NOT NULL, pair_index INTEGER NOT NULL DEFAULT 0,
+             cell_id INTEGER NOT NULL,
+             pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
+             rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
+             half_x REAL NOT NULL, half_z REAL NOT NULL,
+             room_a INTEGER, room_b INTEGER,
+             PRIMARY KEY (ref_id, pair_index)
+         );
+         INSERT INTO room_portals_new (ref_id, pair_index, cell_id, pos_x, pos_y, pos_z,
+                                       rot_x, rot_y, rot_z, half_x, half_z, room_a, room_b)
+             SELECT ref_id, 0, cell_id, pos_x, pos_y, pos_z,
+                    rot_x, rot_y, rot_z, half_x, half_z, room_a, room_b
+             FROM room_portals;
+         DROP TABLE room_portals;
+         ALTER TABLE room_portals_new RENAME TO room_portals;
+         CREATE INDEX IF NOT EXISTS idx_room_portals_cell ON room_portals(cell_id);",
+    );
+    match migrated.and_then(|()| conn.execute_batch("RELEASE room_portals_migration")) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Undo the partial migration and close the savepoint, including after a failed
+            // RELEASE, so no transaction is left open; report the original error. When the
+            // savepoint opened the transaction, ROLLBACK ends it (a second RELEASE could fail
+            // the same way); inside the caller's transaction, releasing a nested savepoint
+            // commits nothing and cannot be busy.
+            let cleanup = if outermost {
+                "ROLLBACK"
+            } else {
+                "ROLLBACK TO room_portals_migration; RELEASE room_portals_migration"
+            };
+            let _ = conn.execute_batch(cleanup);
+            Err(error)
+        }
+    }
+}
+
 /// Counters for the conversion report (`integration-report.json`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomGraphReport {
     pub rooms: u64,
+    /// Portal markers written, one count per marker however many `room_portals` rows it has.
     pub portals: u64,
     pub links: u64,
-    /// Portals whose `room_a` or `room_b` is NULL (0, missing or not a room of the same cell).
+    /// `room_portals` rows whose `room_a` or `room_b` is NULL (0, missing or not a room of the
+    /// same cell). A portal with several pairs adds one per such row.
     pub portals_with_missing_side: u64,
+    /// Portal markers whose `XPOD` holds more than one (origin, destination) pair.
+    pub portals_with_extra_pairs: u64,
+    /// Portal markers whose `XPOD` length is not a multiple of 8; the trailing bytes are ignored.
+    pub portals_with_trailing_xpod_bytes: u64,
     /// Interior room markers that are not boxes; they get no row and their objects count as
     /// being in no room.
     pub non_box_rooms_skipped: u64,
@@ -76,11 +154,13 @@ pub struct RoomGraphReport {
     pub overlap_rows: u64,
 }
 
-const STAT_NAMES: [&str; 10] = [
+const STAT_NAMES: [&str; 12] = [
     "rooms",
     "portals",
     "links",
     "portals_with_missing_side",
+    "portals_with_extra_pairs",
+    "portals_with_trailing_xpod_bytes",
     "non_box_rooms_skipped",
     "portals_without_size_skipped",
     "invalid_markers_skipped",
@@ -90,12 +170,14 @@ const STAT_NAMES: [&str; 10] = [
 ];
 
 impl RoomGraphReport {
-    fn values(&self) -> [u64; 10] {
+    fn values(&self) -> [u64; 12] {
         [
             self.rooms,
             self.portals,
             self.links,
             self.portals_with_missing_side,
+            self.portals_with_extra_pairs,
+            self.portals_with_trailing_xpod_bytes,
             self.non_box_rooms_skipped,
             self.portals_without_size_skipped,
             self.invalid_markers_skipped,
@@ -140,6 +222,10 @@ impl RoomGraphReport {
                 "portals" => report.portals = value,
                 "links" => report.links = value,
                 "portals_with_missing_side" => report.portals_with_missing_side = value,
+                "portals_with_extra_pairs" => report.portals_with_extra_pairs = value,
+                "portals_with_trailing_xpod_bytes" => {
+                    report.portals_with_trailing_xpod_bytes = value
+                }
                 "non_box_rooms_skipped" => report.non_box_rooms_skipped = value,
                 "portals_without_size_skipped" => report.portals_without_size_skipped = value,
                 "invalid_markers_skipped" => report.invalid_markers_skipped = value,
@@ -449,10 +535,19 @@ pub fn export_room_graph(
             report.invalid_markers_skipped += 1;
             continue;
         }
-        let side = |offset: usize| {
-            view.find(b"XPOD")
-                .filter(|data| data.len() >= 8)
-                .and_then(|data| u32_at(data, offset))
+        // `XPOD` is an array of (origin, destination) pairs of 8 bytes (xEdit 4.1.5f defs).
+        // One row per pair; a portal with no complete pair gets one row with NULL sides.
+        let xpod = view.find(b"XPOD").unwrap_or(&[]);
+        let pairs = xpod.len() / 8;
+        if pairs > 1 {
+            report.portals_with_extra_pairs += 1;
+        }
+        if !xpod.len().is_multiple_of(8) {
+            report.portals_with_trailing_xpod_bytes += 1;
+        }
+        let side = |pair: usize, offset: usize| {
+            u32_at(xpod, pair * 8 + offset)
+                .filter(|_| pair < pairs)
                 .filter(|id| {
                     *id != 0
                         && rooms_by_cell
@@ -460,19 +555,21 @@ pub fn export_room_graph(
                             .is_some_and(|rooms| rooms.iter().any(|room| room.ref_id == *id))
                 })
         };
-        let (room_a, room_b) = (side(0), side(4));
-        tx.execute(
-            "INSERT OR REPLACE INTO room_portals(ref_id, cell_id, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, half_x, half_z, room_a, room_b)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                form_id, cell, position[0], position[1], position[2], rotation[0], rotation[1],
-                rotation[2], half_x, half_z, room_a, room_b
-            ],
-        )?;
-        report.portals += 1;
-        if room_a.is_none() || room_b.is_none() {
-            report.portals_with_missing_side += 1;
+        for pair in 0..pairs.max(1) {
+            let (room_a, room_b) = (side(pair, 0), side(pair, 4));
+            tx.execute(
+                "INSERT OR REPLACE INTO room_portals(ref_id, pair_index, cell_id, pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, half_x, half_z, room_a, room_b)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    form_id, pair as i64, cell, position[0], position[1], position[2],
+                    rotation[0], rotation[1], rotation[2], half_x, half_z, room_a, room_b
+                ],
+            )?;
+            if room_a.is_none() || room_b.is_none() {
+                report.portals_with_missing_side += 1;
+            }
         }
+        report.portals += 1;
     }
 
     // Membership: every placed object of a cell with rooms except the markers themselves.
