@@ -165,7 +165,8 @@ fn generated_interior_plugin_holds_an_interior_cell_and_a_door_pair() {
     // reference's own (`form_id_layout` in `crates/converter/src/esm/mod.rs`),
     // so the doors keep pointing at each other in any load-order slot. The
     // fixture is the only plugin here, at index 0, so the values are unchanged.
-    // Nothing consumes `XTEL` yet.
+    // The converter exports it to `door_links` (see
+    // `docs/specs/converters/db-schema.md`) for the engine's door crossing.
     let inside_xtel = subrecord_or_panic(inside_ref, b"XTEL");
     let outside_xtel = subrecord_or_panic(outside_ref, b"XTEL");
     assert_eq!(inside_xtel.len(), 32, "Skyrim SE's XTEL");

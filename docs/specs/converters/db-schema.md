@@ -158,19 +158,26 @@ CREATE TABLE IF NOT EXISTS door_links (
     ref_id INTEGER PRIMARY KEY,           -- Source door reference (`references.id`)
     destination_ref_id INTEGER NOT NULL,  -- XTEL bytes 0-3, load-order numbering like `references.id`
     pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,  -- XTEL bytes 4-15, arrival position
-    rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,  -- XTEL bytes 16-27, arrival rotation
+    rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,  -- XTEL bytes 16-27, arrival rotation (radians)
     destination_cell_id INTEGER,          -- `references.cell_id` of the destination; NULL if unresolved
     destination_worldspace_id INTEGER     -- `references.worldspace_id` of the destination; NULL for an interior or unresolved
 );
 ```
 
 The arrival position and rotation are the door's own `XTEL` values, not the
-destination reference's transform. The destination cell and worldspace are
-resolved after every reference is written; a destination outside the exported
-plugins leaves both NULL. The plugin loader already drops an `XTEL` that is not
-32 bytes (the only length its FormID remap accepts); the exporter also skips
-one that is not 32 bytes, or one with a NaN or infinite position or rotation,
-with a warning.
+destination reference's transform; the rotation is in radians, as stored in
+`XTEL`. The destination cell and worldspace are resolved after every reference is
+written: `destination_cell_id` is the destination reference's own
+`references.cell_id` as stored, and `destination_worldspace_id` is its
+`references.worldspace_id`. A destination outside the exported plugins leaves
+both NULL; for an exterior arrival the destination worldspace plus the arrival
+position is the reliable pair. The loader rewrites an `XTEL` destination it could
+not resolve (a master that is not in the load order) to 0, so such a link is
+exported as `destination_ref_id = 0` with both destination columns NULL: a reader
+treats `destination_ref_id = 0` as "no destination". The plugin loader already
+drops an `XTEL` that is not 32 bytes (the only length its FormID remap accepts);
+the exporter also skips one that is not 32 bytes, or one with a NaN or infinite
+position or rotation, with a warning.
 The flags word (bytes 28-31) is not exported. A reference exported again
 without a usable `XTEL` loses its row. Field layout: xEdit 4.1.5f defs,
 `Core/wbDefinitionsTES5.pas:12344-12350` (Door, PosRot, Flags).

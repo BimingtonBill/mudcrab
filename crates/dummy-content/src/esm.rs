@@ -633,9 +633,9 @@ fn reference_record(form_id: u32, cell: &Cell) -> Result<Vec<u8>> {
 ///
 /// `destination_ref_id` is written as the fixture's own local id. The
 /// converter's load-order remap rewrites it into load-order numbering like the
-/// reference's own FormID, so the link survives any load-order slot. Nothing
-/// consumes `XTEL` yet, so the link is only as good as the fixture's own reader
-/// (`crates/converter/tests/fixture_doors.rs`).
+/// reference's own FormID, so the link survives any load-order slot. The
+/// converter exports it to the `door_links` table (see
+/// `docs/specs/converters/db-schema.md`) for the engine's door crossing.
 fn door_reference_record(
     form_id: u32,
     base_form_id: u32,

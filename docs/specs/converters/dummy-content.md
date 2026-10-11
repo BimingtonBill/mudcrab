@@ -129,7 +129,8 @@ client would consume; the [ADRs](../../adr/README.md) record the reasoning:
 - `XTEL` destination FormIDs are written as the fixture's own local IDs. The converter's
   load-order remap rewrites them into load-order numbering like each reference's own FormID,
   so the door links survive any load-order slot. The single-plugin `dummy-content gen` case
-  occupies index 0, where these values are unchanged. Nothing consumes `XTEL` yet.
+  occupies index 0, where these values are unchanged. The converter exports `XTEL` to the
+  `door_links` table (see `docs/specs/converters/db-schema.md`) for the engine's door crossing.
 - A light reference's `XRDS` is a single little-endian `f32` rather than a FormID, so the
   load-order remap leaves it alone and a reader gets the value as written. The base record's
   `DATA` puts the radius at bytes 4..8 (`u32`), the colour at 8..11, the flags at 12..16 (`u32`)
