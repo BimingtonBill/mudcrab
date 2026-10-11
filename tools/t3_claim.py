@@ -8,6 +8,7 @@ the same task.
   python tools/t3_claim.py claim <id> --thread <label>
   python tools/t3_claim.py set <id> <active|waiting|parked|done> [--note "..."]
   python tools/t3_claim.py claimed
+  python tools/t3_claim.py add --title "..." --owner "..." --detail "..." [--prefix R] [--full "..."]
 """
 
 import argparse
@@ -188,6 +189,70 @@ def cmd_claimed(_args):
         print(f"{path.stem} | {by[len('- Claimed by:'):].strip()} | {state[len('- State:'):].strip()}")
 
 
+NEW_HEADING = "## New tasks (added from threads)"
+
+
+def clean(text):
+    """One line, no table separators."""
+    return " ".join((text or "").replace("|", "/").split())
+
+
+def known_ids():
+    ids = set()
+    for path in (QUEUE, SPECS):
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").split("\n"):
+                cells = line.split("|")
+                if len(cells) >= 3:
+                    ids.add(cells[1].strip())
+    for path in list(STATUS_DIR.glob("*.md")) + list(ARCHIVE_DIR.glob("*.md")):
+        ids.add(path.stem)
+    return ids
+
+
+def insert_row(text, row):
+    """Put the row in the 'New tasks' table, creating that section above 'Waiting on the user' if needed."""
+    lines = text.split("\n")
+    head = next((i for i, l in enumerate(lines) if l.strip() == NEW_HEADING), None)
+    if head is None:
+        wait = next((i for i, l in enumerate(lines) if l.startswith("## Waiting on the user")), None)
+        if wait is None:
+            sys.exit("no 'Waiting on the user' heading in the queue to place the new section above")
+        lines[wait:wait] = [NEW_HEADING, "", "| # | Task | Owner | Status | Detail |",
+                            "|---|---|---|---|---|", row, ""]
+    else:
+        end = next((i for i in range(head + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+        last = max(i for i in range(head, end) if lines[i].startswith("|"))
+        lines.insert(last + 1, row)
+    return "\n".join(lines)
+
+
+def cmd_add(args):
+    prefix = args.prefix.upper()
+    if not re.fullmatch(r"[A-Z]{1,3}", prefix):
+        sys.exit("prefix must be 1 to 3 letters, e.g. R for research")
+    title = clean(args.title)
+    detail = clean(args.detail)
+    full = clean(args.full) or title
+    if not title or not detail:
+        sys.exit("a title and a detail are needed")
+    acquire_lock()
+    try:
+        numbers = [int(m.group(1)) for i in known_ids()
+                   if (m := re.fullmatch(rf"{prefix}(\d+)", i))]
+        new_id = f"{prefix}{max(numbers, default=0) + 1}"
+        row = f"| {new_id} | {title} | {clean(args.owner)} | queued | {detail} |"
+        QUEUE.write_text(insert_row(QUEUE.read_text(encoding="utf-8"), row), encoding="utf-8")
+        if not SPECS.exists():
+            SPECS.write_text("# Original task text per queue row\n\n| # | Original task | Original detail |\n"
+                             "|---|---|---|\n", encoding="utf-8")
+        with SPECS.open("a", encoding="utf-8") as f:
+            f.write(f"| {new_id} | {full} | {detail} |\n")
+    finally:
+        release_lock()
+    print(new_id)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -197,6 +262,13 @@ def main():
     claim.add_argument("id")
     claim.add_argument("--thread", required=True)
     claim.set_defaults(run=cmd_claim)
+    add = sub.add_parser("add", help="add a new task to the queue; prints its ID")
+    add.add_argument("--title", required=True, help="plain-language name, readable at a glance")
+    add.add_argument("--owner", required=True, help="track or person, e.g. 'Team Lead' or 'the user'")
+    add.add_argument("--detail", required=True, help="one line: what done means")
+    add.add_argument("--full", help="full description (goes to task-specs.md; defaults to the title)")
+    add.add_argument("--prefix", default="N", help="1-3 letter ID prefix, e.g. R for research")
+    add.set_defaults(run=cmd_add)
     setp = sub.add_parser("set")
     setp.add_argument("id")
     setp.add_argument("state")
