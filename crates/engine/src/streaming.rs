@@ -1582,14 +1582,24 @@ fn attach_authored_collision(
     }
 }
 
-/// Every point of a shape, for the convex hull of a non-convex body.
-fn shape_hull_points(shape: &CollisionShape, points: &mut Vec<Vec3>) {
+/// Most points one convexified dynamic body may expand to. A body may list a shape index many
+/// times, so the cost is the sum over every occurrence, not over the distinct shapes.
+const MAX_CLUTTER_HULL_POINTS: usize = 1_000_000;
+
+/// Every point of a shape, for the convex hull of a non-convex body, handed to `emit`.
+///
+/// The copy and the count both run through here, so the two cannot drift apart.
+fn for_each_shape_hull_point(shape: &CollisionShape, mut emit: impl FnMut(Vec3)) {
     match shape {
         CollisionShape::Mesh { vertices, .. } => {
-            points.extend(vertices.iter().copied().map(Vec3::from_array));
+            for vertex in vertices {
+                emit(Vec3::from_array(*vertex));
+            }
         }
         CollisionShape::Hull { points: hull } => {
-            points.extend(hull.iter().copied().map(Vec3::from_array));
+            for point in hull {
+                emit(Vec3::from_array(*point));
+            }
         }
         CollisionShape::Box {
             center,
@@ -1603,7 +1613,7 @@ fn shape_hull_points(shape: &CollisionShape, points: &mut Vec<Vec3>) {
                     if corner & 2 == 0 { -1.0 } else { 1.0 },
                     if corner & 4 == 0 { -1.0 } else { 1.0 },
                 );
-                points.push(center + sign * half);
+                emit(center + sign * half);
             }
         }
         CollisionShape::Capsule { a, b, radius } => {
@@ -1629,18 +1639,53 @@ fn shape_hull_points(shape: &CollisionShape, points: &mut Vec<Vec3>) {
             ];
             for end in [Vec3::from_array(*a), Vec3::from_array(*b)] {
                 for direction in DIRECTIONS {
-                    points.push(end + direction * *radius);
-                    points.push(end - direction * *radius);
+                    emit(end + direction * *radius);
+                    emit(end - direction * *radius);
                 }
             }
         }
     }
 }
 
+/// Every point of a shape, for the convex hull of a non-convex body.
+fn shape_hull_points(shape: &CollisionShape, points: &mut Vec<Vec3>) {
+    for_each_shape_hull_point(shape, |point| points.push(point));
+}
+
+/// How many points [`shape_hull_points`] would append for `shape`, counted without allocating.
+fn shape_hull_point_count(shape: &CollisionShape) -> usize {
+    let mut count = 0usize;
+    for_each_shape_hull_point(shape, |_| count += 1);
+    count
+}
+
+/// The checked total of the points every listed shape contributes, repeats included, or `None`
+/// when the running total passes `budget`. Bailing out early keeps a long list of indices from
+/// being counted in full.
+fn clutter_hull_point_total(shapes: &[&CollisionShape], budget: usize) -> Option<usize> {
+    let mut total = 0usize;
+    for shape in shapes {
+        total = total.checked_add(shape_hull_point_count(shape))?;
+        if total > budget {
+            return None;
+        }
+    }
+    Some(total)
+}
+
 /// Decide whether a movable-type model's authored data gives it a dynamic body (#104 phase a).
 /// Takes the first dynamic body; a body whose shapes are not all convex primitives (or that lists
 /// any trimesh) becomes one convex hull, counted by the caller.
 fn clutter_decision_from_asset(asset: &CollisionAsset) -> StaticCollisionDecision {
+    clutter_decision_from_asset_within(asset, MAX_CLUTTER_HULL_POINTS)
+}
+
+/// As [`clutter_decision_from_asset`], with the hull point limit injectable so a test does not
+/// need a million points to reach it.
+fn clutter_decision_from_asset_within(
+    asset: &CollisionAsset,
+    point_budget: usize,
+) -> StaticCollisionDecision {
     let mut dynamic = asset
         .bodies
         .iter()
@@ -1667,14 +1712,23 @@ fn clutter_decision_from_asset(asset: &CollisionAsset) -> StaticCollisionDecisio
         || shapes
             .iter()
             .any(|shape| matches!(shape, CollisionShape::Mesh { .. }));
+    // The budget is checked over every listed occurrence before a single point is copied or any
+    // collider is built: a corrupt or crafted body may list one shape index thousands of times,
+    // and building first would allocate hundreds of megabytes only to reject the result. It holds
+    // for both branches: the convex-primitive one builds one collider per listed occurrence.
+    let Some(point_count) = clutter_hull_point_total(&shapes, point_budget) else {
+        return StaticCollisionDecision::ClutterSkipped(
+            "dynamic body has too many hull points".to_owned(),
+        );
+    };
     let parts = if convexify {
-        let mut points = Vec::new();
+        let mut points = Vec::with_capacity(point_count);
         for shape in &shapes {
             shape_hull_points(shape, &mut points);
         }
-        if points.len() > 1_000_000 || points.iter().any(|point| !point.is_finite()) {
+        if points.iter().any(|point| !point.is_finite()) {
             return StaticCollisionDecision::ClutterSkipped(
-                "dynamic body has invalid or too many hull points".to_owned(),
+                "dynamic body has invalid hull points".to_owned(),
             );
         }
         match Collider::convex_hull(&points) {
@@ -6915,6 +6969,185 @@ mod tests {
         assert_eq!(metrics.dynamic_clutter_bodies, 0);
         assert!(app.world().get::<RigidBody>(misc).is_none());
         assert!(app.world().get::<Collider>(misc).is_none());
+    }
+
+    /// A pyramid mesh: five points with a 3D hull, and a body listing it is always convexified.
+    fn pyramid_mesh() -> CollisionShape {
+        CollisionShape::Mesh {
+            vertices: vec![
+                [0.0, 0.0, 0.0],
+                [20.0, 0.0, 0.0],
+                [0.0, 20.0, 0.0],
+                [0.0, 0.0, 20.0],
+                [5.0, 5.0, 5.0],
+            ],
+            triangles: vec![[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]],
+        }
+    }
+
+    /// The point limit is injectable, so these tests reach it without millions of points.
+    fn clutter_decision_within(asset: &CollisionAsset, budget: usize) -> StaticCollisionDecision {
+        clutter_decision_from_asset_within(asset, budget)
+    }
+
+    fn skip_reason(decision: StaticCollisionDecision) -> String {
+        match decision {
+            StaticCollisionDecision::ClutterSkipped(reason) => reason,
+            _ => panic!("expected a skipped dynamic body"),
+        }
+    }
+
+    /// A corrupt body may list one in-range index thousands of times. The count is over every
+    /// occurrence and is checked before any point is copied: the reviewer's fixture packs 4_096
+    /// occurrences of a 4_096-point hull (16_777_216 points, ~192 MiB) into a 72 KB file.
+    #[test]
+    fn a_body_repeating_one_shape_index_is_rejected_before_expansion() {
+        let asset = CollisionAsset {
+            version: 2,
+            authored: true,
+            shapes: vec![CollisionShape::Hull {
+                points: (0..4_096)
+                    .map(|index| {
+                        let index = index as f32;
+                        [index, index % 64.0, index % 17.0]
+                    })
+                    .collect(),
+            }],
+            skipped: Vec::new(),
+            bodies: vec![clutter_body(BodyKind::Dynamic, vec![0; 4_096], false)],
+        };
+        assert_eq!(shape_hull_point_count(&asset.shapes[0]), 4_096);
+        // Under a small injected budget the body is rejected, and the reason is the budget rather
+        // than a hull that could not be built.
+        let reason = skip_reason(clutter_decision_within(&asset, 1_000));
+        assert!(reason.contains("too many hull points"), "{reason}");
+        // The same holds for the real limit of the shipped path: 16_777_216 points is over it.
+        const { assert!(4_096 * 4_096 > MAX_CLUTTER_HULL_POINTS) };
+        let reason = skip_reason(clutter_decision_from_asset(&asset));
+        assert!(reason.contains("too many hull points"), "{reason}");
+    }
+
+    /// Each shape alone is well under the budget; what is counted is the total of all of them.
+    #[test]
+    fn distinct_shapes_over_the_budget_together_are_rejected() {
+        let asset = CollisionAsset {
+            version: 2,
+            authored: true,
+            shapes: vec![
+                CollisionShape::Box {
+                    center: [0.0, 0.0, 0.0],
+                    half_extents: [1.0, 2.0, 3.0],
+                },
+                CollisionShape::Capsule {
+                    a: [0.0, 0.0, 0.0],
+                    b: [4.0, 0.0, 0.0],
+                    radius: 1.0,
+                },
+                pyramid_mesh(),
+            ],
+            skipped: Vec::new(),
+            bodies: vec![clutter_body(BodyKind::Dynamic, vec![0, 1, 2], false)],
+        };
+        assert_eq!(shape_hull_point_count(&asset.shapes[0]), 8);
+        assert_eq!(shape_hull_point_count(&asset.shapes[1]), 52);
+        assert_eq!(shape_hull_point_count(&asset.shapes[2]), 5);
+        // 8 + 52 + 5 = 65, so 64 is one point short and 65 fits exactly.
+        let reason = skip_reason(clutter_decision_within(&asset, 64));
+        assert!(reason.contains("too many hull points"), "{reason}");
+        assert!(matches!(
+            clutter_decision_within(&asset, 65),
+            StaticCollisionDecision::Clutter(_)
+        ));
+    }
+
+    /// The convex-primitive branch builds one collider per listed occurrence, so it answers to the
+    /// same budget: a convex body listing one hull index thousands of times is rejected too.
+    #[test]
+    fn a_convex_body_repeating_one_hull_index_is_rejected_before_any_collider_is_built() {
+        let asset = CollisionAsset {
+            version: 2,
+            authored: true,
+            shapes: vec![CollisionShape::Hull {
+                points: (0..64)
+                    .map(|index| {
+                        let index = index as f32;
+                        [index, index % 8.0, index % 5.0]
+                    })
+                    .collect(),
+            }],
+            skipped: Vec::new(),
+            bodies: vec![clutter_body(BodyKind::Dynamic, vec![0; 4_096], true)],
+        };
+        let reason = skip_reason(clutter_decision_within(&asset, 1_000));
+        assert!(reason.contains("too many hull points"), "{reason}");
+        // Listed once it is a single collider part and fits.
+        let mut once = asset;
+        once.bodies[0].shapes = vec![0];
+        assert!(matches!(
+            clutter_decision_within(&once, 1_000),
+            StaticCollisionDecision::Clutter(_)
+        ));
+    }
+
+    /// A body inside the budget is unaffected: it still gets its one convex hull.
+    #[test]
+    fn a_body_just_under_the_budget_still_produces_a_hull() {
+        let mut asset = CollisionAsset {
+            version: 2,
+            authored: true,
+            shapes: vec![pyramid_mesh()],
+            skipped: Vec::new(),
+            bodies: vec![clutter_body(BodyKind::Dynamic, vec![0], false)],
+        };
+        // One occurrence costs five points: comfortably inside a budget of ten.
+        assert!(matches!(
+            clutter_decision_within(&asset, 10),
+            StaticCollisionDecision::Clutter(_)
+        ));
+        // Listed twice it costs ten, which fits exactly.
+        asset.bodies[0].shapes = vec![0, 0];
+        let spec = match clutter_decision_within(&asset, 10) {
+            StaticCollisionDecision::Clutter(spec) => *spec,
+            _ => panic!("a body inside the budget must keep its hull"),
+        };
+        assert!(spec.convexified);
+        assert_eq!(spec.parts.len(), 1);
+        assert!(spec.parts[0].collider.as_convex_polyhedron().is_some());
+        let reason = skip_reason(clutter_decision_within(&asset, 9));
+        assert!(reason.contains("too many hull points"), "{reason}");
+    }
+
+    /// The count a budget is checked against is the number of points the copy appends, for every
+    /// shape kind.
+    #[test]
+    fn the_counted_hull_points_match_the_appended_points() {
+        let shapes = [
+            pyramid_mesh(),
+            CollisionShape::Hull {
+                points: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            },
+            CollisionShape::Box {
+                center: [1.0, 2.0, 3.0],
+                half_extents: [1.0, 2.0, 3.0],
+            },
+            CollisionShape::Capsule {
+                a: [0.0, 0.0, 0.0],
+                b: [4.0, 0.0, 0.0],
+                radius: 1.0,
+            },
+        ];
+        // 5 mesh vertices, 3 hull points, 8 box corners, 26 points at each of two capsule ends.
+        let expected = [5, 3, 8, 52];
+        for (shape, expected) in shapes.iter().zip(expected) {
+            let mut points = Vec::new();
+            shape_hull_points(shape, &mut points);
+            assert_eq!(points.len(), expected);
+            assert_eq!(shape_hull_point_count(shape), points.len());
+        }
+        // A repeat costs its points again, the same way the copy would.
+        let repeated = [&shapes[0], &shapes[0], &shapes[1]];
+        assert_eq!(clutter_hull_point_total(&repeated, 13), Some(13));
+        assert_eq!(clutter_hull_point_total(&repeated, 12), None);
     }
 
     #[test]
