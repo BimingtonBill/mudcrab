@@ -33,13 +33,20 @@ pub struct LoadDoor {
 
 /// The [`LoadDoor`] of a reference with this `door_links` row, or `None` when it has no row or the
 /// link's destination cannot be resolved to an interior cell or a worldspace.
+///
+/// Both halves of the destination are form ids, and 0 is no form: a `Some(0)` worldspace is as
+/// unresolved as a `Some(0)` cell and reads as `None` here (the converter copies whatever
+/// `worldspace_id` the destination cell has). The rules below then apply unchanged, so
+/// `(0, cell != 0)` is an interior door to that cell, `(0, 0)` and `(0, None)` are no door, and any
+/// real worldspace id still leads outside.
 pub(crate) fn load_door(ref_id: u32, link: Option<&DoorLinkRow>) -> Option<LoadDoor> {
     let link = link?;
-    let interior_cell_id = match (link.destination_worldspace_id, link.destination_cell_id) {
+    let worldspace_id = link.destination_worldspace_id.filter(|id| *id != 0);
+    let interior_cell_id = match (worldspace_id, link.destination_cell_id) {
         (None, Some(cell_id)) if cell_id != 0 => Some(cell_id),
         _ => None,
     };
-    if interior_cell_id.is_none() && link.destination_worldspace_id.is_none() {
+    if interior_cell_id.is_none() && worldspace_id.is_none() {
         return None;
     }
     Some(LoadDoor {
@@ -47,7 +54,7 @@ pub(crate) fn load_door(ref_id: u32, link: Option<&DoorLinkRow>) -> Option<LoadD
         destination: DoorDestination {
             destination_ref_id: link.destination_ref_id,
             interior_cell_id,
-            worldspace_id: link.destination_worldspace_id,
+            worldspace_id,
             arrival_position: link.arrival_position,
             arrival_rotation: link.arrival_rotation,
         },
@@ -83,6 +90,8 @@ mod tests {
         let door = load_door(5, Some(&link(Some(12), Some(60)))).unwrap();
         assert_eq!(door.destination.interior_cell_id, None);
         assert_eq!(door.destination.worldspace_id, Some(60));
+        let exterior_only = load_door(5, Some(&link(None, Some(60)))).unwrap();
+        assert_eq!(exterior_only.destination.worldspace_id, Some(60));
     }
 
     #[test]
@@ -90,5 +99,20 @@ mod tests {
         assert!(load_door(5, None).is_none());
         assert!(load_door(5, Some(&link(None, None))).is_none());
         assert!(load_door(5, Some(&link(Some(0), None))).is_none());
+    }
+
+    #[test]
+    fn a_zero_worldspace_leaves_a_real_cell_link_an_interior_door() {
+        // Worldspace 0 is never a worldspace, so it reads as unresolved and the cell carries the
+        // door, exactly as for a link with a NULL worldspace.
+        let door = load_door(5, Some(&link(Some(12), Some(0)))).unwrap();
+        assert_eq!(door.destination.interior_cell_id, Some(12));
+        assert_eq!(door.destination.worldspace_id, None);
+    }
+
+    #[test]
+    fn a_zero_worldspace_without_a_real_cell_is_no_load_door() {
+        assert!(load_door(5, Some(&link(None, Some(0)))).is_none());
+        assert!(load_door(5, Some(&link(Some(0), Some(0)))).is_none());
     }
 }
