@@ -109,8 +109,8 @@ this duty; see "Team Lead".)
   `portal-integration`, its own `target/` there. Steps: `git merge --ff-only portal` (catch up), merge the branch, resolve, run the
   checks and the GPU check there (through the gate), then fast-forward the main checkout once: `git -C C:/Modding/Mudcrab/mudcrab
   merge --ff-only portal-integration`. Never merge or resolve conflicts in the main checkout: half-done merges there change files
-  under every session that builds from it and invalidate their builds. Its first build is cold (about 20 GB on D:): check
-  `tools/disk_guard.py --drive D:` first.
+  under every session that builds from it and invalidate their builds. Its first build is cold (about 20 GB on C:): check
+  `tools/disk_guard.py --drive C:` first.
 - **One target folder per worktree (2026-10-09).** Never point two worktrees at the same `target/` or `CARGO_TARGET_DIR`:
   cargo gives workspace crates the same hash across worktrees, so a shared target silently reuses stale artifacts and
   fails or passes builds for the wrong code. A copied seed is fine; sharing is not.
@@ -150,7 +150,7 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   2026-10-01**: finish, package and send the launcher work already built, start nothing new): the launcher (upstream Phase 3
   item 3.4, `docs/roadmap/03-luau-and-ui.md`), sent upstream like Phase 2. Worktree
   `C:\Modding\Mudcrab\worktrees\phase3-safety`, branches `phase3/<topic>` cut from `main`, upstream's commit style
-  (`feat(launcher): ...`), build targets on D:, worker tasks `<kind>-<nnn>-p3-<slug>` numbered
+  (`feat(launcher): ...`), build targets on C:, worker tasks `<kind>-<nnn>-p3-<slug>` numbered
   900-999. It owns `crates/launcher/**` and `crates/converter-gui/**` (being folded into the
   launcher; the crate is then deleted); converter API changes go through Phase 1 Dev by message.
   Starting brief: `local/handover/phase3-dev.md`.
@@ -158,7 +158,7 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   on jobs Team Lead hands out): upstream Phase 4 (`docs/roadmap/04-gameplay-and-physics.md`: Rapier
   physics, skeletal animation, combat/quest state, save/quick-load), sent upstream like Phase 2.
   Worktree `C:\Modding\Mudcrab\worktrees\phase4` (made at the first job), branches `phase4/<topic>` cut
-  from `main`, upstream's commit style, build targets on D: (`D:\Mudcrab\builds\phase4-target`), worker
+  from `main`, upstream's commit style, build targets on C: (`C:\Modding\Mudcrab\builds\phase4-target`), worker
   tasks `<kind>-<nnn>-p4-<slug>` numbered 2000-2099. Owns new Phase 4 crates once agreed; edits to
   `crates/engine/**`, `crates/shared/**` or `crates/converter/**` are agreed by message with Phase 2 Dev
   and Phase 1 Dev first. The portal's walking player and door work stays on the Portal track (its
@@ -168,7 +168,7 @@ Every task belongs to one track; name it in the brief, the commit and the handof
   (`docs/roadmap/05-multiplatform-and-networking.md`: RT and upscaling, Linux/macOS/Android/WASM, co-op
   networking, LLM NPCs and OpenXR), sent upstream like Phase 2. Worktree `C:\Modding\Mudcrab\worktrees\phase5`
   (made at the first coding job), branches `phase5/<topic>` cut from `main`, upstream's commit style, build
-  targets on D: (`D:\Mudcrab\builds\phase5-target`), worker tasks `<kind>-<nnn>-p5-<slug>` numbered 2100-2199.
+  targets on C: (`C:\Modding\Mudcrab\builds\phase5-target`), worker tasks `<kind>-<nnn>-p5-<slug>` numbered 2100-2199.
   Research in `local/research/phase5/`, plan in `local/plans/phase5-plan.md`. Owns new Phase 5 crates once
   agreed; edits to `crates/engine/**`, `crates/shared/**` or `crates/converter/**` are agreed by message
   with Phase 2 Dev and Phase 1 Dev first.
@@ -216,6 +216,12 @@ The user added a **Team Lead** session above the dev sessions and Upstream Dev, 
 >   PUBLISHING relayed by another session does not count, and one yes covers only the item it was
 >   given for. (Job hand-outs are different: a job the user approved in Upstream Dev's session and
 >   Upstream Dev hands to a dev session is a valid hand-out.)
+> - **T3 Code task threads publish their own work (the user, 2026-10-11).** A thread may push its branch to
+>   the fork (`myfork`) and open a draft PR there, when the user presses that thread's push or PR button in
+>   T3 Code: the button is the user's yes, for that one push or PR only. The thread links the PR with
+>   `link_pull_request`. Still the user's yes each time: marking a draft ready, comments, replies, and
+>   anything on `origin` (Mudcrab-Team/mudcrab), which goes through Upstream Dev as above. Claude Code dev
+>   sessions keep the rule as written.
 > - Exception (the user, 2026-09-28): Upstream Dev may reply to CodeRabbit (the bot) on our PRs
 >   without asking, AI-labelled. Replies to people still need the user's yes.
 > - **Standing yes for fix pushes (the user, 2026-10-02).** Upstream Dev may push, without asking

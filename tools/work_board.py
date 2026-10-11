@@ -210,12 +210,12 @@ def branch_cards(skip: set[str]) -> list[dict]:
     out = run(["git", "for-each-ref", "--sort=-committerdate", "refs/heads",
                "--format=%(refname:short)|%(committerdate:iso-strict)|%(contents:subject)"])
     # Already in portal or upstream main = integrated, not in progress.
-    merged = set(run(["git", "branch", "--format=%(refname:short)", "--merged", "portal"]).split())
+    merged = set(run(["git", "branch", "--format=%(refname:short)", "--merged", "plus"]).split())
     merged |= set(run(["git", "branch", "--format=%(refname:short)", "--merged", "origin/main"]).split())
     pushed = set(run(["git", "for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/myfork"]).split())
     for line in out.splitlines():
         name, date, subject = (line.split("|", 2) + ["", ""])[:3]
-        if not BRANCH_RE.match(name) or name in skip or name in merged or name == "portal":
+        if not BRANCH_RE.match(name) or name in skip or name in merged or name == "plus":
             continue
         when = datetime.fromisoformat(date).replace(tzinfo=None)
         if when < since:

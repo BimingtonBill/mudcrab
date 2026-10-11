@@ -24,12 +24,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/experimental_build.ps1
 param(
     [string]$Branch = "experimental/$(Get-Date -Format yyyy-MM-dd)",
     [string]$Worktree = "D:/Mudcrab/worktrees-experimental",
-    [string]$TargetDir = "D:/Mudcrab/builds/experimental",
+    [string]$TargetDir = "C:/Modding/Mudcrab/builds/experimental",
     [switch]$Resume,          # continue merging from the current branch head instead of resetting
     [switch]$SkipOnConflict,  # skip a PR whose conflicts have no recorded resolution
     [switch]$NoPortal,        # main + PRs only
     [switch]$NoBuild,
-    [string]$PortalRef = "portal",
+    [string]$PortalRef = "plus",
     [string]$ResolveFrom,     # a previous build whose merges are reused when unchanged (default: the branch before reset)
     [switch]$NoFetch          # reuse refs/exp/pr<N> as they are (replays the exact heads of the last run)
 )
