@@ -108,9 +108,10 @@
 //!
 //! # Not yet covered
 //!
-//! TODO(#188): the image-comparison test, culling on versus off on a real converted interior,
-//! which proves the culled frame matches the full one. Until it exists the feature stays behind
-//! `--room-culling`.
+//! The image-comparison evidence (culling on versus off on real converted interiors, which shows
+//! the culled frame matches the full one) lives in the pull request text, not in the tests. Until
+//! that comparison is part of CI the feature stays behind `--room-culling`. The first frame that
+//! hides anything logs how many meshes it removed, so a run shows that the setting did something.
 //!
 //! # Coordinates
 //!
@@ -151,6 +152,7 @@ pub fn exempt_record_type(record_type: Option<&str>) -> bool {
         Some(
             "NPC_"
                 | "LVLN"
+                | "LVLI"
                 | "CREA"
                 | "DOOR"
                 | "ACTI"
@@ -301,8 +303,10 @@ pub const OVERLAP_TOLERANCE: f32 = 8.0;
 /// separating-axis test on two oriented boxes (their six face axes and the nine edge cross
 /// products).
 pub fn rooms_overlap(a: &Room, b: &Room) -> bool {
+    // A box with a non-finite number has no geometry to test. Joining it keeps the neighbours
+    // drawn; "not overlapping" would drop an edge and cull more.
     if !(a.center.is_finite() && b.center.is_finite() && a.half.is_finite() && b.half.is_finite()) {
-        return false;
+        return true;
     }
     // The tolerance is in units only if the rotations are unit quaternions, which
     // `Room::from_creation` guarantees.
@@ -800,6 +804,8 @@ pub struct RoomCullingState {
     failed: HashSet<u32>,
     /// Entities removed from the main view in the last frame, for diagnostics.
     pub culled_last_frame: usize,
+    /// Whether the first frame that hid anything has been logged.
+    reported_first_cull: bool,
 }
 
 impl RoomCullingState {
@@ -812,6 +818,7 @@ impl RoomCullingState {
             pending: HashMap::new(),
             failed: HashSet::new(),
             culled_last_frame: 0,
+            reported_first_cull: false,
         }
     }
 
@@ -1061,11 +1068,16 @@ pub fn cull_room_views(
                 loaded.graph.is_drawn(form_id, &reached)
             });
             culled += before - list.len();
-            // One cell holds the camera; the rest cannot also contain it.
-            break;
+            // No `break`: every resident interior is kept until something unloads it, so a second
+            // cell whose rooms also hold the camera is walked too. A cell only removes its own
+            // objects ([`RoomGraph::is_drawn`] keeps what is outside its graph).
         }
     }
     state.culled_last_frame = culled;
+    if culled > 0 && !state.reported_first_cull {
+        state.reported_first_cull = true;
+        info!("room culling: the first frame that hid anything removed {culled} meshes");
+    }
 }
 
 /// Whether a rigid body can move, as opposed to the `Fixed` bodies static collision uses.
@@ -1302,7 +1314,8 @@ mod tests {
     }
 
     /// Rooms A (0), B (1) and C (2): A at the camera, B behind the doorway at z = -10 and C behind
-    /// a doorway in B's far wall at `far_door`.
+    /// a doorway in B's far wall at `far_door`. The boxes touch and `overlaps` is empty: the loader
+    /// would add overlap edges for touching boxes, but these tests exercise the doorway walk alone.
     fn chain(far_door: Portal) -> RoomGraph {
         RoomGraph {
             rooms: vec![
@@ -2060,8 +2073,24 @@ mod tests {
     }
 
     #[test]
+    fn a_room_with_a_non_finite_box_is_joined_to_its_neighbour() {
+        let finite = Room {
+            ref_id: 1,
+            center: Vec3::ZERO,
+            half: Vec3::splat(10.0),
+            rotation: Quat::IDENTITY,
+        };
+        let broken = Room {
+            center: Vec3::new(f32::NAN, 0.0, 0.0),
+            ..finite.clone()
+        };
+        assert!(rooms_overlap(&finite, &broken));
+        assert!(rooms_overlap(&broken, &finite));
+    }
+
+    #[test]
     fn actor_door_and_loose_item_records_are_exempt_and_statics_are_not() {
-        for kept in ["NPC_", "LVLN", "DOOR", "ACTI", "MISC", "WEAP"] {
+        for kept in ["NPC_", "LVLN", "LVLI", "DOOR", "ACTI", "MISC", "WEAP"] {
             assert!(exempt_record_type(Some(kept)), "{kept}");
         }
         for culled in ["STAT", "TREE", "FURN", "LIGH"] {
