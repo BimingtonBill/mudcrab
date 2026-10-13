@@ -2512,6 +2512,13 @@ mod gate_tests {
             );
         app.update();
         app.insert_resource(CursorCapture::Captured);
+        // The Riverwood test tankards already exist; the one T spawns is the one not listed here.
+        let existing: Vec<Entity> = {
+            let mut query = app
+                .world_mut()
+                .query_filtered::<Entity, With<DebugTankard>>();
+            query.iter(app.world()).collect()
+        };
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::KeyT);
@@ -2555,7 +2562,7 @@ mod gate_tests {
                 .query_filtered::<(Entity, &Transform), With<DebugTankard>>();
             query
                 .iter(app.world())
-                .find(|(_, pose)| pose.translation.z < -100.0)
+                .find(|(entity, _)| !existing.contains(entity))
                 .map(|(entity, pose)| (entity, pose.translation))
                 .expect("spawned tankard above terrain")
         };
