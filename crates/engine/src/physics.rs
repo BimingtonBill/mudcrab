@@ -313,6 +313,10 @@ impl Plugin for PhysicsFixturePlugin {
 /// Mouse and movement systems shared by Riverwood and the regression fixture.
 pub struct PlayerControlsPlugin;
 
+/// Complete camera/player update, before streaming reads or rebases their render positions.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PlayerControlsSystems;
+
 impl Plugin for PlayerControlsPlugin {
     fn build(&self, app: &mut App) {
         register_move_mode_effect(app.world_mut());
@@ -338,7 +342,8 @@ impl Plugin for PlayerControlsPlugin {
                     sprint_fov_system,
                     overlay_system,
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(PlayerControlsSystems),
             )
             .add_systems(FixedUpdate, walk_movement_system);
     }

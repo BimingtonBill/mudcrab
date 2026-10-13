@@ -534,4 +534,132 @@ mod tests {
         let camera = Vec3::new(2048.0, 156.0, -2048.0);
         assert!((at - camera).length() < 1e-2, "{at:?} vs {camera:?}");
     }
+
+    #[derive(Resource)]
+    struct QueuedCommand(Option<&'static str>);
+
+    fn execute_queued_command(world: &mut World) {
+        if let Some(command) = world.resource_mut::<QueuedCommand>().0.take() {
+            execute_line(world, command);
+        }
+    }
+
+    fn streaming_command_app(directory: &tempfile::TempDir, with_player: bool) -> App {
+        use crate::{
+            physics::{MoveMode, PhysicsFixturePlugin},
+            profiling::ProfilingState,
+            render::{TerrainMaterial, WaterMaterial, WaterReflectionTexture},
+            streaming::StreamingPlugin,
+            world::database::{AssetCatalog, WorldDatabase},
+        };
+        use bevy::{mesh::MeshPlugin, time::TimeUpdateStrategy};
+        use std::time::Duration;
+
+        let path = directory.path().join("skyrim_world.db");
+        connection(directory)
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER NOT NULL);
+                 INSERT INTO schema_info VALUES({});",
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            TransformPlugin,
+            bevy::input::InputPlugin,
+            AssetPlugin::default(),
+            MeshPlugin,
+            MaterialPlugin::<StandardMaterial>::default(),
+        ))
+        .init_asset::<Image>()
+        .init_asset::<WorldAsset>()
+        .init_asset::<TerrainMaterial>()
+        .init_asset::<WaterMaterial>()
+        .init_resource::<AssetCatalog>()
+        .init_resource::<ProfilingState>()
+        .init_resource::<ConsoleState>()
+        .insert_resource(WaterReflectionTexture(Handle::default()))
+        .insert_resource(WorldDatabase::open(&path).unwrap())
+        .insert_resource(cell_cache(directory))
+        .insert_resource(EngineConfig {
+            assets_dir: directory.path().to_owned(),
+            worldspace_id: 60,
+            // No asset loads are needed to exercise the real streaming/rebase schedule.
+            stream_radius: -1,
+            ..default()
+        })
+        .insert_resource(RenderOrigin(IVec2::new(4, -12)))
+        .insert_resource(MoveMode::Noclip)
+        .insert_resource(QueuedCommand(None))
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+            1.0 / 60.0,
+        )))
+        // Match app::run: streaming is registered before the player controls.
+        .add_plugins(StreamingPlugin)
+        .add_systems(PreUpdate, execute_queued_command);
+        if with_player {
+            app.add_plugins(PhysicsFixturePlugin);
+            register_cell_commands(&mut app);
+        } else {
+            app.world_mut()
+                .spawn((Transform::default(), StreamingCamera));
+        }
+        app.finish();
+        app.update();
+        app
+    }
+
+    #[test]
+    fn console_teleport_keeps_the_requested_world_cell_when_the_origin_rebases() {
+        let directory = database();
+        let mut app = streaming_command_app(&directory, true);
+
+        // This is reachable when the preceding frame's controls run after rebasing.
+        let mut camera = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<StreamingCamera>>();
+        camera.single_mut(app.world_mut()).unwrap().translation =
+            Vec3::new(2.25 * CELL_SIZE, 200.0, 0.0);
+        app.world_mut().resource_mut::<QueuedCommand>().0 = Some("coe 5 -12");
+        app.update();
+
+        let origin = app.world().resource::<RenderOrigin>().0;
+        let local = camera_position(&mut app);
+        let world_position = local
+            + Vec3::new(
+                origin.x as f32 * CELL_SIZE,
+                0.0,
+                -origin.y as f32 * CELL_SIZE,
+            );
+        let expected = Vec3::new(5.5 * CELL_SIZE, 256.0, 11.5 * CELL_SIZE);
+        assert!(
+            (world_position - expected).length() < 1e-2,
+            "requested cell 5 -12, got {world_position:?} around origin {origin:?}"
+        );
+        assert_eq!(origin, IVec2::new(5, -12));
+        assert!(
+            app.world()
+                .resource::<crate::streaming::StreamingMetrics>()
+                .origin_rebases
+                > 0
+        );
+    }
+
+    #[test]
+    fn streaming_rebases_when_the_player_controls_set_is_empty() {
+        let directory = database();
+        let mut app = streaming_command_app(&directory, false);
+        let mut camera = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<StreamingCamera>>();
+        camera.single_mut(app.world_mut()).unwrap().translation =
+            Vec3::new(2.25 * CELL_SIZE, 200.0, 0.0);
+        app.update();
+        assert_eq!(app.world().resource::<RenderOrigin>().0, IVec2::new(6, -12));
+        assert_eq!(
+            camera_position(&mut app),
+            Vec3::new(0.25 * CELL_SIZE, 200.0, 0.0)
+        );
+    }
 }
