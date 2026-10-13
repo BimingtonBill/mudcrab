@@ -1887,13 +1887,7 @@ mod tests {
             .unwrap()
             .translation
             .x += CELL_SIZE;
-        let started = Instant::now();
         app.update();
-        eprintln!(
-            "terrain_lod_visibility_crossing_{}_patches_us={}",
-            patches.len(),
-            started.elapsed().as_micros()
-        );
         assert_eq!(visibility(&app, 92), Visibility::Inherited);
         assert_eq!(
             visibility(&app, 5),
