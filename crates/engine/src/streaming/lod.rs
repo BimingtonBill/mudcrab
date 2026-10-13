@@ -775,7 +775,7 @@ pub(super) fn update_terrain_lod_visibility(
     mut streaming: ParamSet<(Res<LodStreaming>, ResMut<LodStreaming>)>,
     ready_patches: Query<
         (Entity, &TerrainCoverage, Has<super::TerrainPatch>),
-        (With<TerrainSurfaceReady>, Added<TerrainSurfaceReady>),
+        Added<TerrainSurfaceReady>,
     >,
     mut patch_visibility: Query<&mut Visibility, LodPatchFilter>,
     mut index: Local<TerrainLodIndex>,
