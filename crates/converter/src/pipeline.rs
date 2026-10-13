@@ -4689,6 +4689,12 @@ mod tests {
             archive_load_order_priority(Path::new("Foobar.bsa"), &plugins),
             None
         );
+        // Two plugins with the same stem tie; the earlier one in load order wins.
+        let same_stem = vec![PathBuf::from("Foo.esp"), PathBuf::from("Foo.esm")];
+        assert_eq!(
+            archive_load_order_priority(Path::new("Foo.bsa"), &same_stem),
+            Some(0)
+        );
 
         let mut archives = vec![PathBuf::from("Another.bsa"), PathBuf::from("Foo - Bar.bsa")];
         sort_archives_by_load_order(&mut archives, &plugins);
