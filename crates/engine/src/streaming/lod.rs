@@ -775,10 +775,7 @@ pub(super) fn update_terrain_lod_visibility(
     mut streaming: ParamSet<(Res<LodStreaming>, ResMut<LodStreaming>)>,
     ready_patches: Query<
         (Entity, &TerrainCoverage, Has<super::TerrainPatch>),
-        (
-            With<TerrainSurfaceReady>,
-            Or<(Added<TerrainSurfaceReady>, Changed<TerrainCoverage>)>,
-        ),
+        (With<TerrainSurfaceReady>, Added<TerrainSurfaceReady>),
     >,
     mut patch_visibility: Query<&mut Visibility, LodPatchFilter>,
     mut index: Local<TerrainLodIndex>,
@@ -1909,6 +1906,73 @@ mod tests {
                 .visible_lod_terrain_patches,
             visible_before + 1,
             "cell 92 enters the reach"
+        );
+    }
+
+    #[test]
+    fn terrain_lod_index_follows_removals_and_returns_on_scheduled_updates() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(StreamingMetrics::default())
+            .insert_resource(ProfilingState::default())
+            .insert_resource(LodStreaming::default())
+            .add_systems(Update, update_terrain_lod_visibility);
+        let world = app.world_mut();
+        world.spawn((
+            StreamingCamera,
+            Transform::from_xyz(CELL_SIZE * 0.5, 0.0, -CELL_SIZE * 0.5),
+        ));
+        let spawn = |world: &mut World, tier| {
+            world
+                .spawn((
+                    TerrainCoverage {
+                        grid: IVec2::new(3, 0),
+                        quadrant: 0,
+                        tier: Some(tier),
+                    },
+                    TerrainSurfaceReady,
+                    Visibility::Hidden,
+                ))
+                .id()
+        };
+        let fine = spawn(world, LodTier::Tier4);
+        let coarse = spawn(world, LodTier::Tier8);
+        let visible = |app: &App, entity| *app.world().get::<Visibility>(entity).unwrap();
+
+        app.update();
+        assert_eq!(visible(&app, fine), Visibility::Inherited);
+        assert_eq!(visible(&app, coarse), Visibility::Hidden);
+
+        // The finer tier goes away: the coarser one covers the quadrant.
+        app.world_mut().entity_mut(fine).despawn();
+        app.update();
+        assert_eq!(visible(&app, coarse), Visibility::Inherited);
+
+        // A live patch that loses readiness stops drawing and the quadrant has nothing left.
+        app.world_mut()
+            .entity_mut(coarse)
+            .remove::<TerrainSurfaceReady>();
+        app.update();
+        assert_eq!(visible(&app, coarse), Visibility::Hidden);
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .visible_lod_terrain_patches,
+            0
+        );
+
+        // Readiness returns: the patch is indexed again and draws.
+        app.world_mut()
+            .entity_mut(coarse)
+            .insert(TerrainSurfaceReady);
+        app.update();
+        assert_eq!(visible(&app, coarse), Visibility::Inherited);
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .visible_lod_terrain_patches,
+            1
         );
     }
 
