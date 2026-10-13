@@ -671,6 +671,12 @@ impl QuadrantPatches {
 /// frame of the crossing). Here a crossing only recomputes the selected tier of each quadrant and
 /// writes the visibility of the quadrants whose selection changed, which is a ring of patches
 /// around the tier boundaries.
+///
+/// This system owns the `Visibility` of ready LOD patches: a patch that something else shows or
+/// hides is not corrected until its quadrant's selection changes or a patch in it comes or goes.
+/// A patch enters the index only through `Added<TerrainSurfaceReady>` (a patch is never given
+/// coverage after readiness), and leaves it through the removal messages, which Bevy keeps for
+/// about two updates, so the system must run every `Update`, not behind a run condition.
 #[derive(Default)]
 pub(super) struct TerrainLodIndex {
     patches: HashMap<Entity, IndexedPatch>,
@@ -1967,6 +1973,51 @@ mod tests {
                 .resource::<StreamingMetrics>()
                 .visible_lod_terrain_patches,
             1
+        );
+    }
+
+    #[test]
+    fn terrain_lod_index_drops_patches_when_their_chunk_root_is_despawned() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(StreamingMetrics::default())
+            .insert_resource(ProfilingState::default())
+            .insert_resource(LodStreaming::default())
+            .add_systems(Update, update_terrain_lod_visibility);
+        let world = app.world_mut();
+        world.spawn((
+            StreamingCamera,
+            Transform::from_xyz(CELL_SIZE * 0.5, 0.0, -CELL_SIZE * 0.5),
+        ));
+        let root = world.spawn(Visibility::Inherited).id();
+        for quadrant in 0..4 {
+            world.spawn((
+                ChildOf(root),
+                TerrainCoverage {
+                    grid: IVec2::new(3, 0),
+                    quadrant,
+                    tier: Some(LodTier::Tier4),
+                },
+                TerrainSurfaceReady,
+                Visibility::Hidden,
+            ));
+        }
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .visible_lod_terrain_patches,
+            4
+        );
+        // Production retires a chunk by despawning its root; the patches go with it.
+        app.world_mut().entity_mut(root).despawn();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .visible_lod_terrain_patches,
+            0
         );
     }
 
