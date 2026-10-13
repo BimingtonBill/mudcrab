@@ -1,6 +1,7 @@
 pub mod app;
 pub mod color_pipeline;
 pub mod config;
+pub mod console;
 pub mod door_crossing;
 pub mod doors;
 pub mod lights;
