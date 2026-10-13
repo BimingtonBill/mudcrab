@@ -129,6 +129,11 @@ pub struct EngineConfig {
     /// Whether a streamed `LIGH` reference places a point light (`--lights`). Off by default, so
     /// every run that does not ask for lights renders exactly as it did before.
     pub lights: bool,
+    /// Whether the weather's distance fog is left off (`--no-fog`). Fog hides far terrain behind a
+    /// blue haze, which makes a screenshot or a before/after comparison of terrain hard to read;
+    /// with this on, no camera carries distance fog and the sky itself is unchanged. Off by
+    /// default, so every run that does not ask renders exactly as it did before.
+    pub no_fog: bool,
     pub physics_fixture: bool,
 }
 
@@ -191,6 +196,7 @@ impl Default for EngineConfig {
             renderer_fixture: false,
             streaming_fixture: false,
             lights: false,
+            no_fog: false,
             physics_fixture: false,
         }
     }
@@ -217,6 +223,7 @@ Assets and start position:
   --allow-incomplete-assets             run despite a failed manifest or integration-report gate
   --headless                            run without opening a window
   --lights                              place a point light for each streamed LIGH reference
+  --no-fog                              draw without the weather's distance fog (clear far views for shots)
 
 Streaming:
   --ini <file>                        layer Skyrim INI settings; CLI options override files
@@ -702,6 +709,7 @@ impl EngineConfig {
                 "--renderer-fixture" => config.renderer_fixture = true,
                 "--streaming-fixture" => config.streaming_fixture = true,
                 "--lights" => config.lights = true,
+                "--no-fog" => config.no_fog = true,
                 "--physics-fixture" => config.physics_fixture = true,
                 unknown => return Err(ConfigError::unrecognized(unknown)),
             }
@@ -1225,6 +1233,7 @@ mod tests {
             "--renderer-fixture",
             "--streaming-fixture",
             "--lights",
+            "--no-fog",
             "--physics-fixture",
         ]);
         assert_eq!(config.assets_dir, PathBuf::from("converted"));
@@ -1270,6 +1279,7 @@ mod tests {
         assert!(config.renderer_fixture);
         assert!(config.streaming_fixture);
         assert!(config.lights);
+        assert!(config.no_fog);
         assert!(config.physics_fixture);
     }
 
@@ -1306,6 +1316,13 @@ mod tests {
 
     /// Lights are opt-in: the flag is off unless it is given, so the default run - and every
     /// acceptance or benchmark baseline taken from one - is unchanged.
+    #[test]
+    fn fog_is_on_until_no_fog_is_given() {
+        assert!(!EngineConfig::default().no_fog);
+        assert!(!run_config(&["--headless"]).no_fog);
+        assert!(run_config(&["--no-fog"]).no_fog);
+    }
+
     #[test]
     fn lights_are_off_until_the_flag_is_given() {
         assert!(!EngineConfig::default().lights);

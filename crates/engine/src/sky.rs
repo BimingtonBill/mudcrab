@@ -15,7 +15,7 @@
 //! to the weather's `FNAM` fog distances, so terrain fades into the band the dome leaves open at
 //! the horizon.
 
-use crate::world::database::CellKey;
+use crate::{config::EngineConfig, world::database::CellKey};
 use bevy::{
     asset::{RenderAssetUsages, embedded_asset},
     camera::visibility::NoFrustumCulling,
@@ -517,16 +517,19 @@ fn apply_sky(
 /// Gives every [`FogCamera`] the weather's distance fog, and takes it away inside an interior,
 /// where there is no weather and nothing far enough away to hide. The fog's colour and its
 /// density only change when the palette does, so the component is written then and left alone
-/// otherwise.
+/// otherwise. `--no-fog` ([`EngineConfig::no_fog`]) takes the fog away everywhere, for shots and
+/// comparisons that need a clear view.
 fn apply_fog(
     mut commands: Commands,
     palette: Res<SkyPalette>,
     space: Res<CameraSpace>,
+    config: Option<Res<EngineConfig>>,
     cameras: Query<(Entity, Option<&DistanceFog>), With<FogCamera>>,
 ) {
+    let no_fog = config.is_some_and(|config| config.no_fog);
     let wanted = match *space {
-        CameraSpace::Exterior => Some(fog_for(&palette)),
-        CameraSpace::Interior => None,
+        CameraSpace::Exterior if !no_fog => Some(fog_for(&palette)),
+        CameraSpace::Exterior | CameraSpace::Interior => None,
     };
     for (camera, current) in &cameras {
         let up_to_date = match (&wanted, current) {
@@ -1012,5 +1015,23 @@ mod tests {
         *app.world_mut().resource_mut::<CameraSpace>() = CameraSpace::Exterior;
         app.update();
         assert!(app.world().get::<DistanceFog>(camera).is_some());
+    }
+
+    #[test]
+    fn no_fog_takes_the_fog_off_every_camera_outside_too() {
+        let mut app = sky_app();
+        app.insert_resource(EngineConfig {
+            no_fog: true,
+            ..EngineConfig::default()
+        });
+        let camera = app
+            .world_mut()
+            .spawn((Camera::default(), Transform::default(), FogCamera))
+            .id();
+        app.update();
+        assert!(
+            app.world().get::<DistanceFog>(camera).is_none(),
+            "--no-fog leaves an exterior camera without distance fog"
+        );
     }
 }
