@@ -1759,6 +1759,7 @@ mod tests {
                     (b"INAM", word(0x0006_7890)),
                     (b"XLRM", word(0x1002)),
                     (b"XLRM", word(0x1003)),
+                    (b"XLRM", word(0)),
                 ],
             ),
             room(0x1002, 0x100, [0.0; 3], [0.0; 3], [1.0; 3], vec![]),
@@ -1801,7 +1802,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(second, (None, None));
-        // Links are stored as written, including one to a room that does not exist.
+        // Links are stored as written, including one to a room that does not exist; a zero
+        // target (no room) is not a link.
         let links: Vec<(u32, u32)> = conn
             .prepare("SELECT room_ref, linked_ref FROM room_links ORDER BY linked_ref")
             .unwrap()

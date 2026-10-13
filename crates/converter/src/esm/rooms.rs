@@ -498,7 +498,11 @@ pub fn export_room_graph(
             ],
         )?;
         for (_, link) in record.subrecords.iter().filter(|(tag, _)| tag == b"XLRM") {
-            if let Some(linked) = u32_at(link, 0).filter(|_| link.len() == 4) {
+            // A zero id is "no room": the plugin remap clears an invalid link to 0.
+            if let Some(linked) = u32_at(link, 0)
+                .filter(|_| link.len() == 4)
+                .filter(|id| *id != 0)
+            {
                 let inserted = tx.execute(
                     "INSERT OR IGNORE INTO room_links(room_ref, linked_ref) VALUES (?1, ?2)",
                     params![form_id, linked],

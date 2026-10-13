@@ -467,6 +467,7 @@ objects to draw is the engine's policy (design: `docs/research/interior-room-gra
 upstream issue #188). Only interior cells and only box rooms (`XPRM` shape 1) are written;
 exterior markers are skipped silently, and rooms of other shapes, and rooms or portals with a non-finite size or transform, are skipped and counted in the conversion report.
 All FormIDs are in load-order numbering, like `references.id`.
+The two marker base forms are the ones `Skyrim.esm` defines (always load-order slot 0, so the numbers do not change with the load order). A plugin that places rooms with a marker base of its own is not recognised and produces no rows; the conversion report does not count that case.
 
 ```sql
 CREATE TABLE IF NOT EXISTS room_bounds (       -- one row per interior RoomMarker with a box XPRM
