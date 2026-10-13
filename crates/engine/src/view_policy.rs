@@ -44,9 +44,10 @@ use std::time::Duration;
 
 /// The largest target side a [`ViewPolicy`] may ask for.
 ///
-/// The bound only exists so a mistyped policy is refused rather than handed to the renderer:
-/// 8192 is inside the guaranteed minimum `max_texture_dimension_2d` of every backend this engine
-/// targets.
+/// The bound only exists so a mistyped policy is refused rather than handed to the renderer. It is
+/// not a backend limit: a device with a smaller `max_texture_dimension_2d` (Android GLES
+/// guarantees 2048) still fails to create a target this size, so the renderer can refuse a policy
+/// that this bound accepts.
 pub const MAX_TARGET_DIMENSION: u32 = 8192;
 
 /// The reflection target as it has always been: the size behaviour is kept at until a preset is
@@ -56,10 +57,6 @@ pub const BASELINE_TARGET_SIZE: UVec2 = UVec2::new(1024, 576);
 /// The water preset target (an unverified starting value): a quarter of the pixels, 16:9 like the
 /// default window so the view's projection keeps the observer's aspect while costing less.
 pub const WATER_TARGET_SIZE: UVec2 = UVec2::new(512, 288);
-
-/// The water preset's admission priority. Priority ranks optional work against other optional
-/// work; it is not [`Camera::order`], which stays the texture dependency order.
-pub const WATER_PRIORITY: i16 = -100;
 
 /// How long a demanded view may go unrendered before the deadline forces a refresh.
 pub const DEFAULT_MAX_STALENESS: Duration = Duration::from_millis(100);
@@ -102,7 +99,9 @@ pub enum ViewShadows {
 
 /// What a managed view is allowed to cost.
 ///
-/// The preset a view is given decides everything about its cost; see [`ViewPolicy::baseline`] and
+/// The preset a view is given decides its image size, rate and shadows; the spawn of a managed
+/// water reflection also sets its multisampling and occlusion (see `render.rs`), and changing the
+/// policy later does not change those two. See [`ViewPolicy::baseline`] and
 /// [`ViewPolicy::water`]. The default is [`ViewPolicy::baseline`], so a camera that carries a
 /// policy without choosing one keeps the behaviour it had before the policy existed.
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
@@ -111,8 +110,6 @@ pub struct ViewPolicy {
     /// render.
     pub target_size: UVec2,
     pub update_rate: ViewUpdateRate,
-    /// Ranks this view against other optional views. Not [`Camera::order`].
-    pub priority: i16,
     /// The age at which a demanded view is refreshed whatever its update rate says. Zero means
     /// every demanded frame; [`Duration::MAX`] leaves the update rate as the only admission.
     pub max_staleness: Duration,
@@ -130,7 +127,6 @@ impl ViewPolicy {
         Self {
             target_size: BASELINE_TARGET_SIZE,
             update_rate: ViewUpdateRate::EveryFrame,
-            priority: 0,
             max_staleness: DEFAULT_MAX_STALENESS,
             jump_distance: DEFAULT_JUMP_DISTANCE,
             jump_angle_radians: DEFAULT_JUMP_ANGLE_RADIANS,
@@ -139,7 +135,7 @@ impl ViewPolicy {
     }
 
     /// Starting settings for the water reflection: a quarter of the pixels,
-    /// every other frame, low priority, no shadow cascades of its own, with a hundred milliseconds
+    /// every other frame, no shadow cascades of its own, with a hundred milliseconds
     /// and 256 units or ten degrees of staleness allowed before the view is forced.
     ///
     /// These are unverified quality settings, not measured optima. They exist to be compared with
@@ -148,7 +144,6 @@ impl ViewPolicy {
         Self {
             target_size: WATER_TARGET_SIZE,
             update_rate: ViewUpdateRate::EveryOtherFrame,
-            priority: WATER_PRIORITY,
             shadows: ViewShadows::Off,
             ..Self::baseline()
         }
@@ -369,8 +364,9 @@ pub enum ViewInvalidationReason {
 /// Send this **after the destination values are committed**: after the consumer's transform and
 /// [`CameraSpace`] have been written, in the same frame. A caller that sends it first, or from a
 /// step that runs after `PostUpdate`'s view policies, has its views refreshed on the following
-/// frame instead. Door crossings, teleport scripts and map travel must all send it; a pose jump
-/// the policy can measure by itself is the exception, not the rule.
+/// frame instead. Only the streaming fixture's teleport sends it today. Door crossings and map
+/// travel do not, and rely on the policy measuring the jump itself (origin, space, or the
+/// consumer's thresholds); a caller that wants the refresh on the crossing frame should send it.
 #[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidateSecondaryViews {
     pub reason: ViewInvalidationReason,

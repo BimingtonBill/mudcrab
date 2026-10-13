@@ -952,11 +952,10 @@ fn current_global_transform(
 /// Whether a water plane's bounds reach the main camera's view, its bounds grown by
 /// [`WATER_REFLECTION_FRUSTUM_MARGIN`] first.
 ///
-/// The frustum half is Bevy's own test against the plane's [`Aabb`]. Bevy's perspective projection
-/// is infinite reverse-z, so the [`Frustum`] carries no far plane at all (`from_clip_from_world`
-/// leaves its last half space at `(NaN, NaN, NaN, inf)`), and the far distance of the camera's
-/// [`Projection`] is applied here by hand: the plane's nearest reach along the camera's forward
-/// axis, from its bounds projected onto that axis.
+/// The frustum half is Bevy's own test against the plane's [`Aabb`]. Bevy's `compute_frustum` takes
+/// the far plane from the camera's [`Projection`], so the [`Frustum`] already has one. The check
+/// below adds the plane's nearest reach along the camera's forward axis, from its bounds projected
+/// onto that axis, against the same far distance.
 ///
 /// Missing pieces mean the test cannot run - a plane whose mesh has not produced an [`Aabb`] yet,
 /// or an observer without a [`Projection`] to build the frustum from - and the plane then counts as
