@@ -5,6 +5,7 @@ pub mod console;
 pub mod door_crossing;
 pub mod doors;
 pub mod lights;
+pub mod mesh_preparation_retry;
 pub mod metrics;
 pub mod nif_material;
 pub mod pacing;
