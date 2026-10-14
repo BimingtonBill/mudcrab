@@ -1141,6 +1141,12 @@ fn spawn_cell(
                         flow_normal.clone(),
                         fresnel,
                         reflectivity,
+                    )
+                    .with_reflection_color(
+                        water_colors
+                            .map_or(crate::render::DEFAULT_WATER_REFLECTION_COLOR, |colors| {
+                                colors.reflection
+                            }),
                     ),
                 });
                 parent.spawn((
