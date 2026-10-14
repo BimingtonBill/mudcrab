@@ -201,6 +201,9 @@ fn unpack_color(value: u32) -> [u8; 3] {
 pub struct AssetCatalog {
     landscape_diffuse: std::collections::HashMap<u32, String>,
     landscape_normal: std::collections::HashMap<u32, String>,
+    /// The landscape texture Skyrim paints a quadrant with when it names no base texture: the
+    /// record whose diffuse is [`DEFAULT_LAND_DIFFUSE`] (the lowest id when several share it).
+    default_landscape: Option<u32>,
     water_flow: std::collections::HashMap<u32, String>,
     water_colors: std::collections::HashMap<u32, WaterColors>,
 }
@@ -211,7 +214,7 @@ impl AssetCatalog {
         let mut statement = connection.prepare(
             "SELECT l.id,t.diffuse_path FROM landscape_textures l JOIN texture_sets t ON t.id=l.texture_set_id WHERE t.diffuse_path IS NOT NULL",
         )?;
-        let landscape_diffuse = statement
+        let landscape_diffuse: std::collections::HashMap<u32, String> = statement
             .query_map([], |row| {
                 Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
             })?
@@ -276,12 +279,23 @@ impl AssetCatalog {
                     .map(|rows| rows.filter_map(std::result::Result::ok).collect())
             })
             .unwrap_or_default();
+        let default_landscape = landscape_diffuse
+            .iter()
+            .filter(|(_, path)| path.as_str() == DEFAULT_LAND_DIFFUSE)
+            .map(|(id, _)| *id)
+            .min();
         Ok(Self {
             landscape_diffuse,
             landscape_normal,
+            default_landscape,
             water_flow,
             water_colors,
         })
+    }
+
+    /// The landscape texture a quadrant with no base texture is drawn with, if the package has it.
+    pub fn default_landscape(&self) -> Option<u32> {
+        self.default_landscape
     }
 
     pub fn landscape_diffuse(&self, form_id: u32) -> Option<&str> {
@@ -301,6 +315,12 @@ impl AssetCatalog {
         self.water_colors.get(&form_id).copied()
     }
 }
+
+/// The converted diffuse of Skyrim's default land texture, `Skyrim.ini`'s
+/// `[Landscape] sDefaultLandDiffuseTexture` (`Landscape\Dirt02.dds` in the stock ini): what the
+/// engine paints a quadrant with that names no base texture. The value is Skyrim's stock one; an ini
+/// that changes the key is not read yet (the converter would need to carry it into the database).
+pub const DEFAULT_LAND_DIFFUSE: &str = "textures/landscape/dirt02.ktx2";
 
 /// Maps a texture path stored in the world database to the converted `.ktx2` under `textures/`.
 ///
@@ -1571,6 +1591,36 @@ mod tests {
             converted_texture_path("land/grass..old.dds".to_owned()).as_deref(),
             Some("textures/land/grass..old.ktx2")
         );
+    }
+
+    #[test]
+    fn catalog_finds_the_default_land_texture_by_its_diffuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let build = |name: &str, rows: &str| {
+            let path = directory.path().join(name);
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT); {rows}"
+                ))
+                .unwrap();
+            drop(connection);
+            AssetCatalog::open(&path).unwrap()
+        };
+        // Two records share the default's diffuse: the lowest id is the one used, so the choice does
+        // not depend on the order rows come back in.
+        let catalog = build(
+            "with.db",
+            "INSERT INTO texture_sets VALUES(1,'Textures\\Landscape\\Dirt02.dds'); INSERT INTO texture_sets VALUES(2,'textures/landscape/tundra02.dds'); INSERT INTO landscape_textures VALUES(9,1); INSERT INTO landscape_textures VALUES(5,1); INSERT INTO landscape_textures VALUES(3,2);",
+        );
+        assert_eq!(catalog.default_landscape(), Some(5));
+        // A package with no such texture has no default: a quadrant with no base is then drawn white
+        // and the engine says so, rather than borrowing another texture.
+        let catalog = build(
+            "without.db",
+            "INSERT INTO texture_sets VALUES(2,'textures/landscape/tundra02.dds'); INSERT INTO landscape_textures VALUES(3,2);",
+        );
+        assert_eq!(catalog.default_landscape(), None);
     }
 
     #[test]

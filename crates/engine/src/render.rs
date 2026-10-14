@@ -429,6 +429,18 @@ pub struct TerrainImages {
     pub normal: Vec<Handle<Image>>,
 }
 
+/// Says once that the package has no default land texture, so a quadrant with no base texture
+/// draws white instead of Skyrim's dirt.
+fn warn_no_default_land_texture() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        warn!(
+            "the package has no {}: a terrain quadrant with no base texture is drawn white",
+            crate::world::database::DEFAULT_LAND_DIFFUSE
+        );
+    }
+}
+
 impl TerrainExtension {
     /// Builds the material without looking up zero texture IDs, retaining those layers' slots
     /// and weights. Nonzero texture IDs still require a converted diffuse image.
@@ -443,12 +455,31 @@ impl TerrainExtension {
         let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
         let mut handles = Vec::with_capacity(layers.len());
         let mut normal_handles = Vec::new();
-        for ((target, normal), layer) in textures.iter_mut().zip(normals.iter_mut()).zip(&layers) {
-            if layer.texture_form_id == 0 {
-                // A preserved unresolved layer keeps its slot and weights with no image bound.
-                continue;
+        // Which landscape texture fills each slot. A quadrant with no base texture (a null `BTXT`, or
+        // no layers at all) is drawn with Skyrim's default land texture, as the game does; without
+        // one in the package the slot stays empty and Bevy binds its white fallback.
+        let mut slots: Vec<(usize, u32)> = Vec::with_capacity(layers.len().max(1));
+        for (slot, layer) in layers.iter().enumerate() {
+            if layer.texture_form_id != 0 {
+                slots.push((slot, layer.texture_form_id));
+            } else if layer.is_base {
+                if let Some(default) = catalog.default_landscape() {
+                    slots.push((slot, default));
+                } else {
+                    warn_no_default_land_texture();
+                }
             }
-            if let Some(path) = catalog.landscape_normal(layer.texture_form_id) {
+            // A preserved unresolved overlay layer keeps its slot and weights with no image bound.
+        }
+        if layers.is_empty() {
+            if let Some(default) = catalog.default_landscape() {
+                slots.push((0, default));
+            } else {
+                warn_no_default_land_texture();
+            }
+        }
+        for (slot, texture_form_id) in slots {
+            if let Some(path) = catalog.landscape_normal(texture_form_id) {
                 // A normal map holds directions, not colours: it must not be decoded as sRGB.
                 let handle = asset_server
                     .load_builder()
@@ -457,24 +488,22 @@ impl TerrainExtension {
                         settings.is_srgb = false;
                     })
                     .load(path.to_owned());
-                *normal = Some(handle.clone());
+                normals[slot] = Some(handle.clone());
                 normal_handles.push(handle);
             }
-            let path = catalog
-                .landscape_diffuse(layer.texture_form_id)
-                .ok_or_else(|| {
-                    format!(
-                        "LAND {:08X} quadrant {quadrant} texture {:08X} has no diffuse image",
-                        terrain.cell_id, layer.texture_form_id
-                    )
-                })?;
+            let path = catalog.landscape_diffuse(texture_form_id).ok_or_else(|| {
+                format!(
+                    "LAND {:08X} quadrant {quadrant} texture {:08X} has no diffuse image",
+                    terrain.cell_id, texture_form_id
+                )
+            })?;
             let handle = asset_server
                 .load_builder()
                 .with_settings(|settings: &mut ImageLoaderSettings| {
                     settings.sampler = ImageSampler::Descriptor(terrain_layer_sampler());
                 })
                 .load(path.to_owned());
-            *target = Some(handle.clone());
+            textures[slot] = Some(handle.clone());
             handles.push(handle);
         }
         let overlay_weights = crate::streaming::quadrant_overlay_weights(terrain, quadrant)?;
@@ -1768,6 +1797,50 @@ mod tests {
         assert!(error.contains("00000844") && error.contains("no diffuse image"));
         terrain.layers[2].texture_form_id = 0;
         assert!(TerrainExtension::from_quadrant(&terrain, 0, &catalog, asset_server).is_ok());
+    }
+
+    /// A quadrant whose base layer names no texture is drawn with the package's default land
+    /// texture in slot 0 (diffuse and normal); the overlays' slots stay empty and the weights and
+    /// layer count are those of the quadrant's own layers.
+    #[test]
+    fn null_base_quadrant_uses_the_default_land_texture_in_slot_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("default-land-catalogue.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT);
+                 CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
+                 CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);
+                 INSERT INTO texture_sets VALUES(1,'textures/landscape/dirt02.dds','textures/landscape/dirt02_n.dds');
+                 INSERT INTO landscape_textures VALUES(5,1);",
+            )
+            .unwrap();
+        drop(connection);
+        let catalog = AssetCatalog::open(&path).unwrap();
+        assert_eq!(catalog.default_landscape(), Some(5));
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>();
+        let asset_server = app.world().resource::<AssetServer>();
+        let mut terrain =
+            terrain_fixture_with_overlays(91, &[vec![(0, 0.25), (18, 0.75)], vec![(3, 0.625)]]);
+        for layer in &mut terrain.layers {
+            layer.texture_form_id = 0;
+        }
+        let (extension, images) =
+            TerrainExtension::from_quadrant(&terrain, 0, &catalog, asset_server)
+                .expect("a null base takes the default land texture");
+        assert!(extension.layer_0.is_some() && extension.normal_0.is_some());
+        assert!(extension.layer_1.is_none() && extension.layer_2.is_none());
+        assert!(extension.normal_1.is_none() && extension.normal_2.is_none());
+        assert_eq!((images.color.len(), images.normal.len()), (1, 1));
+        assert_eq!(extension.settings.tiling_and_layer_count.z, 3.0);
+        let sample = |overlay: usize, vertex: usize| {
+            extension.settings.weights[overlay * OVERLAY_WEIGHT_WORDS + vertex / 4][vertex % 4]
+        };
+        assert_eq!(sample(0, 18).to_bits(), 0.75f32.to_bits());
+        assert_eq!(sample(1, 3).to_bits(), 0.625f32.to_bits());
     }
 
     /// The weight field is the quadrant's own `17x17` grids, one per overlay, in the order
