@@ -237,6 +237,14 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              glow_path TEXT, height_path TEXT, environment_path TEXT, mask_path TEXT,
              specular_path TEXT, detail_path TEXT
          );
+         -- A base record's alternate textures (`MODS`): the named shape of its model draws this
+         -- texture set instead of the one its mesh was authored with. `shape_index` is the shape's
+         -- position among the model's shapes; the runtime matches on the name and keeps the index.
+         CREATE TABLE IF NOT EXISTS model_alternate_textures (
+             base_id INTEGER NOT NULL, shape_name TEXT NOT NULL, shape_index INTEGER NOT NULL,
+             texture_set_id INTEGER NOT NULL,
+             PRIMARY KEY (base_id, shape_name, shape_index)
+         );
          CREATE TABLE IF NOT EXISTS landscape_textures (
              id INTEGER PRIMARY KEY, editor_id TEXT, texture_set_id INTEGER,
              material_type INTEGER, friction REAL, restitution REAL
@@ -699,6 +707,7 @@ fn export_records(
                         "INSERT OR REPLACE INTO statics(id, editor_id, model_path, flags) VALUES (?1, ?2, ?3, ?4)")?.execute(
                         params![form_id, view.get_string(b"EDID"), model_path, record.flags],
                     )?;
+                    insert_model_alternate_textures(&tx, form_id, &view, b"MODS")?;
                 }
             }
             // Every base record type with a world model. The runtime spawns
@@ -723,6 +732,10 @@ fn export_records(
                     "INSERT OR REPLACE INTO statics(id, editor_id, model_path, flags) VALUES (?1, ?2, ?3, ?4)")?.execute(
                     params![form_id, view.get_string(b"EDID"), model, record.flags],
                 )?;
+                // The world model's alternate textures sit in the subrecord that follows its path:
+                // `MODS`, or `MO2S` for the armour's first world model.
+                let alternates_tag = if type_str == "ARMO" { b"MO2S" } else { b"MODS" };
+                insert_model_alternate_textures(&tx, form_id, &view, alternates_tag)?;
             }
             "NPC_" => {
                 let view = SubrecordView::new(&record.subrecords);
@@ -837,6 +850,36 @@ fn export_records(
         crate::esm::rooms::export_room_graph(&tx, master, &interior_cells)?;
     }
     tx.commit()
+}
+
+/// Replaces base record `form_id`'s alternate textures with the ones its `tag` subrecord lists.
+/// An entry that names no texture set (a zero FormID) says nothing and is skipped, and a repeated
+/// shape keeps its last entry, as a record that listed a shape twice would draw it.
+fn insert_model_alternate_textures(
+    tx: &Transaction<'_>,
+    form_id: u32,
+    view: &SubrecordView<'_>,
+    tag: &[u8; 4],
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM model_alternate_textures WHERE base_id=?1",
+        [form_id],
+    )?;
+    for alternate in view.get_alternate_textures(tag) {
+        if alternate.texture_form_id == 0 || alternate.name_3d.is_empty() {
+            continue;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO model_alternate_textures(base_id, shape_name, shape_index, texture_set_id) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                form_id,
+                alternate.name_3d,
+                alternate.index_3d,
+                alternate.texture_form_id
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Projects xEdit's TES5 GRAS/DATA layout without inventing missing fields.
@@ -1462,6 +1505,103 @@ mod tests {
                 (8, Some("Armor\\Helmet01.nif".to_owned())),
                 (9, Some("Armor\\HelmetFemale01.nif".to_owned())),
                 (11, None),
+            ]
+        );
+    }
+
+    /// A `MODS`-style list: (count, then name length, name, texture set, shape index per entry).
+    fn alternate_textures_payload(entries: &[(&str, u32, u32)]) -> Vec<u8> {
+        let mut bytes = (entries.len() as u32).to_le_bytes().to_vec();
+        for (name, texture_set, index) in entries {
+            bytes.extend((name.len() as u32).to_le_bytes());
+            bytes.extend(name.as_bytes());
+            bytes.extend(texture_set.to_le_bytes());
+            bytes.extend(index.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn exports_the_alternate_textures_of_base_models() {
+        fn base(
+            form_id: u32,
+            record_type: &[u8; 4],
+            model_tag: &[u8; 4],
+            alternates_tag: &[u8; 4],
+            entries: &[(&str, u32, u32)],
+        ) -> RawRecord {
+            RawRecord {
+                form_id,
+                record_type: *record_type,
+                flags: 0,
+                subrecords: vec![
+                    (b"EDID".to_vec(), b"TestBase\0".to_vec()),
+                    (
+                        model_tag.to_vec(),
+                        b"Landscape\\DirtCliffs\\DirtCliffs01.nif\0".to_vec(),
+                    ),
+                    (alternates_tag.to_vec(), alternate_textures_payload(entries)),
+                ],
+                cell_form_id: None,
+                worldspace_form_id: None,
+                load_order: 0,
+            }
+        }
+        let build = |records: Vec<RawRecord>| -> HashMap<u32, RawRecord> {
+            records
+                .into_iter()
+                .map(|record| (record.form_id, record))
+                .collect()
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let master = build(vec![
+            // Index 4 is the slab's grass shape in the real DirtCliffs01FieldGrass01 record. A
+            // zero texture set names nothing and is skipped.
+            base(
+                1,
+                b"STAT",
+                b"MODL",
+                b"MODS",
+                &[("DirtCliffs01:1", 0x1_3427, 4), ("Skirt", 0, 0)],
+            ),
+            base(2, b"ARMO", b"MOD2", b"MO2S", &[("Helmet", 0x2_0001, 0)]),
+            // The armour's second model has its own list; it is not this record's world model.
+            base(3, b"ARMO", b"MOD2", b"MO3S", &[("Helmet", 0x2_0002, 0)]),
+            base(4, b"STAT", b"MODL", b"MODS", &[]),
+        ]);
+        export_to_db(&conn, &master).unwrap();
+        let rows = |conn: &Connection| -> Vec<(u32, String, u32, u32)> {
+            conn.prepare(
+                "SELECT base_id, shape_name, shape_index, texture_set_id FROM model_alternate_textures ORDER BY base_id, shape_name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            rows(&conn),
+            vec![
+                (1, "DirtCliffs01:1".to_owned(), 4, 0x1_3427),
+                (2, "Helmet".to_owned(), 0, 0x2_0001),
+            ]
+        );
+        // An export that includes the record replaces its list, including with a shorter one.
+        let master = build(vec![base(
+            1,
+            b"STAT",
+            b"MODL",
+            b"MODS",
+            &[("Other", 0x1_3428, 1)],
+        )]);
+        export_to_db(&conn, &master).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![
+                (1, "Other".to_owned(), 1, 0x1_3428),
+                (2, "Helmet".to_owned(), 0, 0x2_0001),
             ]
         );
     }

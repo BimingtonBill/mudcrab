@@ -543,6 +543,42 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
     })
 }
 
+/// The subrecords that list a model's alternate textures: the world model's `MODS`, the armour
+/// models' `MO2S` to `MO5S`, and a destruction stage's `DMDS`. Each is a count followed by
+/// (name length, name, texture set FormID, shape index) entries.
+fn is_alternate_textures_tag(tag: &[u8]) -> bool {
+    matches!(
+        tag,
+        b"MODS" | b"MO2S" | b"MO3S" | b"MO4S" | b"MO5S" | b"DMDS"
+    )
+}
+
+/// Remaps the texture set FormID of every entry in an alternate texture list, in place. Fails on a
+/// truncated list or trailing bytes, leaving the list partly remapped: the caller drops it.
+fn remap_alternate_textures(data: &mut [u8], remap: &dyn Fn(u32) -> Result<u32>) -> Result<()> {
+    color_eyre::eyre::ensure!(data.len() >= 4, "truncated alternate textures");
+    let count = u32::from_le_bytes(data[..4].try_into().unwrap());
+    let mut offset = 4usize;
+    for _ in 0..count {
+        color_eyre::eyre::ensure!(
+            data.len().saturating_sub(offset) >= 4,
+            "truncated MODS name length"
+        );
+        let length = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        color_eyre::eyre::ensure!(
+            data.len().saturating_sub(offset) >= length.saturating_add(8),
+            "truncated MODS entry"
+        );
+        offset += length;
+        let value = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        data[offset..offset + 4].copy_from_slice(&remap(value)?.to_le_bytes());
+        offset += 8;
+    }
+    color_eyre::eyre::ensure!(offset == data.len(), "trailing bytes in alternate textures");
+    Ok(())
+}
+
 /// Remaps local FormIDs within a record header, parent cell/worldspace references,
 /// and relevant subrecords according to master plugin load-order indices.
 fn remap_record_form_ids(
@@ -613,28 +649,40 @@ fn remap_record_form_ids(
     record.worldspace_form_id = record.worldspace_form_id.map(&remap_link).transpose()?;
     let mut malformed_subrecords = Vec::new();
     for (index, (tag, data)) in record.subrecords.iter_mut().enumerate() {
-        if record.record_type == *b"GRAS" && tag.as_slice() == b"MODS" {
-            color_eyre::eyre::ensure!(data.len() >= 4, "truncated GRAS alternate textures");
-            let count = u32::from_le_bytes(data[..4].try_into().unwrap());
-            let mut offset = 4usize;
-            for _ in 0..count {
-                color_eyre::eyre::ensure!(
-                    data.len().saturating_sub(offset) >= 4,
-                    "truncated MODS name length"
-                );
-                let length =
-                    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                offset += 4;
-                color_eyre::eyre::ensure!(
-                    data.len().saturating_sub(offset) >= length.saturating_add(8),
-                    "truncated MODS entry"
-                );
-                offset += length;
-                let value = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                data[offset..offset + 4].copy_from_slice(&remap_link(value)?.to_le_bytes());
-                offset += 8;
+        if is_alternate_textures_tag(tag) {
+            if record.record_type == *b"GRAS" {
+                // Grass is a strict kind: a broken list stops the conversion.
+                remap_alternate_textures(data, &remap_link).wrap_err("GRAS alternate textures")?;
+                continue;
             }
-            color_eyre::eyre::ensure!(offset == data.len(), "trailing bytes in GRAS MODS");
+            // Any other record's list is optional, like its other links: drop a malformed one and
+            // null a texture set that names no known plugin, and keep converting.
+            let lenient = |form_id: u32| {
+                Ok(remap_with_validation(form_id, true).unwrap_or_else(|error| {
+                    warnings.skipped_optional(
+                        plugin_name,
+                        format!(
+                            "{} record source {source_id:08X} (load-order {:08X}) {} texture set {form_id:08X}: {error}",
+                            String::from_utf8_lossy(&record_type),
+                            record.form_id,
+                            String::from_utf8_lossy(tag)
+                        ),
+                    );
+                    0
+                }))
+            };
+            if let Err(error) = remap_alternate_textures(data, &lenient) {
+                warnings.skipped_optional(
+                    plugin_name,
+                    format!(
+                        "{} record source {source_id:08X} (load-order {:08X}) {}: {error}",
+                        String::from_utf8_lossy(&record_type),
+                        record.form_id,
+                        String::from_utf8_lossy(tag)
+                    ),
+                );
+                malformed_subrecords.push(index);
+            }
             continue;
         }
         if record.record_type == *b"LAND" && matches!(tag.as_slice(), b"BTXT" | b"ATXT") {

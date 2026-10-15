@@ -350,6 +350,104 @@ fn remaps_cell_and_world_water_references_and_preserves_nulls() {
     assert_eq!(world.get_form_id(b"NAM3"), Some(0));
 }
 
+/// A `MODS` list: count, then name length, name, texture set and shape index per entry.
+fn alternate_textures(entries: &[(&str, u32, u32)]) -> Vec<u8> {
+    let mut bytes = (entries.len() as u32).to_le_bytes().to_vec();
+    for (name, texture_set, index) in entries {
+        bytes.extend((name.len() as u32).to_le_bytes());
+        bytes.extend(name.as_bytes());
+        bytes.extend(texture_set.to_le_bytes());
+        bytes.extend(index.to_le_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn remaps_the_alternate_textures_of_any_base_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 0, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &[], 0, Vec::new());
+    // Local FormIDs: index 00 is the one master (Base.esm), 01 the plugin itself.
+    let patch = plugin(
+        dir.path(),
+        "Patch.esp",
+        &["Base.esm"],
+        0,
+        [
+            record(
+                b"STAT",
+                0x0100_0800,
+                0,
+                sub(
+                    b"MODS",
+                    &alternate_textures(&[("Slab:1", 0x0000_0801, 4), ("Slab:2", 0x0100_0802, 1)]),
+                ),
+            ),
+            record(
+                b"ARMO",
+                0x0100_0810,
+                0,
+                sub(b"MO2S", &alternate_textures(&[("Helmet", 0x0000_0803, 0)])),
+            ),
+        ]
+        .concat(),
+    );
+    let merged = EsmParser::merge_plugins(&[filler, base, patch]).unwrap();
+    // Base.esm loads second here, so its FormIDs take index 1; the patch's own take index 2.
+    let stat = SubrecordView::new(&merged[&0x0200_0800].subrecords);
+    let entries = stat.get_alternate_textures(b"MODS");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (
+                entry.name_3d.as_str(),
+                entry.texture_form_id,
+                entry.index_3d
+            ))
+            .collect::<Vec<_>>(),
+        vec![("Slab:1", 0x0100_0801, 4), ("Slab:2", 0x0200_0802, 1)]
+    );
+    let armour = SubrecordView::new(&merged[&0x0200_0810].subrecords);
+    assert_eq!(
+        armour.get_alternate_textures(b"MO2S")[0].texture_form_id,
+        0x0100_0803
+    );
+}
+
+#[test]
+fn drops_a_malformed_alternate_texture_list_on_an_optional_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(
+        dir.path(),
+        "Base.esm",
+        &[],
+        0,
+        [
+            record(b"STAT", 0x800, 0, sub(b"MODS", &1u32.to_le_bytes())),
+            record(
+                b"MSTT",
+                0x801,
+                0,
+                [sub(b"MODS", &[0; 5]), sub(b"EDID", b"Kept\0")].concat(),
+            ),
+        ]
+        .concat(),
+    );
+    let merged = EsmParser::merge_plugins(&[base]).unwrap();
+    for form_id in [0x800, 0x801] {
+        assert!(
+            SubrecordView::new(&merged[&form_id].subrecords)
+                .find(b"MODS")
+                .is_none(),
+            "malformed MODS of {form_id:#x} was kept"
+        );
+    }
+    assert_eq!(
+        SubrecordView::new(&merged[&0x801].subrecords).get_string(b"EDID"),
+        Some("Kept".to_owned())
+    );
+}
+
 #[test]
 fn rejects_malformed_land_and_alternate_texture_references() {
     for (kind, payload) in [
