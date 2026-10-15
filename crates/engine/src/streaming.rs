@@ -80,6 +80,7 @@ impl Plugin for StreamingPlugin {
             .init_resource::<SceneSpawnBatch>()
             .init_resource::<StaticCollisionCache>()
             .init_resource::<crate::pacing::PacingTracker>()
+            .add_plugins(crate::alternate_textures::AlternateTexturesPlugin)
             .add_observer(mark_world_instance_ready)
             .add_observer(lod::mark_lod_world_instance_ready)
             .add_systems(
@@ -1240,6 +1241,13 @@ fn spawn_cell(
                 *model_sequence = model_sequence.saturating_add(1);
                 let handle = asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.clone()));
                 profiler.observe_scene(handle.id(), asset_server);
+                // The base record's alternate textures wait on the reference until its scene is
+                // spawned and its shapes exist to be retextured.
+                if let Some(alternates) = catalog.alternate_textures(reference.base_form_id) {
+                    entity.insert(crate::alternate_textures::AlternateTextures(
+                        alternates.clone(),
+                    ));
+                }
                 entity.insert((
                     MeshHandle(path.clone()),
                     PendingModel { handle, sequence },
@@ -1653,12 +1661,14 @@ type RenderPrimitiveQuery<'world, 'state> = Query<
     ),
 >;
 
-/// The mesh and material stores, the camera and the pacing tracker the readiness scan also uses.
+/// The mesh and material stores, the camera and the pacing tracker the readiness scan also uses,
+/// and the references still waiting for their alternate textures to be swapped in.
 type ReadinessExtras<'world, 'state> = (
     ResMut<'world, Assets<Mesh>>,
     ResMut<'world, Assets<StandardMaterial>>,
     Query<'world, 'state, &'static Transform, With<StreamingCamera>>,
     ResMut<'world, crate::pacing::PacingTracker>,
+    Query<'world, 'state, (), With<crate::alternate_textures::AlternateTextures>>,
 );
 
 type PendingAssetQuery<'world, 'state> = Query<
@@ -1812,7 +1822,7 @@ fn track_asset_readiness(
     world_assets: Res<Assets<WorldAsset>>,
     mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
     mut static_cache: ResMut<StaticCollisionCache>,
-    (mut meshes, mut materials, camera, mut pacing): ReadinessExtras,
+    (mut meshes, mut materials, camera, mut pacing, awaiting_alternates): ReadinessExtras,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -1859,7 +1869,10 @@ fn track_asset_readiness(
             }
             commands.entity(entity).remove::<PendingAssetProfile>();
             completed_this_scan += 1;
-        } else if pending.scene_spawned && asset_server.is_loaded_with_dependencies(root.0.id()) {
+        } else if pending.scene_spawned
+            && !awaiting_alternates.contains(entity)
+            && asset_server.is_loaded_with_dependencies(root.0.id())
+        {
             let transform_validation = validate_spawned_transforms_and_bounds(
                 entity,
                 local,

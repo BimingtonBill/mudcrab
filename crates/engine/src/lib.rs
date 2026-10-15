@@ -1,3 +1,4 @@
+pub mod alternate_textures;
 pub mod app;
 pub mod cell_commands;
 pub mod color_pipeline;

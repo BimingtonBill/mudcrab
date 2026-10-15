@@ -1,3 +1,4 @@
+use crate::alternate_textures::AlternateTexture;
 use bevy::prelude::Resource;
 use color_eyre::{Result, eyre::WrapErr};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
@@ -203,6 +204,8 @@ pub struct AssetCatalog {
     landscape_normal: std::collections::HashMap<u32, String>,
     water_flow: std::collections::HashMap<u32, String>,
     water_colors: std::collections::HashMap<u32, WaterColors>,
+    /// Each base record's alternate textures, by base FormID.
+    alternate_textures: std::collections::HashMap<u32, std::sync::Arc<[AlternateTexture]>>,
 }
 
 impl AssetCatalog {
@@ -276,12 +279,55 @@ impl AssetCatalog {
                     .map(|rows| rows.filter_map(std::result::Result::ok).collect())
             })
             .unwrap_or_default();
+        // A database converted before `model_alternate_textures` existed has no such table, and
+        // `prepare` fails with a "no such table" error: its models draw with their own textures.
+        let alternate_textures = connection
+            .prepare(
+                "SELECT m.base_id, m.shape_name, m.shape_index, t.diffuse_path, t.normal_path                  FROM model_alternate_textures m JOIN texture_sets t ON t.id = m.texture_set_id                  ORDER BY m.base_id, m.shape_index, m.shape_name",
+            )
+            .ok()
+            .map(|mut statement| {
+                let mut lists: std::collections::HashMap<u32, Vec<AlternateTexture>> =
+                    std::collections::HashMap::new();
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        AlternateTexture {
+                            shape_name: row.get(1)?,
+                            shape_index: row.get(2)?,
+                            diffuse: row
+                                .get::<_, Option<String>>(3)?
+                                .and_then(converted_texture_path),
+                            normal: row
+                                .get::<_, Option<String>>(4)?
+                                .and_then(converted_texture_path),
+                        },
+                    ))
+                });
+                for (base, alternate) in rows.into_iter().flatten().filter_map(Result::ok) {
+                    // A texture set with neither map changes nothing.
+                    if alternate.diffuse.is_some() || alternate.normal.is_some() {
+                        lists.entry(base).or_default().push(alternate);
+                    }
+                }
+                lists
+                    .into_iter()
+                    .map(|(base, list)| (base, std::sync::Arc::from(list)))
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
             landscape_diffuse,
             landscape_normal,
             water_flow,
             water_colors,
+            alternate_textures,
         })
+    }
+
+    /// The alternate textures of base record `form_id`'s model, if it has any.
+    pub fn alternate_textures(&self, form_id: u32) -> Option<&std::sync::Arc<[AlternateTexture]>> {
+        self.alternate_textures.get(&form_id)
     }
 
     pub fn landscape_diffuse(&self, form_id: u32) -> Option<&str> {
@@ -1611,6 +1657,52 @@ mod tests {
             Some("textures/land/grass.ktx2")
         );
         assert_eq!(catalog.landscape_normal(1), None);
+    }
+
+    #[test]
+    fn catalog_lists_a_base_models_alternate_textures_and_tolerates_their_absence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT);                  CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);                  CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);                  CREATE TABLE model_alternate_textures(base_id INTEGER,shape_name TEXT,shape_index INTEGER,texture_set_id INTEGER);                  INSERT INTO texture_sets VALUES(2,'Textures/Landscape/FieldGrass01.dds','Textures/Landscape/FieldGrass01_n.dds');                  INSERT INTO texture_sets VALUES(3,NULL,'');                  INSERT INTO model_alternate_textures VALUES(10,'DirtCliffs01:1',4,2);                  INSERT INTO model_alternate_textures VALUES(10,'Skirt',0,3);                  INSERT INTO model_alternate_textures VALUES(11,'Other',0,99);",
+            )
+            .unwrap();
+        drop(connection);
+        let catalog = AssetCatalog::open(&path).unwrap();
+        let list = catalog.alternate_textures(10).expect("base 10 has a list");
+        assert_eq!(
+            list.as_ref(),
+            [AlternateTexture {
+                shape_name: "DirtCliffs01:1".to_owned(),
+                shape_index: 4,
+                diffuse: Some("textures/landscape/fieldgrass01.ktx2".to_owned()),
+                normal: Some("textures/landscape/fieldgrass01_n.ktx2".to_owned()),
+            }],
+            "a texture set with no maps changes nothing"
+        );
+        assert!(
+            catalog.alternate_textures(11).is_none(),
+            "an unknown texture set is not a list"
+        );
+        assert!(catalog.alternate_textures(12).is_none());
+
+        // A database converted before the table existed opens, and no model changes.
+        let older = directory.path().join("older.db");
+        let connection = Connection::open(&older).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT); CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER); CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);",
+            )
+            .unwrap();
+        drop(connection);
+        assert!(
+            AssetCatalog::open(&older)
+                .unwrap()
+                .alternate_textures(10)
+                .is_none()
+        );
     }
 
     #[test]
