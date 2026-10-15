@@ -953,6 +953,7 @@ mod tests {
                         ..default()
                     },
                     Transform::default(),
+                    Projection::Perspective(PerspectiveProjection::default()),
                     SceneColorPipeline::reflection(),
                     WaterReflectionCamera,
                 ))
@@ -1551,7 +1552,7 @@ mod tests {
         let water_y = 3.0;
         let reflection = reflected_camera_transform(&main, water_y);
         let lens = reflection_lens(&PerspectiveProjection::default(), &reflection, water_y);
-        // The mirrored camera sits at y = -4 looking slightly up; straight ahead along its view.
+        // The mirrored camera sits at y = -4 looking level; the points are straight ahead of it.
         assert!(in_reflection_view(
             &lens,
             &reflection,
@@ -1567,6 +1568,51 @@ mod tests {
             &reflection,
             Vec3::new(0.0, -2.0, -20.0)
         ));
+    }
+
+    #[test]
+    fn the_reflection_lens_for_a_camera_below_the_water_keeps_what_is_below_it() {
+        let main = GlobalTransform::from(
+            Transform::from_xyz(0.0, -4.0, 0.0).looking_to(Vec3::NEG_Z, Vec3::Y),
+        );
+        let water_y = 3.0;
+        let reflection = reflected_camera_transform(&main, water_y);
+        let lens = reflection_lens(&PerspectiveProjection::default(), &reflection, water_y);
+        // The mirrored camera sits at y = 10 looking level: the world under the surface is kept
+        // and the air above it is dropped.
+        assert!(in_reflection_view(
+            &lens,
+            &reflection,
+            Vec3::new(0.0, -2.0, -20.0)
+        ));
+        assert!(!in_reflection_view(
+            &lens,
+            &reflection,
+            Vec3::new(0.0, 5.0, -20.0)
+        ));
+    }
+
+    #[test]
+    fn the_reflection_system_gives_the_reflection_camera_the_clipped_main_lens() {
+        use bevy::camera::CameraProjection;
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        harness.spawn_water(Vec3::new(0.0, 40.0, -800.0), CELL_WATER_HALF_EXTENTS);
+        assert!(harness.frame().active);
+        let Projection::Perspective(lens) = harness
+            .app
+            .world()
+            .get::<Projection>(harness.reflection_camera)
+            .unwrap()
+        else {
+            panic!("the reflection camera lost its perspective projection");
+        };
+        let Projection::Perspective(main_lens) = main_camera_projection() else {
+            unreachable!();
+        };
+        assert_eq!(lens.far, main_lens.far);
+        assert!(lens.near_clip_plane.xyz().length() > 0.99);
+        assert!(lens.near_clip_plane.w < 0.0);
+        let _ = lens.get_clip_from_view();
     }
 
     #[test]
