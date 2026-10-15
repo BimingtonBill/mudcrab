@@ -12,24 +12,40 @@ pub fn rebuild_door_links(conn: &Connection) -> Result<usize> {
     Ok(count)
 }
 
-pub(super) fn project_door_links(conn: &Connection) -> Result<usize> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS door_links (
-            ref_id INTEGER PRIMARY KEY, destination_ref_id INTEGER NOT NULL,
-            pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
-            rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
-            destination_cell_id INTEGER NOT NULL, destination_worldspace_id INTEGER,
-            destination_name TEXT
-         );
-         DELETE FROM door_links;",
-    )?;
+/// The optional door table (db-schema.md section 16). Created with the other tables so a reused
+/// database gains it; a table from before `destination_name` is migrated by [`ensure_table`].
+pub(super) const DOOR_LINKS_SQL: &str = "CREATE TABLE IF NOT EXISTS door_links (
+    ref_id INTEGER PRIMARY KEY, destination_ref_id INTEGER NOT NULL,
+    pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
+    rot_x REAL NOT NULL, rot_y REAL NOT NULL, rot_z REAL NOT NULL,
+    destination_cell_id INTEGER NOT NULL, destination_worldspace_id INTEGER,
+    destination_name TEXT
+ );";
+
+/// Create `door_links` if absent and add `destination_name` to an older-shaped table.
+pub(super) fn ensure_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(DOOR_LINKS_SQL)?;
     let has_name: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('door_links') WHERE name='destination_name')",
-        [], |row| row.get(0),
+        [],
+        |row| row.get(0),
     )?;
     if !has_name {
         conn.execute_batch("ALTER TABLE door_links ADD COLUMN destination_name TEXT;")?;
     }
+    Ok(())
+}
+
+/// Delete every door link. Called at the start of a complete snapshot, so a diagnostic archive
+/// that defers runtime views never keeps links from the export it replaced.
+pub(super) fn clear(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM door_links", [])?;
+    Ok(())
+}
+
+pub(super) fn project_door_links(conn: &Connection) -> Result<usize> {
+    ensure_table(conn)?;
+    clear(conn)?;
     let mut sources = conn.prepare(
         "SELECT r.id, raw.data FROM \"references\" r
          JOIN records base ON base.form_id=r.base_form_id AND base.record_type='DOOR'

@@ -288,3 +288,80 @@ fn real_plugin_export_projects_reciprocal_door_arrivals() {
         1
     );
 }
+
+/// One `door_links` row: reference, destination reference, arrival frame bits, destination cell,
+/// destination worldspace and name.
+type DoorLinkRow = (u32, u32, [u32; 6], u32, Option<u32>, Option<String>);
+
+/// Both record readers publish the same `door_links` through the real conversion command.
+#[test]
+fn both_record_readers_publish_the_same_door_links() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    layout::prepare_directory(&data, false).unwrap();
+    layout::generate(&data, layout::DEFAULT_SEED, layout::Formats::all()).unwrap();
+    layout::write_plugin(&data, &preset_plugin()).unwrap();
+
+    let mut projections = Vec::new();
+    for (name, legacy) in [("inhouse", false), ("legacy", true)] {
+        let output = directory.path().join(name);
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_converter"));
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        command
+            .arg(&data)
+            .arg(&output)
+            .args(["--no-lod", "--cpu-jobs", "2", "--io-jobs", "1"]);
+        if legacy {
+            command.args(["--record-reader", "legacy"]);
+        }
+        let run = command.output().unwrap();
+        assert!(
+            run.status.success(),
+            "{name}: stdout={} stderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let conn = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
+        let rows: Vec<DoorLinkRow> = conn
+            .prepare(
+                "SELECT ref_id,destination_ref_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,
+                        destination_cell_id,destination_worldspace_id,destination_name
+                 FROM door_links ORDER BY ref_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                let mut frame = [0u32; 6];
+                for (index, slot) in frame.iter_mut().enumerate() {
+                    *slot = row.get::<_, f32>(2 + index)?.to_bits();
+                }
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    frame,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 2, "{name}: one link per door");
+        assert_eq!(
+            rows[0].0, rows[1].1,
+            "{name}: the doors point at each other"
+        );
+        assert_eq!(rows[0].1, rows[1].0);
+        assert!(
+            rows.iter()
+                .any(|row| row.5.as_deref() == Some("Generated Interior")),
+            "{name}: the interior is named"
+        );
+        projections.push(rows);
+    }
+    assert_eq!(projections[0], projections[1], "readers disagree");
+}
