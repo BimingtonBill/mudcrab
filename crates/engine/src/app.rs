@@ -131,16 +131,16 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let benchmark_active =
         config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
     configure_benchmark_priority(benchmark_active)?;
-    let window = (!config.headless || shots_active).then(|| Window {
+    let window = (!config.headless || shots_active || config.hidden_window).then(|| Window {
         title: config.window_title(),
+        visible: !config.hidden_window,
         // A shots file's frame is the size its reference screenshots were taken at, so the window,
         // and every PNG taken of it, is exactly that many pixels.
         resolution: match &shots {
             Some(run) => run.file.window_resolution(),
             None => (1600, 900).into(),
         },
-        // A timing or shots run opens on screen, in the middle, so whoever is at the machine can
-        // see what is running and not disturb it.
+        // Visible timing and shots runs open in the middle of the primary screen.
         position: if benchmark_active || shots_active {
             WindowPosition::Centered(MonitorSelection::Primary)
         } else {
@@ -161,7 +161,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     if let Some(asset_lock) = asset_lock {
         app.insert_resource(AssetDirectoryReadLock { _guard: asset_lock });
     }
-    if benchmark_active || shots_active {
+    if benchmark_active || shots_active || config.hidden_window {
         // Acceptance runs are commonly left unfocused while the campaign driver
         // advances through its scenarios. Bevy's game default throttles an
         // unfocused window to 60 Hz, which makes a 16.67 ms P95 gate measure the
@@ -206,6 +206,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
         .add_plugins((
             VercidiumRendererPlugin,
+            crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
             SkyPlugin,
             ConsolePlugin,
             crate::nif_material::NifMaterialPlugin,
@@ -214,7 +215,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
         .add_plugins(crate::lights::LightsPlugin)
         // Registered for every run; with `--room-culling` off it adds no system.
-        .add_plugins(room_culling);
+        .add_plugins(room_culling)
+        .add_systems(PostUpdate, keep_windows_hidden);
     add_camera_and_capture_systems(&mut app);
     if let Some((database, catalog, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
@@ -225,6 +227,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         app.add_systems(Startup, setup_world);
         if interactive_world_physics {
             app.add_plugins(WorldPlayerPlugin);
+            // `coc`/`coe` move the player, so they come with it, as `tcl` does: a run without a
+            // player (a benchmark, `--shots`, headless) lists neither in Help.
+            crate::cell_commands::register_cell_commands(&mut app);
         }
         if app.world().resource::<EngineConfig>().streaming_fixture {
             app.init_resource::<StreamingFixtureState>()
@@ -283,6 +288,18 @@ fn finished(exit: &AppExit) -> Result<()> {
         AppExit::Error(code) => Err(color_eyre::eyre::eyre!(
             "the run failed (exit code {code:?})"
         )),
+    }
+}
+
+/// Reset accidental visibility changes before Bevy applies Window changes in Last.
+/// The primary window starts hidden, so screenshot rendering needs no visible flash.
+fn keep_windows_hidden(config: Res<EngineConfig>, mut windows: Query<&mut Window>) {
+    if config.hidden_window {
+        for mut window in &mut windows {
+            if window.visible {
+                window.visible = false;
+            }
+        }
     }
 }
 
@@ -2010,31 +2027,74 @@ fn initial_camera_ground_height(
     database_path: &std::path::Path,
     cache: &CellCache,
 ) -> Result<f32> {
+    Ok(cell_centre_ground_height(
+        config.worldspace_id,
+        config.start_grid,
+        database_path,
+        cache,
+    )?
+    .unwrap_or(0.0))
+}
+
+/// The terrain height at the middle of one exterior cell, or `None` when the cell has no terrain
+/// (or the cache has no height there).
+fn cell_centre_ground_height(
+    worldspace_id: u32,
+    grid: (i32, i32),
+    database_path: &std::path::Path,
+    cache: &CellCache,
+) -> Result<Option<f32>> {
     let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .wrap_err_with(|| format!("failed to open {}", database_path.display()))?;
     let cell_id = connection
         .query_row(
             crate::world::database::EXTERIOR_CELL_ID_SQL,
-            params![
-                config.worldspace_id,
-                config.start_grid.0,
-                config.start_grid.1
-            ],
+            params![worldspace_id, grid.0, grid.1],
             |row| row.get::<_, u32>(0),
         )
         .optional()?;
-    let Some(terrain) = cell_id.and_then(|cell_id| cache.terrain(cell_id)) else {
-        return Ok(0.0);
-    };
-    let width = usize::from(terrain.width);
-    let height = usize::from(terrain.height);
-    let center = (height / 2)
-        .checked_mul(width)
-        .and_then(|row| row.checked_add(width / 2));
-    Ok(center
-        .and_then(|index| terrain.heights.get(index))
-        .copied()
-        .unwrap_or(0.0))
+    Ok(cell_id.and_then(|cell_id| cache.centre_height(cell_id)))
+}
+
+/// Where `--benchmark-jump` puts the camera: the middle of exterior cell `grid`, at that cell's
+/// ground height plus the same height offset `setup_world` gives the start position, in the
+/// coordinates of the current render `origin`.
+pub(crate) fn benchmark_jump_position(
+    config: &EngineConfig,
+    cache: &CellCache,
+    origin: IVec2,
+    grid: (i32, i32),
+) -> Vec3 {
+    let database_path = config.assets_dir.join("skyrim_world.db");
+    let ground_height =
+        match cell_centre_ground_height(config.worldspace_id, grid, &database_path, cache) {
+            Ok(Some(height)) => height,
+            // A jump target with no terrain is legitimate (a cell past the map edge the run may
+            // still want to view), but a silent 0 puts the camera at the wrong height, so say so.
+            Ok(None) => {
+                warn!(
+                    grid_x = grid.0,
+                    grid_y = grid.1,
+                    "benchmark jump: no terrain at the target cell, using ground height 0"
+                );
+                0.0
+            }
+            Err(error) => {
+                warn!(%error, "benchmark jump: ground height unavailable, using 0");
+                0.0
+            }
+        };
+    jump_camera_position(grid, origin, ground_height + camera_offset(config).y)
+}
+
+/// The middle of grid square `grid` at height `y`, in the render space around `origin`: +x is east,
+/// +grid_y runs towards -z.
+fn jump_camera_position(grid: (i32, i32), origin: IVec2, y: f32) -> Vec3 {
+    Vec3::new(
+        ((grid.0 - origin.x) as f32 + 0.5) * crate::world::components::CELL_SIZE,
+        y,
+        -((grid.1 - origin.y) as f32 + 0.5) * crate::world::components::CELL_SIZE,
+    )
 }
 
 const CELL_SIZE_HALF: f32 = crate::world::components::CELL_SIZE * 0.5;
@@ -2241,6 +2301,53 @@ mod tests {
     use bevy::window::{PrimaryWindow, Window};
     use bevy::world_serialization::WorldSerializationPlugin;
     use std::time::Duration;
+
+    /// A capture window remains hidden if an update system tries to show it.
+    #[test]
+    fn hidden_capture_suppresses_visibility_changes_before_window_sync() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            hidden_window: true,
+            ..default()
+        })
+        .add_systems(PostUpdate, keep_windows_hidden);
+        let entity = app
+            .world_mut()
+            .spawn(Window {
+                visible: true,
+                ..default()
+            })
+            .id();
+        app.update();
+        assert!(!app.world().get::<Window>(entity).unwrap().visible);
+        app.world_mut().resource_mut::<EngineConfig>().hidden_window = false;
+        app.world_mut().get_mut::<Window>(entity).unwrap().visible = true;
+        app.update();
+        assert!(app.world().get::<Window>(entity).unwrap().visible);
+    }
+
+    /// The origin cell's centre is (2048, y, -2048), the start position's convention, and +grid_y
+    /// runs towards -z, so the sign and the half-cell offset are pinned per axis.
+    #[test]
+    fn jump_position_is_the_target_cells_centre_around_the_origin() {
+        for (grid, origin, expected) in [
+            ((0, 0), IVec2::ZERO, Vec3::new(2048.0, 9.0, -2048.0)),
+            ((1, 0), IVec2::ZERO, Vec3::new(6144.0, 9.0, -2048.0)),
+            ((0, 1), IVec2::ZERO, Vec3::new(2048.0, 9.0, -6144.0)),
+            ((-1, -1), IVec2::ZERO, Vec3::new(-2048.0, 9.0, 2048.0)),
+            (
+                (4, -21),
+                IVec2::new(4, -12),
+                Vec3::new(2048.0, 9.0, 34816.0),
+            ),
+        ] {
+            assert_eq!(
+                jump_camera_position(grid, origin, 9.0),
+                expected,
+                "grid {grid:?} origin {origin:?}"
+            );
+        }
+    }
 
     #[test]
     fn an_existing_io_pool_of_another_size_is_an_error_only_for_an_explicit_request() {
