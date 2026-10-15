@@ -285,6 +285,9 @@ impl AssetCatalog {
             .prepare(
                 "SELECT m.base_id, m.shape_name, m.shape_index, t.diffuse_path, t.normal_path                  FROM model_alternate_textures m JOIN texture_sets t ON t.id = m.texture_set_id                  ORDER BY m.base_id, m.shape_index, m.shape_name",
             )
+            .inspect_err(|error| {
+                bevy::log::info!("no alternate textures in this world database: {error}");
+            })
             .ok()
             .map(|mut statement| {
                 let mut lists: std::collections::HashMap<u32, Vec<AlternateTexture>> =

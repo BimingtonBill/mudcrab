@@ -444,6 +444,7 @@ fn replace_complete_snapshot(tx: &Transaction<'_>) -> Result<()> {
     // Every complete snapshot owns these derived rows, including archive-only exports
     // that deliberately defer all runtime projections.
     crate::esm::rooms::clear(tx)?;
+    tx.execute("DELETE FROM model_alternate_textures", [])?;
     tx.execute("DELETE FROM schema_info", [])?;
     tx.execute(
         "INSERT INTO schema_info(version) VALUES (?1)",
@@ -722,19 +723,20 @@ fn export_records(
                 // ARMO has no MODL path; its world models live in the
                 // gendered world-model slots (male first, female fallback).
                 // Both frontends use MOD4 for the female world model.
-                let model = if type_str == "ARMO" {
-                    view.get_string(b"MOD2")
-                        .or_else(|| view.get_string(b"MOD4"))
+                // The alternate textures follow the model they belong to: `MODS` for a static,
+                // `MO2S` for the male world model, `MO4S` for the female fallback.
+                let (model, alternates_tag): (_, &[u8; 4]) = if type_str == "ARMO" {
+                    match view.get_string(b"MOD2") {
+                        Some(model) => (Some(model), b"MO2S"),
+                        None => (view.get_string(b"MOD4"), b"MO4S"),
+                    }
                 } else {
-                    view.get_string(b"MODL")
+                    (view.get_string(b"MODL"), b"MODS")
                 };
                 tx.prepare_cached(
                     "INSERT OR REPLACE INTO statics(id, editor_id, model_path, flags) VALUES (?1, ?2, ?3, ?4)")?.execute(
                     params![form_id, view.get_string(b"EDID"), model, record.flags],
                 )?;
-                // The world model's alternate textures sit in the subrecord that follows its path:
-                // `MODS`, or `MO2S` for the armour's first world model.
-                let alternates_tag = if type_str == "ARMO" { b"MO2S" } else { b"MODS" };
                 insert_model_alternate_textures(&tx, form_id, &view, alternates_tag)?;
             }
             "NPC_" => {
@@ -1569,6 +1571,8 @@ mod tests {
             // The armour's second model has its own list; it is not this record's world model.
             base(3, b"ARMO", b"MOD2", b"MO3S", &[("Helmet", 0x2_0002, 0)]),
             base(4, b"STAT", b"MODL", b"MODS", &[]),
+            // An armour with only a female world model takes that model's list.
+            base(5, b"ARMO", b"MOD4", b"MO4S", &[("Boots", 0x2_0003, 0)]),
         ]);
         export_to_db(&conn, &master).unwrap();
         let rows = |conn: &Connection| -> Vec<(u32, String, u32, u32)> {
@@ -1586,6 +1590,7 @@ mod tests {
             vec![
                 (1, "DirtCliffs01:1".to_owned(), 4, 0x1_3427),
                 (2, "Helmet".to_owned(), 0, 0x2_0001),
+                (5, "Boots".to_owned(), 0, 0x2_0003),
             ]
         );
         // An export that includes the record replaces its list, including with a shorter one.
@@ -1602,6 +1607,7 @@ mod tests {
             vec![
                 (1, "Other".to_owned(), 1, 0x1_3428),
                 (2, "Helmet".to_owned(), 0, 0x2_0001),
+                (5, "Boots".to_owned(), 0, 0x2_0003),
             ]
         );
     }
