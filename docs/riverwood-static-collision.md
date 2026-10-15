@@ -72,3 +72,9 @@ the global linear speed cap is raised to 20,000 units/s and each body is clamped
 to its authored limit. Only a model's first dynamic body is used (extra ones
 are counted and logged), and over the live cap of 256 bodies a reference keeps
 no collider until its cell loads again.
+
+Dynamic clutter resolves each shape index once, preserving its first occurrence.
+Repeated indices do not add collider entities or density-derived mass. Both collider
+paths check a one-million-point geometry budget before construction. Bodies made
+from convex primitives also have a separate cap of 256 collider parts; over-limit
+bodies keep no collider and count as skipped. Non-convex bodies use one hull.
