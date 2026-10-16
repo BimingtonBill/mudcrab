@@ -15,7 +15,7 @@
 //!    back where they were, with a warning.
 //! 4. **Fade in** (0.25 s). The player is placed on the landing point once more as it starts.
 //!
-//! The player's walking systems pause for the whole crossing ([`no_door_crossing`]): nothing under
+//! The player's walking and noclip systems pause for the whole crossing ([`no_door_crossing`]): nothing under
 //! the landing point has collision until its cell is ready, so a WALK body would fall (and WASD
 //! would move it) while the screen is black.
 //!
@@ -192,7 +192,7 @@ impl DoorCrossing {
     }
 }
 
-/// Run condition for the player's walking systems: true unless a door crossing is in progress (a
+/// Run condition for the player's movement systems: true unless a door crossing is in progress (a
 /// run without the crossing plugin never has one).
 pub fn no_door_crossing(crossing: Option<Res<DoorCrossing>>) -> bool {
     crossing.is_none_or(|crossing| !crossing.is_active())
@@ -382,12 +382,20 @@ fn switch_space(world: &mut World, landing: Landing) {
 /// Places the player on `landing` again as the fade-in starts. The walking systems paused during
 /// the crossing, so this only undoes anything else that moved the body or the camera while black.
 fn place_again(commands: &mut Commands, landing: &Landing) {
-    let teleport = TeleportPlayer {
-        position: landing.position,
-        yaw: landing.yaw,
-    };
+    let landing = *landing;
     commands.queue(move |world: &mut World| {
-        world.write_message(teleport);
+        // A saved exterior pose belongs to its landing origin, which may have changed during
+        // the hold. Interiors use absolute coordinates and do not follow the render origin.
+        let position = match landing.origin {
+            Some(saved) => {
+                absolute_feet(landing.position, saved - world.resource::<RenderOrigin>().0)
+            }
+            None => landing.position,
+        };
+        world.write_message(TeleportPlayer {
+            position,
+            yaw: landing.yaw,
+        });
     });
 }
 
@@ -1051,6 +1059,60 @@ mod tests {
         let teleports = &app.world().resource::<Teleports>().0;
         assert_eq!(teleports.len(), 2, "{teleports:?}");
         assert_eq!(teleports[1], teleports[0], "the same landing point twice");
+    }
+
+    #[test]
+    fn exterior_landing_and_restore_survive_a_rebase_during_the_black_hold() {
+        for restoring in [false, true] {
+            let (mut app, _) = app_with(exterior_door());
+            press_e(&mut app);
+            run_until_black(&mut app);
+            if restoring {
+                let target = app
+                    .world()
+                    .resource::<DoorCrossing>()
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .target;
+                app.world_mut()
+                    .resource_mut::<StreamingWorld>()
+                    .set_failed_for_test(target.key);
+                app.update();
+            }
+            let crossing = app
+                .world()
+                .resource::<DoorCrossing>()
+                .active
+                .as_ref()
+                .unwrap();
+            let landing = if restoring {
+                crossing.restore.landing()
+            } else {
+                crossing.target
+            };
+            let saved_origin = landing.origin.unwrap();
+            let rebased = saved_origin + IVec2::new(2, -1);
+            app.world_mut().resource_mut::<RenderOrigin>().0 = rebased;
+            let root = app.world_mut().spawn_empty().id();
+            app.world_mut()
+                .resource_mut::<StreamingWorld>()
+                .set_resident_for_test(landing.key, root);
+            for _ in 0..4 {
+                app.update();
+            }
+            assert!(
+                alpha(&mut app) < 1.0,
+                "restoring={restoring}: fade-in starts"
+            );
+            let teleports = &app.world().resource::<Teleports>().0;
+            let final_pose = teleports.last().unwrap();
+            assert_eq!(
+                absolute_feet(final_pose.position, rebased),
+                absolute_feet(landing.position, saved_origin)
+            );
+            assert_eq!(final_pose.yaw, landing.yaw);
+        }
     }
 
     #[test]

@@ -200,6 +200,28 @@ impl StreamingWorld {
         (side * side, resident, failed)
     }
 
+    /// Residency of the space the planner currently wants, including a single active interior.
+    pub(crate) fn active_residency(
+        &self,
+        space: &ActiveSpace,
+        configured_worldspace: u32,
+        center: IVec2,
+        radius: i32,
+    ) -> (usize, usize, usize) {
+        if let Some(cell) = space.interior {
+            return match self.cells.get(&CellKey::Interior(cell)) {
+                Some(CellStatus::Resident { .. } | CellStatus::Retiring { .. }) => (1, 1, 0),
+                Some(CellStatus::Failed) => (1, 0, 1),
+                _ => (1, 0, 0),
+            };
+        }
+        self.window_residency(
+            space.exterior_worldspace(configured_worldspace),
+            center,
+            radius,
+        )
+    }
+
     /// Submits one load for `key` unless it is already loading or resident, and records the
     /// request on the streaming metrics. This is the loader path every cell goes through, however
     /// the request is driven: the camera planner streams exteriors from it, and the streaming
