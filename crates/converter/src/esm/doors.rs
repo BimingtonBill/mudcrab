@@ -12,7 +12,7 @@ pub fn rebuild_door_links(conn: &Connection) -> Result<usize> {
     Ok(count)
 }
 
-/// The optional door table (db-schema.md section 16). Created with the other tables so a reused
+/// The optional door table (db-schema.md section 17). Created with the other tables so a reused
 /// database gains it; a table from before `destination_name` is migrated by [`ensure_table`].
 pub(super) const DOOR_LINKS_SQL: &str = "CREATE TABLE IF NOT EXISTS door_links (
     ref_id INTEGER PRIMARY KEY, destination_ref_id INTEGER NOT NULL,
