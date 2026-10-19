@@ -2809,7 +2809,7 @@ fn toggle_mode_system(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn toggle_move_mode_effect(
     tuning: Res<MovementTuning>,
-    crossing: Option<Res<crate::door_crossing::DoorCrossing>>,
+    mut crossing: Option<ResMut<crate::door_crossing::DoorCrossing>>,
     context: ReadRapierContext,
     mut mode: ResMut<MoveMode>,
     mut status: ResMut<WalkEntryStatus>,
@@ -2828,7 +2828,17 @@ fn toggle_move_mode_effect(
     // A reason from an earlier attempt must not outlive it: if this attempt stops early
     // (no camera, player or physics context), the caller reports "no player" instead.
     status.blocked_reason = None;
-    if crossing.is_some_and(|crossing| crossing.is_active()) {
+    if let Some(crossing) = crossing.as_mut().filter(|crossing| crossing.is_active()) {
+        if crossing.needs_recovery() {
+            let Ok((entity, _, _)) = player.single() else {
+                return;
+            };
+            commands.entity(entity).insert(RigidBodyDisabled);
+            *mode = MoveMode::Noclip;
+            clear_motion_state(&mut intent, &mut sprint, &mut states, &mut controllers);
+            crossing.finish_recovery();
+            return;
+        }
         status.blocked_reason = Some("door crossing in progress".to_owned());
         return;
     }
@@ -2893,12 +2903,19 @@ fn toggle_collision_command() -> ConsoleCommand {
                 return Err("noclip is not available in this run".to_owned());
             }
             let before = *world.resource::<MoveMode>();
+            let recovering = world
+                .get_resource::<crate::door_crossing::DoorCrossing>()
+                .is_some_and(|crossing| crossing.needs_recovery());
             let Some(effect) = world.get_resource::<MoveModeEffect>().map(|e| e.0) else {
                 return Err("noclip is not available in this run".to_owned());
             };
             world.run_system(effect).map_err(|e| e.to_string())?;
             let after = *world.resource::<MoveMode>();
-            if after == before {
+            let recovered = recovering
+                && world
+                    .get_resource::<crate::door_crossing::DoorCrossing>()
+                    .is_some_and(|crossing| !crossing.is_active());
+            if after == before && !recovered {
                 let reason = world
                     .get_resource::<WalkEntryStatus>()
                     .and_then(|status| status.blocked_reason.clone());
@@ -2940,6 +2957,7 @@ fn overlay_system(
     mode: Res<MoveMode>,
     status: Res<WalkEntryStatus>,
     sprint: Res<SprintLatch>,
+    crossing: Option<Res<crate::door_crossing::DoorCrossing>>,
     collision_debug: Option<Res<DebugRenderContext>>,
     player: Query<Option<&KinematicCharacterControllerOutput>, With<PlayerBody>>,
     mut overlay: Query<&mut Text, With<NoclipOverlay>>,
@@ -2961,6 +2979,11 @@ fn overlay_system(
         } else {
             "  COLLISION: OFF  [F3]"
         });
+    }
+    if crossing.is_some_and(|crossing| crossing.needs_recovery()) {
+        label.push_str(
+            "\nDoor crossing failed. Movement paused. Press V or use tcl to recover in noclip.",
+        );
     }
     **text = label;
 }
@@ -3691,6 +3714,25 @@ mod gate_tests {
     }
 
     #[test]
+    fn a_failed_crossing_holds_the_walking_body_and_shows_how_to_recover() {
+        let mut app = headless::fixture_app();
+        let start = Vec3::new(0.0, 5_000.0, 0.0);
+        headless::place_player(&mut app, start);
+        app.insert_resource(crate::door_crossing::DoorCrossing::recovery_for_test());
+        for _ in 0..60 {
+            app.update();
+        }
+        let (held, _) = headless::player_pose(&mut app);
+        assert!((held - start).length() < 1.0, "unguarded fall: {held}");
+        let mut query = app
+            .world_mut()
+            .query_filtered::<&Text, With<NoclipOverlay>>();
+        let text = query.single(app.world()).unwrap();
+        assert!(text.contains("Movement paused"));
+        assert!(text.contains("Press V or use tcl to recover in noclip"));
+    }
+
+    #[test]
     fn fixed_step_walk_is_frame_rate_independent() {
         // Two simulated seconds at 30/60/120 render fps must all run the same
         // 120 fixed physics ticks and reach the same point (V18).
@@ -3882,6 +3924,40 @@ mod console_tests {
             app.insert_resource(crate::door_crossing::DoorCrossing::default());
             execute_line(app.world_mut(), "tcl");
             assert_ne!(mode(&app), initial, "switching resumes after crossing");
+        }
+    }
+
+    #[test]
+    fn failed_crossing_recovery_uses_noclip_from_both_modes_and_entry_points() {
+        for initial in [MoveMode::Noclip, MoveMode::Walk] {
+            for keyed in [false, true] {
+                let mut app = console_fixture();
+                app.insert_resource(initial);
+                app.insert_resource(CursorCapture::Captured);
+                app.insert_resource(crate::door_crossing::DoorCrossing::recovery_for_test());
+                if keyed {
+                    press(&mut app, KeyCode::KeyV);
+                    app.world_mut().run_system_once(toggle_mode_system).unwrap();
+                } else {
+                    execute_line(app.world_mut(), "tcl");
+                    assert!(scrollback(&app).contains("noclip ON"));
+                }
+                assert_eq!(mode(&app), MoveMode::Noclip);
+                assert!(
+                    !app.world()
+                        .resource::<crate::door_crossing::DoorCrossing>()
+                        .is_active()
+                );
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<&RigidBodyDisabled, With<PlayerBody>>();
+                assert_eq!(players.iter(app.world()).count(), 1);
+                assert!(
+                    app.world_mut()
+                        .run_system_once(crate::door_crossing::no_door_crossing)
+                        .unwrap()
+                );
+            }
         }
     }
 

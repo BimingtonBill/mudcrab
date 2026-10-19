@@ -9,10 +9,12 @@
 //!    player is teleported to the door's `XTEL` arrival point.
 //! 3. **Hold black** until the landing cell is resident, nothing under its root is pending (models, surfaces) and
 //!    every mesh, material and texture under the cell's root has finished loading, then two more
-//!    frames so render extraction and preparation run, for at most 10 s. While the screen is black
+//!    frames so render extraction and preparation run, for at most 10 s per landing. While black,
 //!    the per-frame upload budget is lifted (a stutter behind black is invisible) and the configured
 //!    value comes back when the fade-in starts. A landing cell that fails to load puts the player
-//!    back where they were, with a warning.
+//!    back where they were, with a warning. A destination timeout also returns to the saved space.
+//!    If that return fails or times out, the screen fades in but movement stays paused until the
+//!    player presses V or uses `tcl` to recover in noclip.
 //! 4. **Fade in** (0.25 s). The player is placed on the landing point once more as it starts.
 //!
 //! The player's walking and noclip systems pause for the whole crossing ([`no_door_crossing`]): nothing under
@@ -111,7 +113,9 @@ enum Stage {
     },
     FadeIn {
         elapsed: f32,
+        recovery: bool,
     },
+    Recovery,
 }
 
 /// The player's own place before a crossing.
@@ -190,6 +194,19 @@ impl DoorCrossing {
     pub fn is_active(&self) -> bool {
         self.active.is_some()
     }
+
+    /// Whether the failed return is visible and the player can explicitly recover in noclip.
+    pub(crate) fn needs_recovery(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| matches!(active.stage, Stage::Recovery))
+    }
+
+    /// Release the movement guard after the caller has disabled the walking body.
+    pub(crate) fn finish_recovery(&mut self) {
+        debug_assert!(self.needs_recovery());
+        self.active = None;
+    }
 }
 
 /// Run condition for the player's movement systems: true unless a door crossing is in progress (a
@@ -200,6 +217,12 @@ pub fn no_door_crossing(crossing: Option<Res<DoorCrossing>>) -> bool {
 
 #[cfg(test)]
 impl DoorCrossing {
+    pub(crate) fn recovery_for_test() -> Self {
+        let mut crossing = Self::holding_for_test();
+        crossing.active.as_mut().unwrap().stage = Stage::Recovery;
+        crossing
+    }
+
     /// A crossing held black on its landing, for tests of systems that must pause during one.
     pub(crate) fn holding_for_test() -> Self {
         let door = LoadDoor {
@@ -695,18 +718,21 @@ fn drive_door_crossing(
                 if restoring {
                     warn!(
                         door = format_args!("{:08X}", active.door.ref_id),
-                        "door crossing: the player's own space could not be reloaded; fading in anyway"
+                        "door crossing: the player's own space could not be reloaded; movement stays paused; press V or use tcl to recover in noclip"
                     );
                     info!(
                         door = format_args!("{:08X}", active.door.ref_id),
                         destination = %describe_destination(&landing.key),
                         restored = true,
                         milliseconds = (active.since_press * 1000.0) as u32,
-                        "door crossing: restored the player's own place (it failed to reload); fade-in starts"
+                        "door crossing: return failed; fade-in starts with movement paused"
                     );
                     set_upload_budget(&mut budget, config.max_upload_bytes_per_frame());
                     place_again(&mut commands, &landing);
-                    active.stage = Stage::FadeIn { elapsed: 0.0 };
+                    active.stage = Stage::FadeIn {
+                        elapsed: 0.0,
+                        recovery: true,
+                    };
                 } else {
                     warn!(
                         door = format_args!("{:08X}", active.door.ref_id),
@@ -735,6 +761,20 @@ fn drive_door_crossing(
             // still lifted: the fade-in starts on the SETTLE_FRAMES-th loaded frame.
             let ready_frames = if loaded { ready_frames + 1 } else { 0 };
             let ready = ready_frames >= SETTLE_FRAMES;
+            if !ready && waited >= LANDING_TIMEOUT_SECONDS && !restoring {
+                warn!(
+                    door = format_args!("{:08X}", active.door.ref_id),
+                    "door crossing: the destination was not ready in time; putting the player back"
+                );
+                let restore = active.restore.landing();
+                commands.queue(move |world: &mut World| switch_space(world, restore));
+                active.stage = Stage::Landing {
+                    waited: 0.0,
+                    restoring: true,
+                    ready_frames: 0,
+                };
+                return;
+            }
             if ready || waited >= LANDING_TIMEOUT_SECONDS {
                 if !ready {
                     warn!(
@@ -747,7 +787,7 @@ fn drive_door_crossing(
                             .as_ref()
                             .and_then(|report| report.first_waiting.as_deref())
                             .unwrap_or("none"),
-                        "door crossing: the destination was not ready in time; fading in anyway"
+                        "door crossing: the return was not ready in time; movement stays paused; press V or use tcl to recover in noclip"
                     );
                 }
                 if let Some(report) = report.as_ref().filter(|report| !report.failed.is_empty()) {
@@ -763,7 +803,9 @@ fn drive_door_crossing(
                     restored = restoring,
                     milliseconds = (active.since_press * 1000.0) as u32,
                     "door crossing: {} fade-in starts",
-                    if restoring {
+                    if !ready {
+                        "return timed out with movement paused;"
+                    } else if restoring {
                         "restored the player's own place;"
                     } else {
                         "arrived;"
@@ -771,7 +813,10 @@ fn drive_door_crossing(
                 );
                 set_upload_budget(&mut budget, config.max_upload_bytes_per_frame());
                 place_again(&mut commands, &landing);
-                active.stage = Stage::FadeIn { elapsed: 0.0 };
+                active.stage = Stage::FadeIn {
+                    elapsed: 0.0,
+                    recovery: !ready,
+                };
             } else {
                 active.stage = Stage::Landing {
                     waited,
@@ -780,15 +825,20 @@ fn drive_door_crossing(
                 };
             }
         }
-        Stage::FadeIn { elapsed } => {
+        Stage::FadeIn { elapsed, recovery } => {
             let elapsed = elapsed + delta;
             set_alpha(&mut overlay, 1.0 - elapsed / FADE_SECONDS);
             if elapsed >= FADE_SECONDS {
-                crossing.active = None;
+                if recovery {
+                    active.stage = Stage::Recovery;
+                } else {
+                    crossing.active = None;
+                }
             } else {
-                active.stage = Stage::FadeIn { elapsed };
+                active.stage = Stage::FadeIn { elapsed, recovery };
             }
         }
+        Stage::Recovery => {}
     }
 }
 
@@ -1194,7 +1244,7 @@ mod tests {
             None,
             "still black, still lifted while restoring"
         );
-        // The player's own space fails too: the crossing fades in anyway.
+        // The player's own space fails too: fade in with movement still guarded.
         let own = CellKey::Exterior {
             worldspace_id: crate::config::EngineConfig::default().worldspace_id,
             grid_x: 1,
@@ -1269,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn the_timeout_fades_in_anyway() {
+    fn a_destination_timeout_returns_to_the_saved_space_before_resuming() {
         let (mut app, _) = app_with(interior_door());
         press_e(&mut app);
         run_until_black(&mut app);
@@ -1281,7 +1331,77 @@ mod tests {
         for _ in 0..20 {
             app.update();
         }
-        assert!(alpha(&mut app) < 1.0, "the timeout started the fade-in");
+        assert!(alpha(&mut app) >= 0.99, "the return is still loading");
+        assert_eq!(
+            *app.world().resource::<ActiveSpace>(),
+            ActiveSpace::default()
+        );
+        assert!(!app.world_mut().run_system_once(no_door_crossing).unwrap());
+        let own = app
+            .world()
+            .resource::<DoorCrossing>()
+            .active
+            .as_ref()
+            .unwrap()
+            .restore
+            .landing()
+            .key;
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_resident_for_test(own, root);
+        for _ in 0..20 {
+            app.update();
+        }
+        assert!(alpha(&mut app) < 0.01, "the loaded return fades in");
+        assert!(app.world_mut().run_system_once(no_door_crossing).unwrap());
+        assert_eq!(budget(&app), configured_budget());
+    }
+
+    #[test]
+    fn a_return_timeout_fades_in_without_releasing_the_movement_guard() {
+        let (mut app, _) = app_with(interior_door());
+        press_e(&mut app);
+        run_until_black(&mut app);
+        for _ in 0..((2.0 * LANDING_TIMEOUT_SECONDS + 1.0) / DT) as usize {
+            app.update();
+        }
+        assert!(
+            alpha(&mut app) < 0.01,
+            "failure does not leave a black screen"
+        );
+        assert!(app.world().resource::<DoorCrossing>().needs_recovery());
+        assert!(!app.world_mut().run_system_once(no_door_crossing).unwrap());
+        assert_eq!(budget(&app), configured_budget());
+    }
+
+    #[test]
+    fn a_failed_return_stays_guarded_after_the_fade_in() {
+        let (mut app, _) = app_with(interior_door());
+        press_e(&mut app);
+        run_until_black(&mut app);
+        let own = app
+            .world()
+            .resource::<DoorCrossing>()
+            .active
+            .as_ref()
+            .unwrap()
+            .restore
+            .landing()
+            .key;
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_failed_for_test(CellKey::Interior(77));
+        app.update();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_failed_for_test(own);
+        for _ in 0..20 {
+            app.update();
+        }
+        assert!(alpha(&mut app) < 0.01);
+        assert!(app.world().resource::<DoorCrossing>().needs_recovery());
+        assert!(!app.world_mut().run_system_once(no_door_crossing).unwrap());
         assert_eq!(budget(&app), configured_budget());
     }
 
