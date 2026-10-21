@@ -18146,6 +18146,7 @@ mod upstream_tests {
     #[test]
     fn a_spawned_door_reference_carries_load_door() {
         let link = |cell| crate::world::database::DoorLinkRow {
+            label: String::new(),
             destination_ref_id: 0x700,
             destination_cell_id: cell,
             destination_worldspace_id: None,

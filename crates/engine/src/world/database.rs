@@ -86,6 +86,8 @@ pub struct ReferenceRow {
 /// `XTEL` subrecord.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DoorLinkRow {
+    /// Destination interior FULL name or worldspace editor ID.
+    pub label: String,
     /// The destination door reference (`XTEL` bytes 0..4, after plugin FormID remapping).
     pub destination_ref_id: u32,
     /// The destination reference's cell, `None` when the converter could not resolve it.
@@ -1202,6 +1204,30 @@ impl ReferenceQuery {
                 "incomplete reference enable-state columns: expected header_flags, enable_parent_id and enable_parent_flags"
             ),
         };
+        let has_worldspaces: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='worldspaces')",
+            [],
+            |row| row.get(0),
+        )?;
+        let has_interior_name: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('cells') WHERE name='interior_name')",
+            [],
+            |row| row.get(0),
+        )?;
+        let door_label_column = if has_doors && has_interior_name {
+            joins.push_str(" LEFT JOIN cells dc ON dc.id=d.destination_cell_id");
+            if has_worldspaces {
+                joins.push_str(" LEFT JOIN worldspaces ws ON ws.id=d.destination_worldspace_id");
+                "COALESCE(NULLIF(dc.interior_name,''),NULLIF(ws.editor_id,''),'')"
+            } else {
+                "COALESCE(NULLIF(dc.interior_name,''),'')"
+            }
+        } else if has_doors && has_worldspaces {
+            joins.push_str(" LEFT JOIN worldspaces ws ON ws.id=d.destination_worldspace_id");
+            "COALESCE(NULLIF(ws.editor_id,''),'')"
+        } else {
+            "''"
+        };
         let reference_enable_columns = match enable_column_count {
             0 => "0,NULL,0",
             _ => "r.header_flags,r.enable_parent_id,r.enable_parent_flags",
@@ -1209,7 +1235,7 @@ impl ReferenceQuery {
         Ok(Self {
             columns: format!(
                 "{REFERENCE_COLUMNS},{record_column},{light_columns},{override_column},\
-                 {door_columns},{emittance_columns},{reference_enable_columns}"
+                 {door_columns},{emittance_columns},{reference_enable_columns},{door_label_column}"
             ),
             joins,
             has_doors,
@@ -1359,6 +1385,10 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<(ReferenceRow, Ini
             if arrival.iter().all(Option::is_some) {
                 let value = |index: usize| arrival[index].unwrap_or_default();
                 Some(DoorLinkRow {
+                    label: row
+                        .get::<_, String>(REFERENCE_ENABLE_START + 3)?
+                        .trim_end_matches(|c: char| c == '\0' || c.is_whitespace())
+                        .to_owned(),
                     destination_ref_id,
                     destination_cell_id: row.get(26)?,
                     destination_worldspace_id: row.get(27)?,
@@ -2952,6 +2982,7 @@ mod tests {
                 assert_eq!(
                     reference.door,
                     doors.then_some(DoorLinkRow {
+                        label: String::new(),
                         destination_ref_id: 700,
                         destination_cell_id: Some(500),
                         destination_worldspace_id: None,
@@ -2967,6 +2998,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn door_labels_use_authored_destination_and_trim_terminators() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        add_door_links(&connection);
+        connection
+            .execute_batch(
+                "ALTER TABLE cells ADD COLUMN interior_name TEXT;
+            INSERT INTO cells(id,interior_name) VALUES(500,'Interior');
+            CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,editor_id TEXT);
+            INSERT INTO worldspaces VALUES(60,'OtherWorld');",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE cells SET interior_name=?1 WHERE id=500",
+                ["Interior\0  "],
+            )
+            .unwrap();
+        let payload = exterior_payload(&connection);
+        let label = |id| {
+            payload
+                .references
+                .iter()
+                .find(|r| r.form_id == id)
+                .unwrap()
+                .door
+                .as_ref()
+                .unwrap()
+                .label
+                .as_str()
+        };
+        assert_eq!(label(30), "Interior");
+        assert_eq!(label(31), "OtherWorld");
+    }
+
+    #[test]
+    fn named_destination_keeps_interior_label_with_a_worldspace_and_blank_uses_editor_id() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        add_door_links(&connection);
+        connection
+            .execute_batch(
+                "ALTER TABLE cells ADD COLUMN interior_name TEXT;
+            INSERT INTO cells(id,interior_name) VALUES(500,'Named destination');
+            CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,editor_id TEXT);
+            INSERT INTO worldspaces VALUES(60,'OtherWorld');
+            UPDATE door_links SET destination_worldspace_id=60 WHERE ref_id=30;",
+            )
+            .unwrap();
+        let label = || {
+            exterior_payload(&connection)
+                .references
+                .into_iter()
+                .find(|r| r.form_id == 30)
+                .unwrap()
+                .door
+                .unwrap()
+                .label
+        };
+        assert_eq!(label(), "Named destination");
+        connection
+            .execute("UPDATE cells SET interior_name='' WHERE id=500", [])
+            .unwrap();
+        assert_eq!(label(), "OtherWorld");
+        connection
+            .execute("UPDATE worldspaces SET editor_id='' WHERE id=60", [])
+            .unwrap();
+        assert_eq!(label(), "");
     }
 
     #[test]
@@ -2989,6 +3091,7 @@ mod tests {
         assert_eq!(
             door(30),
             Some(DoorLinkRow {
+                label: String::new(),
                 destination_ref_id: 700,
                 destination_cell_id: Some(500),
                 destination_worldspace_id: None,

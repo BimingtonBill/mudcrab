@@ -19,6 +19,7 @@ pub mod emittance;
 pub mod extensions;
 pub mod fingerprint;
 pub mod frame_budget;
+pub mod hud;
 pub mod indirect_metrics;
 pub mod lights;
 mod live_console;

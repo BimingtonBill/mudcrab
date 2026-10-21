@@ -28,6 +28,8 @@ pub struct DoorDestination {
 pub struct LoadDoor {
     /// The door reference's own FormID.
     pub ref_id: u32,
+    /// Authored destination name for ordinary interaction UI.
+    pub label: String,
     pub destination: DoorDestination,
 }
 
@@ -51,6 +53,7 @@ pub(crate) fn load_door(ref_id: u32, link: Option<&DoorLinkRow>) -> Option<LoadD
     }
     Some(LoadDoor {
         ref_id,
+        label: link.label.clone(),
         destination: DoorDestination {
             destination_ref_id: link.destination_ref_id,
             interior_cell_id,
@@ -67,6 +70,7 @@ mod tests {
 
     fn link(cell: Option<u32>, worldspace: Option<u32>) -> DoorLinkRow {
         DoorLinkRow {
+            label: String::new(),
             destination_ref_id: 7,
             destination_cell_id: cell,
             destination_worldspace_id: worldspace,
@@ -115,4 +119,38 @@ mod tests {
         assert!(load_door(5, Some(&link(None, Some(0)))).is_none());
         assert!(load_door(5, Some(&link(Some(0), Some(0)))).is_none());
     }
+}
+
+/// A controller other than the ordinary capsule owns targeting and keyboard activation.
+/// Its adapter puts this marker on its controlled entity and writes the shared target.
+#[derive(Component, Default)]
+pub struct ExternalDoorTargetOwner;
+
+/// The current interaction shared by keyboard activation and ordinary HUD.
+#[derive(Resource, Default, Debug, Clone, PartialEq)]
+pub struct DoorTarget(pub Option<TargetedDoor>);
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetedDoor {
+    pub door: Entity,
+    pub prompt: String,
+}
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DoorTargetSystems;
+pub fn open_prompt(label: &str) -> String {
+    format!("E  Open  {label}")
+}
+/// Scripted crossing; intentionally does not request a swing.
+#[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivateDoor {
+    pub door: Entity,
+}
+#[derive(Message, Debug, Clone, PartialEq)]
+pub struct DoorCrossed {
+    pub from_ref_id: u32,
+    pub label: String,
+}
+/// One accepted keyboard activation requests one authored source swing.
+#[derive(Message, Debug, Clone, Copy)]
+pub struct OpenDoor {
+    pub door: Entity,
 }
