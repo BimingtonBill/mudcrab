@@ -508,8 +508,8 @@ pub(in crate::streaming) struct TerrainLodIndex {
     /// The demanded world counts are taken for.
     world: Option<u32>,
     cluster_stamp: Option<ClusterStamp>,
-    /// Cells whose far terrain cluster terrain owns; their stock LOD patches are not drawn.
     /// Retained batches and confirmed merged cells feed the same tier decision as source patches.
+    /// Current cluster ownership is applied per render view after extraction.
     retained: HashMap<PatchKey, u8>,
     merged: HashSet<PatchKey>,
     batch_selection: HashMap<PatchKey, Option<LodTier>>,

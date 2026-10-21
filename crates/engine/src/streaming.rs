@@ -182,8 +182,8 @@ pub(crate) struct TerrainWorldspace(u32);
 #[derive(Component)]
 struct TerrainSurfaceReady;
 
-/// Terrain-only allocation retained as a reversible stand-in within the ordinary cell keep-set.
-/// The LOD selector owns its visibility; readiness and world identity remain the ordinary ones.
+/// Terrain-only allocation retained as a reversible stand-in within the planned keep-set.
+/// Current render-view coverage controls its draw; readiness and world identity remain ordinary.
 #[derive(Component)]
 struct RingTerrain;
 
@@ -1604,6 +1604,7 @@ struct CellPlanningContext<'w, 's> {
     prestream: Res<'w, PrestreamCells>,
     origin: Res<'w, RenderOrigin>,
     camera: Query<'w, 's, &'static Transform, With<StreamingCamera>>,
+    cluster_terrain: Option<Res<'w, crate::cluster::terrain::ClusterTerrain>>,
     restored_roots: Query<'w, 's, (Has<StreamedCellRoot>, Has<DistantTerrainRoot>)>,
 }
 
@@ -1632,6 +1633,7 @@ fn plan_cells(
         prestream,
         origin,
         camera,
+        cluster_terrain,
         restored_roots,
     } = context;
     let plan_started = Instant::now();
@@ -1661,16 +1663,39 @@ fn plan_cells(
         return;
     };
     let center = camera_grid(camera.translation, origin.0);
-    // Keep LAND stand-ins resident through drawable coverage withdrawal. Inventory does not
-    // authorize retirement; the existing LOD index arbitrates each surface's visibility below.
-    let terrain_radius = config.effective_terrain_radius(false);
+    // Vanilla LOD worlds keep their ordinary empty ring. Only cluster-owned cells need
+    // extra LAND allocations available when current render-view coverage withdraws.
+    let terrain_radius =
+        config.effective_terrain_radius(database.has_lod_for(active.worldspace_id));
+    let cluster_standins = cluster_terrain_standins(
+        &config,
+        active.worldspace_id,
+        center,
+        cluster_terrain.as_deref(),
+    );
+    let planning_radius = if cluster_standins.is_empty() {
+        terrain_radius
+    } else {
+        terrain_radius.max(config.terrain_radius)
+    };
     let mut wanted = wanted_cells(
         &active,
         config.stream_radius,
-        terrain_radius,
+        planning_radius,
         center,
         &prestream,
     );
+    wanted.retain(|(key, detail)| {
+        cluster_standins.contains(key)
+            || wanted_detail(
+                &active,
+                config.stream_radius,
+                terrain_radius,
+                center,
+                *key,
+                &prestream,
+            ) == Some(*detail)
+    });
     wanted.retain(|(key, detail)| terrain_request_required(&database, *key, *detail));
     let controlled = config.streaming_controls_enabled();
     if config.prioritize_streaming || controlled {
@@ -1884,6 +1909,15 @@ fn plan_cells(
     let mut revived = 0u64;
     streaming.cells.retain(|key, status| {
         let keep = pinned.contains(key)
+            || (cluster_standins.contains(key)
+                && cell_within_unload_radius(
+                    *key,
+                    &active,
+                    center,
+                    config.unload_radius,
+                    config.terrain_radius,
+                    &prestream,
+                ))
             || cell_within_unload_radius(
                 *key,
                 &active,
@@ -3786,6 +3820,45 @@ fn retry_failed_interior(
         return false;
     }
     streaming.failed_retries.get(key).copied().unwrap_or(0) < MAX_CELL_LOAD_RETRIES
+}
+
+/// Inventory bounds fallback residency; it never proves a replacement can draw.
+/// Pending blocks also need stand-ins before they become drawable and can withdraw.
+fn cluster_terrain_standins(
+    config: &EngineConfig,
+    world: u32,
+    center: IVec2,
+    terrain: Option<&crate::cluster::terrain::ClusterTerrain>,
+) -> HashSet<CellKey> {
+    if !config.cluster_terrain || config.clusters.is_none() {
+        return HashSet::new();
+    }
+    let radius = i64::from(config.terrain_radius.saturating_add(1));
+    terrain
+        .into_iter()
+        .flat_map(|terrain| &terrain.blocks)
+        .filter(|block| {
+            // Validated source cells lie inside this authored block rectangle. Reject remote
+            // blocks before walking their members, then keep the exact inventory test below.
+            block.worldspace_id == world
+                && i64::from(block.anchor.x) <= i64::from(center.x) + radius
+                && i64::from(block.anchor.y) <= i64::from(center.y) + radius
+                && i64::from(block.anchor.x) + i64::from(block.side_cells)
+                    > i64::from(center.x) - radius
+                && i64::from(block.anchor.y) + i64::from(block.side_cells)
+                    > i64::from(center.y) - radius
+        })
+        .flat_map(|block| &block.cells)
+        .filter(|grid| {
+            (i64::from(grid.x) - i64::from(center.x)).abs() <= radius
+                && (i64::from(grid.y) - i64::from(center.y)).abs() <= radius
+        })
+        .map(|grid| CellKey::Exterior {
+            worldspace_id: world,
+            grid_x: grid.x,
+            grid_y: grid.y,
+        })
+        .collect()
 }
 
 /// Whether this request has any terrain work; full loads still own references without LAND.
@@ -8121,6 +8194,7 @@ type WaitingTerrainPatches = (With<TerrainPatch>, With<SwapWaiting>);
 /// stay within Bevy's 16 system parameters.
 #[derive(SystemParam)]
 struct LifecycleQueries<'w, 's> {
+    cluster_terrain: Option<Res<'w, crate::cluster::terrain::ClusterTerrain>>,
     terrain_patches: Query<'w, 's, &'static ChildOf, With<TerrainPatch>>,
     static_colliders: Query<'w, 's, (), With<StaticColliderSource>>,
 }
@@ -8128,7 +8202,7 @@ struct LifecycleQueries<'w, 's> {
 #[allow(clippy::too_many_arguments)]
 fn validate_streaming_lifecycle(
     config: Res<EngineConfig>,
-    _database: Option<Res<WorldDatabase>>,
+    database: Option<Res<WorldDatabase>>,
     active: Res<ActiveCell>,
     prestream: Res<PrestreamCells>,
     origin: Res<RenderOrigin>,
@@ -8151,6 +8225,7 @@ fn validate_streaming_lifecycle(
     let LifecycleQueries {
         terrain_patches,
         static_colliders,
+        cluster_terrain,
     } = lifecycle_queries;
     let active_requests = streaming
         .cells
@@ -8199,7 +8274,16 @@ fn validate_streaming_lifecycle(
         // stopped wanting (`EngineConfig::effective_terrain_radius`).
         camera.single().map_or(0, |camera| {
             let center = camera_grid(camera.translation, origin.0);
-            let terrain_radius = config.effective_terrain_radius(false);
+            let has_lod = database
+                .as_ref()
+                .is_some_and(|database| database.has_lod_for(active.worldspace_id));
+            let terrain_radius = config.effective_terrain_radius(has_lod);
+            let cluster_standins = cluster_terrain_standins(
+                &config,
+                active.worldspace_id,
+                center,
+                cluster_terrain.as_deref(),
+            );
             let limit = config.unload_radius.max(terrain_radius.saturating_add(1));
             streaming
                 .cells
@@ -8208,6 +8292,15 @@ fn validate_streaming_lifecycle(
                     let key = **key;
                     matches!(status, CellStatus::Resident { .. })
                         && !prestream.contains(&key)
+                        && !(cluster_standins.contains(&key)
+                            && cell_within_unload_radius(
+                                key,
+                                &active,
+                                center,
+                                config.unload_radius,
+                                config.terrain_radius,
+                                &prestream,
+                            ))
                         && matches!(key, CellKey::Exterior { worldspace_id, grid_x, grid_y }
                             if worldspace_id == active.worldspace_id
                                 && ((grid_x - center.x).abs() > limit
@@ -8481,6 +8574,131 @@ mod tests {
             assert!(streaming.outstanding_cells.is_empty());
             assert!(app.world().get_entity(old).is_ok());
         }
+    }
+
+    #[test]
+    fn cluster_ring_plans_only_owned_cells_inside_the_configured_envelope() {
+        use crate::cluster::terrain::{ClusterTerrain, TerrainBlock};
+        let world = 7;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database_with_lod_for(&path, world);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        for (id, x, y) in [(1001, 2, 0), (1002, 3, 0), (1003, 0, 2)] {
+            connection
+                .execute(
+                    "INSERT INTO cells VALUES(?1,?2,?3,?4,NULL,0)",
+                    rusqlite::params![id, world, x, y],
+                )
+                .unwrap();
+            connection
+                .execute("INSERT INTO land VALUES(?1,x'00')", [id])
+                .unwrap();
+        }
+        drop(connection);
+        let block = |owner, grid: IVec2| TerrainBlock {
+            mesh_hash: String::new(),
+            primitive_index: 0,
+            worldspace_id: owner,
+            anchor: grid,
+            side_cells: 1,
+            instance_path: String::new(),
+            cells: vec![grid],
+            material: Handle::default(),
+            batch: None,
+        };
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 2,
+            cluster_terrain: true,
+            clusters: Some(String::new()),
+            ..EngineConfig::default()
+        })
+        .insert_resource(ClusterTerrain::for_blocks_test(vec![
+            block(world, IVec2::new(2, 0)),
+            block(world, IVec2::new(3, 0)),
+            block(world + 1, IVec2::new(0, 2)),
+        ]))
+        .insert_resource(RenderOrigin(IVec2::ZERO))
+        .insert_resource(ActiveCell {
+            worldspace_id: world,
+            interior: None,
+        })
+        .insert_resource(WorldDatabase::open(&path).unwrap())
+        .init_resource::<StreamingWorld>()
+        .init_resource::<PrestreamCells>()
+        .init_resource::<TerrainContinuity>()
+        .init_resource::<StreamingMetrics>()
+        .init_resource::<StreamingCommitBudget>()
+        .init_resource::<ProfilingState>()
+        .add_systems(Update, plan_cells);
+        app.world_mut()
+            .spawn((Transform::from_xyz(1.0, 0.0, -1.0), StreamingCamera));
+        app.update();
+        let keys = planned_keys(&app);
+        assert_eq!(
+            keys.len(),
+            10,
+            "nine full cells plus the one owned ring cell"
+        );
+        assert!(keys.contains(&CellKey::Exterior {
+            worldspace_id: world,
+            grid_x: 2,
+            grid_y: 0
+        }));
+        assert!(!keys.contains(&CellKey::Exterior {
+            worldspace_id: world,
+            grid_x: 3,
+            grid_y: 0
+        }));
+        assert!(!keys.contains(&CellKey::Exterior {
+            worldspace_id: world,
+            grid_x: 0,
+            grid_y: 2
+        }));
+    }
+
+    #[test]
+    fn cluster_standin_inventory_requires_enabled_matching_world_ownership() {
+        use crate::cluster::terrain::{ClusterTerrain, TerrainBlock};
+        let grid = IVec2::new(4, -3);
+        let world = 7;
+        let terrain = ClusterTerrain::for_blocks_test(vec![TerrainBlock {
+            mesh_hash: String::new(),
+            primitive_index: 0,
+            worldspace_id: world,
+            anchor: grid,
+            side_cells: 1,
+            instance_path: String::new(),
+            cells: vec![grid],
+            material: Handle::default(),
+            batch: None,
+        }]);
+        let mut config = EngineConfig {
+            clusters: Some(String::new()),
+            ..EngineConfig::default()
+        };
+        assert!(cluster_terrain_standins(&config, world, IVec2::ZERO, Some(&terrain)).is_empty());
+        config.cluster_terrain = true;
+        let expected = CellKey::Exterior {
+            worldspace_id: world,
+            grid_x: grid.x,
+            grid_y: grid.y,
+        };
+        assert_eq!(
+            cluster_terrain_standins(&config, world, IVec2::ZERO, Some(&terrain)),
+            HashSet::from([expected])
+        );
+        assert!(
+            cluster_terrain_standins(&config, world + 1, IVec2::ZERO, Some(&terrain)).is_empty()
+        );
+        assert!(cluster_terrain_standins(&config, world, IVec2::ZERO, None).is_empty());
+        assert!(
+            cluster_terrain_standins(&config, world, IVec2::splat(100), Some(&terrain)).is_empty()
+        );
+        config.clusters = None;
+        assert!(cluster_terrain_standins(&config, world, IVec2::ZERO, Some(&terrain)).is_empty());
     }
 
     #[test]
@@ -10787,10 +11005,10 @@ mod tests {
         )));
     }
 
-    /// Both worlds retain actual LAND stand-ins despite sparse authored LOD inventory.
-    /// A crossing changes exact world identity; inventory alone never retires a ring.
+    /// The automatic ring follows the active worldspace: stock LOD worlds keep the full grid
+    /// only, and worlds without stock LOD keep their configured terrain ring.
     #[test]
-    fn sparse_lod_in_another_worldspace_does_not_remove_the_terrain_ring() {
+    fn the_terrain_ring_follows_the_active_worldspaces_lod_data() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
         write_plan_database_with_lod_for(&path, 614);
@@ -10876,8 +11094,8 @@ mod tests {
         let lod = planned_keys(&app);
         assert_eq!(
             lod.len(),
-            25,
-            "a single source cell does not cover the requested terrain ring"
+            9,
+            "a worldspace with LOD data plans its full-detail grid and leaves the ring to the LOD"
         );
         assert!(lod.iter().all(|key| matches!(
             key,
@@ -10887,12 +11105,12 @@ mod tests {
             }
         )));
         assert!(
-            lod.contains(&CellKey::Exterior {
+            !lod.contains(&CellKey::Exterior {
                 worldspace_id: 614,
                 grid_x: center.x + 2,
                 grid_y: center.y,
             }),
-            "an uncovered ring cell must still be requested"
+            "the cell the LOD draws is not planned as a ring cell"
         );
         assert!(
             !lod.contains(&ring_cell),

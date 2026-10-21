@@ -684,8 +684,12 @@ fn update_atmosphere(
     // How far distant terrain reaches, once the world is known to have any. Absent in a run that
     // does not stream, and unset in a world converted without LOD.
     horizon: Option<Res<LodHorizon>>,
-    // Kept as an optional dependency for the existing atmosphere fixture API.
-    _database: Option<Res<WorldDatabase>>,
+    // Read for the active worldspace's LOD data, which decides the ring the fog is measured from:
+    // an unnamed ring is off where the exterior draws its own terrain LOD
+    // (`EngineConfig::effective_terrain_radius`). Absent in a run that opens no world database, and
+    // every worldspace of one keeps the configured ring.
+    database: Option<Res<WorldDatabase>>,
+    cluster_terrain: Option<Res<crate::cluster::terrain::ClusterTerrain>>,
     catalog: Option<Res<SpaceLightingCatalog>>,
     mut clear: ResMut<ClearColor>,
     ambient: Option<ResMut<GlobalAmbientLight>>,
@@ -699,7 +703,7 @@ fn update_atmosphere(
     mut applied: Local<bool>,
     // The space the far plane was last written for. A change of *space* writes it; a change of the
     // LOD horizon, which the fog above follows in the same frame, does not.
-    mut far_space: Local<Option<SpaceKey>>,
+    mut far_space: Local<Option<(SpaceKey, i32)>>,
 ) {
     let Some(active) = active else {
         return;
@@ -707,10 +711,33 @@ fn update_atmosphere(
     if cameras.is_empty() {
         return;
     }
+    let has_lod = database
+        .as_ref()
+        .is_some_and(|database| database.has_lod_for(active.worldspace_id));
+    let terrain_radius = config.effective_terrain_radius(has_lod);
+    // Only the cluster-owned inventory retains extra reversible LAND surfaces.
+    let cluster_owned_world = config.cluster_terrain
+        && config.clusters.is_some()
+        && cluster_terrain.as_ref().is_some_and(|terrain| {
+            terrain
+                .blocks
+                .iter()
+                .any(|block| block.worldspace_id == active.worldspace_id && !block.cells.is_empty())
+        });
+    let terrain_radius = if cluster_owned_world {
+        terrain_radius.max(config.terrain_radius)
+    } else {
+        terrain_radius
+    };
     // Apply on the first frame that has a camera, then on every change of place. Starting inside
     // (--demo blackreach) never changes ActiveCell, so a change-only check left it in daylight.
     if *applied
         && !active.is_changed()
+        && far_space.is_some_and(|(_, radius)| radius == terrain_radius)
+        && !config.is_changed()
+        && !cluster_terrain
+            .as_ref()
+            .is_some_and(|terrain| terrain.is_changed())
         && !horizon.as_ref().is_some_and(|horizon| horizon.is_changed())
     {
         return;
@@ -729,9 +756,6 @@ fn update_atmosphere(
     let lod_reach = horizon
         .as_ref()
         .and_then(|horizon| horizon.reach_in(active.worldspace_id));
-    // The resident LAND stand-ins can reappear on any draw-coverage withdrawal.
-    // Keep fog/far reach outside that envelope; inventory alone cannot shorten it.
-    let terrain_radius = config.effective_terrain_radius(false);
     let fog = atmosphere_fog(&atmosphere, config.stream_radius, terrain_radius, lod_reach);
     // The far plane follows the ring, and the ring is not the same in every worldspace: a crossing
     // from a worldspace whose LOD left the ring off into one without LOD draws the ring there, and
@@ -744,15 +768,12 @@ fn update_atmosphere(
     // back in on the frame the horizon became known would clip the LOD that announced it. An equal
     // value is not written, so a change of interior cell - every cell a space of its own - marks
     // nothing.
-    if *far_space != Some(key) {
-        *far_space = Some(key);
+    if *far_space != Some((key, terrain_radius)) {
+        *far_space = Some((key, terrain_radius));
         // A worldspace whose LOD horizon is already known (it is kept through an interior and
         // across crossings) gets the LOD's own far plane back at once: waiting for the next LOD
         // query to extend it would clip the distant terrain for the frames in between.
-        let ring_far = camera_far_plane(
-            config.stream_radius,
-            terrain_radius.max(config.terrain_radius),
-        );
+        let ring_far = camera_far_plane(config.stream_radius, terrain_radius);
         let far = match lod_reach {
             Some(_) if active.interior.is_none() => ring_far.max(
                 crate::streaming::lod::lod_camera_far(config.terrain_lod.max_reach_cells()),
@@ -854,8 +875,9 @@ mod tests {
         );
         assert_eq!(
             ring.effective_terrain_radius(true),
-            ring.terrain_radius,
-            "inventory cannot remove the retained stand-in envelope"
+            ring.stream_radius,
+            "and this is the run the old rule read: started where the world has LOD, the ring it \
+             starts with is off, and the worldspace it crosses into draws the configured one"
         );
         assert!(ring.terrain_radius > ring.stream_radius);
 
@@ -1847,8 +1869,8 @@ mod tests {
         app.update();
         assert_eq!(
             camera_far(&app),
-            camera_far_plane(config.stream_radius, config.terrain_radius),
-            "inventory cannot clip retained ring stand-ins"
+            lod_far,
+            "the worldspace the camera started in keeps its own far plane"
         );
 
         // The crossing the review's failure was about: into a worldspace without LOD data, whose
@@ -1882,7 +1904,40 @@ mod tests {
             interior: None,
         };
         app.update();
+        assert_eq!(camera_far(&app), lod_far);
+
+        // Cluster ownership adds reversible stand-ins only in its own world. Removing that
+        // inventory restores the ordinary plane without needing a space change.
+        {
+            let mut config = app.world_mut().resource_mut::<EngineConfig>();
+            config.clusters = Some(String::new());
+            config.cluster_terrain = true;
+        }
+        app.world_mut()
+            .insert_resource(crate::cluster::terrain::ClusterTerrain::for_blocks_test(
+                vec![crate::cluster::terrain::TerrainBlock {
+                    mesh_hash: String::new(),
+                    primitive_index: 0,
+                    worldspace_id: 614,
+                    anchor: IVec2::ZERO,
+                    side_cells: 1,
+                    instance_path: String::new(),
+                    cells: vec![IVec2::ZERO],
+                    material: Handle::default(),
+                    batch: None,
+                }],
+            ));
+        app.update();
         assert_eq!(camera_far(&app), ring_far);
+        app.world_mut()
+            .remove_resource::<crate::cluster::terrain::ClusterTerrain>();
+        app.update();
+        assert_eq!(camera_far(&app), lod_far);
+        {
+            let mut config = app.world_mut().resource_mut::<EngineConfig>();
+            config.clusters = None;
+            config.cluster_terrain = false;
+        }
 
         // And what the LOD extended it to survives the frame the horizon becomes known: that frame
         // rewrites the fog (the system above is listening for the horizon) and must not pull the
