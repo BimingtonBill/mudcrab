@@ -1751,6 +1751,30 @@ fn forget_lost_door_players(
         if let Some(restore) = restore {
             commands.entity(entity).try_insert(ReattachPose(restore));
         }
+        if let Some(player) = player
+            && let Ok(graph) = derived_graphs.get(entity)
+        {
+            let graph = graph.0.clone();
+            // A source can change without replacing its scene/player. Withdraw our playback
+            // only while this player still uses our graph; the public owner or another system
+            // may already have installed a replacement. Check when the command applies too.
+            // This runs before attachment in the chain, so a newly derived graph wins afterward.
+            commands.queue(move |world: &mut World| {
+                let Ok(mut entity) = world.get_entity_mut(player) else {
+                    return;
+                };
+                if !entity
+                    .get::<AnimationGraphHandle>()
+                    .is_some_and(|actual| actual.0 == graph)
+                {
+                    return;
+                }
+                if let Some(mut player) = entity.get_mut::<AnimationPlayer>() {
+                    player.stop_all();
+                }
+                entity.remove::<(AnimationGraphHandle, AnimationTransitions)>();
+            });
+        }
         // The marker describes the animation being withdrawn, so it goes with it: the door that
         // resolves again is judged on that resolution.
         commands.entity(entity).try_remove::<(
@@ -3116,6 +3140,221 @@ mod tests {
     }
 
     #[test]
+    fn same_player_static_revision_withdraws_private_graph_and_stops_its_real_curve() {
+        let mut app = door_app();
+        let model = door_with_model(&mut app, WIDE_SWING_DEGREES);
+        app.update();
+        activate(&mut app, model.door);
+        step(&mut app, 2);
+        assert!(
+            player(&app, model.player)
+                .playing_animations()
+                .next()
+                .is_some()
+        );
+        let pose = *app.world().get::<Transform>(model.moved).unwrap();
+        assert!(leaf_degrees(&app, model.moved) > 0.0);
+        let authored = app
+            .world()
+            .get::<SourceClipBinding>(model.door)
+            .unwrap()
+            .clone();
+        let authored_graph = authored.graph.clone().unwrap();
+        app.world_mut()
+            .entity_mut(authored.source)
+            .insert(SourceClips::default());
+
+        app.update();
+
+        assert_eq!(state(&app, model.door), DoorState::Open { animated: false });
+        assert!(
+            !app.world()
+                .get::<DoorAnimation>(model.door)
+                .unwrap()
+                .swings()
+        );
+        assert!(app.world().get::<DerivedGraph>(model.door).is_none());
+        assert!(
+            app.world()
+                .get::<AnimationGraphHandle>(model.player)
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .get::<AnimationTransitions>(model.player)
+                .is_none()
+        );
+        assert!(
+            player(&app, model.player)
+                .playing_animations()
+                .next()
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<AnimationGraph>>()
+                .get(&authored_graph)
+                .is_some()
+        );
+        assert!(
+            app.world()
+                .get::<SourceClips>(authored.source)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        step(&mut app, 3);
+        assert_eq!(*app.world().get::<Transform>(model.moved).unwrap(), pose);
+        assert!(app.world().get_entity(model.moved_mesh).is_ok());
+    }
+
+    #[test]
+    fn same_player_unresolved_revision_withdraws_private_graph_until_real_curve_returns() {
+        let mut app = door_app();
+        let model = door_with_model(&mut app, WIDE_SWING_DEGREES);
+        app.update();
+        activate(&mut app, model.door);
+        step(&mut app, 2);
+        let authored = app
+            .world()
+            .get::<SourceClipBinding>(model.door)
+            .unwrap()
+            .clone();
+        let inventory = app
+            .world()
+            .get::<SourceClips>(authored.source)
+            .unwrap()
+            .0
+            .clone();
+        let old_graph = app
+            .world()
+            .get::<DerivedGraph>(model.door)
+            .unwrap()
+            .0
+            .clone();
+        let pose = *app.world().get::<Transform>(model.moved).unwrap();
+        let missing = {
+            let mut clips = app.world_mut().resource_mut::<Assets<AnimationClip>>();
+            let handle = clips.add(AnimationClip::default());
+            clips.remove(handle.id());
+            handle
+        };
+        app.world_mut()
+            .entity_mut(authored.source)
+            .insert(SourceClips(vec![(OPEN_CLIP.into(), missing.clone())]));
+
+        app.update();
+
+        assert!(app.world().get::<SourceClipBinding>(model.door).is_none());
+        assert!(app.world().get::<DoorAnimation>(model.door).is_none());
+        assert!(app.world().get::<DerivedGraph>(model.door).is_none());
+        assert!(app.world().get::<DerivedSource>(model.door).is_none());
+        assert!(
+            app.world()
+                .get::<AnimationGraphHandle>(model.player)
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .get::<AnimationTransitions>(model.player)
+                .is_none()
+        );
+        assert!(
+            player(&app, model.player)
+                .playing_animations()
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            app.world().get::<ReattachPose>(model.door).unwrap().0,
+            DoorState::Open { animated: true }
+        );
+        assert_eq!(
+            app.world().get::<SourceClips>(authored.source).unwrap().0[0].1,
+            missing
+        );
+        step(&mut app, UNRESOLVED_OBSERVATION_FRAMES);
+        assert!(app.world().get::<DoorAnimation>(model.door).is_none());
+        assert_eq!(*app.world().get::<Transform>(model.moved).unwrap(), pose);
+
+        app.world_mut()
+            .entity_mut(authored.source)
+            .insert(SourceClips(inventory));
+        app.update();
+        let graph = &app.world().get::<DerivedGraph>(model.door).unwrap().0;
+        assert_ne!(*graph, old_graph);
+        assert_eq!(
+            &app.world()
+                .get::<AnimationGraphHandle>(model.player)
+                .unwrap()
+                .0,
+            graph
+        );
+        assert_eq!(state(&app, model.door), DoorState::Open { animated: true });
+        assert!(app.world().get::<ReattachPose>(model.door).is_none());
+        assert!((leaf_degrees(&app, model.moved) - WIDE_SWING_DEGREES).abs() < 0.1);
+        assert!(
+            player(&app, model.player)
+                .playing_animations()
+                .next()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn private_withdrawal_preserves_replacement_graph_and_its_playback() {
+        let mut app = door_app();
+        let model = door_with_model(&mut app, WIDE_SWING_DEGREES);
+        app.update();
+        activate(&mut app, model.door);
+        let authored = app
+            .world()
+            .get::<SourceClipBinding>(model.door)
+            .unwrap()
+            .clone();
+        // A foreign owner gets a distinct asset identity, not the withdrawn authored handle.
+        let replacement_value = app
+            .world()
+            .resource::<Assets<AnimationGraph>>()
+            .get(authored.graph.as_ref().unwrap())
+            .unwrap()
+            .clone();
+        let replacement = app
+            .world_mut()
+            .resource_mut::<Assets<AnimationGraph>>()
+            .add(replacement_value);
+        app.world_mut()
+            .entity_mut(model.player)
+            .insert(AnimationGraphHandle(replacement.clone()));
+        app.world_mut()
+            .entity_mut(authored.source)
+            .insert(SourceClips::default());
+
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .get::<AnimationGraphHandle>(model.player)
+                .unwrap()
+                .0,
+            replacement
+        );
+        assert!(
+            player(&app, model.player)
+                .playing_animations()
+                .next()
+                .is_some()
+        );
+        assert!(
+            app.world()
+                .get::<AnimationTransitions>(model.player)
+                .is_some()
+        );
+        assert!(app.world().get::<DerivedGraph>(model.door).is_none());
+        assert_eq!(state(&app, model.door), DoorState::Open { animated: false });
+    }
+
+    #[test]
     fn public_source_revision_rebuilds_private_graph_without_changing_authored_clips_or_live_meshes()
      {
         let mut app = door_app();
@@ -3149,6 +3388,14 @@ mod tests {
         assert_ne!(binding.graph, old_binding.graph);
         assert_ne!(derived.0, old_derived);
         assert_ne!(binding.graph.as_ref(), Some(&derived.0));
+        assert_eq!(
+            app.world()
+                .get::<AnimationGraphHandle>(model.player)
+                .unwrap()
+                .0,
+            derived.0,
+            "the newly attached private graph remains authoritative after withdrawal"
+        );
         assert_eq!(
             app.world().get::<SourceClips>(binding.source).unwrap().0[0].1,
             replacement
@@ -5314,6 +5561,16 @@ mod tests {
         step(&mut app, 1);
         assert!(app.world().get::<DoorAnimation>(model.door).is_none());
         assert!(app.world().get::<DoorAnimationGaveUp>(model.door).is_none());
+        assert!(
+            app.world()
+                .get::<AnimationGraphHandle>(model.player)
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .get::<AnimationTransitions>(model.player)
+                .is_none()
+        );
     }
 
     /// What a caller that wants to open a door may rely on: the door's resolved animation, never the
