@@ -1436,6 +1436,11 @@ impl CaptureRun {
 }
 
 impl ShotsRun {
+    /// Static captures use a fixed water phase; route captures retain the live clock.
+    pub(crate) fn water_time_seconds(&self) -> Option<f32> {
+        self.route_checkpoints.is_none().then_some(1.0)
+    }
+
     /// Legacy portal caller convenience; exterior defaults are derived from the file.
     pub fn for_portal(file: ShotsFile, output_dir: PathBuf) -> Self {
         let worldspace_id = file
@@ -2483,7 +2488,7 @@ fn request_capture(
                         "preset_saturation": grading.preset_saturation,
                         "grading_source": grading.source,
                         "resolved_grade": grading.resolved_grade,
-                        "water_time_seconds": if run.route_checkpoints.is_none() { Some(1.0) } else { None }
+                        "water_time_seconds": run.water_time_seconds()
                     });
                     run.note(line.to_string());
                     if run.log_failed {
@@ -2769,6 +2774,17 @@ mod tests {
         }
       ]
     }"#;
+
+    #[test]
+    fn only_static_shots_request_a_pinned_water_clock() {
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).unwrap();
+        let mut run = ShotsRun::for_portal(file, PathBuf::from("unused-shots-output"));
+        assert_eq!(run.water_time_seconds(), Some(1.0));
+        run.route_checkpoints = Some(BTreeSet::new());
+        assert_eq!(run.water_time_seconds(), None);
+        run.route_checkpoints = Some(BTreeSet::from([0]));
+        assert_eq!(run.water_time_seconds(), None);
+    }
 
     fn interior_example() -> String {
         r#"{"width": 1050, "height": 1400, "shots": [

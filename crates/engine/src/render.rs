@@ -1006,9 +1006,16 @@ pub struct WaterReflectionTexture(pub Handle<Image>);
 /// Apply live water controls without rewriting materials merely to advance their clock.
 fn apply_water_settings(
     settings: Option<Res<crate::settings::RenderingSettings>>,
+    shots: Option<Res<crate::shots::ShotsRun>>,
     mut materials: ResMut<Assets<WaterMaterial>>,
 ) {
     let Some(settings) = settings else { return };
+    // A static capture claims a fixed water phase in its receipt, so every water material,
+    // including streamed cells that arrive later, must read that phase and not the shared clock.
+    let pinned_clock = shots
+        .as_ref()
+        .and_then(|shots| shots.water_time_seconds())
+        .map(|seconds| Vec4::new(seconds, 1.0, 0.0, 0.0));
     let wanted_wave = Vec4::new(
         settings.wave_scale,
         settings.wave_speed,
@@ -1033,8 +1040,9 @@ fn apply_water_settings(
             ));
             (water.settings.wave_scale_speed_strength != wanted_wave
                 || water.settings.flow_direction.w != flow
-                || water.settings.fresnel_reflectivity.z != wanted_reflection)
-                .then_some((id, flow))
+                || water.settings.fresnel_reflectivity.z != wanted_reflection
+                || pinned_clock.is_some_and(|clock| water.settings.clock != clock))
+            .then_some((id, flow))
         })
         .collect();
     for (id, flow) in changed {
@@ -1043,6 +1051,9 @@ fn apply_water_settings(
             water.settings.wave_scale_speed_strength = wanted_wave;
             water.settings.flow_direction.w = flow;
             water.settings.fresnel_reflectivity.z = wanted_reflection;
+            if let Some(clock) = pinned_clock {
+                water.settings.clock = clock;
+            }
         }
     }
 }
@@ -4147,6 +4158,152 @@ mod tests {
             pinned.settings.wave_scale_speed_strength,
             shared.settings.wave_scale_speed_strength
         );
+    }
+
+    fn water_settings_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((bevy::app::TaskPoolPlugin::default(), AssetPlugin::default()))
+            .init_asset::<WaterMaterial>()
+            .init_resource::<crate::settings::RenderingSettings>()
+            .add_systems(Update, apply_water_settings);
+        app
+    }
+
+    fn water_shots_run() -> crate::shots::ShotsRun {
+        crate::shots::ShotsRun::new(
+            crate::shots::ShotsFile {
+                width: 64,
+                height: 64,
+                shots: Vec::new(),
+            },
+            std::path::PathBuf::from("unused-shots-output"),
+            0,
+        )
+    }
+
+    fn add_test_water(app: &mut App, extension: WaterExtension) -> Handle<WaterMaterial> {
+        app.world_mut()
+            .resource_mut::<Assets<WaterMaterial>>()
+            .add(WaterMaterial {
+                base: StandardMaterial::default(),
+                extension,
+            })
+    }
+
+    #[test]
+    fn static_shots_pin_existing_and_newly_arriving_water_materials() {
+        let mut app = water_settings_app();
+        app.insert_resource(water_shots_run());
+        let mut handles = vec![
+            add_test_water(&mut app, WaterExtension::default()),
+            add_test_water(&mut app, WaterExtension::default().with_pinned_clock(7.0)),
+        ];
+        app.update();
+        for handle in &handles {
+            let water = app
+                .world()
+                .resource::<Assets<WaterMaterial>>()
+                .get(handle)
+                .unwrap();
+            assert_eq!(
+                water.extension.settings.clock,
+                Vec4::new(1.0, 1.0, 0.0, 0.0)
+            );
+        }
+        handles.push(add_test_water(&mut app, WaterExtension::default()));
+        app.update();
+        for handle in &handles {
+            let water = app
+                .world()
+                .resource::<Assets<WaterMaterial>>()
+                .get(handle)
+                .unwrap();
+            assert_eq!(
+                water.extension.settings.clock,
+                Vec4::new(1.0, 1.0, 0.0, 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn static_shots_do_not_modify_water_materials_on_repeated_frames() {
+        let mut app = water_settings_app();
+        app.insert_resource(water_shots_run());
+        let handle = add_test_water(&mut app, WaterExtension::default());
+        // Flush creation and first-update events before checking steady frames.
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(
+            app.world()
+                .resource::<Assets<WaterMaterial>>()
+                .get(&handle)
+                .unwrap()
+                .extension
+                .settings
+                .clock,
+            Vec4::new(1.0, 1.0, 0.0, 0.0)
+        );
+        app.world_mut()
+            .resource_mut::<Messages<AssetEvent<WaterMaterial>>>()
+            .clear();
+        for _ in 0..3 {
+            app.update();
+            let events: Vec<_> = app
+                .world_mut()
+                .resource_mut::<Messages<AssetEvent<WaterMaterial>>>()
+                .drain()
+                .collect();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AssetEvent::Modified { .. })),
+                "unchanged static-shot water was modified: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_and_route_water_keep_shared_and_authored_clocks() {
+        for route in [false, true] {
+            let mut app = water_settings_app();
+            if route {
+                let mut run = water_shots_run();
+                run.route_checkpoints = Some(BTreeSet::from([0]));
+                app.insert_resource(run);
+            }
+            let shared = add_test_water(&mut app, WaterExtension::default());
+            let authored =
+                add_test_water(&mut app, WaterExtension::default().with_pinned_clock(7.0));
+            // Force a real settings update, so preservation is not an early-return artifact.
+            app.world_mut()
+                .resource_mut::<crate::settings::RenderingSettings>()
+                .wave_speed = 0.25;
+            for _ in 0..2 {
+                app.update();
+                let materials = app.world().resource::<Assets<WaterMaterial>>();
+                assert_eq!(
+                    materials.get(&shared).unwrap().extension.settings.clock,
+                    Vec4::ZERO
+                );
+                assert_eq!(
+                    materials.get(&authored).unwrap().extension.settings.clock,
+                    Vec4::new(7.0, 1.0, 0.0, 0.0)
+                );
+                for handle in [&shared, &authored] {
+                    assert_eq!(
+                        materials
+                            .get(handle)
+                            .unwrap()
+                            .extension
+                            .settings
+                            .wave_scale_speed_strength
+                            .y,
+                        0.25
+                    );
+                }
+            }
+        }
     }
 
     #[test]
