@@ -3209,7 +3209,8 @@ mod tests {
 
         for phase in [Phase::Door, Phase::Settle] {
             let file = ShotsFile::from_json(&door_example()).expect("fixture parses");
-            let mut run = ShotsRun::for_portal(file, PathBuf::from("unused-shots-output"));
+            let output = tempfile::tempdir().expect("temporary shots folder");
+            let mut run = ShotsRun::for_portal(file, output.path().into());
             run.enter(phase);
             let mut app = automation_app(run);
             app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(31)));
@@ -3250,7 +3251,8 @@ mod tests {
 
         for phase in [Phase::Door, Phase::Settle] {
             let file = ShotsFile::from_json(&door_example()).expect("fixture parses");
-            let mut run = ShotsRun::for_portal(file, PathBuf::from("unused-shots-output"));
+            let output = tempfile::tempdir().expect("temporary shots folder");
+            let mut run = ShotsRun::for_portal(file, output.path().into());
             run.enter(phase);
             let mut app = automation_app(run);
             app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(31)))
@@ -3286,7 +3288,7 @@ mod tests {
 
     #[test]
     fn a_door_startup_wait_does_not_hold_an_already_ready_settle_phase() {
-        let mut run = door_run();
+        let (mut run, _output) = door_run();
         let scene = initial_scene(true);
         let metrics = StreamingMetrics::default();
         assert!(run.advance_door_automation(
@@ -3736,7 +3738,8 @@ mod tests {
     fn initial_shot_certification_wait_preserves_the_capture_window() {
         let phase = Phase::Settle;
         let file = ShotsFile::from_json(DESIGN_EXAMPLE).expect("fixture parses");
-        let mut run = ShotsRun::for_portal(file, PathBuf::from("unused-shots-output"));
+        let output = tempfile::tempdir().expect("temporary shots folder");
+        let mut run = ShotsRun::for_portal(file, output.path().into());
         assert_eq!(
             run.phase,
             Phase::Move,
@@ -3802,7 +3805,8 @@ mod tests {
             .resident
             .store(false, std::sync::atomic::Ordering::Release);
         let file = ShotsFile::from_json(DESIGN_EXAMPLE).expect("fixture parses");
-        let mut run = ShotsRun::for_portal(file, PathBuf::from("unused-shots-output"));
+        let output = tempfile::tempdir().expect("temporary shots folder");
+        let mut run = ShotsRun::for_portal(file, output.path().into());
         run.enter(phase);
         let ready = Some(&PackageValidationStatus::Ready);
         for _ in 0..40 {
@@ -4011,11 +4015,14 @@ mod tests {
         }
     }
 
-    fn door_run() -> ShotsRun {
+    /// A run in its door phase. The returned folder holds the run's `shots.log`; keep it alive as
+    /// long as the run.
+    fn door_run() -> (ShotsRun, tempfile::TempDir) {
         let file = ShotsFile::from_json(DESIGN_EXAMPLE).expect("fixture parses");
-        let mut run = ShotsRun::for_portal(file, PathBuf::from("unused-shots-output"));
+        let output = tempfile::tempdir().expect("temporary shots folder");
+        let mut run = ShotsRun::for_portal(file, output.path().into());
         run.enter(Phase::Door);
-        run
+        (run, output)
     }
 
     fn door_frame<'a>(
@@ -4043,7 +4050,7 @@ mod tests {
     fn a_resolved_animated_door_is_asked_while_the_package_is_pending() {
         let mut bed = DoorBed::new(Some(DoorAnimation::swinging_for_test()));
         bed.graph_player();
-        let mut run = door_run();
+        let (mut run, _output) = door_run();
         let pending = PackageValidationStatus::Pending;
 
         bed.frame(&mut run, &door_frame(0.25, Some(&pending), None, None));
@@ -4077,7 +4084,7 @@ mod tests {
     #[test]
     fn a_resolved_static_door_is_asked_at_once_and_gets_the_ordinary_window_after_a_long_startup() {
         let mut bed = DoorBed::new(Some(DoorAnimation::default()));
-        let mut run = door_run();
+        let (mut run, _output) = door_run();
         let pending = PackageValidationStatus::Pending;
         let waiting = door_frame(1.0, Some(&pending), None, None);
 
@@ -4128,7 +4135,7 @@ mod tests {
             Some(DoorAnimation::swinging_for_test()),
         ] {
             let mut bed = DoorBed::new(animation);
-            let mut run = door_run();
+            let (mut run, _output) = door_run();
             // A stock run, no package: the door deadline is the only clock, and no amount of
             // waiting makes a missing player a static door.
             for _ in 0..DOOR_TIMEOUT_SECONDS as u32 - 1 {
@@ -4149,7 +4156,7 @@ mod tests {
     #[test]
     fn startup_holds_only_the_first_shots_door_deadline_and_never_a_later_shot() {
         let mut bed = DoorBed::new(None);
-        let mut run = door_run();
+        let (mut run, _output) = door_run();
         let pending = PackageValidationStatus::Pending;
         for _ in 0..100 {
             bed.frame(&mut run, &door_frame(1.0, Some(&pending), None, None));
@@ -4194,7 +4201,7 @@ mod tests {
         assert!(!asked(&run));
 
         // A later shot is never held behind the first shot's package.
-        let mut later = door_run();
+        let (mut later, _later_output) = door_run();
         later.shot = 1;
         bed.frame(&mut later, &door_frame(1.0, Some(&pending), None, None));
         assert_eq!(later.timer, 1.0);
@@ -4204,7 +4211,7 @@ mod tests {
     fn later_cluster_work_cannot_restart_a_released_first_door_deadline() {
         for kind in 0..3 {
             let mut bed = DoorBed::new(None);
-            let mut run = door_run();
+            let (mut run, _output) = door_run();
             let ready = PackageValidationStatus::Ready;
             let complete = initial_scene(true);
             let metrics = StreamingMetrics::default();
@@ -4249,7 +4256,7 @@ mod tests {
     fn a_door_that_gave_up_fails_its_shot_at_once_and_is_never_asked() {
         let mut bed = DoorBed::new(Some(DoorAnimation::default()));
         bed.gave_up();
-        let mut run = door_run();
+        let (mut run, _output) = door_run();
         let pending = PackageValidationStatus::Pending;
         bed.frame(&mut run, &door_frame(1.0, Some(&pending), None, None));
         assert_eq!(bed.facts().activation, DoorActivation::GaveUp);
@@ -4276,7 +4283,7 @@ mod tests {
     fn a_failed_package_still_wins_over_a_door_that_gave_up() {
         let mut bed = DoorBed::new(Some(DoorAnimation::default()));
         bed.gave_up();
-        let mut run = door_run();
+        let (mut run, _output) = door_run();
         let failure = PackageValidationStatus::Failed("invalid certificate".into());
         bed.frame(&mut run, &door_frame(1.0, Some(&failure), None, None));
         assert_eq!(run.phase, Phase::Done);
@@ -4296,7 +4303,7 @@ mod tests {
         bed.record_player(recorded);
         bed.stray_graph_player();
         assert_eq!(bed.facts().activation, DoorActivation::Resolving);
-        let mut run = door_run();
+        let (mut run, _output) = door_run();
         bed.frame(&mut run, &door_frame(0.25, None, None, None));
         assert!(!asked(&run));
         assert_eq!(bed.opens(), 0);
@@ -4347,7 +4354,7 @@ mod tests {
             DoorActivation::Resolving,
             "a withdrawn graph is not a static door"
         );
-        let mut run = door_run();
+        let (mut run, _output) = door_run();
         let pending = PackageValidationStatus::Pending;
         bed.frame(&mut run, &door_frame(0.25, Some(&pending), None, None));
         assert!(!asked(&run));
@@ -4369,7 +4376,7 @@ mod tests {
     fn a_failed_package_stops_the_door_phase_even_for_a_resolved_door() {
         let mut bed = DoorBed::new(Some(DoorAnimation::swinging_for_test()));
         bed.graph_player();
-        let mut run = door_run();
+        let (mut run, _output) = door_run();
         let failure = PackageValidationStatus::Failed("invalid certificate".into());
         bed.frame(&mut run, &door_frame(1.0, Some(&failure), None, None));
         assert_eq!(run.phase, Phase::Done);
@@ -4382,7 +4389,8 @@ mod tests {
     #[test]
     fn shot_certification_failure_cannot_capture_and_stock_startup_is_unchanged() {
         let file = ShotsFile::from_json(DESIGN_EXAMPLE).expect("fixture parses");
-        let mut run = ShotsRun::for_portal(file.clone(), PathBuf::from("unused-shots-output"));
+        let output = tempfile::tempdir().expect("temporary shots folder");
+        let mut run = ShotsRun::for_portal(file.clone(), output.path().into());
         run.enter(Phase::Settle);
         let failure = PackageValidationStatus::Failed("invalid certificate".into());
         assert!(!run.advance_view_automation(20.0, Some(&failure), None, None));
@@ -4391,7 +4399,7 @@ mod tests {
         assert!(run.log.contains("invalid certificate"));
         assert_eq!(run.shot, 0);
         assert_eq!(run.timer, 0.0);
-        let mut stock = ShotsRun::for_portal(file, PathBuf::from("unused-shots-output"));
+        let mut stock = ShotsRun::for_portal(file, output.path().into());
         stock.enter(Phase::Settle);
         assert!(stock.advance_view_automation(0.5, None, None, None));
         assert_eq!(stock.phase, Phase::Settle);
@@ -4439,7 +4447,8 @@ mod tests {
 
         // The run records the failure and moves on; the settle armed no capture, so no PNG is
         // written for it.
-        let mut run = ShotsRun::for_portal(file, PathBuf::from("out"));
+        let output = tempfile::tempdir().expect("temporary shots folder");
+        let mut run = ShotsRun::for_portal(file, output.path().into());
         run.fail(reason);
         assert!(run.failed);
         assert!(run.log.contains("FAILED"), "{}", run.log);
@@ -4495,7 +4504,8 @@ mod tests {
 
         // The run records the failure and moves on; the settle armed no capture (it never reported
         // `Ready`), so no PNG is written for it.
-        let mut run = ShotsRun::for_portal(file, PathBuf::from("out"));
+        let output = tempfile::tempdir().expect("temporary shots folder");
+        let mut run = ShotsRun::for_portal(file, output.path().into());
         run.fail(reason);
         assert!(run.failed);
         assert!(run.log.contains("FAILED"), "{}", run.log);
@@ -4718,7 +4728,8 @@ mod tests {
         let shot = &file.shots[0];
         assert_eq!(shot.open_door, None);
         assert_eq!(phase_after_move(shot), Phase::Settle);
-        let run = ShotsRun::for_portal(file, PathBuf::from("out"));
+        let output = tempfile::tempdir().expect("temporary shots folder");
+        let run = ShotsRun::for_portal(file, output.path().into());
         assert!(run.door.is_none(), "nothing for a close phase to put back");
         assert_eq!(run.phase, Phase::Move);
     }
@@ -4730,7 +4741,8 @@ mod tests {
         assert_eq!(shot.open_door, Some(HexFormId(0x0001_CBB0)));
         assert_eq!(phase_after_move(shot), Phase::Door);
         // Nothing is asked until the sequence has found the door in the streamed cells.
-        let run = ShotsRun::for_portal(file, PathBuf::from("out"));
+        let output = tempfile::tempdir().expect("temporary shots folder");
+        let run = ShotsRun::for_portal(file, output.path().into());
         assert!(
             run.door.is_none(),
             "the sequence starts with the shot's own move"
