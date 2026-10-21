@@ -35,3 +35,9 @@ src/lod/terrain.rs
 ../shared/src/records.rs
 ../meshopt-cluster/src/lib.rs
 ../meshopt-cluster/src/ffi.rs
+# Stock material resolution and source metadata define the certified shading contract.
+src/material.rs
+../engine/src/nif_material.rs
+../engine/src/nif_depth.rs
+../engine/src/cluster/material_geometry.rs
+../engine/src/cluster/package.rs

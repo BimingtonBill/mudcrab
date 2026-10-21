@@ -55,6 +55,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stock_material_contract_sources_invalidate_overlay_identity() {
+        let listed: Vec<_> = include_str!("../../cluster-identity-sources.txt")
+            .lines()
+            .map(str::trim)
+            .collect();
+        // build.rs hashes the contents of every listed source and watches each path.
+        // Requiring the stock resolver here prevents a material-only edit from reusing
+        // an overlay certified against the previous material contract.
+        for source in [
+            "src/material.rs",
+            "../engine/src/nif_material.rs",
+            "../engine/src/nif_depth.rs",
+            "../engine/src/cluster/material_geometry.rs",
+            "../engine/src/cluster/package.rs",
+            "../shared/src/material_depth.rs",
+        ] {
+            assert!(
+                listed.contains(&source),
+                "material contract source {source} must invalidate cluster identity"
+            );
+        }
+    }
+
     /// The modules of `src/cluster` that are not part of the identity, each with its reason.
     const EXEMPT: [(&str, &str); 7] = [
         (
