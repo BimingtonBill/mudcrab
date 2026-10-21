@@ -367,6 +367,8 @@ pub struct SwapBridgeStats {
     pub drawn_this_frame: u32,
     /// Covering roots still retained after this frame's handovers.
     pub live_holds: usize,
+    /// Waiting surfaces the bridge evaluated at the last extract: zero in a settled frame.
+    pub evaluated: usize,
 }
 
 /// The bridge's one main-world query: the entities the engine has marked waiting, with what their
@@ -389,17 +391,129 @@ type WaitingSurfaces = Query<
     With<SwapWaiting>,
 >;
 
+/// Main-world journal of waiting-set changes, written by observers as they happen and drained by
+/// the bridge at each extract. A settled world writes nothing to it.
+#[derive(Resource, Debug, Default)]
+pub(crate) struct SwapWaitingJournal {
+    changed: Vec<Entity>,
+    removed: Vec<Entity>,
+}
+
+/// A surface entered the waiting set, or a waiting surface's mesh or declaration was replaced.
+fn journal_waiting_insert(
+    entity: Entity,
+    waiting: &Query<(), With<SwapWaiting>>,
+    journal: &mut SwapWaitingJournal,
+) {
+    if waiting.contains(entity) {
+        journal.changed.push(entity);
+    }
+}
+
+fn journal_waiting_marker(
+    event: On<Insert, SwapWaiting>,
+    waiting: Query<(), With<SwapWaiting>>,
+    mut journal: ResMut<SwapWaitingJournal>,
+) {
+    journal_waiting_insert(event.entity, &waiting, &mut journal);
+}
+
+fn journal_waiting_mesh(
+    event: On<Insert, Mesh3d>,
+    waiting: Query<(), With<SwapWaiting>>,
+    mut journal: ResMut<SwapWaitingJournal>,
+) {
+    journal_waiting_insert(event.entity, &waiting, &mut journal);
+}
+
+fn journal_waiting_surface(
+    event: On<Insert, SwapSurface>,
+    waiting: Query<(), With<SwapWaiting>>,
+    mut journal: ResMut<SwapWaitingJournal>,
+) {
+    journal_waiting_insert(event.entity, &waiting, &mut journal);
+}
+
+/// Fires for a removed marker and for a despawned waiting surface alike.
+fn journal_waiting_removed(
+    event: On<Remove, SwapWaiting>,
+    mut journal: ResMut<SwapWaitingJournal>,
+) {
+    journal.removed.push(event.entity);
+}
+
+/// Which waiting surfaces the bridge evaluates this extract. Evaluation is event-driven: a surface
+/// is due when the main world changed it (journal), when a camera's visible set gained or lost it
+/// (the render world's own per-frame visibility diff), or while it is still in transit - its
+/// assets are not prepared yet, or a camera sees it and it is not yet drawn. A prepared surface no
+/// camera sees is dormant: nothing about it can change until one of those events names it, so a
+/// settled frame evaluates nothing.
+#[derive(Debug, Default)]
+pub(crate) struct WaitingWork {
+    waiting: bevy::platform::collections::HashSet<Entity>,
+    active: bevy::platform::collections::HashSet<Entity>,
+    due: Vec<Entity>,
+    seeded: bool,
+}
+
+impl WaitingWork {
+    fn note_changed(&mut self, entity: Entity) {
+        self.waiting.insert(entity);
+        self.active.insert(entity);
+    }
+
+    fn note_removed(&mut self, entity: Entity) {
+        self.waiting.remove(&entity);
+        self.active.remove(&entity);
+    }
+
+    /// A camera's visible set gained or lost this entity.
+    fn note_view_change(&mut self, entity: Entity) {
+        if self.waiting.contains(&entity) {
+            self.active.insert(entity);
+        }
+    }
+
+    /// The surfaces to evaluate this extract, in a stable order.
+    fn take_due(&mut self) -> Vec<Entity> {
+        let mut due = std::mem::take(&mut self.due);
+        due.clear();
+        due.extend(self.active.iter().copied());
+        due.sort_unstable();
+        due
+    }
+
+    /// After evaluation: keep a surface in transit due next extract, let a settled one rest.
+    fn settle(&mut self, entity: Entity, in_transit: bool) {
+        if !in_transit {
+            self.active.remove(&entity);
+        }
+    }
+
+    /// A due entity the waiting query no longer yields (it lost its mesh or declaration).
+    fn forget(&mut self, entity: Entity) {
+        self.note_removed(entity);
+    }
+
+    fn give_back(&mut self, due: Vec<Entity>) {
+        self.due = due;
+    }
+}
+
 /// The bridge: for every waiting surface, the render world's own answer to "is this drawable?".
 ///
 /// It reads the state the *previous* render frame left - assets are prepared and pipelines are
 /// compiled in the render world's `Render` schedule, after the extract - and writes a marker into
 /// the main world, which sees it on its next frame. A surface is up in the stand-in for at least
 /// those frames, so no frame shows neither (design-1091 §2.2).
+///
+/// Only the surfaces [`WaitingWork`] names are evaluated; the count is published as
+/// [`SwapBridgeStats::evaluated`].
 #[allow(clippy::too_many_arguments)]
 fn swap_bridge(
     mut main_world: ResMut<MainWorld>,
     mut waiting: Local<Option<SystemState<WaitingSurfaces>>>,
-    mut frame: Local<u32>,
+    (mut work, mut frame): (Local<WaitingWork>, Local<u32>),
     mut decisions: Local<Vec<SwapDecision>>,
     mut forward_members: Local<systems::ForwardPhaseMembership>,
     mesh_allocator: Res<MeshAllocator>,
@@ -430,10 +544,57 @@ fn swap_bridge(
 
     decisions.clear();
     {
+        let (changed, removed) = {
+            let mut journal = main_world.resource_mut::<SwapWaitingJournal>();
+            (
+                std::mem::take(&mut journal.changed),
+                std::mem::take(&mut journal.removed),
+            )
+        };
+        if work.seeded {
+            for entity in removed {
+                work.note_removed(entity);
+            }
+            for entity in changed {
+                work.note_changed(entity);
+            }
+        } else {
+            // First extract: the observers may predate the render world's first look, so take
+            // the whole waiting set once. Later extracts follow the journal only.
+            work.seeded = true;
+            let query = state
+                .get(&main_world)
+                .expect("the cached query state was built from the main world");
+            for (entity, ..) in query.iter() {
+                work.note_changed(entity);
+            }
+        }
+    }
+    for (_, visible) in views.iter() {
+        let Some(class) = visible.get::<Mesh3d>() else {
+            continue;
+        };
+        for (_, main) in class.added_entities.iter().chain(&class.removed_entities) {
+            work.note_view_change(main.id());
+        }
+        // GPU-culled meshes carry no per-frame diff; the engine uses none (`NoCpuCulling`), and
+        // any that appear are re-checked while they are visible.
+        for main in class.entities_gpu_culling.keys() {
+            work.note_view_change(main.id());
+        }
+    }
+    let due = work.take_due();
+    let mut evaluated = 0usize;
+    {
         let query = state
             .get(&main_world)
             .expect("the cached query state was built from the main world");
-        for (entity, mesh, surface, prepared, in_view) in query.iter() {
+        for &due_entity in &due {
+            let Ok((entity, mesh, surface, prepared, in_view)) = query.get(due_entity) else {
+                work.forget(due_entity);
+                continue;
+            };
+            evaluated += 1;
             let seen = views
                 .iter()
                 .any(|(_, visible)| view_sees(visible, MainEntity::from(entity)));
@@ -483,6 +644,11 @@ fn swap_bridge(
                             })
                 });
             let readiness = swap_readiness(&facts);
+            // In transit: assets still arriving, or a camera sees it and it is not drawn yet.
+            work.settle(
+                entity,
+                readiness == SwapReadiness::Waiting || (seen && readiness != SwapReadiness::Drawn),
+            );
             let in_view_changed = (seen != in_view).then_some(seen);
             if failed || readiness != SwapReadiness::Waiting || in_view_changed.is_some() {
                 decisions.push(SwapDecision {
@@ -498,6 +664,8 @@ fn swap_bridge(
             }
         }
     }
+    work.give_back(due);
+    main_world.resource_mut::<SwapBridgeStats>().evaluated = evaluated;
 
     // Observe the covering geometry too: a hidden replacement can be absent from every
     // camera while its visible old root still covers the hole. Absence on the new surface
@@ -906,6 +1074,7 @@ fn record_swap_gauges(
     profiler.set_gauge("swap/waiting", waiting.iter().count() as f64);
     profiler.set_gauge("swap/prepared_not_drawn", prepared.iter().count() as f64);
     profiler.set_gauge("swap/drawn_this_frame", f64::from(stats.drawn_this_frame));
+    profiler.set_gauge("swap/evaluated", stats.evaluated as f64);
     // The split of `swap/waiting` the settles depend on: of the surfaces still waiting, how many a
     // camera can see (what `pending_drawn` counts - near 0 once a view has settled) against the rest,
     // which no camera sees and so are never confirmed drawn (off camera, or in a shadow view only).
@@ -944,6 +1113,12 @@ impl Plugin for SwapBridgePlugin {
         }
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app.add_systems(ExtractSchedule, swap_bridge);
+            // The journal has one reader, the bridge: a headless app records nothing.
+            app.init_resource::<SwapWaitingJournal>()
+                .add_observer(journal_waiting_marker)
+                .add_observer(journal_waiting_mesh)
+                .add_observer(journal_waiting_surface)
+                .add_observer(journal_waiting_removed);
         }
     }
 }
@@ -951,6 +1126,101 @@ impl Plugin for SwapBridgePlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bridge's work list: a settled frame - every surface prepared and unseen, no journal
+    /// entry, no visibility diff - evaluates nothing; each event names exactly its surface.
+    #[test]
+    fn a_settled_frame_evaluates_no_waiting_surface() {
+        let mut world = World::new();
+        let surfaces: Vec<Entity> = (0..512).map(|_| world.spawn_empty().id()).collect();
+        let unrelated = world.spawn_empty().id();
+        let mut work = WaitingWork::default();
+        for &entity in &surfaces {
+            work.note_changed(entity);
+        }
+        // First evaluation: all prepared, none seen, except one still loading its assets and one
+        // a camera sees before its pipeline is ready.
+        let due = work.take_due();
+        assert_eq!(due.len(), 512);
+        for &entity in &due {
+            work.settle(entity, entity == surfaces[0] || entity == surfaces[1]);
+        }
+        work.give_back(due);
+        let mut in_transit = vec![surfaces[0], surfaces[1]];
+        in_transit.sort_unstable();
+        assert_eq!(work.take_due(), in_transit);
+        work.settle(surfaces[0], false);
+        work.settle(surfaces[1], false);
+
+        // Settled: nothing is due, frame after frame.
+        for _ in 0..3 {
+            let due = work.take_due();
+            assert!(
+                due.is_empty(),
+                "a settled frame evaluates {} surfaces",
+                due.len()
+            );
+            work.give_back(due);
+        }
+
+        // A camera turn names one surface; a diff entry for an entity that is not waiting is
+        // ignored.
+        work.note_view_change(surfaces[7]);
+        work.note_view_change(unrelated);
+        assert_eq!(work.take_due(), vec![surfaces[7]]);
+        work.settle(surfaces[7], false);
+
+        // A replaced mesh names its surface; a removed surface is never due again.
+        work.note_changed(surfaces[9]);
+        work.note_removed(surfaces[9]);
+        work.note_view_change(surfaces[9]);
+        assert!(work.take_due().is_empty());
+    }
+
+    /// The main-world journal records waiting-set changes as they happen, and nothing else.
+    #[test]
+    fn the_journal_records_only_waiting_surface_changes() {
+        let mut app = App::new();
+        app.init_resource::<SwapWaitingJournal>()
+            .add_observer(journal_waiting_marker)
+            .add_observer(journal_waiting_mesh)
+            .add_observer(journal_waiting_surface)
+            .add_observer(journal_waiting_removed);
+        let world = app.world_mut();
+        let waiting = world
+            .spawn((Mesh3d(Handle::<Mesh>::default()), surface(&[]), SwapWaiting))
+            .id();
+        // An ordinary mesh and a declaration nobody waits on are not journaled.
+        let ordinary = world
+            .spawn((Mesh3d(Handle::<Mesh>::default()), surface(&[])))
+            .id();
+        world
+            .entity_mut(ordinary)
+            .insert(Mesh3d(Handle::<Mesh>::default()));
+        let journal = world.resource::<SwapWaitingJournal>();
+        assert!(journal.changed.iter().all(|entity| *entity == waiting));
+        assert!(!journal.changed.is_empty());
+        assert!(journal.removed.is_empty());
+
+        world.resource_mut::<SwapWaitingJournal>().changed.clear();
+        world
+            .entity_mut(waiting)
+            .insert(Mesh3d(Handle::<Mesh>::default()));
+        assert_eq!(
+            world.resource::<SwapWaitingJournal>().changed,
+            vec![waiting]
+        );
+
+        world.entity_mut(waiting).remove::<SwapWaiting>();
+        let despawned = world
+            .spawn((Mesh3d(Handle::<Mesh>::default()), surface(&[]), SwapWaiting))
+            .id();
+        world.despawn(despawned);
+        assert_eq!(
+            world.resource::<SwapWaitingJournal>().removed,
+            vec![waiting, despawned]
+        );
+    }
 
     #[test]
     fn shader_loading_errors_do_not_abort_a_replacement() {
