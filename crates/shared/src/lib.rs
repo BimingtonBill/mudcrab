@@ -1,6 +1,7 @@
 //! Stable data contracts shared by the offline converter and the runtime.
 
 pub mod asset_lock;
+pub mod cluster;
 pub mod collision;
 pub mod coordinates;
 pub mod extensions;

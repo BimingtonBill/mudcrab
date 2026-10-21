@@ -4581,6 +4581,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "meshopt-cluster"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "gltf",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

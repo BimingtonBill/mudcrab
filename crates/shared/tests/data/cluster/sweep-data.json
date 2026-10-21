@@ -1,0 +1,56 @@
+[
+  {
+    "threshold": 128,
+    "primitives_clustered": 4391,
+    "source_triangles_clustered": 3628600,
+    "clusters": 85699,
+    "mesh_payload_bytes": 160829184,
+    "baked_chunk_bytes": 391768240,
+    "baked_output_triangles": 5452042
+  },
+  {
+    "threshold": 256,
+    "primitives_clustered": 3149,
+    "source_triangles_clustered": 3403680,
+    "clusters": 80087,
+    "mesh_payload_bytes": 149634304,
+    "baked_chunk_bytes": 485797340,
+    "baked_output_triangles": 6751698
+  },
+  {
+    "threshold": 512,
+    "primitives_clustered": 1888,
+    "source_triangles_clustered": 2944272,
+    "clusters": 68638,
+    "mesh_payload_bytes": 128620800,
+    "baked_chunk_bytes": 669536784,
+    "baked_output_triangles": 9770089
+  },
+  {
+    "threshold": 1024,
+    "primitives_clustered": 935,
+    "source_triangles_clustered": 2263028,
+    "clusters": 52439,
+    "mesh_payload_bytes": 98923264,
+    "baked_chunk_bytes": 812559384,
+    "baked_output_triangles": 12004671
+  },
+  {
+    "threshold": 2048,
+    "primitives_clustered": 369,
+    "source_triangles_clustered": 1450041,
+    "clusters": 33841,
+    "mesh_payload_bytes": 64297984,
+    "baked_chunk_bytes": 1094766880,
+    "baked_output_triangles": 17297369
+  },
+  {
+    "threshold": 4096,
+    "primitives_clustered": 93,
+    "source_triangles_clustered": 667298,
+    "clusters": 15952,
+    "mesh_payload_bytes": 30704128,
+    "baked_chunk_bytes": 1481664000,
+    "baked_output_triangles": 25270906
+  }
+]

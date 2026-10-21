@@ -1,0 +1,1133 @@
+{
+  "baked": {
+    "cold": {
+      "requested_mode": "baked",
+      "mode": "baked",
+      "probe": null,
+      "builder_identity": "40970fe3922a1e2b1e7be3c7409a97593f8196d10d67b0a9fc67337c7361307a",
+      "triangle_threshold": 1024,
+      "bench_baked": true,
+      "jobs": 8,
+      "timings": {
+        "probe_ms": 0.0,
+        "classify_ms": 2274.0037,
+        "models_pass_wall_ms": 677.355,
+        "blocks_pass_wall_ms": 1274.7872,
+        "tables_ms": 0.5528,
+        "total_ms": 4694.0344,
+        "cpu_model_load_ms": 1402.5601999999985,
+        "cpu_cluster_build_ms": 0.0,
+        "cpu_cluster_write_ms": 0.0,
+        "cpu_baked_chain_ms": 3478.854099999996,
+        "cpu_instance_block_ms": 0.0,
+        "cpu_baked_block_ms": 9024.686300000001,
+        "attributed_baked_ms": 1757.5200872506273,
+        "attributed_cluster_ms": 0.5528,
+        "attributed_shared_ms": 2502.4849291296946
+      },
+      "counts": {
+        "references_examined": 323499,
+        "references_eligible": 116163,
+        "models": 2758,
+        "models_loaded": 2758,
+        "models_known_from_previous": 0,
+        "models_missing_from_manifest": 0,
+        "models_failed_to_load": 0,
+        "primitives": 9845,
+        "primitives_clustered": 0,
+        "meshes_built": 0,
+        "meshes_reused": 0,
+        "clusters": 0,
+        "groups": 0,
+        "source_triangles_clustered": 0,
+        "monotonic_fixups": 0,
+        "instances": 0,
+        "blocks": 0,
+        "baked_primitives": 9598,
+        "baked_blocks": 85,
+        "baked_blocks_reused": 0,
+        "baked_instances": 269753,
+        "baked_input_triangles": 121245093,
+        "baked_output_triangles": 25390078
+      },
+      "bytes": {
+        "mesh_payloads": 0,
+        "instance_payloads": 0,
+        "baked_chunks": 1490710524
+      },
+      "peak_working_set_bytes": 1546215424,
+      "reference_rejects": {
+        "base_not_static:ACTI": 8458,
+        "base_not_static:ALCH": 1253,
+        "base_not_static:AMMO": 256,
+        "base_not_static:APPA": 25,
+        "base_not_static:ARMO": 340,
+        "base_not_static:ASPC": 17,
+        "base_not_static:BOOK": 335,
+        "base_not_static:CONT": 2421,
+        "base_not_static:DOOR": 904,
+        "base_not_static:FLOR": 6104,
+        "base_not_static:FURN": 4805,
+        "base_not_static:IDLM": 2601,
+        "base_not_static:INGR": 481,
+        "base_not_static:KEYM": 3,
+        "base_not_static:LIGH": 1007,
+        "base_not_static:MISC": 2783,
+        "base_not_static:MSTT": 11465,
+        "base_not_static:NPC_": 6341,
+        "base_not_static:PROJ": 9,
+        "base_not_static:SCRL": 18,
+        "base_not_static:SLGM": 84,
+        "base_not_static:SOUN": 2216,
+        "base_not_static:TACT": 8,
+        "base_not_static:TREE": 129949,
+        "base_not_static:TXST": 1098,
+        "base_not_static:WEAP": 706,
+        "enable_parent": 4546,
+        "initially_disabled": 1673,
+        "model_path_excluded": 15958,
+        "no_model": 1379,
+        "scripted": 93
+      },
+      "primitive_rejects": {},
+      "notices": [],
+      "process_wall_ms": 4795.372099993983,
+      "database_growth_bytes": 0,
+      "total_spread_ms": [
+        4303.7652,
+        4906.5276
+      ],
+      "repeats": 3
+    },
+    "warm": {
+      "requested_mode": "baked",
+      "mode": "baked",
+      "probe": null,
+      "builder_identity": "40970fe3922a1e2b1e7be3c7409a97593f8196d10d67b0a9fc67337c7361307a",
+      "triangle_threshold": 1024,
+      "bench_baked": true,
+      "jobs": 8,
+      "timings": {
+        "probe_ms": 0.0,
+        "classify_ms": 2166.3518000000004,
+        "models_pass_wall_ms": 596.8892,
+        "blocks_pass_wall_ms": 106.19489999999999,
+        "tables_ms": 0.5799,
+        "total_ms": 3067.6216,
+        "cpu_model_load_ms": 1246.208500000004,
+        "cpu_cluster_build_ms": 0.0,
+        "cpu_cluster_write_ms": 0.0,
+        "cpu_baked_chain_ms": 3175.7302000000054,
+        "cpu_instance_block_ms": 0.0,
+        "cpu_baked_block_ms": 617.2125999999996,
+        "attributed_baked_ms": 534.3706916454719,
+        "attributed_cluster_ms": 0.5799,
+        "attributed_shared_ms": 2334.5695083545284
+      },
+      "counts": {
+        "references_examined": 323499,
+        "references_eligible": 116163,
+        "models": 2758,
+        "models_loaded": 2758,
+        "models_known_from_previous": 0,
+        "models_missing_from_manifest": 0,
+        "models_failed_to_load": 0,
+        "primitives": 9845,
+        "primitives_clustered": 0,
+        "meshes_built": 0,
+        "meshes_reused": 0,
+        "clusters": 0,
+        "groups": 0,
+        "source_triangles_clustered": 0,
+        "monotonic_fixups": 0,
+        "instances": 0,
+        "blocks": 0,
+        "baked_primitives": 9598,
+        "baked_blocks": 85,
+        "baked_blocks_reused": 85,
+        "baked_instances": 269753,
+        "baked_input_triangles": 121245093,
+        "baked_output_triangles": 0
+      },
+      "bytes": {
+        "mesh_payloads": 0,
+        "instance_payloads": 0,
+        "baked_chunks": 1490710524
+      },
+      "peak_working_set_bytes": 656523264,
+      "reference_rejects": {
+        "base_not_static:ACTI": 8458,
+        "base_not_static:ALCH": 1253,
+        "base_not_static:AMMO": 256,
+        "base_not_static:APPA": 25,
+        "base_not_static:ARMO": 340,
+        "base_not_static:ASPC": 17,
+        "base_not_static:BOOK": 335,
+        "base_not_static:CONT": 2421,
+        "base_not_static:DOOR": 904,
+        "base_not_static:FLOR": 6104,
+        "base_not_static:FURN": 4805,
+        "base_not_static:IDLM": 2601,
+        "base_not_static:INGR": 481,
+        "base_not_static:KEYM": 3,
+        "base_not_static:LIGH": 1007,
+        "base_not_static:MISC": 2783,
+        "base_not_static:MSTT": 11465,
+        "base_not_static:NPC_": 6341,
+        "base_not_static:PROJ": 9,
+        "base_not_static:SCRL": 18,
+        "base_not_static:SLGM": 84,
+        "base_not_static:SOUN": 2216,
+        "base_not_static:TACT": 8,
+        "base_not_static:TREE": 129949,
+        "base_not_static:TXST": 1098,
+        "base_not_static:WEAP": 706,
+        "enable_parent": 4546,
+        "initially_disabled": 1673,
+        "model_path_excluded": 15958,
+        "no_model": 1379,
+        "scripted": 93
+      },
+      "primitive_rejects": {},
+      "notices": [],
+      "process_wall_ms": 3163.889500021469,
+      "database_growth_bytes": 0,
+      "total_spread_ms": [
+        2979.7012999999997,
+        3433.6171000000004
+      ],
+      "repeats": 3
+    },
+    "plugin": {
+      "requested_mode": "baked",
+      "mode": "baked",
+      "probe": null,
+      "builder_identity": "40970fe3922a1e2b1e7be3c7409a97593f8196d10d67b0a9fc67337c7361307a",
+      "triangle_threshold": 1024,
+      "bench_baked": true,
+      "jobs": 8,
+      "timings": {
+        "probe_ms": 0.0,
+        "classify_ms": 2537.7687,
+        "models_pass_wall_ms": 646.2411999999999,
+        "blocks_pass_wall_ms": 735.2486,
+        "tables_ms": 0.5437000000000001,
+        "total_ms": 4145.1663,
+        "cpu_model_load_ms": 1344.6452000000008,
+        "cpu_cluster_build_ms": 0.0,
+        "cpu_cluster_write_ms": 0.0,
+        "cpu_baked_chain_ms": 3345.5055000000016,
+        "cpu_instance_block_ms": 0.0,
+        "cpu_baked_block_ms": 4968.8252,
+        "attributed_baked_ms": 1196.2153422683455,
+        "attributed_cluster_ms": 0.5437000000000001,
+        "attributed_shared_ms": 2723.0431577316544
+      },
+      "counts": {
+        "references_examined": 323499,
+        "references_eligible": 116163,
+        "models": 2758,
+        "models_loaded": 2758,
+        "models_known_from_previous": 0,
+        "models_missing_from_manifest": 0,
+        "models_failed_to_load": 0,
+        "primitives": 9845,
+        "primitives_clustered": 0,
+        "meshes_built": 0,
+        "meshes_reused": 0,
+        "clusters": 0,
+        "groups": 0,
+        "source_triangles_clustered": 0,
+        "monotonic_fixups": 0,
+        "instances": 0,
+        "blocks": 0,
+        "baked_primitives": 9598,
+        "baked_blocks": 85,
+        "baked_blocks_reused": 69,
+        "baked_instances": 269753,
+        "baked_input_triangles": 121245093,
+        "baked_output_triangles": 13187234
+      },
+      "bytes": {
+        "mesh_payloads": 0,
+        "instance_payloads": 0,
+        "baked_chunks": 1490710524
+      },
+      "peak_working_set_bytes": 1755680768,
+      "reference_rejects": {
+        "base_not_static:ACTI": 8458,
+        "base_not_static:ALCH": 1253,
+        "base_not_static:AMMO": 256,
+        "base_not_static:APPA": 25,
+        "base_not_static:ARMO": 340,
+        "base_not_static:ASPC": 17,
+        "base_not_static:BOOK": 335,
+        "base_not_static:CONT": 2421,
+        "base_not_static:DOOR": 904,
+        "base_not_static:FLOR": 6104,
+        "base_not_static:FURN": 4805,
+        "base_not_static:IDLM": 2601,
+        "base_not_static:INGR": 481,
+        "base_not_static:KEYM": 3,
+        "base_not_static:LIGH": 1007,
+        "base_not_static:MISC": 2783,
+        "base_not_static:MSTT": 11465,
+        "base_not_static:NPC_": 6341,
+        "base_not_static:PROJ": 9,
+        "base_not_static:SCRL": 18,
+        "base_not_static:SLGM": 84,
+        "base_not_static:SOUN": 2216,
+        "base_not_static:TACT": 8,
+        "base_not_static:TREE": 129949,
+        "base_not_static:TXST": 1098,
+        "base_not_static:WEAP": 706,
+        "enable_parent": 4546,
+        "initially_disabled": 1673,
+        "model_path_excluded": 15958,
+        "no_model": 1379,
+        "scripted": 93
+      },
+      "primitive_rejects": {},
+      "notices": [],
+      "process_wall_ms": 5069.959299988113,
+      "database_growth_bytes": 0,
+      "total_spread_ms": [
+        3640.3988,
+        4858.3005
+      ],
+      "repeats": 3
+    }
+  },
+  "cluster": {
+    "cold": {
+      "requested_mode": "cluster",
+      "mode": "cluster",
+      "probe": {
+        "adapter_name": "NVIDIA GeForce RTX 3090",
+        "backend": "Vulkan",
+        "device_type": "DiscreteGpu",
+        "driver": "NVIDIA",
+        "driver_info": "616.92",
+        "features": {
+          "INDIRECT_FIRST_INSTANCE": {
+            "reported": true,
+            "required": true
+          }
+        },
+        "forced": true,
+        "limits": {
+          "max_bind_groups": {
+            "reported": 8,
+            "required": 4
+          },
+          "max_storage_buffer_binding_size": {
+            "reported": 2147483644,
+            "required": 134217728
+          },
+          "max_storage_buffers_per_shader_stage": {
+            "reported": 524288,
+            "required": 8
+          }
+        },
+        "missing": [],
+        "required_backends": [
+          "Vulkan",
+          "Dx12",
+          "Metal"
+        ]
+      },
+      "builder_identity": "40970fe3922a1e2b1e7be3c7409a97593f8196d10d67b0a9fc67337c7361307a",
+      "triangle_threshold": 1024,
+      "bench_baked": true,
+      "jobs": 8,
+      "timings": {
+        "probe_ms": 330.67269999999996,
+        "classify_ms": 2197.9934000000003,
+        "models_pass_wall_ms": 1464.5844000000002,
+        "blocks_pass_wall_ms": 831.433,
+        "tables_ms": 55.9765,
+        "total_ms": 4874.0145999999995,
+        "cpu_model_load_ms": 1295.4295000000043,
+        "cpu_cluster_build_ms": 5994.360599999995,
+        "cpu_cluster_write_ms": 685.0822000000003,
+        "cpu_baked_chain_ms": 1766.9880999999993,
+        "cpu_instance_block_ms": 157.76620000000003,
+        "cpu_baked_block_ms": 5725.4043,
+        "attributed_baked_ms": 1049.5191858813498,
+        "attributed_cluster_ms": 1080.6905953672835,
+        "attributed_shared_ms": 2392.747354491055
+      },
+      "counts": {
+        "references_examined": 323499,
+        "references_eligible": 116163,
+        "models": 2758,
+        "models_loaded": 2758,
+        "models_known_from_previous": 0,
+        "models_missing_from_manifest": 0,
+        "models_failed_to_load": 0,
+        "primitives": 9845,
+        "primitives_clustered": 935,
+        "meshes_built": 935,
+        "meshes_reused": 0,
+        "clusters": 52439,
+        "groups": 6695,
+        "source_triangles_clustered": 2263028,
+        "monotonic_fixups": 0,
+        "instances": 28253,
+        "blocks": 80,
+        "baked_primitives": 8663,
+        "baked_blocks": 81,
+        "baked_blocks_reused": 0,
+        "baked_instances": 241500,
+        "baked_input_triangles": 63408357,
+        "baked_output_triangles": 12004671
+      },
+      "bytes": {
+        "mesh_payloads": 98923264,
+        "instance_payloads": 2493696,
+        "baked_chunks": 812559384
+      },
+      "peak_working_set_bytes": 958857216,
+      "reference_rejects": {
+        "base_not_static:ACTI": 8458,
+        "base_not_static:ALCH": 1253,
+        "base_not_static:AMMO": 256,
+        "base_not_static:APPA": 25,
+        "base_not_static:ARMO": 340,
+        "base_not_static:ASPC": 17,
+        "base_not_static:BOOK": 335,
+        "base_not_static:CONT": 2421,
+        "base_not_static:DOOR": 904,
+        "base_not_static:FLOR": 6104,
+        "base_not_static:FURN": 4805,
+        "base_not_static:IDLM": 2601,
+        "base_not_static:INGR": 481,
+        "base_not_static:KEYM": 3,
+        "base_not_static:LIGH": 1007,
+        "base_not_static:MISC": 2783,
+        "base_not_static:MSTT": 11465,
+        "base_not_static:NPC_": 6341,
+        "base_not_static:PROJ": 9,
+        "base_not_static:SCRL": 18,
+        "base_not_static:SLGM": 84,
+        "base_not_static:SOUN": 2216,
+        "base_not_static:TACT": 8,
+        "base_not_static:TREE": 129949,
+        "base_not_static:TXST": 1098,
+        "base_not_static:WEAP": 706,
+        "enable_parent": 4546,
+        "initially_disabled": 1673,
+        "model_path_excluded": 15958,
+        "no_model": 1379,
+        "scripted": 93
+      },
+      "primitive_rejects": {
+        "below_triangle_threshold": 6216,
+        "effect_shader": 10,
+        "missing_attributes": 47,
+        "not_opaque": 1654,
+        "unsupported_material_feature": 983
+      },
+      "notices": [],
+      "process_wall_ms": 4988.0969999940135,
+      "database_growth_bytes": 2338816,
+      "total_spread_ms": [
+        4771.0867,
+        6238.6095
+      ],
+      "repeats": 3
+    },
+    "warm": {
+      "requested_mode": "cluster",
+      "mode": "cluster",
+      "probe": {
+        "adapter_name": "NVIDIA GeForce RTX 3090",
+        "backend": "Vulkan",
+        "device_type": "DiscreteGpu",
+        "driver": "NVIDIA",
+        "driver_info": "616.92",
+        "features": {
+          "INDIRECT_FIRST_INSTANCE": {
+            "reported": true,
+            "required": true
+          }
+        },
+        "forced": true,
+        "limits": {
+          "max_bind_groups": {
+            "reported": 8,
+            "required": 4
+          },
+          "max_storage_buffer_binding_size": {
+            "reported": 2147483644,
+            "required": 134217728
+          },
+          "max_storage_buffers_per_shader_stage": {
+            "reported": 524288,
+            "required": 8
+          }
+        },
+        "missing": [],
+        "required_backends": [
+          "Vulkan",
+          "Dx12",
+          "Metal"
+        ]
+      },
+      "builder_identity": "40970fe3922a1e2b1e7be3c7409a97593f8196d10d67b0a9fc67337c7361307a",
+      "triangle_threshold": 1024,
+      "bench_baked": true,
+      "jobs": 8,
+      "timings": {
+        "probe_ms": 327.5163,
+        "classify_ms": 2155.1647,
+        "models_pass_wall_ms": 471.8151,
+        "blocks_pass_wall_ms": 115.216,
+        "tables_ms": 205.94819999999999,
+        "total_ms": 3353.3534999999997,
+        "cpu_model_load_ms": 1206.2667999999976,
+        "cpu_cluster_build_ms": 0.0,
+        "cpu_cluster_write_ms": 0.0,
+        "cpu_baked_chain_ms": 1650.837400000002,
+        "cpu_instance_block_ms": 133.83920000000003,
+        "cpu_baked_block_ms": 541.1383,
+        "attributed_baked_ms": 364.0153174398365,
+        "attributed_cluster_ms": 227.86252013480137,
+        "attributed_shared_ms": 2352.743192822638
+      },
+      "counts": {
+        "references_examined": 323499,
+        "references_eligible": 116163,
+        "models": 2758,
+        "models_loaded": 2758,
+        "models_known_from_previous": 0,
+        "models_missing_from_manifest": 0,
+        "models_failed_to_load": 0,
+        "primitives": 9845,
+        "primitives_clustered": 935,
+        "meshes_built": 0,
+        "meshes_reused": 935,
+        "clusters": 52439,
+        "groups": 6695,
+        "source_triangles_clustered": 2263028,
+        "monotonic_fixups": 0,
+        "instances": 28253,
+        "blocks": 80,
+        "baked_primitives": 8663,
+        "baked_blocks": 81,
+        "baked_blocks_reused": 81,
+        "baked_instances": 241500,
+        "baked_input_triangles": 63408357,
+        "baked_output_triangles": 0
+      },
+      "bytes": {
+        "mesh_payloads": 98923264,
+        "instance_payloads": 2493696,
+        "baked_chunks": 812559384
+      },
+      "peak_working_set_bytes": 471425024,
+      "reference_rejects": {
+        "base_not_static:ACTI": 8458,
+        "base_not_static:ALCH": 1253,
+        "base_not_static:AMMO": 256,
+        "base_not_static:APPA": 25,
+        "base_not_static:ARMO": 340,
+        "base_not_static:ASPC": 17,
+        "base_not_static:BOOK": 335,
+        "base_not_static:CONT": 2421,
+        "base_not_static:DOOR": 904,
+        "base_not_static:FLOR": 6104,
+        "base_not_static:FURN": 4805,
+        "base_not_static:IDLM": 2601,
+        "base_not_static:INGR": 481,
+        "base_not_static:KEYM": 3,
+        "base_not_static:LIGH": 1007,
+        "base_not_static:MISC": 2783,
+        "base_not_static:MSTT": 11465,
+        "base_not_static:NPC_": 6341,
+        "base_not_static:PROJ": 9,
+        "base_not_static:SCRL": 18,
+        "base_not_static:SLGM": 84,
+        "base_not_static:SOUN": 2216,
+        "base_not_static:TACT": 8,
+        "base_not_static:TREE": 129949,
+        "base_not_static:TXST": 1098,
+        "base_not_static:WEAP": 706,
+        "enable_parent": 4546,
+        "initially_disabled": 1673,
+        "model_path_excluded": 15958,
+        "no_model": 1379,
+        "scripted": 93
+      },
+      "primitive_rejects": {
+        "below_triangle_threshold": 6216,
+        "effect_shader": 10,
+        "missing_attributes": 47,
+        "not_opaque": 1654,
+        "unsupported_material_feature": 983
+      },
+      "notices": [],
+      "process_wall_ms": 3463.2502000022214,
+      "database_growth_bytes": 2338816,
+      "total_spread_ms": [
+        3324.0145,
+        3356.5614
+      ],
+      "repeats": 3
+    },
+    "plugin": {
+      "requested_mode": "cluster",
+      "mode": "cluster",
+      "probe": {
+        "adapter_name": "NVIDIA GeForce RTX 3090",
+        "backend": "Vulkan",
+        "device_type": "DiscreteGpu",
+        "driver": "NVIDIA",
+        "driver_info": "616.92",
+        "features": {
+          "INDIRECT_FIRST_INSTANCE": {
+            "reported": true,
+            "required": true
+          }
+        },
+        "forced": true,
+        "limits": {
+          "max_bind_groups": {
+            "reported": 8,
+            "required": 4
+          },
+          "max_storage_buffer_binding_size": {
+            "reported": 2147483644,
+            "required": 134217728
+          },
+          "max_storage_buffers_per_shader_stage": {
+            "reported": 524288,
+            "required": 8
+          }
+        },
+        "missing": [],
+        "required_backends": [
+          "Vulkan",
+          "Dx12",
+          "Metal"
+        ]
+      },
+      "builder_identity": "40970fe3922a1e2b1e7be3c7409a97593f8196d10d67b0a9fc67337c7361307a",
+      "triangle_threshold": 1024,
+      "bench_baked": true,
+      "jobs": 8,
+      "timings": {
+        "probe_ms": 324.3761,
+        "classify_ms": 2178.6841,
+        "models_pass_wall_ms": 546.5568,
+        "blocks_pass_wall_ms": 494.82910000000004,
+        "tables_ms": 54.3949,
+        "total_ms": 3751.7303,
+        "cpu_model_load_ms": 1379.8056000000008,
+        "cpu_cluster_build_ms": 0.0,
+        "cpu_cluster_write_ms": 0.0,
+        "cpu_baked_chain_ms": 1812.7967999999971,
+        "cpu_instance_block_ms": 154.923,
+        "cpu_baked_block_ms": 3066.2562000000003,
+        "attributed_baked_ms": 767.1763687698033,
+        "attributed_cluster_ms": 78.98015057097182,
+        "attributed_shared_ms": 2415.6977532943033
+      },
+      "counts": {
+        "references_examined": 323499,
+        "references_eligible": 116163,
+        "models": 2758,
+        "models_loaded": 2758,
+        "models_known_from_previous": 0,
+        "models_missing_from_manifest": 0,
+        "models_failed_to_load": 0,
+        "primitives": 9845,
+        "primitives_clustered": 935,
+        "meshes_built": 0,
+        "meshes_reused": 935,
+        "clusters": 52439,
+        "groups": 6695,
+        "source_triangles_clustered": 2263028,
+        "monotonic_fixups": 0,
+        "instances": 28253,
+        "blocks": 80,
+        "baked_primitives": 8663,
+        "baked_blocks": 81,
+        "baked_blocks_reused": 65,
+        "baked_instances": 241500,
+        "baked_input_triangles": 63408357,
+        "baked_output_triangles": 6154788
+      },
+      "bytes": {
+        "mesh_payloads": 98923264,
+        "instance_payloads": 2493696,
+        "baked_chunks": 812559384
+      },
+      "peak_working_set_bytes": 1069244416,
+      "reference_rejects": {
+        "base_not_static:ACTI": 8458,
+        "base_not_static:ALCH": 1253,
+        "base_not_static:AMMO": 256,
+        "base_not_static:APPA": 25,
+        "base_not_static:ARMO": 340,
+        "base_not_static:ASPC": 17,
+        "base_not_static:BOOK": 335,
+        "base_not_static:CONT": 2421,
+        "base_not_static:DOOR": 904,
+        "base_not_static:FLOR": 6104,
+        "base_not_static:FURN": 4805,
+        "base_not_static:IDLM": 2601,
+        "base_not_static:INGR": 481,
+        "base_not_static:KEYM": 3,
+        "base_not_static:LIGH": 1007,
+        "base_not_static:MISC": 2783,
+        "base_not_static:MSTT": 11465,
+        "base_not_static:NPC_": 6341,
+        "base_not_static:PROJ": 9,
+        "base_not_static:SCRL": 18,
+        "base_not_static:SLGM": 84,
+        "base_not_static:SOUN": 2216,
+        "base_not_static:TACT": 8,
+        "base_not_static:TREE": 129949,
+        "base_not_static:TXST": 1098,
+        "base_not_static:WEAP": 706,
+        "enable_parent": 4546,
+        "initially_disabled": 1673,
+        "model_path_excluded": 15958,
+        "no_model": 1379,
+        "scripted": 93
+      },
+      "primitive_rejects": {
+        "below_triangle_threshold": 6216,
+        "effect_shader": 10,
+        "missing_attributes": 47,
+        "not_opaque": 1654,
+        "unsupported_material_feature": 983
+      },
+      "notices": [],
+      "process_wall_ms": 5081.870900001377,
+      "database_growth_bytes": 2338816,
+      "total_spread_ms": [
+        3735.5454,
+        3865.8727000000003
+      ],
+      "repeats": 3
+    }
+  },
+  "cluster-only": {
+    "cold": {
+      "requested_mode": "cluster",
+      "mode": "cluster",
+      "probe": {
+        "adapter_name": "NVIDIA GeForce RTX 3090",
+        "backend": "Vulkan",
+        "device_type": "DiscreteGpu",
+        "driver": "NVIDIA",
+        "driver_info": "616.92",
+        "features": {
+          "INDIRECT_FIRST_INSTANCE": {
+            "reported": true,
+            "required": true
+          }
+        },
+        "forced": true,
+        "limits": {
+          "max_bind_groups": {
+            "reported": 8,
+            "required": 4
+          },
+          "max_storage_buffer_binding_size": {
+            "reported": 2147483644,
+            "required": 134217728
+          },
+          "max_storage_buffers_per_shader_stage": {
+            "reported": 524288,
+            "required": 8
+          }
+        },
+        "missing": [],
+        "required_backends": [
+          "Vulkan",
+          "Dx12",
+          "Metal"
+        ]
+      },
+      "builder_identity": "40970fe3922a1e2b1e7be3c7409a97593f8196d10d67b0a9fc67337c7361307a",
+      "triangle_threshold": 1024,
+      "bench_baked": false,
+      "jobs": 8,
+      "timings": {
+        "probe_ms": 364.9142,
+        "classify_ms": 2423.7218000000003,
+        "models_pass_wall_ms": 1432.9343,
+        "blocks_pass_wall_ms": 32.0384,
+        "tables_ms": 54.603100000000005,
+        "total_ms": 4477.1773,
+        "cpu_model_load_ms": 1719.9793999999988,
+        "cpu_cluster_build_ms": 7800.173200000007,
+        "cpu_cluster_write_ms": 905.0203000000007,
+        "cpu_baked_chain_ms": 0.0,
+        "cpu_instance_block_ms": 139.23619999999997,
+        "cpu_baked_block_ms": 0.0,
+        "attributed_baked_ms": 0.0,
+        "attributed_cluster_ms": 1292.674866131226,
+        "attributed_shared_ms": 2676.9723641606324
+      },
+      "counts": {
+        "references_examined": 323499,
+        "references_eligible": 116163,
+        "models": 2758,
+        "models_loaded": 2758,
+        "models_known_from_previous": 0,
+        "models_missing_from_manifest": 0,
+        "models_failed_to_load": 0,
+        "primitives": 9845,
+        "primitives_clustered": 935,
+        "meshes_built": 935,
+        "meshes_reused": 0,
+        "clusters": 52439,
+        "groups": 6695,
+        "source_triangles_clustered": 2263028,
+        "monotonic_fixups": 0,
+        "instances": 28253,
+        "blocks": 80,
+        "baked_primitives": 0,
+        "baked_blocks": 0,
+        "baked_blocks_reused": 0,
+        "baked_instances": 0,
+        "baked_input_triangles": 0,
+        "baked_output_triangles": 0
+      },
+      "bytes": {
+        "mesh_payloads": 98923264,
+        "instance_payloads": 2493696,
+        "baked_chunks": 0
+      },
+      "peak_working_set_bytes": 142020608,
+      "reference_rejects": {
+        "base_not_static:ACTI": 8458,
+        "base_not_static:ALCH": 1253,
+        "base_not_static:AMMO": 256,
+        "base_not_static:APPA": 25,
+        "base_not_static:ARMO": 340,
+        "base_not_static:ASPC": 17,
+        "base_not_static:BOOK": 335,
+        "base_not_static:CONT": 2421,
+        "base_not_static:DOOR": 904,
+        "base_not_static:FLOR": 6104,
+        "base_not_static:FURN": 4805,
+        "base_not_static:IDLM": 2601,
+        "base_not_static:INGR": 481,
+        "base_not_static:KEYM": 3,
+        "base_not_static:LIGH": 1007,
+        "base_not_static:MISC": 2783,
+        "base_not_static:MSTT": 11465,
+        "base_not_static:NPC_": 6341,
+        "base_not_static:PROJ": 9,
+        "base_not_static:SCRL": 18,
+        "base_not_static:SLGM": 84,
+        "base_not_static:SOUN": 2216,
+        "base_not_static:TACT": 8,
+        "base_not_static:TREE": 129949,
+        "base_not_static:TXST": 1098,
+        "base_not_static:WEAP": 706,
+        "enable_parent": 4546,
+        "initially_disabled": 1673,
+        "model_path_excluded": 15958,
+        "no_model": 1379,
+        "scripted": 93
+      },
+      "primitive_rejects": {
+        "below_triangle_threshold": 6216,
+        "effect_shader": 10,
+        "missing_attributes": 47,
+        "not_opaque": 1654,
+        "unsupported_material_feature": 983
+      },
+      "notices": [],
+      "process_wall_ms": 4582.474399998318,
+      "database_growth_bytes": 2338816,
+      "total_spread_ms": [
+        3745.749,
+        4959.699600000001
+      ],
+      "repeats": 3
+    },
+    "warm": {
+      "requested_mode": "cluster",
+      "mode": "cluster",
+      "probe": {
+        "adapter_name": "NVIDIA GeForce RTX 3090",
+        "backend": "Vulkan",
+        "device_type": "DiscreteGpu",
+        "driver": "NVIDIA",
+        "driver_info": "616.92",
+        "features": {
+          "INDIRECT_FIRST_INSTANCE": {
+            "reported": true,
+            "required": true
+          }
+        },
+        "forced": true,
+        "limits": {
+          "max_bind_groups": {
+            "reported": 8,
+            "required": 4
+          },
+          "max_storage_buffer_binding_size": {
+            "reported": 2147483644,
+            "required": 134217728
+          },
+          "max_storage_buffers_per_shader_stage": {
+            "reported": 524288,
+            "required": 8
+          }
+        },
+        "missing": [],
+        "required_backends": [
+          "Vulkan",
+          "Dx12",
+          "Metal"
+        ]
+      },
+      "builder_identity": "40970fe3922a1e2b1e7be3c7409a97593f8196d10d67b0a9fc67337c7361307a",
+      "triangle_threshold": 1024,
+      "bench_baked": false,
+      "jobs": 8,
+      "timings": {
+        "probe_ms": 341.1945,
+        "classify_ms": 2605.8347,
+        "models_pass_wall_ms": 186.6613,
+        "blocks_pass_wall_ms": 36.575,
+        "tables_ms": 60.945100000000004,
+        "total_ms": 3281.0115,
+        "cpu_model_load_ms": 0.0,
+        "cpu_cluster_build_ms": 0.0,
+        "cpu_cluster_write_ms": 1367.8989000000004,
+        "cpu_baked_chain_ms": 0.0,
+        "cpu_instance_block_ms": 166.73480000000004,
+        "cpu_baked_block_ms": 0.0,
+        "attributed_baked_ms": 0.0,
+        "attributed_cluster_ms": 281.1818,
+        "attributed_shared_ms": 2605.8347
+      },
+      "counts": {
+        "references_examined": 323499,
+        "references_eligible": 116163,
+        "models": 2758,
+        "models_loaded": 0,
+        "models_known_from_previous": 2758,
+        "models_missing_from_manifest": 0,
+        "models_failed_to_load": 0,
+        "primitives": 9845,
+        "primitives_clustered": 935,
+        "meshes_built": 0,
+        "meshes_reused": 935,
+        "clusters": 52439,
+        "groups": 6695,
+        "source_triangles_clustered": 2263028,
+        "monotonic_fixups": 0,
+        "instances": 28253,
+        "blocks": 80,
+        "baked_primitives": 0,
+        "baked_blocks": 0,
+        "baked_blocks_reused": 0,
+        "baked_instances": 0,
+        "baked_input_triangles": 0,
+        "baked_output_triangles": 0
+      },
+      "bytes": {
+        "mesh_payloads": 98923264,
+        "instance_payloads": 2493696,
+        "baked_chunks": 0
+      },
+      "peak_working_set_bytes": 120512512,
+      "reference_rejects": {
+        "base_not_static:ACTI": 8458,
+        "base_not_static:ALCH": 1253,
+        "base_not_static:AMMO": 256,
+        "base_not_static:APPA": 25,
+        "base_not_static:ARMO": 340,
+        "base_not_static:ASPC": 17,
+        "base_not_static:BOOK": 335,
+        "base_not_static:CONT": 2421,
+        "base_not_static:DOOR": 904,
+        "base_not_static:FLOR": 6104,
+        "base_not_static:FURN": 4805,
+        "base_not_static:IDLM": 2601,
+        "base_not_static:INGR": 481,
+        "base_not_static:KEYM": 3,
+        "base_not_static:LIGH": 1007,
+        "base_not_static:MISC": 2783,
+        "base_not_static:MSTT": 11465,
+        "base_not_static:NPC_": 6341,
+        "base_not_static:PROJ": 9,
+        "base_not_static:SCRL": 18,
+        "base_not_static:SLGM": 84,
+        "base_not_static:SOUN": 2216,
+        "base_not_static:TACT": 8,
+        "base_not_static:TREE": 129949,
+        "base_not_static:TXST": 1098,
+        "base_not_static:WEAP": 706,
+        "enable_parent": 4546,
+        "initially_disabled": 1673,
+        "model_path_excluded": 15958,
+        "no_model": 1379,
+        "scripted": 93
+      },
+      "primitive_rejects": {
+        "below_triangle_threshold": 6216,
+        "effect_shader": 10,
+        "missing_attributes": 47,
+        "not_opaque": 1654,
+        "unsupported_material_feature": 983
+      },
+      "notices": [],
+      "process_wall_ms": 3378.584399993997,
+      "database_growth_bytes": 2338816,
+      "total_spread_ms": [
+        2779.477,
+        3377.8397999999997
+      ],
+      "repeats": 3
+    },
+    "plugin": {
+      "requested_mode": "cluster",
+      "mode": "cluster",
+      "probe": {
+        "adapter_name": "NVIDIA GeForce RTX 3090",
+        "backend": "Vulkan",
+        "device_type": "DiscreteGpu",
+        "driver": "NVIDIA",
+        "driver_info": "616.92",
+        "features": {
+          "INDIRECT_FIRST_INSTANCE": {
+            "reported": true,
+            "required": true
+          }
+        },
+        "forced": true,
+        "limits": {
+          "max_bind_groups": {
+            "reported": 8,
+            "required": 4
+          },
+          "max_storage_buffer_binding_size": {
+            "reported": 2147483644,
+            "required": 134217728
+          },
+          "max_storage_buffers_per_shader_stage": {
+            "reported": 524288,
+            "required": 8
+          }
+        },
+        "missing": [],
+        "required_backends": [
+          "Vulkan",
+          "Dx12",
+          "Metal"
+        ]
+      },
+      "builder_identity": "40970fe3922a1e2b1e7be3c7409a97593f8196d10d67b0a9fc67337c7361307a",
+      "triangle_threshold": 1024,
+      "bench_baked": false,
+      "jobs": 8,
+      "timings": {
+        "probe_ms": 399.3266,
+        "classify_ms": 2595.0181,
+        "models_pass_wall_ms": 197.81650000000002,
+        "blocks_pass_wall_ms": 36.7472,
+        "tables_ms": 67.70320000000001,
+        "total_ms": 3243.1906000000004,
+        "cpu_model_load_ms": 0.0,
+        "cpu_cluster_build_ms": 0.0,
+        "cpu_cluster_write_ms": 1451.1778999999997,
+        "cpu_baked_chain_ms": 0.0,
+        "cpu_instance_block_ms": 183.02110000000002,
+        "cpu_baked_block_ms": 0.0,
+        "attributed_baked_ms": 0.0,
+        "attributed_cluster_ms": 300.7976,
+        "attributed_shared_ms": 2595.0181
+      },
+      "counts": {
+        "references_examined": 323499,
+        "references_eligible": 116163,
+        "models": 2758,
+        "models_loaded": 0,
+        "models_known_from_previous": 2758,
+        "models_missing_from_manifest": 0,
+        "models_failed_to_load": 0,
+        "primitives": 9845,
+        "primitives_clustered": 935,
+        "meshes_built": 0,
+        "meshes_reused": 935,
+        "clusters": 52439,
+        "groups": 6695,
+        "source_triangles_clustered": 2263028,
+        "monotonic_fixups": 0,
+        "instances": 28253,
+        "blocks": 80,
+        "baked_primitives": 0,
+        "baked_blocks": 0,
+        "baked_blocks_reused": 0,
+        "baked_instances": 0,
+        "baked_input_triangles": 0,
+        "baked_output_triangles": 0
+      },
+      "bytes": {
+        "mesh_payloads": 98923264,
+        "instance_payloads": 2493696,
+        "baked_chunks": 0
+      },
+      "peak_working_set_bytes": 120795136,
+      "reference_rejects": {
+        "base_not_static:ACTI": 8458,
+        "base_not_static:ALCH": 1253,
+        "base_not_static:AMMO": 256,
+        "base_not_static:APPA": 25,
+        "base_not_static:ARMO": 340,
+        "base_not_static:ASPC": 17,
+        "base_not_static:BOOK": 335,
+        "base_not_static:CONT": 2421,
+        "base_not_static:DOOR": 904,
+        "base_not_static:FLOR": 6104,
+        "base_not_static:FURN": 4805,
+        "base_not_static:IDLM": 2601,
+        "base_not_static:INGR": 481,
+        "base_not_static:KEYM": 3,
+        "base_not_static:LIGH": 1007,
+        "base_not_static:MISC": 2783,
+        "base_not_static:MSTT": 11465,
+        "base_not_static:NPC_": 6341,
+        "base_not_static:PROJ": 9,
+        "base_not_static:SCRL": 18,
+        "base_not_static:SLGM": 84,
+        "base_not_static:SOUN": 2216,
+        "base_not_static:TACT": 8,
+        "base_not_static:TREE": 129949,
+        "base_not_static:TXST": 1098,
+        "base_not_static:WEAP": 706,
+        "enable_parent": 4546,
+        "initially_disabled": 1673,
+        "model_path_excluded": 15958,
+        "no_model": 1379,
+        "scripted": 93
+      },
+      "primitive_rejects": {
+        "below_triangle_threshold": 6216,
+        "effect_shader": 10,
+        "missing_attributes": 47,
+        "not_opaque": 1654,
+        "unsupported_material_feature": 983
+      },
+      "notices": [],
+      "process_wall_ms": 4185.268899978837,
+      "database_growth_bytes": 2338816,
+      "total_spread_ms": [
+        3019.8952,
+        3462.3544
+      ],
+      "repeats": 3
+    }
+  }
+}
