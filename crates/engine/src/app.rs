@@ -278,7 +278,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         || config.benchmark_duration_secs.is_some()
         || config.streaming_benchmark_route_speed.is_some();
     configure_benchmark_priority(benchmark_active)?;
-    let window = (!config.headless || shots_active || config.hidden_window).then(|| Window {
+    let window = (!config.headless || config.hidden_window).then(|| Window {
         title: config.window_title(),
         visible: !config.hidden_window,
         // Start the window at the reference size; shots use an independent exact-size image target.
@@ -434,6 +434,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     if let Some(terrain_merge) = terrain_merge {
         app.insert_resource(terrain_merge);
     }
+    if shots_active || app.world().resource::<EngineConfig>().stdin_console {
+        app.add_plugins(crate::capture_frame::CaptureFramePlugin);
+    }
     if app
         .world()
         .resource::<EngineConfig>()
@@ -522,9 +525,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     {
         app.add_plugins(RenderDiagnosticsPlugin);
     }
-    if app.world().resource::<EngineConfig>().stdin_console && !shots_active {
-        app.add_plugins(crate::capture_frame::CaptureFramePlugin);
-    }
+
     if let Some(run) = shots {
         info!(
             shots = run.file.shots.len(),
@@ -577,9 +578,19 @@ fn keep_windows_hidden(config: Res<EngineConfig>, mut windows: Query<&mut Window
 /// and a single asset larger than the whole budget is still prepared. Images
 /// are prepared before meshes and share the one budget, so while new images
 /// use it up, new meshes wait for a later frame.
+///
+/// A capture run (`--shots`, `--demo-tour`) has no budget: its settle gate
+/// counts what the streamer still has to spawn, not what the render world still
+/// has to upload, and a loaded machine left whole rooms undrawn in the frame it
+/// photographed (research-283). The timing runs keep the configured budget.
 fn upload_budget(config: &EngineConfig) -> RenderAssetBytesPerFrame {
+    let captures = config.shots.is_some();
     RenderAssetBytesPerFrame {
-        max_bytes: config.max_upload_bytes_per_frame(),
+        max_bytes: if captures {
+            None
+        } else {
+            config.max_upload_bytes_per_frame()
+        },
     }
 }
 
@@ -2928,6 +2939,12 @@ fn capture_acceptance_screenshot(
     world_database: Option<Res<WorldDatabase>>,
     renderer: Res<RendererMetrics>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    // Surfaces a view can see that the render world has not confirmed drawn: an acceptance
+    // screenshot must not be taken while one is outstanding (design-1091 §4).
+    waiting: Query<
+        Has<crate::swap_bridge::SwapInCameraView>,
+        With<crate::swap_bridge::SwapWaiting>,
+    >,
 ) {
     let Some(path) = &config.acceptance_screenshot else {
         return;
@@ -2943,9 +2960,10 @@ fn capture_acceptance_screenshot(
     {
         return;
     }
-    let assets_ready = streaming
-        .as_deref()
-        .is_none_or(|metrics| screenshot_assets_ready(metrics, world_database.is_some(), &config));
+    let pending_drawn = crate::swap_bridge::pending_drawn(&waiting);
+    let assets_ready = streaming.as_deref().is_none_or(|metrics| {
+        screenshot_assets_ready(metrics, pending_drawn, world_database.is_some(), &config)
+    });
     let renderer_ready = renderer.final_path_active()
         && (!config.renderer_fixture || renderer.renderer_fixture_validated);
     if !assets_ready || !renderer_ready {
@@ -2965,12 +2983,14 @@ fn capture_acceptance_screenshot(
 
 fn screenshot_assets_ready(
     metrics: &StreamingMetrics,
+    pending_drawn: usize,
     world_streaming_active: bool,
     config: &EngineConfig,
 ) -> bool {
     metrics.pending_asset_instances == 0
         && metrics.pending_surface_instances == 0
         && metrics.loading_cells == 0
+        && pending_drawn == 0
         && metrics.pending_lod_queries == 0
         && metrics.pending_lod_chunks == 0
         && metrics.pending_lod_object_blocks == 0
@@ -4017,29 +4037,33 @@ mod tests {
         let metrics = StreamingMetrics::default();
         let config = EngineConfig::default();
 
-        assert!(screenshot_assets_ready(&metrics, false, &config));
-        assert!(!screenshot_assets_ready(&metrics, true, &config));
+        assert!(screenshot_assets_ready(&metrics, 0, false, &config));
+        assert!(!screenshot_assets_ready(&metrics, 0, true, &config));
 
         let mut settled_metrics = metrics;
         settled_metrics.resident_cells = 1;
-        assert!(screenshot_assets_ready(&settled_metrics, true, &config));
+        assert!(screenshot_assets_ready(&settled_metrics, 0, true, &config));
+
+        // A surface waiting on the render world holds the screenshot back until it is confirmed
+        // drawn: the acceptance screenshot must not photograph a stand-in or a hole (design-1091 §4).
+        assert!(!screenshot_assets_ready(&settled_metrics, 1, true, &config));
 
         let mut failed_metrics = settled_metrics.clone();
         failed_metrics.failed_cells = 1;
-        assert!(!screenshot_assets_ready(&failed_metrics, true, &config));
+        assert!(!screenshot_assets_ready(&failed_metrics, 0, true, &config));
 
         let mut pending_lod = settled_metrics.clone();
         pending_lod.pending_lod_queries = 1;
-        assert!(!screenshot_assets_ready(&pending_lod, true, &config));
+        assert!(!screenshot_assets_ready(&pending_lod, 0, true, &config));
 
         let mut failed_lod = settled_metrics;
         failed_lod.failed_lod_chunks = 1;
-        assert!(screenshot_assets_ready(&failed_lod, true, &config));
+        assert!(screenshot_assets_ready(&failed_lod, 0, true, &config));
         failed_lod.unrecovered_lod_chunks = 1;
-        assert!(!screenshot_assets_ready(&failed_lod, true, &config));
+        assert!(!screenshot_assets_ready(&failed_lod, 0, true, &config));
         failed_lod.unrecovered_lod_chunks = 0;
         failed_lod.unrecovered_lod_queries = 1;
-        assert!(!screenshot_assets_ready(&failed_lod, true, &config));
+        assert!(!screenshot_assets_ready(&failed_lod, 0, true, &config));
     }
 
     /// Frames `capture_acceptance_screenshot` needs before the screenshot: the run's warmup plus
@@ -4658,6 +4682,19 @@ mod tests {
             app.world().resource::<RenderAssetBytesPerFrame>().max_bytes,
             None
         );
+    }
+
+    /// A capture is photographed once its streaming has settled, and nothing in that gate waits
+    /// for the render world's upload backlog, so a capture run uploads unthrottled.
+    #[test]
+    fn capture_runs_upload_without_a_budget() {
+        let mut config = EngineConfig::default();
+        let normal = upload_budget(&config).max_bytes;
+        config.shots = Some(PathBuf::from("shots.json"));
+        assert_eq!(upload_budget(&config).max_bytes, None);
+        config.shots = None;
+        config.benchmark_frames = Some(10);
+        assert_eq!(upload_budget(&config).max_bytes, normal);
     }
 
     /// An assets directory the engine was given.

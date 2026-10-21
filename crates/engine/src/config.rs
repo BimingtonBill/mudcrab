@@ -2469,10 +2469,13 @@ mod tests {
         assert_eq!(config.start_position, Some([-100.0, 8200.0, 5.0]));
         assert_eq!(config.start_grid, (-1, 2));
         assert_eq!(config.start_yaw, 1.5);
-        assert!(
-            EngineConfig::from_args(["--start-position", "NaN", "0", "0"].map(String::from))
-                .is_err()
-        );
+        for arguments in [
+            ["--start-position", "1", "2"].as_slice(),
+            ["--start-position", "NaN", "0", "0"].as_slice(),
+            ["--start-yaw", "inf"].as_slice(),
+        ] {
+            assert!(EngineConfig::from_args(arguments.iter().map(|a| (*a).to_owned())).is_err());
+        }
     }
 
     #[test]

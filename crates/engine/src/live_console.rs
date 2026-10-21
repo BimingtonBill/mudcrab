@@ -94,7 +94,7 @@ fn build_live_capture_receipt(
         .grading
         .as_ref()
         .ok_or("live captured frame has no validated grading evidence")?;
-    if !frame.work.is_quiet() {
+    if frame.work.space_failed || !frame.work.is_quiet() {
         return Err(format!(
             "live captured frame is not settled: {}",
             frame.work.describe()
@@ -282,6 +282,7 @@ mod tests {
             render_origin: [5, -11],
             pending_specializations: Some(0),
             work: SettleCounts {
+                scope: crate::shots::SettleScope::Capture,
                 renderer_ready: true,
                 pending_specializations: Some(0),
                 pending_render_transfers: Some(0),
@@ -385,6 +386,22 @@ mod tests {
                 .unwrap_err()
                 .contains("no tone-map mode")
         );
+    }
+
+    #[test]
+    fn live_receipt_rejects_a_failed_current_cell_even_without_new_failures() {
+        let mut frame = captured_frame();
+        frame.work.scope = crate::shots::SettleScope::ViewAndCapture;
+        frame.work.space_failed = true;
+        assert!(
+            frame.work.is_quiet(),
+            "the shared tour rule permits failed cells"
+        );
+
+        let error =
+            build_live_capture_receipt(&serde_json::json!({"ready": true}), &frame, [1920, 1080])
+                .expect_err("the camera's own failed cell must never certify a screenshot");
+        assert!(error.contains("not settled"), "{error}");
     }
 
     #[test]

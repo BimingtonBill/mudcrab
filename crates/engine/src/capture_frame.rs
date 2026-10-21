@@ -10,7 +10,8 @@ use crate::{
         SkyrimCinematicPost,
     },
     shots::shot_camera_translation,
-    streaming::RenderOrigin,
+    streaming::{ActiveSpace, RenderOrigin, StreamingWorld},
+    swap_bridge::{SwapInCameraView, SwapWaiting, pending_drawn},
     tone_mapping::SceneToneMapSource,
     world::components::StreamingCamera,
 };
@@ -250,8 +251,15 @@ fn extract_capture_frames(
         Option<Res<SceneToneMapSource>>,
         Option<Res<SceneGradeOverrides>>,
     )>,
+    view_inputs: Extract<(
+        Res<crate::config::EngineConfig>,
+        Option<Res<ActiveSpace>>,
+        Option<Res<StreamingWorld>>,
+        Query<Has<SwapInCameraView>, With<SwapWaiting>>,
+    )>,
 ) {
     let (frame, origin, camera, tickets, streaming, renderer, profiler, uploads) = &*frame_inputs;
+    let (config, active, world, waiting) = &*view_inputs;
     let (
         windows,
         surfaces,
@@ -272,15 +280,61 @@ fn extract_capture_frames(
     else {
         return;
     };
-    // Reuse the same origin conversion as the pose driver; origin is an absolute cell offset.
-    let offset = shot_camera_translation([0.0; 3], origin.0);
-    let absolute = transform.translation - offset;
+    // Match app.rs's explicit modes without StreamingPlugin. A streaming fixture takes
+    // precedence there, including when benchmark_only is also set. Missing resources never
+    // select Capture scope for a run that should own a streamed world.
+    let renderer_only = !config.streaming_fixture
+        && (config.benchmark_only
+            || config.material_fixture
+            || config.terrain_water_fixture
+            || config.transform_bounds_fixture
+            || config.renderer_fixture
+            || config.physics_fixture);
+    let view = if renderer_only {
+        None
+    } else {
+        let (Some(active), Some(world)) = (active.as_deref(), world.as_deref()) else {
+            error!(
+                active_cell_available = active.is_some(),
+                streaming_world_available = world.is_some(),
+                "cannot extract a streamed-world capture without current cell and world evidence"
+            );
+            return;
+        };
+        Some((active, world))
+    };
+    // Interior transforms are already absolute; switch_space retains the old exterior origin.
+    // Outdoors and in renderer-only fixtures, preserve the pose driver's origin conversion.
+    let absolute = if view.is_some_and(|(active, _)| active.interior.is_some()) {
+        transform.translation
+    } else {
+        transform.translation - shot_camera_translation([0.0; 3], origin.0)
+    };
     let pose = shared::coordinates::runtime_to_creation_vector(absolute.to_array());
+    let view_counts = view.map(|(active, world)| {
+        let key = if let Some(cell_id) = active.interior {
+            crate::world::database::CellKey::Interior(cell_id)
+        } else {
+            let (grid_x, grid_y) = crate::config::grid_of(pose[0], pose[1]);
+            crate::world::database::CellKey::Exterior {
+                worldspace_id: active.worldspace_id.unwrap_or(config.worldspace_id),
+                grid_x,
+                grid_y,
+            }
+        };
+        crate::shots::settle_counts(
+            Some(key),
+            0,
+            pending_drawn(waiting),
+            Some(world),
+            Some(streaming),
+        )
+    });
     for ticket in tickets {
         if ticket.receipt().is_some() {
             continue;
         }
-        let work = captured_work(
+        let mut work = captured_work(
             ticket,
             streaming,
             renderer,
@@ -288,6 +342,9 @@ fn extract_capture_frames(
             uploads,
             renderer.final_path_active(),
         );
+        if let Some(view_counts) = view_counts {
+            work = work.with_view(view_counts);
+        }
         let record = CaptureFrame {
             main_frame: frame.0,
             render_frame: extracted.render_frame,
@@ -384,6 +441,320 @@ pub(crate) fn validate_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        shots::{Failures, SettleScope},
+        streaming::{ActiveSpace, StreamingMetrics, StreamingWorld},
+        swap_bridge::{SwapInCameraView, SwapWaiting},
+        world::database::CellKey,
+    };
+    use bevy::{ecs::system::RunSystemOnce, render::MainWorld, window::PrimaryWindow};
+
+    /// Run the production extraction against an actual MainWorld, without a GPU or readback.
+    fn extraction_world(
+        active: ActiveSpace,
+        origin: IVec2,
+        translation: Vec3,
+        baseline: Failures,
+    ) -> (World, CaptureTicket) {
+        let ticket = CaptureTicket::new(baseline);
+        let mut main = MainWorld::default();
+        main.insert_resource(crate::config::EngineConfig::default());
+        main.insert_resource(FrameCount(7));
+        main.insert_resource(RenderOrigin(origin));
+        main.insert_resource(active);
+        main.insert_resource(StreamingWorld::default());
+        main.insert_resource(StreamingMetrics::default());
+        main.insert_resource(crate::render::RendererMetrics {
+            gpu_preprocessing_active: true,
+            gpu_culling_active: true,
+            indirect_drawing_active: true,
+            occlusion_culling_views: 1,
+            hzb_views: 1,
+            indirect_phase_buffers: 1,
+            indirect_batch_sets: 1,
+            proof_frames: 1,
+            ..default()
+        });
+        main.insert_resource(crate::profiling::ProfilingState::default());
+        main.insert_resource(crate::terrain_upload::TerrainMeshUploadReadiness::default());
+        main.spawn(PrimaryWindow);
+        main.spawn((
+            StreamingCamera,
+            Transform::from_translation(translation),
+            Projection::Perspective(PerspectiveProjection::default()),
+        ));
+        main.spawn((Screenshot::primary_window(), ticket.clone()));
+
+        let mut render = World::new();
+        render.insert_resource(main);
+        render.init_resource::<ExtractedCaptures>();
+        render.insert_resource(RetryReadiness(Arc::new(Mutex::new(Some(0)))));
+        render.insert_resource(TransferReadiness(Arc::new(Mutex::new(Some(0)))));
+        let mut schedule = Schedule::new(ExtractSchedule);
+        schedule.add_systems(extract_capture_frames);
+        render.add_schedule(schedule);
+        (render, ticket)
+    }
+
+    fn extracted_receipt(render: &mut World, ticket: &CaptureTicket) -> CaptureFrame {
+        render.run_schedule(ExtractSchedule);
+        render.run_system_once(finalize_capture_frames).unwrap();
+        ticket
+            .receipt()
+            .expect("the extraction finalized a receipt")
+    }
+
+    #[test]
+    fn renderer_only_fixtures_extract_capture_receipts_without_streaming_resources() {
+        for fixture in [
+            "material",
+            "terrain_water",
+            "transform_bounds",
+            "renderer",
+            "physics",
+            "benchmark",
+        ] {
+            let (mut render, ticket) = extraction_world(
+                ActiveSpace {
+                    worldspace_id: Some(17),
+                    interior: None,
+                },
+                IVec2::new(4, -10),
+                Vec3::ZERO,
+                Failures::default(),
+            );
+            {
+                let mut main = render.resource_mut::<MainWorld>();
+                main.insert_resource(crate::config::EngineConfig {
+                    stdin_console: true,
+                    material_fixture: fixture == "material",
+                    terrain_water_fixture: fixture == "terrain_water",
+                    transform_bounds_fixture: fixture == "transform_bounds",
+                    renderer_fixture: fixture == "renderer",
+                    physics_fixture: fixture == "physics",
+                    benchmark_only: fixture == "benchmark",
+                    ..default()
+                });
+                main.remove_resource::<ActiveSpace>();
+                main.remove_resource::<StreamingWorld>();
+            }
+
+            let frame = extracted_receipt(&mut render, &ticket);
+            assert_eq!(frame.work.scope, SettleScope::Capture, "{fixture}");
+            assert!(
+                frame.work.is_quiet(),
+                "{fixture}: {}",
+                frame.work.describe()
+            );
+            assert_eq!((frame.main_frame, frame.render_frame), (7, 1), "{fixture}");
+            assert_eq!(frame.camera_creation, [16384.0, -40960.0, 0.0], "{fixture}");
+            assert_eq!(frame.render_origin, [4, -10], "{fixture}");
+        }
+    }
+
+    #[test]
+    fn missing_streamed_world_state_never_downgrades_to_renderer_only_capture() {
+        for mode in ["world", "streaming_benchmark", "streaming_fixture"] {
+            for missing in ["cell", "world", "both"] {
+                let (mut render, ticket) = extraction_world(
+                    ActiveSpace {
+                        worldspace_id: Some(17),
+                        interior: Some(83),
+                    },
+                    IVec2::new(4, -10),
+                    Vec3::ZERO,
+                    Failures::default(),
+                );
+                {
+                    let mut main = render.resource_mut::<MainWorld>();
+                    main.insert_resource(crate::config::EngineConfig {
+                        stdin_console: true,
+                        benchmark_frames: (mode == "streaming_benchmark").then_some(120),
+                        // app.rs gives streaming_fixture priority over benchmark_only.
+                        streaming_fixture: mode == "streaming_fixture",
+                        benchmark_only: mode == "streaming_fixture",
+                        ..default()
+                    });
+                    if missing != "world" {
+                        main.remove_resource::<ActiveSpace>();
+                    }
+                    if missing != "cell" {
+                        main.remove_resource::<StreamingWorld>();
+                    }
+                }
+
+                render.run_schedule(ExtractSchedule);
+                render.run_system_once(finalize_capture_frames).unwrap();
+                assert_eq!(
+                    render.resource::<ExtractedCaptures>().render_frame,
+                    1,
+                    "{mode}/{missing}: extraction must handle absent state explicitly"
+                );
+                assert!(
+                    ticket.receipt().is_none(),
+                    "{mode}/{missing}: no receipt without world evidence"
+                );
+                assert!(render.resource::<ExtractedCaptures>().captures.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn interior_extraction_ignores_the_previous_exterior_origin() {
+        let pose = [21750.0, -44530.0, 140.0];
+        let (mut render, ticket) = extraction_world(
+            ActiveSpace {
+                worldspace_id: Some(17),
+                interior: Some(83),
+            },
+            IVec2::new(4, -10),
+            Vec3::from_array(shared::coordinates::creation_to_runtime_vector(pose)),
+            Failures::default(),
+        );
+        render
+            .resource_mut::<MainWorld>()
+            .resource_mut::<StreamingWorld>()
+            .set_resident_for_test(CellKey::Interior(83), Entity::PLACEHOLDER);
+
+        let frame = extracted_receipt(&mut render, &ticket);
+        assert_eq!(frame.camera_creation, pose);
+        assert_eq!(frame.render_origin, [4, -10], "record the actual resource");
+        assert_eq!(frame.work.scope, SettleScope::ViewAndCapture);
+        assert!(frame.work.space_resident, "{}", frame.work.describe());
+        assert!(frame.work.is_quiet(), "{}", frame.work.describe());
+    }
+
+    #[test]
+    fn exterior_extraction_uses_the_captured_pose_and_active_worldspace() {
+        let pose = [21750.0, -44530.0, 140.0];
+        let origin = IVec2::new(4, -10);
+        let (mut render, ticket) = extraction_world(
+            ActiveSpace {
+                worldspace_id: Some(17),
+                interior: None,
+            },
+            origin,
+            shot_camera_translation(pose, origin),
+            Failures::default(),
+        );
+        render
+            .resource_mut::<MainWorld>()
+            .resource_mut::<StreamingWorld>()
+            .set_resident_for_test(
+                CellKey::Exterior {
+                    worldspace_id: 17,
+                    grid_x: 5,
+                    grid_y: -11,
+                },
+                Entity::PLACEHOLDER,
+            );
+
+        let frame = extracted_receipt(&mut render, &ticket);
+        assert_eq!(frame.camera_creation, pose);
+        assert_eq!((frame.main_frame, frame.render_frame), (7, 1));
+        assert!(frame.work.space_resident, "{}", frame.work.describe());
+        assert!(frame.work.is_quiet(), "{}", frame.work.describe());
+    }
+
+    #[test]
+    fn extraction_reads_the_new_active_cells_failure_after_the_request() {
+        let (mut render, ticket) = extraction_world(
+            ActiveSpace {
+                worldspace_id: Some(17),
+                interior: None,
+            },
+            IVec2::ZERO,
+            Vec3::ZERO,
+            Failures::default(),
+        );
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.resource_mut::<StreamingWorld>().set_resident_for_test(
+                CellKey::Exterior {
+                    worldspace_id: 17,
+                    grid_x: 0,
+                    grid_y: 0,
+                },
+                Entity::PLACEHOLDER,
+            );
+            // A space switch after the request invalidates the old resident-cell observation.
+            main.resource_mut::<ActiveSpace>().interior = Some(83);
+            main.resource_mut::<StreamingWorld>()
+                .set_failed_for_test(CellKey::Interior(83));
+            main.resource_mut::<FrameCount>().0 = 9;
+        }
+
+        let frame = extracted_receipt(&mut render, &ticket);
+        assert_eq!(frame.main_frame, 9);
+        assert_eq!(frame.work.scope, SettleScope::ViewAndCapture);
+        assert!(!frame.work.space_resident);
+        assert!(frame.work.space_failed, "{}", frame.work.describe());
+    }
+
+    #[test]
+    fn extraction_reads_camera_visible_swap_waiters_at_capture_time() {
+        let (mut render, ticket) = extraction_world(
+            ActiveSpace {
+                worldspace_id: Some(17),
+                interior: Some(83),
+            },
+            IVec2::ZERO,
+            Vec3::ZERO,
+            Failures::default(),
+        );
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.resource_mut::<StreamingWorld>()
+                .set_resident_for_test(CellKey::Interior(83), Entity::PLACEHOLDER);
+            // Use the bridge's own markers; off-camera and non-waiting work is excluded.
+            main.spawn((SwapWaiting, SwapInCameraView));
+            main.spawn((SwapWaiting, SwapInCameraView));
+            main.spawn(SwapWaiting);
+            main.spawn(SwapInCameraView);
+        }
+
+        let frame = extracted_receipt(&mut render, &ticket);
+        assert_eq!(frame.work.pending_drawn, 2);
+        assert!(!frame.work.is_quiet(), "{}", frame.work.describe());
+    }
+
+    #[test]
+    fn extraction_combines_view_evidence_with_the_frozen_failure_baseline() {
+        let earlier = StreamingMetrics {
+            failed_cells: 1,
+            asset_load_failures: 2,
+            failed_lod_chunks: 3,
+            ..default()
+        };
+        let baseline = Failures::read(&earlier, &crate::render::RendererMetrics::default());
+        let (mut render, ticket) = extraction_world(
+            ActiveSpace {
+                worldspace_id: Some(17),
+                interior: Some(83),
+            },
+            IVec2::ZERO,
+            Vec3::ZERO,
+            baseline,
+        );
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.resource_mut::<StreamingWorld>()
+                .set_resident_for_test(CellKey::Interior(83), Entity::PLACEHOLDER);
+            main.insert_resource(earlier);
+            main.resource_mut::<StreamingMetrics>().asset_load_failures += 1;
+        }
+
+        let frame = extracted_receipt(&mut render, &ticket);
+        assert_eq!(ticket.baseline(), baseline);
+        assert!(frame.work.space_resident);
+        assert_eq!(
+            (frame.work.failed_cells, frame.work.failed_lod_work),
+            (0, 0)
+        );
+        assert_eq!(frame.work.asset_load_failures, 1);
+        assert!(!frame.work.is_quiet(), "{}", frame.work.describe());
+    }
+
     #[test]
     fn incomplete_capture_has_no_receipt() {
         assert!(validate_receipt(&CaptureTicket::default(), [0.0; 3]).is_err());
