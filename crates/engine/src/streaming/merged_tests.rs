@@ -771,7 +771,13 @@ fn a_merged_cell_spawns_one_terrain_entity_with_one_collider() {
         .insert_resource(WaterReflectionTexture(Handle::default()))
         .add_systems(
             Update,
-            (spawn_merged_cell, track_merged_surface_readiness).chain(),
+            (
+                spawn_merged_cell,
+                track_merged_surface_readiness,
+                // Collision is enabled by the geometry/space system, not by texture readiness.
+                enable_non_portal_terrain_colliders,
+            )
+                .chain(),
         );
     app.update();
     app.update();
