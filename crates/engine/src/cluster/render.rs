@@ -120,6 +120,8 @@ pub(super) mod queue_stats {
     /// Views whose batches were walked (an input of the walk changed, or the last walk left a
     /// batch out for want of a prepared material, mesh or pipeline).
     pub static BATCH_WALKS: AtomicU64 = AtomicU64::new(0);
+    /// Batches those walks took up (all of them, or only the changed and still incomplete ones).
+    pub static BATCH_RESOLVED: AtomicU64 = AtomicU64::new(0);
     pub static BATCH_NANOS: AtomicU64 = AtomicU64::new(0);
     pub static SHADOW_FULL: AtomicU64 = AtomicU64::new(0);
     pub static SHADOW_SKIPPED: AtomicU64 = AtomicU64::new(0);
@@ -181,11 +183,12 @@ pub(super) mod queue_stats {
         let take = |counter: &AtomicU64| counter.swap(0, Relaxed);
         let per_frame = |nanos: u64| nanos as f64 / 1.0e6 / QUEUE_REPORT_EVERY as f64;
         bevy::log::info!(
-            "cluster queue over {QUEUE_REPORT_EVERY} frames: batches {} full / {} skipped views ({} walked), {:.2} ms/frame; \
+            "cluster queue over {QUEUE_REPORT_EVERY} frames: batches {} full / {} skipped views ({} walked, {} batches taken up), {:.2} ms/frame; \
              shadows {} full / {} skipped views, {:.2} ms/frame; source orders built {}; batch loader {:.2}, extract {:.2}, prepare {:.2}, cull {:.2} ms/frame (writes {:.2}, passes {:.2}); draw groups: camera {} ({} pipelines x {} material bind groups; {} of {} batches bindless), a shadow view {}",
             take(&BATCH_FULL),
             take(&BATCH_SKIPPED),
             take(&BATCH_WALKS),
+            take(&BATCH_RESOLVED),
             per_frame(take(&BATCH_NANOS)),
             take(&SHADOW_FULL),
             take(&SHADOW_SKIPPED),
@@ -334,15 +337,17 @@ struct ClusterBatchMaterials {
     /// Updated only on handle/material events, using the actual material base.
     /// Missing assets have no entry and cannot inherit an old tangent layout.
     geometry: HashMap<bevy::asset::UntypedAssetId, super::material_geometry::GeometryRequirements>,
-    /// Current material identities, bounded by the handle table; O(1) event matching.
-    named: std::collections::HashSet<bevy::asset::UntypedAssetId>,
+    /// Current material identities and the batches that draw with each, bounded by the handle
+    /// table; O(1) event matching.
+    named: HashMap<bevy::asset::UntypedAssetId, Vec<u32>>,
+    /// The batches whose material identity changed, or whose material had an event, in the
+    /// extraction that last moved `version` (by exactly one).
+    changed_batches: Vec<u32>,
     /// Bumped when `ids` changes or an asset event names one of the materials in it (it was
     /// modified, removed, or finished loading): the prepared materials the plan was made from
     /// can only have changed then. The stock material table's own change tick is no use for this:
     /// something unrelated to the batches (an animated material) moves it every frame.
     version: u64,
-    /// Exact batches changed by the latest version; renderer caches still use `version`.
-    changed_batches: HashSet<usize>,
 }
 
 /// What the render world needs to place and show the instances this frame, read from the main
@@ -422,9 +427,9 @@ fn extract_batch_materials(
     let _timer = queue_stats::Timed::start(&queue_stats::EXTRACT_NANOS);
     let mut changed = false;
     let mut dirty = HashSet::new();
-    let mut changed_batches = HashSet::new();
-    let mut asset_changes = HashSet::new();
-    // The handles change only while materials are being requested, so the table is read only then.
+    let mut changed_batches = Vec::new();
+    // The handles change only while materials are being requested, so the table is read only then,
+    // and only the batches whose material changed are taken up again.
     if handles.is_changed() {
         let ids: Vec<_> = handles
             .handles
@@ -432,55 +437,62 @@ fn extract_batch_materials(
             .map(|handle| handle.as_ref().map(bevy::asset::UntypedHandle::id))
             .collect();
         if out.ids != ids {
-            changed_batches.extend(
-                (0..out.ids.len().max(ids.len()))
-                    .filter(|&index| out.ids.get(index) != ids.get(index)),
-            );
+            for index in 0..ids.len().max(out.ids.len()) {
+                let old = out.ids.get(index).copied().flatten();
+                let new = ids.get(index).copied().flatten();
+                if old == new {
+                    continue;
+                }
+                let batch = index as u32;
+                if let Some(old) = old
+                    && let Some(batches) = out.named.get_mut(&old)
+                {
+                    batches.retain(|named| *named != batch);
+                    if batches.is_empty() {
+                        out.named.remove(&old);
+                        out.geometry.remove(&old);
+                    }
+                }
+                if let Some(new) = new {
+                    out.named.entry(new).or_default().push(batch);
+                    dirty.insert(new);
+                }
+                changed_batches.push(batch);
+            }
             out.ids = ids;
-            out.named = out.ids.iter().flatten().copied().collect();
-            let named = out.named.clone();
-            out.geometry.retain(|id, _| named.contains(id));
-            dirty.extend(named);
             changed = true;
         }
     }
     let handles_changed = changed;
+    let mut hit = |out: &mut ClusterBatchMaterials, id: bevy::asset::UntypedAssetId| {
+        let Some(batches) = out.named.get(&id) else {
+            return false;
+        };
+        changed_batches.extend(batches.iter().copied());
+        dirty.insert(id);
+        true
+    };
     let mut standard_hits = Vec::new();
     for event in events.standard.read() {
-        if out.named.contains(&event_asset_id(event).untyped()) {
+        if hit(&mut out, event_asset_id(event).untyped()) {
             changed = true;
             standard_hits.push(*event);
-            dirty.insert(event_asset_id(event).untyped());
-            asset_changes.insert(event_asset_id(event).untyped());
         }
     }
     let mut snow_hits = 0usize;
     for event in events.snow.read() {
-        if out.named.contains(&event_asset_id(event).untyped()) {
+        if hit(&mut out, event_asset_id(event).untyped()) {
             changed = true;
             snow_hits += 1;
-            dirty.insert(event_asset_id(event).untyped());
-            asset_changes.insert(event_asset_id(event).untyped());
         }
     }
     let mut terrain_changed = false;
     if let Some(events) = events.terrain.as_ref() {
         for event in terrain_cursor.read(events) {
-            let id = event_asset_id(event).untyped();
-            if out.named.contains(&id) {
-                dirty.insert(id);
-                asset_changes.insert(id);
-                terrain_changed = true;
-            }
+            terrain_changed |= hit(&mut out, event_asset_id(event).untyped());
         }
     }
     changed |= terrain_changed;
-    if !asset_changes.is_empty() {
-        changed_batches.extend(out.ids.iter().enumerate().filter_map(|(index, id)| {
-            id.is_some_and(|id| asset_changes.contains(&id))
-                .then_some(index)
-        }));
-    }
     let (standard, snow, terrain) = &*assets;
     for id in dirty {
         match material_geometry(id, standard, snow.as_deref(), terrain.as_deref()) {
@@ -493,6 +505,8 @@ fn extract_batch_materials(
         }
     }
     if changed {
+        changed_batches.sort_unstable();
+        changed_batches.dedup();
         out.changed_batches = changed_batches;
         out.version += 1;
         debug!(
@@ -936,6 +950,17 @@ struct ViewGpu {
     /// What the last walk over the batches was made from, kept only when it left nothing out for
     /// want of a prepared material, mesh or pipeline: the same again means the same plan.
     walk_stamp: Option<[u64; 10]>,
+    /// `walk_stamp` without the batch materials' version and the phase occupancy, neither of
+    /// which changes what a batch resolves to: under the same base, a walk takes up only the
+    /// batches named by the version's step (`ClusterBatchMaterials::changed_batches`) and the
+    /// ones the last walk left out for want of a prepared material, mesh or pipeline.
+    walk_base: Option<[u64; 10]>,
+    walked_version: u64,
+    /// What each batch resolved to in the walks so far (by batch index), how far a terrain batch
+    /// got (for `note_terrain_walk`), and the batches left out for want of something prepared.
+    walk_ready: Vec<Option<ReadyBatch>>,
+    walk_terrain: Vec<Option<u8>>,
+    walk_incomplete: std::collections::BTreeSet<u32>,
     /// The cull epoch each prepass draw group last drew in (see [`DrawClusterIndirect`]'s `ONCE`).
     prepass_drawn: std::sync::Mutex<HashMap<u32, u32>>,
     walk_carriers: Vec<Option<(Entity, MainEntity)>>,
@@ -2328,22 +2353,68 @@ fn queue_cluster_batches(
                 | (u64::from(render_meshes.get(dummy_mesh.tangent.id()).is_some()) << 3),
             pipelines.far_readiness_revision,
         ];
-        if gpu.views[&key].walk_stamp == Some(stamp) && gpu.views[&key].walk_carriers == *carriers {
+        let view_gpu = &gpu.views[&key];
+        if view_gpu.walk_stamp == Some(stamp)
+            && view_gpu.walk_incomplete.is_empty()
+            && view_gpu.walk_carriers == *carriers
+        {
             queue_stats::bump(&queue_stats::BATCH_SKIPPED);
             continue;
         }
+        let batch_count = gpu.batches.len();
+        let walk_base = |mut stamp: [u64; 10]| {
+            stamp[4] = 0;
+            stamp[8] &= !0b11;
+            stamp
+        };
+        let same_base = view_gpu.walk_base == Some(walk_base(stamp))
+            && view_gpu.walk_ready.len() == batch_count
+            && view_gpu.walk_terrain.len() == batch_count;
+        let changed: Option<Vec<usize>> = if !same_base {
+            None
+        } else if view_gpu.walked_version == batch_materials.version {
+            Some(Vec::new())
+        } else if view_gpu.walked_version.wrapping_add(1) == batch_materials.version {
+            Some(
+                batch_materials
+                    .changed_batches
+                    .iter()
+                    .map(|batch| *batch as usize)
+                    .collect(),
+            )
+        } else {
+            None
+        };
         perf_span!("cluster::queue_batches::walk");
         queue_stats::bump(&queue_stats::BATCH_WALKS);
-        let mut incomplete = false;
+        let view_gpu = gpu.views.get_mut(&key).unwrap();
         // By batch index, so the plan below does not depend on the order Bevy hands the visible
         // lists over in (parallel queues: a different order every frame).
-        let mut by_index: Vec<Option<ReadyBatch>> = vec![None; gpu.batches.len()];
-        // Diagnostic: how far each terrain batch gets through this walk (see `note_terrain_walk`).
+        let mut by_index = std::mem::take(&mut view_gpu.walk_ready);
+        // Diagnostic: how far each terrain batch gets (see `note_terrain_walk`).
+        let mut terrain_stage = std::mem::take(&mut view_gpu.walk_terrain);
+        let mut incomplete = std::mem::take(&mut view_gpu.walk_incomplete);
+        let indices: Vec<usize> = match changed {
+            Some(changed) => {
+                let mut indices: std::collections::BTreeSet<usize> =
+                    incomplete.iter().map(|batch| *batch as usize).collect();
+                indices.extend(changed.into_iter().filter(|index| *index < batch_count));
+                indices.into_iter().collect()
+            }
+            None => {
+                by_index = vec![None; batch_count];
+                terrain_stage = vec![None; batch_count];
+                incomplete.clear();
+                (0..batch_count).collect()
+            }
+        };
+        queue_stats::BATCH_RESOLVED
+            .fetch_add(indices.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let terrain_type = std::any::TypeId::of::<super::terrain::ClusterTerrainMaterial>();
-        let mut terrain_walk = [0u32; 7];
-        // `gpu` is borrowed mutably below (memo, generation), so the batches are walked by index.
-        #[allow(clippy::needless_range_loop)]
-        for index in 0..gpu.batches.len() {
+        for index in indices {
+            by_index[index] = None;
+            terrain_stage[index] = None;
+            incomplete.remove(&(index as u32));
             if gpu.batches[index].slots == 0 {
                 continue;
             }
@@ -2368,17 +2439,22 @@ fn queue_cluster_batches(
             };
             let mesh_asset = dummy_mesh.asset(tangents);
             let is_terrain = asset_id.type_id() == terrain_type;
-            terrain_walk[0] += u32::from(is_terrain);
+            let mut stage = |reached: u8| {
+                if is_terrain {
+                    terrain_stage[index] = Some(reached);
+                }
+            };
+            stage(0);
             let Some(material) = materials.get(asset_id) else {
-                terrain_walk[1] += u32::from(is_terrain);
+                stage(1);
                 invalidate_batch_material(gpu, index);
-                incomplete = true;
+                incomplete.insert(index as u32);
                 continue;
             };
             let Some(render_mesh) = render_meshes.get(mesh_asset) else {
-                terrain_walk[2] += u32::from(is_terrain);
+                stage(2);
                 invalidate_batch_material(gpu, index);
-                incomplete = true;
+                incomplete.insert(index as u32);
                 continue;
             };
             // The material's own key bits, plus the alpha mode's: an alpha-masked
@@ -2460,8 +2536,8 @@ fn queue_cluster_batches(
                     );
                     let Some((pipeline_id, selected_far)) = pipeline else {
                         invalidate_batch_material(gpu, index);
-                        terrain_walk[2] += u32::from(is_terrain);
-                        incomplete = true;
+                        stage(2);
+                        incomplete.insert(index as u32);
                         continue;
                     };
                     far_variant = selected_far;
@@ -2554,11 +2630,11 @@ fn queue_cluster_batches(
                 Some(false) => false,
                 Some(true) if alpha_mask_phase.is_some() => true,
                 _ => {
-                    terrain_walk[3] += u32::from(is_terrain);
+                    stage(3);
                     continue;
                 }
             };
-            terrain_walk[4] += u32::from(is_terrain);
+            stage(4);
             by_index[index] = Some(ReadyBatch {
                 // The entity is the group's carrier, set where the groups are made.
                 render_entity: Entity::PLACEHOLDER,
@@ -2571,10 +2647,25 @@ fn queue_cluster_batches(
                 bindless: resolved.bindless,
             });
         }
-        let ready_batches: Vec<ReadyBatch> = by_index.into_iter().flatten().collect();
+        let ready_batches: Vec<ReadyBatch> = by_index.iter().flatten().copied().collect();
+        let mut terrain_walk = [0u32; 7];
+        for stage in terrain_stage.iter().flatten() {
+            terrain_walk[0] += 1;
+            if *stage > 0 {
+                terrain_walk[*stage as usize] += 1;
+            }
+        }
         let carriers_changed = gpu.views[&key].walk_carriers != *carriers;
+        // The walk's own resolutions move the generation; the stamp it leaves is the state after it.
+        let mut walked = stamp;
+        walked[7] = gpu.generation;
         if let Some(view_gpu) = gpu.views.get_mut(&key) {
-            view_gpu.walk_stamp = (!incomplete).then_some(stamp);
+            view_gpu.walk_stamp = Some(walked);
+            view_gpu.walk_base = Some(walk_base(walked));
+            view_gpu.walked_version = batch_materials.version;
+            view_gpu.walk_ready = by_index;
+            view_gpu.walk_terrain = terrain_stage;
+            view_gpu.walk_incomplete = incomplete;
             view_gpu.walk_carriers.clone_from(carriers);
         }
         // A fingerprint of the plan: which batches draw, with what, and under which carriers.
@@ -3413,6 +3504,11 @@ fn new_view_gpu(
         memo: vec![None; gpu.batches.len()],
         plan_hash: None,
         walk_stamp: None,
+        walk_base: None,
+        walked_version: 0,
+        walk_ready: Vec::new(),
+        walk_terrain: Vec::new(),
+        walk_incomplete: std::collections::BTreeSet::new(),
         prepass_drawn: std::sync::Mutex::new(HashMap::new()),
         walk_carriers: Vec::new(),
         plan_items: Vec::new(),
@@ -5355,6 +5451,86 @@ mod tangent_layout_regressions {
         assert_eq!(out.ids[0], Some(pending.id().untyped()));
         assert!(out.geometry[&pending.id().untyped()].tangents);
     }
+    /// Unchanged frames move nothing; a changed handle or a material event moves the version by
+    /// one and names exactly the batches it concerns, which is all the batch walk takes up again.
+    #[test]
+    fn material_changes_name_only_their_batches() {
+        use bevy::render::MainWorld;
+        let mut main = MainWorld::default();
+        main.init_resource::<Assets<StandardMaterial>>();
+        main.init_resource::<Messages<AssetEvent<StandardMaterial>>>();
+        main.init_resource::<Messages<AssetEvent<SnowMaterial>>>();
+        main.init_resource::<ClusterBatchHandles>();
+        let (shared, other, late) = {
+            let mut materials = main.resource_mut::<Assets<StandardMaterial>>();
+            (
+                materials.add(StandardMaterial::default()),
+                materials.add(StandardMaterial::default()),
+                materials.add(StandardMaterial::default()),
+            )
+        };
+        {
+            let mut handles = main.resource_mut::<ClusterBatchHandles>();
+            handles.set(0, shared.clone());
+            handles.set(1, other.clone());
+            handles.set(2, shared.clone());
+        }
+        let mut render = World::new();
+        render.init_resource::<ClusterBatchMaterials>();
+        render.insert_resource(main);
+        let mut schedule = Schedule::new(ExtractSchedule);
+        schedule.add_systems(extract_batch_materials);
+        schedule.run(&mut render);
+        let first = render.resource::<ClusterBatchMaterials>().version;
+        assert_eq!(
+            render.resource::<ClusterBatchMaterials>().changed_batches,
+            [0, 1, 2]
+        );
+        for _ in 0..100 {
+            render.resource_mut::<MainWorld>().increment_change_tick();
+            schedule.run(&mut render);
+        }
+        assert_eq!(render.resource::<ClusterBatchMaterials>().version, first);
+        // One batch is given another material: one step, naming that batch only.
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.increment_change_tick();
+            main.resource_mut::<ClusterBatchHandles>()
+                .set(1, late.clone());
+        }
+        schedule.run(&mut render);
+        let out = render.resource::<ClusterBatchMaterials>();
+        assert_eq!(out.version, first + 1);
+        assert_eq!(out.changed_batches, [1]);
+        assert!(!out.named.contains_key(&other.id().untyped()));
+        assert!(!out.geometry.contains_key(&other.id().untyped()));
+        assert!(out.geometry.contains_key(&late.id().untyped()));
+        // An event on a material two batches share names both; one on a material no batch
+        // uses moves nothing.
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.increment_change_tick();
+            let mut events = main.resource_mut::<Messages<AssetEvent<StandardMaterial>>>();
+            events.write(AssetEvent::Modified { id: shared.id() });
+            events.write(AssetEvent::Modified { id: other.id() });
+        }
+        schedule.run(&mut render);
+        let out = render.resource::<ClusterBatchMaterials>();
+        assert_eq!(out.version, first + 2);
+        assert_eq!(out.changed_batches, [0, 2]);
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.increment_change_tick();
+            main.resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+                .write(AssetEvent::Modified { id: other.id() });
+        }
+        schedule.run(&mut render);
+        assert_eq!(
+            render.resource::<ClusterBatchMaterials>().version,
+            first + 2
+        );
+    }
+
     #[test]
     fn cleared_and_shortened_material_tables_drop_every_old_binding_and_dependency() {
         use bevy::render::MainWorld;

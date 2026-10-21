@@ -176,18 +176,22 @@ fn observe_candidates(
             .map(WorldId::exterior),
     );
     let empty_delta = CandidateWorlds::default();
-    let empty_batches = HashSet::new();
+    let changed_batches: HashSet<usize> = if materials_changed {
+        materials
+            .changed_batches
+            .iter()
+            .map(|&batch| batch as usize)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut effects = destination_scope::Effects::from_delta(
         if source_changed {
             &sources.candidate_worlds
         } else {
             &empty_delta
         },
-        if materials_changed {
-            &materials.changed_batches
-        } else {
-            &empty_batches
-        },
+        &changed_batches,
         &previous.index,
     );
     // A delta belongs to one version only. A missed version, absent material
