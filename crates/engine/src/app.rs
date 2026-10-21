@@ -2789,6 +2789,18 @@ fn sun_rotation(config: &EngineConfig) -> Quat {
 /// at the origin of the world grid: the acceptance screenshot is taken from far above it, the
 /// walk-around view from behind and above it. [`sun_shadow_cascades`] measures its range from the
 /// camera, so the offsets live here rather than in two places.
+/// Whether the worldspace the run is configured with draws its own terrain LOD data, which decides
+/// the ring it starts with ([`EngineConfig::effective_terrain_radius`]). Read through the world
+/// database when the run opened one; a run that streams no world (a fixture, `--benchmark-only`)
+/// has none, and so does a database converted before LOD existed.
+///
+/// This is the configured worldspace and not the active one: it is what the camera is placed in
+/// before the first frame, and every later space change resolves its own
+/// ([`crate::streaming::plan_cells`], [`crate::atmosphere`]).
+fn has_lod_data(config: &EngineConfig, database: Option<&WorldDatabase>) -> bool {
+    database.is_some_and(|database| database.has_lod_for(config.worldspace_id))
+}
+
 fn camera_offset(config: &EngineConfig) -> Vec3 {
     if config.streaming_benchmark_route_speed.is_some() {
         Vec3::new(0.0, 6000.0, 0.0)
@@ -2801,10 +2813,15 @@ fn camera_offset(config: &EngineConfig) -> Vec3 {
         Vec3::new(0.0, 1200.0, 2500.0)
     }
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy injects the independent world startup resources."
+)]
 fn setup_world(
     mut commands: Commands,
     shot_output: Option<Res<ShotOutputImage>>,
     config: Res<EngineConfig>,
+    database: Option<Res<WorldDatabase>>,
     ground_height: Option<Res<InitialCameraGroundHeight>>,
     start_pose: Option<Res<crate::portal::StartPose>>,
     tuning: Option<Res<MovementTuning>>,
@@ -2819,7 +2836,10 @@ fn setup_world(
         camera_offset(&config)
     };
     let camera_position = target + camera_offset;
-    let far = camera_far_plane(config.stream_radius, config.effective_terrain_radius(false));
+    let far = camera_far_plane(
+        config.stream_radius,
+        config.effective_terrain_radius(has_lod_data(&config, database.as_deref())),
+    );
     let mut camera_transform = if config.interactive_world_physics() {
         Transform::from_translation(camera_position)
             .looking_at(camera_position + Vec3::NEG_Z, Vec3::Y)

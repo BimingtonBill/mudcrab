@@ -2699,6 +2699,7 @@ fn measure_portal_opens(
 struct DestinationAtmosphereState {
     destination: SpaceKey,
     lod_reach_bits: Option<u32>,
+    terrain_radius: i32,
 }
 
 /// Gives the portal camera the atmosphere of the space behind the doorway it is showing, and the
@@ -2725,7 +2726,8 @@ fn update_destination_atmosphere(
     policy: Option<Res<crate::swap_bridge::destination::RequiredHandoff>>,
     catalog: Option<Res<SpaceLightingCatalog>>,
     config: Option<Res<EngineConfig>>,
-    _database: Option<Res<WorldDatabase>>,
+    database: Option<Res<WorldDatabase>>,
+    cluster_terrain: Option<Res<crate::cluster::terrain::ClusterTerrain>>,
     horizon: Option<Res<LodHorizon>>,
     doors: Query<&LoadDoor>,
     mut camera: Query<
@@ -2780,9 +2782,18 @@ fn update_destination_atmosphere(
             .as_ref()
             .and_then(|horizon| horizon.reach_in(worldspace_id))
     });
+    let terrain_radius = destination_worldspace.map_or(config.terrain_radius, |worldspace_id| {
+        crate::atmosphere::ring_radius(
+            &config,
+            database.as_deref(),
+            cluster_terrain.as_deref(),
+            worldspace_id,
+        )
+    });
     let current = DestinationAtmosphereState {
         destination,
         lod_reach_bits: lod_reach.map(f32::to_bits),
+        terrain_radius,
     };
     if *applied != Some(current) {
         *applied = Some(current);
@@ -2800,7 +2811,7 @@ fn update_destination_atmosphere(
         *fog = crate::atmosphere::atmosphere_fog(
             &atmosphere,
             config.stream_radius,
-            config.effective_terrain_radius(false),
+            terrain_radius,
             lod_reach,
         );
         // And the colours the doorway's own dome is drawn with, from the same destination: this
@@ -14962,13 +14973,9 @@ mod tests {
         app.insert_resource(database);
         portal_shows(&mut app, Some(lod_new_door));
         update(&mut app, 2);
-        assert_eq!(
-            fog(&app, portal_camera),
-            (
-                cell * (stream_radius + 1) as f32,
-                cell * (terrain_radius + 1) as f32
-            ),
-            "inventory cannot fog out retained stand-ins before any horizon is known"
+        assert!(
+            fog(&app, portal_camera).0 > cell * (terrain_radius + 1) as f32,
+            "the fog no longer ends at the ring's edge in a worldspace that draws no ring"
         );
         assert_eq!(
             fog(&app, portal_camera),

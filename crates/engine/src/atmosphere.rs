@@ -673,6 +673,34 @@ pub(crate) fn atmosphere_fog(
 /// `space_lighting` row for it; with a row ([`space_atmosphere`]) the colours, the fog, the
 /// backdrop and the sun all come from the game's own records, and the constants here are what
 /// those records are scaled to and what a space without a row still falls back on.
+/// The ring fog and the far plane are measured from in `worldspace_id`: the one answer the
+/// camera's own space and the doorway's destination both use. An unnamed ring is off where the
+/// worldspace draws its own terrain LOD ([`EngineConfig::effective_terrain_radius`]); only a
+/// worldspace whose terrain cluster terrain owns keeps the configured ring, because that ring
+/// holds the reversible stand-ins the cluster plan can withdraw.
+pub(crate) fn ring_radius(
+    config: &EngineConfig,
+    database: Option<&WorldDatabase>,
+    cluster_terrain: Option<&crate::cluster::terrain::ClusterTerrain>,
+    worldspace_id: u32,
+) -> i32 {
+    let has_lod = database.is_some_and(|database| database.has_lod_for(worldspace_id));
+    let radius = config.effective_terrain_radius(has_lod);
+    let owned = config.cluster_terrain
+        && config.clusters.is_some()
+        && cluster_terrain.is_some_and(|terrain| {
+            terrain
+                .blocks
+                .iter()
+                .any(|block| block.worldspace_id == worldspace_id && !block.cells.is_empty())
+        });
+    if owned {
+        radius.max(config.terrain_radius)
+    } else {
+        radius
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_atmosphere(
     mut commands: Commands,
@@ -711,24 +739,12 @@ fn update_atmosphere(
     if cameras.is_empty() {
         return;
     }
-    let has_lod = database
-        .as_ref()
-        .is_some_and(|database| database.has_lod_for(active.worldspace_id));
-    let terrain_radius = config.effective_terrain_radius(has_lod);
-    // Only the cluster-owned inventory retains extra reversible LAND surfaces.
-    let cluster_owned_world = config.cluster_terrain
-        && config.clusters.is_some()
-        && cluster_terrain.as_ref().is_some_and(|terrain| {
-            terrain
-                .blocks
-                .iter()
-                .any(|block| block.worldspace_id == active.worldspace_id && !block.cells.is_empty())
-        });
-    let terrain_radius = if cluster_owned_world {
-        terrain_radius.max(config.terrain_radius)
-    } else {
-        terrain_radius
-    };
+    let terrain_radius = ring_radius(
+        &config,
+        database.as_deref(),
+        cluster_terrain.as_deref(),
+        active.worldspace_id,
+    );
     // Apply on the first frame that has a camera, then on every change of place. Starting inside
     // (--demo blackreach) never changes ActiveCell, so a change-only check left it in daylight.
     if *applied
