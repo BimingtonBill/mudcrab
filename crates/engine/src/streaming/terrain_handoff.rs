@@ -23,11 +23,11 @@ use bevy::{
     ecs::system::SystemParam,
     pbr::{
         LightEntity, PendingMeshMaterialQueues, PendingPrepassMeshMaterialQueues,
-        PendingShadowQueues, Shadow, Transmissive3d,
+        PendingShadowQueues, RenderMeshInstances, Shadow, Transmissive3d,
     },
     prelude::*,
     render::{
-        Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
+        Extract, ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems,
         render_phase::{ViewBinnedRenderPhases, ViewSortedRenderPhases},
         sync_world::MainEntity,
         view::{
@@ -106,21 +106,179 @@ struct Filters {
     active: Vec<Domain>,
 }
 
+/// Profiling inventory only: exact renderable native and compact LOD meshes. It carries no
+/// coverage, ancestry, ownership or stand-in state and never authorizes draw suppression.
+#[derive(Resource, Default)]
+struct LodDrawInventory {
+    resident: HashSet<MainEntity>,
+    meshes: HashMap<MainEntity, bevy::asset::AssetId<Mesh>>,
+    #[cfg(test)]
+    child_visits: usize,
+}
+
+#[derive(SystemParam)]
+struct LodDiagnosticInputs<'w, 's> {
+    native: Query<'w, 's, (&'static super::TerrainCoverage, &'static Children)>,
+    batches: Query<'w, 's, &'static Children, With<LodTerrainBatches>>,
+    meshes: Query<'w, 's, (&'static Mesh3d, Option<&'static InheritedVisibility>)>,
+}
+
+impl LodDrawInventory {
+    fn collect(&mut self, inputs: &LodDiagnosticInputs) {
+        self.resident.clear();
+        self.meshes.clear();
+        #[cfg(test)]
+        {
+            self.child_visits = 0;
+        }
+        // Validated native nodes have their primitive as an immediate child. Generated batches
+        // and compact source primitives are immediate children of their owning batching root.
+        // Neither join needs the terrain identity index or a hierarchy walk.
+        let children = inputs
+            .native
+            .iter()
+            .filter(|(coverage, _)| coverage.tier.is_some())
+            .map(|(_, children)| children)
+            .chain(inputs.batches.iter());
+        for children in children {
+            for entity in children.iter() {
+                #[cfg(test)]
+                {
+                    self.child_visits += 1;
+                }
+                if let Ok((mesh, visibility)) = inputs.meshes.get(entity) {
+                    self.resident.insert(entity.into());
+                    if visibility.is_some_and(|visibility| visibility.get()) {
+                        self.meshes.insert(entity.into(), mesh.0.id());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn extract_lod_inventory(mut out: ResMut<LodDrawInventory>, inputs: Extract<LodDiagnosticInputs>) {
+    perf_span!("terrain_lod::diagnostics::inventory");
+    out.collect(&inputs);
+}
+
+/// Actual extracted instances and queued entity memberships before terrain complement filtering.
+/// Membership counts deduplicate entities within each view/pass family. They do not count queue
+/// insertion attempts, mesh subdraws, or draw commands, and are collected only for profile output.
+#[derive(Resource, Default)]
+struct TerrainDrawCounts {
+    sampled: bool,
+    resident_lod: usize,
+    extracted_lod: usize,
+    queued_forward: usize,
+    queued_prepass: usize,
+    queued_shadow: usize,
+}
+
+fn publish_counts(mut main: ResMut<MainWorld>, counts: Res<TerrainDrawCounts>) {
+    if !counts.sampled {
+        return;
+    }
+    if let Some(mut metrics) = main.get_resource_mut::<super::StreamingMetrics>() {
+        metrics.terrain_lod_counts_measured = true;
+        metrics.extracted_terrain_lod_items = counts.extracted_lod;
+        metrics.queued_terrain_lod_forward_items = counts.queued_forward;
+        metrics.queued_terrain_lod_prepass_items = counts.queued_prepass;
+        metrics.queued_terrain_lod_shadow_items = counts.queued_shadow;
+    }
+    if let Some(mut profiler) = main.get_resource_mut::<crate::profiling::ProfilingState>() {
+        profiler.set_gauge(
+            "lod/resident_terrain_mesh_entities",
+            counts.resident_lod as f64,
+        );
+        profiler.set_gauge("lod/extracted_terrain_items", counts.extracted_lod as f64);
+        profiler.set_gauge(
+            "lod/queued_terrain_forward_items",
+            counts.queued_forward as f64,
+        );
+        profiler.set_gauge(
+            "lod/queued_terrain_prepass_items",
+            counts.queued_prepass as f64,
+        );
+        profiler.set_gauge(
+            "lod/queued_terrain_shadow_items",
+            counts.queued_shadow as f64,
+        );
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn collect_counts(
+    inventory: Res<LodDrawInventory>,
+    instances: Res<RenderMeshInstances>,
+    queued: crate::swap_bridge::systems::QueuePhases,
+    views: Query<(&ExtractedView, Has<LightEntity>)>,
+    mut counts: ResMut<TerrainDrawCounts>,
+) {
+    counts.sampled = true;
+    counts.resident_lod = inventory.resident.len();
+    counts.extracted_lod = inventory
+        .meshes
+        .iter()
+        .filter(|(main, mesh)| instances.mesh_asset_id(**main) == Some(**mesh))
+        .count();
+    counts.queued_forward = 0;
+    counts.queued_prepass = 0;
+    counts.queued_shadow = 0;
+    if inventory.meshes.is_empty() {
+        return;
+    }
+    let mut visited = HashSet::new();
+    for (view, is_shadow) in &views {
+        let key = view.retained_view_entity;
+        if !visited.insert((key, is_shadow)) {
+            continue;
+        }
+        if is_shadow {
+            let shadow = queued.shadow(&key);
+            counts.queued_shadow += inventory
+                .meshes
+                .keys()
+                .filter(|main| shadow.queued(**main))
+                .count();
+        } else {
+            let forward = queued.forward(&key);
+            let prepass = queued.prepass(&key);
+            for main in inventory.meshes.keys() {
+                counts.queued_forward += usize::from(forward.queued(*main));
+                counts.queued_prepass += usize::from(prepass.queued(*main));
+            }
+        }
+    }
+}
+
 pub(super) struct TerrainHandoffPlugin;
 impl Plugin for TerrainHandoffPlugin {
     fn build(&self, app: &mut App) {
+        let config = app.world().get_resource::<crate::config::EngineConfig>();
+        let profiling = config.is_some_and(|config| config.profile_output_dir.is_some());
         // Cluster package/terrain are startup options, not mutable graphics-menu controls.
         // Install no terrain complement systems when their owner is absent.
-        let enabled = app
-            .world()
-            .get_resource::<crate::config::EngineConfig>()
-            .is_some_and(|config| config.clusters.is_some() && config.cluster_terrain);
-        if !enabled {
-            return;
-        }
+        let enabled =
+            config.is_some_and(|config| config.clusters.is_some() && config.cluster_terrain);
         let Some(render) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
+        if profiling {
+            render
+                .init_resource::<TerrainDrawCounts>()
+                .init_resource::<LodDrawInventory>()
+                .add_systems(ExtractSchedule, (publish_counts, extract_lod_inventory))
+                .add_systems(
+                    Render,
+                    collect_counts
+                        .after(RenderSystems::Queue)
+                        .before(TerrainHandoffSystems::Filter),
+                );
+        }
+        if !enabled {
+            return;
+        }
         render
             .init_resource::<RenderTerrain>()
             .init_resource::<ClusterCoverage>()
@@ -663,6 +821,202 @@ mod tests {
         asset::AssetPlugin, camera::visibility::VisibilityPlugin, mesh::MeshPlugin,
         transform::TransformPlugin,
     };
+
+    fn scheduled_systems(
+        world: &mut World,
+        label: impl bevy::ecs::schedule::ScheduleLabel + Clone,
+    ) -> Vec<std::any::TypeId> {
+        if !world.resource::<Schedules>().contains(label.clone()) {
+            return Vec::new();
+        }
+        world.schedule_scope(label, |world, schedule| {
+            schedule.initialize(world).unwrap();
+            schedule
+                .systems()
+                .unwrap()
+                .map(|(_, system)| bevy::ecs::system::System::system_type(&**system))
+                .collect()
+        })
+    }
+
+    fn identity<M>(system: impl IntoSystem<(), (), M>) -> std::any::TypeId {
+        bevy::ecs::system::System::system_type(&IntoSystem::into_system(system))
+    }
+
+    #[test]
+    fn disabled_cluster_terrain_installs_no_handoff_systems_even_when_profiling() {
+        for clusters in [None, Some(String::new())] {
+            for profiling in [false, true] {
+                let mut app = App::new();
+                app.insert_resource(crate::config::EngineConfig {
+                    clusters: clusters.clone(),
+                    cluster_terrain: false,
+                    profile_output_dir: profiling.then(|| std::path::PathBuf::from("profile-test")),
+                    ..default()
+                });
+                let mut render = bevy::app::SubApp::new();
+                render.add_schedule(Render::base_schedule());
+                app.insert_sub_app(RenderApp, render);
+                app.add_plugins(TerrainHandoffPlugin);
+                let world = app.get_sub_app_mut(RenderApp).unwrap().world_mut();
+                let extracted = scheduled_systems(world, ExtractSchedule);
+                let rendered = scheduled_systems(world, Render);
+                assert!(!extracted.contains(&identity(extract)));
+                assert!(!rendered.contains(&identity(filter)));
+                assert!(!rendered.contains(&identity(restore)));
+                assert!(!world.contains_resource::<RenderTerrain>());
+                assert!(!world.contains_resource::<Filters>());
+                assert_eq!(
+                    extracted.contains(&identity(extract_lod_inventory)),
+                    profiling
+                );
+                assert_eq!(rendered.contains(&identity(collect_counts)), profiling);
+            }
+        }
+        // A stray terrain flag cannot activate the option without a cluster package.
+        let mut app = App::new();
+        app.insert_resource(crate::config::EngineConfig {
+            cluster_terrain: true,
+            ..default()
+        });
+        let mut render = bevy::app::SubApp::new();
+        render.add_schedule(Render::base_schedule());
+        app.insert_sub_app(RenderApp, render);
+        app.add_plugins(TerrainHandoffPlugin);
+        let world = app.get_sub_app_mut(RenderApp).unwrap().world_mut();
+        assert!(!scheduled_systems(world, ExtractSchedule).contains(&identity(extract)));
+        assert!(!scheduled_systems(world, Render).contains(&identity(filter)));
+    }
+
+    #[test]
+    fn enabled_cluster_terrain_installs_the_handoff_systems() {
+        let mut app = App::new();
+        app.insert_resource(crate::config::EngineConfig {
+            clusters: Some(String::new()),
+            cluster_terrain: true,
+            ..default()
+        });
+        let mut render = bevy::app::SubApp::new();
+        render.add_schedule(Render::base_schedule());
+        app.insert_sub_app(RenderApp, render);
+        app.add_plugins(TerrainHandoffPlugin);
+        let world = app.get_sub_app_mut(RenderApp).unwrap().world_mut();
+        assert!(scheduled_systems(world, ExtractSchedule).contains(&identity(extract)));
+        let rendered = scheduled_systems(world, Render);
+        assert!(rendered.contains(&identity(filter)));
+        assert!(rendered.contains(&identity(restore)));
+        assert!(world.contains_resource::<RenderTerrain>());
+        assert!(world.contains_resource::<Filters>());
+        assert!(!world.contains_resource::<LodDrawInventory>());
+    }
+
+    #[test]
+    fn profiling_inventory_visits_only_immediate_lod_children() {
+        let mut world = World::new();
+        for _ in 0..512 {
+            world.spawn((Mesh3d(Handle::default()), InheritedVisibility::VISIBLE));
+        }
+        let near = world
+            .spawn(super::super::TerrainCoverage {
+                grid: IVec2::ZERO,
+                quadrant: 0,
+                tier: None,
+            })
+            .id();
+        for _ in 0..64 {
+            world.spawn((
+                Mesh3d(Handle::default()),
+                InheritedVisibility::VISIBLE,
+                ChildOf(near),
+            ));
+        }
+        let native = world
+            .spawn(super::super::TerrainCoverage {
+                grid: IVec2::ZERO,
+                quadrant: 0,
+                tier: Some(shared::lod::LodTier::Tier4),
+            })
+            .id();
+        let primitive = world
+            .spawn((
+                Mesh3d(Handle::default()),
+                InheritedVisibility::VISIBLE,
+                ChildOf(native),
+            ))
+            .id();
+        world.spawn((
+            Mesh3d(Handle::default()),
+            InheritedVisibility::HIDDEN,
+            ChildOf(native),
+        ));
+        let mut state = bevy::ecs::system::SystemState::<LodDiagnosticInputs>::new(&mut world);
+        let mut inventory = LodDrawInventory::default();
+        inventory.collect(&state.get(&world).unwrap());
+        assert_eq!(inventory.child_visits, 2);
+        assert_eq!(
+            inventory.resident.len(),
+            2,
+            "inherited-hidden meshes remain resident"
+        );
+        assert_eq!(inventory.meshes.len(), 1);
+        assert!(inventory.meshes.contains_key(&primitive.into()));
+        assert!(!world.contains_resource::<RenderTerrain>());
+    }
+
+    #[test]
+    fn terrain_queue_counts_reach_the_benchmark_metrics() {
+        let mut main = MainWorld::default();
+        main.init_resource::<super::super::StreamingMetrics>();
+        main.init_resource::<crate::profiling::ProfilingState>();
+        let mut app = App::new();
+        app.insert_resource(main)
+            .insert_resource(TerrainDrawCounts {
+                sampled: true,
+                resident_lod: 9,
+                extracted_lod: 7,
+                queued_forward: 3,
+                queued_prepass: 2,
+                queued_shadow: 11,
+            })
+            .add_systems(Update, publish_counts);
+        app.update();
+        let metrics = app
+            .world()
+            .resource::<MainWorld>()
+            .resource::<super::super::StreamingMetrics>();
+        let report = serde_json::to_value(metrics).unwrap();
+        assert_eq!(report["terrain_lod_counts_measured"], true);
+        assert_eq!(report["extracted_terrain_lod_items"], 7);
+        assert_eq!(report["queued_terrain_lod_forward_items"], 3);
+        assert_eq!(report["queued_terrain_lod_prepass_items"], 2);
+        assert_eq!(report["queued_terrain_lod_shadow_items"], 11);
+        let main = app.world().resource::<MainWorld>();
+        let profiler = main.resource::<crate::profiling::ProfilingState>();
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::EngineConfig {
+            profile_output_dir: Some(directory.path().to_owned()),
+            ..default()
+        };
+        profiler
+            .write_bundle(
+                &config,
+                &serde_json::json!({}),
+                Some(metrics),
+                &crate::render::RendererMetrics::default(),
+                None,
+                None,
+            )
+            .unwrap();
+        let cpu_spans: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("cpu-spans.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cpu_spans["gauges"]["lod/resident_terrain_mesh_entities"],
+            9.0
+        );
+        assert_eq!(cpu_spans["gauges"]["lod/extracted_terrain_items"], 7.0);
+    }
 
     fn main(id: u32) -> MainEntity {
         Entity::from_raw_u32(id).unwrap().into()

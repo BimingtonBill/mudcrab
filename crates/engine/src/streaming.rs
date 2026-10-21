@@ -962,6 +962,16 @@ pub struct StreamingMetrics {
     /// Failed authored normal bindings rendered with the stock geometric-normal behavior.
     /// These do not disable collision or fail an otherwise valid terrain surface.
     pub terrain_normal_map_failures: u64,
+    /// Whether the profiling-only render collector has actually sampled these LOD counts.
+    pub terrain_lod_counts_measured: bool,
+    /// Actual render mesh instances for native terrain LOD, immutable batches and source fallbacks.
+    pub extracted_terrain_lod_items: usize,
+    /// Per-view forward queued entity memberships before terrain complement filtering.
+    pub queued_terrain_lod_forward_items: usize,
+    /// Per-view prepass queued entity memberships before terrain complement filtering.
+    pub queued_terrain_lod_prepass_items: usize,
+    /// Per-view shadow queued entity memberships before terrain complement filtering.
+    pub queued_terrain_lod_shadow_items: usize,
     /// Fixed placements represented by NIF-authored Havok shapes.
     pub static_colliders_authored: u64,
     /// Authored colliders that also contain shape families this extractor could not decode.

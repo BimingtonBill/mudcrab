@@ -212,7 +212,7 @@ fn graph_lap_value(sides: &CycleSides, column: &str) -> Option<String> {
 ///
 /// A name here that no system records yet — the portal's five, on a branch where portal.rs does not
 /// span them — still gets its column, and the column stays zero.
-const FRAME_SERIES_COLUMNS: [&str; 16] = [
+const FRAME_SERIES_COLUMNS: [&str; 21] = [
     "portal/isolate",
     "portal/colliders",
     "portal/update",
@@ -229,6 +229,11 @@ const FRAME_SERIES_COLUMNS: [&str; 16] = [
     "swap/drawn_this_frame",
     "swap/terrain_ready_not_drawn",
     "swap/in_camera_view_not_drawn",
+    "swap/live_holds",
+    "lod/extracted_terrain_items",
+    "lod/queued_terrain_forward_items",
+    "lod/queued_terrain_prepass_items",
+    "lod/queued_terrain_shadow_items",
 ];
 
 /// One column per [`FRAME_SERIES_COLUMNS`] entry, so the two cannot drift apart.
@@ -3220,7 +3225,9 @@ mod tests {
             "frame,real_ms,portal/isolate,portal/colliders,portal/update,portal/floor_probe,\
 portal/propagate,streaming/plan_cells,streaming/frame_commit,lod/collect,scene/spawn_batch,\
 lights/budget,physics/step,swap/waiting,swap/prepared_not_drawn,swap/drawn_this_frame,\
-swap/terrain_ready_not_drawn,swap/in_camera_view_not_drawn"
+swap/terrain_ready_not_drawn,swap/in_camera_view_not_drawn,swap/live_holds,\
+lod/extracted_terrain_items,lod/queued_terrain_forward_items,\
+lod/queued_terrain_prepass_items,lod/queued_terrain_shadow_items"
         );
         let column = |name: &str| frame_series_column(name).unwrap() + 2;
         let first: Vec<&str> = lines.next().unwrap().split(',').collect();
