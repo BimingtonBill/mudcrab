@@ -73,10 +73,12 @@ pub fn add_ordinary_animation_plugins(app: &mut App) {
         .resource::<crate::config::EngineConfig>()
         .interactive_world_physics()
     {
-        app.add_plugins((
-            ModelAnimationPlugin,
-            crate::door_animation::DoorAnimationPlugin,
-        ));
+        if !app.is_plugin_added::<ModelAnimationPlugin>() {
+            app.add_plugins(ModelAnimationPlugin);
+        }
+        if !app.is_plugin_added::<crate::door_animation::DoorAnimationPlugin>() {
+            app.add_plugins(crate::door_animation::DoorAnimationPlugin);
+        }
     }
 }
 
@@ -116,27 +118,44 @@ pub(crate) fn resolve_source_clips(
     mut commands: Commands,
     references: Query<(Entity, Option<&LoadDoor>, Option<&SourceClipBinding>), With<MeshHandle>>,
     children: Query<&Children>,
-    inventories: Query<&SourceClips>,
-    players: Query<(), With<AnimationPlayer>>,
+    parents: Query<&ChildOf>,
+    inventories: Query<Ref<SourceClips>>,
+    mut players: Query<(Option<&AnimationGraphHandle>, &mut AnimationPlayer)>,
     clips: Res<Assets<AnimationClip>>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
     invalid: Query<(), With<InvalidSourceClip>>,
 ) {
     for (reference, door, binding) in &references {
         if binding.is_some_and(|b| {
-            inventories.contains(b.source) && b.players.iter().all(|p| players.contains(*p))
+            inventories.get(b.source).is_ok_and(|i| !i.is_changed())
+                && parents.iter_ancestors(b.source).any(|e| e == reference)
+                && b.players.iter().all(|p| players.contains(*p))
         }) {
             continue;
+        }
+        if let Some(binding) = binding {
+            // The authored binding owns playback only while its graph is installed.
+            // Private adapters may have replaced it with a derived graph on this player.
+            if let Some(graph) = &binding.graph {
+                for player in &binding.players {
+                    if let Ok((Some(installed), mut playback)) = players.get_mut(*player)
+                        && installed.0 == *graph
+                    {
+                        playback.stop_all();
+                        commands
+                            .entity(*player)
+                            .try_remove::<AnimationGraphHandle>();
+                    }
+                }
+            }
+            commands
+                .entity(reference)
+                .try_remove::<(SourceClipBinding, IdleStarted)>();
         }
         let Some((source, inventory)) = children
             .iter_descendants(reference)
             .find_map(|e| inventories.get(e).ok().map(|i| (e, i)))
         else {
-            if binding.is_some() {
-                commands
-                    .entity(reference)
-                    .try_remove::<(SourceClipBinding, IdleStarted)>();
-            }
             continue;
         };
         let named = |wanted: &str, ignore_case: bool| {
@@ -275,6 +294,7 @@ mod tests {
             let mut app = App::new();
             app.init_resource::<GltfExtensionHandlers>()
                 .insert_resource(config);
+            add_ordinary_animation_plugins(&mut app);
             add_ordinary_animation_plugins(&mut app);
             assert_eq!(
                 app.is_plugin_added::<ModelAnimationPlugin>(),

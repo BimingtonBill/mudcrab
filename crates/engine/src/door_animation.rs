@@ -67,6 +67,7 @@ mod tests {
         animation::{
             AnimatedBy, AnimationPlugin, AnimationTargetId, animated_field,
             animation_curves::{AnimatableCurve, AnimatableKeyframeCurve},
+            graph::{AnimationGraph, AnimationGraphHandle},
         },
         gltf::extensions::GltfExtensionHandlers,
         time::TimeUpdateStrategy,
@@ -203,6 +204,161 @@ mod tests {
                 .elapsed()
                 > 0.15
         );
+    }
+    #[test]
+    fn same_source_inventory_change_withdraws_playback_until_replacement_is_ready() {
+        let mut app = app();
+        let door = door(&mut app);
+        let (player, _) = source(&mut app, door, "Open");
+        app.world_mut().write_message(OpenDoor { door });
+        app.update();
+        let old = app.world().get::<SourceClipBinding>(door).unwrap().clone();
+        assert!(
+            app.world()
+                .get::<AnimationPlayer>(player)
+                .unwrap()
+                .is_playing_animation(old.open.unwrap())
+        );
+        let clip = app
+            .world()
+            .resource::<Assets<AnimationClip>>()
+            .get(&app.world().get::<SourceClips>(player).unwrap().0[0].1)
+            .unwrap()
+            .clone();
+        let replacement = app
+            .world()
+            .resource::<Assets<AnimationClip>>()
+            .reserve_handle();
+        app.world_mut().get_mut::<SourceClips>(player).unwrap().0 =
+            vec![("Open".into(), replacement.clone())];
+        app.world_mut().write_message(OpenDoor { door });
+        app.update();
+        assert!(app.world().get::<SourceClipBinding>(door).is_none());
+        assert!(app.world().get::<AnimationGraphHandle>(player).is_none());
+        assert_eq!(
+            app.world()
+                .get::<AnimationPlayer>(player)
+                .unwrap()
+                .playing_animations()
+                .count(),
+            0
+        );
+        assert_eq!(app.world().resource::<PendingDoorOpens>().0, vec![door]);
+        app.world_mut()
+            .resource_mut::<Assets<AnimationClip>>()
+            .insert(replacement.id(), clip)
+            .unwrap();
+        app.update();
+        let binding = app.world().get::<SourceClipBinding>(door).unwrap();
+        assert_eq!(binding.source, player);
+        assert_ne!(binding.graph, old.graph);
+        assert!(
+            app.world()
+                .get::<AnimationPlayer>(player)
+                .unwrap()
+                .is_playing_animation(binding.open.unwrap())
+        );
+        assert!(app.world().resource::<PendingDoorOpens>().0.is_empty());
+    }
+    #[test]
+    fn same_source_becoming_static_releases_its_authored_graph_and_playback() {
+        let mut app = app();
+        let door = door(&mut app);
+        let (player, _) = source(&mut app, door, "Open");
+        app.world_mut().write_message(OpenDoor { door });
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<AnimationPlayer>(player)
+                .unwrap()
+                .playing_animations()
+                .count(),
+            1
+        );
+        app.world_mut()
+            .entity_mut(player)
+            .insert(SourceClips::default());
+        app.world_mut().write_message(OpenDoor { door });
+        app.update();
+        let binding = app.world().get::<SourceClipBinding>(door).unwrap();
+        assert_eq!(binding.source, player);
+        assert!(binding.graph.is_none() && binding.open.is_none() && binding.players.is_empty());
+        assert!(app.world().get::<AnimationGraphHandle>(player).is_none());
+        assert_eq!(
+            app.world()
+                .get::<AnimationPlayer>(player)
+                .unwrap()
+                .playing_animations()
+                .count(),
+            0
+        );
+        assert!(app.world().resource::<PendingDoorOpens>().0.is_empty());
+    }
+    #[test]
+    fn detached_source_withdraws_binding_and_only_stops_its_authored_graph() {
+        // A private adapter may replace the graph on the same player. Public cleanup
+        // must leave that graph and its playback alone when the source detaches.
+        for derived in [false, true] {
+            let mut app = app();
+            let door = door(&mut app);
+            let (player, leaf) = source(&mut app, door, "Open");
+            app.world_mut().write_message(OpenDoor { door });
+            app.update();
+            let binding = app.world().get::<SourceClipBinding>(door).unwrap().clone();
+            let graph = if derived {
+                let clip = app.world().get::<SourceClips>(player).unwrap().0[0]
+                    .1
+                    .clone();
+                let (graph, node) = AnimationGraph::from_clip(clip);
+                let graph = app
+                    .world_mut()
+                    .resource_mut::<Assets<AnimationGraph>>()
+                    .add(graph);
+                app.world_mut()
+                    .entity_mut(player)
+                    .insert(AnimationGraphHandle(graph.clone()));
+                app.world_mut()
+                    .get_mut::<AnimationPlayer>(player)
+                    .unwrap()
+                    .stop_all()
+                    .start(node);
+                graph
+            } else {
+                binding.graph.unwrap()
+            };
+            app.world_mut().entity_mut(player).remove::<ChildOf>();
+            app.world_mut().write_message(OpenDoor { door });
+            app.update();
+            assert!(app.world().get::<SourceClipBinding>(door).is_none());
+            assert_eq!(app.world().resource::<PendingDoorOpens>().0, vec![door]);
+            assert_eq!(
+                app.world()
+                    .get::<AnimationGraphHandle>(player)
+                    .map(|h| &h.0),
+                derived.then_some(&graph)
+            );
+            assert_eq!(
+                app.world()
+                    .get::<AnimationPlayer>(player)
+                    .unwrap()
+                    .playing_animations()
+                    .count(),
+                usize::from(derived)
+            );
+            let rotation = app.world().get::<Transform>(leaf).unwrap().rotation;
+            app.update();
+            if derived {
+                assert_ne!(
+                    app.world().get::<Transform>(leaf).unwrap().rotation,
+                    rotation
+                );
+            } else {
+                assert_eq!(
+                    app.world().get::<Transform>(leaf).unwrap().rotation,
+                    rotation
+                );
+            }
+        }
     }
     #[test]
     fn unload_discards_pending_and_only_inventory_proves_a_static_leaf() {
