@@ -401,6 +401,7 @@ fn swap_bridge(
     mut waiting: Local<Option<SystemState<WaitingSurfaces>>>,
     mut frame: Local<u32>,
     mut decisions: Local<Vec<SwapDecision>>,
+    mut forward_members: Local<systems::ForwardPhaseMembership>,
     mesh_allocator: Res<MeshAllocator>,
     render_meshes: Res<RenderAssets<RenderMesh>>,
     gpu_images: Res<RenderAssets<GpuImage>>,
@@ -413,6 +414,8 @@ fn swap_bridge(
     pipelines: Res<PipelineCache>,
     views: Query<(&ExtractedView, &RenderVisibleEntities)>,
 ) {
+    perf_span!("swap_bridge::extract::evaluate");
+    forward_members.clear();
     // The pipeline cache is created in the render world's `RenderStartup`; before it has run
     // nothing has been drawn, so there is nothing to confirm.
     let Some(specialized) = specialized else {
@@ -446,8 +449,8 @@ fn swap_bridge(
                 )
             };
             let facts = SwapSurfaceFacts {
-                pipeline_ok: mesh_instances.mesh_asset_id(MainEntity::from(entity))
-                    == Some(mesh.0.id())
+                pipeline_ok: swap_readiness(&facts) != SwapReadiness::Waiting
+                    && mesh_instances.mesh_asset_id(MainEntity::from(entity)) == Some(mesh.0.id())
                     && material_instances
                         .instances
                         .get(&MainEntity::from(entity))
@@ -458,6 +461,7 @@ fn swap_bridge(
                         &specialized,
                         &pipelines,
                         &phases,
+                        &mut forward_members,
                     ),
                 ..facts
             };
@@ -635,6 +639,7 @@ fn pipeline_resolved(
     specialized: &SpecializedMaterialPipelineCache,
     pipelines: &PipelineCache,
     phases: &systems::QueuePhases,
+    forward_members: &mut systems::ForwardPhaseMembership,
 ) -> bool {
     let mut seen = false;
     for (view, visible) in views.iter() {
@@ -642,9 +647,6 @@ fn pipeline_resolved(
             continue;
         }
         seen = true;
-        if !phases.forward(&view.retained_view_entity).queued(entity) {
-            return false;
-        }
         // The cheap half first: a view with no cache entry or no pipeline for the entity cannot
         // have drawn it, and costs one lookup each.
         let Some(cached) = specialized
@@ -658,6 +660,9 @@ fn pipeline_resolved(
             pipelines.get_render_pipeline_state(cached),
             CachedPipelineState::Ok(_)
         ) {
+            return false;
+        }
+        if !phases.forward_queued(view.retained_view_entity, entity, forward_members) {
             return false;
         }
     }

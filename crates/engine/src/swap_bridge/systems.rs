@@ -241,6 +241,12 @@ fn visible_meshes(visible: &RenderVisibleEntities) -> impl Iterator<Item = MainE
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    // Per-thread so independent test cases cannot disturb the work assertion.
+    static FORWARD_PHASE_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// The entities one render phase of one view holds right now: the batchable and unbatchable bins,
 /// the multidrawable batch sets (through the read-only accessor the vendored `bevy_render` adds) and
 /// the sorted items. An entity absent from all of them is not queued, whatever else the phase holds.
@@ -250,22 +256,33 @@ pub(crate) struct PhaseMembers {
 }
 
 impl PhaseMembers {
+    fn extend(&mut self, entities: impl IntoIterator<Item = MainEntity>) {
+        #[cfg(test)]
+        let entities = entities.into_iter().inspect(|_| {
+            FORWARD_PHASE_WORK.with(|work| {
+                let (builds, visits) = work.get();
+                work.set((builds, visits + 1));
+            });
+        });
+        self.entities.extend(entities);
+    }
+
     fn of_binned<BPI: BinnedPhaseItem>(phase: Option<&BinnedRenderPhase<BPI>>) -> Self {
         let mut members = Self::default();
         let Some(phase) = phase else {
             return members;
         };
         for bin in phase.batchable_meshes.values() {
-            members.entities.extend(bin.entities().keys().copied());
+            members.extend(bin.entities().keys().copied());
         }
         for bin in phase.unbatchable_meshes.values() {
-            members.entities.extend(bin.entities.keys().copied());
+            members.extend(bin.entities.keys().copied());
         }
         for set in phase.multidrawable_meshes.values() {
-            members.entities.extend(set.entities());
+            members.extend(set.entities());
         }
         for bin in phase.non_mesh_items.values() {
-            members.entities.extend(bin.entities.keys().copied());
+            members.extend(bin.entities.keys().copied());
         }
         members
     }
@@ -273,9 +290,7 @@ impl PhaseMembers {
     fn of_sorted<SPI: SortedPhaseItem>(phase: Option<&SortedRenderPhase<SPI>>) -> Self {
         let mut members = Self::default();
         if let Some(phase) = phase {
-            members
-                .entities
-                .extend(phase.items.keys().map(|(_, main)| *main));
+            members.extend(phase.items.keys().map(|(_, main)| *main));
         }
         members
     }
@@ -287,6 +302,29 @@ impl PhaseMembers {
     /// Whether `main` is queued in one of the phases.
     pub(crate) fn queued(&self, main: MainEntity) -> bool {
         self.entities.contains(&main)
+    }
+}
+
+/// Per-extract forward membership, populated only for views with a ready waiting surface.
+/// The bridge clears this before reading each render frame; a retained view key must never
+/// carry membership over a queue withdrawal. Each requested view is enumerated once.
+#[derive(Default)]
+pub(crate) struct ForwardPhaseMembership {
+    views: HashMap<RetainedViewEntity, PhaseMembers>,
+}
+
+impl ForwardPhaseMembership {
+    pub(crate) fn clear(&mut self) {
+        self.views.clear();
+    }
+
+    fn queued_with(
+        &mut self,
+        view: RetainedViewEntity,
+        main: MainEntity,
+        build: impl FnOnce() -> PhaseMembers,
+    ) -> bool {
+        self.views.entry(view).or_insert_with(build).queued(main)
     }
 }
 
@@ -305,6 +343,11 @@ pub(crate) struct QueuePhases<'w> {
 impl QueuePhases<'_> {
     /// What the view's main (forward) phases hold.
     pub(crate) fn forward(&self, view: &RetainedViewEntity) -> PhaseMembers {
+        #[cfg(test)]
+        FORWARD_PHASE_WORK.with(|work| {
+            let (builds, visits) = work.get();
+            work.set((builds + 1, visits));
+        });
         let mut members = PhaseMembers::of_binned(self.opaque.as_ref().and_then(|p| p.get(view)));
         members.merge(PhaseMembers::of_binned(
             self.alpha_mask.as_ref().and_then(|p| p.get(view)),
@@ -316,6 +359,19 @@ impl QueuePhases<'_> {
             self.transparent.as_ref().and_then(|p| p.get(view)),
         ));
         members
+    }
+
+    /// Exact forward membership without rebuilding the view's index for every surface.
+    pub(crate) fn forward_queued(
+        &self,
+        view: RetainedViewEntity,
+        main: MainEntity,
+        cache: &mut ForwardPhaseMembership,
+    ) -> bool {
+        cache.queued_with(view, main, || {
+            perf_span!("swap_bridge::forward_membership::build");
+            self.forward(&view)
+        })
     }
 
     /// What the view's prepass phases hold.
@@ -838,6 +894,89 @@ mod tests {
         let mut merged = members(&[1]);
         merged.merge(members(&[5]));
         assert!(merged.queued(main_entity(5)) && !merged.queued(main_entity(6)));
+    }
+
+    #[test]
+    fn many_waiting_surfaces_enumerate_forward_members_once_per_view_and_frame() {
+        use bevy::{
+            core_pipeline::core_3d::{Opaque3dBatchSetKey, Opaque3dBinKey},
+            render::{
+                batching::gpu_preprocessing::GpuPreprocessingMode,
+                mesh::allocator::MeshSlabs,
+                render_phase::{BinnedRenderPhaseType, DrawFunctionId, InputUniformIndex},
+            },
+        };
+        let mut cache = ForwardPhaseMembership::default();
+        let view = RetainedViewEntity::new(main_entity(1000), None, 0);
+        let mut phases = ViewBinnedRenderPhases::<Opaque3d>::default();
+        phases.prepare_for_new_frame(view, GpuPreprocessingMode::None);
+        let phase = phases.get_mut(&view).unwrap();
+        let batch_key = Opaque3dBatchSetKey {
+            pipeline: CachedRenderPipelineId::INVALID,
+            draw_function: DrawFunctionId(0),
+            material_bind_group_index: None,
+            slabs: MeshSlabs::default(),
+            lightmap_slab: None,
+        };
+        let bin_key = Opaque3dBinKey {
+            asset_id: Handle::<Mesh>::default().id().untyped(),
+        };
+        for entity in 1..=512 {
+            phase.add(
+                batch_key.clone(),
+                bin_key.clone(),
+                (Entity::PLACEHOLDER, main_entity(entity)),
+                InputUniformIndex::default(),
+                BinnedRenderPhaseType::NonMesh,
+            );
+        }
+        let mut world = World::new();
+        world.insert_resource(phases);
+        let mut state = bevy::ecs::system::SystemState::<QueuePhases>::new(&mut world);
+        FORWARD_PHASE_WORK.with(|work| work.set((0, 0)));
+        {
+            let queues = state.get(&world).unwrap();
+            for waiting in 1..=256 {
+                assert!(queues.forward_queued(view, main_entity(waiting), &mut cache));
+            }
+        }
+        // These counts come from the production forward builder and phase visitor.
+        FORWARD_PHASE_WORK.with(|work| assert_eq!(work.get(), (1, 512)));
+        cache.clear();
+        world
+            .resource_mut::<ViewBinnedRenderPhases<Opaque3d>>()
+            .get_mut(&view)
+            .unwrap()
+            .remove(main_entity(1));
+        {
+            let queues = state.get(&world).unwrap();
+            assert!(!queues.forward_queued(view, main_entity(1), &mut cache));
+        }
+        FORWARD_PHASE_WORK.with(|work| assert_eq!(work.get(), (2, 1023)));
+        cache.clear();
+        // A populated world with no waiting surfaces performs no lazy lookup or enumeration.
+        let _queues = state.get(&world).unwrap();
+        assert!(cache.views.is_empty());
+        FORWARD_PHASE_WORK.with(|work| assert_eq!(work.get(), (2, 1023)));
+    }
+
+    #[test]
+    fn cached_forward_membership_is_separate_for_each_retained_view() {
+        let mut cache = ForwardPhaseMembership::default();
+        let first = RetainedViewEntity::new(main_entity(1000), None, 0);
+        let second = RetainedViewEntity::new(main_entity(1001), None, 0);
+        assert!(cache.queued_with(first, main_entity(1), || members(&[1])));
+        assert!(!cache.queued_with(second, main_entity(1), || members(&[2])));
+        assert!(cache.queued_with(second, main_entity(2), || panic!("view already indexed")));
+    }
+
+    #[test]
+    fn idle_forward_membership_does_not_enumerate_any_view() {
+        let mut cache = ForwardPhaseMembership::default();
+        for _ in 0..32 {
+            cache.clear();
+            assert!(cache.views.is_empty());
+        }
     }
 
     #[test]
