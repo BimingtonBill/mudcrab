@@ -220,10 +220,8 @@ fn read_primitive(
             "stock native depth material requires the sorted color pass",
         ))
     } else {
-        // The draw uses the stock StandardMaterial fragment shader and the exact same
-        // material handle. Metadata for effects absent from stock is not a refusal;
-        // stock-supported emission is evaluated by that shared fragment shader.
-        None
+        unsupported_feature(material, family)
+            .map(|feature| Reject::new(RejectReason::UnsupportedMaterialFeature, feature))
     };
     let baked_ok =
         structural.is_none() && alpha != AlphaMode::Blend && !effect && !skinned && !non_rendering;
@@ -239,6 +237,44 @@ fn read_primitive(
         reject,
         baked_ok,
     }
+}
+
+// Admission requires stock-versus-cluster captures with maximum RGB error <= 2/255.
+// A05 certifies ordinary cutout, directx normal maps and shadows only. Shared material
+// handles alone do not prove parity for these additional shader features.
+fn unsupported_feature(material: &Value, family: Option<&str>) -> Option<String> {
+    if family != Some("lighting") {
+        return Some(format!("shaderFamily {}", family.unwrap_or("none")));
+    }
+    let lighting_type = material
+        .pointer("/extras/openSkyrim/lightingShaderType")
+        .and_then(Value::as_str);
+    if let Some(kind) = lighting_type.filter(|kind| *kind != "default") {
+        return Some(format!("lightingShaderType {kind}"));
+    }
+    // Only the directx-convention tangent-space normal map is shaded the way the stock path
+    // does it; a model-space normal map would shade wrongly once node transforms are baked in.
+    if let Some(convention) = material
+        .pointer("/extras/openSkyrim/normalConvention")
+        .and_then(Value::as_str)
+        .filter(|convention| *convention != "directx")
+    {
+        return Some(format!("normalConvention {convention}"));
+    }
+    for flag in ["premultipliedAlpha", "screenDoorAlphaFade"] {
+        let pointer = format!("/extensions/OPEN_SKYRIM_material/{flag}");
+        if material.pointer(&pointer).and_then(Value::as_bool) == Some(true) {
+            return Some(flag.to_owned());
+        }
+    }
+    if material.get("emissiveTexture").is_some() {
+        return Some("emissive texture".into());
+    }
+    let emissive = material
+        .get("emissiveFactor")
+        .and_then(Value::as_array)
+        .is_some_and(|factor| factor.iter().any(|v| v.as_f64().is_some_and(|v| v > 0.0)));
+    emissive.then(|| "emissive factor".into())
 }
 
 fn stock_requires_sorted_depth(material: &Value, alpha: AlphaMode) -> bool {
@@ -424,6 +460,60 @@ mod tests {
             facts.texture_paths.iter().collect::<Vec<_>>(),
             ["meshes/textures/a/diffuse.ktx2"]
         );
+    }
+
+    #[test]
+    fn unproven_material_features_remain_refused() {
+        use serde_json::json;
+        let ordinary = json!({"extras": {"openSkyrim": {
+            "shaderFamily": "lighting", "lightingShaderType": "default",
+            "normalConvention": "directx"
+        }}, "alphaMode": "MASK"});
+        assert_eq!(unsupported_feature(&ordinary, Some("lighting")), None);
+        for kind in [
+            "environment_map",
+            "multi_layer_parallax",
+            "parallax",
+            "skin_tint",
+            "glow",
+        ] {
+            let mut material = ordinary.clone();
+            material["extras"]["openSkyrim"]["lightingShaderType"] = json!(kind);
+            assert_eq!(
+                unsupported_feature(&material, Some("lighting")),
+                Some(format!("lightingShaderType {kind}"))
+            );
+        }
+        for (pointer, value, reason) in [
+            ("/emissiveTexture", json!({"index": 0}), "emissive texture"),
+            ("/emissiveFactor", json!([0.1, 0.0, 0.0]), "emissive factor"),
+            (
+                "/extras/openSkyrim/normalConvention",
+                json!("opengl"),
+                "normalConvention opengl",
+            ),
+        ] {
+            let mut material = ordinary.clone();
+            if pointer == "/emissiveTexture" {
+                material["emissiveTexture"] = value;
+            } else if pointer == "/emissiveFactor" {
+                material["emissiveFactor"] = value;
+            } else {
+                *material.pointer_mut(pointer).unwrap() = value;
+            }
+            assert_eq!(
+                unsupported_feature(&material, Some("lighting")),
+                Some(reason.into())
+            );
+        }
+        for flag in ["premultipliedAlpha", "screenDoorAlphaFade"] {
+            let mut material = ordinary.clone();
+            material["extensions"]["OPEN_SKYRIM_material"][flag] = json!(true);
+            assert_eq!(
+                unsupported_feature(&material, Some("lighting")),
+                Some(flag.into())
+            );
+        }
     }
 
     fn point(position: [f32; 3], normal: [f32; 3]) -> PrimitiveGeometry {

@@ -897,7 +897,7 @@ fn scripts_on_either_reference_or_base_prevent_cluster_replacement() {
 }
 
 #[test]
-fn plain_pbr_shader_metadata_and_emission_keep_the_source_material_identity() {
+fn unproven_shader_features_are_refused_without_losing_source_material_identity() {
     let bytes = grid_glb(false, None);
     let source = gltf::Gltf::from_slice(&bytes).unwrap();
     let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
@@ -922,7 +922,11 @@ fn plain_pbr_shader_metadata_and_emission_keep_the_source_material_identity() {
         )
         .unwrap();
         assert_eq!(loaded.len(), 1);
-        assert!(loaded[0].reject.is_none(), "{kind}: {:?}", loaded[0].reject);
+        assert_eq!(
+            loaded[0].reject.as_ref().unwrap().reason,
+            converter::cluster::model::RejectReason::UnsupportedMaterialFeature,
+            "{kind}"
+        );
         assert_eq!(loaded[0].material_key, facts.materials[&0].material_key);
         material_document["materials"][0]["extras"]["openSkyrim"]["shaderFlags1"] =
             json!(shared::material_depth::DEPTH_TEST | shared::material_depth::DECAL);
