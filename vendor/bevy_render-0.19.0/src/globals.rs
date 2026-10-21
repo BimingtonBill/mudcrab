@@ -50,9 +50,17 @@ pub struct GlobalsUniform {
     /// Frame count since the start of the app.
     /// It wraps to zero when it reaches the maximum value of a u32.
     frame_count: u32,
-    /// WebGL2 structs must be 16 byte aligned.
-    #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
-    _webgl2_padding: f32,
+    /// Nonwrapping time for animations whose phase cannot repeat at the clock wrap.
+    /// Occupies the fourth word; the Globals uniform remains 16-byte aligned.
+    time_unwrapped: f32,
+}
+
+impl GlobalsUniform {
+    fn update_time(&mut self, time: &Time) {
+        self.time = time.elapsed_secs_wrapped();
+        self.time_unwrapped = time.elapsed_secs();
+        self.delta_time = time.delta_secs();
+    }
 }
 
 /// The buffer containing the [`GlobalsUniform`]
@@ -69,11 +77,37 @@ fn prepare_globals_buffer(
     frame_count: Res<FrameCount>,
 ) {
     let buffer = globals_buffer.buffer.get_mut();
-    buffer.time = time.elapsed_secs_wrapped();
-    buffer.delta_time = time.delta_secs();
+    buffer.update_time(&time);
     buffer.frame_count = frame_count.0;
 
     globals_buffer
         .buffer
         .write_buffer(&render_device, &render_queue);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonwrapping_animation_time_crosses_both_previous_water_wrap_boundaries() {
+        for seconds in [3600, 12 * 3600] {
+            let mut time = Time::default();
+            let mut globals = GlobalsUniform::default();
+            time.set_wrap_period(core::time::Duration::from_secs(seconds));
+            time.advance_by(
+                core::time::Duration::from_secs(seconds) - core::time::Duration::from_millis(16),
+            );
+            globals.update_time(&time);
+            let before = globals.time_unwrapped;
+            time.advance_by(core::time::Duration::from_millis(32));
+            globals.update_time(&time);
+            let after = globals.time_unwrapped;
+            assert!(globals.time < 1.0);
+            assert!((after - before - 0.032).abs() < 0.004);
+            // The animation phase continues instead of resetting with globals.time.
+            let phase = |t: f32| (t * 0.15 * 0.8).cos();
+            assert!((phase(after) - phase(before)).abs() < 0.005);
+        }
+    }
 }

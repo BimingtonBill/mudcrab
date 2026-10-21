@@ -33,7 +33,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     let scale = water.wave_scale_speed_strength.x;
     // The shared view clock: no per-material time, so the material is never rewritten per frame.
-    let time = select(globals.time, water.clock.x, water.clock.y > 0.5);
+    let time = select(globals.time_unwrapped, water.clock.x, water.clock.y > 0.5);
     let phase = time * water.wave_scale_speed_strength.y;
     let strength = water.wave_scale_speed_strength.z;
     let p = in.world_position.xz * scale + water.flow_direction.xy * phase;

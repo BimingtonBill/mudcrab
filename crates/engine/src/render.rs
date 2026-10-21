@@ -70,7 +70,6 @@ pub const PLACED_OBJECT_LAYER: Layer = 2;
 pub const MAIN_VIEW_LAYERS: &[Layer] = &[WORLD_LAYER, WATER_LAYER, PLACED_OBJECT_LAYER];
 
 /// What the water reflection camera draws.
-/// Period after which `globals.time`, the clock the water waves read, wraps back to zero.
 ///
 /// Vanilla Skyrim builds its water reflection from the LOD world - LOD land, LOD objects and LOD
 /// trees - plus the sky, selected by the `[Water]` settings `bReflectLODLand`, `bReflectLODObjects`,
@@ -108,12 +107,6 @@ pub fn light_render_layers() -> (RenderLayers, PropagateOver<RenderLayers>) {
 pub const PLACED_OBJECT_RENDER_LAYERS: RenderLayers = RenderLayers::layer(PLACED_OBJECT_LAYER);
 
 /// Registers the propagation of [`PLACED_OBJECT_RENDER_LAYERS`] down reference hierarchies.
-/// This is applied to Bevy's `Time<Virtual>` wrap period, so it changes the wrap engine-wide, from
-/// Bevy's default of 1 hour to 12 hours, for everything that reads `elapsed_wrapped` or the
-/// `globals` uniform's `time`, not only the water. The water's wave phase is not periodic over any
-/// wrap period, so every wrap is a one-off visible jump of the waves; 12 hours makes it rare, while
-/// f32 still resolves about 4 ms at that magnitude, no worse than the unwrapped clock the water used
-/// before. Nothing else in the engine reads the wrapped clock.
 ///
 /// A reference entity is spawned in `streaming::spawn_cell` and the meshes it draws arrive later as
 /// descendants from the converted glb, so `RenderLayers` on the reference alone would not reach
@@ -128,25 +121,12 @@ pub fn add_placed_object_layer_propagation(app: &mut App) {
             PropagateSet::<RenderLayers>::default().before(VisibilitySystems::CheckVisibility),
         );
 }
-/// TEMPORARY. A wrap-safe drive is a follow-up, for example one shared time buffer for all water
-/// materials, written once a frame and not wrapped; until then each wrap is one visible jump of the
-/// waves.
-const WATER_CLOCK_WRAP_PERIOD: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
-
 pub struct VercidiumRendererPlugin;
 
 impl Plugin for VercidiumRendererPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/terrain.wgsl");
         embedded_asset!(app, "shaders/water.wgsl");
-        // The water shader reads Bevy's shared `globals.time`, which is the virtual clock wrapped
-        // to this period (one hour by default). The wave phase is not periodic over the wrap, so
-        // every wrap is a one-off jump of the wave pattern; a longer period makes that rare while
-        // f32 still resolves far below a frame at this magnitude (about 4 ms at 12 hours, the same
-        // loss the unwrapped clock had before).
-        app.world_mut()
-            .get_resource_or_init::<Time<Virtual>>()
-            .set_wrap_period(WATER_CLOCK_WRAP_PERIOD);
         app.add_plugins((
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
@@ -778,7 +758,7 @@ impl WaterExtension {
 impl WaterExtension {
     /// Pins this water's animation clock to a fixed time instead of the shared clock.
     ///
-    /// The waves otherwise read `globals.time` in the shader, the one clock Bevy uploads once a
+    /// The waves otherwise read `globals.time_unwrapped` in the shader, the one clock Bevy uploads once a
     /// frame for every view, so the material itself never changes while time advances and Bevy does
     /// not re-prepare its bind group every frame. A pinned clock is for scenes that need a
     /// reproducible still, such as the terrain/water fixture.
@@ -1878,12 +1858,14 @@ mod tests {
             .resource::<Assets<WaterMaterial>>()
             .get(&handle)
             .unwrap();
-        // Bevy uploads this wrapped clock through globals. Material time stays untouched.
+        // The shared nonwrapping clock advances; material time stays untouched.
         assert_eq!(app.world().resource::<Time>().elapsed_secs_wrapped(), 2.0);
         assert_eq!(material.extension.settings.clock.y, 0.0);
         assert_eq!(material.extension.settings.wave_scale_speed_strength.w, 0.0);
         let shader = include_str!("shaders/water.wgsl");
-        assert!(shader.contains("select(globals.time, water.clock.x, water.clock.y > 0.5)"));
+        assert!(
+            shader.contains("select(globals.time_unwrapped, water.clock.x, water.clock.y > 0.5)")
+        );
         assert!(shader.contains("let phase = time * water.wave_scale_speed_strength.y;"));
     }
 
