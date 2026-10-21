@@ -36,7 +36,11 @@ mod source_fallback_bridge;
 
 #[path = "candidate_worlds.rs"]
 mod candidate_worlds;
+#[path = "source_index.rs"]
+mod source_index;
 use candidate_worlds::{CandidateInputs, CandidateWorlds, candidate_worlds};
+
+type StockMeshCandidate = (AssetId<Mesh>, MainEntity);
 
 #[derive(Resource, Default)]
 pub(super) struct Sources {
@@ -59,6 +63,16 @@ pub(super) struct Sources {
     expected_primitives: HashMap<u32, BTreeSet<u32>>,
     seen_roots: HashMap<Entity, BTreeSet<u32>>,
     qualification_refreshes: u64,
+    /// Candidate dependencies include duplicate ordinals: invalidating one duplicate can
+    /// make its remaining sibling uniquely bindable. Rebuilt only with ECS proof.
+    stock_meshes: HashMap<AssetId<Mesh>, HashSet<(u32, u32)>>,
+    stock_candidates: HashMap<(u32, u32), Vec<StockMeshCandidate>>,
+    stock_members: HashMap<u32, Vec<MainEntity>>,
+    proof_keys: HashMap<u32, HashSet<(u32, u32)>>,
+    template_meshes: TemplateMeshDependencies,
+    last_work: SourceExtractionWork,
+    #[cfg(test)]
+    force_full: bool,
     terrain: Arc<HashMap<MainEntity, crate::streaming::TerrainPrimitiveIdentity>>,
     /// Raw main-world eligibility, independent of frustum/ViewVisibility and GPU
     /// preparation. Withdrawing an old visible source revokes prior stock proof.
@@ -84,18 +98,138 @@ pub(super) struct Sources {
     /// Which batches each cached material and template decision was made for, so a cache entry an
     /// asset event drops sends exactly those batches back through [`template_row`].
     template_rows: TemplateRows,
+    template_inputs: Vec<(
+        Option<bevy::asset::UntypedAssetId>,
+        Option<AssetId<WorldAsset>>,
+    )>,
+}
+
+/// Dependencies belong to the loaded template, including every mesh of a refused template.
+/// Collect them independently of validation; otherwise an early refusal hides dependencies.
+#[derive(Default)]
+struct TemplateMeshDependencies {
+    by_scene: HashMap<AssetId<WorldAsset>, HashSet<AssetId<Mesh>>>,
+    by_mesh: HashMap<AssetId<Mesh>, HashSet<AssetId<WorldAsset>>>,
+}
+
+impl TemplateMeshDependencies {
+    fn register(&mut self, scene: AssetId<WorldAsset>, asset: &WorldAsset) {
+        self.remove(scene);
+        let meshes: HashSet<_> = asset
+            .world
+            .try_query::<&Mesh3d>()
+            .map(|mut query| query.iter(&asset.world).map(|mesh| mesh.0.id()).collect())
+            .unwrap_or_default();
+        for &mesh in &meshes {
+            self.by_mesh.entry(mesh).or_default().insert(scene);
+        }
+        self.by_scene.insert(scene, meshes);
+    }
+
+    fn remove(&mut self, scene: AssetId<WorldAsset>) {
+        if let Some(meshes) = self.by_scene.remove(&scene) {
+            for mesh in meshes {
+                if let Some(scenes) = self.by_mesh.get_mut(&mesh) {
+                    scenes.remove(&scene);
+                    if scenes.is_empty() {
+                        self.by_mesh.remove(&mesh);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Work actually done in one extraction, separate from the invalidation event counts.
+/// Kept in all builds so tests and ordinary INFO logs attribute work without Tracy.
+#[derive(Clone, Copy, Debug, Default)]
+struct SourceExtractionWork {
+    scene_events: u64,
+    material_events: u64,
+    mesh_modified: u64,
+    mesh_removed: u64,
+    scene_modified: u64,
+    scene_removed: u64,
+    stock_rows_revoked: u64,
+    stock_rows_requalified: u64,
+    roots_scanned: u64,
+    meshes_scanned: u64,
+    primitives_scanned: u64,
+    template_rows: u64,
+    qualification_full: bool,
+    affected_references: u64,
+    journal_entities: u64,
+    journal_events: u64,
+    journal_complete: bool,
+    retired_proof_keys_visited: u64,
+    subjects_updated: u64,
+    ancestry_edges: u64,
+    discovery_roots: u64,
+    discovery_meshes: u64,
+    indexed_subjects: u64,
+    indexed_nodes: u64,
+    indexed_reference_groups: u64,
+}
+
+// The caller supplies one affected reference's proof keys, never the global map.
+fn retired_reference_proof(
+    keys: Option<&HashSet<(u32, u32)>>,
+    stock: &HashMap<(u32, u32), MainEntity>,
+    work: &mut SourceExtractionWork,
+) -> (HashSet<MainEntity>, BTreeSet<u32>) {
+    let mut proven = HashSet::new();
+    let mut instantiated = BTreeSet::new();
+    if let Some(keys) = keys {
+        for key in keys {
+            work.retired_proof_keys_visited += 1;
+            if let Some(&entity) = stock.get(key) {
+                proven.insert(entity);
+                instantiated.insert(key.1);
+            }
+        }
+    }
+    (proven, instantiated)
 }
 
 /// The batches behind each cache entry [`template_row`] reads, and those it could not settle yet.
 #[derive(Default)]
 struct TemplateRows {
-    /// Every batch must be decided again (first pass, new handles, a new certificate, an
-    /// invalidated mesh, or a scope reset).
+    /// Every batch must be decided again (first pass, new handles, a new certificate,
+    /// or a scope reset). Mesh events instead use template -> mesh dependencies.
     stale: bool,
     by_material: HashMap<bevy::asset::UntypedAssetId, BTreeSet<u32>>,
     by_scene: HashMap<AssetId<WorldAsset>, BTreeSet<u32>>,
     /// Batches whose material or template asset is still loading: decided again every frame.
     pending: BTreeSet<u32>,
+}
+
+impl TemplateRows {
+    fn remove(
+        &mut self,
+        index: u32,
+        input: (
+            Option<bevy::asset::UntypedAssetId>,
+            Option<AssetId<WorldAsset>>,
+        ),
+    ) {
+        self.pending.remove(&index);
+        if let Some(id) = input.0
+            && let Some(rows) = self.by_material.get_mut(&id)
+        {
+            rows.remove(&index);
+            if rows.is_empty() {
+                self.by_material.remove(&id);
+            }
+        }
+        if let Some(id) = input.1
+            && let Some(rows) = self.by_scene.get_mut(&id)
+        {
+            rows.remove(&index);
+            if rows.is_empty() {
+                self.by_scene.remove(&id);
+            }
+        }
+    }
 }
 
 /// One batch's template decision: whether its material needs tangents, whether its source
@@ -116,6 +250,7 @@ struct TemplateCaches<'a> {
         super::super::material_geometry::GeometryRequirements,
     >,
     templates: &'a mut HashMap<AssetId<WorldAsset>, bool>,
+    template_meshes: &'a mut TemplateMeshDependencies,
     invalid_templates: &'a HashSet<AssetId<WorldAsset>>,
     invalid_meshes: &'a HashSet<AssetId<Mesh>>,
     rows: &'a mut TemplateRows,
@@ -178,7 +313,8 @@ fn template_row(
             let valid = asset.is_some_and(|asset| template_valid(asset, caches.invalid_meshes));
             // An absent/loading template must be retried; only a loaded
             // asset has an event-scoped result that can be retained.
-            if asset.is_some() {
+            if let Some(asset) = asset {
+                caches.template_meshes.register(source.id(), asset);
                 caches.templates.insert(source.id(), valid);
             } else {
                 row.pending = true;
@@ -250,6 +386,68 @@ fn collect_terrain_visibility(
 }
 
 impl Sources {
+    /// Mesh invalidity is sticky in the existing certification contract. Reclassify exactly
+    /// the affected ordinals, including a duplicate becoming uniquely bindable.
+    /// No root/presence/primitive query is needed. Keep the old snapshot until candidate_worlds
+    /// has compared it with the new one, just like ordinary qualification.
+    fn invalidate_stock_meshes(
+        &mut self,
+        meshes: &HashSet<AssetId<Mesh>>,
+        work: &mut SourceExtractionWork,
+    ) -> Option<QualifiedFacts> {
+        let affected: HashSet<_> = meshes
+            .iter()
+            .filter_map(|mesh| self.stock_meshes.remove(mesh))
+            .flatten()
+            .collect();
+        if affected.is_empty() {
+            return None;
+        }
+        let mut facts = QualifiedFacts {
+            present: self.present.clone(),
+            retired_refs: self.retired_refs.clone(),
+            retired_present: self.retired_present.clone(),
+            retired_materials: self.retired_materials.clone(),
+            retired_eligibility: self.retired_eligibility.clone(),
+            bound: self.bound.clone(),
+            stock_primitives: self.stock_primitives.clone(),
+        };
+        for primitive in affected {
+            let winner = self
+                .stock_candidates
+                .get_mut(&primitive)
+                .and_then(|candidates| {
+                    candidates.retain(|(mesh, _)| !meshes.contains(mesh));
+                    (candidates.len() == 1).then(|| candidates[0].1)
+                });
+            let previous = facts.stock_primitives.remove(&primitive);
+            work.stock_rows_revoked += u64::from(previous.is_some() && previous != winner);
+            work.stock_rows_requalified += u64::from(winner.is_some() && previous != winner);
+            if let Some(entity) = winner {
+                facts.stock_primitives.insert(primitive, entity);
+            }
+            if let Some(key) = self.record_lookup.get(&primitive) {
+                facts.bound.remove(key);
+                if let Some(entity) = winner {
+                    facts.bound.insert(*key, entity);
+                }
+            }
+            // A single invalid ordinal revokes the complete retired-reference exception,
+            // including the material/layer facts of its other, still valid primitives.
+            if previous != winner
+                && facts.retired_refs.remove(&primitive.0)
+                && let Some(members) = self.stock_members.get(&primitive.0)
+            {
+                for member in members {
+                    facts.retired_materials.remove(member);
+                    facts.retired_eligibility.remove(member);
+                }
+            }
+        }
+        self.qualification_refreshes += 1;
+        Some(facts)
+    }
+
     fn record_change(&mut self, candidate_changed: bool) {
         self.version = self.version.wrapping_add(1);
         if candidate_changed {
@@ -338,9 +536,11 @@ struct QualificationCache {
     structure: Option<u64>,
     evaluated: Option<bevy::ecs::change_detection::Tick>,
     origin: IVec2,
-    watched: EntityHashSet,
-    hot: EntityHashMap<HotFacts>,
     identities: EntityHashMap<(Option<u32>, Option<Entity>)>,
+    hot: EntityHashMap<HotFacts>,
+    index: source_index::SourceIndex,
+    cursor:
+        bevy::ecs::message::MessageCursor<crate::streaming::identity_changes::SourceNodeChanged>,
 }
 
 #[derive(PartialEq)]
@@ -418,21 +618,64 @@ type HotFactChanges = Or<(
     Changed<MeshMaterial3d<StandardMaterial>>,
 )>;
 
+// Invalidation is a superset of the actual proof-role domains. Required reads,
+// With and Has can opt a role into a registered disabler; optional reads cannot.
+// Cover that union and all Changed inputs here so change filters and semantic
+// snapshots share one default-filter policy and see every proof role.
+// These filters MUST NOT be used for qualification or dependency readability.
+type SourceObservationDomain = (
+    (
+        bevy::ecs::query::Allow<FormId>,
+        bevy::ecs::query::Allow<Mesh3d>,
+        bevy::ecs::query::Allow<Transform>,
+        bevy::ecs::query::Allow<ChildOf>,
+        bevy::ecs::query::Allow<Visibility>,
+        bevy::ecs::query::Allow<InheritedVisibility>,
+        bevy::ecs::query::Allow<StreamedCellKey>,
+        bevy::ecs::query::Allow<crate::streaming::RetireHidden>,
+        bevy::ecs::query::Allow<crate::streaming::AssetFailed>,
+        bevy::ecs::query::Allow<SourcePrimitive>,
+        bevy::ecs::query::Allow<SourcePrimitiveMesh>,
+        bevy::ecs::query::Allow<SourcePrimitiveTransform>,
+        bevy::ecs::query::Allow<SourceStaticModel>,
+    ),
+    (
+        bevy::ecs::query::Allow<crate::billboard::Billboard>,
+        bevy::ecs::query::Allow<bevy::mesh::skinning::SkinnedMesh>,
+        bevy::ecs::query::Allow<bevy::mesh::morph::MorphWeights>,
+        bevy::ecs::query::Allow<bevy::animation::AnimationTargetId>,
+        bevy::ecs::query::Allow<bevy::mesh::morph::MeshMorphWeights>,
+        bevy::ecs::query::Allow<bevy::light::NotShadowCaster>,
+    ),
+    (
+        bevy::ecs::query::Allow<CellRef>,
+        bevy::ecs::query::Allow<WorldAssetRoot>,
+        bevy::ecs::query::Allow<MeshHandle>,
+        bevy::ecs::query::Allow<SourceNodePose>,
+        bevy::ecs::query::Allow<bevy::gltf::GltfExtras>,
+        bevy::ecs::query::Allow<RenderLayers>,
+        bevy::ecs::query::Allow<MeshMaterial3d<StandardMaterial>>,
+    ),
+);
+
 #[derive(SystemParam)]
 struct SourceQueries<'w, 's> {
     structure: Option<Res<'w, crate::streaming::identity_changes::StructureEpoch>>,
     query_filters: Res<'w, bevy::ecs::entity_disabling::DefaultQueryFilters>,
-    fact_changes: Query<'w, 's, Entity, SourceFactChanges>,
-    hot_changes: Query<'w, 's, Entity, HotFactChanges>,
-    hot_facts: Query<'w, 's, HotFactState<'static>>,
-    identity_changes: Query<'w, 's, Entity, SourceIdentityChanges>,
-    identity_state: Query<'w, 's, (Option<&'static FormId>, Option<&'static ChildOf>)>,
+    journal: Option<Res<'w, Messages<crate::streaming::identity_changes::SourceNodeChanged>>>,
+    fact_changes: Query<'w, 's, Entity, (SourceObservationDomain, SourceFactChanges)>,
+    hot_changes: Query<'w, 's, Entity, (SourceObservationDomain, HotFactChanges)>,
+    hot_facts: Query<'w, 's, HotFactState<'static>, SourceObservationDomain>,
+    identity_changes: Query<'w, 's, Entity, (SourceObservationDomain, SourceIdentityChanges)>,
+    identity_state:
+        Query<'w, 's, (Option<&'static FormId>, Option<&'static ChildOf>), SourceObservationDomain>,
     terrain_visibility_changes: Query<'w, 's, Entity, SourceVisibilityChanges>,
     ticks: bevy::ecs::system::SystemChangeTick,
     cache: Local<'s, QualificationCache>,
 
     roots: Query<'w, 's, RootState>,
-    entities: Query<'w, 's, Entity>,
+    // Entity allocation metadata is unfiltered; it is never a role/dependency oracle.
+    entities: &'w bevy::ecs::entity::Entities,
     retired_cells: crate::streaming::RetiredCellAccess<'w, 's>,
     explicit_visibility: Query<'w, 's, &'static Visibility>,
     terrain_visibility: Query<'w, 's, (&'static Visibility, &'static InheritedVisibility)>,
@@ -742,25 +985,38 @@ fn extract_sources(
     (mut timing, settings): (Local<SourceExtractionTiming>, Option<Res<ClusterSettings>>),
 ) {
     perf_span!("cluster::handoff::extract_sources");
-    // With owned statics (`--cluster-own-statics`) the stock copies of owned primitives are
-    // hidden at spawn and no view decides per stock reference any more, so the stock facts this
-    // system qualifies (present, bound, retired) are not read per frame: they are qualified once
-    // per certificate and the per-frame change queries over every entity are not run.
+    // PI1 suppression is independent of extraction. Lifecycle and hot changes
+    // invalidate stock proof in either ownership mode.
     let own_statics = settings.is_some_and(|settings| settings.own_statics);
     let out = &mut *out;
     let queries = &mut *queries;
     let started = std::time::Instant::now();
-    let mut assets_invalidated = false;
+    #[cfg(test)]
+    let forced_full = std::mem::take(&mut out.force_full);
+    #[cfg(not(test))]
+    let forced_full = false;
+    if forced_full {
+        out.template_cache.clear();
+        out.geometry_cache.clear();
+    }
+    let mut work = SourceExtractionWork::default();
+    let mut dropped_meshes = HashSet::new();
     // The batches whose cached template decision an event below drops.
     let mut dropped_materials = Vec::new();
     let mut dropped_scenes = Vec::new();
     for event in events.meshes.read() {
         if let AssetEvent::Modified { id } | AssetEvent::Removed { id } = event {
             debug!(?event, path=?asset_server.as_ref().and_then(|server| server.get_path(*id)), "cluster source mesh invalidated");
-            assets_invalidated = true;
+            work.mesh_modified += u64::from(matches!(event, AssetEvent::Modified { .. }));
+            work.mesh_removed += u64::from(matches!(event, AssetEvent::Removed { .. }));
+            dropped_meshes.insert(*id);
             out.invalid_meshes.insert(*id);
-            out.template_cache.clear();
-            out.template_rows.stale = true;
+            if let Some(scenes) = out.template_meshes.by_mesh.get(id) {
+                for &scene in scenes {
+                    out.template_cache.remove(&scene);
+                    dropped_scenes.push(scene);
+                }
+            }
         }
     }
     for event in events
@@ -769,15 +1025,20 @@ fn extract_sources(
         .into_iter()
         .flat_map(|events| events.read())
     {
-        out.template_cache.remove(&event_asset_id(event));
-        dropped_scenes.push(event_asset_id(event));
+        let id = event_asset_id(event);
+        work.scene_events += 1;
+        out.template_cache.remove(&id);
+        out.template_meshes.remove(id);
+        dropped_scenes.push(id);
         if let AssetEvent::Modified { id } | AssetEvent::Removed { id } = event {
             debug!(?event, path=?asset_server.as_ref().and_then(|server| server.get_path(*id)), "cluster source scene invalidated");
-            assets_invalidated = true;
+            work.scene_modified += u64::from(matches!(event, AssetEvent::Modified { .. }));
+            work.scene_removed += u64::from(matches!(event, AssetEvent::Removed { .. }));
             out.invalid_templates.insert(*id);
         }
     }
     for event in events.standards.read() {
+        work.material_events += 1;
         out.geometry_cache.remove(&event_asset_id(event).untyped());
         dropped_materials.push(event_asset_id(event).untyped());
     }
@@ -794,89 +1055,221 @@ fn extract_sources(
     let current_origin = origin.as_ref().map_or(IVec2::ZERO, |origin| origin.0);
     let changes_span = ::bevy::log::info_span!("cluster::sources::change_queries").entered();
     let fetch_gap = queries.cache.evaluated != Some(queries.ticks.last_run());
-    if fetch_gap {
-        queries.cache.identities.clear();
-    }
-    let mut identity_changed = false;
-    if !own_statics {
-        for entity in &queries.identity_changes {
-            let identity = queries
-                .identity_state
-                .get(entity)
-                .ok()
-                .map(|(form, parent)| (form.map(|form| form.0), parent.map(ChildOf::parent)))
-                .unwrap_or_default();
-            identity_changed |= queries.cache.identities.insert(entity, identity) != Some(identity);
+    let missed = queries
+        .journal
+        .as_ref()
+        .is_some_and(|journal| queries.cache.cursor.missed_messages(journal) != 0);
+    let mut changed = EntityHashSet::default();
+    let mut covered_epoch = queries.cache.structure;
+    let mut journal_contiguous = covered_epoch.is_some();
+    let mut journal_events = 0_u64;
+    if let Some(journal) = &queries.journal {
+        for event in queries.cache.cursor.read(journal) {
+            journal_events += 1;
+            journal_contiguous &=
+                covered_epoch.is_some_and(|previous| event.epoch == previous.wrapping_add(1));
+            covered_epoch = Some(event.epoch);
+            changed.insert(event.entity);
         }
     }
-    // Structural events include arbitrary default-disabling components. Without
-    // the observer resource (standalone consumers), retain the uncached path.
-    // Reparenting/FormId changes can introduce a previously unrelated subtree.
-    let other_changed = !own_statics
-        && queries
-            .fact_changes
-            .iter()
-            .any(|entity| queries.cache.watched.contains(&entity));
-    let hot_changed = !own_statics
-        && queries.hot_changes.iter().any(|entity| {
-            queries.cache.watched.contains(&entity)
-                && queries.cache.hot.get(&entity).is_none_or(|previous| {
-                    queries
-                        .hot_facts
-                        .get(entity)
-                        .ok()
-                        .map(|state| hot_facts(state, previous.literal_pose))
-                        .as_ref()
-                        != Some(previous)
-                })
-        });
+    // A nonempty suffix cannot prove coverage: check every sequence edge AND
+    // both endpoints of the prior/current epoch interval. Missing, expired or
+    // replaced journals recover even when surviving events are all unrelated.
+    let journal_complete =
+        queries.journal.is_some() && journal_contiguous && covered_epoch == structure;
+    let journal_entities = changed.len();
+    let mut identity_changed = false;
+    for entity in &queries.identity_changes {
+        let identity = queries
+            .identity_state
+            .get(entity)
+            .ok()
+            .map(|(form, parent)| (form.map(|form| form.0), parent.map(ChildOf::parent)))
+            .unwrap_or_default();
+        if queries.cache.identities.get(&entity) != Some(&identity) {
+            changed.insert(entity);
+            identity_changed = true;
+        }
+    }
+    let other_changed = queries.fact_changes.iter().next().is_some();
+    changed.extend(queries.fact_changes.iter());
+    let mut hot_changed = false;
+    for entity in &queries.hot_changes {
+        if queries.cache.index.contains_node(entity)
+            && queries.cache.hot.get(&entity).is_none_or(|previous| {
+                queries
+                    .hot_facts
+                    .get(entity)
+                    .ok()
+                    .map(|state| hot_facts(state, previous.literal_pose))
+                    .as_ref()
+                    != Some(previous)
+            })
+        {
+            changed.insert(entity);
+            hot_changed = true;
+        }
+    }
+    // StructureEpoch is coverage/repair evidence, never a list of affected roots.
+    // Sequence coverage is independent of subject membership and event count.
     let structural_changed = structure.is_none() || structure != queries.cache.structure;
+    let unexplained_structure = !journal_complete;
+    let refresh = forced_full
+        || !same
+        || !queries.cache.index.initialized
+        || missed
+        || fetch_gap
+        || queries.query_filters.is_changed()
+        || structure.is_none()
+        || queries.journal.is_none()
+        || unexplained_structure;
+    if refresh {
+        warn!(
+            certificate_changed = !same,
+            forced_full,
+            initialized = queries.cache.index.initialized,
+            missed,
+            fetch_gap,
+            filters_changed = queries.query_filters.is_changed(),
+            uncovered = structure.is_none(),
+            missing_journal = queries.journal.is_none(),
+            unexplained_structure,
+            journal_events,
+            prior_epoch = ?queries.cache.structure,
+            current_epoch = ?structure,
+            covered_epoch = ?covered_epoch,
+            origin_changed = queries.cache.origin != current_origin,
+            "cluster source qualification full recovery"
+        );
+    }
+    if refresh {
+        // Cursor offsets belong to one Messages instance. A fresh/replaced
+        // resource may have a lower count; clear resets in either direction.
+        if let Some(journal) = &queries.journal {
+            queries.cache.cursor.clear(journal);
+        } else {
+            queries.cache.cursor = default();
+        }
+    }
+    if queries.cache.origin != current_origin {
+        changed.extend(queries.cache.index.roots());
+    }
+    if !same {
+        out.seen_roots.clear();
+    }
+    let mut index = std::mem::take(&mut queries.cache.index);
+    let affected = index.update(
+        queries,
+        &out.seen_roots,
+        &changed,
+        refresh,
+        certificate.as_deref(),
+    );
+    queries.cache.index = index;
+    work.qualification_full = refresh;
+    work.affected_references = affected.references.len() as u64;
+    work.journal_entities = journal_entities as u64;
+    work.journal_events = journal_events;
+    work.journal_complete = journal_complete;
+    work.subjects_updated = affected.subjects_updated;
+    work.ancestry_edges = affected.ancestry_edges;
+    work.discovery_roots = affected.discovery_roots;
+    work.discovery_meshes = affected.discovery_meshes;
+    let (subjects, nodes, groups) = queries.cache.index.sizes();
+    work.indexed_subjects = subjects as u64;
+    work.indexed_nodes = nodes as u64;
+    work.indexed_reference_groups = groups as u64;
     timing.hot_refreshes += u64::from(hot_changed);
     timing.identity_refreshes += u64::from(identity_changed);
     timing.other_refreshes += u64::from(other_changed);
     timing.structural_refreshes += u64::from(structural_changed);
-    let refresh = if own_statics {
-        !same || assets_invalidated
-    } else {
-        !same
-            || assets_invalidated
-            || structural_changed
-            || queries.query_filters.is_changed()
-            || fetch_gap
-            || queries.cache.origin != current_origin
-            || identity_changed
-            || other_changed
-            || hot_changed
-    };
     timing.calls += 1;
-    timing.reused += u64::from(!refresh);
+
     drop(changes_span);
     let _refresh_span = ::bevy::log::info_span!("cluster::sources::refresh").entered();
-    let fresh = if refresh {
-        queries
-            .cache
-            .identities
-            .retain(|entity, _| queries.entities.contains(*entity));
-        let mut watched = EntityHashSet::default();
+    // Asset deltas are applied before merging affected ECS reference groups. The
+    // immutable previous snapshot stays intact until candidate_worlds compares it.
+    let asset_facts = out.invalidate_stock_meshes(&dropped_meshes, &mut work);
+    let fresh = if refresh || !affected.references.is_empty() {
+        let mut facts = asset_facts.unwrap_or_else(|| QualifiedFacts {
+            present: out.present.clone(),
+            retired_refs: out.retired_refs.clone(),
+            retired_present: out.retired_present.clone(),
+            retired_materials: out.retired_materials.clone(),
+            retired_eligibility: out.retired_eligibility.clone(),
+            bound: out.bound.clone(),
+            stock_primitives: out.stock_primitives.clone(),
+        });
+        if refresh {
+            facts = QualifiedFacts::default();
+        }
+        let refs = &affected.references;
+        if refresh {
+            out.stock_candidates.clear();
+            out.stock_meshes.clear();
+            out.stock_members.clear();
+            out.proof_keys.clear();
+        } else {
+            for reference in refs {
+                facts.present.remove(reference);
+                facts.retired_refs.remove(reference);
+                facts.retired_present.remove(reference);
+                if let Some(members) = out.stock_members.remove(reference) {
+                    for member in members {
+                        facts.retired_materials.remove(&member);
+                        facts.retired_eligibility.remove(&member);
+                    }
+                }
+                if let Some(keys) = out.proof_keys.remove(reference) {
+                    for key in keys {
+                        facts.stock_primitives.remove(&key);
+                        if let Some(record) = out.record_lookup.get(&key) {
+                            facts.bound.remove(record);
+                        }
+                        if let Some(candidates) = out.stock_candidates.remove(&key) {
+                            for (mesh, _) in candidates {
+                                if let Some(keys) = out.stock_meshes.get_mut(&mesh) {
+                                    keys.remove(&key);
+                                    if keys.is_empty() {
+                                        out.stock_meshes.remove(&mesh);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let QualifiedFacts {
+            mut present,
+            mut retired_refs,
+            mut retired_present,
+            mut retired_materials,
+            mut retired_eligibility,
+            mut bound,
+            mut stock_primitives,
+        } = facts;
         if !same {
             out.seen_roots.clear();
         }
-        out.seen_roots
-            .retain(|entity, _| queries.entities.contains(*entity));
-        // Losing identity or all mesh components after instancing is a runtime
-        // change, not a return to the initial, never-instantiated pending state.
-        let mut present: BTreeSet<_> = out.seen_roots.values().flatten().copied().collect();
-        let mut retired_present = HashSet::new();
-        for (root, references) in &out.seen_roots {
-            if under_retired_cell(*root, &queries.parents, &queries.retired_cells) {
-                retired_present.extend(references.iter().copied());
+        for root in &affected.nodes {
+            if !queries.entities.contains_spawned(*root) {
+                out.seen_roots.remove(root);
             }
         }
-        let mut retired_refs = HashSet::new();
-        let mut retired_materials = HashMap::new();
-        let mut retired_eligibility = HashMap::new();
-        let mut bound = HashMap::new();
-        let mut stock_primitives = HashMap::new();
+        let history: Vec<_> = if refresh {
+            out.seen_roots.keys().copied().collect()
+        } else {
+            affected.history.iter().copied().collect()
+        };
+        for root in history {
+            if let Some(references) = out.seen_roots.get(&root) {
+                present.extend(references.iter().copied());
+                if under_retired_cell(root, &queries.parents, &queries.retired_cells) {
+                    retired_present.extend(references.iter().copied());
+                }
+            }
+        }
         if let Some(certificate) = &certificate {
             if !same {
                 out.record_lookup.clear();
@@ -890,6 +1283,7 @@ fn extract_sources(
                         .insert(identity.primitive);
                 }
                 out.template_cache.clear();
+                out.template_meshes = TemplateMeshDependencies::default();
                 out.template_rows.stale = true;
             }
             let mut roots = HashMap::new();
@@ -897,20 +1291,15 @@ fn extract_sources(
             let mut valid_roots = HashMap::new();
             let mut retired_candidates = HashMap::new();
             let mut mesh_roots: HashMap<Entity, Vec<Entity>> = HashMap::new();
-            for (entity, form, cell, asset, mesh_path, actual, parent, visible, failed) in
-                &queries.roots
-            {
+            for root in &affected.roots {
+                let Ok((entity, form, cell, asset, mesh_path, actual, parent, visible, failed)) =
+                    queries.roots.get(*root)
+                else {
+                    continue;
+                };
+                work.roots_scanned += 1;
                 if certificate.reference(form.0).is_none() {
                     continue;
-                }
-                let mut at = Some(entity);
-                let mut ancestry = EntityHashSet::default();
-                while let Some(node) = at {
-                    if !ancestry.insert(node) {
-                        break;
-                    }
-                    watched.insert(node);
-                    at = queries.parents.get(node).ok().map(ChildOf::parent);
                 }
                 if under_retired_cell(entity, &queries.parents, &queries.retired_cells) {
                     retired_present.insert(form.0);
@@ -976,7 +1365,8 @@ fn extract_sources(
             // presence. A valid root awaiting instancing keeps its ready cluster.
             let mut reference_roots = ReferenceRootMemo::default();
             let presence_span = bevy::log::tracing::info_span!("cluster_source_presence").entered();
-            for entity in &queries.all_meshes {
+            for &entity in &affected.meshes {
+                work.meshes_scanned += 1;
                 let Some(root) = reference_roots.resolve(
                     entity,
                     |at| queries.roots.contains(at),
@@ -999,23 +1389,20 @@ fn extract_sources(
                 }
             }
 
-            for (&node, root) in &reference_roots.resolved {
-                if root
-                    .and_then(|root| queries.roots.get(root).ok())
-                    .is_some_and(|(_, form, ..)| certificate.reference(form.0).is_some())
-                {
-                    watched.insert(node);
-                }
-            }
             drop(presence_span);
             present.extend(duplicates.iter().copied());
             let lookup = &out.record_lookup;
             let mut ambiguous = HashSet::new();
+
             let qualification_span =
                 bevy::log::tracing::info_span!("cluster_source_qualification").entered();
-            for (entity, tag, source_mesh, source_transform, static_model, mesh) in
-                &queries.primitives
-            {
+            for primitive_entity in &affected.meshes {
+                let Ok((entity, tag, source_mesh, source_transform, static_model, mesh)) =
+                    queries.primitives.get(*primitive_entity)
+                else {
+                    continue;
+                };
+                work.primitives_scanned += 1;
                 if !tag.matches_default_scene
                     || !static_model.0
                     || source_mesh.0 != mesh.0
@@ -1048,6 +1435,15 @@ fn extract_sources(
                     continue;
                 }
                 let primitive = (*form, tag.ordinal);
+                out.proof_keys.entry(*form).or_default().insert(primitive);
+                out.stock_candidates
+                    .entry(primitive)
+                    .or_default()
+                    .push((mesh.0.id(), entity.into()));
+                out.stock_meshes
+                    .entry(mesh.0.id())
+                    .or_default()
+                    .insert(primitive);
                 if ambiguous.contains(&primitive) {
                     continue;
                 }
@@ -1073,19 +1469,21 @@ fn extract_sources(
             // instantiated, currently proven model may bypass visible-list presence;
             // missing/extra/modified meshes, duplicates and explicit child hides pin.
             if !retired_candidates.is_empty() {
-                let proven: HashSet<_> = stock_primitives.values().copied().collect();
-                let mut instantiated: HashMap<u32, BTreeSet<u32>> = HashMap::new();
-                for &(reference, ordinal) in stock_primitives.keys() {
-                    instantiated.entry(reference).or_default().insert(ordinal);
-                }
                 for (root, (reference, cell)) in retired_candidates {
+                    // Read only this affected reference's proof candidates. Ambiguous
+                    // keys stay indexed but contribute no unique instantiated proof.
+                    let (proven, instantiated) = retired_reference_proof(
+                        out.proof_keys.get(&reference),
+                        &stock_primitives,
+                        &mut work,
+                    );
                     let meshes = mesh_roots.get(&root).map(Vec::as_slice).unwrap_or(&[]);
                     let Some(expected) = out.expected_primitives.get(&reference) else {
                         continue;
                     };
                     if !duplicates.contains(&reference)
                         && !expected.is_empty()
-                        && instantiated.get(&reference) == Some(expected)
+                        && &instantiated == expected
                         && meshes.len() == expected.len()
                         && meshes.iter().all(|entity| {
                             proven.contains(&MainEntity::from(*entity))
@@ -1118,18 +1516,15 @@ fn extract_sources(
             }
         }
 
-        queries.cache.hot = watched
-            .iter()
-            .filter_map(|entity| {
-                let literal = queries.roots.contains(*entity) || queries.cells.contains(*entity);
-                queries
-                    .hot_facts
-                    .get(*entity)
-                    .ok()
-                    .map(|state| (*entity, hot_facts(state, literal)))
-            })
-            .collect();
-        queries.cache.watched = watched;
+        for reference in refs {
+            if let Some(keys) = out.proof_keys.get(reference) {
+                let members = keys
+                    .iter()
+                    .filter_map(|key| stock_primitives.get(key).copied())
+                    .collect();
+                out.stock_members.insert(*reference, members);
+            }
+        }
         out.qualification_refreshes += 1;
         Some(QualifiedFacts {
             present,
@@ -1141,8 +1536,31 @@ fn extract_sources(
             stock_primitives,
         })
     } else {
-        None
+        asset_facts
     };
+    let qualification_updated = fresh.is_some();
+    for entity in &affected.nodes {
+        if queries.cache.index.contains_node(*entity) {
+            let identity = queries
+                .identity_state
+                .get(*entity)
+                .ok()
+                .map(|(form, parent)| (form.map(|form| form.0), parent.map(ChildOf::parent)))
+                .unwrap_or_default();
+            queries.cache.identities.insert(*entity, identity);
+            let literal = queries.roots.contains(*entity) || queries.cells.contains(*entity);
+            if let Ok(state) = queries.hot_facts.get(*entity) {
+                queries.cache.hot.insert(*entity, hot_facts(state, literal));
+            } else {
+                queries.cache.hot.remove(entity);
+            }
+        } else {
+            queries.cache.hot.remove(entity);
+            queries.cache.identities.remove(entity);
+        }
+    }
+    timing.reused += u64::from(!qualification_updated);
+    let qualification_elapsed = started.elapsed();
     queries.cache.structure = structure;
     queries.cache.origin = current_origin;
     queries.cache.evaluated = Some(queries.ticks.this_run());
@@ -1164,17 +1582,15 @@ fn extract_sources(
         .as_ref()
         .map_or(&out.stock_primitives, |facts| &facts.stock_primitives);
 
+    let templates_started = std::time::Instant::now();
     let templates_span = ::bevy::log::info_span!("cluster::sources::templates").entered();
     // Each batch's decision depends only on its own handle, material, template and the caches
-    // above. Once every batch is settled, a frame redecides only the batches whose cache entry an
-    // asset event dropped and those still loading; a new handle table, certificate or mesh
-    // invalidation decides them all again.
+    // above. Retry pending rows, event dependencies and rows whose material/source IDs
+    // changed. Only a certificate/scope reset decides every row again. Mesh events
+    // reach exactly their indexed source scenes.
     let batches = handles.handles.len();
-    let full = out.template_rows.stale
-        || !same
-        || handles.is_changed()
-        || out.templates.len() != batches
-        || out.normal_maps.len() != batches;
+    let template_stale = out.template_rows.stale;
+    let full = template_stale || !same || forced_full;
     let (mut templates, mut normal_maps, mut source_fallback_batches, redo) = if full {
         out.template_rows = TemplateRows::default();
         (
@@ -1185,6 +1601,27 @@ fn extract_sources(
         )
     } else {
         let mut redo = std::mem::take(&mut out.template_rows.pending);
+        if handles.is_changed()
+            || lazy.as_ref().is_some_and(|lazy| lazy.is_changed())
+            || out.template_inputs.len() != batches
+        {
+            for index in 0..batches {
+                let input = (
+                    handles.handles[index].as_ref().map(|handle| handle.id()),
+                    lazy.as_deref()
+                        .and_then(|lazy| lazy.source_scene(index as u32))
+                        .map(|scene| scene.id()),
+                );
+                if out.template_inputs.get(index) != Some(&input) {
+                    redo.insert(index as u32);
+                }
+            }
+            // Truncation must remove old inverse memberships and pending rows too.
+            for index in batches..out.template_inputs.len() {
+                out.template_rows
+                    .remove(index as u32, out.template_inputs[index]);
+            }
+        }
         for id in &dropped_materials {
             redo.extend(out.template_rows.by_material.get(id).into_iter().flatten());
         }
@@ -1198,7 +1635,18 @@ fn extract_sources(
             redo,
         )
     };
+    templates.resize(batches, false);
+    normal_maps.resize(batches, false);
+    source_fallback_batches.retain(|index| (*index as usize) < batches);
+    out.template_inputs.truncate(batches);
     for index in redo {
+        if index as usize >= batches {
+            continue;
+        }
+        if let Some(&previous) = out.template_inputs.get(index as usize) {
+            out.template_rows.remove(index, previous);
+        }
+        work.template_rows += 1;
         let Some(handle) = handles.handles.get(index as usize) else {
             continue;
         };
@@ -1209,6 +1657,7 @@ fn extract_sources(
                 TemplateCaches {
                     geometry: &mut out.geometry_cache,
                     templates: &mut out.template_cache,
+                    template_meshes: &mut out.template_meshes,
                     invalid_templates: &out.invalid_templates,
                     invalid_meshes: &out.invalid_meshes,
                     rows: &mut out.template_rows,
@@ -1219,6 +1668,16 @@ fn extract_sources(
             ),
             None => TemplateRow::default(),
         };
+        let input = (
+            handle.as_ref().map(|handle| handle.id()),
+            lazy.as_deref()
+                .and_then(|lazy| lazy.source_scene(index))
+                .map(|scene| scene.id()),
+        );
+        if out.template_inputs.len() <= index as usize {
+            out.template_inputs.resize(index as usize + 1, (None, None));
+        }
+        out.template_inputs[index as usize] = input;
         templates[index as usize] = row.template;
         normal_maps[index as usize] = row.normal_map;
         if row.fallback {
@@ -1230,39 +1689,11 @@ fn extract_sources(
             out.template_rows.pending.insert(index);
         }
     }
-    #[cfg(debug_assertions)]
-    if !full {
-        // Every batch decided again from the same caches must give the same answer.
-        let mut rows = TemplateRows::default();
-        for (index, handle) in handles.handles.iter().enumerate() {
-            let row = handle.as_ref().map_or_else(TemplateRow::default, |handle| {
-                template_row(
-                    index as u32,
-                    handle,
-                    TemplateCaches {
-                        geometry: &mut out.geometry_cache,
-                        templates: &mut out.template_cache,
-                        invalid_templates: &out.invalid_templates,
-                        invalid_meshes: &out.invalid_meshes,
-                        rows: &mut rows,
-                    },
-                    &standards,
-                    lazy.as_deref(),
-                    assets.as_deref(),
-                )
-            });
-            debug_assert!(
-                templates[index] == row.template
-                    && normal_maps[index] == row.normal_map
-                    && source_fallback_batches.contains(&(index as u32)) == row.fallback,
-                "batch {index}: an incremental template decision differs from a full pass"
-            );
-        }
-    }
     // Pending=false -> loaded-invalid=false does not change templates. Keep its
     // negative demand independently so that transition cannot be lost.
     out.source_fallback_batches = source_fallback_batches;
     drop(templates_span);
+    let templates_elapsed = templates_started.elapsed();
     let terrain_started = std::time::Instant::now();
     let terrain_span = bevy::log::tracing::info_span!("cluster_terrain_identity").entered();
     let terrain_snapshot = queries.terrain.identities_shared();
@@ -1498,6 +1929,56 @@ fn extract_sources(
                 );
             }
         }
+    }
+    out.last_work = work;
+    if qualification_updated
+        || full
+        || work.mesh_modified + work.mesh_removed + work.scene_events + work.material_events > 0
+    {
+        info!(
+            extraction = timing.calls,
+            certificate_changed = !same,
+            qualification_full = work.qualification_full,
+            affected_references = work.affected_references,
+            journal_entities = work.journal_entities,
+            journal_events = work.journal_events,
+            journal_complete = work.journal_complete,
+            retired_proof_keys_visited = work.retired_proof_keys_visited,
+            subjects_updated = work.subjects_updated,
+            ancestry_edges = work.ancestry_edges,
+            discovery_roots = work.discovery_roots,
+            discovery_meshes = work.discovery_meshes,
+            indexed_subjects = work.indexed_subjects,
+            indexed_nodes = work.indexed_nodes,
+            indexed_reference_groups = work.indexed_reference_groups,
+            template_full = full,
+            template_stale,
+            handles_changed = handles.is_changed(),
+            own_statics,
+            query_filters_changed = queries.query_filters.is_changed(),
+            structural_changed,
+            fetch_gap,
+            hot_changed,
+            identity_changed,
+            other_changed,
+            scene_events = work.scene_events,
+            material_events = work.material_events,
+            mesh_modified = work.mesh_modified,
+            mesh_removed = work.mesh_removed,
+            scene_modified = work.scene_modified,
+            scene_removed = work.scene_removed,
+            stock_rows_revoked = work.stock_rows_revoked,
+            stock_rows_requalified = work.stock_rows_requalified,
+            roots_scanned = work.roots_scanned,
+            meshes_scanned = work.meshes_scanned,
+            primitives_scanned = work.primitives_scanned,
+            template_rows = work.template_rows,
+            qualification_ms = qualification_elapsed.as_secs_f64() * 1000.0,
+            templates_ms = templates_elapsed.as_secs_f64() * 1000.0,
+            source_version = out.version,
+            candidate_version = out.candidate_version,
+            "cluster source invalidation work"
+        );
     }
     if timing.calls.is_multiple_of(120) {
         info!(
@@ -4015,6 +4496,10 @@ mod extract_source_tests {
 
     impl Fixture {
         fn pending() -> Self {
+            Self::pending_with_disablers(|_| {})
+        }
+
+        fn pending_with_disablers(register: impl FnOnce(&mut World)) -> Self {
             let directory = published_for_loader();
             let certificate = Arc::new(
                 crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
@@ -4027,12 +4512,16 @@ mod extract_source_tests {
             assert_eq!((key.worldspace, key.tier, key.anchor), (0x70, 16, [2, 2]));
             assert_eq!(certificate.record(&key).unwrap().primitive, 0);
             let mut app = loader_app(directory.path());
-            crate::streaming::identity_changes::install(app.world_mut());
             app.init_asset::<StandardMaterial>()
                 .insert_resource(ValidatedPackage(certificate))
                 .init_resource::<ClusterBatchHandles>();
             let handle: Handle<Gltf> = app.world().resource::<AssetServer>().load(MODEL);
             wait_for_loaded(&mut app, &handle);
+            // Loader/spawner systems initialize during loading. Register custom
+            // filters before tracking/extraction, without changing the loader's
+            // unrelated already-constructed query domains.
+            register(app.world_mut());
+            crate::streaming::identity_changes::install(app.world_mut());
             let scene = app
                 .world()
                 .resource::<Assets<Gltf>>()
@@ -4118,7 +4607,8 @@ mod extract_source_tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let world = self.app.world_mut();
-            let mut primitives = world.query_filtered::<Entity, With<SourcePrimitive>>();
+            let mut primitives =
+                world.query_filtered::<Entity, (With<SourcePrimitive>, With<Mesh3d>)>();
             let entities = primitives.iter(world).collect::<Vec<_>>();
             assert_eq!(entities.len(), 1, "one real loader-tagged primitive");
             entities[0]
@@ -4138,6 +4628,1292 @@ mod extract_source_tests {
                 Some(&MainEntity::from(primitive))
             );
         }
+    }
+
+    /// Force the independent full ECS loops, preserving certificate/history/sticky
+    /// asset invalidations. Replacing the certificate Arc would erase history and
+    /// is therefore not a valid oracle for removed-identity transitions.
+    fn assert_full_oracle(input: &mut Fixture) {
+        let snapshot = |s: &Sources| {
+            (
+                s.present.clone(),
+                s.bound.clone(),
+                s.stock_primitives.clone(),
+                s.retired_refs.clone(),
+                s.retired_present.clone(),
+                s.retired_materials.clone(),
+                s.retired_eligibility.clone(),
+                s.templates.clone(),
+                s.normal_maps.clone(),
+                s.source_fallback_batches.clone(),
+                s.seen_roots.clone(),
+            )
+        };
+        let expected = snapshot(input.sources());
+        let version = input.sources().candidate_version;
+        input.render.resource_mut::<Sources>().force_full = true;
+        input.extract();
+        assert!(input.sources().last_work.qualification_full);
+        assert_eq!(snapshot(input.sources()), expected);
+        assert_eq!(
+            input.sources().candidate_version,
+            version,
+            "a full oracle must not publish a correction to the preceding delta"
+        );
+    }
+
+    fn assert_delta_only(input: &Fixture) {
+        let work = input.sources().last_work;
+        assert!(!work.qualification_full);
+        assert_eq!((work.discovery_roots, work.discovery_meshes), (0, 0));
+    }
+
+    fn duplicate_primitive(input: &mut Fixture, primitive: Entity) -> Entity {
+        let world = input.app.world();
+        let mesh = world.get::<Mesh3d>(primitive).unwrap().clone();
+        let source = world.get::<SourcePrimitiveMesh>(primitive).unwrap().clone();
+        let tag = *world.get::<SourcePrimitive>(primitive).unwrap();
+        let matrix = *world.get::<SourcePrimitiveTransform>(primitive).unwrap();
+        let static_model = *world.get::<SourceStaticModel>(primitive).unwrap();
+        let baseline = *world.get::<SourceNodePose>(primitive).unwrap();
+        let pose = *world.get::<Transform>(primitive).unwrap();
+        let parent = world.get::<ChildOf>(primitive).unwrap().parent();
+        input
+            .app
+            .world_mut()
+            .spawn((
+                mesh,
+                source,
+                tag,
+                matrix,
+                static_model,
+                baseline,
+                pose,
+                ChildOf(parent),
+            ))
+            .id()
+    }
+
+    #[test]
+    fn one_root_edit_never_visits_unrelated_stock_in_either_mode() {
+        for own_statics in [false, true] {
+            let mut input = Fixture::pending();
+            let primitive = input.spawn_stock();
+            input.render.insert_resource(ClusterSettings {
+                own_statics,
+                ..default()
+            });
+            let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().clone();
+            for ordinal in 0..256 {
+                let root = input
+                    .app
+                    .world_mut()
+                    .spawn((
+                        FormId(u32::MAX - ordinal),
+                        Transform::IDENTITY,
+                        ChildOf(input.cell),
+                    ))
+                    .id();
+                input
+                    .app
+                    .world_mut()
+                    .spawn((mesh.clone(), Transform::IDENTITY, ChildOf(root)));
+            }
+            input.assert_bound(primitive);
+            input
+                .app
+                .world_mut()
+                .get_mut::<Transform>(input.root)
+                .unwrap()
+                .translation
+                .x += 1.0;
+            input.assert_blocked();
+            assert_delta_only(&input);
+            let work = input.sources().last_work;
+            assert_eq!(
+                (
+                    work.roots_scanned,
+                    work.meshes_scanned,
+                    work.primitives_scanned
+                ),
+                (1, 1, 1)
+            );
+            assert_eq!(work.affected_references, 1);
+            assert_full_oracle(&mut input);
+            input
+                .app
+                .world_mut()
+                .entity_mut(input.root)
+                .insert(input.root_pose);
+            input.assert_bound(primitive);
+            assert_delta_only(&input);
+            assert_full_oracle(&mut input);
+        }
+    }
+
+    #[test]
+    fn duplicate_root_and_ordinal_removal_promote_only_the_survivor() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        let duplicate = input
+            .app
+            .world_mut()
+            .spawn((
+                FormId(REFERENCE),
+                CellRef(0x30),
+                MeshHandle(MODEL.into()),
+                input.root_pose,
+                ChildOf(input.cell),
+                InheritedVisibility::VISIBLE,
+            ))
+            .id();
+        input.assert_blocked();
+        assert_delta_only(&input);
+        assert_eq!(input.sources().last_work.roots_scanned, 2);
+        assert_full_oracle(&mut input);
+        input.app.world_mut().despawn(duplicate);
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        let duplicate = duplicate_primitive(&mut input, primitive);
+        input.assert_blocked();
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        input.app.world_mut().despawn(duplicate);
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+    }
+
+    #[test]
+    fn ancestry_identity_and_component_removals_match_the_full_oracle() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        let parent = input
+            .app
+            .world()
+            .get::<ChildOf>(primitive)
+            .unwrap()
+            .parent();
+        let wrapper = input
+            .app
+            .world_mut()
+            .spawn((
+                Transform::IDENTITY,
+                SourceNodePose(Transform::IDENTITY),
+                ChildOf(parent),
+            ))
+            .id();
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .insert(ChildOf(wrapper));
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        // New root barrier on an already-indexed node; no Children discovery.
+        input
+            .app
+            .world_mut()
+            .entity_mut(wrapper)
+            .insert(FormId(u32::MAX));
+        input.assert_blocked();
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        input.app.world_mut().entity_mut(wrapper).remove::<FormId>();
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        input
+            .app
+            .world_mut()
+            .entity_mut(wrapper)
+            .remove::<ChildOf>();
+        input.extract();
+        assert!(!input.sources().bound.contains_key(&input.key));
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        input
+            .app
+            .world_mut()
+            .entity_mut(wrapper)
+            .insert(ChildOf(parent));
+        input.assert_bound(primitive);
+        let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().clone();
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .remove::<Mesh3d>();
+        input.assert_blocked();
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        input.app.world_mut().entity_mut(primitive).insert(mesh);
+        input.assert_bound(primitive);
+        // Removed FormId must keep instantiated history, including on repeated calls.
+        input
+            .app
+            .world_mut()
+            .entity_mut(input.root)
+            .remove::<FormId>();
+        input.assert_blocked();
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        input.assert_blocked();
+        input
+            .app
+            .world_mut()
+            .entity_mut(input.root)
+            .insert(FormId(REFERENCE));
+        input.assert_bound(primitive);
+        assert_full_oracle(&mut input);
+    }
+
+    #[test]
+    fn changed_handle_rows_remove_inverse_edges_and_skip_unchanged_rows() {
+        let mut input = Fixture::pending();
+        input.spawn_stock();
+        source_template(&mut input);
+        let first = input
+            .app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        input
+            .app
+            .world_mut()
+            .resource_mut::<ClusterBatchHandles>()
+            .set(1, first.clone());
+        input.extract();
+        input.extract();
+        let second = input
+            .app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        input
+            .app
+            .world_mut()
+            .resource_mut::<ClusterBatchHandles>()
+            .set(1, second.clone());
+        input.extract();
+        assert_eq!(input.sources().last_work.template_rows, 1);
+        assert!(
+            !input
+                .sources()
+                .template_rows
+                .by_material
+                .contains_key(&first.id().untyped())
+        );
+        assert!(input.sources().template_rows.by_material[&second.id().untyped()].contains(&1));
+        assert_full_oracle(&mut input);
+        input
+            .app
+            .world_mut()
+            .resource_mut::<ClusterBatchHandles>()
+            .set(1, second);
+        input.extract();
+        assert_eq!(input.sources().last_work.template_rows, 0);
+        input
+            .app
+            .world_mut()
+            .resource_mut::<ClusterBatchHandles>()
+            .handles
+            .truncate(1);
+        input.extract();
+        assert_eq!(input.sources().last_work.template_rows, 0);
+        assert_eq!(input.sources().templates.len(), 1);
+        assert_full_oracle(&mut input);
+    }
+
+    #[test]
+    fn mixed_lifecycle_sequences_match_full_qualification_in_both_modes() {
+        for own_statics in [false, true] {
+            for seed in [1_u64, 17, 101, 4099] {
+                let mut input = Fixture::pending();
+                let primitive = input.spawn_stock();
+                input.render.insert_resource(ClusterSettings {
+                    own_statics,
+                    ..default()
+                });
+                input.assert_bound(primitive);
+                let baseline = *input.app.world().get::<SourceNodePose>(primitive).unwrap();
+                let tag = *input.app.world().get::<SourcePrimitive>(primitive).unwrap();
+                let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().clone();
+                let mut state = seed;
+                let mut duplicate = None;
+                for _ in 0..128 {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match (state >> 32) % 12 {
+                        0 => {
+                            input
+                                .app
+                                .world_mut()
+                                .entity_mut(primitive)
+                                .insert(baseline.0);
+                        }
+                        1 => {
+                            let mut pose = baseline.0;
+                            pose.translation.x += 1.0;
+                            input.app.world_mut().entity_mut(primitive).insert(pose);
+                        }
+                        2 => {
+                            input
+                                .app
+                                .world_mut()
+                                .entity_mut(primitive)
+                                .remove::<SourceNodePose>();
+                        }
+                        3 => {
+                            input.app.world_mut().entity_mut(primitive).insert(baseline);
+                        }
+                        4 => {
+                            input
+                                .app
+                                .world_mut()
+                                .entity_mut(primitive)
+                                .remove::<SourcePrimitive>();
+                        }
+                        5 => {
+                            input.app.world_mut().entity_mut(primitive).insert(tag);
+                        }
+                        6 => {
+                            input
+                                .app
+                                .world_mut()
+                                .entity_mut(primitive)
+                                .remove::<Mesh3d>();
+                        }
+                        7 => {
+                            input
+                                .app
+                                .world_mut()
+                                .entity_mut(primitive)
+                                .insert(mesh.clone());
+                        }
+                        8 => {
+                            input
+                                .app
+                                .world_mut()
+                                .entity_mut(input.root)
+                                .insert(FormId(u32::MAX));
+                        }
+                        9 => {
+                            input
+                                .app
+                                .world_mut()
+                                .entity_mut(input.root)
+                                .insert(FormId(REFERENCE));
+                        }
+                        10 => {
+                            input
+                                .app
+                                .world_mut()
+                                .entity_mut(primitive)
+                                .insert(Visibility::Hidden);
+                        }
+                        _ => {
+                            input
+                                .app
+                                .world_mut()
+                                .entity_mut(primitive)
+                                .insert(Visibility::Inherited);
+                        }
+                    }
+                    // Unrelated lifecycle interleaves with changed/refused stock facts.
+                    if state & 3 == 0 {
+                        if let Some(entity) = duplicate.take() {
+                            input.app.world_mut().despawn(entity);
+                        } else {
+                            duplicate = Some(
+                                input
+                                    .app
+                                    .world_mut()
+                                    .spawn((
+                                        FormId(REFERENCE),
+                                        input.root_pose,
+                                        ChildOf(input.cell),
+                                    ))
+                                    .id(),
+                            );
+                        }
+                    }
+                    input.extract();
+                    assert_delta_only(&input);
+                    assert_full_oracle(&mut input);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn journal_loss_is_an_explicit_recovery_and_next_change_is_incremental() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .remove::<SourceNodePose>();
+        for _ in 0..2 {
+            input
+                .app
+                .world_mut()
+                .resource_mut::<Messages<crate::streaming::identity_changes::SourceNodeChanged>>()
+                .update();
+        }
+        input.assert_blocked();
+        assert!(input.sources().last_work.qualification_full);
+        assert_full_oracle(&mut input);
+        let pose = *input.app.world().get::<Transform>(primitive).unwrap();
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .insert(SourceNodePose(pose));
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+    }
+    #[test]
+    fn retired_descendant_hides_and_sticky_mesh_refusals_match_full_oracle() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        input
+            .app
+            .world_mut()
+            .entity_mut(input.cell)
+            .insert(Visibility::Inherited);
+        crate::streaming::set_distance_retired_for_cluster_test(
+            input.app.world_mut(),
+            input.cell,
+            true,
+        );
+        input.app.update();
+        input.extract();
+        assert!(input.sources().retired_refs.contains(&REFERENCE));
+        assert_eq!(input.sources().last_work.retired_proof_keys_visited, 1);
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .insert(Visibility::Hidden);
+        input.extract();
+        assert!(!input.sources().retired_refs.contains(&REFERENCE));
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .insert(Visibility::Inherited);
+        input.extract();
+        assert!(input.sources().retired_refs.contains(&REFERENCE));
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .insert((RenderLayers::layer(2), bevy::light::NotShadowCaster));
+        input.extract();
+        let eligibility = &input.sources().retired_eligibility[&MainEntity::from(primitive)];
+        assert!(!eligibility.casts_shadows);
+        assert_eq!(eligibility.layers, RenderLayers::layer(2));
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().0.id();
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Modified { id: mesh });
+        input.assert_blocked();
+        assert!(!input.sources().retired_refs.contains(&REFERENCE));
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        // An ECS repair must not recertify an asset invalidated earlier in the run.
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .remove::<bevy::light::NotShadowCaster>();
+        input.assert_blocked();
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+    }
+
+    #[test]
+    fn hook_skipped_reparenting_uses_exact_childof_dependencies() {
+        use bevy::ecs::relationship::RelationshipHookMode;
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        let original = input
+            .app
+            .world()
+            .get::<ChildOf>(primitive)
+            .unwrap()
+            .parent();
+        let other = input
+            .app
+            .world_mut()
+            .spawn((
+                Transform::IDENTITY,
+                SourceNodePose(Transform::IDENTITY),
+                FormId(u32::MAX),
+            ))
+            .id();
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .insert_with_relationship_hook_mode(ChildOf(other), RelationshipHookMode::Skip);
+        input.extract();
+        assert!(!input.sources().bound.contains_key(&input.key));
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .insert_with_relationship_hook_mode(ChildOf(original), RelationshipHookMode::Skip);
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+    }
+    #[test]
+    fn unrelated_mesh_despawn_reclaims_ancestry_and_reference_memberships() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().clone();
+        let before = input.sources().last_work;
+        let version = input.sources().candidate_version;
+        for _ in 0..16 {
+            let root = input
+                .app
+                .world_mut()
+                .spawn((Transform::IDENTITY, FormId(u32::MAX), ChildOf(input.cell)))
+                .id();
+            input
+                .app
+                .world_mut()
+                .spawn((mesh.clone(), Transform::IDENTITY, ChildOf(root)));
+            input.extract();
+            assert_delta_only(&input);
+            assert_eq!(input.sources().last_work.roots_scanned, 0);
+            assert_eq!(
+                input.sources().last_work.indexed_subjects,
+                before.indexed_subjects + 2
+            );
+            input.app.world_mut().despawn(root);
+            input.extract();
+            assert_delta_only(&input);
+            let after = input.sources().last_work;
+            assert_eq!(
+                (
+                    after.indexed_subjects,
+                    after.indexed_nodes,
+                    after.indexed_reference_groups
+                ),
+                (
+                    before.indexed_subjects,
+                    before.indexed_nodes,
+                    before.indexed_reference_groups
+                )
+            );
+            assert_eq!(input.sources().candidate_version, version);
+        }
+        assert_full_oracle(&mut input);
+    }
+    #[test]
+    fn disabled_root_and_mesh_membership_changes_use_deltas() {
+        use bevy::ecs::entity_disabling::Disabled;
+        for own_statics in [false, true] {
+            let mut input = Fixture::pending();
+            let primitive = input.spawn_stock();
+            input.render.insert_resource(ClusterSettings {
+                own_statics,
+                ..default()
+            });
+            input.assert_bound(primitive);
+            for entity in [primitive, input.root] {
+                input.app.world_mut().entity_mut(entity).insert(Disabled);
+                input.extract();
+                assert!(!input.sources().bound.contains_key(&input.key));
+                assert_delta_only(&input);
+                assert_full_oracle(&mut input);
+                input
+                    .app
+                    .world_mut()
+                    .entity_mut(entity)
+                    .remove::<Disabled>();
+                input.assert_bound(primitive);
+                assert_delta_only(&input);
+                assert_full_oracle(&mut input);
+            }
+        }
+    }
+
+    #[test]
+    fn form_id_disabler_preserves_root_domain_hot_observation_and_history() {
+        use bevy::ecs::entity_disabling::Disabled;
+        for own_statics in [false, true] {
+            let mut input = Fixture::pending_with_disablers(|world| {
+                world.register_disabling_component::<FormId>();
+            });
+            let primitive = input.spawn_stock();
+            input.render.insert_resource(ClusterSettings {
+                own_statics,
+                ..default()
+            });
+            input.assert_bound(primitive);
+            let before = input.sources().last_work.indexed_subjects;
+            // Explicit required FormId admits this root while Query<Entity> does not.
+            let world = input.app.world_mut();
+            let mut generic = world.query::<Entity>();
+            assert!(generic.get(world, input.root).is_err());
+            assert!(world.entities().contains_spawned(input.root));
+            // Several ordinary deltas BEFORE the full oracle can repair the index.
+            let tag = *input.app.world().get::<SourcePrimitive>(primitive).unwrap();
+            input.app.world_mut().entity_mut(primitive).insert(tag);
+            input.assert_bound(primitive);
+            assert_delta_only(&input);
+            assert_eq!(input.sources().last_work.roots_scanned, 1);
+            assert_eq!(input.sources().last_work.indexed_subjects, before);
+            input
+                .app
+                .world_mut()
+                .get_mut::<Transform>(input.root)
+                .unwrap()
+                .translation
+                .x += 1.0;
+            input.assert_blocked();
+            assert_delta_only(&input);
+            assert_eq!(input.sources().last_work.roots_scanned, 1);
+            input
+                .app
+                .world_mut()
+                .entity_mut(input.root)
+                .insert(input.root_pose);
+            input.assert_bound(primitive);
+            assert_delta_only(&input);
+            // Same-value root writes remain semantically quiet after the aligned snapshot.
+            input
+                .app
+                .world_mut()
+                .entity_mut(input.root)
+                .insert(input.root_pose);
+            input.assert_bound(primitive);
+            assert_delta_only(&input);
+            assert_eq!(input.sources().last_work.roots_scanned, 0);
+            assert_full_oracle(&mut input);
+            input
+                .app
+                .world_mut()
+                .entity_mut(input.root)
+                .insert(Disabled);
+            input.extract();
+            assert_delta_only(&input);
+            assert!(!input.sources().bound.contains_key(&input.key));
+            assert!(input.sources().seen_roots[&input.root].contains(&REFERENCE));
+            assert!(input.sources().present.contains(&REFERENCE));
+            assert_full_oracle(&mut input);
+            input
+                .app
+                .world_mut()
+                .entity_mut(input.root)
+                .remove::<Disabled>();
+            input.assert_bound(primitive);
+            assert_delta_only(&input);
+            input.app.world_mut().despawn(input.root);
+            input.extract();
+            assert_delta_only(&input);
+            assert!(!input.sources().seen_roots.contains_key(&input.root));
+            assert_full_oracle(&mut input);
+        }
+    }
+
+    #[test]
+    fn mesh_disabler_indexes_mesh_role_without_broadening_parent_or_node_reads() {
+        for own_statics in [false, true] {
+            let mut input = Fixture::pending_with_disablers(|world| {
+                world.register_disabling_component::<Mesh3d>();
+            });
+            let primitive = input.spawn_stock();
+            input.render.insert_resource(ClusterSettings {
+                own_statics,
+                ..default()
+            });
+            input.extract();
+            // Mesh enumeration admits Mesh3d; dependency reads deliberately do not.
+            assert!(!input.sources().bound.contains_key(&input.key));
+            let before = input.sources().last_work.indexed_subjects;
+            let world = input.app.world_mut();
+            let mut meshes = world.query_filtered::<Entity, With<Mesh3d>>();
+            assert!(meshes.get(world, primitive).is_ok());
+            let mut generic = world.query::<Entity>();
+            assert!(generic.get(world, primitive).is_err());
+            let mut parents = world.query::<&ChildOf>();
+            assert!(parents.get(world, primitive).is_err());
+            let mesh = world.get::<Mesh3d>(primitive).unwrap().clone();
+            let added = world
+                .spawn((
+                    mesh,
+                    Transform::IDENTITY,
+                    SourceNodePose(Transform::IDENTITY),
+                    ChildOf(input.root),
+                ))
+                .id();
+            input.extract();
+            assert_delta_only(&input);
+            assert_eq!(input.sources().last_work.indexed_subjects, before + 1);
+            input.extract();
+            assert_delta_only(&input);
+            assert_eq!(input.sources().last_work.subjects_updated, 0);
+            *input.app.world_mut().get_mut::<Transform>(added).unwrap() = Transform::IDENTITY;
+            input.extract();
+            assert_delta_only(&input);
+            assert_eq!(input.sources().last_work.subjects_updated, 0);
+            // An in-place hot edit on an indexed Mesh3d must still be observed,
+            // even though no original dependency query can certify this primitive.
+            // The authored baseline makes this a semantic eligibility change;
+            // unbaselined poses are all the same refused proof.
+            input
+                .app
+                .world_mut()
+                .get_mut::<Transform>(added)
+                .unwrap()
+                .translation
+                .x += 1.0;
+            input.extract();
+            assert_delta_only(&input);
+            assert!(input.sources().last_work.subjects_updated > 0);
+            assert_full_oracle(&mut input);
+            input
+                .app
+                .world_mut()
+                .get_mut::<Transform>(added)
+                .unwrap()
+                .translation
+                .x += 1.0;
+            input.extract();
+            assert_delta_only(&input);
+            assert_eq!(input.sources().last_work.subjects_updated, 0);
+            *input.app.world_mut().get_mut::<Transform>(added).unwrap() = Transform::IDENTITY;
+            input.extract();
+            assert_delta_only(&input);
+            assert!(input.sources().last_work.subjects_updated > 0);
+            assert_full_oracle(&mut input);
+            let tag = *input.app.world().get::<SourcePrimitive>(primitive).unwrap();
+            input.app.world_mut().entity_mut(primitive).insert(tag);
+            input.extract();
+            assert_delta_only(&input);
+            assert!(input.sources().last_work.subjects_updated > 0);
+            assert!(!input.sources().bound.contains_key(&input.key));
+            assert_full_oracle(&mut input);
+            input.app.world_mut().entity_mut(added).remove::<Mesh3d>();
+            input.extract();
+            assert_delta_only(&input);
+            assert_eq!(input.sources().last_work.indexed_subjects, before);
+            input.app.world_mut().despawn(added);
+            input.extract();
+            assert_delta_only(&input);
+            assert_full_oracle(&mut input);
+        }
+    }
+
+    #[test]
+    fn replacement_journal_with_unrelated_suffix_requires_full_epoch_coverage() {
+        use crate::streaming::identity_changes::{SourceNodeChanged, StructureEpoch};
+        for own_statics in [false, true] {
+            let mut input = Fixture::pending();
+            let primitive = input.spawn_stock();
+            input.render.insert_resource(ClusterSettings {
+                own_statics,
+                ..default()
+            });
+            input.assert_bound(primitive);
+            let mut stale = input
+                .app
+                .world()
+                .resource::<Messages<SourceNodeChanged>>()
+                .get_cursor_current();
+            // Epoch count bounds the old cursor count even if older messages expired.
+            let unrelated = usize::try_from(input.app.world().resource::<StructureEpoch>().version)
+                .unwrap()
+                + 1;
+            input
+                .app
+                .world_mut()
+                .entity_mut(primitive)
+                .remove::<SourceNodePose>();
+            input
+                .app
+                .world_mut()
+                .insert_resource(Messages::<SourceNodeChanged>::default());
+            for _ in 0..unrelated {
+                input.app.world_mut().spawn(Transform::IDENTITY);
+            }
+            let journal = input.app.world().resource::<Messages<SourceNodeChanged>>();
+            assert_eq!(stale.missed_messages(journal), 0);
+            let surviving: Vec<_> = stale.read(journal).copied().collect();
+            assert!(!surviving.is_empty());
+            assert!(surviving.iter().all(|event| event.entity != primitive));
+            input.assert_blocked();
+            let work = input.sources().last_work;
+            assert!(work.qualification_full);
+            assert!(work.journal_events > 0);
+            assert!(!work.journal_complete);
+            // Resynchronization is checked immediately, without an intervening oracle.
+            let pose = *input.app.world().get::<Transform>(primitive).unwrap();
+            input
+                .app
+                .world_mut()
+                .entity_mut(primitive)
+                .insert(SourceNodePose(pose));
+            input.assert_bound(primitive);
+            assert_delta_only(&input);
+            assert!(input.sources().last_work.journal_complete);
+            assert_full_oracle(&mut input);
+        }
+    }
+
+    #[test]
+    fn missing_or_lower_count_journal_recovers_and_resynchronizes_before_next_delta() {
+        use crate::streaming::identity_changes::SourceNodeChanged;
+        for missing_at_extract in [false, true] {
+            let mut input = Fixture::pending();
+            let primitive = input.spawn_stock();
+            input.assert_bound(primitive);
+            input
+                .app
+                .world_mut()
+                .remove_resource::<Messages<SourceNodeChanged>>();
+            // The epoch still advances if the journal resource itself is absent.
+            input
+                .app
+                .world_mut()
+                .entity_mut(primitive)
+                .remove::<SourceNodePose>();
+            if !missing_at_extract {
+                input
+                    .app
+                    .world_mut()
+                    .insert_resource(Messages::<SourceNodeChanged>::default());
+            }
+            input.assert_blocked();
+            assert!(input.sources().last_work.qualification_full);
+            assert!(!input.sources().last_work.journal_complete);
+            if missing_at_extract {
+                input
+                    .app
+                    .world_mut()
+                    .insert_resource(Messages::<SourceNodeChanged>::default());
+            }
+            let pose = *input.app.world().get::<Transform>(primitive).unwrap();
+            input
+                .app
+                .world_mut()
+                .entity_mut(primitive)
+                .insert(SourceNodePose(pose));
+            input.assert_bound(primitive);
+            assert_delta_only(&input);
+            assert!(input.sources().last_work.journal_complete);
+            assert_full_oracle(&mut input);
+        }
+    }
+
+    #[test]
+    fn retired_proof_visits_only_reference_keys_including_ambiguous_keys() {
+        let mut stock = HashMap::new();
+        let member = MainEntity::from(Entity::from_raw_u32(1).unwrap());
+        stock.insert((REFERENCE, 0), member);
+        for reference in 0..256 {
+            stock.insert((u32::MAX - reference, 0), member);
+        }
+        let keys = HashSet::from([(REFERENCE, 0), (REFERENCE, 1)]);
+        let mut work = SourceExtractionWork::default();
+        let (proven, instantiated) = retired_reference_proof(Some(&keys), &stock, &mut work);
+        assert_eq!(proven, HashSet::from([member]));
+        assert_eq!(instantiated, BTreeSet::from([0]));
+        assert_eq!(work.retired_proof_keys_visited, 2);
+        let (proven, instantiated) = retired_reference_proof(None, &stock, &mut work);
+        assert!(proven.is_empty());
+        assert!(instantiated.is_empty());
+        assert_eq!(work.retired_proof_keys_visited, 2);
+    }
+
+    fn source_template(input: &mut Fixture) -> Handle<WorldAsset> {
+        let scene = input
+            .app
+            .world()
+            .get::<WorldAssetRoot>(input.root)
+            .unwrap()
+            .0
+            .clone();
+        let material = input
+            .app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        input
+            .app
+            .world_mut()
+            .resource_mut::<ClusterBatchHandles>()
+            .set(0, material);
+        input
+            .app
+            .insert_resource(LazyBatches::for_source_test(MODEL, scene.clone()));
+        scene
+    }
+
+    #[test]
+    fn unrelated_mesh_events_do_no_qualification_work_in_either_ownership_mode() {
+        for own_statics in [false, true] {
+            let mut input = Fixture::pending();
+            let primitive = input.spawn_stock();
+            input.render.insert_resource(ClusterSettings {
+                own_statics,
+                ..default()
+            });
+            source_template(&mut input);
+            input.assert_bound(primitive);
+            input.extract();
+            assert!(input.sources().templates[0]);
+            let version = input.sources().candidate_version;
+            let refreshes = input.sources().qualification_refreshes;
+            let mesh = Handle::<Mesh>::Uuid(
+                bevy::asset::uuid::Uuid::from_u128(0xabcdef),
+                std::marker::PhantomData,
+            );
+            for event in [
+                AssetEvent::Modified { id: mesh.id() },
+                AssetEvent::Removed { id: mesh.id() },
+            ] {
+                input
+                    .app
+                    .world_mut()
+                    .resource_mut::<Messages<AssetEvent<Mesh>>>()
+                    .write(event);
+                input.assert_bound(primitive);
+                let work = input.sources().last_work;
+                assert_eq!(
+                    (
+                        work.roots_scanned,
+                        work.meshes_scanned,
+                        work.primitives_scanned,
+                        work.template_rows,
+                        work.stock_rows_revoked
+                    ),
+                    (0, 0, 0, 0, 0)
+                );
+                assert_eq!(input.sources().qualification_refreshes, refreshes);
+                assert_eq!(input.sources().candidate_version, version);
+                assert!(input.sources().templates[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_bound_mesh_modification_revokes_stock_and_its_template_without_a_scene_scan() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        source_template(&mut input);
+        input.assert_bound(primitive);
+        input.extract();
+        assert!(input.sources().templates[0]);
+        let version = input.sources().candidate_version;
+        let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().0.id();
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Modified { id: mesh });
+        input.assert_blocked();
+        let work = input.sources().last_work;
+        assert_eq!(
+            (
+                work.roots_scanned,
+                work.meshes_scanned,
+                work.primitives_scanned
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!((work.stock_rows_revoked, work.template_rows), (1, 1));
+        assert!(!input.sources().templates[0]);
+        assert!(input.sources().source_fallback_batches.contains(&0));
+        assert!(
+            !input
+                .sources()
+                .stock_primitives
+                .contains_key(&(REFERENCE, 0))
+        );
+        assert!(input.sources().candidate_version > version);
+        let revoked_version = input.sources().candidate_version;
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Removed { id: mesh });
+        input.assert_blocked();
+        assert_eq!(input.sources().last_work.stock_rows_revoked, 0);
+        assert_eq!(input.sources().candidate_version, revoked_version);
+    }
+
+    #[test]
+    fn a_scene_modification_redecides_only_its_template_and_preserves_live_stock_proof() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        let scene = source_template(&mut input);
+        input.assert_bound(primitive);
+        input.extract();
+        let refreshes = input.sources().qualification_refreshes;
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<WorldAsset>>>()
+            .write(AssetEvent::Modified { id: scene.id() });
+        input.assert_bound(primitive);
+        let work = input.sources().last_work;
+        assert_eq!(
+            (
+                work.roots_scanned,
+                work.meshes_scanned,
+                work.primitives_scanned,
+                work.stock_rows_revoked,
+                work.template_rows
+            ),
+            (0, 0, 0, 0, 1)
+        );
+        assert_eq!(input.sources().qualification_refreshes, refreshes);
+        assert!(!input.sources().templates[0]);
+    }
+
+    #[test]
+    fn simultaneous_ecs_mutation_and_asset_invalidation_keep_runtime_root_checks() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().0.id();
+        input
+            .app
+            .world_mut()
+            .entity_mut(input.root)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation
+            .x += 1.0;
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Modified { id: mesh });
+        input.assert_blocked();
+        assert!(input.sources().last_work.roots_scanned > 0);
+        input
+            .app
+            .world_mut()
+            .entity_mut(input.root)
+            .insert(input.root_pose);
+        input.assert_blocked(); // Returning the pose does not recertify the modified mesh.
+    }
+
+    #[test]
+    fn a_mesh_withdrawal_revokes_the_entire_retired_reference_exception() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        input
+            .app
+            .world_mut()
+            .entity_mut(input.cell)
+            .insert(Visibility::Inherited);
+        crate::streaming::set_distance_retired_for_cluster_test(
+            input.app.world_mut(),
+            input.cell,
+            true,
+        );
+        input.app.update();
+        input.extract();
+        assert!(input.sources().retired_refs.contains(&REFERENCE));
+        input.extract();
+        let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().0.id();
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Removed { id: mesh });
+        input.assert_blocked();
+        assert!(!input.sources().retired_refs.contains(&REFERENCE));
+        assert!(input.sources().retired_present.contains(&REFERENCE));
+        assert!(input.sources().retired_materials.is_empty());
+        assert!(input.sources().retired_eligibility.is_empty());
+        assert_eq!(input.sources().last_work.meshes_scanned, 0);
+    }
+
+    #[test]
+    fn asset_deltas_match_forced_full_qualification_and_preserve_an_unaffected_row() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        let scene = source_template(&mut input);
+        // A second material row has no source scene. It must not be redecided for row 0's mesh.
+        let material = input
+            .app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        input
+            .app
+            .world_mut()
+            .resource_mut::<ClusterBatchHandles>()
+            .set(1, material);
+        input.assert_bound(primitive);
+        input.extract();
+        assert!(input.sources().templates[0]);
+        let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().0.id();
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Removed { id: mesh });
+        input.extract();
+        assert_eq!(input.sources().last_work.template_rows, 1);
+        let incremental = input.sources();
+        let expected = (
+            incremental.present.clone(),
+            incremental.bound.clone(),
+            incremental.stock_primitives.clone(),
+            incremental.retired_refs.clone(),
+            incremental.retired_materials.clone(),
+            incremental.retired_eligibility.clone(),
+            incremental.templates.clone(),
+            incremental.normal_maps.clone(),
+            incremental.source_fallback_batches.clone(),
+        );
+        // Replacing only the Arc forces the independent existing full ECS path.
+        let replacement = Arc::new(
+            crate::cluster::overlay_fixture::open_fixture(input._directory.path(), false).unwrap(),
+        );
+        input.app.insert_resource(ValidatedPackage(replacement));
+        input.extract();
+        let rebuilt = input.sources();
+        assert_eq!(
+            expected,
+            (
+                rebuilt.present.clone(),
+                rebuilt.bound.clone(),
+                rebuilt.stock_primitives.clone(),
+                rebuilt.retired_refs.clone(),
+                rebuilt.retired_materials.clone(),
+                rebuilt.retired_eligibility.clone(),
+                rebuilt.templates.clone(),
+                rebuilt.normal_maps.clone(),
+                rebuilt.source_fallback_batches.clone()
+            )
+        );
+        assert!(rebuilt.template_meshes.by_scene.contains_key(&scene.id()));
+    }
+
+    #[test]
+    fn invalidating_one_ambiguous_candidate_binds_the_survivor_without_a_scene_scan() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        let original_mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().0.id();
+        // An independent labelled handle in the same model path exercises differing asset
+        // dependencies of duplicated runtime ordinals. No asset I/O needs to finish.
+        let alternative: Handle<Mesh> = input
+            .app
+            .world()
+            .resource::<AssetServer>()
+            .load(format!("{MODEL}#Mesh999/Primitive0"));
+        let world = input.app.world();
+        let pose = *world.get::<Transform>(primitive).unwrap();
+        let baseline = *world.get::<SourceNodePose>(primitive).unwrap();
+        let parent = world.get::<ChildOf>(primitive).unwrap().parent();
+        let tag = *world.get::<SourcePrimitive>(primitive).unwrap();
+        let matrix = *world.get::<SourcePrimitiveTransform>(primitive).unwrap();
+        let static_model = *world.get::<SourceStaticModel>(primitive).unwrap();
+        let duplicate = input
+            .app
+            .world_mut()
+            .spawn((
+                Mesh3d(alternative.clone()),
+                SourcePrimitiveMesh(alternative),
+                pose,
+                baseline,
+                ChildOf(parent),
+                tag,
+                matrix,
+                static_model,
+            ))
+            .id();
+        input.assert_blocked();
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Modified { id: original_mesh });
+        input.assert_bound(duplicate);
+        assert_eq!(input.sources().last_work.stock_rows_requalified, 1);
+        assert_eq!(input.sources().last_work.meshes_scanned, 0);
+        let replacement = Arc::new(
+            crate::cluster::overlay_fixture::open_fixture(input._directory.path(), false).unwrap(),
+        );
+        input.app.insert_resource(ValidatedPackage(replacement));
+        input.assert_bound(duplicate);
+    }
+
+    #[test]
+    fn refused_template_dependencies_include_all_meshes_and_remove_only_the_replaced_scene() {
+        let mesh_a = Handle::<Mesh>::Uuid(
+            bevy::asset::uuid::Uuid::from_u128(701),
+            std::marker::PhantomData,
+        );
+        let mesh_b = Handle::<Mesh>::Uuid(
+            bevy::asset::uuid::Uuid::from_u128(702),
+            std::marker::PhantomData,
+        );
+        let mut first = World::new();
+        first.spawn(Mesh3d(mesh_a.clone())); // Missing identity: validation refuses immediately.
+        first.spawn(Mesh3d(mesh_b.clone()));
+        let mut second = World::new();
+        second.spawn(Mesh3d(mesh_b.clone()));
+        let mut assets = Assets::<WorldAsset>::default();
+        let first = assets.add(WorldAsset::new(first));
+        let second = assets.add(WorldAsset::new(second));
+        assert!(!template_valid(
+            assets.get(&first).unwrap(),
+            &HashSet::new()
+        ));
+        let mut dependencies = TemplateMeshDependencies::default();
+        dependencies.register(first.id(), assets.get(&first).unwrap());
+        dependencies.register(second.id(), assets.get(&second).unwrap());
+        assert_eq!(
+            dependencies.by_mesh[&mesh_b.id()],
+            HashSet::from([first.id(), second.id()])
+        );
+        assert_eq!(
+            dependencies.by_mesh[&mesh_a.id()],
+            HashSet::from([first.id()])
+        );
+        dependencies.remove(first.id());
+        assert!(!dependencies.by_mesh.contains_key(&mesh_a.id()));
+        assert_eq!(
+            dependencies.by_mesh[&mesh_b.id()],
+            HashSet::from([second.id()])
+        );
+        dependencies.remove(second.id());
+        assert!(dependencies.by_scene.is_empty());
+        assert!(dependencies.by_mesh.is_empty());
     }
 
     #[test]

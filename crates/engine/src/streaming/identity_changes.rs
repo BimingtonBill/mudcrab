@@ -126,6 +126,14 @@ pub(crate) fn install_terrain(world: &mut World) {
     );
 }
 
+/// Exact cluster-source lifecycle journal; independent extraction cursor.
+/// Each recorded entry carries its exact epoch increment, including unrelated entities.
+#[derive(Message, Clone, Copy)]
+pub(crate) struct SourceNodeChanged {
+    pub entity: Entity,
+    pub epoch: u64,
+}
+
 pub(crate) fn install(world: &mut World) {
     install_terrain(world);
     if world.contains_resource::<StructureEpoch>() {
@@ -174,6 +182,7 @@ pub(crate) fn install(world: &mut World) {
     components.extend(disablers.iter().copied());
     components.sort();
     components.dedup();
+    bevy::ecs::message::MessageRegistry::register_message::<SourceNodeChanged>(world);
     world.insert_resource(StructureEpoch {
         version: 0,
         disablers,
@@ -181,15 +190,35 @@ pub(crate) fn install(world: &mut World) {
     // Bevy lifecycle dispatch requires component-scoped observer flags. A bare
     // global On<Add>/On<Remove> does not establish those archetype flags.
     world.spawn(
-        Observer::new(|_: On<Add>, mut epoch: ResMut<StructureEpoch>| {
-            epoch.version = epoch.version.wrapping_add(1);
-        })
+        Observer::new(
+            |event: On<Add>,
+             mut epoch: ResMut<StructureEpoch>,
+             changes: Option<ResMut<Messages<SourceNodeChanged>>>| {
+                epoch.version = epoch.version.wrapping_add(1);
+                if let Some(mut changes) = changes {
+                    changes.write(SourceNodeChanged {
+                        entity: event.entity,
+                        epoch: epoch.version,
+                    });
+                }
+            },
+        )
         .with_components(components.clone()),
     );
     world.spawn(
-        Observer::new(|_: On<Remove>, mut epoch: ResMut<StructureEpoch>| {
-            epoch.version = epoch.version.wrapping_add(1);
-        })
+        Observer::new(
+            |event: On<Remove>,
+             mut epoch: ResMut<StructureEpoch>,
+             changes: Option<ResMut<Messages<SourceNodeChanged>>>| {
+                epoch.version = epoch.version.wrapping_add(1);
+                if let Some(mut changes) = changes {
+                    changes.write(SourceNodeChanged {
+                        entity: event.entity,
+                        epoch: epoch.version,
+                    });
+                }
+            },
+        )
         .with_components(components),
     );
 }
