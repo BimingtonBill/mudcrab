@@ -121,6 +121,8 @@ pub(super) mod queue_stats {
     pub static SHADOW_FULL: AtomicU64 = AtomicU64::new(0);
     pub static SHADOW_SKIPPED: AtomicU64 = AtomicU64::new(0);
     pub static SHADOW_NANOS: AtomicU64 = AtomicU64::new(0);
+    /// Source orders built (one serves every view with the same draw groups).
+    pub static ORDER_BUILDS: AtomicU64 = AtomicU64::new(0);
     /// The other per-frame cluster systems: the batch loader (main world), the material and batch
     /// extraction, the GPU preparation and the cull encode (render world).
     pub static LOAD_NANOS: AtomicU64 = AtomicU64::new(0);
@@ -177,13 +179,14 @@ pub(super) mod queue_stats {
         let per_frame = |nanos: u64| nanos as f64 / 1.0e6 / QUEUE_REPORT_EVERY as f64;
         bevy::log::info!(
             "cluster queue over {QUEUE_REPORT_EVERY} frames: batches {} full / {} skipped views, {:.2} ms/frame; \
-             shadows {} full / {} skipped views, {:.2} ms/frame; batch loader {:.2}, extract {:.2}, prepare {:.2}, cull {:.2} ms/frame (writes {:.2}, passes {:.2}); draw groups: camera {} ({} pipelines x {} material bind groups; {} of {} batches bindless), a shadow view {}",
+             shadows {} full / {} skipped views, {:.2} ms/frame; source orders built {}; batch loader {:.2}, extract {:.2}, prepare {:.2}, cull {:.2} ms/frame (writes {:.2}, passes {:.2}); draw groups: camera {} ({} pipelines x {} material bind groups; {} of {} batches bindless), a shadow view {}",
             take(&BATCH_FULL),
             take(&BATCH_SKIPPED),
             per_frame(take(&BATCH_NANOS)),
             take(&SHADOW_FULL),
             take(&SHADOW_SKIPPED),
             per_frame(take(&SHADOW_NANOS)),
+            take(&ORDER_BUILDS),
             per_frame(take(&LOAD_NANOS)),
             per_frame(take(&EXTRACT_NANOS)),
             per_frame(take(&PREPARE_NANOS)),
@@ -908,7 +911,8 @@ struct ViewGpu {
     instance_list: Buffer,
     dispatch: Buffer,
     source_order: Buffer,
-    order_words: Vec<u32>,
+    /// The source order `source_order` holds, shared with every view of the same draw groups.
+    order: Option<Arc<stable_order::SharedOrder>>,
     compaction_tiles: u32,
     large_scatter_count: u32,
     compaction_bind_groups: [BindGroup; 6],
@@ -1059,19 +1063,51 @@ impl DrawGroups {
         stable_order::source_order(instances, &bases, large_instances, ordered_instances)
     }
 
+    /// The source order of these groups, built only when no view holds it already (see
+    /// [`stable_order::OrderCache`]).
+    fn shared_order(&self, gpu: &mut ClusterGpu) -> Arc<stable_order::SharedOrder> {
+        let ClusterGpu {
+            order_cache,
+            batches,
+            large_instances,
+            total_instances,
+            layout_epoch,
+            ..
+        } = gpu;
+        let builds = order_cache.builds;
+        let order =
+            order_cache.get_or_build(*layout_epoch, &self.groups, &self.batch_group, || {
+                self.order(batches, large_instances, *total_instances)
+            });
+        if order_cache.builds != builds {
+            queue_stats::bump(&queue_stats::ORDER_BUILDS);
+        }
+        order
+    }
+
     /// Writes immutable ordering and batch metadata only when their inputs changed.
-    fn apply(self, view_gpu: &mut ViewGpu, queue: &RenderQueue, order: Vec<u32>) {
+    fn apply(
+        self,
+        view_gpu: &mut ViewGpu,
+        queue: &RenderQueue,
+        order: Arc<stable_order::SharedOrder>,
+    ) {
         perf_span!("cluster::plan::apply");
-        view_gpu.compaction_tiles = order[1];
-        view_gpu.large_scatter_count = order[order[3] as usize];
-        if order != view_gpu.order_words {
+        let words = &order.words;
+        view_gpu.compaction_tiles = words[1];
+        view_gpu.large_scatter_count = words[words[3] as usize];
+        let written = view_gpu
+            .order
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, &order) || held.words == *words);
+        if !written {
             #[cfg(feature = "tracy")]
             let _span =
-                bevy::log::info_span!("cluster::upload::source_order", bytes = order.len() * 4)
+                bevy::log::info_span!("cluster::upload::source_order", bytes = words.len() * 4)
                     .entered();
-            queue.write_buffer(&view_gpu.source_order, 0, bytemuck::cast_slice(&order));
-            view_gpu.order_words = order;
+            queue.write_buffer(&view_gpu.source_order, 0, bytemuck::cast_slice(words));
         }
+        view_gpu.order = Some(order);
         let (draws, table) = self.plan();
         view_gpu.draws.clear();
         for (group, draw) in draws.into_iter().enumerate() {
@@ -1398,6 +1434,8 @@ struct ClusterGpu {
     /// Whether the adapter can read the draw count on the GPU (`multi_draw_indirect_count`); when
     /// it cannot, the draw covers the whole list and the cull pass leaves unused entries empty.
     use_count: bool,
+    /// The source orders the views hold, shared between views with the same draw groups.
+    order_cache: stable_order::OrderCache,
     views: HashMap<RetainedViewEntity, ViewGpu>,
 }
 
@@ -2048,6 +2086,7 @@ fn prepare_cluster_gpu(
             && device
                 .features()
                 .contains(bevy::render::settings::WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT),
+        order_cache: stable_order::OrderCache::default(),
         views: HashMap::new(),
     });
 }
@@ -2610,7 +2649,7 @@ fn queue_cluster_batches(
             .filter(|ready| is_terrain_batch(ready.index))
             .count() as u32;
         note_terrain_walk(terrain_walk, groups.groups.len() as u32);
-        let order = groups.order(&gpu.batches, &gpu.large_instances, gpu.total_instances);
+        let order = groups.shared_order(gpu);
         let Some(view_gpu) = gpu.views.get_mut(&key) else {
             continue;
         };
@@ -3359,7 +3398,7 @@ fn new_view_gpu(
         instance_list,
         dispatch,
         source_order,
-        order_words: Vec::new(),
+        order: None,
         compaction_tiles: 0,
         large_scatter_count: 0,
         compaction_bind_groups,
@@ -4227,7 +4266,7 @@ fn queue_cluster_shadows(
                 });
             }
         }
-        let order = groups.order(&gpu.batches, &gpu.large_instances, gpu.total_instances);
+        let order = groups.shared_order(&mut gpu);
         if let Some(view_gpu) = gpu.views.get_mut(&key) {
             for previous in view_gpu.plan_items.drain(..) {
                 phase.remove(previous);
