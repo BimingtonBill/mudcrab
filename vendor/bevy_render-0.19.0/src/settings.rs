@@ -174,6 +174,28 @@ pub struct RenderResources(
 );
 
 impl RenderResources {
+    /// Packages resources created through ordinary wgpu initialization.
+    ///
+    /// No raw Vulkan callbacks ran for these resources, so the additional feature
+    /// inventory is empty even when `raw_vulkan_init` is enabled by another crate.
+    pub fn from_wgpu(
+        device: RenderDevice,
+        queue: RenderQueue,
+        adapter_info: RenderAdapterInfo,
+        adapter: RenderAdapter,
+        instance: RenderInstance,
+    ) -> Self {
+        Self(
+            device,
+            queue,
+            adapter_info,
+            adapter,
+            instance,
+            #[cfg(feature = "raw_vulkan_init")]
+            renderer::raw_vulkan_init::AdditionalVulkanFeatures::default(),
+        )
+    }
+
     /// Effectively, this replaces the current render backend entirely with the given resources.
     ///
     /// We deconstruct the [`RenderResources`] and make them usable by the main and render worlds,

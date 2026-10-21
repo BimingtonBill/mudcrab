@@ -7,6 +7,7 @@ members = [
     "crates/launcher",
     "crates/mo2",
     "crates/shared",
+    "vendor/bevy_render-0.19.0",
 ]
 
 [workspace.package]
@@ -59,6 +60,10 @@ project-wormhole-esm = "0.1.0"
 opt-level = 1
 
 [profile.dev.package."*"]
+opt-level = 3
+
+# Keep the vendored renderer's existing dependency optimization after making its tests runnable.
+[profile.dev.package.bevy_render]
 opt-level = 3
 
 [profile.release]

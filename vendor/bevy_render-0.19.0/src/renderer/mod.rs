@@ -176,6 +176,24 @@ async fn find_adapter_by_name(
     None
 }
 
+/// Initializes a renderer without application-provided raw Vulkan callbacks.
+///
+/// This entry point has the same arguments regardless of feature unification.
+pub async fn initialize_renderer_without_callbacks(
+    backends: Backends,
+    primary_window: Option<RawHandleWrapperHolder>,
+    options: &WgpuSettings,
+) -> RenderResources {
+    initialize_renderer(
+        backends,
+        primary_window,
+        options,
+        #[cfg(feature = "raw_vulkan_init")]
+        raw_vulkan_init::RawVulkanInitSettings::default(),
+    )
+    .await
+}
+
 /// Initializes the renderer by retrieving and preparing the GPU instance, device and queue
 /// for the specified backend.
 pub async fn initialize_renderer(

@@ -250,7 +250,7 @@ async fn initialize_renderer(
     let (device, queue) = adapter.request_device(&descriptor).await.unwrap();
     bevy::log::debug!("Configured wgpu adapter Limits: {:#?}", device.limits());
     bevy::log::debug!("Configured wgpu adapter Features: {:#?}", device.features());
-    RenderResources(
+    RenderResources::from_wgpu(
         RenderDevice::from(device),
         RenderQueue(Arc::new(WgpuWrapper::new(queue))),
         RenderAdapterInfo(WgpuWrapper::new(adapter_info)),
