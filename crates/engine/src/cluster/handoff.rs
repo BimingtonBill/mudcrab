@@ -2217,6 +2217,60 @@ enum Domain {
 struct DomainFacts {
     consumers: Vec<RetainedViewEntity>,
     visible: bevy::platform::collections::HashSet<MainEntity>,
+    /// Whether `visible` was read this frame (one visibility class serves the whole domain).
+    collected: bool,
+    /// Whether `visible`, or the stock material of a mesh in it, may differ from last frame's.
+    changed: bool,
+}
+
+/// A domain's visible stock meshes, kept between frames and moved by the visibility class's own
+/// added and removed lists, so a frame in which nothing came into or left view reads nothing.
+#[derive(Default)]
+struct DomainVisible {
+    set: bevy::platform::collections::HashSet<MainEntity>,
+    /// The `Filters::frames` it was last updated in: a delta applies to last frame's set only.
+    frame: u64,
+}
+
+/// Brings `previous` (last frame's visible set of a domain) to this frame's `class`, and says
+/// whether it changed. The class's added and removed lists are the change since last frame,
+/// including what the stock visibility filters ahead of the selection hid or gave back (see
+/// [`ClassFilter::apply`]), so they apply only to the set of the frame just before; anything else
+/// is read in full.
+fn update_domain_visible(
+    previous: Option<DomainVisible>,
+    class: Option<&RenderVisibleEntitiesClass>,
+    frame: u64,
+) -> (DomainVisible, bool) {
+    let consecutive = previous
+        .as_ref()
+        .is_some_and(|previous| previous.frame.wrapping_add(1) == frame);
+    let mut visible = previous.unwrap_or_default();
+    visible.frame = frame;
+    let changed = match class {
+        Some(class) if consecutive => {
+            for (_, main) in &class.removed_entities {
+                visible.set.remove(main);
+            }
+            for (_, main) in &class.added_entities {
+                visible.set.insert(*main);
+            }
+            !class.removed_entities.is_empty() || !class.added_entities.is_empty()
+        }
+        Some(class) => {
+            visible.set.clear();
+            visible
+                .set
+                .extend(class.iter_visible().map(|(_, main)| *main));
+            true
+        }
+        None => {
+            let changed = !consecutive || !visible.set.is_empty();
+            visible.set.clear();
+            changed
+        }
+    };
+    (visible, changed)
 }
 
 #[derive(Resource, Default)]
@@ -2228,10 +2282,25 @@ struct Filters {
     bases: Vec<Arc<SelectionBase>>,
     saved: HashMap<Domain, ClassFilter>,
     active: HashSet<Domain>,
+    /// Each domain's visible stock meshes, as of the frame it was last selected in.
+    visible: HashMap<Domain, DomainVisible>,
+    /// Each domain's stock hide decision (what every consumer chose), as last applied.
+    joints: HashMap<
+        Domain,
+        (
+            Vec<RetainedViewEntity>,
+            bevy::platform::collections::HashSet<MainEntity>,
+        ),
+    >,
+    /// Selections reused unchanged, and rebuilt, since the last report.
+    reused: u64,
+    rebuilt: u64,
 }
 
 pub(super) struct Selection {
     stamp: [u64; 7],
+    /// The view's render layers the retired sources were filtered by.
+    layers: RenderLayers,
     visible: bevy::platform::collections::HashSet<MainEntity>,
     readiness: Vec<bool>,
     stock_materials: HashMap<MainEntity, Option<bevy::asset::UntypedAssetId>>,
@@ -3307,17 +3376,18 @@ fn select_instances(
     mut shadows: Query<&mut RenderShadowMapVisibleEntities>,
     scene: Option<Res<ClusterScene>>,
     mut filters: ResMut<Filters>,
-    (native, settings, batch_materials, runtime_state, mut terrain_coverage): (
+    (native, settings, batch_materials, runtime_state, mut terrain_coverage, dirty): (
         Option<Res<crate::streaming::native_lod::FarNativePolicy>>,
         Option<Res<ClusterSettings>>,
         Option<Res<super::ClusterBatchMaterials>>,
         Option<Res<super::super::runtime_state::RuntimeReferenceState>>,
         ResMut<crate::streaming::terrain_handoff::ClusterCoverage>,
+        Option<Res<bevy::render::camera::DirtySpecializations>>,
     ),
 ) {
-    // Clear even if a withdrawn GPU/package means this frame has no selection.
-    terrain_coverage.views.clear();
     let Some(mut gpu) = gpu else {
+        // Clear even if a withdrawn GPU/package means this frame has no selection.
+        terrain_coverage.views.clear();
         return;
     };
     perf_span!("cluster::select::total");
@@ -3329,6 +3399,7 @@ fn select_instances(
     filters.bases.retain(|base| Arc::strong_count(base) > 1);
     let mut domains: HashMap<Domain, DomainFacts> = HashMap::new();
     let mut layers_by_view = HashMap::new();
+    let mut previous_visible = std::mem::take(&mut filters.visible);
     for (entity, view, light, visible, layers) in &views {
         let key = view.retained_view_entity;
         if !gpu.views.contains_key(&key) {
@@ -3346,14 +3417,32 @@ fn select_instances(
         let facts = domains.entry(domain).or_default();
         facts.consumers.push(key);
         // With owned statics no selection reads the visible set (see `selection_inputs`).
-        if own_statics {
+        if own_statics || facts.collected {
             continue;
         }
-        if let Some(class) = visible.and_then(|visible| visible.get::<Mesh3d>()) {
-            facts
-                .visible
-                .extend(class.iter_visible().map(|(_, main)| *main));
+        facts.collected = true;
+        let (domain_visible, changed) = update_domain_visible(
+            previous_visible.remove(&domain),
+            visible.and_then(|visible| visible.get::<Mesh3d>()),
+            filters.frames,
+        );
+        facts.visible = domain_visible.set;
+        facts.changed = changed;
+    }
+    drop(previous_visible);
+    // A stock mesh whose material changed (or went) changes what its view's selection binds,
+    // even when nothing came into or left view.
+    for facts in domains.values_mut() {
+        if facts.changed || !facts.collected {
+            continue;
         }
+        facts.changed = dirty.as_deref().is_none_or(|dirty| {
+            dirty
+                .changed_renderables
+                .iter()
+                .chain(&dirty.removed_renderables)
+                .any(|main| facts.visible.contains(main))
+        });
     }
     let compute_ready = prepared_cluster_cull(&gpu, &frame, &pipelines, &cache).is_some();
     let same_certificate = match (&gpu.certificate, &sources.certificate) {
@@ -3361,13 +3450,12 @@ fn select_instances(
         (None, None) => true,
         _ => false,
     };
-    let mut wanted = HashMap::new();
     // The views whose selection this frame rebuilt; only their masks can have changed.
     let mut rebuilt = HashSet::new();
+    let mut covered_views = HashSet::new();
     for (domain, facts) in &domains {
         perf_span!("cluster::select::domain");
         let shadow = matches!(domain, Domain::Shadow(..));
-        let mut joint: Option<bevy::platform::collections::HashSet<MainEntity>> = None;
         for key in &facts.consumers {
             let world = sources
                 .worlds
@@ -3379,20 +3467,7 @@ fn select_instances(
             // all (`--no-cluster-prepass` leaves the camera's prepass to the stock meshes).
             let prepass = prepass_phases.contains_key(key)
                 && settings.as_ref().is_none_or(|settings| settings.prepass);
-            let retired_allowed = retired_allowed_for_view(
-                &sources.retired_eligibility,
-                &layers_by_view[key],
-                shadow,
-            );
-            // With owned statics nothing in the selection depends on the visible set: owned stock
-            // is hidden at spawn and stock terrain under cluster terrain is hidden by cell below.
-            let mut selection_inputs = if own_statics {
-                bevy::platform::collections::HashSet::default()
-            } else {
-                perf_span!("cluster::select::inputs_clone");
-                facts.visible.clone()
-            };
-            selection_inputs.extend(retired_allowed.iter().copied());
+            let layers: &RenderLayers = &layers_by_view[key];
             let readiness_span = ::bevy::log::info_span!("cluster::select::readiness").entered();
             let readiness = cached_batch_readiness(
                 &mut gpu,
@@ -3403,30 +3478,6 @@ fn select_instances(
                 (&cache, &materials, &allocators, far_state.as_deref()),
             );
             drop(readiness_span);
-            let stock_span = ::bevy::log::info_span!("cluster::select::stock_ids").entered();
-            let retired_bound = sources.retired_materials.keys();
-            let stock_ids: HashMap<_, _> = if own_statics {
-                HashMap::new()
-            } else {
-                facts
-                    .visible
-                    .iter()
-                    .chain(retired_bound)
-                    .map(|main| {
-                        (
-                            *main,
-                            match sources.retired_materials.get(main) {
-                                Some(material) => *material,
-                                None => stock_materials
-                                    .instances
-                                    .get(main)
-                                    .map(|instance| instance.asset_id),
-                            },
-                        )
-                    })
-                    .collect()
-            };
-            drop(stock_span);
             let stamp = [
                 sources.version,
                 gpu.layout_epoch,
@@ -3504,12 +3555,70 @@ fn select_instances(
                 gpu.views.get_mut(key).unwrap().selection_base = Some(base);
             }
             let view = &gpu.views[key];
-            let matches_span = ::bevy::log::info_span!("cluster::select::matches").entered();
-            let stale = view.selection.as_ref().is_none_or(|selection| {
-                !selection.matches(stamp, &selection_inputs, &readiness, &stock_ids)
-            });
-            drop(matches_span);
+            // Nothing the selection reads moved (no stock mesh came into or left view, no stock
+            // material changed, the stamp and readiness are the same): it stands as it is,
+            // without reading the visible set at all.
+            let reusable = !facts.changed
+                && view.selection.as_ref().is_some_and(|selection| {
+                    selection.stamp == stamp
+                        && selection.readiness == readiness
+                        && selection.layers == *layers
+                });
+            let mut current_inputs = None;
+            let stale = !reusable && {
+                let retired_allowed =
+                    retired_allowed_for_view(&sources.retired_eligibility, layers, shadow);
+                // With owned statics nothing in the selection depends on the visible set: owned
+                // stock is hidden at spawn and stock terrain under cluster terrain is hidden by
+                // cell below.
+                let mut selection_inputs = if own_statics {
+                    bevy::platform::collections::HashSet::default()
+                } else {
+                    perf_span!("cluster::select::inputs_clone");
+                    facts.visible.clone()
+                };
+                selection_inputs.extend(retired_allowed.iter().copied());
+                let stock_span = ::bevy::log::info_span!("cluster::select::stock_ids").entered();
+                let retired_bound = sources.retired_materials.keys();
+                let stock_ids: HashMap<_, _> = if own_statics {
+                    HashMap::new()
+                } else {
+                    facts
+                        .visible
+                        .iter()
+                        .chain(retired_bound)
+                        .map(|main| {
+                            (
+                                *main,
+                                match sources.retired_materials.get(main) {
+                                    Some(material) => *material,
+                                    None => stock_materials
+                                        .instances
+                                        .get(main)
+                                        .map(|instance| instance.asset_id),
+                                },
+                            )
+                        })
+                        .collect()
+                };
+                drop(stock_span);
+                let matches_span = ::bevy::log::info_span!("cluster::select::matches").entered();
+                let stale = view.selection.as_ref().is_none_or(|selection| {
+                    selection.layers != *layers
+                        || !selection.matches(stamp, &selection_inputs, &readiness, &stock_ids)
+                });
+                drop(matches_span);
+                current_inputs = Some((retired_allowed, selection_inputs, stock_ids));
+                stale
+            };
             if stale {
+                filters.rebuilt += 1;
+            } else {
+                filters.reused += 1;
+            }
+            if let Some((retired_allowed, selection_inputs, stock_ids)) =
+                current_inputs.filter(|_| stale)
+            {
                 perf_span!("cluster::select::overlay");
                 rebuilt.insert(*key);
                 let base = view.selection_base.as_ref().unwrap();
@@ -3592,6 +3701,7 @@ fn select_instances(
                 // Never hide stock terrain from a global/main-world readiness set.
                 gpu.views.get_mut(key).unwrap().selection = Some(Selection {
                     stamp,
+                    layers: layers.clone(),
                     visible: selection_inputs,
                     readiness,
                     stock_materials: stock_ids,
@@ -3610,31 +3720,66 @@ fn select_instances(
                     "native far LOD retained; certified far clusters suppressed");
             }
             let view = &gpu.views[key];
-            terrain_coverage.views.insert(
-                *key,
-                crate::streaming::terrain_handoff::ClusterViewCoverage {
-                    generation: gpu.generation,
-                    layout: gpu.layout_epoch,
-                    plan: view.plan_epoch,
-                    cells: selected
-                        .terrain_blocks
-                        .iter()
-                        .flat_map(|index| {
-                            let block = &gpu.terrain_blocks[*index as usize];
-                            block
-                                .cells
-                                .iter()
-                                .copied()
-                                .map(move |cell| (block.worldspace_id, cell))
-                        })
-                        .collect(),
-                },
-            );
-            let hidden = &selected.hidden;
-            perf_span!("cluster::select::joint");
-            joint = Some(intersect_hidden(joint, hidden));
+            // The coverage follows the selection and the plan; it is made again only when one
+            // of them moved.
+            let covered = terrain_coverage.views.get(key).is_some_and(|coverage| {
+                !stale
+                    && coverage.generation == gpu.generation
+                    && coverage.layout == gpu.layout_epoch
+                    && coverage.plan == view.plan_epoch
+            });
+            if !covered {
+                terrain_coverage.views.insert(
+                    *key,
+                    crate::streaming::terrain_handoff::ClusterViewCoverage {
+                        generation: gpu.generation,
+                        layout: gpu.layout_epoch,
+                        plan: view.plan_epoch,
+                        cells: selected
+                            .terrain_blocks
+                            .iter()
+                            .flat_map(|index| {
+                                let block = &gpu.terrain_blocks[*index as usize];
+                                block
+                                    .cells
+                                    .iter()
+                                    .copied()
+                                    .map(move |cell| (block.worldspace_id, cell))
+                            })
+                            .collect(),
+                    },
+                );
+            }
+            covered_views.insert(*key);
         }
-        let joint = joint.unwrap_or_default();
+        // No consumer's selection was rebuilt and the consumers are last frame's: the hide
+        // decision stands, and so does every consumer's uploaded mask.
+        let domain_unchanged = facts.consumers.iter().all(|key| !rebuilt.contains(key))
+            && filters
+                .joints
+                .get(domain)
+                .is_some_and(|(consumers, _)| *consumers == facts.consumers);
+        if domain_unchanged
+            && facts
+                .consumers
+                .iter()
+                .all(|key| !gpu.views[key].instance_mask_bytes.is_empty())
+        {
+            continue;
+        }
+        let joint = if domain_unchanged {
+            filters.joints[domain].1.clone()
+        } else {
+            perf_span!("cluster::select::joint");
+            facts
+                .consumers
+                .iter()
+                .fold(None, |joint, key| {
+                    let selection = gpu.views[key].selection.as_ref().unwrap();
+                    Some(intersect_hidden(joint, &selection.hidden))
+                })
+                .unwrap_or_default()
+        };
         // Several dependent views can share one point/spot visibility table.
         // Suppress its stock primitive only when EVERY consumer independently chose it.
         for key in &facts.consumers {
@@ -3709,17 +3854,41 @@ fn select_instances(
                 );
             }
         }
-        wanted.insert(*domain, joint);
+        filters
+            .joints
+            .insert(*domain, (facts.consumers.clone(), joint));
     }
+    terrain_coverage
+        .views
+        .retain(|key, _| covered_views.contains(key));
     filters
         .saved
         .retain(|domain, _| domains.contains_key(domain));
+    filters
+        .joints
+        .retain(|domain, _| domains.contains_key(domain));
+    let frame = filters.frames;
+    filters.visible = domains
+        .iter_mut()
+        .filter(|(_, facts)| facts.collected)
+        .map(|(domain, facts)| {
+            (
+                *domain,
+                DomainVisible {
+                    set: std::mem::take(&mut facts.visible),
+                    frame,
+                },
+            )
+        })
+        .collect();
     assert!(
         filters.active.is_empty(),
         "stock visibility was not restored after the previous frame"
     );
     let _apply_span = ::bevy::log::info_span!("cluster::select::apply").entered();
-    for (domain, hidden) in wanted {
+    let joints = std::mem::take(&mut filters.joints);
+    for (domain, (_, hidden)) in &joints {
+        let domain = *domain;
         let class = match domain {
             Domain::Camera(entity) => views
                 .get_mut(entity)
@@ -3733,8 +3902,16 @@ fn select_instances(
         }
         .and_then(|visible| visible.classes.get_mut(&std::any::TypeId::of::<Mesh3d>()));
         if let Some(class) = class {
-            filters.apply_class(domain, class, &hidden);
+            filters.apply_class(domain, class, hidden);
         }
+    }
+    filters.joints = joints;
+    if filters.frames.is_multiple_of(600) {
+        info!(
+            reused = std::mem::take(&mut filters.reused),
+            rebuilt = std::mem::take(&mut filters.rebuilt),
+            "cluster view selections over 600 frames"
+        );
     }
 }
 
@@ -4074,6 +4251,68 @@ mod selection_regressions {
         ids.iter().map(|id| main(*id)).collect()
     }
 
+    /// The visible set a domain keeps between frames, moved by the class's added and removed
+    /// lists after Bevy's own diff and a stock filter ahead of the selection, is at every frame
+    /// what reading the class in full gives; unchanged frames report no change and read nothing.
+    #[test]
+    fn domain_visible_follows_the_class_deltas_through_a_filter() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let pair = |id: u32| (Entity::from_raw_u32(1000 + id).unwrap(), main(id));
+        let mut class = RenderVisibleEntitiesClass::default();
+        let mut filter = ClassFilter::default();
+        let mut kept: Option<DomainVisible> = None;
+        let mut raw: Vec<u32> = Vec::new();
+        let mut hidden = VisibleSet::default();
+        let mut changes = 0;
+        let mut expected_changes = 0;
+        let mut previous_filtered: Option<VisibleSet<MainEntity>> = None;
+        for frame in 1..=400_u64 {
+            // Long quiet runs between changes, as in a settled scene.
+            if frame % 25 == 0 {
+                raw = (0..40).filter(|_| next() % 3 != 0).collect();
+            }
+            if frame % 40 == 0 {
+                hidden = (0..40).filter(|_| next() % 4 == 0).map(main).collect();
+            }
+            class.prepare_for_new_frame();
+            let pairs: Vec<_> = raw.iter().map(|id| pair(*id)).collect();
+            class.update_cpu_culled_entities(&pairs);
+            filter.apply(&mut class, &hidden);
+            let from_scratch: VisibleSet<MainEntity> =
+                class.iter_visible().map(|(_, main)| *main).collect();
+            let (visible, changed) = update_domain_visible(kept.take(), Some(&class), frame);
+            assert_eq!(visible.set, from_scratch, "frame {frame}");
+            if previous_filtered.as_ref() != Some(&from_scratch) {
+                expected_changes += 1;
+                assert!(changed, "frame {frame}: a change went unreported");
+            }
+            changes += u32::from(changed);
+            previous_filtered = Some(from_scratch);
+            kept = Some(visible);
+            filter.restore(&mut class);
+        }
+        // Reported changes are the real ones (the first frame counts as one).
+        assert_eq!(changes, expected_changes);
+        assert!(changes < 40, "{changes} changes in 400 frames");
+        // A skipped frame cannot take a delta: the set is read in full.
+        let skipped = kept.take().map(|mut visible| {
+            visible.set.insert(main(999));
+            visible
+        });
+        let (visible, changed) = update_domain_visible(skipped, Some(&class), 402);
+        assert!(changed);
+        assert_eq!(
+            visible.set,
+            class.iter_visible().map(|(_, main)| *main).collect()
+        );
+    }
+
     #[test]
     fn retired_view_domain_obeys_layers_caster_and_exact_selection_input() {
         let eligible = main(41);
@@ -4131,6 +4370,7 @@ mod selection_regressions {
     fn selection(ids: &[u32], capacity: u32) -> Selection {
         Selection {
             stamp: [7, 11, 13, 17, 1, 0, 0],
+            layers: RenderLayers::default(),
             visible: visible(ids),
             readiness: vec![true],
             stock_materials: ids.iter().map(|id| (main(*id), None)).collect(),
