@@ -20,6 +20,7 @@ use crate::{
         build_terrain_quadrant_mesh, streaming_center, validate_standard_material,
     },
     tone_mapping::SceneToneMapSource,
+    view_policy::{InvalidateSecondaryViews, ViewInvalidationReason},
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
@@ -977,6 +978,7 @@ fn setup_streaming_fixture_visual(
 fn drive_streaming_fixture(
     mut state: ResMut<StreamingFixtureState>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    mut invalidations: MessageWriter<InvalidateSecondaryViews>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     if state.finished {
@@ -997,10 +999,22 @@ fn drive_streaming_fixture(
     let Ok(mut camera) = camera.single_mut() else {
         return;
     };
-    camera.translation.x += x as f32 * crate::world::components::CELL_SIZE;
-    camera.translation.z -= y as f32 * crate::world::components::CELL_SIZE;
+    // A move of whole cells east and north, which is how far a cell root that many grids away sits.
+    camera.translation += crate::streaming::grid_translation(IVec2::new(x, y), IVec2::ZERO);
     state.total_x += x;
     state.total_y += y;
+    // Only a move the fixture labels "teleport" is a discontinuity no pose comparison is meant to
+    // catch: the destination pose is committed above, so a secondary view must refresh on this
+    // frame rather than the next one its own cadence allows for. The "rapid_traversal" and
+    // "return_to_origin" moves are fast travel, not a teleport, and the policy's own pose-jump
+    // detection already refreshes a view that moved that far, so they report nothing and keep
+    // exercising that path.
+    if label == "teleport" {
+        invalidations.write(InvalidateSecondaryViews {
+            reason: ViewInvalidationReason::Teleport,
+            target: None,
+        });
+    }
     profiler.event("streaming-fixture", label, None);
 }
 
@@ -1252,7 +1266,7 @@ fn setup_material_fixture(
             shadow_maps_enabled: true,
             ..default()
         },
-        RenderLayers::from_layers(LIGHT_LAYERS),
+        RenderLayers::from_layers(&LIGHT_LAYERS),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.7, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
@@ -1456,6 +1470,7 @@ fn setup_terrain_water_fixture(
                 }),
             ),
             TerrainWaterFixtureTerrain,
+            crate::render::reflectable_world_layers(),
         ));
     }
     commands.spawn((
@@ -1491,7 +1506,7 @@ fn setup_terrain_water_fixture(
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
-        RenderLayers::from_layers(MAIN_VIEW_LAYERS),
+        RenderLayers::from_layers(&MAIN_VIEW_LAYERS),
     ));
     commands.spawn((
         DirectionalLight {
@@ -1499,7 +1514,7 @@ fn setup_terrain_water_fixture(
             shadow_maps_enabled: true,
             ..default()
         },
-        RenderLayers::from_layers(LIGHT_LAYERS),
+        RenderLayers::from_layers(&LIGHT_LAYERS),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
@@ -1673,7 +1688,7 @@ fn setup_transform_bounds_fixture(
             shadow_maps_enabled: true,
             ..default()
         },
-        RenderLayers::from_layers(LIGHT_LAYERS),
+        RenderLayers::from_layers(&LIGHT_LAYERS),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.7, -0.55, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
@@ -1881,7 +1896,7 @@ fn setup_renderer_fixture(
             shadow_maps_enabled: true,
             ..default()
         },
-        RenderLayers::from_layers(LIGHT_LAYERS),
+        RenderLayers::from_layers(&LIGHT_LAYERS),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.65, -0.45, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
@@ -2344,7 +2359,7 @@ fn setup_world(
         SkyCamera,
         Msaa::Off,
         DepthPrepass,
-        RenderLayers::from_layers(MAIN_VIEW_LAYERS),
+        RenderLayers::from_layers(&MAIN_VIEW_LAYERS),
     ));
     if config.main_occlusion {
         camera.insert(OcclusionCulling);
@@ -2374,7 +2389,7 @@ fn setup_world(
             ..default()
         },
         sun_shadow_cascades(&config),
-        RenderLayers::from_layers(LIGHT_LAYERS),
+        RenderLayers::from_layers(&LIGHT_LAYERS),
         Transform::from_rotation(sun_rotation(&config)),
     ));
     commands.insert_resource(GlobalAmbientLight {

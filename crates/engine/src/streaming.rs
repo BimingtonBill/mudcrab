@@ -4024,13 +4024,21 @@ fn spawn_diagnostic_fallback(
     ));
 }
 
+/// Translate a cell grid relative to the current render origin.
+pub(crate) fn grid_translation(grid: IVec2, origin: IVec2) -> Vec3 {
+    let offset = grid - origin;
+    Vec3::new(
+        offset.x as f32 * CELL_SIZE,
+        0.0,
+        -offset.y as f32 * CELL_SIZE,
+    )
+}
+
 fn cell_translation(key: CellKey, origin: IVec2) -> Vec3 {
     match key {
-        CellKey::Exterior { grid_x, grid_y, .. } => Vec3::new(
-            (grid_x - origin.x) as f32 * CELL_SIZE,
-            0.0,
-            -(grid_y - origin.y) as f32 * CELL_SIZE,
-        ),
+        CellKey::Exterior { grid_x, grid_y, .. } => {
+            grid_translation(IVec2::new(grid_x, grid_y), origin)
+        }
         CellKey::Interior(_) => Vec3::ZERO,
     }
 }
@@ -8940,7 +8948,7 @@ mod tests {
         // `render::a_light_below_a_reference_keeps_the_light_layers`.
         assert_eq!(
             app.world().entity(light_entity).get::<RenderLayers>(),
-            Some(&RenderLayers::from_layers(crate::render::LIGHT_LAYERS))
+            Some(&RenderLayers::from_layers(&crate::render::LIGHT_LAYERS))
         );
         assert!(
             app.world()

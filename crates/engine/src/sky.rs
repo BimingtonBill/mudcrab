@@ -507,6 +507,8 @@ fn spawn_sky_domes(
             MeshMaterial3d(materials.add(SkyMaterial::new(&palette))),
             Transform::from_translation(transform.translation),
             Visibility::default(),
+            // Both reflection routes retain the same ordinary sky content.
+            crate::render::reflectable_world_layers(),
             NotShadowCaster,
             // The dome always surrounds its camera.
             NoFrustumCulling,

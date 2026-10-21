@@ -12,7 +12,9 @@ use crate::{
     },
 };
 use bevy::{
+    app::Propagate,
     asset::{AssetLoadError, LoadState, RecursiveDependencyLoadState, io::AssetReaderError},
+    camera::visibility::RenderLayers,
     gltf::GltfAssetLabel,
     mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
     prelude::*,
@@ -409,6 +411,12 @@ pub(super) fn plan_lod_chunks(
     profiler.record_elapsed("lod/plan", started);
 }
 
+/// Root and descendant layers for distant world geometry on both reflection routes.
+pub(super) fn lod_ring_layers() -> (RenderLayers, Propagate<RenderLayers>) {
+    let layers = crate::render::reflectable_world_layers();
+    (layers.clone(), Propagate(layers))
+}
+
 /// Collect LOD query results and request current chunks within the shared commit budget.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn collect_lod_chunks(
@@ -618,6 +626,7 @@ pub(super) fn collect_lod_chunks(
         let local_grid_y = min_grid.1 - i64::from(origin.0.y);
         let root = commands
             .spawn((
+                lod_ring_layers(),
                 Name::new(format!(
                     "LOD {:?} chunk {},{}",
                     key.tier, key.anchor.x, key.anchor.y
@@ -3280,5 +3289,28 @@ mod tests {
             (22, 0),
             side_reach().max_reach_cells() + LOD_UNLOAD_MARGIN_CELLS,
         ));
+    }
+    /// asset server and budget in hand, so the test holds the one layer choice it spawns with
+    /// ([`lod_ring_layers`]) instead of standing the spawn up.
+    #[test]
+    fn the_lod_ring_is_on_both_reflection_routes() {
+        let (layers, propagated) = lod_ring_layers();
+        let shadowed = RenderLayers::from_layers(crate::render::REFLECTION_VIEW_LAYERS);
+        let shadowless =
+            RenderLayers::from_layers(crate::render::UNSHADOWED_REFLECTION_VIEW_LAYERS);
+        assert!(
+            layers.intersects(&shadowed),
+            "the shadowed reflection must draw the LOD ring: {layers:?}"
+        );
+        assert!(
+            layers.intersects(&shadowless),
+            "the shadowless reflection must draw the LOD ring: {layers:?}"
+        );
+        // The chunk's meshes are stamped from the propagation source, so it must carry the same
+        // set as the root itself or the widening would stop at the root.
+        assert_eq!(
+            propagated.0, layers,
+            "the ring's meshes must be stamped with the root's own layers"
+        );
     }
 }

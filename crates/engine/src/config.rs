@@ -72,6 +72,7 @@ impl TerrainLodDistances {
 
 /// Bevy Remote Protocol's default HTTP port, used by `--remote` unless `--remote-port` is given.
 pub const DEFAULT_REMOTE_PORT: u16 = 15702;
+
 #[derive(Debug, Clone, Resource)]
 pub struct EngineConfig {
     /// Keep an automated capture window on screen instead of parking it off screen.
@@ -92,8 +93,6 @@ pub struct EngineConfig {
     pub terrain_lod: TerrainLodDistances,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
-    /// Cells outside the unload radius a frame may despawn. `0` despawns every one at once, which
-    /// is the unbudgeted behaviour unloading used to have.
     pub max_cell_unloads_per_frame: usize,
     /// Converted models a frame may hand to Bevy's scene spawner. `0` arms every model whose asset
     /// is loaded, which is the unbudgeted behaviour a single spawn batch used to have.
@@ -204,6 +203,8 @@ pub struct EngineConfig {
     /// probe system, so an ordinary run is unchanged. See [`crate::streaming`].
     pub probe_retire_visibility: Option<PathBuf>,
     pub acceptance_screenshot: Option<PathBuf>,
+    /// The water reflection camera's cost options ([`ReflectionOptions`]).
+    pub reflection: ReflectionOptions,
     /// `--cull-counter`: read the GPU culling result back every few frames and report how many
     /// instances the main views submit and draw (`renderer.json`, `cull`). Off by default: it asks
     /// Bevy to let the indirect draw buffers be copied, which Bevy documents as a debugging
@@ -236,6 +237,38 @@ pub struct EngineConfig {
     /// every run that does not ask for lights renders exactly as it did before.
     pub lights: bool,
     pub physics_fixture: bool,
+    /// `--water-reflection-preset <baseline|water>`: which [`crate::view_policy::ViewPolicy`] the
+    /// water reflection camera is given. `baseline` is the full-size, every-frame reflection the
+    /// engine has always drawn.
+    pub water_reflection_preset: WaterReflectionPreset,
+    /// `--water-reflection <on|off|planar|ssr>`: whether the water reflection view is drawn at
+    /// all (`off` is the measurement switch; `on` and `planar` draw it, and `ssr` is the Water Plus
+    /// reflection of [`Self::water_reflection_mode`]). See [`HELP_TEXT`].
+    pub water_reflection: bool,
+}
+
+/// The view policy the water reflection camera is given (`--water-reflection-preset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaterReflectionPreset {
+    /// [`crate::view_policy::ViewPolicy::baseline`]: today's full-size, every-frame reflection.
+    #[default]
+    Baseline,
+    /// [`crate::view_policy::ViewPolicy::water`]: a quarter of the pixels, every other frame, no
+    /// shadows of its own, and a camera without occlusion history or MSAA.
+    Water,
+}
+
+impl WaterReflectionPreset {
+    /// Every preset, in the order the help lists them.
+    pub const ALL: [Self; 2] = [Self::Baseline, Self::Water];
+
+    /// The spelling the command line and run records use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Water => "water",
+        }
+    }
 }
 
 impl Default for EngineConfig {
@@ -328,6 +361,7 @@ impl Default for EngineConfig {
             profile_hardware: "unspecified".into(),
             probe_retire_visibility: None,
             acceptance_screenshot: None,
+            reflection: ReflectionOptions::default(),
             cull_counter: false,
             main_occlusion: true,
             screenshot_camera_offset: None,
@@ -345,6 +379,8 @@ impl Default for EngineConfig {
             remote_port: DEFAULT_REMOTE_PORT,
             lights: false,
             physics_fixture: false,
+            water_reflection_preset: WaterReflectionPreset::Baseline,
+            water_reflection: true,
         }
     }
 }
@@ -379,7 +415,6 @@ Streaming:
   --ini <file>                        layer Skyrim INI settings; CLI options override files
   --stream-radius <cells>               cells streamed around the camera (default: 2)
   --max-commit-ms <ms>                  cell commit time allowed per frame (default: 16.67)
-  --max-unloads-per-frame <count>       cells despawned per frame; 0 despawns all at once (default: 2)
   --max-model-spawns-per-frame <count>  models spawned per frame; 0 spawns all at once (default: 32)
   --prioritize-streaming               prioritize nearby collision and view-facing bounds
   --max-scene-loads <count>             outstanding unique scene jobs; 0 is unlimited (default: 0)
@@ -444,6 +479,8 @@ Benchmark and profiling:
   --profile-commit <hash>               commit recorded in the profile (default: unknown)
   --profile-dirty-worktree              record uncommitted worktree changes in the profile
   --profile-hardware <text>             hardware recorded in the profile (default: unspecified)
+  --water-reflection-preset <name>      water reflection cost: baseline (full size, every frame, shadowed)
+                                        or water (quarter size, every other frame, shadowless) (default: baseline);
   --probe-retire-visibility <dir>       record whether a draining retiring cell ever shows, write retire-visibility.json and PNGs here, then exit
 
 Diagnostics:
@@ -461,6 +498,7 @@ Remote:
   --remote-port <port>                  port for --remote (default: 15702); implies --remote
 
   --show-window                         keep an automated run's window on screen
+
 Help:
   -h, --help                            print this message and exit
 
@@ -497,6 +535,8 @@ pub enum ConfigError {
         /// What the option needs, phrased for the message.
         expected: &'static str,
     },
+    /// A value one of the portal's or the reflection's flags refused, already phrased as a message.
+    Message(String),
     /// An option that only works together with another option that was not given.
     MissingRequirement {
         option: &'static str,
@@ -533,6 +573,7 @@ impl fmt::Display for ConfigError {
     /// Format a configuration error with the relevant option and usage guidance.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Message(message) => formatter.write_str(message),
             Self::UnknownOption {
                 argument,
                 suggestion: Some(suggestion),
@@ -797,7 +838,16 @@ impl EngineConfig {
                 .cloned(),
         );
         let mut args = args.into_iter().peekable();
+
         while let Some(argument) = args.next() {
+            // The water reflection's cost flags ([`ReflectionOptions`]); a value that is not one is
+            // refused rather than left at its default.
+            match ReflectionOptions::parse_flag(&mut config.reflection, &argument, &mut args) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => return Err(ConfigError::Message(error)),
+            }
+            // The portal's own flags, parsed by one block at the end of this file.
             match argument.as_str() {
                 // The pre-scan above answers both spellings; these arms keep the
                 // option list the help-drift tests read complete.
@@ -1329,6 +1379,22 @@ impl EngineConfig {
                 }
                 "--lights" => config.lights = true,
                 "--physics-fixture" => config.physics_fixture = true,
+                "--water-reflection-preset" => {
+                    const EXPECTED: &str = "baseline or water";
+                    let raw = take_raw("--water-reflection-preset", EXPECTED, args.next())?;
+                    config.water_reflection_preset = WaterReflectionPreset::ALL
+                        .into_iter()
+                        .find(|preset| preset.name() == raw)
+                        .ok_or_else(|| {
+                            ConfigError::invalid_value(
+                                "--water-reflection-preset",
+                                Some(raw),
+                                EXPECTED,
+                            )
+                        })?;
+                }
+                // A value that is not one stops the run rather than leaving the vanilla crossing
+                // in place of the one asked for.
                 unknown => return Err(ConfigError::unrecognized(unknown)),
             }
         }
@@ -1460,14 +1526,188 @@ const STREAM_RADIUS_EXPECTED: &str = "a cell count from 0 to 1073741822";
 const SUN_POSITION_EXPECTED: &str =
     "two finite angles in degrees: azimuth,elevation (elevation 0 to 90)";
 
-/// Test shorthand for a command line that must ask for a run.
-#[cfg(test)]
-impl EngineConfig {
-    pub(crate) fn run_from_args(args: impl IntoIterator<Item = String>) -> Self {
-        match Self::from_args(args) {
-            Ok(ConfigAction::Run(config)) => *config,
-            other => panic!("expected a run configuration, got {other:?}"),
+/// The water reflection camera's cost options: each drops one piece of the reflection's per-view
+/// work, so the portal bench can measure them one at a time (`crate::render`'s
+/// `setup_water_reflection` and `limit_water_reflection_cascades` read them).
+///
+/// The default is the cheaper reflection (the user's decision, 2026-09-26): no depth prepass (so no
+/// occlusion culling) and no shadow cascades, which cut the render thread 1.0-1.4 ms at Riften's
+/// water door (`local/bench/portal-bench-2026-09-26_16-42-33`). The full reflection as it was
+/// before comes back with `--reflection-prepass=on --reflection-cascades all`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReflectionOptions {
+    /// Whether the reflection camera has a `DepthPrepass`: off by default, `--reflection-prepass=on`
+    /// opts back in. Bevy's occlusion culling needs the prepass, so without it
+    /// [`occlusion`](Self::occlusion) has no effect.
+    pub prepass: bool,
+    /// `--reflection-occlusion=off`: no `OcclusionCulling` on the reflection camera even when it
+    /// has its depth prepass (on by default, so `--reflection-prepass=on` brings occlusion culling
+    /// back with it).
+    pub occlusion: bool,
+    /// `--reflection-cascades N` (0 to [`MAX_REFLECTION_CASCADES`], or `all`): the reflection view
+    /// keeps only the first `N` shadow cascades of the sun; 0 (the default) draws the reflection
+    /// unshadowed. `None` (`all`, or `N` = [`MAX_REFLECTION_CASCADES`]) keeps every cascade the sun
+    /// has and installs no limiting system.
+    pub cascades: Option<usize>,
+    /// `--reflection-scale S` (above 0, at most 1): the reflection target's size as a fraction of
+    /// [`REFLECTION_SIZE`] per axis.
+    pub scale: f32,
+}
+
+/// The water reflection target's full size, in pixels.
+pub const REFLECTION_SIZE: (u32, u32) = (1024, 576);
+/// The most cascades Bevy gives a directional light (`MAX_CASCADES_PER_LIGHT`).
+pub const MAX_REFLECTION_CASCADES: usize = 4;
+/// The smallest side a scaled reflection target is given, in pixels.
+const MIN_REFLECTION_SIDE: u32 = 16;
+
+impl Default for ReflectionOptions {
+    fn default() -> Self {
+        Self {
+            prepass: false,
+            occlusion: true,
+            cascades: Some(0),
+            scale: 1.0,
         }
+    }
+}
+
+impl ReflectionOptions {
+    /// Parses one reflection flag, taking the argument it needs from `args`, and says whether
+    /// `argument` was one of them.
+    ///
+    /// A value that is not one is an [`Err`] naming the flag, the value and what is accepted, and
+    /// [`EngineConfig::from_args`] stops the run on it: every one of these flags drops work from the
+    /// reflection view, so a run that asked for one by name would otherwise measure the default
+    /// without a word (`GraphicsSettings::set` refuses a bad knob the same way). The value flags
+    /// take their value either as the next argument or after `=`, so no spelling of a reflection
+    /// flag is ignored.
+    pub fn parse_flag(
+        options: &mut Self,
+        argument: &str,
+        args: &mut impl Iterator<Item = String>,
+    ) -> Result<bool, String> {
+        match argument {
+            // The switches carry their value: a bare `--reflection-prepass` (or any value but
+            // `on`/`off`) is an error rather than the default.
+            flag if flag.starts_with("--reflection-prepass") => {
+                options.prepass = reflection_switch(flag, "--reflection-prepass")?;
+            }
+            flag if flag.starts_with("--reflection-occlusion") => {
+                options.occlusion = reflection_switch(flag, "--reflection-occlusion")?;
+            }
+            flag if flag.starts_with("--reflection-cascades") => {
+                let accepted = cascades_accepted();
+                let value = reflection_value(flag, "--reflection-cascades", &accepted, args)?;
+                options.cascades = if value.value == "all" {
+                    None
+                } else {
+                    let count = value
+                        .value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|count| *count <= MAX_REFLECTION_CASCADES)
+                        .ok_or_else(|| value.rejected(&accepted))?;
+                    // Every cascade Bevy gives a light is the same as no limit at all.
+                    (count < MAX_REFLECTION_CASCADES).then_some(count)
+                };
+            }
+            flag if flag.starts_with("--reflection-scale") => {
+                let accepted = "a fraction above 0, at most 1";
+                let value = reflection_value(flag, "--reflection-scale", accepted, args)?;
+                options.scale = value
+                    .value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|scale| scale.is_finite() && *scale > 0.0 && *scale <= 1.0)
+                    .ok_or_else(|| value.rejected(accepted))?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Whether the reflection camera carries `OcclusionCulling`: asked for, and with the depth
+    /// prepass Bevy's occlusion culling requires (`bevy_render-0.19.0/src/occlusion_culling/mod.rs`,
+    /// "Occlusion culling currently requires a `DepthPrepass`").
+    pub fn occlusion_culling(&self) -> bool {
+        self.prepass && self.occlusion
+    }
+
+    /// The reflection target's size in pixels.
+    pub fn target_size(&self) -> (u32, u32) {
+        self.scaled_size(REFLECTION_SIZE)
+    }
+
+    /// `full`, a reflection target size in pixels, scaled by [`scale`](Self::scale) per axis: what
+    /// `--reflection-scale` does to whichever size the `--water-reflection-preset` starts from.
+    pub fn scaled_size(&self, full: (u32, u32)) -> (u32, u32) {
+        let side = |full: u32| ((full as f32 * self.scale).round() as u32).max(MIN_REFLECTION_SIDE);
+        (side(full.0), side(full.1))
+    }
+}
+
+/// What `--reflection-cascades` accepts, for the message a value that is not one is refused with.
+/// The count is [`MAX_REFLECTION_CASCADES`], so the message cannot drift from the limit.
+fn cascades_accepted() -> String {
+    format!("0 to {MAX_REFLECTION_CASCADES} (Bevy 0.19's limit), or all")
+}
+
+/// The `=on`/`=off` a reflection switch carries: the value is part of the argument, so a bare flag
+/// or anything else after its name is an error naming what the flag accepts.
+fn reflection_switch(argument: &str, flag: &str) -> Result<bool, String> {
+    match argument
+        .strip_prefix(flag)
+        .and_then(|value| value.strip_prefix('='))
+    {
+        Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        _ => Err(format!("{argument}: valid: {flag}=on, {flag}=off")),
+    }
+}
+
+/// A reflection flag's value, and the flag with that value as it was written, for the message a
+/// value that is not one is refused with: `--reflection-scale "wide"` for `--flag value`, and
+/// `--reflection-scale=wide` for `--flag=value`.
+struct ReflectionValue {
+    value: String,
+    written: String,
+}
+
+impl ReflectionValue {
+    /// The message refusing this value: what was written, and what the flag accepts.
+    fn rejected(&self, accepted: &str) -> String {
+        format!("{}: {accepted}", self.written)
+    }
+}
+
+/// The value of a reflection flag that takes one, written `--flag value` or `--flag=value`. A flag
+/// with nothing after its name, with no value following it, or with anything else after its name
+/// (`--flag`, a name that is not this flag) is an error naming the flag and what it accepts.
+fn reflection_value(
+    argument: &str,
+    flag: &str,
+    accepted: &str,
+    args: &mut impl Iterator<Item = String>,
+) -> Result<ReflectionValue, String> {
+    match argument.strip_prefix(flag) {
+        Some("") => {
+            let value = args
+                .next()
+                .ok_or_else(|| format!("{flag}: the value is missing; valid: {accepted}"))?;
+            Ok(ReflectionValue {
+                written: format!("{flag} {value:?}"),
+                value,
+            })
+        }
+        Some(value) => match value.strip_prefix('=') {
+            Some(value) => Ok(ReflectionValue {
+                value: value.to_owned(),
+                written: argument.to_owned(),
+            }),
+            None => Err(format!("{argument}: valid: {flag} <value>, {accepted}")),
+        },
+        None => Err(format!("{argument}: valid: {flag} <value>, {accepted}")),
     }
 }
 
@@ -1539,6 +1779,32 @@ fn take_raw(
         // Only `--` marks an option: a path or a negative number may start
         // with a single dash.
         other => Err(ConfigError::invalid_value(option, other, expected)),
+    }
+}
+
+/// An `on` or `off` value, for the measurement switches.
+fn take_on_off(option: &'static str, value: Option<String>) -> Result<bool, ConfigError> {
+    const EXPECTED: &str = "on or off";
+    let raw = take_raw(option, EXPECTED, value)?;
+    // Not a `match` on string literals: the help-drift tests read every `"..." =>` line of this file
+    // as an option arm.
+    if raw == "on" {
+        Ok(true)
+    } else if raw == "off" {
+        Ok(false)
+    } else {
+        Err(ConfigError::invalid_value(option, Some(raw), EXPECTED))
+    }
+}
+
+/// Test shorthand for a command line that must ask for a run.
+#[cfg(test)]
+impl EngineConfig {
+    pub(crate) fn run_from_args(args: impl IntoIterator<Item = String>) -> Self {
+        match Self::from_args(args) {
+            Ok(ConfigAction::Run(config)) => *config,
+            other => panic!("expected a run configuration, got {other:?}"),
+        }
     }
 }
 
@@ -3821,5 +4087,242 @@ mod tests {
         let config = EngineConfig::run_from_args(["--remote-port", "16001"].map(str::to_owned));
         assert!(config.remote);
         assert_eq!(config.remote_port, 16_001);
+    }
+
+    #[test]
+    fn the_water_reflection_preset_defaults_to_baseline_and_parses_both_names() {
+        assert_eq!(
+            EngineConfig::default().water_reflection_preset,
+            WaterReflectionPreset::Baseline
+        );
+        assert_eq!(
+            run_config(&[]).water_reflection_preset,
+            WaterReflectionPreset::Baseline
+        );
+        for (name, preset) in [
+            ("baseline", WaterReflectionPreset::Baseline),
+            ("water", WaterReflectionPreset::Water),
+        ] {
+            let config = run_config(&["--water-reflection-preset", name]);
+            assert_eq!(config.water_reflection_preset, preset);
+            assert_eq!(preset.name(), name);
+        }
+    }
+
+    #[test]
+    fn an_unknown_water_reflection_preset_or_a_missing_value_is_refused() {
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset", "fast"]),
+            ConfigError::InvalidValue { option: "--water-reflection-preset", value: Some(ref value), .. }
+                if value == "fast"
+        ));
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset"]),
+            ConfigError::InvalidValue {
+                option: "--water-reflection-preset",
+                value: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset", "--headless"]),
+            ConfigError::InvalidValue {
+                option: "--water-reflection-preset",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_measurement_switches_default_on_and_take_on_or_off() {
+        let config = run_config(&[]);
+        assert!(config.water_reflection);
+
+        let config = run_config(&["--water-reflection", "off"]);
+        assert!(!config.water_reflection);
+
+        let config = run_config(&["--water-reflection", "off", "--water-reflection", "on"]);
+        assert!(config.water_reflection, "the last value wins");
+    }
+
+    #[test]
+    fn a_measurement_switch_refuses_any_other_value() {
+        for option in ["--water-reflection"] {
+            for value in ["no", "true", "0", "OFF"] {
+                assert!(
+                    matches!(
+                        parse_error(&[option, value]),
+                        ConfigError::InvalidValue { value: Some(ref given), .. } if given == value
+                    ),
+                    "{option} accepted {value}"
+                );
+            }
+            assert!(matches!(
+                parse_error(&[option]),
+                ConfigError::InvalidValue { value: None, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn help_documents_the_measurement_switches_as_such() {
+        assert!(help_names("--water-reflection"));
+        let rows: Vec<_> = HELP_TEXT
+            .lines()
+            .filter(|line| line.trim_start().starts_with("--water-reflection <"))
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows.iter().all(|row| row.contains("measurement switch")),
+            "the A/B switches are for measurement and the help says so"
+        );
+    }
+
+    #[test]
+    fn help_documents_the_water_reflection_preset() {
+        assert!(help_names("--water-reflection-preset"));
+    }
+
+    #[test]
+    fn reflection_options_default_to_no_prepass_and_no_cascades() {
+        let options = EngineConfig::run_from_args(Vec::<String>::new()).reflection;
+        assert_eq!(options, ReflectionOptions::default());
+        assert!(!options.prepass);
+        assert!(!options.occlusion_culling());
+        assert_eq!(options.cascades, Some(0));
+        assert_eq!(options.target_size(), REFLECTION_SIZE);
+    }
+
+    #[test]
+    fn the_opt_back_in_flags_give_the_full_reflection() {
+        let parse = |args: &[&str]| {
+            EngineConfig::run_from_args(args.iter().map(|arg| (*arg).to_owned())).reflection
+        };
+        for cascades in ["all", "4"] {
+            let options = parse(&["--reflection-prepass=on", "--reflection-cascades", cascades]);
+            assert!(options.prepass);
+            assert!(options.occlusion_culling());
+            assert_eq!(options.cascades, None, "--reflection-cascades {cascades}");
+            assert_eq!(options.target_size(), REFLECTION_SIZE);
+        }
+    }
+
+    #[test]
+    fn parses_the_reflection_cost_flags() {
+        let parse = |args: &[&str]| {
+            EngineConfig::run_from_args(args.iter().map(|arg| (*arg).to_owned())).reflection
+        };
+        let options = parse(&[
+            "--reflection-occlusion=off",
+            "--reflection-cascades",
+            "1",
+            "--reflection-scale",
+            "0.5",
+        ]);
+        assert!(!options.prepass);
+        assert!(!options.occlusion_culling());
+        assert_eq!(options.cascades, Some(1));
+        assert_eq!(options.target_size(), (512, 288));
+        assert_eq!(parse(&["--reflection-cascades", "2"]).cascades, Some(2));
+        assert_eq!(
+            parse(&["--reflection-cascades=2"]).cascades,
+            Some(2),
+            "the value may follow the flag after `=`"
+        );
+        assert_eq!(parse(&["--reflection-scale=0.5"]).target_size(), (512, 288));
+        assert_eq!(
+            parse(&["--reflection-scale", "0.001"]).target_size(),
+            (16, 16),
+            "a tiny scale keeps a usable target"
+        );
+    }
+
+    #[test]
+    fn a_reflection_flag_value_that_is_not_one_is_refused() {
+        let refused = |args: &[&str]| {
+            EngineConfig::from_args(args.iter().map(|arg| (*arg).to_owned()))
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| panic!("{args:?} is refused, but it parsed"))
+        };
+        assert_eq!(
+            refused(&["--reflection-cascades", "5"]),
+            "--reflection-cascades \"5\": 0 to 4 (Bevy 0.19's limit), or all"
+        );
+        assert_eq!(
+            refused(&["--reflection-cascades", "two"]),
+            "--reflection-cascades \"two\": 0 to 4 (Bevy 0.19's limit), or all"
+        );
+        assert_eq!(
+            refused(&["--reflection-cascades", "-1"]),
+            "--reflection-cascades \"-1\": 0 to 4 (Bevy 0.19's limit), or all"
+        );
+        assert_eq!(
+            refused(&["--reflection-cascades"]),
+            "--reflection-cascades: the value is missing; valid: 0 to 4 (Bevy 0.19's limit), or all"
+        );
+        assert_eq!(
+            refused(&["--reflection-cascades=5"]),
+            "--reflection-cascades=5: 0 to 4 (Bevy 0.19's limit), or all"
+        );
+        assert_eq!(
+            refused(&["--reflection-scale", "0"]),
+            "--reflection-scale \"0\": a fraction above 0, at most 1"
+        );
+        assert_eq!(
+            refused(&["--reflection-scale", "1.5"]),
+            "--reflection-scale \"1.5\": a fraction above 0, at most 1"
+        );
+        assert_eq!(
+            refused(&["--reflection-scale", "wide"]),
+            "--reflection-scale \"wide\": a fraction above 0, at most 1"
+        );
+        assert_eq!(
+            refused(&["--reflection-scale"]),
+            "--reflection-scale: the value is missing; valid: a fraction above 0, at most 1"
+        );
+        assert_eq!(
+            refused(&["--reflection-prepass"]),
+            "--reflection-prepass: valid: --reflection-prepass=on, --reflection-prepass=off"
+        );
+        assert_eq!(
+            refused(&["--reflection-prepass=maybe"]),
+            "--reflection-prepass=maybe: valid: --reflection-prepass=on, --reflection-prepass=off"
+        );
+        assert_eq!(
+            refused(&["--reflection-occlusion"]),
+            "--reflection-occlusion: valid: --reflection-occlusion=on, --reflection-occlusion=off"
+        );
+        assert_eq!(
+            refused(&["--reflection-occlusion=yes"]),
+            "--reflection-occlusion=yes: valid: --reflection-occlusion=on, \
+             --reflection-occlusion=off"
+        );
+        assert_eq!(
+            refused(&["--reflection-prepass=on", "--reflection-scale", "2"]),
+            "--reflection-scale \"2\": a fraction above 0, at most 1",
+            "the run stops on the bad flag whatever good ones came before it"
+        );
+    }
+
+    #[test]
+    fn from_args_stops_the_run_on_a_bad_reflection_value() {
+        let error = EngineConfig::from_args(["--reflection-cascades", "5"].map(str::to_owned))
+            .expect_err("a bad reflection value stops the run");
+        assert_eq!(
+            error.to_string(),
+            "--reflection-cascades \"5\": 0 to 4 (Bevy 0.19's limit), or all"
+        );
+    }
+
+    #[test]
+    fn the_reflection_prepass_off_takes_occlusion_culling_with_it() {
+        let options = EngineConfig::run_from_args(
+            ["--reflection-prepass=on", "--reflection-prepass=off"].map(str::to_owned),
+        )
+        .reflection;
+        assert!(!options.prepass);
+        assert!(options.occlusion, "the flag itself is left as given");
+        assert!(!options.occlusion_culling());
     }
 }
