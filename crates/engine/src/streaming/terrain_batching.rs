@@ -615,6 +615,23 @@ impl LodBatchActivation<'_, '_> {
     }
 }
 
+/// Counts of chunks by the first reason their source hierarchy cannot retire.
+#[derive(Default, Debug)]
+struct RetireBlockers {
+    chunks: usize,
+    owned: usize,
+    root_not_ready: usize,
+    source_patch: usize,
+    source_mesh_upload: usize,
+    unowned_batch_upload: usize,
+    owned_batch_upload: usize,
+    owned_undrawn_batch_viewed: usize,
+    owned_undrawn_region_viewed: usize,
+    owned_undrawn_region_observed: usize,
+    owned_undrawn_not_prepared: usize,
+    other: usize,
+}
+
 #[derive(SystemParam)]
 pub(crate) struct LodBatchVisibility<'w, 's> {
     config: Option<Res<'w, crate::config::EngineConfig>>,
@@ -669,6 +686,105 @@ impl LodBatchVisibility<'_, '_> {
             .collect()
     }
 
+    /// Why each chunk still holding its source hierarchy cannot retire, by first failing
+    /// condition. Mirrors the retirement candidate test; read-only, for the stall log.
+    fn retire_blockers(
+        &self,
+        current: &crate::swap_bridge::CurrentCoverageVisibility,
+    ) -> RetireBlockers {
+        let fallback_cells = self.cluster_fallback_cells();
+        let Some(readiness) = self.readiness.as_deref() else {
+            return RetireBlockers::default();
+        };
+        let mut out = RetireBlockers::default();
+        for (entity, chunk, ready) in self.chunks.iter() {
+            if chunk.source_children.is_none() {
+                continue;
+            }
+            out.chunks += 1;
+            let world = self
+                .roots
+                .get(entity)
+                .ok()
+                .map(|root| root.key.worldspace_id);
+            if ready.is_none() {
+                out.root_not_ready += 1;
+                continue;
+            }
+            if chunk
+                .batches
+                .iter()
+                .any(|batch| owned_source_mask(batch, world, &fallback_cells) != 0)
+            {
+                out.owned += 1;
+            }
+            let mut sources = 0;
+            for member in chunk.batches.iter().flat_map(|batch| &batch.members) {
+                if !self
+                    .source_states
+                    .get(member.source_patch)
+                    .is_ok_and(|(coverage, ready)| ready && *coverage == member.coverage)
+                {
+                    sources = 1;
+                } else if sources == 0 && !readiness.is_ready(member.source.id()) {
+                    sources = 2;
+                }
+            }
+            if sources == 1 {
+                out.source_patch += 1;
+                continue;
+            }
+            if sources == 2 {
+                out.source_mesh_upload += 1;
+                continue;
+            }
+            let mut stopped = false;
+            for batch in &chunk.batches {
+                if batch.selected == 0 {
+                    continue;
+                }
+                if owned_source_mask(batch, world, &fallback_cells) == 0 {
+                    if batch.pending_upload && !readiness.is_ready(batch.mesh.id()) {
+                        out.unowned_batch_upload += 1;
+                        stopped = true;
+                        break;
+                    }
+                } else if batch.pending_upload {
+                    out.owned_batch_upload += 1;
+                    stopped = true;
+                    break;
+                } else if !self.drawn.get(batch.entity).is_ok_and(|receipt| {
+                    receipt.mesh == batch.mesh.id()
+                        && receipt.material == batch.state.material.id().untyped()
+                }) {
+                    if !current.is_unviewed(batch.entity) {
+                        out.owned_undrawn_batch_viewed += 1;
+                    } else if !batch
+                        .members
+                        .iter()
+                        .all(|member| current.is_unviewed(member.source_patch))
+                    {
+                        out.owned_undrawn_region_viewed += 1;
+                    } else if !batch.members.iter().all(|member| {
+                        self.coverage_views
+                            .get(member.source_patch)
+                            .is_ok_and(|view| !view.0)
+                    }) {
+                        out.owned_undrawn_region_observed += 1;
+                    } else {
+                        out.owned_undrawn_not_prepared += 1;
+                    }
+                    stopped = true;
+                    break;
+                }
+            }
+            if !stopped {
+                out.other += 1;
+            }
+        }
+        out
+    }
+
     pub(super) fn pending_count(&self) -> usize {
         self.chunks
             .iter()
@@ -715,15 +831,20 @@ impl LodBatchVisibility<'_, '_> {
                 .ok()
                 .map(|root| root.key.worldspace_id);
             if ready.is_some() && chunk.source_children.is_some() {
-                if chunk
-                    .batches
-                    .iter()
-                    .any(|batch| owned_source_mask(batch, world, &fallback_cells) != 0)
-                    && !self.coverage_requests.contains(entity)
-                {
-                    self.commands
-                        .entity(entity)
-                        .insert(crate::swap_bridge::SwapCoverageRoot);
+                // Observe each owned batch's own source region, not the whole chunk: a far chunk
+                // across the frustum edge has drawn batches in view and offscreen batches that
+                // can never draw, and a chunk-wide observation would hold the latter forever.
+                for batch in &chunk.batches {
+                    if owned_source_mask(batch, world, &fallback_cells) == 0 {
+                        continue;
+                    }
+                    for member in &batch.members {
+                        if !self.coverage_requests.contains(member.source_patch) {
+                            self.commands
+                                .entity(member.source_patch)
+                                .try_insert(crate::swap_bridge::SwapCoverageRoot);
+                        }
+                    }
                 }
                 for batch in &mut chunk.batches {
                     let owned = owned_source_mask(batch, world, &fallback_cells);
@@ -749,8 +870,6 @@ impl LodBatchVisibility<'_, '_> {
             {
                 return None;
             }
-            let source_unviewed_now =
-                current.is_some_and(|visibility| visibility.is_unviewed(entity));
             // CPU source readiness does not prove GPU preparation. Keep the source scene until
             // the immutable source buffers are prepared as well: later index-mask transitions
             // use those retained buffers for their exact coverage fallback.
@@ -781,20 +900,25 @@ impl LodBatchVisibility<'_, '_> {
                             receipt.mesh == batch.mesh.id()
                                 && receipt.material == batch.state.material.id().untyped()
                         });
-                        // Prepared offscreen transfer requires an observation of the entire old
-                        // hierarchy, never absence of the replacement batch alone. Unknown holds.
-                        let unviewed_ready = source_unviewed_now
-                            && self.coverage_views.get(entity).is_ok_and(|view| !view.0)
-                            && current
-                                .is_some_and(|visibility| visibility.is_unviewed(batch.entity))
-                            && self
-                                .prepared
-                                .get(batch.entity)
-                                .is_ok_and(|(mesh, surface)| {
-                                    mesh.0.id() == batch.mesh.id()
-                                        && surface.material_id()
-                                            == batch.state.material.id().untyped()
-                                });
+                        // Prepared offscreen transfer requires an observation of every source
+                        // patch this batch replaces, never absence of the replacement batch
+                        // alone: current culling and the renderer's own observation must both
+                        // say unviewed. Unknown holds.
+                        let unviewed_ready = current.is_some_and(|visibility| {
+                            visibility.is_unviewed(batch.entity)
+                                && batch.members.iter().all(|member| {
+                                    visibility.is_unviewed(member.source_patch)
+                                        && self
+                                            .coverage_views
+                                            .get(member.source_patch)
+                                            .is_ok_and(|view| !view.0)
+                                })
+                        }) && self.prepared.get(batch.entity).is_ok_and(
+                            |(mesh, surface)| {
+                                mesh.0.id() == batch.mesh.id()
+                                    && surface.material_id() == batch.state.material.id().untyped()
+                            },
+                        );
                         !batch.pending_upload && (drawn || unviewed_ready)
                     }
                 }))
@@ -809,10 +933,7 @@ impl LodBatchVisibility<'_, '_> {
             .ok()
             .map(|root| root.key.worldspace_id);
         let (_, mut chunk, _) = self.chunks.get_mut(entity).expect("selected chunk exists");
-        self.commands.entity(entity).remove::<(
-            crate::swap_bridge::SwapCoverageRoot,
-            crate::swap_bridge::SwapCoverageInCameraView,
-        )>();
+        // The observed source patches leave with the hierarchy below.
         // Unregister before despawning so the retained immutable GLB cannot respawn duplicates.
         self.commands.entity(entity).remove::<WorldAssetRoot>();
         self.commands.entity(entity).remove::<WorldInstance>();
@@ -1077,6 +1198,22 @@ pub(in crate::streaming) fn finalize_unviewed_lod_batches(
             &mut profiler,
             pending_cpu,
             batches.pending_count(),
+        );
+    }
+}
+
+/// Profiled cluster-terrain runs only: every 300 frames while chunks still hold their source
+/// hierarchy, log why each cannot retire. Ordinary runs install nothing.
+pub(in crate::streaming) fn log_terrain_retire_blockers(
+    batches: LodBatchVisibility,
+    current: crate::swap_bridge::CurrentCoverageVisibility,
+    mut frames: Local<u32>,
+) {
+    *frames = frames.wrapping_add(1);
+    if (*frames).is_multiple_of(300) && batches.pending_count() != 0 {
+        info!(
+            blockers = ?batches.retire_blockers(&current),
+            "terrain batches awaiting source retirement"
         );
     }
 }
@@ -1598,6 +1735,15 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    /// The renderer's historical observation of every source patch (synthetic).
+    fn observe_patches(app: &mut App, fixture: &Fixture, in_view: bool) {
+        for &(patch, _) in &fixture.patches {
+            app.world_mut()
+                .entity_mut(patch)
+                .insert(crate::swap_bridge::SwapCoverageInCameraView(in_view));
+        }
     }
 
     fn unview_fixture_meshes(app: &mut App, fixture: &Fixture, batch: Entity) {
@@ -3273,7 +3419,7 @@ mod tests {
 
     #[test]
     fn last_transfer_uses_postupdate_visibility_over_previous_offscreen_observation() {
-        use crate::swap_bridge::{SwapCoverageInCameraView, SwapPrepared};
+        use crate::swap_bridge::SwapPrepared;
         for changed_source in [None, Some(true), Some(false)] {
             let mut app = test_app();
             enable_cluster_fallback(&mut app);
@@ -3290,9 +3436,7 @@ mod tests {
                 .batches[0]
                 .entity;
             unview_fixture_meshes(&mut app, &fixture, batch);
-            app.world_mut()
-                .entity_mut(fixture.root)
-                .insert(SwapCoverageInCameraView(false));
+            observe_patches(&mut app, &fixture, false);
             app.world_mut().entity_mut(batch).insert(SwapPrepared {
                 stand_in: None,
                 since: 1,
@@ -3343,7 +3487,7 @@ mod tests {
 
     #[test]
     fn last_transfer_keeps_unknown_current_source_visibility() {
-        use crate::swap_bridge::{SwapCoverageInCameraView, SwapPrepared};
+        use crate::swap_bridge::SwapPrepared;
         let mut app = test_app();
         enable_cluster_fallback(&mut app);
         let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
@@ -3359,9 +3503,7 @@ mod tests {
             .batches[0]
             .entity;
         unview_fixture_meshes(&mut app, &fixture, batch);
-        app.world_mut()
-            .entity_mut(fixture.root)
-            .insert(SwapCoverageInCameraView(false));
+        observe_patches(&mut app, &fixture, false);
         app.world_mut().entity_mut(batch).insert(SwapPrepared {
             stand_in: None,
             since: 1,
@@ -3391,8 +3533,8 @@ mod tests {
     }
 
     #[test]
-    fn owned_prepared_offscreen_batches_retire_only_after_whole_source_observation() {
-        use crate::swap_bridge::{SwapCoverageInCameraView, SwapCoverageRoot, SwapPrepared};
+    fn owned_prepared_offscreen_batches_retire_only_after_source_region_observation() {
+        use crate::swap_bridge::{SwapCoverageRoot, SwapPrepared};
         for observed in [None, Some(true), Some(false)] {
             let mut app = test_app();
             enable_cluster_fallback(&mut app);
@@ -3405,7 +3547,12 @@ mod tests {
                 !finalize_initial(&mut app),
                 "unobserved hierarchy must remain"
             );
-            assert!(app.world().get::<SwapCoverageRoot>(fixture.root).is_some());
+            assert!(
+                fixture
+                    .patches
+                    .iter()
+                    .all(|(patch, _)| app.world().get::<SwapCoverageRoot>(*patch).is_some())
+            );
             let batch_entity = app
                 .world()
                 .get::<LodTerrainBatches>(fixture.root)
@@ -3419,9 +3566,7 @@ mod tests {
                     since: 1,
                 });
             if let Some(in_view) = observed {
-                app.world_mut()
-                    .entity_mut(fixture.root)
-                    .insert(SwapCoverageInCameraView(in_view));
+                observe_patches(&mut app, &fixture, in_view);
             }
             unview_fixture_meshes(&mut app, &fixture, batch_entity);
             assert!(
@@ -3432,15 +3577,14 @@ mod tests {
             assert_eq!(retired, observed == Some(false));
             let chunk = app.world().get::<LodTerrainBatches>(fixture.root).unwrap();
             assert_eq!(chunk.source_children.is_none(), retired);
-            assert_eq!(
-                app.world().get::<SwapCoverageRoot>(fixture.root).is_none(),
-                retired
-            );
+            assert!(app.world().get::<SwapCoverageRoot>(fixture.root).is_none());
             if retired {
                 assert!(
-                    app.world()
-                        .get::<SwapCoverageInCameraView>(fixture.root)
-                        .is_none()
+                    fixture
+                        .patches
+                        .iter()
+                        .all(|(patch, _)| app.world().get_entity(*patch).is_err()),
+                    "observed patches leave with the hierarchy"
                 );
                 assert_eq!(chunk.batches[0].fallback_entities.len(), 4);
                 assert!(
@@ -3461,8 +3605,91 @@ mod tests {
     }
 
     #[test]
+    fn partly_viewed_chunk_retires_its_offscreen_batch_on_that_batchs_own_region() {
+        // A far chunk across the frustum edge: one owned batch is drawn in view, the other lies
+        // wholly offscreen and can never be drawn. The offscreen batch may transfer once its own
+        // source patches are unviewed now and unobserved by the renderer; a viewed sibling batch
+        // must not hold it forever, and an observed offscreen patch still holds.
+        use crate::swap_bridge::{
+            SwapCoverageInCameraView, SwapCoverageRoot, SwapDrawReceipt, SwapPrepared,
+        };
+        for offscreen_observed in [false, true] {
+            let mut app = test_app();
+            enable_cluster_fallback(&mut app);
+            let fixture = fixture(&mut app, &[IVec2::ZERO, IVec2::new(2, 0)], LodTier::Tier4);
+            ready_source(&mut app, &fixture);
+            let prepared = prepare(&mut app, &fixture).unwrap();
+            assert_eq!(prepared.len(), 2, "two batch tiles");
+            install_fixture(&mut app, &fixture, prepared);
+            acknowledge_uploads(&app, fixture.root);
+            assert!(!finalize_initial(&mut app));
+            assert!(
+                fixture
+                    .patches
+                    .iter()
+                    .all(|(patch, _)| app.world().get::<SwapCoverageRoot>(*patch).is_some()),
+                "owned regions are observed per source patch"
+            );
+            assert!(app.world().get::<SwapCoverageRoot>(fixture.root).is_none());
+            let chunk = app.world().get::<LodTerrainBatches>(fixture.root).unwrap();
+            let regions: Vec<_> = chunk
+                .batches
+                .iter()
+                .map(|batch| {
+                    (
+                        batch.entity,
+                        SwapDrawReceipt {
+                            mesh: batch.mesh.id(),
+                            material: batch.state.material.id().untyped(),
+                        },
+                        batch.members.iter().any(|m| m.coverage.grid == IVec2::ZERO),
+                        batch
+                            .members
+                            .iter()
+                            .map(|member| member.source_patch)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            for (batch, receipt, viewed, patches) in regions {
+                let visibility = if viewed {
+                    ViewVisibility::VISIBLE
+                } else {
+                    ViewVisibility::default()
+                };
+                app.world_mut().entity_mut(batch).insert(visibility);
+                if viewed {
+                    app.world_mut().entity_mut(batch).insert(receipt);
+                } else {
+                    app.world_mut().entity_mut(batch).insert(SwapPrepared {
+                        stand_in: None,
+                        since: 1,
+                    });
+                }
+                for patch in patches {
+                    app.world_mut()
+                        .entity_mut(patch)
+                        .insert(SwapCoverageInCameraView(viewed || offscreen_observed));
+                    let primitive = app.world().get::<Children>(patch).unwrap()[0];
+                    app.world_mut().entity_mut(primitive).insert(visibility);
+                }
+            }
+            let retired = finalize_unviewed_initial(&mut app);
+            assert_eq!(retired, !offscreen_observed);
+            assert_eq!(
+                app.world()
+                    .get::<LodTerrainBatches>(fixture.root)
+                    .unwrap()
+                    .source_children
+                    .is_none(),
+                retired
+            );
+        }
+    }
+
+    #[test]
     fn offscreen_initial_retirement_requires_current_batch_asset_identity() {
-        use crate::swap_bridge::{SwapCoverageInCameraView, SwapPrepared};
+        use crate::swap_bridge::SwapPrepared;
         let mut app = test_app();
         enable_cluster_fallback(&mut app);
         let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
@@ -3477,9 +3704,7 @@ mod tests {
             .unwrap()
             .batches[0]
             .entity;
-        app.world_mut()
-            .entity_mut(fixture.root)
-            .insert(SwapCoverageInCameraView(false));
+        observe_patches(&mut app, &fixture, false);
         assert!(
             !finalize_initial(&mut app),
             "unviewed upload without preparation still holds"
