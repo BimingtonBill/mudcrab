@@ -3573,7 +3573,7 @@ fn spawn_cell_with_options(
                 // The quadrant declares what its draw needs, for the renderâ†’main swap bridge
                 // (`crate::swap_bridge`): the material it draws with and every image that material
                 // binds. The images are the ones the readiness pass validates below, and the
-                // declaration is re-made there if a normal map has to be dropped.
+                // declaration includes every authored diffuse and normal dependency.
                 let surface = SwapSurface::new(
                     material.id().untyped(),
                     images
@@ -3923,8 +3923,8 @@ struct PendingTerrainProfile {
     cell_id: u32,
     quadrant: u8,
     images: Vec<Handle<Image>>,
-    /// The layers' normal maps, which the quadrant can be drawn without: see
-    /// [`crate::render::TerrainExtension::drop_normal_maps`].
+    /// Authored normal maps are required dependencies when declared. Their failure refuses
+    /// the surface through the same recorded AssetFailed path as diffuse-map failure.
     normals: Vec<Handle<Image>>,
 }
 
@@ -4900,75 +4900,35 @@ fn track_surface_readiness(
     config: Res<EngineConfig>,
     asset_server: Res<AssetServer>,
     images: Res<Assets<Image>>,
-    terrain: Query<(
-        Entity,
-        &PendingTerrainProfile,
-        Option<&MeshMaterial3d<TerrainMaterial>>,
-    )>,
+    terrain: Query<(Entity, &PendingTerrainProfile)>,
     water: Query<(Entity, &PendingWaterProfile)>,
     mut lod_streaming: ResMut<lod::LodStreaming>,
-    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     metrics.pending_surface_instances = terrain.iter().count() + water.iter().count();
     let mut completed = 0usize;
-    for (entity, pending, material) in &terrain {
-        let mut normals_dropped = false;
-        let state = match validate_surface_dependencies(
-            &asset_server,
-            &images,
-            &pending.images,
-            SurfaceImageKind::Terrain,
-        ) {
-            SurfaceDependencyState::Ready => {
-                match validate_surface_dependencies(
+    for (entity, pending) in &terrain {
+        let state = terrain_dependency_state(
+            validate_surface_dependencies(
+                &asset_server,
+                &images,
+                &pending.images,
+                SurfaceImageKind::Terrain,
+            ),
+            || {
+                validate_surface_dependencies(
                     &asset_server,
                     &images,
                     &pending.normals,
                     SurfaceImageKind::TerrainNormal,
-                ) {
-                    // A normal map is optional detail: without it the quadrant is lit by its
-                    // geometric normal, as a quadrant whose layers have none is.
-                    SurfaceDependencyState::Failed(reason) => {
-                        warn!(
-                            cell = format_args!("{:08X}", pending.cell_id),
-                            quadrant = pending.quadrant,
-                            %reason,
-                            "terrain normal map failed; drawing the quadrant without normal maps"
-                        );
-                        if let Some(mut material) =
-                            material.and_then(|material| terrain_materials.get_mut(&material.0))
-                        {
-                            material.extension.drop_normal_maps();
-                        }
-                        // The swap bridge waits on the images the material binds, so the failed
-                        // normal maps leave the quadrant's declaration with them: an image that
-                        // will never reach the render world is one the surface could never stop
-                        // waiting for, and from slice C4 that would fail a settle loudly.
-                        let bound: Vec<_> =
-                            pending.images.iter().map(|handle| handle.id()).collect();
-                        commands
-                            .entity(entity)
-                            .entry::<SwapSurface>()
-                            .and_modify(move |mut surface| surface.set_images(bound));
-                        profiler.increment("terrain/normal_map_fallbacks", 1);
-                        normals_dropped = true;
-                        SurfaceDependencyState::Ready
-                    }
-                    other => other,
-                }
-            }
-            other => other,
-        };
+                )
+            },
+        );
         match state {
             SurfaceDependencyState::Pending => {}
             SurfaceDependencyState::Ready => {
-                let normals_validated = if normals_dropped {
-                    0
-                } else {
-                    pending.normals.len()
-                };
+                let normals_validated = pending.normals.len();
                 metrics.terrain_patches_validated =
                     metrics.terrain_patches_validated.saturating_add(1);
                 metrics.materials_validated = metrics.materials_validated.saturating_add(1);
@@ -5089,6 +5049,17 @@ enum SurfaceDependencyState {
     Pending,
     Ready,
     Failed(String),
+}
+
+/// Undeclared normals require no assets; declared normals must validate without substitution.
+fn terrain_dependency_state(
+    diffuse: SurfaceDependencyState,
+    normals: impl FnOnce() -> SurfaceDependencyState,
+) -> SurfaceDependencyState {
+    match diffuse {
+        SurfaceDependencyState::Ready => normals(),
+        other => other,
+    }
 }
 
 /// Which surface a set of images belongs to, and so which colour space and sampler each must have
@@ -7241,6 +7212,104 @@ mod tests {
     use crate::world::database::LightRow;
     use bevy::asset::{AssetApp, AssetPlugin};
     use bevy::ecs::system::SystemState;
+
+    /// Exercise the real readiness system. AssetServer::add queues a procedural image
+    /// synchronously, so no filesystem, loader sleep or private fixture is involved.
+    #[test]
+    fn invalid_authored_normal_records_failure_instead_of_revealing_the_surface() {
+        use bevy::asset::RenderAssetUsages;
+        use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .init_asset::<TerrainMaterial>()
+            .init_resource::<EngineConfig>()
+            .init_resource::<lod::LodStreaming>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, track_surface_readiness);
+        // sRGB is invalid for a declared linear terrain normal, even when fully loaded.
+        let image = Image::new_fill(
+            Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[128, 128, 255, 255],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        let normal = app.world().resource::<AssetServer>().add(image);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<AssetServer>()
+                .is_loaded_with_dependencies(normal.id())
+        );
+        let entity = app
+            .world_mut()
+            .spawn((
+                PendingTerrainProfile {
+                    cell_id: 7,
+                    quadrant: 2,
+                    images: vec![],
+                    normals: vec![normal.clone()],
+                },
+                Visibility::Hidden,
+                SwapSurface::new(
+                    Handle::<TerrainMaterial>::default().id().untyped(),
+                    [normal.id()],
+                ),
+                SwapWaiting,
+            ))
+            .id();
+        app.update();
+        assert!(app.world().get::<AssetFailed>(entity).is_some());
+        assert_eq!(
+            app.world().get::<Visibility>(entity),
+            Some(&Visibility::Hidden)
+        );
+        assert!(app.world().get::<TerrainSurfaceReady>(entity).is_none());
+        assert!(app.world().get::<SwapWaiting>(entity).is_some());
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.terrain_validation_failures, 1);
+        assert_eq!(metrics.terrain_patches_validated, 0);
+        assert!(
+            metrics.asset_failures[0]
+                .dependency_chain
+                .iter()
+                .any(|reason| reason.contains("wrong color space"))
+        );
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .terrain_validation_failures,
+            1
+        );
+    }
+
+    #[test]
+    fn declared_terrain_normal_failure_refuses_readiness_with_its_reason() {
+        let state = terrain_dependency_state(SurfaceDependencyState::Ready, || {
+            SurfaceDependencyState::Failed("normal image has wrong color space".into())
+        });
+        assert!(matches!(state, SurfaceDependencyState::Failed(reason)
+            if reason == "normal image has wrong color space"));
+        assert!(matches!(
+            terrain_dependency_state(SurfaceDependencyState::Ready, || {
+                SurfaceDependencyState::Pending
+            }),
+            SurfaceDependencyState::Pending
+        ));
+        assert!(matches!(
+            terrain_dependency_state(SurfaceDependencyState::Ready, || {
+                SurfaceDependencyState::Ready
+            }),
+            SurfaceDependencyState::Ready
+        ));
+    }
 
     #[test]
     fn window_residency_counts_only_the_active_interior_inside() {

@@ -773,22 +773,6 @@ impl TerrainExtension {
         self.settings.weight_source.x > 0.5
     }
 
-    /// Unbinds every layer's normal map, so the quadrant is lit by its geometric normal as a
-    /// quadrant without normal maps is. Used when a normal map fails to load: a normal map is
-    /// optional detail, and losing one must not hide the terrain its diffuse layers can draw.
-    pub(crate) fn drop_normal_maps(&mut self) {
-        let none: [Option<Handle<Image>>; 6] = Default::default();
-        self.settings.set_normal_layers(&none);
-        [
-            self.normal_0,
-            self.normal_1,
-            self.normal_2,
-            self.normal_3,
-            self.normal_4,
-            self.normal_5,
-        ] = none;
-    }
-
     /// Whether any layer has a normal map bound.
     #[cfg(test)]
     pub(crate) fn has_normal_maps(&self) -> bool {
@@ -3234,29 +3218,25 @@ mod tests {
     }
 
     #[test]
-    fn dropping_normal_maps_unbinds_them_and_clears_their_flags() {
+    fn authored_terrain_normal_bindings_and_flags_are_preserved() {
         let mut extension = TerrainExtension::default();
         let normals: [Option<Handle<Image>>; 6] =
             std::array::from_fn(|index| (index % 2 == 0).then(Handle::default));
         extension.settings.set_normal_layers(&normals);
         [extension.normal_0, extension.normal_2, extension.normal_4] =
             [normals[0].clone(), normals[2].clone(), normals[4].clone()];
-        assert!(extension.has_normal_maps());
-
-        extension.drop_normal_maps();
-
-        assert!(!extension.has_normal_maps());
-        assert!(
+        let copy = extension.clone();
+        assert!(copy.has_normal_maps());
+        assert_eq!(
             [
-                &extension.normal_0,
-                &extension.normal_1,
-                &extension.normal_2,
-                &extension.normal_3,
-                &extension.normal_4,
-                &extension.normal_5,
-            ]
-            .iter()
-            .all(|normal| normal.is_none())
+                copy.normal_0,
+                copy.normal_1,
+                copy.normal_2,
+                copy.normal_3,
+                copy.normal_4,
+                copy.normal_5
+            ],
+            normals
         );
     }
 
