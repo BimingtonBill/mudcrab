@@ -60,6 +60,19 @@ fn prepare_generated_tangents(
     }
 }
 
+/// The same unorm8 RGBA interpretation as the pooled vertex shader, including alpha.
+fn source_colours(bytes: &[u8], count: usize) -> Vec<[f32; 4]> {
+    if bytes.is_empty() {
+        return vec![[1.0; 4]; count];
+    }
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|rgba| std::array::from_fn(|channel| f32::from(rgba[channel]) / 255.0))
+        .collect()
+}
+
 /// A validated per-mesh cluster payload (`.mcl`).
 #[derive(Asset, TypePath, Clone)]
 pub struct ClusterMeshAsset {
@@ -119,7 +132,7 @@ impl ClusterMeshAsset {
     }
 
     /// The mesh as the stock path sees it: one ordinary indexed triangle list of the source
-    /// geometry (the clusters no simplification produced), with positions, normals and UVs.
+    /// geometry (the clusters no simplification produced), retaining colours and authored tangents.
     pub fn source_mesh(&self) -> Mesh {
         let view = self.view();
         let count = self.vertex_count as usize;
@@ -130,6 +143,7 @@ impl ClusterMeshAsset {
         let uvs: Vec<[f32; 2]> = (0..count)
             .map(|vertex| decode_uv_unorm16(view.uv(vertex), self.uv_min, self.uv_scale))
             .collect();
+        let colours = source_colours(view.section(MclSection::Colours), count);
         let mut indices = Vec::new();
         for index in 0..self.cluster_count as usize {
             let cluster = view.cluster(index);
@@ -140,14 +154,36 @@ impl ClusterMeshAsset {
                 indices.push(view.cluster_vertex(cluster.vertex_offset as usize + *local as usize));
             }
         }
-        Mesh::new(
+        let mut mesh = Mesh::new(
             bevy::mesh::PrimitiveTopology::TriangleList,
             bevy::asset::RenderAssetUsages::default(),
         )
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-        .with_inserted_indices(bevy::mesh::Indices::U32(indices))
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colours)
+        .with_inserted_indices(bevy::mesh::Indices::U32(indices));
+        if self.flags & FLAG_TANGENTS != 0 {
+            let tangents: Vec<[f32; 4]> = self
+                .section(MclSection::Tangents)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| {
+                    let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    let direction =
+                        decode_oct_snorm16([word as u16 as i16, ((word >> 16) as u16 & !1) as i16]);
+                    [
+                        direction[0],
+                        direction[1],
+                        direction[2],
+                        if word & 0x10000 != 0 { -1.0 } else { 1.0 },
+                    ]
+                })
+                .collect();
+            mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, tangents);
+        }
+        mesh
     }
 
     /// One packed tangent word per vertex, in the payload's encoding (octahedral snorm16x2, the
@@ -361,6 +397,53 @@ mod tests {
     const MCI: &[u8] = include_bytes!("../../../shared/tests/data/cluster/fixture.mci");
 
     #[test]
+    fn stock_source_preserves_alpha_and_colour_used_by_cutout_materials() {
+        assert_eq!(
+            source_colours(&[255, 128, 0, 0, 0, 64, 255, 127], 2),
+            vec![
+                [1.0, 128.0 / 255.0, 0.0, 0.0],
+                [0.0, 64.0 / 255.0, 1.0, 127.0 / 255.0]
+            ]
+        );
+        // Give the existing clean-room fixture an authored colour section so this assertion
+        // fails if source_mesh drops RGBA, including alpha values on either side of a cutout.
+        let mut bytes = MCL.to_vec();
+        while !bytes
+            .len()
+            .is_multiple_of(shared::cluster::SECTION_ALIGNMENT)
+        {
+            bytes.push(0);
+        }
+        let offset = bytes.len();
+        let count = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
+        let rgba: Vec<u8> = (0..count)
+            .flat_map(|vertex| [255, 128, 64, if vertex % 2 == 0 { 0 } else { 255 }])
+            .collect();
+        bytes.extend_from_slice(&rgba);
+        let entry = shared::cluster::MCL_HEADER_BYTES + MclSection::Colours as usize * 16;
+        bytes[entry..entry + 8].copy_from_slice(&(offset as u64).to_le_bytes());
+        bytes[entry + 8..entry + 16].copy_from_slice(&(rgba.len() as u64).to_le_bytes());
+        let flags = u32::from_le_bytes(bytes[76..80].try_into().unwrap())
+            | shared::cluster::FLAG_VERTEX_COLOURS;
+        bytes[76..80].copy_from_slice(&flags.to_le_bytes());
+        let mesh = ClusterMeshAsset::from_bytes(bytes).unwrap();
+        let source = mesh.source_mesh();
+        let Some(bevy::mesh::VertexAttributeValues::Float32x4(colours)) =
+            source.attribute(Mesh::ATTRIBUTE_COLOR)
+        else {
+            panic!("source must expose RGBA");
+        };
+        assert_eq!(colours.len(), mesh.vertex_count as usize);
+        assert_eq!(
+            *colours,
+            source_colours(
+                mesh.section(MclSection::Colours),
+                mesh.vertex_count as usize
+            )
+        );
+    }
+
+    #[test]
     fn unused_terrain_slots_never_become_successful_tangent_proof_or_generate_later() {
         let mesh = ClusterMeshAsset::from_bytes(MCL.to_vec()).unwrap();
         assert_eq!(mesh.prepared_tangents_usable(), None);
@@ -497,5 +580,135 @@ mod tests {
         let mut bad_version = MCI.to_vec();
         bad_version[4] = 9;
         assert!(ClusterBlockAsset::from_bytes(&bad_version).is_err());
+    }
+}
+
+/// Add an authored tangent section to the real hierarchy without changing its
+/// source/parent clusters, vertices, groups or BVH records.
+#[cfg(test)]
+pub(crate) fn authored_tangent_fixture() -> ClusterMeshAsset {
+    use shared::cluster::{MclContents, write_mcl};
+    let source = ClusterMeshAsset::from_bytes(
+        include_bytes!("../../../shared/tests/data/cluster/fixture.mcl").to_vec(),
+    )
+    .unwrap();
+    let view = source.view();
+    let count = source.vertex_count as usize;
+    let positions: Vec<_> = (0..count).map(|i| view.position(i)).collect();
+    let normals: Vec<_> = (0..count).map(|i| view.normal(i)).collect();
+    let uvs: Vec<_> = (0..count).map(|i| view.uv(i)).collect();
+    let tangents: Vec<_> = (0..count)
+        .map(|i| {
+            let word = pack_tangent_word(if i % 2 == 0 {
+                [1.0, 0.0, 0.0, -1.0]
+            } else {
+                [0.0, 1.0, 0.0, 1.0]
+            });
+            [word as u16 as i16, (word >> 16) as u16 as i16]
+        })
+        .collect();
+    let clusters: Vec<_> = (0..source.cluster_count as usize)
+        .map(|i| view.cluster(i))
+        .collect();
+    let groups: Vec<_> = (0..source.group_count as usize)
+        .map(|i| view.group(i))
+        .collect();
+    let bvh: Vec<_> = (0..source.bvh_node_count as usize)
+        .map(|i| view.bvh_node(i))
+        .collect();
+    let vertices: Vec<_> = (0..view.section(MclSection::ClusterVertices).len() / 4)
+        .map(|i| view.cluster_vertex(i))
+        .collect();
+    let triangles: Vec<[u8; 3]> = view
+        .section(MclSection::ClusterTriangles)
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|v| [v[0], v[1], v[2]])
+        .collect();
+    let bytes = write_mcl(&MclContents {
+        builder_identity: view.builder_identity,
+        mesh_hash: view.mesh_hash,
+        primitive_index: view.primitive_index,
+        root_error: view.root_error,
+        bounds: view.bounds,
+        uv_min: view.uv_min,
+        uv_scale: view.uv_scale,
+        positions: &positions,
+        normals: &normals,
+        uvs: &uvs,
+        tangents: Some(&tangents),
+        colours: None,
+        clusters: &clusters,
+        cluster_vertices: &vertices,
+        cluster_triangles: &triangles,
+        groups: &groups,
+        bvh: &bvh,
+    })
+    .unwrap();
+    ClusterMeshAsset::from_bytes(bytes).unwrap()
+}
+
+#[cfg(test)]
+mod source_tangent_regressions {
+    use super::*;
+    use bevy::mesh::VertexAttributeValues;
+
+    #[test]
+    fn source_mesh_keeps_authored_tangents_without_a_normal_map() {
+        let asset = authored_tangent_fixture();
+        let source = asset.source_mesh();
+        let Some(VertexAttributeValues::Float32x4(tangents)) =
+            source.attribute(Mesh::ATTRIBUTE_TANGENT)
+        else {
+            panic!("authored TANGENT semantic was dropped");
+        };
+        assert_eq!(tangents.len(), asset.vertex_count as usize);
+        assert!(
+            tangents
+                .iter()
+                .enumerate()
+                .all(|(i, t)| t[3] == if i % 2 == 0 { -1.0 } else { 1.0 })
+        );
+        let mut mapped = asset.source_mesh();
+        if !mapped.contains_attribute(Mesh::ATTRIBUTE_TANGENT) {
+            mapped.generate_tangents().unwrap();
+        }
+        assert_eq!(
+            mapped.attribute(Mesh::ATTRIBUTE_TANGENT),
+            source.attribute(Mesh::ATTRIBUTE_TANGENT)
+        );
+        asset.prepare_tangents();
+        let expected: Vec<_> = asset
+            .section(MclSection::Tangents)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+            .collect();
+        assert_eq!(asset.tangent_words().as_ref(), expected);
+    }
+
+    #[test]
+    fn source_tangent_direction_masks_the_handedness_bit_like_the_cluster_shader() {
+        let asset = authored_tangent_fixture();
+        let source = asset.source_mesh();
+        let Some(VertexAttributeValues::Float32x4(tangents)) =
+            source.attribute(Mesh::ATTRIBUTE_TANGENT)
+        else {
+            panic!("missing authored tangents")
+        };
+        for (tangent, bytes) in tangents.iter().zip(
+            asset
+                .section(MclSection::Tangents)
+                .as_chunks::<4>()
+                .0
+                .iter(),
+        ) {
+            let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let direction =
+                decode_oct_snorm16([word as u16 as i16, ((word >> 16) as u16 & !1) as i16]);
+            assert_eq!(&tangent[..3], &direction);
+        }
     }
 }

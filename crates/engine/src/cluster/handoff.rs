@@ -84,6 +84,11 @@ pub(super) struct Sources {
     stock_primitives: HashMap<(u32, u32), MainEntity>,
     templates: Vec<bool>,
     normal_maps: Vec<bool>,
+    /// Actual certified stock attribute, including retained glTF-generated tangents.
+    stock_tangents: Vec<Option<bool>>,
+    pub(super) layout_version: u64,
+    lazy_layout_scope: Option<u64>,
+    fixture_layout_scope: bool,
     /// Definitive global template/material refusal, separate from loading false values.
     source_fallback_batches: BTreeSet<u32>,
     pub(super) worlds: HashMap<MainEntity, Option<u32>>,
@@ -110,16 +115,32 @@ pub(super) struct Sources {
 struct TemplateMeshDependencies {
     by_scene: HashMap<AssetId<WorldAsset>, HashSet<AssetId<Mesh>>>,
     by_mesh: HashMap<AssetId<Mesh>, HashSet<AssetId<WorldAsset>>>,
+    /// Ambiguous ordinal domains refuse layout proof. All meshes remain in the
+    /// reverse graph, including duplicate ordinals and refused templates.
+    by_ordinal: HashMap<AssetId<WorldAsset>, HashMap<u32, AssetId<Mesh>>>,
 }
 
 impl TemplateMeshDependencies {
     fn register(&mut self, scene: AssetId<WorldAsset>, asset: &WorldAsset) {
         self.remove(scene);
-        let meshes: HashSet<_> = asset
-            .world
-            .try_query::<&Mesh3d>()
-            .map(|mut query| query.iter(&asset.world).map(|mesh| mesh.0.id()).collect())
-            .unwrap_or_default();
+        let mut meshes = HashSet::new();
+        let mut bindings = HashMap::new();
+        let mut duplicate = false;
+        // Exactly template_valid's mesh domain and identity readability. Making
+        // SourcePrimitive a required query input could admit a disabled entity
+        // that template_valid never inspected.
+        if let Some(mut query) = asset.world.try_query::<(Entity, &Mesh3d)>() {
+            for (entity, mesh) in query.iter(&asset.world) {
+                meshes.insert(mesh.0.id());
+                if let Some(tag) = asset.world.get::<SourcePrimitive>(entity) {
+                    duplicate |= bindings.insert(tag.ordinal, mesh.0.id()).is_some();
+                }
+            }
+        }
+        if duplicate {
+            bindings.clear();
+        }
+        self.by_ordinal.insert(scene, bindings);
         for &mesh in &meshes {
             self.by_mesh.entry(mesh).or_default().insert(scene);
         }
@@ -127,6 +148,7 @@ impl TemplateMeshDependencies {
     }
 
     fn remove(&mut self, scene: AssetId<WorldAsset>) {
+        self.by_ordinal.remove(&scene);
         if let Some(meshes) = self.by_scene.remove(&scene) {
             for mesh in meshes {
                 if let Some(scenes) = self.by_mesh.get_mut(&mesh) {
@@ -201,6 +223,8 @@ struct TemplateRows {
     by_scene: HashMap<AssetId<WorldAsset>, BTreeSet<u32>>,
     /// Batches whose material or template asset is still loading: decided again every frame.
     pending: BTreeSet<u32>,
+    fixture_by_mesh: HashMap<AssetId<Mesh>, BTreeSet<u32>>,
+    fixture_by_row: HashMap<u32, AssetId<Mesh>>,
 }
 
 impl TemplateRows {
@@ -213,6 +237,14 @@ impl TemplateRows {
         ),
     ) {
         self.pending.remove(&index);
+        if let Some(mesh) = self.fixture_by_row.remove(&index)
+            && let Some(rows) = self.fixture_by_mesh.get_mut(&mesh)
+        {
+            rows.remove(&index);
+            if rows.is_empty() {
+                self.fixture_by_mesh.remove(&mesh);
+            }
+        }
         if let Some(id) = input.0
             && let Some(rows) = self.by_material.get_mut(&id)
         {
@@ -238,6 +270,7 @@ impl TemplateRows {
 #[derive(Clone, Copy, Default)]
 struct TemplateRow {
     normal_map: bool,
+    stock_tangents: Option<bool>,
     template: bool,
     fallback: bool,
     pending: bool,
@@ -256,15 +289,27 @@ struct TemplateCaches<'a> {
     rows: &'a mut TemplateRows,
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Borrowed qualification inputs; no additional per-frame source traversal.
+struct TemplateAssets<'a> {
+    standards: &'a Assets<StandardMaterial>,
+    lazy: Option<&'a LazyBatches>,
+    scenes: Option<&'a Assets<WorldAsset>>,
+    meshes: &'a Assets<Mesh>,
+    fixtures: Option<&'a ClusterBatchStockMeshes>,
+}
+
 fn template_row(
     index: u32,
     handle: &bevy::asset::UntypedHandle,
     caches: TemplateCaches<'_>,
-    standards: &Assets<StandardMaterial>,
-    lazy: Option<&LazyBatches>,
-    assets: Option<&Assets<WorldAsset>>,
+    inputs: &TemplateAssets<'_>,
 ) -> TemplateRow {
+    let TemplateAssets {
+        standards,
+        lazy,
+        scenes: assets,
+        ..
+    } = *inputs;
     let id = handle.id();
     caches.rows.by_material.entry(id).or_default().insert(index);
     let geometry = caches.geometry.get(&id).copied().or_else(|| {
@@ -294,6 +339,33 @@ fn template_row(
         ..default()
     };
     let Some(source) = lazy.and_then(|lazy| lazy.source_scene(index)) else {
+        // Standalone fixtures provide the very same Mesh handle stock would draw.
+        // No MCL flag or material-derived layout is accepted as a substitute.
+        if let Some(mesh) = inputs
+            .fixtures
+            .and_then(|sources| sources.0.get(index as usize))
+        {
+            caches
+                .rows
+                .fixture_by_mesh
+                .entry(mesh.id())
+                .or_default()
+                .insert(index);
+            caches.rows.fixture_by_row.insert(index, mesh.id());
+            row.stock_tangents = inputs
+                .meshes
+                .get(mesh)
+                .map(|mesh| mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT));
+            row.pending = row.stock_tangents.is_none();
+            row.fallback = caches.invalid_meshes.contains(&mesh.id())
+                || row
+                    .stock_tangents
+                    .is_some_and(|present| geometry.tangents && !present);
+            if row.fallback {
+                row.stock_tangents = None;
+            }
+        }
+        row.normal_map |= row.stock_tangents == Some(true);
         return row;
     };
     caches
@@ -323,6 +395,31 @@ fn template_row(
         }
     };
     row.template = valid;
+    if valid {
+        // Validation and ordinal binding share the same event-scoped graph.
+        let mesh = lazy
+            .and_then(|lazy| lazy.source_primitive(index))
+            .and_then(|ordinal| {
+                caches
+                    .template_meshes
+                    .by_ordinal
+                    .get(&source.id())?
+                    .get(&ordinal)
+            });
+        row.stock_tangents = mesh
+            .and_then(|id| inputs.meshes.get(*id))
+            .map(|mesh| mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT));
+        row.pending |= mesh.is_some() && row.stock_tangents.is_none();
+        row.fallback |= mesh.is_none()
+            || row
+                .stock_tangents
+                .is_some_and(|present| geometry.tangents && !present);
+        if row.fallback || row.pending {
+            row.template = false;
+            row.stock_tangents = None;
+        }
+    }
+    row.normal_map |= row.stock_tangents == Some(true);
     if !valid && caches.templates.get(&source.id()) == Some(&false) {
         row.fallback = true;
     }
@@ -386,6 +483,10 @@ fn collect_terrain_visibility(
 }
 
 impl Sources {
+    pub(super) fn stock_tangents(&self, batch: usize) -> Option<bool> {
+        self.stock_tangents.get(batch).copied().flatten()
+    }
+
     /// Mesh invalidity is sticky in the existing certification contract. Reclassify exactly
     /// the affected ordinals, including a duplicate becoming uniquely bindable.
     /// No root/presence/primitive query is needed. Keep the old snapshot until candidate_worlds
@@ -967,13 +1068,19 @@ struct SourceExtractionTiming {
     structural_refreshes: u64,
 }
 
+type SourceGeometryAssets<'w> = (
+    Option<Res<'w, Assets<WorldAsset>>>,
+    Res<'w, Assets<Mesh>>,
+    Option<Res<'w, ClusterBatchStockMeshes>>,
+);
+
 #[allow(clippy::too_many_arguments)]
 fn extract_sources(
     mut out: ResMut<Sources>,
     package: Extract<Option<Res<ValidatedPackage>>>,
     scene: Extract<Option<Res<ClusterScene>>>,
     lazy: Extract<Option<Res<LazyBatches>>>,
-    assets: Extract<Option<Res<Assets<WorldAsset>>>>,
+    geometry_assets: Extract<SourceGeometryAssets>,
     handles: Extract<Res<ClusterBatchHandles>>,
     standards: Extract<Res<Assets<StandardMaterial>>>,
     mut queries: Extract<SourceQueries>,
@@ -988,6 +1095,7 @@ fn extract_sources(
     // PI1 suppression is independent of extraction. Lifecycle and hot changes
     // invalidate stock proof in either ownership mode.
     let own_statics = settings.is_some_and(|settings| settings.own_statics);
+    let (assets, stock_meshes, fixture_meshes) = &*geometry_assets;
     let out = &mut *out;
     let queries = &mut *queries;
     let started = std::time::Instant::now();
@@ -1004,7 +1112,14 @@ fn extract_sources(
     // The batches whose cached template decision an event below drops.
     let mut dropped_materials = Vec::new();
     let mut dropped_scenes = Vec::new();
+    let mut dropped_fixture_rows = BTreeSet::new();
     for event in events.meshes.read() {
+        let id = event_asset_id(event);
+        // Added/LoadedWithDependencies wake pending layout proofs without making
+        // geometry invalid. Modified/Removed remain sticky certification refusals.
+        if let Some(rows) = out.template_rows.fixture_by_mesh.get(&id) {
+            dropped_fixture_rows.extend(rows.iter().copied());
+        }
         if let AssetEvent::Modified { id } | AssetEvent::Removed { id } = event {
             debug!(?event, path=?asset_server.as_ref().and_then(|server| server.get_path(*id)), "cluster source mesh invalidated");
             work.mesh_modified += u64::from(matches!(event, AssetEvent::Modified { .. }));
@@ -1590,7 +1705,17 @@ fn extract_sources(
     // reach exactly their indexed source scenes.
     let batches = handles.handles.len();
     let template_stale = out.template_rows.stale;
-    let full = template_stale || !same || forced_full;
+    let layout_scope = lazy.as_ref().map(|lazy| lazy.layout_scope);
+    let full = template_stale
+        || !same
+        || forced_full
+        || out.lazy_layout_scope != layout_scope
+        || out.fixture_layout_scope != fixture_meshes.is_some()
+        || fixture_meshes
+            .as_ref()
+            .is_some_and(|meshes| meshes.is_changed());
+    out.lazy_layout_scope = layout_scope;
+    out.fixture_layout_scope = fixture_meshes.is_some();
     let (mut templates, mut normal_maps, mut source_fallback_batches, redo) = if full {
         out.template_rows = TemplateRows::default();
         (
@@ -1637,6 +1762,21 @@ fn extract_sources(
     };
     templates.resize(batches, false);
     normal_maps.resize(batches, false);
+    let mut stock_tangents = if full {
+        vec![None; batches]
+    } else {
+        out.stock_tangents.clone()
+    };
+    stock_tangents.resize(batches, None);
+    let inputs = TemplateAssets {
+        standards: &standards,
+        lazy: lazy.as_deref(),
+        scenes: assets.as_deref(),
+        meshes: stock_meshes,
+        fixtures: fixture_meshes.as_deref(),
+    };
+    let mut redo = redo;
+    redo.extend(dropped_fixture_rows);
     source_fallback_batches.retain(|index| (*index as usize) < batches);
     out.template_inputs.truncate(batches);
     for index in redo {
@@ -1662,9 +1802,7 @@ fn extract_sources(
                     invalid_meshes: &out.invalid_meshes,
                     rows: &mut out.template_rows,
                 },
-                &standards,
-                lazy.as_deref(),
-                assets.as_deref(),
+                &inputs,
             ),
             None => TemplateRow::default(),
         };
@@ -1680,6 +1818,7 @@ fn extract_sources(
         out.template_inputs[index as usize] = input;
         templates[index as usize] = row.template;
         normal_maps[index as usize] = row.normal_map;
+        stock_tangents[index as usize] = row.stock_tangents;
         if row.fallback {
             source_fallback_batches.insert(index);
         } else {
@@ -1688,6 +1827,11 @@ fn extract_sources(
         if row.pending {
             out.template_rows.pending.insert(index);
         }
+    }
+    let layout_changed = out.stock_tangents != stock_tangents;
+    if layout_changed {
+        out.stock_tangents = stock_tangents;
+        out.layout_version = out.layout_version.wrapping_add(1);
     }
     // Pending=false -> loaded-invalid=false does not change templates. Keep its
     // negative demand independently so that transition cannot be lost.
@@ -1827,6 +1971,7 @@ fn extract_sources(
         || terrain_change == TerrainMapChange::Invalidating
         || terrain_visible_withdrawn;
     if candidate_changed
+        || layout_changed
         || terrain_change == TerrainMapChange::FarAdditionsOnly
         || terrain_visible_changed
     {
@@ -1914,6 +2059,10 @@ fn extract_sources(
             out.bound.clear();
             out.stock_primitives.clear();
             out.templates.fill(false);
+            if out.stock_tangents.iter().any(Option::is_some) {
+                out.stock_tangents.fill(None);
+                out.layout_version = out.layout_version.wrapping_add(1);
+            }
             out.template_rows.stale = true;
             out.candidate_worlds = CandidateWorlds {
                 all: true,
@@ -4647,6 +4796,7 @@ mod extract_source_tests {
                 s.normal_maps.clone(),
                 s.source_fallback_batches.clone(),
                 s.seen_roots.clone(),
+                s.stock_tangents.clone(),
             )
         };
         let expected = snapshot(input.sources());
@@ -5549,6 +5699,369 @@ mod extract_source_tests {
         assert!(proven.is_empty());
         assert!(instantiated.is_empty());
         assert_eq!(work.retired_proof_keys_visited, 2);
+    }
+
+    fn layout_batch() -> (Fixture, Handle<StandardMaterial>, Handle<Mesh>) {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        let stock = input
+            .app
+            .world()
+            .get::<Mesh3d>(primitive)
+            .unwrap()
+            .0
+            .clone();
+        let scene = input
+            .app
+            .world()
+            .get::<WorldAssetRoot>(input.root)
+            .unwrap()
+            .0
+            .clone();
+        let material = input
+            .app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        input
+            .app
+            .world_mut()
+            .resource_mut::<ClusterBatchHandles>()
+            .set(0, material.clone());
+        input
+            .app
+            .insert_resource(LazyBatches::for_source_test(MODEL, scene));
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), Some(false));
+        (input, material, stock)
+    }
+
+    #[test]
+    fn actual_extract_material_events_refuse_hot_depth_and_restore_plain_stock_layout() {
+        let (mut input, material, _) = layout_batch();
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&material)
+            .unwrap()
+            .depth_map = Some(Handle::default());
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+            .write(AssetEvent::Modified { id: material.id() });
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), None);
+        assert!(input.sources().source_fallback_batches.contains(&0));
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&material)
+            .unwrap()
+            .depth_map = None;
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+            .write(AssetEvent::Modified { id: material.id() });
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), Some(false));
+        assert!(!input.sources().source_fallback_batches.contains(&0));
+    }
+
+    #[test]
+    fn actual_extract_mesh_mutation_revokes_layout_and_wakes_only_dependent_templates() {
+        let (mut input, _, stock) = layout_batch();
+        let version = input.sources().layout_version;
+        let unrelated = input
+            .app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(dummy_mesh());
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Modified { id: unrelated.id() });
+        input.extract();
+        assert_eq!(input.sources().layout_version, version);
+        assert_eq!(input.sources().last_work.template_rows, 0);
+        assert_eq!(input.sources().last_work.primitives_scanned, 0);
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Modified { id: stock.id() });
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), None);
+        assert!(input.sources().source_fallback_batches.contains(&0));
+        assert!(input.sources().layout_version > version);
+        assert_eq!(input.sources().last_work.template_rows, 1);
+        assert_eq!(input.sources().last_work.primitives_scanned, 0);
+    }
+
+    #[test]
+    fn actual_extract_material_removal_and_handle_clear_revoke_old_layout() {
+        let (mut input, material, _) = layout_batch();
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .remove(material.id());
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+            .write(AssetEvent::Removed { id: material.id() });
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), None);
+        input
+            .app
+            .world_mut()
+            .resource_mut::<ClusterBatchHandles>()
+            .handles[0] = None;
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), None);
+        assert!(!input.sources().template_rows.pending.contains(&0));
+    }
+
+    #[test]
+    fn actual_extract_source_scope_rebinding_and_scene_removal_revoke_layout() {
+        let (mut input, _, _) = layout_batch();
+        let original = input
+            .app
+            .world()
+            .resource::<LazyBatches>()
+            .source_scene(0)
+            .unwrap()
+            .clone();
+        let missing = input
+            .app
+            .world()
+            .resource::<Assets<WorldAsset>>()
+            .reserve_handle();
+        input
+            .app
+            .insert_resource(LazyBatches::for_source_test(MODEL, missing));
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), None);
+        assert!(input.sources().template_rows.pending.contains(&0));
+        input
+            .app
+            .insert_resource(LazyBatches::for_source_test(MODEL, original.clone()));
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), Some(false));
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<WorldAsset>>>()
+            .write(AssetEvent::Removed { id: original.id() });
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), None);
+        assert!(input.sources().source_fallback_batches.contains(&0));
+    }
+
+    #[test]
+    fn unrequested_material_does_not_hide_a_stock_mesh_qualification_invalidation() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        assert!(
+            input
+                .app
+                .world()
+                .resource::<ClusterBatchHandles>()
+                .handles
+                .is_empty()
+        );
+        let stock = input.app.world().get::<Mesh3d>(primitive).unwrap().0.id();
+        assert!(input.sources().stock_meshes.contains_key(&stock));
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Modified { id: stock });
+        input.assert_blocked();
+    }
+
+    #[test]
+    fn retained_generated_layout_survives_material_deltas_and_journal_recovery() {
+        use crate::streaming::identity_changes::SourceNodeChanged;
+        for own_statics in [false, true] {
+            let mut input = Fixture::pending();
+            let primitive = input.spawn_stock();
+            let stock = input
+                .app
+                .world()
+                .get::<Mesh3d>(primitive)
+                .unwrap()
+                .0
+                .clone();
+            // Model the initial glTF-generated layout before certification. This is
+            // not runtime regeneration and does not claim a glTF loader E2E test.
+            {
+                let mut meshes = input.app.world_mut().resource_mut::<Assets<Mesh>>();
+                let mut mesh = meshes.get_mut(&stock).unwrap();
+                let vertices = mesh.count_vertices();
+                mesh.try_insert_attribute(
+                    Mesh::ATTRIBUTE_TANGENT,
+                    vec![[1.0_f32, 0.0, 0.0, 1.0]; vertices],
+                )
+                .unwrap();
+            }
+            source_template(&mut input);
+            input.render.insert_resource(ClusterSettings {
+                own_statics,
+                ..default()
+            });
+            input.assert_bound(primitive);
+            assert_eq!(input.sources().stock_tangents(0), Some(true));
+            let material = input.app.world().resource::<ClusterBatchHandles>().handles[0]
+                .as_ref()
+                .unwrap()
+                .id()
+                .typed::<StandardMaterial>();
+            // Keep an unaffected row to detect a competing whole-table invalidator.
+            let unrelated = input
+                .app
+                .world_mut()
+                .resource_mut::<Assets<StandardMaterial>>()
+                .add(StandardMaterial::default());
+            input
+                .app
+                .world_mut()
+                .resource_mut::<ClusterBatchHandles>()
+                .set(1, unrelated);
+            input.extract();
+            let version = input.sources().layout_version;
+            for normal_map in [Some(Handle::default()), None] {
+                input
+                    .app
+                    .world_mut()
+                    .resource_mut::<Assets<StandardMaterial>>()
+                    .get_mut(material)
+                    .unwrap()
+                    .normal_map_texture = normal_map;
+                input
+                    .app
+                    .world_mut()
+                    .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+                    .write(AssetEvent::Modified { id: material });
+                input.assert_bound(primitive);
+                assert_eq!(input.sources().last_work.template_rows, 1);
+                assert_eq!(input.sources().last_work.primitives_scanned, 0);
+                assert_eq!(input.sources().stock_tangents(0), Some(true));
+                assert!(input.sources().normal_maps[0]);
+                assert!(!input.sources().source_fallback_batches.contains(&0));
+            }
+            // Layout stays stable while an uncovered identity interval revokes stock
+            // proof. Recover immediately, without a full oracle repairing the delta.
+            input
+                .app
+                .world_mut()
+                .remove_resource::<Messages<SourceNodeChanged>>();
+            input
+                .app
+                .world_mut()
+                .entity_mut(primitive)
+                .remove::<SourceNodePose>();
+            input
+                .app
+                .world_mut()
+                .insert_resource(Messages::<SourceNodeChanged>::default());
+            input.assert_blocked();
+            assert!(input.sources().last_work.qualification_full);
+            assert!(!input.sources().last_work.journal_complete);
+            assert_eq!(input.sources().stock_tangents(0), Some(true));
+            let pose = *input.app.world().get::<Transform>(primitive).unwrap();
+            input
+                .app
+                .world_mut()
+                .entity_mut(primitive)
+                .insert(SourceNodePose(pose));
+            input.assert_bound(primitive);
+            assert_delta_only(&input);
+            assert!(input.sources().last_work.journal_complete);
+            assert_eq!(input.sources().last_work.template_rows, 0);
+            assert_eq!(input.sources().stock_tangents(0), Some(true));
+            assert_eq!(input.sources().layout_version, version);
+            input
+                .app
+                .world_mut()
+                .resource_mut::<Messages<AssetEvent<Mesh>>>()
+                .write(AssetEvent::Modified { id: stock.id() });
+            input.assert_blocked();
+            assert_eq!(input.sources().stock_tangents(0), None);
+            assert_eq!(input.sources().last_work.template_rows, 1);
+            assert_eq!(input.sources().last_work.primitives_scanned, 0);
+            assert!(input.sources().source_fallback_batches.contains(&0));
+            input.render.resource_mut::<Sources>().force_full = true;
+            input.extract();
+            assert_eq!(input.sources().stock_tangents(0), None);
+            assert!(input.sources().source_fallback_batches.contains(&0));
+        }
+    }
+
+    #[test]
+    fn fixture_rebinding_retires_reverse_edges_and_removal_revokes_layout() {
+        let (mut input, _, stock) = layout_batch();
+        input.app.world_mut().remove_resource::<LazyBatches>();
+        input
+            .app
+            .insert_resource(ClusterBatchStockMeshes(vec![stock.clone()]));
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), Some(false));
+        assert_eq!(
+            input.sources().template_rows.fixture_by_mesh[&stock.id()],
+            BTreeSet::from([0])
+        );
+        let replacement = input
+            .app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&stock)
+            .unwrap()
+            .clone();
+        let replacement = input
+            .app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(replacement);
+        input
+            .app
+            .insert_resource(ClusterBatchStockMeshes(vec![replacement.clone()]));
+        input.extract();
+        assert!(
+            !input
+                .sources()
+                .template_rows
+                .fixture_by_mesh
+                .contains_key(&stock.id())
+        );
+        assert_eq!(
+            input.sources().template_rows.fixture_by_row[&0],
+            replacement.id()
+        );
+        let version = input.sources().layout_version;
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Modified { id: stock.id() });
+        input.extract();
+        assert_eq!(input.sources().last_work.template_rows, 0);
+        assert_eq!(input.sources().stock_tangents(0), Some(false));
+        assert_eq!(input.sources().layout_version, version);
+        input
+            .app
+            .world_mut()
+            .remove_resource::<ClusterBatchStockMeshes>();
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), None);
+        assert!(input.sources().template_rows.fixture_by_mesh.is_empty());
+        assert!(input.sources().template_rows.fixture_by_row.is_empty());
     }
 
     fn source_template(input: &mut Fixture) -> Handle<WorldAsset> {
@@ -6744,5 +7257,240 @@ mod terrain_visibility_regressions {
             .entity_mut(child)
             .remove::<InheritedVisibility>();
         assert!(!collect(app.world_mut(), &identified).contains(&main));
+    }
+}
+
+#[cfg(test)]
+mod actual_stock_layout_regressions {
+    use super::*;
+
+    struct Fixture {
+        standards: Assets<StandardMaterial>,
+        meshes: Assets<Mesh>,
+        scenes: Assets<WorldAsset>,
+        lazy: LazyBatches,
+        material: bevy::asset::UntypedHandle,
+        stock: Handle<Mesh>,
+        source: Handle<WorldAsset>,
+        state: Sources,
+    }
+
+    impl Fixture {
+        fn new(generated: bool) -> Self {
+            let payload = ClusterMeshAsset::from_bytes(
+                include_bytes!("../../../shared/tests/data/cluster/fixture.mcl").to_vec(),
+            )
+            .unwrap();
+            assert_eq!(payload.flags & shared::cluster::FLAG_TANGENTS, 0);
+            let mut mesh = payload.source_mesh();
+            if generated {
+                mesh.generate_tangents().unwrap();
+            }
+            let mut meshes = Assets::default();
+            let stock = meshes.add(mesh);
+            let mut world = World::new();
+            world.spawn((
+                Mesh3d(stock.clone()),
+                Transform::IDENTITY,
+                SourcePrimitive {
+                    scene_index: 0,
+                    ordinal: 0,
+                    mesh_index: 0,
+                    primitive_index: 0,
+                    matches_default_scene: true,
+                },
+                SourcePrimitiveMesh(stock.clone()),
+                SourcePrimitiveTransform(Mat4::IDENTITY),
+                SourceNodePose(Transform::IDENTITY),
+                SourceStaticModel(true),
+            ));
+            let mut scenes = Assets::default();
+            let source = scenes.add(WorldAsset::new(world));
+            let lazy = LazyBatches::for_source_test("test/primitive.glb", source.clone());
+            let mut standards = Assets::default();
+            let material = standards.add(StandardMaterial::default()).untyped();
+            Self {
+                standards,
+                meshes,
+                scenes,
+                lazy,
+                material,
+                stock,
+                source,
+                state: Sources::default(),
+            }
+        }
+
+        fn row(&mut self) -> TemplateRow {
+            template_row(
+                0,
+                &self.material,
+                TemplateCaches {
+                    geometry: &mut self.state.geometry_cache,
+                    templates: &mut self.state.template_cache,
+                    template_meshes: &mut self.state.template_meshes,
+                    invalid_templates: &self.state.invalid_templates,
+                    invalid_meshes: &self.state.invalid_meshes,
+                    rows: &mut self.state.template_rows,
+                },
+                &TemplateAssets {
+                    standards: &self.standards,
+                    lazy: Some(&self.lazy),
+                    scenes: Some(&self.scenes),
+                    meshes: &self.meshes,
+                    fixtures: None,
+                },
+            )
+        }
+
+        fn edit_material(&mut self, edit: impl FnOnce(&mut StandardMaterial)) {
+            edit(
+                &mut self
+                    .standards
+                    .get_mut(self.material.id().typed::<StandardMaterial>())
+                    .unwrap(),
+            );
+            self.state.geometry_cache.remove(&self.material.id());
+        }
+    }
+
+    #[test]
+    fn generated_stock_tangents_persist_when_the_normal_map_is_removed() {
+        let mut input = Fixture::new(true);
+        input.edit_material(|material| material.normal_map_texture = Some(Handle::default()));
+        assert_eq!(input.row().stock_tangents, Some(true));
+        input.edit_material(|material| material.normal_map_texture = None);
+        let row = input.row();
+        assert!(row.template && !row.fallback && !row.pending);
+        assert_eq!(row.stock_tangents, Some(true));
+        assert!(
+            input
+                .meshes
+                .get(&input.stock)
+                .unwrap()
+                .contains_attribute(Mesh::ATTRIBUTE_TANGENT)
+        );
+    }
+
+    #[test]
+    fn hot_normal_depth_and_anisotropy_additions_cannot_invent_stock_geometry() {
+        for consumer in 0..3 {
+            let mut input = Fixture::new(false);
+            assert_eq!(input.row().stock_tangents, Some(false));
+            input.edit_material(|material| match consumer {
+                0 => material.normal_map_texture = Some(Handle::default()),
+                1 => material.depth_map = Some(Handle::default()),
+                _ => material.anisotropy_strength = 0.5,
+            });
+            let row = input.row();
+            assert!(
+                row.fallback && !row.template && !row.pending,
+                "consumer {consumer}"
+            );
+            assert_eq!(row.stock_tangents, None);
+            assert!(
+                !input
+                    .meshes
+                    .get(&input.stock)
+                    .unwrap()
+                    .contains_attribute(Mesh::ATTRIBUTE_TANGENT)
+            );
+            input.edit_material(|material| *material = StandardMaterial::default());
+            assert_eq!(input.row().stock_tangents, Some(false));
+        }
+    }
+
+    #[test]
+    fn material_only_refresh_reuses_binding_cache_and_retains_mesh_dependencies() {
+        let mut input = Fixture::new(true);
+        assert_eq!(input.row().stock_tangents, Some(true));
+        let cached = &input.state.template_meshes.by_ordinal[&input.source.id()];
+        let storage = cached as *const _;
+        assert!(
+            input.state.template_meshes.by_mesh[&input.stock.id()].contains(&input.source.id())
+        );
+        assert!(input.state.template_rows.by_scene[&input.source.id()].contains(&0));
+        input.edit_material(|material| material.double_sided = true);
+        assert_eq!(input.row().stock_tangents, Some(true));
+        assert_eq!(
+            &input.state.template_meshes.by_ordinal[&input.source.id()] as *const _,
+            storage
+        );
+    }
+
+    #[test]
+    fn missing_mesh_is_pending_and_runtime_mutation_revokes_certification() {
+        let mut input = Fixture::new(true);
+        let mesh = input.meshes.remove(input.stock.id()).unwrap();
+        let row = input.row();
+        assert!(row.pending && !row.fallback && !row.template);
+        assert_eq!(row.stock_tangents, None);
+        input.meshes.insert(input.stock.id(), mesh).unwrap();
+        assert_eq!(input.row().stock_tangents, Some(true));
+        input.state.invalid_meshes.insert(input.stock.id());
+        input.state.template_cache.clear();
+        input.state.template_meshes = TemplateMeshDependencies::default();
+        let row = input.row();
+        assert!(row.fallback && !row.template);
+        assert_eq!(row.stock_tangents, None);
+    }
+}
+
+#[cfg(test)]
+mod layout_dependency_regressions {
+    use super::*;
+
+    fn tag(ordinal: u32) -> SourcePrimitive {
+        SourcePrimitive {
+            scene_index: 0,
+            ordinal,
+            mesh_index: 0,
+            primitive_index: 0,
+            matches_default_scene: true,
+        }
+    }
+
+    #[test]
+    fn ordinal_bindings_never_expand_the_template_validation_query_domain() {
+        let mut world = World::new();
+        world.register_disabling_component::<SourcePrimitive>();
+        let mesh = Handle::<Mesh>::default();
+        world.spawn((Mesh3d(mesh.clone()), tag(0)));
+        let mut wider = world.query::<(&SourcePrimitive, &Mesh3d)>();
+        assert_eq!(wider.iter(&world).count(), 1);
+        let asset = WorldAsset::new(world);
+        assert!(!template_valid(&asset, &HashSet::new()));
+        let scene = Handle::<WorldAsset>::default().id();
+        let mut dependencies = TemplateMeshDependencies::default();
+        dependencies.register(scene, &asset);
+        assert!(dependencies.by_scene[&scene].is_empty());
+        assert!(dependencies.by_ordinal[&scene].is_empty());
+        assert!(!dependencies.by_mesh.contains_key(&mesh.id()));
+    }
+
+    #[test]
+    fn duplicate_ordinals_refuse_the_layout_domain_but_keep_every_reverse_mesh_edge() {
+        let mut meshes = Assets::<Mesh>::default();
+        let a = meshes.add(dummy_mesh());
+        let b = meshes.add(dummy_mesh());
+        let mut world = World::new();
+        world.spawn((Mesh3d(a.clone()), tag(0)));
+        world.spawn((Mesh3d(b.clone()), tag(0)));
+        world.spawn((Mesh3d(b.clone()), tag(1)));
+        let asset = WorldAsset::new(world);
+        let scene = Handle::<WorldAsset>::default().id();
+        let mut dependencies = TemplateMeshDependencies::default();
+        dependencies.register(scene, &asset);
+        assert!(dependencies.by_ordinal[&scene].is_empty());
+        assert_eq!(
+            dependencies.by_scene[&scene],
+            HashSet::from([a.id(), b.id()])
+        );
+        for mesh in [a.id(), b.id()] {
+            assert_eq!(dependencies.by_mesh[&mesh], HashSet::from([scene]));
+        }
+        dependencies.remove(scene);
+        assert!(dependencies.by_ordinal.is_empty());
+        assert!(dependencies.by_mesh.is_empty());
     }
 }

@@ -24,6 +24,7 @@ fn app() -> App {
 
 fn batch() -> LazyBatch {
     LazyBatch {
+        primitive: 0,
         key: BatchKey {
             model_path: "invented-loader-fixture.glb".into(),
             material_index: None,
@@ -46,6 +47,7 @@ fn batch() -> LazyBatch {
 
 fn install_batch(app: &mut App, batch: LazyBatch, in_flight: bool) {
     app.insert_resource(LazyBatches {
+        layout_scope: next_layout_scope(),
         batches: vec![batch],
         assets_dir: PathBuf::new(),
         native_by_model: HashMap::new(),

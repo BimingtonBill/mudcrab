@@ -194,7 +194,17 @@ pub(super) mod queue_stats {
         );
     }
 }
-use std::{any::Any, collections::HashMap, num::NonZeroU64, sync::Arc};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    num::NonZeroU64,
+    sync::Arc,
+};
+
+/// Actual stock geometry for standalone fixtures without a certified glTF template.
+/// Keep the same handle that the stock path draws; runtime mutation revokes proof.
+#[derive(Resource, Default)]
+pub struct ClusterBatchStockMeshes(pub Vec<Handle<Mesh>>);
 
 /// The material handle of each batch, kept alive here rather than on one entity per batch (about
 /// five thousand entities cost the main world's visibility and material systems and the render
@@ -229,14 +239,83 @@ impl ClusterBatchHandles {
 /// the cluster vertex stage writes. No entity draws it; its render mesh only supplies the vertex
 /// layout and key bits to the material pipeline.
 #[derive(Resource, Clone, ExtractResource)]
-pub struct ClusterDummyMesh(pub Handle<Mesh>);
+pub struct ClusterDummyMesh {
+    plain: Handle<Mesh>,
+    tangent: Handle<Mesh>,
+}
+
+impl ClusterDummyMesh {
+    fn asset(&self, tangents: bool) -> AssetId<Mesh> {
+        if tangents {
+            self.tangent.id()
+        } else {
+            self.plain.id()
+        }
+    }
+}
+
+/// Bevy's erased material key omits the mesh vertex layout: stock specialization
+/// caches it separately. Our manual cache must retain that discriminator itself.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ClusterMaterialPipelineKey {
+    material: ErasedMaterialPipelineKey,
+    tangents: bool,
+}
+
+fn tangent_layout(
+    stock_tangents: bool,
+    geometry: super::material_geometry::GeometryRequirements,
+) -> Option<bool> {
+    (geometry.supported && (!geometry.tangents || stock_tangents)).then_some(stock_tangents)
+}
+
+fn batch_tangent_layout(
+    batch: &BatchGpu,
+    index: usize,
+    material: bevy::asset::UntypedAssetId,
+    geometry: super::material_geometry::GeometryRequirements,
+    sources: &handoff::Sources,
+) -> Option<bool> {
+    let stock =
+        if material.type_id() == std::any::TypeId::of::<super::terrain::ClusterTerrainMaterial>() {
+            // Baked atlas terrain has no glTF stock primitive. Its own immutable
+            // payload defines geometry; material edits cannot add attributes to it.
+            Some(batch.source_tangents)
+        } else {
+            sources.stock_tangents(index)
+        }?;
+    // A certified authored semantic must also be present on actual stock.
+    if batch.source_tangents && !stock {
+        return None;
+    }
+    tangent_layout(stock, geometry)
+}
+
+fn material_geometry(
+    id: bevy::asset::UntypedAssetId,
+    standard: &Assets<StandardMaterial>,
+    terrain: Option<&Assets<super::terrain::ClusterTerrainMaterial>>,
+) -> Option<super::material_geometry::GeometryRequirements> {
+    let material = if id.type_id() == std::any::TypeId::of::<StandardMaterial>() {
+        standard.get(id.typed::<StandardMaterial>())
+    } else if id.type_id() == std::any::TypeId::of::<super::terrain::ClusterTerrainMaterial>() {
+        terrain?
+            .get(id.typed::<super::terrain::ClusterTerrainMaterial>())
+            .map(|material| &material.base)
+    } else {
+        None
+    }?;
+    Some(super::material_geometry::requirements(material))
+}
 
 /// Per batch, the asset its material lives in, as the render world sees it.
 #[derive(Resource, Default)]
 struct ClusterBatchMaterials {
     ids: Vec<Option<bevy::asset::UntypedAssetId>>,
-    /// Every asset id `ids` has held, so an asset event is matched against the batches in one
-    /// lookup; grown as ids appear, never trimmed.
+    /// Updated only on handle/material events, using the actual material base.
+    /// Missing assets have no entry and cannot inherit an old tangent layout.
+    geometry: HashMap<bevy::asset::UntypedAssetId, super::material_geometry::GeometryRequirements>,
+    /// Current material identities, bounded by the handle table; O(1) event matching.
     named: std::collections::HashSet<bevy::asset::UntypedAssetId>,
     /// Bumped when `ids` changes or an asset event names one of the materials in it (it was
     /// modified, removed, or finished loading): the prepared materials the plan was made from
@@ -288,49 +367,85 @@ fn extract_cluster_frame(
 }
 
 fn create_dummy_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
-    commands.insert_resource(ClusterDummyMesh(meshes.add(dummy_mesh())));
+    commands.insert_resource(ClusterDummyMesh {
+        plain: meshes.add(dummy_mesh_with_tangents(false)),
+        tangent: meshes.add(dummy_mesh_with_tangents(true)),
+    });
 }
+
+#[derive(bevy::ecs::system::SystemParam)]
+struct BatchMaterialEvents<'w, 's> {
+    standard: MessageReader<'w, 's, AssetEvent<StandardMaterial>>,
+    terrain: Option<Res<'w, Messages<AssetEvent<super::terrain::ClusterTerrainMaterial>>>>,
+}
+
+type BatchMaterialAssets<'w> = (
+    Res<'w, Assets<StandardMaterial>>,
+    Option<Res<'w, Assets<super::terrain::ClusterTerrainMaterial>>>,
+);
 
 fn extract_batch_materials(
     mut out: ResMut<ClusterBatchMaterials>,
     mut timing: Local<crate::profiling::PeriodicTiming>,
     handles: Extract<Res<ClusterBatchHandles>>,
-    mut standard_events: Extract<MessageReader<AssetEvent<StandardMaterial>>>,
-    terrain_assets: Extract<Option<Res<Assets<super::terrain::ClusterTerrainMaterial>>>>,
+    mut events: Extract<BatchMaterialEvents>,
+    assets: Extract<BatchMaterialAssets>,
+    mut terrain_cursor: Local<
+        bevy::ecs::message::MessageCursor<AssetEvent<super::terrain::ClusterTerrainMaterial>>,
+    >,
 ) {
     perf_span!("cluster::extract_materials::total");
     let started = std::time::Instant::now();
     let _timer = queue_stats::Timed::start(&queue_stats::EXTRACT_NANOS);
     let mut changed = false;
+    let mut dirty = HashSet::new();
     // The handles change only while materials are being requested, so the table is read only then.
     if handles.is_changed() {
-        for (slot, handle) in handles.handles.iter().enumerate() {
-            let Some(id) = handle.as_ref().map(bevy::asset::UntypedHandle::id) else {
-                continue;
-            };
-            if out.ids.len() <= slot {
-                out.ids.resize(slot + 1, None);
-            }
-            if out.ids[slot] != Some(id) {
-                out.ids[slot] = Some(id);
-                // An id that was replaced stays in `named`: a stale entry only costs an extra bump.
-                out.named.insert(id);
-                changed = true;
-            }
+        let ids: Vec<_> = handles
+            .handles
+            .iter()
+            .map(|handle| handle.as_ref().map(bevy::asset::UntypedHandle::id))
+            .collect();
+        if out.ids != ids {
+            out.ids = ids;
+            out.named = out.ids.iter().flatten().copied().collect();
+            let named = out.named.clone();
+            out.geometry.retain(|id, _| named.contains(id));
+            dirty.extend(named);
+            changed = true;
         }
     }
     let handles_changed = changed;
     let mut standard_hits = Vec::new();
-    for event in standard_events.read() {
+    for event in events.standard.read() {
         if out.named.contains(&event_asset_id(event).untyped()) {
             changed = true;
             standard_hits.push(*event);
+            dirty.insert(event_asset_id(event).untyped());
         }
     }
-    let terrain_changed = terrain_assets
-        .as_ref()
-        .is_some_and(|assets| assets.is_changed());
+    let mut terrain_changed = false;
+    if let Some(events) = events.terrain.as_ref() {
+        for event in terrain_cursor.read(events) {
+            let id = event_asset_id(event).untyped();
+            if out.named.contains(&id) {
+                dirty.insert(id);
+                terrain_changed = true;
+            }
+        }
+    }
     changed |= terrain_changed;
+    let (standard, terrain) = &*assets;
+    for id in dirty {
+        match material_geometry(id, standard, terrain.as_deref()) {
+            Some(requirements) => {
+                out.geometry.insert(id, requirements);
+            }
+            None => {
+                out.geometry.remove(&id);
+            }
+        }
+    }
     if changed {
         out.version += 1;
         debug!(
@@ -593,7 +708,11 @@ impl Default for ClusterSettings {
 /// A mesh the batch's dummy entity carries: one degenerate triangle with the attributes the
 /// cluster vertex stage writes, so the specialised pipeline gets the matching shader definitions.
 pub fn dummy_mesh() -> Mesh {
-    Mesh::new(
+    dummy_mesh_with_tangents(true)
+}
+
+fn dummy_mesh_with_tangents(tangents: bool) -> Mesh {
+    let mut mesh = Mesh::new(
         bevy::mesh::PrimitiveTopology::TriangleList,
         bevy::asset::RenderAssetUsages::default(),
     )
@@ -601,8 +720,11 @@ pub fn dummy_mesh() -> Mesh {
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0_f32, 1.0, 0.0]; 3])
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0_f32; 2]; 3])
     .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, vec![[1.0_f32; 4]; 3])
-    .with_inserted_attribute(Mesh::ATTRIBUTE_TANGENT, vec![[1.0_f32, 0.0, 0.0, 1.0]; 3])
-    .with_inserted_indices(bevy::mesh::Indices::U32(vec![0, 1, 2]))
+    .with_inserted_indices(bevy::mesh::Indices::U32(vec![0, 1, 2]));
+    if tangents {
+        mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, vec![[1.0_f32, 0.0, 0.0, 1.0]; 3]);
+    }
+    mesh
 }
 
 /// The dummy entity's bounds: large enough that it is always inside the view, so the batch is
@@ -752,7 +874,7 @@ struct ViewGpu {
     plan_hash: Option<u64>,
     /// What the last walk over the batches was made from, kept only when it left nothing out for
     /// want of a prepared material, mesh or pipeline: the same again means the same plan.
-    walk_stamp: Option<[u64; 7]>,
+    walk_stamp: Option<[u64; 8]>,
     /// Per batch, whether it was drawable in this view, and what that was decided from
     /// (`handoff::cached_batch_readiness`).
     readiness_memo: Option<(u64, Vec<bool>)>,
@@ -923,6 +1045,44 @@ struct BatchGpu {
     material_slot: Option<u32>,
     /// What a shadow view needs to draw this batch when its material discards by alpha.
     cutout: Option<CutoutShadow>,
+    /// Authored TANGENT semantic from immutable payload metadata, never the
+    /// presence of generated tangent words in the GPU interleave.
+    source_tangents: bool,
+    /// Layout last resolved with the actual material requirements.
+    tangents: Option<bool>,
+}
+
+fn invalidate_batch_material(gpu: &mut ClusterGpu, index: usize) {
+    let batch = &mut gpu.batches[index];
+    if batch.material.take().is_some() || batch.tangents.is_some() {
+        gpu.generation = gpu.generation.wrapping_add(1);
+    }
+    batch.tangents = None;
+    batch.cutout = None;
+}
+
+/// One load-time walk, not a scene scan per frame. The package loader partitions
+/// material batches by source layout; fixture callers must preserve that invariant.
+fn batch_source_tangents(scene: &ClusterScene, batches: usize) -> Result<Vec<bool>, &'static str> {
+    let mut layouts = vec![None; batches];
+    for instance in &scene.instances {
+        let mesh = scene
+            .meshes
+            .get(instance.mesh as usize)
+            .ok_or("batch references missing mesh")?;
+        let source = mesh.flags & shared::cluster::FLAG_TANGENTS != 0;
+        let layout = layouts
+            .get_mut(instance.batch as usize)
+            .ok_or("batch index out of range")?;
+        if layout.is_some_and(|previous| previous != source) {
+            return Err("cluster material batch mixes authored tangent layouts");
+        }
+        *layout = Some(source);
+    }
+    Ok(layouts
+        .into_iter()
+        .map(|layout| layout.unwrap_or(false))
+        .collect())
 }
 
 /// The part of an alpha-masked material a shadow pipeline and draw are built from.
@@ -1207,22 +1367,30 @@ struct ClusterPipelines {
     shadow: HashMap<bool, CachedRenderPipelineId>,
     /// Shadow pipelines of alpha-masked materials: the stock prepass fragment stage of the
     /// material behind the cluster vertex stage, keyed as the stock shadow queue keys it.
-    shadow_mask: HashMap<ErasedMaterialPipelineKey, CachedRenderPipelineId>,
+    shadow_mask: HashMap<ClusterMaterialPipelineKey, CachedRenderPipelineId>,
     /// The camera prepass pipelines (depth, normals, motion vectors), by the same key; `None`
     /// where the material has no prepass pipeline to build.
-    prepass: HashMap<ErasedMaterialPipelineKey, Option<CachedClusterPrepass>>,
+    prepass: HashMap<ClusterMaterialPipelineKey, Option<CachedClusterPrepass>>,
+    prepass_material_version: u64,
     /// Keyed by the material's type too: two material types with equal mesh keys still have
     /// different bind group layouts and fragment shaders.
-    render: HashMap<ErasedMaterialPipelineKey, CachedRenderPipelineId>,
+    render: HashMap<ClusterMaterialPipelineKey, CachedRenderPipelineId>,
 }
 
 impl ClusterPipelines {
+    fn refresh_prepass_refusals(&mut self, version: u64) {
+        if self.prepass_material_version != version {
+            self.prepass.retain(|_, pipeline| pipeline.is_some());
+            self.prepass_material_version = version;
+        }
+    }
+
     /// Cache successful ordinary specializations by the complete material key.
     /// Failed specialization is retried; compilation readiness is checked by
     /// the draw/readiness consumers rather than by pipeline creation.
     fn forward_pipeline(
         &mut self,
-        key: ErasedMaterialPipelineKey,
+        key: ClusterMaterialPipelineKey,
         mut build: impl FnMut() -> Option<RenderPipelineDescriptor>,
         mut queue: impl FnMut(RenderPipelineDescriptor) -> CachedRenderPipelineId,
     ) -> Option<CachedRenderPipelineId> {
@@ -1546,13 +1714,24 @@ fn prepare_cluster_gpu(
         .map(|instance| instance.batch + 1)
         .max()
         .unwrap_or(0) as usize;
-    let batches: Vec<BatchGpu> = (0..batch_total)
-        .map(|_| BatchGpu {
+    let source_layouts = match batch_source_tangents(&scene, batch_total) {
+        Ok(layouts) => layouts,
+        Err(reason) => {
+            error!(%reason, "invalid cluster batch layout; refusing GPU scene");
+            *refused = true;
+            return;
+        }
+    };
+    let batches: Vec<BatchGpu> = source_layouts
+        .into_iter()
+        .map(|source_tangents| BatchGpu {
             ranges: Vec::new(),
             slots: 0,
             material: None,
             material_slot: None,
             cutout: None,
+            source_tangents,
+            tangents: None,
         })
         .collect();
     // The most clusters one view can select from the whole scene: what the per-view lists hold.
@@ -1859,6 +2038,7 @@ fn mesh_uniform_bytes(world_from_local: Mat4, flags: u32, material_slot: u32, ta
 /// The stock render-world tables the batch's dummy entity is looked up in.
 #[derive(bevy::ecs::system::SystemParam)]
 struct StockLookups<'w> {
+    sources: Res<'w, handoff::Sources>,
     materials: Res<'w, ErasedRenderAssets<PreparedMaterial>>,
     render_meshes: Res<'w, RenderAssets<RenderMesh>>,
 }
@@ -1903,13 +2083,14 @@ fn queue_cluster_batches(
     let _timer = queue_stats::Timed::start(&queue_stats::BATCH_NANOS);
     queue_stats::frame_done();
     let StockLookups {
+        sources,
         materials,
         render_meshes,
     } = stock;
     let Some(gpu) = gpu.as_deref_mut() else {
         return;
     };
-    let Some(mesh_asset) = dummy_mesh.map(|dummy| dummy.0.id()) else {
+    let Some(dummy_mesh) = dummy_mesh else {
         return;
     };
     let draw_function = queue_draw_functions.opaque.read().id::<DrawClusterBatch>();
@@ -1946,8 +2127,12 @@ fn queue_cluster_batches(
         // batch materials' own version stands for the prepared materials (see there); the exact
         // index-to-identity carrier mapping is compared independently of query arrival order.
         let mut mesh_hasher = std::hash::DefaultHasher::new();
-        std::hash::Hash::hash(&mesh_asset, &mut mesh_hasher);
-        let stamp: [u64; 7] = [
+        std::hash::Hash::hash(
+            &(dummy_mesh.plain.id(), dummy_mesh.tangent.id()),
+            &mut mesh_hasher,
+        );
+        let stamp: [u64; 8] = [
+            sources.layout_version,
             view_key.bits(),
             std::hash::Hasher::finish(&mesh_hasher),
             batch_materials.version,
@@ -1960,7 +2145,8 @@ fn queue_cluster_batches(
                         .as_deref()
                         .is_some_and(|phase| phase.non_mesh_items.is_empty()),
                 ) << 1)
-                | (u64::from(render_meshes.get(mesh_asset).is_some()) << 2),
+                | (u64::from(render_meshes.get(dummy_mesh.plain.id()).is_some()) << 2)
+                | (u64::from(render_meshes.get(dummy_mesh.tangent.id()).is_some()) << 3),
         ];
         if gpu.views[&key].walk_stamp == Some(stamp) && gpu.views[&key].walk_carriers == *carriers {
             queue_stats::bump(&queue_stats::BATCH_SKIPPED);
@@ -1981,17 +2167,36 @@ fn queue_cluster_batches(
                 continue;
             }
             let Some(Some(asset_id)) = batch_materials.ids.get(index).copied() else {
+                invalidate_batch_material(gpu, index);
+                // Lazy batches may have no handle indefinitely. Handle changes
+                // wake the walk through batch_materials.version.
                 continue;
             };
+            let Some(geometry) = batch_materials.geometry.get(&asset_id).copied() else {
+                invalidate_batch_material(gpu, index);
+                // Main-world asset arrivals/removals have material events.
+                continue;
+            };
+            let Some(tangents) =
+                batch_tangent_layout(&gpu.batches[index], index, asset_id, geometry, &sources)
+            else {
+                invalidate_batch_material(gpu, index);
+                // A known unsupported layout cannot become supported without
+                // a material event. Never turn that refusal into a frame scan.
+                continue;
+            };
+            let mesh_asset = dummy_mesh.asset(tangents);
             let is_terrain = asset_id.type_id() == terrain_type;
             terrain_walk[0] += u32::from(is_terrain);
             let Some(material) = materials.get(asset_id) else {
                 terrain_walk[1] += u32::from(is_terrain);
+                invalidate_batch_material(gpu, index);
                 incomplete = true;
                 continue;
             };
             let Some(render_mesh) = render_meshes.get(mesh_asset) else {
                 terrain_walk[2] += u32::from(is_terrain);
+                invalidate_batch_material(gpu, index);
                 incomplete = true;
                 continue;
             };
@@ -2009,10 +2214,13 @@ fn queue_cluster_batches(
             // The same key the stock queue specializes by: the mesh key, the
             // material's own key (its cull mode, double-sidedness, extension flags)
             // and its type.
-            let pipeline_key = ErasedMaterialPipelineKey {
-                mesh_key: ErasedMeshPipelineKey::new(mesh_key),
-                material_key: material.properties.material_key.clone(),
-                type_id: asset_id.type_id(),
+            let pipeline_key = ClusterMaterialPipelineKey {
+                material: ErasedMaterialPipelineKey {
+                    mesh_key: ErasedMeshPipelineKey::new(mesh_key),
+                    material_key: material.properties.material_key.clone(),
+                    type_id: asset_id.type_id(),
+                },
+                tangents,
             };
             // What this batch resolved to last time, when none of its inputs has changed since:
             // the same material instance, prepared material (by address, which moves when the
@@ -2026,6 +2234,9 @@ fn queue_cluster_batches(
                     && memo.material_slot == u32::from(material.binding.slot)
                     && memo.material_group == material.binding.group.0
                     && memo.alpha_mode == material.properties.alpha_mode
+                    && gpu.batches[index].material == Some(asset_id)
+                    && gpu.batches[index].tangents == Some(tangents)
+                    && memo.tangents == tangents
                     && memo.mesh_asset == mesh_asset
                     && memo.view_key == view_key
             });
@@ -2047,11 +2258,13 @@ fn queue_cluster_batches(
                         |descriptor| pipeline_cache.queue_render_pipeline(descriptor),
                     );
                     let Some(pipeline_id) = pipeline else {
+                        invalidate_batch_material(gpu, index);
                         terrain_walk[2] += u32::from(is_terrain);
                         incomplete = true;
                         continue;
                     };
                     gpu.batches[index].material = Some(asset_id);
+                    gpu.batches[index].tangents = Some(tangents);
                     gpu.generation = gpu.generation.wrapping_add(1);
                     // The batch's mesh uniforms need its material's slot, known only now.
                     let slot = u32::from(material.binding.slot);
@@ -2097,6 +2310,10 @@ fn queue_cluster_batches(
                             None
                         }
                     };
+                    if phase_kind.is_none() {
+                        invalidate_batch_material(gpu, index);
+                        continue;
+                    }
                     gpu.batches[index].cutout = (phase_kind == Some(true)).then(|| CutoutShadow {
                         asset: asset_id,
                         type_id: asset_id.type_id(),
@@ -2122,6 +2339,7 @@ fn queue_cluster_batches(
                             material_group: material.binding.group.0,
                             alpha_mode: material.properties.alpha_mode,
                             mesh_asset,
+                            tangents,
                             view_key,
                             resolved,
                         });
@@ -2157,7 +2375,10 @@ fn queue_cluster_batches(
         }
         // A fingerprint of the plan: which batches draw, with what, and under which carriers.
         let plan_hash = ready_batches.iter().fold(
-            0xcbf2_9ce4_8422_2325u64 ^ gpu.layout_epoch.rotate_left(17),
+            0xcbf2_9ce4_8422_2325u64
+                ^ gpu.layout_epoch.rotate_left(17)
+                ^ batch_materials.version.rotate_left(29)
+                ^ sources.layout_version.rotate_left(41),
             |hash, ready| {
                 [
                     u64::from(ready.index),
@@ -2410,6 +2631,7 @@ struct BatchMemo {
     material_group: u32,
     alpha_mode: AlphaMode,
     mesh_asset: AssetId<Mesh>,
+    tangents: bool,
     view_key: MeshPipelineKey,
     resolved: ResolvedBatch,
 }
@@ -2428,12 +2650,13 @@ struct ReadyBatch {
 
 fn build_descriptor(
     material_pipeline: &MaterialPipeline,
-    key: ErasedMaterialPipelineKey,
+    key: ClusterMaterialPipelineKey,
     layout: &MeshVertexBufferLayoutRef,
     material: &PreparedMaterial,
     draw_layout: &BindGroupLayoutDescriptor,
     asset_server: &AssetServer,
 ) -> Option<bevy::render::render_resource::RenderPipelineDescriptor> {
+    let key = key.material;
     let mesh_key: MeshPipelineKey = key.mesh_key.downcast();
     let mut descriptor = material_pipeline
         .mesh_pipeline
@@ -3242,7 +3465,7 @@ fn prepass_empty_material_layout(descriptor: &RenderPipelineDescriptor) -> Optio
 /// behind the cluster vertex stage, which gives it the same `VertexOutput` a stock mesh does.
 fn build_prepass_descriptor(
     prepass: &PrepassPipeline,
-    key: ErasedMaterialPipelineKey,
+    key: ClusterMaterialPipelineKey,
     layout: &MeshVertexBufferLayoutRef,
     material: &PreparedMaterial,
     draw_layout: &BindGroupLayoutDescriptor,
@@ -3253,7 +3476,7 @@ fn build_prepass_descriptor(
         properties: material.properties.clone(),
     };
     let mut descriptor = specializer
-        .specialize(key, layout)
+        .specialize(key.material, layout)
         .map_err(|error| note_pipeline_failure("the prepass pipeline", &error))
         .ok()?;
     // Stock layouts are [view, empty, mesh, material-or-empty]. The empty
@@ -3293,21 +3516,23 @@ fn queue_cluster_prepass(
     view_key_cache: Res<ViewKeyCache>,
     stock: StockLookups,
     dummy_mesh: Option<Res<ClusterDummyMesh>>,
-    settings: Res<ClusterSettings>,
+    (settings, batch_materials): (Res<ClusterSettings>, Res<ClusterBatchMaterials>),
 ) {
     perf_span!("cluster::queue_prepass::total");
     if !settings.prepass {
         return;
     }
+    pipelines.refresh_prepass_refusals(batch_materials.version);
     let Some(gpu) = gpu.as_deref_mut() else {
         return;
     };
     let StockLookups {
+        sources,
         materials,
         render_meshes,
         ..
     } = stock;
-    let Some(render_mesh) = dummy_mesh.and_then(|dummy| render_meshes.get(dummy.0.id())) else {
+    let Some(dummy_mesh) = dummy_mesh else {
         return;
     };
     let opaque_draw = opaque_draws.read().id::<DrawClusterPrepass>();
@@ -3354,6 +3579,18 @@ fn queue_cluster_prepass(
                 complete = false;
                 continue;
             };
+            let Some(tangents) = gpu.batches[ready.index as usize].tangents.filter(|layout| {
+                asset_id.type_id()
+                    == std::any::TypeId::of::<super::terrain::ClusterTerrainMaterial>()
+                    || sources.stock_tangents(ready.index as usize) == Some(*layout)
+            }) else {
+                complete = false;
+                continue;
+            };
+            let Some(render_mesh) = render_meshes.get(dummy_mesh.asset(tangents)) else {
+                complete = false;
+                continue;
+            };
             if !material.properties.prepass_enabled {
                 continue;
             }
@@ -3366,10 +3603,13 @@ fn queue_cluster_prepass(
             let mesh_key = view_key
                 | MeshPipelineKey::from_bits_retain(render_mesh.key_bits.bits())
                 | material_bits;
-            let pipeline_key = ErasedMaterialPipelineKey {
-                mesh_key: ErasedMeshPipelineKey::new(mesh_key),
-                material_key: material.properties.material_key.clone(),
-                type_id: asset_id.type_id(),
+            let pipeline_key = ClusterMaterialPipelineKey {
+                material: ErasedMaterialPipelineKey {
+                    mesh_key: ErasedMeshPipelineKey::new(mesh_key),
+                    material_key: material.properties.material_key.clone(),
+                    type_id: asset_id.type_id(),
+                },
+                tangents,
             };
             let pipeline = match pipelines.prepass.get(&pipeline_key) {
                 Some(id) => *id,
@@ -3582,7 +3822,7 @@ fn shadow_mesh_key(unclipped: bool, mesh_bits: MeshPipelineKey) -> MeshPipelineK
 /// stage, whose data group follows the material group as in the forward draw.
 fn build_shadow_mask_descriptor(
     prepass: &PrepassPipeline,
-    key: ErasedMaterialPipelineKey,
+    key: ClusterMaterialPipelineKey,
     layout: &MeshVertexBufferLayoutRef,
     material: &PreparedMaterial,
     draw_layout: &BindGroupLayoutDescriptor,
@@ -3593,7 +3833,7 @@ fn build_shadow_mask_descriptor(
         properties: material.properties.clone(),
     };
     let mut descriptor = specializer
-        .specialize(key, layout)
+        .specialize(key.material, layout)
         .map_err(|error| note_pipeline_failure("the alpha-mask shadow pipeline", &error))
         .ok()?;
     // Layout: view, empty, mesh, material; the cluster data follows at group 4.
@@ -3635,6 +3875,7 @@ fn queue_cluster_shadows(
     dummy_mesh: Option<Res<ClusterDummyMesh>>,
     lights: Query<(&LightEntity, &ExtractedView)>,
     batches: Query<(Entity, &MainEntity, &ClusterBatch)>,
+    batch_materials: Res<ClusterBatchMaterials>,
     mut carrier_scratch: Local<Vec<Option<(Entity, MainEntity)>>>,
 ) {
     perf_span!("cluster::queue_shadows::total");
@@ -3651,11 +3892,15 @@ fn queue_cluster_shadows(
         carriers[marker.index as usize] = Some((entity, *main_entity));
     }
     let StockLookups {
+        sources,
         materials,
         render_meshes,
         ..
     } = stock;
-    let render_mesh = dummy_mesh.and_then(|dummy| render_meshes.get(dummy.0.id()));
+    let layouts_ready = dummy_mesh.as_ref().is_some_and(|dummy| {
+        render_meshes.get(dummy.plain.id()).is_some()
+            && render_meshes.get(dummy.tangent.id()).is_some()
+    });
     let opaque_draw = draw_functions.read().id::<DrawClusterShadow>();
     let mask_draw = draw_functions.read().id::<DrawClusterShadowMask>();
     for (light, view) in &lights {
@@ -3673,9 +3918,11 @@ fn queue_cluster_shadows(
         let plan = gpu
             .generation
             .wrapping_add(gpu.layout_epoch.rotate_left(24))
+            .wrapping_add(batch_materials.version.rotate_left(40))
+            .wrapping_add(sources.layout_version.rotate_left(11))
             .wrapping_mul(4)
             + u64::from(unclipped)
-            + 2 * u64::from(render_mesh.is_some());
+            + 2 * u64::from(layouts_ready);
         if gpu.views.get(&key).is_some_and(|view_gpu| {
             view_gpu.plan_hash == Some(plan)
                 && view_gpu.walk_carriers == *carriers
@@ -3694,12 +3941,6 @@ fn queue_cluster_shadows(
                 &asset_server,
             ))
         });
-        let mesh_key = render_mesh.map(|mesh| {
-            shadow_mesh_key(
-                unclipped,
-                MeshPipelineKey::from_bits_retain(mesh.key_bits.bits()),
-            )
-        });
         let mut groups = DrawGroups::new(gpu.batches.len());
         let mut group_of_key: HashMap<(CachedRenderPipelineId, Option<u32>), u32> = HashMap::new();
         let mut shadow_groups: Vec<ShadowGroup> = Vec::new();
@@ -3709,13 +3950,37 @@ fn queue_cluster_shadows(
             if batch.slots == 0 || batch.material.is_none() {
                 continue;
             }
+            let Some(tangents) = batch
+                .material
+                .filter(|asset| batch_materials.ids.get(index) == Some(&Some(*asset)))
+                .and_then(|asset| batch_materials.geometry.get(&asset).copied())
+                .and_then(|geometry| {
+                    batch_tangent_layout(batch, index, batch.material?, geometry, &sources)
+                })
+                .filter(|layout| batch.tangents == Some(*layout))
+            else {
+                complete = false;
+                continue;
+            };
+            let render_mesh = dummy_mesh
+                .as_ref()
+                .and_then(|dummy| render_meshes.get(dummy.asset(tangents)));
+            let mesh_key = render_mesh.map(|mesh| {
+                shadow_mesh_key(
+                    unclipped,
+                    MeshPipelineKey::from_bits_retain(mesh.key_bits.bits()),
+                )
+            });
             let slots = batch.slots;
             let (pipeline, material_group) = match (&batch.cutout, mesh_key, render_mesh) {
                 (Some(cutout), Some(mesh_key), Some(render_mesh)) => {
-                    let key = ErasedMaterialPipelineKey {
-                        type_id: cutout.type_id,
-                        mesh_key: ErasedMeshPipelineKey::new(mesh_key),
-                        material_key: cutout.material_key.clone(),
+                    let key = ClusterMaterialPipelineKey {
+                        material: ErasedMaterialPipelineKey {
+                            type_id: cutout.type_id,
+                            mesh_key: ErasedMeshPipelineKey::new(mesh_key),
+                            material_key: cutout.material_key.clone(),
+                        },
+                        tangents,
                     };
                     let pipeline = match pipelines.shadow_mask.get(&key) {
                         Some(id) => Some(*id),
@@ -3966,12 +4231,12 @@ fn publish_terrain_readiness(
     let terrain_prepasses: Vec<_> = pipelines
         .prepass
         .iter()
-        .filter(|(key, _)| key.type_id == terrain_type)
+        .filter(|(key, _)| key.material.type_id == terrain_type)
         .collect();
     let terrain_shadows: Vec<_> = pipelines
         .shadow_mask
         .iter()
-        .filter(|(key, _)| key.type_id == terrain_type)
+        .filter(|(key, _)| key.material.type_id == terrain_type)
         .collect();
     let prepass_built = terrain_prepasses
         .iter()
@@ -4081,10 +4346,13 @@ mod tests {
 
     #[test]
     fn ordinary_forward_pipeline_reuses_exact_keys_and_retries_failed_specialization() {
-        let key = ErasedMaterialPipelineKey {
-            mesh_key: ErasedMeshPipelineKey::new(MeshPipelineKey::empty()),
-            material_key: ErasedMaterialKey::new(0_u32),
-            type_id: std::any::TypeId::of::<StandardMaterial>(),
+        let key = ClusterMaterialPipelineKey {
+            material: ErasedMaterialPipelineKey {
+                mesh_key: ErasedMeshPipelineKey::new(MeshPipelineKey::empty()),
+                material_key: ErasedMaterialKey::new(0_u32),
+                type_id: std::any::TypeId::of::<StandardMaterial>(),
+            },
+            tangents: true,
         };
         let mut pipelines = ClusterPipelines::default();
         let mut queued = 0;
@@ -4115,9 +4383,12 @@ mod tests {
             );
         }
         assert_eq!(queued, 1);
-        let other = ErasedMaterialPipelineKey {
-            material_key: ErasedMaterialKey::new(1_u32),
-            ..key
+        let other = ClusterMaterialPipelineKey {
+            material: ErasedMaterialPipelineKey {
+                material_key: ErasedMaterialKey::new(1_u32),
+                ..key.material
+            },
+            tangents: key.tangents,
         };
         assert_eq!(
             pipelines.forward_pipeline(
@@ -4382,5 +4653,369 @@ mod tests {
                 &rewritten[base + 156..base + 176]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tangent_layout_regressions {
+    use super::*;
+
+    fn material_key(tangents: bool) -> ClusterMaterialPipelineKey {
+        ClusterMaterialPipelineKey {
+            material: ErasedMaterialPipelineKey {
+                mesh_key: ErasedMeshPipelineKey::new(MeshPipelineKey::empty()),
+                material_key: ErasedMaterialKey::new(0_u32),
+                type_id: std::any::TypeId::of::<StandardMaterial>(),
+            },
+            tangents,
+        }
+    }
+
+    #[test]
+    fn plain_and_tangent_layouts_keep_the_other_vertex_attributes_identical() {
+        let plain = dummy_mesh_with_tangents(false);
+        let tangent = dummy_mesh_with_tangents(true);
+        assert!(!plain.contains_attribute(Mesh::ATTRIBUTE_TANGENT));
+        assert!(tangent.contains_attribute(Mesh::ATTRIBUTE_TANGENT));
+        for attribute in [
+            Mesh::ATTRIBUTE_POSITION,
+            Mesh::ATTRIBUTE_NORMAL,
+            Mesh::ATTRIBUTE_UV_0,
+            Mesh::ATTRIBUTE_COLOR,
+        ] {
+            assert_eq!(plain.attribute(attribute), tangent.attribute(attribute));
+        }
+    }
+
+    #[test]
+    fn layout_variants_cannot_alias_in_any_material_pipeline_cache() {
+        let plain = material_key(false);
+        let tangent = material_key(true);
+        assert_ne!(plain, tangent);
+        let mut pipelines = ClusterPipelines::default();
+        pipelines
+            .shadow_mask
+            .insert(plain.clone(), CachedRenderPipelineId::INVALID);
+        pipelines.prepass.insert(plain.clone(), None);
+        pipelines
+            .render
+            .insert(plain.clone(), CachedRenderPipelineId::INVALID);
+        assert!(!pipelines.shadow_mask.contains_key(&tangent));
+        assert!(!pipelines.prepass.contains_key(&tangent));
+        assert!(!pipelines.render.contains_key(&tangent));
+    }
+
+    #[test]
+    fn material_requirements_cannot_invent_a_stock_tangent_attribute() {
+        use super::super::material_geometry::GeometryRequirements;
+        for authored in [false, true] {
+            for required in [false, true] {
+                let geometry = GeometryRequirements {
+                    supported: true,
+                    tangents: required,
+                };
+                assert_eq!(
+                    tangent_layout(authored, geometry),
+                    (!required || authored).then_some(authored)
+                );
+                assert_eq!(
+                    tangent_layout(
+                        authored,
+                        GeometryRequirements {
+                            supported: false,
+                            ..geometry
+                        }
+                    ),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extraction_reads_the_actual_standard_and_terrain_bases() {
+        use crate::cluster::terrain::ClusterTerrainMaterial;
+        let mut standard = Assets::<StandardMaterial>::default();
+        let mut terrain = Assets::<ClusterTerrainMaterial>::default();
+        let base = StandardMaterial {
+            depth_map: Some(Handle::default()),
+            ..default()
+        };
+        let standard_handle = standard.add(base.clone());
+        let terrain_handle = terrain.add(ClusterTerrainMaterial {
+            base,
+            extension: default(),
+        });
+        for id in [
+            standard_handle.id().untyped(),
+            terrain_handle.id().untyped(),
+        ] {
+            let requirements = material_geometry(id, &standard, Some(&terrain)).unwrap();
+            assert!(requirements.supported && requirements.tangents);
+        }
+        standard.get_mut(&standard_handle).unwrap().depth_map = None;
+        assert!(
+            !material_geometry(standard_handle.id().untyped(), &standard, Some(&terrain))
+                .unwrap()
+                .tangents
+        );
+        standard.remove(standard_handle.id());
+        assert!(
+            material_geometry(standard_handle.id().untyped(), &standard, Some(&terrain)).is_none()
+        );
+    }
+
+    #[test]
+    fn generated_tangent_memory_does_not_change_source_layout_classification() {
+        let mesh = ClusterMeshAsset::from_bytes(
+            include_bytes!("../../../shared/tests/data/cluster/fixture.mcl").to_vec(),
+        )
+        .unwrap();
+        assert_eq!(mesh.flags & shared::cluster::FLAG_TANGENTS, 0);
+        mesh.prepare_tangents();
+        assert!(mesh.tangents_usable());
+        assert_eq!(mesh.flags & shared::cluster::FLAG_TANGENTS, 0);
+        assert!(
+            !mesh
+                .source_mesh()
+                .contains_attribute(Mesh::ATTRIBUTE_TANGENT)
+        );
+    }
+
+    #[test]
+    fn a_material_shared_by_both_source_layouts_requires_separate_batches() {
+        let plain = ClusterMeshAsset::from_bytes(
+            include_bytes!("../../../shared/tests/data/cluster/fixture.mcl").to_vec(),
+        )
+        .unwrap();
+        let authored = super::super::assets::authored_tangent_fixture();
+        let mut scene = ClusterScene {
+            certificate: None,
+            terrain_blocks: Vec::new(),
+            meshes: vec![plain, authored],
+            instances: vec![
+                ClusterInstance {
+                    identity: ClusterInstanceIdentity::Fixture,
+                    mesh: 0,
+                    batch: 0,
+                    world_from_local: Mat4::IDENTITY,
+                    source_worldspace: 0,
+                },
+                ClusterInstance {
+                    identity: ClusterInstanceIdentity::Fixture,
+                    mesh: 1,
+                    batch: 1,
+                    world_from_local: Mat4::IDENTITY,
+                    source_worldspace: 0,
+                },
+            ],
+            origin_offset: Vec3::ZERO,
+            blocks: Vec::new(),
+        };
+        assert_eq!(batch_source_tangents(&scene, 2).unwrap(), [false, true]);
+        scene.instances[1].batch = 0;
+        assert_eq!(
+            batch_source_tangents(&scene, 1).unwrap_err(),
+            "cluster material batch mixes authored tangent layouts"
+        );
+    }
+
+    #[test]
+    fn real_extraction_updates_requirements_on_events_and_rebinds() {
+        use bevy::render::MainWorld;
+        let mut main = MainWorld::default();
+        main.init_resource::<Assets<StandardMaterial>>();
+        main.init_resource::<Messages<AssetEvent<StandardMaterial>>>();
+        main.init_resource::<ClusterBatchHandles>();
+        let handle = main
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        main.resource_mut::<ClusterBatchHandles>()
+            .set(0, handle.clone());
+        let id = handle.id().untyped();
+        let mut render = World::new();
+        render.init_resource::<ClusterBatchMaterials>();
+        render.insert_resource(main);
+        let mut schedule = Schedule::new(ExtractSchedule);
+        schedule.add_systems(extract_batch_materials);
+        schedule.run(&mut render);
+        assert!(!render.resource::<ClusterBatchMaterials>().geometry[&id].tangents);
+        let version = render.resource::<ClusterBatchMaterials>().version;
+        // Stable extraction does not invalidate unrelated pipelines.
+        render.resource_mut::<MainWorld>().increment_change_tick();
+        schedule.run(&mut render);
+        assert_eq!(render.resource::<ClusterBatchMaterials>().version, version);
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.increment_change_tick();
+            main.resource_mut::<Assets<StandardMaterial>>()
+                .get_mut(&handle)
+                .unwrap()
+                .anisotropy_strength = 0.5;
+            main.resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+                .write(AssetEvent::Modified { id: handle.id() });
+        }
+        schedule.run(&mut render);
+        assert!(render.resource::<ClusterBatchMaterials>().geometry[&id].tangents);
+        assert!(render.resource::<ClusterBatchMaterials>().version > version);
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.increment_change_tick();
+            main.resource_mut::<Assets<StandardMaterial>>()
+                .remove(handle.id());
+            main.resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+                .write(AssetEvent::Removed { id: handle.id() });
+        }
+        schedule.run(&mut render);
+        assert!(
+            !render
+                .resource::<ClusterBatchMaterials>()
+                .geometry
+                .contains_key(&id)
+        );
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.increment_change_tick();
+            let replacement = main
+                .resource_mut::<Assets<StandardMaterial>>()
+                .add(StandardMaterial::default());
+            main.resource_mut::<ClusterBatchHandles>()
+                .set(0, replacement);
+        }
+        schedule.run(&mut render);
+        let out = render.resource::<ClusterBatchMaterials>();
+        let replacement = out.ids[0].unwrap();
+        assert_ne!(replacement, id);
+        assert!(!out.geometry[&replacement].tangents);
+    }
+
+    #[test]
+    fn optional_terrain_events_refresh_the_extended_material_base() {
+        use crate::cluster::terrain::ClusterTerrainMaterial;
+        use bevy::render::MainWorld;
+        let mut main = MainWorld::default();
+        main.init_resource::<Assets<StandardMaterial>>();
+        main.init_resource::<Assets<ClusterTerrainMaterial>>();
+        main.init_resource::<Messages<AssetEvent<StandardMaterial>>>();
+        main.init_resource::<Messages<AssetEvent<ClusterTerrainMaterial>>>();
+        main.init_resource::<ClusterBatchHandles>();
+        let terrain = main
+            .resource_mut::<Assets<ClusterTerrainMaterial>>()
+            .add(ClusterTerrainMaterial::default());
+        main.resource_mut::<ClusterBatchHandles>()
+            .set(1, terrain.clone());
+        let mut render = World::new();
+        render.init_resource::<ClusterBatchMaterials>();
+        render.insert_resource(main);
+        let mut schedule = Schedule::new(ExtractSchedule);
+        schedule.add_systems(extract_batch_materials);
+        schedule.run(&mut render);
+        let before = render.resource::<ClusterBatchMaterials>().version;
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.increment_change_tick();
+            main.resource_mut::<Assets<ClusterTerrainMaterial>>()
+                .get_mut(&terrain)
+                .unwrap()
+                .base
+                .depth_map = Some(Handle::default());
+            main.resource_mut::<Messages<AssetEvent<ClusterTerrainMaterial>>>()
+                .write(AssetEvent::Modified { id: terrain.id() });
+        }
+        schedule.run(&mut render);
+        let out = render.resource::<ClusterBatchMaterials>();
+        assert!(out.version > before);
+        assert!(out.geometry[&terrain.id().untyped()].tangents);
+    }
+
+    #[test]
+    fn a_pending_material_arrival_is_reconsidered_without_a_handle_change() {
+        use bevy::render::MainWorld;
+        let mut main = MainWorld::default();
+        main.init_resource::<Assets<StandardMaterial>>();
+        main.init_resource::<Messages<AssetEvent<StandardMaterial>>>();
+        main.init_resource::<ClusterBatchHandles>();
+        let pending = main.resource::<Assets<StandardMaterial>>().reserve_handle();
+        main.resource_mut::<ClusterBatchHandles>()
+            .set(0, pending.clone());
+        let mut render = World::new();
+        render.init_resource::<ClusterBatchMaterials>();
+        render.insert_resource(main);
+        let mut schedule = Schedule::new(ExtractSchedule);
+        schedule.add_systems(extract_batch_materials);
+        schedule.run(&mut render);
+        assert!(
+            !render
+                .resource::<ClusterBatchMaterials>()
+                .geometry
+                .contains_key(&pending.id().untyped())
+        );
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.increment_change_tick();
+            main.resource_mut::<Assets<StandardMaterial>>()
+                .insert(
+                    pending.id(),
+                    StandardMaterial {
+                        depth_map: Some(Handle::default()),
+                        ..default()
+                    },
+                )
+                .unwrap();
+            main.resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+                .write(AssetEvent::Added { id: pending.id() });
+        }
+        schedule.run(&mut render);
+        let out = render.resource::<ClusterBatchMaterials>();
+        assert_eq!(out.ids[0], Some(pending.id().untyped()));
+        assert!(out.geometry[&pending.id().untyped()].tangents);
+    }
+    #[test]
+    fn cleared_and_shortened_material_tables_drop_every_old_binding_and_dependency() {
+        use bevy::render::MainWorld;
+        let mut main = MainWorld::default();
+        main.init_resource::<Assets<StandardMaterial>>();
+        main.init_resource::<Messages<AssetEvent<StandardMaterial>>>();
+        main.init_resource::<ClusterBatchHandles>();
+        let material = main
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        main.resource_mut::<ClusterBatchHandles>()
+            .set(0, material.clone());
+        let mut render = World::new();
+        render.init_resource::<ClusterBatchMaterials>();
+        render.insert_resource(main);
+        let mut schedule = Schedule::new(ExtractSchedule);
+        schedule.add_systems(extract_batch_materials);
+        schedule.run(&mut render);
+        let initial = render.resource::<ClusterBatchMaterials>().version;
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.increment_change_tick();
+            main.resource_mut::<ClusterBatchHandles>().handles[0] = None;
+        }
+        schedule.run(&mut render);
+        let out = render.resource::<ClusterBatchMaterials>();
+        assert_eq!(out.ids, [None]);
+        assert!(out.named.is_empty() && out.geometry.is_empty());
+        assert!(out.version > initial);
+        {
+            let mut main = render.resource_mut::<MainWorld>();
+            main.increment_change_tick();
+            main.resource_mut::<ClusterBatchHandles>().handles.clear();
+        }
+        schedule.run(&mut render);
+        assert!(render.resource::<ClusterBatchMaterials>().ids.is_empty());
+    }
+
+    #[test]
+    fn prepass_refusal_is_stable_until_a_material_event_changes_its_version() {
+        let mut pipelines = ClusterPipelines::default();
+        let key = material_key(false);
+        pipelines.prepass.insert(key.clone(), None);
+        pipelines.refresh_prepass_refusals(0);
+        assert!(pipelines.prepass.contains_key(&key));
+        pipelines.refresh_prepass_refusals(1);
+        assert!(!pipelines.prepass.contains_key(&key));
     }
 }

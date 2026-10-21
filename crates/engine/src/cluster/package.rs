@@ -671,8 +671,8 @@ fn load_cluster_package(
 
     let mut mesh_index: HashMap<(String, u32), u32> = HashMap::new();
     let mut scene_meshes: Vec<ClusterMeshAsset> = Vec::new();
-    let mut batch_index: HashMap<BatchKey, u32> = HashMap::new();
-    let mut batch_keys: Vec<BatchKey> = Vec::new();
+    let mut batch_index: HashMap<(BatchKey, u32), u32> = HashMap::new();
+    let mut batch_keys: Vec<(BatchKey, u32)> = Vec::new();
     // Where each instance is, for loading its batch's material when it comes into view.
     let mut instance_spheres: Vec<(Vec3, f32)> = Vec::new();
     let mut instances: Vec<ClusterInstance> = Vec::new();
@@ -812,10 +812,16 @@ fn load_cluster_package(
                     return;
                 }
             };
-            let batch = *batch_index.entry(key.clone()).or_insert_with(|| {
-                batch_keys.push(key);
-                (batch_keys.len() - 1) as u32
-            });
+            // Actual loader-generated attributes belong to a source occurrence, not
+            // to a material or the MCL authored-attribute flags. Keep that identity
+            // so later material edits cannot merge different stock layouts.
+            let primitive = row.expected.primitive_index;
+            let batch = *batch_index
+                .entry((key.clone(), primitive))
+                .or_insert_with(|| {
+                    batch_keys.push((key, primitive));
+                    (batch_keys.len() - 1) as u32
+                });
             if let ChunkDomain::Terrain(index) = chunk_source.domain {
                 let Some(terrain) = terrain.as_mut() else {
                     error!("terrain instance has no terrain metadata");
@@ -881,11 +887,13 @@ fn load_cluster_package(
     // instance of the batch comes into view (`load_batches_in_view`), so loading follows what the
     // camera sees and not the size of the package.
     commands.insert_resource(LazyBatches {
+        layout_scope: next_layout_scope(),
         batches: batch_keys
             .iter()
             .zip(batch_spheres)
-            .map(|(key, spheres)| LazyBatch {
+            .map(|((key, primitive), spheres)| LazyBatch {
                 key: key.clone(),
+                primitive: *primitive,
                 bounds: enclosing_sphere(
                     &spheres
                         .iter()
@@ -907,7 +915,12 @@ fn load_cluster_package(
         retried_sources: default(),
         prefetch_in_flight,
         unrequested: (0..batch_keys.len())
-            .filter(|&index| !batch_keys[index].model_path.starts_with("cluster-terrain:"))
+            .filter(|&index| {
+                !batch_keys[index]
+                    .0
+                    .model_path
+                    .starts_with("cluster-terrain:")
+            })
             .collect(),
         in_flight: Vec::new(),
         failed: Vec::new(),
@@ -1245,6 +1258,7 @@ fn lazy_view_distance(
 /// One batch whose material is not requested until it is seen.
 struct LazyBatch {
     key: BatchKey,
+    primitive: u32,
     /// Absolute spheres retain each instance's certified PLACED world, not its storage block.
     spheres: Vec<LazySphere>,
     /// One sphere around all of `spheres`: a batch whose own is out of the view has no instance in
@@ -1275,6 +1289,7 @@ pub(crate) struct ClusterBatchPreload;
 
 #[derive(Resource)]
 pub(super) struct LazyBatches {
+    pub(super) layout_scope: u64,
     batches: Vec<LazyBatch>,
     assets_dir: PathBuf,
     native_by_model: HashMap<String, Vec<bool>>,
@@ -1297,12 +1312,19 @@ pub(super) struct LazyBatches {
     failed: Vec<usize>,
 }
 
+fn next_layout_scope() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl LazyBatches {
     /// One explicitly mapped source for real-loader extraction tests, without the streaming loader.
     #[cfg(test)]
     pub(crate) fn for_source_test(model_path: &str, scene: Handle<WorldAsset>) -> Self {
         Self {
+            layout_scope: next_layout_scope(),
             batches: vec![LazyBatch {
+                primitive: 0,
                 key: BatchKey {
                     model_path: model_path.to_owned(),
                     material_index: Some(0),
@@ -1347,6 +1369,10 @@ impl LazyBatches {
             batch.scene.is_some(),
             batch.loading.is_some(),
         ))
+    }
+
+    pub(super) fn source_primitive(&self, batch: u32) -> Option<u32> {
+        Some(self.batches.get(batch as usize)?.primitive)
     }
 
     pub(super) fn source_scene(&self, batch: u32) -> Option<&Handle<WorldAsset>> {

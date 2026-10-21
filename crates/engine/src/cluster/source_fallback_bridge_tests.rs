@@ -128,6 +128,27 @@ impl Fixture {
             .clone();
         let mut material = StandardMaterial::default();
         if normal_map {
+            // Prepare the actual stock geometry for this normal-mapped test input.
+            // Keep the compressed payload untouched so its asynchronous tangent
+            // preparation remains pending; this is setup, not a loader E2E claim.
+            let template = app
+                .world()
+                .resource::<Assets<WorldAsset>>()
+                .get(&source)
+                .unwrap();
+            let mut query = template.world.try_query::<&Mesh3d>().unwrap();
+            let meshes: Vec<_> = query
+                .iter(&template.world)
+                .map(|mesh| mesh.0.clone())
+                .collect();
+            assert!(!meshes.is_empty());
+            for handle in meshes {
+                let mut assets = app.world_mut().resource_mut::<Assets<Mesh>>();
+                let mut stock = assets.get_mut(&handle).unwrap();
+                stock.generate_tangents().unwrap();
+                assert!(stock.contains_attribute(Mesh::ATTRIBUTE_TANGENT));
+            }
+            assert_eq!(mesh.prepared_tangents_usable(), None);
             material.normal_map_texture = Some(
                 app.world_mut()
                     .resource_mut::<Assets<Image>>()

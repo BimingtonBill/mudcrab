@@ -201,3 +201,35 @@ mod tests {
         assert!(!projected_requirements(&fields).supported);
     }
 }
+
+#[cfg(test)]
+mod tangent_requirement_regressions {
+    use super::*;
+    use bevy::reflect::structs::DynamicStruct;
+
+    #[test]
+    fn all_tangent_consumers_are_classified_even_without_optional_cargo_features() {
+        for name in [
+            "normal_map_texture",
+            "clearcoat_normal_texture",
+            "depth_map",
+        ] {
+            let mut fields = DynamicStruct::default();
+            fields.insert(name, Some(Handle::<Image>::default()));
+            assert_eq!(
+                projected_requirements(&fields),
+                GeometryRequirements {
+                    supported: true,
+                    tangents: true
+                },
+                "{name}"
+            );
+        }
+        let mut fields = DynamicStruct::default();
+        fields.insert("anisotropy_strength", 0.5_f32);
+        assert!(projected_requirements(&fields).tangents);
+        let mut fields = DynamicStruct::default();
+        fields.insert("anisotropy_strength", 0.0_f32);
+        assert!(!projected_requirements(&fields).tangents);
+    }
+}

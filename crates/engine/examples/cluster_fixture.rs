@@ -16,8 +16,9 @@ use bevy::{
 use engine::cluster::{
     assets::{ClusterBlockAsset, ClusterMeshAsset},
     render::{
-        CLUSTER_CARRIERS, ClusterBatch, ClusterBatchHandles, ClusterInstance, ClusterRenderPlugin,
-        ClusterScene, ClusterSettings, batch_bounds, world_from_local,
+        CLUSTER_CARRIERS, ClusterBatch, ClusterBatchHandles, ClusterBatchStockMeshes,
+        ClusterInstance, ClusterRenderPlugin, ClusterScene, ClusterSettings, batch_bounds,
+        world_from_local,
     },
 };
 use std::path::PathBuf;
@@ -313,15 +314,21 @@ fn setup(
         }
         None => (center, radius),
     };
+    // Both modes retain the exact geometry the stock path would draw. This
+    // attribute survives later normal-map removal, just as glTF's generated one does.
+    let mut source = mesh.source_mesh();
+    if normal_mapped.0 && !source.contains_attribute(Mesh::ATTRIBUTE_TANGENT) {
+        source
+            .generate_tangents()
+            .expect("the fixture mesh has tangents");
+    }
+    let handle = meshes.add(source);
+    commands.insert_resource(ClusterBatchStockMeshes(vec![
+        handle.clone();
+        (material_count + 1) as usize
+    ]));
     match *mode {
         Mode::Stock => {
-            let mut source = mesh.source_mesh();
-            if normal_mapped.0 {
-                source
-                    .generate_tangents()
-                    .expect("the fixture mesh has tangents");
-            }
-            let handle = meshes.add(source);
             for (index, record) in block.instances.iter().enumerate() {
                 let mut transform = Transform::from_matrix(world_from_local(record));
                 transform.translation += origin_shift.0;
