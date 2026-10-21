@@ -1604,6 +1604,7 @@ struct CellPlanningContext<'w, 's> {
     prestream: Res<'w, PrestreamCells>,
     origin: Res<'w, RenderOrigin>,
     camera: Query<'w, 's, &'static Transform, With<StreamingCamera>>,
+    restored_roots: Query<'w, 's, (Has<StreamedCellRoot>, Has<DistantTerrainRoot>)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1631,6 +1632,7 @@ fn plan_cells(
         prestream,
         origin,
         camera,
+        restored_roots,
     } = context;
     let plan_started = Instant::now();
     // The immediate-unload span and the subtree counts cost time, so a run that is not
@@ -1727,6 +1729,24 @@ fn plan_cells(
         } else {
             detail
         };
+        // A rolled-back transaction may already hold exactly the requested geometry.
+        // Reattach that restored root instead of requesting an identical replacement.
+        // Keep full_failed intact: reusing LAND does not forgive a refused full upgrade.
+        if let Some(CellStatus::Failed {
+            replaced: Some(root),
+            ..
+        }) = streaming.cells.get(&key)
+            && let Ok((full, terrain)) = restored_roots.get(*root)
+            && match detail {
+                CellDetail::Full => full && !terrain,
+                CellDetail::Terrain => terrain && !full,
+            }
+        {
+            let root = *root;
+            streaming
+                .cells
+                .insert(key, CellStatus::Resident { root, detail });
+        }
         // Whether this is a retry of a failure at exactly the tier the plan is asking for again:
         // only the interior the camera stands in is ever asked for again at the tier it failed at
         // ([`retry_failed_interior`]), and only while its retry budget lasts.
@@ -2852,6 +2872,9 @@ struct SpawnStampContext<'w, 's> {
     reference_entities: Query<'w, 's, (), With<crate::world::components::FormId>>,
 }
 
+#[derive(Component, Clone, Copy)]
+struct ReplacedCellDetail(CellDetail);
+
 /// Hands the root a detail change replaces over to the stand-in hold (design-1091 §3): the cell
 /// changed detail on the same grid, and until the root that replaced it can be drawn this one keeps
 /// covering the ground, so no frame shows neither.
@@ -2869,10 +2892,108 @@ fn hold_replaced_root(commands: &mut Commands, replaced: Entity) {
         if !far_stock::removal_blocked(world, replaced)
             && let Ok(mut entity) = world.get_entity_mut(replaced)
         {
+            let detail = if entity.contains::<StreamedCellRoot>() {
+                CellDetail::Full
+            } else {
+                CellDetail::Terrain
+            };
             entity.remove::<(StreamedCellRoot, DistantTerrainRoot)>();
-            entity.insert(SwapStandIn::default());
+            entity.insert((SwapStandIn::default(), ReplacedCellDetail(detail)));
         }
     });
+}
+
+/// Abort only the current replacement generation. Reuse the streamer's explicit failed-load
+/// state so the old root stays owned and unloadable, without retrying a permanent asset error
+/// every frame. Restoring ownership precedes disposal of the failed replacement.
+pub(crate) fn rollback_detail_change(world: &mut World, stand_in: Entity, replacement: Entity) {
+    let Some(old_detail) = world.get::<ReplacedCellDetail>(stand_in).copied() else {
+        return;
+    };
+    if world.get::<SwapStandIn>(stand_in).is_none() {
+        return;
+    }
+    let Some((key, detail)) = world
+        .get_resource::<StreamingWorld>()
+        .and_then(|streaming| {
+            streaming
+                .cells
+                .iter()
+                .find_map(|(&key, status)| match *status {
+                    CellStatus::Resident { root, detail }
+                    | CellStatus::Retiring { root, detail }
+                    | CellStatus::Loading {
+                        replaced: Some(root),
+                        detail,
+                        ..
+                    }
+                    | CellStatus::Failed {
+                        replaced: Some(root),
+                        detail,
+                        ..
+                    } if root == replacement => Some((key, detail)),
+                    _ => None,
+                })
+        })
+    else {
+        return;
+    };
+    let cell_id = world.get::<CellRef>(replacement).map(|cell| cell.0);
+    let reason = "replacement surface failed asset validation or pipeline compilation".to_owned();
+    world.resource_scope(|world, mut streaming: Mut<StreamingWorld>| {
+        if matches!(streaming.cells.get(&key), Some(CellStatus::Resident { .. })) {
+            let mut metrics = world.resource_mut::<StreamingMetrics>();
+            record_failed_cell(
+                &mut streaming,
+                key,
+                cell_id,
+                detail,
+                1,
+                reason,
+                true,
+                Some(stand_in),
+                &mut metrics,
+            );
+        } else {
+            // A newer database request may already be using the failed root as its cover.
+            // Redirect that existing transaction rather than cancelling its generation or
+            // leaving a failed root and its older stand-in pinned behind it.
+            match streaming.cells.get_mut(&key) {
+                Some(
+                    CellStatus::Loading { replaced, .. } | CellStatus::Failed { replaced, .. },
+                ) => {
+                    *replaced = Some(stand_in);
+                }
+                Some(CellStatus::Retiring { root, detail }) => {
+                    *root = stand_in;
+                    *detail = old_detail.0;
+                }
+                _ => return,
+            }
+            error!(?key, %reason, "redirected replacement ownership to its valid covering root");
+        }
+    });
+    let retiring = matches!(
+        world.resource::<StreamingWorld>().cells.get(&key),
+        Some(CellStatus::Retiring { .. })
+    );
+    let mut old = world.entity_mut(stand_in);
+    old.remove::<(SwapStandIn, ReplacedCellDetail)>();
+    match old_detail.0 {
+        CellDetail::Full => {
+            old.insert(StreamedCellRoot);
+        }
+        CellDetail::Terrain => {
+            old.insert(DistantTerrainRoot);
+        }
+    }
+    if retiring
+        && let Some(visibility) = old.get::<Visibility>().copied()
+        && visibility != Visibility::Hidden
+    {
+        old.insert((Visibility::Hidden, RetireHidden(visibility)));
+    }
+    world.despawn(replacement);
 }
 
 /// Collect database responses, reject stale generations and commit cells within the shared budget.
@@ -8281,6 +8402,180 @@ mod tests {
     };
     use bevy::asset::{AssetApp, AssetPlugin};
     use bevy::ecs::system::SystemState;
+
+    #[test]
+    fn planning_reuses_restored_failed_roots_at_their_actual_detail() {
+        for detail in [CellDetail::Terrain, CellDetail::Full] {
+            let mut app = App::new();
+            app.insert_resource(EngineConfig {
+                stream_radius: 0,
+                terrain_radius: 0,
+                ..EngineConfig::default()
+            })
+            .insert_resource(WorldDatabase::saturated_queue())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 7,
+                interior: None,
+            })
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, plan_cells);
+            app.world_mut()
+                .spawn((Transform::from_xyz(1.0, 0.0, -1.0), StreamingCamera));
+            let old = app.world_mut().spawn(Visibility::Inherited).id();
+            match detail {
+                CellDetail::Terrain => {
+                    app.world_mut().entity_mut(old).insert(DistantTerrainRoot);
+                }
+                CellDetail::Full => {
+                    app.world_mut().entity_mut(old).insert(StreamedCellRoot);
+                }
+            }
+            let key = CellKey::Exterior {
+                worldspace_id: 7,
+                grid_x: 0,
+                grid_y: 0,
+            };
+            {
+                let mut streaming = app.world_mut().resource_mut::<StreamingWorld>();
+                streaming.cells.insert(
+                    key,
+                    CellStatus::Failed {
+                        detail: other_detail(detail),
+                        attempts: 1,
+                        reason: "terminal replacement failure".into(),
+                        retry_at: None,
+                        replaced: Some(old),
+                    },
+                );
+                if detail == CellDetail::Terrain {
+                    streaming.full_failed.insert(
+                        key,
+                        FullFailure {
+                            attempts: 1,
+                            reason: "terminal full upgrade failure".into(),
+                            retry_at: None,
+                        },
+                    );
+                }
+            }
+            app.update();
+            app.update();
+            let streaming = app.world().resource::<StreamingWorld>();
+            assert!(
+                matches!(streaming.cells.get(&key), Some(CellStatus::Resident { root, detail: held }) if *root == old && *held == detail)
+            );
+            assert_eq!(
+                streaming.full_failed.contains_key(&key),
+                detail == CellDetail::Terrain
+            );
+            assert_eq!(
+                streaming.generation, 0,
+                "reused geometry submits no request"
+            );
+            assert!(streaming.outstanding_cells.is_empty());
+            assert!(app.world().get_entity(old).is_ok());
+        }
+    }
+
+    #[test]
+    fn rollback_preserves_a_newer_request_and_its_covering_root() {
+        let mut world = World::new();
+        world.init_resource::<StreamingWorld>();
+        world.init_resource::<StreamingMetrics>();
+        let key = CellKey::Exterior {
+            worldspace_id: 7,
+            grid_x: 1,
+            grid_y: 2,
+        };
+        let old = world
+            .spawn((
+                SwapStandIn::default(),
+                ReplacedCellDetail(CellDetail::Terrain),
+                Visibility::Inherited,
+            ))
+            .id();
+        let failed = world.spawn(StreamedCellRoot).id();
+        world.resource_mut::<StreamingWorld>().cells.insert(
+            key,
+            CellStatus::Loading {
+                generation: 44,
+                detail: CellDetail::Terrain,
+                replaced: Some(failed),
+            },
+        );
+        rollback_detail_change(&mut world, old, failed);
+        assert!(world.get_entity(failed).is_err());
+        assert!(world.get::<DistantTerrainRoot>(old).is_some());
+        assert!(world.get::<SwapStandIn>(old).is_none());
+        assert!(matches!(world.resource::<StreamingWorld>().cells.get(&key),
+            Some(CellStatus::Loading { generation: 44, detail: CellDetail::Terrain,
+                replaced: Some(root) }) if *root == old));
+    }
+
+    #[test]
+    fn failed_replacement_rolls_back_ownership_without_retiring_coverage() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<StreamingWorld>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_plugins(crate::swap_bridge::SwapBridgePlugin);
+        let key = CellKey::Exterior {
+            worldspace_id: 7,
+            grid_x: 1,
+            grid_y: 2,
+        };
+        let old = app
+            .world_mut()
+            .spawn((
+                SwapStandIn::default(),
+                ReplacedCellDetail(CellDetail::Terrain),
+                Visibility::Inherited,
+            ))
+            .id();
+        let replacement = app.world_mut().spawn((StreamedCellRoot, CellRef(9))).id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                key,
+                CellStatus::Resident {
+                    root: replacement,
+                    detail: CellDetail::Full,
+                },
+            );
+        app.world_mut().spawn((
+            ChildOf(replacement),
+            AssetFailed,
+            SwapWaiting,
+            SwapSurface::new(Handle::<TerrainMaterial>::default().id().untyped(), [])
+                .with_stand_in(old),
+        ));
+        app.update();
+        assert!(app.world().get::<SwapStandIn>(old).is_none());
+        assert!(app.world().get::<DistantTerrainRoot>(old).is_some());
+        assert_eq!(
+            app.world().get::<Visibility>(old),
+            Some(&Visibility::Inherited)
+        );
+        assert!(app.world().get_entity(replacement).is_err());
+        assert!(
+            matches!(app.world().resource::<StreamingWorld>().cells.get(&key),
+            Some(CellStatus::Failed { replaced: Some(root), retry_at: None, .. }) if *root == old)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<crate::swap_bridge::SwapBridgeStats>()
+                .live_holds,
+            0
+        );
+    }
 
     #[test]
     fn terrain_collision_keeps_the_portal_space_gate_as_its_authority() {

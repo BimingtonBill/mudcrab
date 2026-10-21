@@ -17,8 +17,8 @@
 //! slices C2 (the LOD swap, the unload side) and C4 (the settles) are what key on the rest of the
 //! signal.
 //!
-//! Cost is O(waiting entities): the bridge iterates exactly the entities carrying the waiting
-//! marker, never all terrain, and a surface leaves the set the frame it is confirmed drawn
+//! The bridge visits waiting surfaces and the descendants of live holds or explicit coverage requests,
+//! never all terrain. A surface leaves the waiting set the frame it is confirmed drawn
 //! (design-1091 §2.3, §5).
 
 pub mod assets;
@@ -225,6 +225,60 @@ pub struct SwapStandIn {
     pub held_frames: u32,
 }
 
+/// Request render-camera visibility observations of this root's covering subtree.
+/// The owner controls its lifetime and removes this marker and its observation when done.
+/// This does not make the root a stand-in or authorize the bridge to release it.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub(crate) struct SwapCoverageRoot;
+
+/// Last render observation of camera visibility of a requested covering subtree.
+/// Absence means unknown. `false` only says no camera saw the covering geometry; the
+/// replacement owner must also establish preparation or draw readiness before retirement.
+#[derive(Component, Debug, Clone, Copy)]
+pub(crate) struct SwapCoverageInCameraView(pub bool);
+
+/// Current main-frame proof, read only after PostUpdate visibility checks (normally in Last).
+/// Shadow visibility also keeps coverage alive. Missing visibility or an empty/invalid subtree
+/// is unknown, never evidence that an old surface can retire.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct CurrentCoverageVisibility<'w, 's> {
+    nodes: Query<
+        'w,
+        's,
+        (
+            Has<Mesh3d>,
+            Option<&'static ViewVisibility>,
+            Option<&'static Children>,
+        ),
+    >,
+}
+
+impl CurrentCoverageVisibility<'_, '_> {
+    pub(crate) fn is_unviewed(&self, root: Entity) -> bool {
+        let mut pending = vec![root];
+        let mut visited = bevy::platform::collections::HashSet::<Entity>::default();
+        let mut meshes = 0;
+        while let Some(entity) = pending.pop() {
+            if !visited.insert(entity) {
+                return false;
+            }
+            let Ok((mesh, visibility, children)) = self.nodes.get(entity) else {
+                return false;
+            };
+            if mesh {
+                meshes += 1;
+                if !visibility.is_some_and(|visibility| !visibility.get()) {
+                    return false;
+                }
+            }
+            if let Some(children) = children {
+                pending.extend(children.iter());
+            }
+        }
+        meshes != 0
+    }
+}
+
 /// What the render world holds for one waiting surface, this extract: the plain snapshot
 /// [`swap_readiness`] decides on. Every field is a fact this world has established, so the decision
 /// is a pure function of the snapshot and can be tested without a GPU.
@@ -306,6 +360,8 @@ pub struct SwapBridgeStats {
     /// Entities that carried both the waiting and the drawn marker this frame and left the
     /// waiting set.
     pub drawn_this_frame: u32,
+    /// Covering roots still retained after this frame's handovers.
+    pub live_holds: usize,
 }
 
 /// The bridge's one main-world query: the entities the engine has marked waiting, with what their
@@ -400,21 +456,46 @@ fn swap_bridge(
                     ),
                 ..facts
             };
+            let failed = surface.stand_in().is_some()
+                && mesh_instances.mesh_asset_id(MainEntity::from(entity)) == Some(mesh.0.id())
+                && material_instances
+                    .instances
+                    .get(&MainEntity::from(entity))
+                    .is_some_and(|instance| instance.asset_id == surface.material)
+                && views.iter().any(|(view, visible)| {
+                    view_sees(visible, MainEntity::from(entity))
+                        && specialized
+                            .get(&view.retained_view_entity)
+                            .and_then(|cache| cache.get(&MainEntity::from(entity)))
+                            .is_some_and(|pipeline| {
+                                terminal_pipeline_failure(
+                                    pipelines.get_render_pipeline_state(*pipeline),
+                                )
+                            })
+                });
             let readiness = swap_readiness(&facts);
             let in_view_changed = (seen != in_view).then_some(seen);
-            if readiness != SwapReadiness::Waiting || in_view_changed.is_some() {
+            if failed || readiness != SwapReadiness::Waiting || in_view_changed.is_some() {
                 decisions.push(SwapDecision {
                     entity,
                     mesh: mesh.0.id(),
                     material: surface.material,
                     insert_prepared: readiness != SwapReadiness::Waiting && prepared.is_none(),
                     drawn: readiness == SwapReadiness::Drawn,
+                    failed,
                     stand_in: surface.stand_in(),
                     in_view: in_view_changed,
                 });
             }
         }
     }
+
+    // Observe the covering geometry too: a hidden replacement can be absent from every
+    // camera while its visible old root still covers the hole. Absence on the new surface
+    // alone therefore cannot authorize retirement.
+    observe_coverage_roots(&mut main_world, |entity| {
+        views.iter().any(|(_, visible)| view_sees(visible, entity))
+    });
 
     for decision in decisions.iter() {
         let mut entity = main_world.entity_mut(decision.entity);
@@ -423,6 +504,10 @@ fn swap_bridge(
                 stand_in: decision.stand_in,
                 since: *frame,
             });
+        }
+        if decision.failed {
+            error!(surface = ?decision.entity, "replacement terrain pipeline failed; requesting detail-change rollback");
+            entity.insert(crate::streaming::AssetFailed);
         }
         if decision.drawn {
             entity.insert((
@@ -445,6 +530,35 @@ fn swap_bridge(
     }
 }
 
+/// Observe only live holds and explicit requests. The return value counts requested roots,
+/// allowing tests to prove that ordinary scene roots do not enter this work domain.
+fn observe_coverage_roots(
+    world: &mut World,
+    mut seen_by_camera: impl FnMut(MainEntity) -> bool,
+) -> usize {
+    let mut query =
+        world.query_filtered::<Entity, Or<(With<SwapStandIn>, With<SwapCoverageRoot>)>>();
+    let roots: Vec<_> = query.iter(world).collect();
+    let observed_roots = roots.len();
+    for root in roots {
+        let mut descendants = vec![root];
+        let mut seen = false;
+        while let Some(entity) = descendants.pop() {
+            if seen_by_camera(entity.into()) {
+                seen = true;
+                break;
+            }
+            if let Some(children) = world.get::<Children>(entity) {
+                descendants.extend(children.iter());
+            }
+        }
+        world
+            .entity_mut(root)
+            .insert(SwapCoverageInCameraView(seen));
+    }
+    observed_roots
+}
+
 /// One marker write the bridge decided on, applied after the query's borrow of the main world ends.
 #[derive(Debug, Clone, Copy)]
 struct SwapDecision {
@@ -455,6 +569,7 @@ struct SwapDecision {
     /// surface waits for its pipeline: that would churn change detection for nothing).
     insert_prepared: bool,
     drawn: bool,
+    failed: bool,
     stand_in: Option<Entity>,
     /// `Some(seen)` when whether a camera can see the surface changed this frame.
     in_view: Option<bool>,
@@ -498,6 +613,17 @@ fn gather_surface_facts(
 /// only for the views whose visible set holds it - but the visible set is read here too, so the
 /// "a view can see it" half of the rule is a fact of this frame rather than an assumption about
 /// Bevy's internals. An entity whose pipeline is `Queued` (or absent) is not drawn yet.
+/// Bevy retries missing shaders and imports. Only processing/module errors are terminal.
+fn terminal_pipeline_failure(state: &CachedPipelineState) -> bool {
+    matches!(
+        state,
+        CachedPipelineState::Err(
+            bevy::shader::ShaderCacheError::ProcessShaderError(_)
+                | bevy::shader::ShaderCacheError::CreateShaderModule(_)
+        )
+    )
+}
+
 fn pipeline_resolved(
     entity: MainEntity,
     views: &Query<(&ExtractedView, &RenderVisibleEntities)>,
@@ -571,50 +697,153 @@ fn complete_drawn_swaps(
     stats.drawn_this_frame = completed;
 }
 
+/// A terminal terrain validation failure cancels the replacement transaction. Streaming
+/// restores the old root's ownership before disposing of the failed replacement, so the
+/// covering geometry and colliders never disappear while the cell is still demanded.
+type FailedReplacementSurfaces<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, &'static SwapSurface),
+    (With<SwapWaiting>, With<crate::streaming::AssetFailed>),
+>;
+
+type DetailReplacementRoots<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    Or<(
+        With<crate::world::components::StreamedCellRoot>,
+        With<crate::world::components::DistantTerrainRoot>,
+        With<SwapStandIn>,
+    )>,
+>;
+
+fn rollback_failed_detail_changes(
+    mut commands: Commands,
+    failed: FailedReplacementSurfaces,
+    parents: Query<&ChildOf>,
+    roots: DetailReplacementRoots,
+    holds: Query<(), With<SwapStandIn>>,
+    mut transactions: Local<Vec<(Entity, Entity)>>,
+) {
+    transactions.clear();
+    for (entity, surface) in &failed {
+        let Some(stand_in) = surface.stand_in().filter(|root| holds.contains(*root)) else {
+            continue;
+        };
+        let Some(replacement) = parents
+            .iter_ancestors(entity)
+            .find(|root| roots.contains(*root))
+        else {
+            continue;
+        };
+        if !transactions.contains(&(stand_in, replacement)) {
+            transactions.push((stand_in, replacement));
+        }
+    }
+    for &(stand_in, replacement) in transactions.iter() {
+        commands.queue(move |world: &mut World| {
+            if world.get::<SwapStandIn>(replacement).is_some() {
+                // A newer committed root already owns this cell. Its failed intermediate
+                // cover must yield to the earlier valid cover without rolling back the
+                // current streaming generation. Redirect declarations before disposal.
+                if world.get::<SwapStandIn>(stand_in).is_none() {
+                    return;
+                }
+                let mut surfaces = world.query::<(&mut SwapSurface, Option<&mut SwapPrepared>)>();
+                for (mut surface, prepared) in surfaces.iter_mut(world) {
+                    if surface.stand_in == Some(replacement) {
+                        surface.stand_in = Some(stand_in);
+                        if let Some(mut prepared) = prepared {
+                            prepared.stand_in = Some(stand_in);
+                        }
+                    }
+                }
+                error!(?replacement, ?stand_in, "retiring failed intermediate stand-in after transferring coverage to its valid predecessor");
+                world.despawn(replacement);
+            } else {
+                crate::streaming::rollback_detail_change(world, stand_in, replacement);
+            }
+        });
+    }
+}
+
 /// A waiting surface names its covering root until the renderer confirms a draw.
-type WaitingCoverage<'w, 's> =
-    Query<'w, 's, (&'static SwapSurface, Has<SwapDrawn>), With<SwapWaiting>>;
+type WaitingCoverage<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static SwapSurface,
+        Has<SwapDrawn>,
+        Has<SwapPrepared>,
+        Has<SwapInCameraView>,
+        Option<&'static ViewVisibility>,
+    ),
+    With<SwapWaiting>,
+>;
+
+#[derive(Default)]
+struct StandInCoverage {
+    uncovered: std::collections::HashSet<Entity>,
+    unviewed: std::collections::HashSet<Entity>,
+}
 
 /// Retire a covering root only after all remaining replacements draw. Preparation and
-/// temporary camera invisibility do not prove a replacement draw. Cancellation still releases
+/// camera invisibility alone do not prove a replacement draw. A prepared replacement
+/// may release its hold only when the renderer observes neither it nor its covering subtree
+/// in any camera AND current PostUpdate culling confirms both are unviewed. This runs in Last;
+/// a camera turn or new view therefore overrules stale render visibility. Cancellation still releases
 /// the root: no remaining surface names it once its replacement has been despawned.
 ///
-/// Cost is one pass over the waiting surfaces plus one over the live holds, and the live holds are
-/// at most the cells crossing a detail boundary in one frame. Nothing is held at all in a settled
-/// run, and the system returns before building the set.
+/// Current visibility visits each historically unviewed covering subtree once per frame,
+/// followed by one pass over waiting surfaces and holds. A settled run returns immediately.
+#[allow(clippy::too_many_arguments)]
 fn release_detail_change_stand_ins(
     mut commands: Commands,
-    mut metrics: ResMut<StreamingMetrics>,
+    (mut metrics, mut stats): (ResMut<StreamingMetrics>, ResMut<SwapBridgeStats>),
     mut profiler: ResMut<ProfilingState>,
-    mut holds: Query<(Entity, &mut SwapStandIn)>,
+    mut holds: Query<(Entity, &mut SwapStandIn, Option<&SwapCoverageInCameraView>)>,
     cells: Query<(&CellRef, Option<&ExteriorCellGrid>)>,
     waiting: WaitingCoverage,
-    mut uncovered: Local<Vec<Entity>>,
+    current: CurrentCoverageVisibility,
+    mut coverage: Local<StandInCoverage>,
 ) {
+    stats.live_holds = 0;
     if holds.is_empty() {
         return;
     }
     // The stand-ins a waiting surface still needs. Built from the surfaces' own declarations rather
     // than from the new root: a new root that is despawned, and one that declares no surface at all
     // (a cell with no terrain), both simply stop naming anything here.
-    uncovered.clear();
-    for (surface, drawn) in &waiting {
-        if drawn {
-            continue;
-        }
-        if let Some(stand_in) = surface.stand_in()
-            && !uncovered.contains(&stand_in)
-        {
-            uncovered.push(stand_in);
+    coverage.unviewed.clear();
+    for (root, _, observed) in holds.iter() {
+        if observed.is_some_and(|observed| !observed.0) && current.is_unviewed(root) {
+            coverage.unviewed.insert(root);
         }
     }
-    for (stand_in, mut hold) in &mut holds {
+    coverage.uncovered.clear();
+    for (surface, drawn, prepared, in_view, visibility) in &waiting {
+        let unviewed_ready = prepared
+            && !in_view
+            && visibility.is_some_and(|visibility| !visibility.get())
+            && surface
+                .stand_in()
+                .is_some_and(|root| coverage.unviewed.contains(&root));
+        if drawn || unviewed_ready {
+            continue;
+        }
+        if let Some(stand_in) = surface.stand_in() {
+            coverage.uncovered.insert(stand_in);
+        }
+    }
+    for (stand_in, mut hold, _) in &mut holds {
         hold.held_frames = hold.held_frames.saturating_add(1);
-        let covered = !uncovered.contains(&stand_in);
+        let covered = !coverage.uncovered.contains(&stand_in);
         if covered {
             commands.entity(stand_in).try_despawn();
             continue;
         }
+        stats.live_holds += 1;
         if hold.held_frames != MAX_SWAP_HOLD_FRAMES {
             continue;
         }
@@ -663,6 +892,7 @@ fn record_swap_gauges(
     stats: Res<SwapBridgeStats>,
     mut profiler: ResMut<ProfilingState>,
 ) {
+    profiler.set_gauge("swap/live_holds", stats.live_holds as f64);
     profiler.set_gauge("swap/waiting", waiting.iter().count() as f64);
     profiler.set_gauge("swap/prepared_not_drawn", prepared.iter().count() as f64);
     profiler.set_gauge("swap/drawn_this_frame", f64::from(stats.drawn_this_frame));
@@ -681,10 +911,14 @@ pub struct SwapBridgePlugin;
 
 impl Plugin for SwapBridgePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<SwapBridgeStats>().add_systems(
-            Update,
-            (complete_drawn_swaps, release_detail_change_stand_ins),
-        );
+        app.init_resource::<SwapBridgeStats>()
+            .add_systems(
+                Update,
+                (rollback_failed_detail_changes, complete_drawn_swaps).chain(),
+            )
+            // Current-frame camera/light culling finishes in PostUpdate. A historical render
+            // observation alone cannot authorize retirement after the camera moves.
+            .add_systems(Last, release_detail_change_stand_ins);
         // The destination readiness protocol (`destination`): idle until a consumer requests.
         app.add_plugins(systems::DestinationReadinessPlugin);
         // The gauges are measurement data: an ordinary play session installs none of them.
@@ -693,7 +927,10 @@ impl Plugin for SwapBridgePlugin {
             .get_resource::<EngineConfig>()
             .is_some_and(|config| config.profile_output_dir.is_some());
         if profiling {
-            app.add_systems(Update, record_swap_gauges);
+            app.add_systems(
+                Last,
+                record_swap_gauges.after(release_detail_change_stand_ins),
+            );
         }
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app.add_systems(ExtractSchedule, swap_bridge);
@@ -704,6 +941,21 @@ impl Plugin for SwapBridgePlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shader_loading_errors_do_not_abort_a_replacement() {
+        use bevy::shader::ShaderCacheError;
+        assert!(!terminal_pipeline_failure(&CachedPipelineState::Queued));
+        assert!(!terminal_pipeline_failure(&CachedPipelineState::Err(
+            ShaderCacheError::ShaderNotLoaded(Handle::<Shader>::default().id()),
+        )));
+        assert!(!terminal_pipeline_failure(&CachedPipelineState::Err(
+            ShaderCacheError::ShaderImportNotYetAvailable,
+        )));
+        assert!(terminal_pipeline_failure(&CachedPipelineState::Err(
+            ShaderCacheError::CreateShaderModule("invalid shader module".into()),
+        )));
+    }
 
     fn surface(images: &[AssetId<Image>]) -> SwapSurface {
         SwapSurface::new(
@@ -911,6 +1163,47 @@ mod tests {
         app
     }
 
+    #[test]
+    fn requested_coverage_observes_only_its_subtree_without_owning_a_stand_in() {
+        let mut app = stand_in_app();
+        let root = app.world_mut().spawn(SwapCoverageRoot).id();
+        let child = app.world_mut().spawn(ChildOf(root)).id();
+        let ordinary = app.world_mut().spawn_empty().id();
+        for _ in 0..128 {
+            app.world_mut().spawn(ChildOf(ordinary));
+        }
+        let mut entity_visits = 0;
+        let observed = observe_coverage_roots(app.world_mut(), |entity| {
+            entity_visits += 1;
+            entity == MainEntity::from(child)
+        });
+        assert_eq!(observed, 1);
+        assert_eq!(entity_visits, 2);
+        assert!(app.world().get::<SwapCoverageInCameraView>(root).unwrap().0);
+        assert!(
+            app.world()
+                .get::<SwapCoverageInCameraView>(ordinary)
+                .is_none()
+        );
+        assert!(app.world().get::<SwapStandIn>(root).is_none());
+        assert_eq!(observe_coverage_roots(app.world_mut(), |_| false), 1);
+        assert!(!app.world().get::<SwapCoverageInCameraView>(root).unwrap().0);
+        app.update();
+        assert!(
+            alive(&app, root),
+            "a request does not transfer lifecycle ownership"
+        );
+        assert!(alive(&app, child));
+        assert_eq!(app.world().resource::<SwapBridgeStats>().live_holds, 0);
+        app.world_mut()
+            .entity_mut(root)
+            .remove::<(SwapCoverageRoot, SwapCoverageInCameraView)>();
+        assert_eq!(
+            observe_coverage_roots(app.world_mut(), |_| panic!("no roots requested")),
+            0
+        );
+    }
+
     /// The shape a detail-change commit leaves behind: a new root whose four terrain patches all
     /// wait and name `stand_in`, and the stand-in's own four quadrants. Returns the new root, its
     /// patches and the stand-in's quadrants. The patches are born revealed and in view but not
@@ -923,7 +1216,9 @@ mod tests {
                     .spawn((
                         surface(&[]).with_stand_in(stand_in),
                         SwapWaiting,
+                        Mesh3d(Handle::default()),
                         Visibility::Inherited,
+                        ViewVisibility::HIDDEN,
                         SwapInCameraView,
                         ChildOf(new_root),
                     ))
@@ -931,7 +1226,15 @@ mod tests {
             })
             .collect();
         let quadrants = (0..4)
-            .map(|_| app.world_mut().spawn(ChildOf(stand_in)).id())
+            .map(|_| {
+                app.world_mut()
+                    .spawn((
+                        ChildOf(stand_in),
+                        Mesh3d(Handle::default()),
+                        ViewVisibility::HIDDEN,
+                    ))
+                    .id()
+            })
             .collect();
         (new_root, patches, quadrants)
     }
@@ -1036,6 +1339,197 @@ mod tests {
         assert!(!alive(&app, stand_in));
     }
 
+    #[test]
+    fn ready_unviewed_replacement_releases_hold_and_settles_live_gauge() {
+        let mut app = stand_in_app();
+        let stand_in = app
+            .world_mut()
+            .spawn((SwapStandIn::default(), SwapCoverageInCameraView(false)))
+            .id();
+        let (_, patches, _) = detail_change(&mut app, stand_in);
+        for patch in patches {
+            set_visibility(&mut app, patch, Visibility::Inherited, false);
+            app.world_mut().entity_mut(patch).insert(SwapPrepared {
+                stand_in: Some(stand_in),
+                since: 1,
+            });
+        }
+        app.update();
+        assert!(!alive(&app, stand_in));
+        assert_eq!(app.world().resource::<SwapBridgeStats>().live_holds, 0);
+    }
+
+    #[test]
+    fn current_visibility_after_camera_turn_overrules_previous_offscreen_observation() {
+        let mut app = stand_in_app();
+        let old = app
+            .world_mut()
+            .spawn((SwapStandIn::default(), SwapCoverageInCameraView(false)))
+            .id();
+        let (_, patches, quadrants) = detail_change(&mut app, old);
+        for &patch in &patches {
+            set_visibility(&mut app, patch, Visibility::Inherited, false);
+            app.world_mut().entity_mut(patch).insert(SwapPrepared {
+                stand_in: Some(old),
+                since: 1,
+            });
+        }
+        let entering_view = quadrants[0];
+        app.add_systems(
+            PostUpdate,
+            move |mut visibility: Query<&mut ViewVisibility>| {
+                if let Ok(mut visible) = visibility.get_mut(entering_view) {
+                    *visible = ViewVisibility::VISIBLE;
+                }
+            },
+        );
+        app.update();
+        assert!(
+            alive(&app, old),
+            "Last must read this frame's culling after the camera turns"
+        );
+        assert_eq!(app.world().resource::<SwapBridgeStats>().live_holds, 1);
+        for patch in patches {
+            app.world_mut().entity_mut(patch).insert(SwapDrawn);
+        }
+        app.update();
+        assert!(
+            !alive(&app, old),
+            "actual replacement draw still authorizes release"
+        );
+    }
+
+    #[test]
+    fn unknown_current_cover_or_replacement_visibility_never_retires_coverage() {
+        for unknown_cover in [true, false] {
+            let mut app = stand_in_app();
+            let old = app
+                .world_mut()
+                .spawn((SwapStandIn::default(), SwapCoverageInCameraView(false)))
+                .id();
+            let (_, patches, quadrants) = detail_change(&mut app, old);
+            for &patch in &patches {
+                set_visibility(&mut app, patch, Visibility::Inherited, false);
+                app.world_mut().entity_mut(patch).insert(SwapPrepared {
+                    stand_in: Some(old),
+                    since: 1,
+                });
+            }
+            let unknown = if unknown_cover {
+                quadrants[0]
+            } else {
+                patches[0]
+            };
+            app.world_mut()
+                .entity_mut(unknown)
+                .remove::<ViewVisibility>();
+            app.update();
+            assert!(alive(&app, old));
+            assert_eq!(app.world().resource::<SwapBridgeStats>().live_holds, 1);
+        }
+    }
+
+    #[test]
+    fn visible_stand_in_keeps_prepared_unviewed_replacement_covered() {
+        let mut app = stand_in_app();
+        let stand_in = app
+            .world_mut()
+            .spawn((SwapStandIn::default(), SwapCoverageInCameraView(true)))
+            .id();
+        let (_, patches, _) = detail_change(&mut app, stand_in);
+        for patch in patches {
+            set_visibility(&mut app, patch, Visibility::Inherited, false);
+            app.world_mut().entity_mut(patch).insert(SwapPrepared {
+                stand_in: Some(stand_in),
+                since: 1,
+            });
+        }
+        app.update();
+        assert!(alive(&app, stand_in));
+        assert_eq!(app.world().resource::<SwapBridgeStats>().live_holds, 1);
+    }
+
+    #[test]
+    fn failed_intermediate_stand_in_transfers_visible_coverage_without_changing_resident_root() {
+        use crate::{
+            streaming::StreamingWorld,
+            world::{components::StreamedCellRoot, database::CellKey},
+        };
+        let mut app = stand_in_app();
+        app.init_resource::<StreamingWorld>();
+        let old = app
+            .world_mut()
+            .spawn((SwapStandIn::default(), SwapCoverageInCameraView(true)))
+            .id();
+        let (intermediate, failed_patches, old_quadrants) = detail_change(&mut app, old);
+        app.world_mut()
+            .entity_mut(intermediate)
+            .insert((SwapStandIn::default(), SwapCoverageInCameraView(false)));
+        app.world_mut()
+            .entity_mut(failed_patches[0])
+            .insert(crate::streaming::AssetFailed);
+        let (current, current_patches, _) = detail_change(&mut app, intermediate);
+        app.world_mut().entity_mut(current).insert(StreamedCellRoot);
+        let key = CellKey::Interior(1);
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_resident_for_test(key, current);
+        for &patch in &current_patches {
+            set_visibility(&mut app, patch, Visibility::Inherited, false);
+            app.world_mut().entity_mut(patch).insert(SwapPrepared {
+                stand_in: Some(intermediate),
+                since: 1,
+            });
+        }
+        app.update();
+        assert!(!alive(&app, intermediate));
+        assert!(
+            alive(&app, old),
+            "the visible valid cover cannot yield to an undrawn replacement"
+        );
+        assert!(old_quadrants.iter().all(|&entity| alive(&app, entity)));
+        assert_eq!(
+            app.world().resource::<StreamingWorld>().resident_root(key),
+            Some(current)
+        );
+        assert_eq!(app.world().resource::<SwapBridgeStats>().live_holds, 1);
+        for &patch in &current_patches {
+            assert_eq!(
+                app.world().get::<SwapSurface>(patch).unwrap().stand_in(),
+                Some(old)
+            );
+            assert_eq!(
+                app.world().get::<SwapPrepared>(patch).unwrap().stand_in,
+                Some(old)
+            );
+            app.world_mut().entity_mut(patch).insert(SwapDrawn);
+        }
+        app.update();
+        assert!(!alive(&app, old));
+        assert!(alive(&app, current));
+        assert_eq!(
+            app.world().resource::<StreamingWorld>().resident_root(key),
+            Some(current)
+        );
+        assert_eq!(app.world().resource::<SwapBridgeStats>().live_holds, 0);
+    }
+
+    #[test]
+    fn unviewed_unprepared_replacement_keeps_hold() {
+        let mut app = stand_in_app();
+        let stand_in = app
+            .world_mut()
+            .spawn((SwapStandIn::default(), SwapCoverageInCameraView(false)))
+            .id();
+        let (_, patches, _) = detail_change(&mut app, stand_in);
+        for patch in patches {
+            set_visibility(&mut app, patch, Visibility::Inherited, false);
+        }
+        app.update();
+        assert!(alive(&app, stand_in));
+        assert_eq!(app.world().resource::<SwapBridgeStats>().live_holds, 1);
+    }
+
     /// Slow preparation must never punch a hole in visible terrain.
     #[test]
     fn a_slow_replacement_keeps_coverage_until_every_surface_draws() {
@@ -1086,6 +1580,7 @@ mod tests {
 
         app.world_mut().entity_mut(new_root).despawn();
         app.update();
+        assert_eq!(app.world().resource::<SwapBridgeStats>().live_holds, 0);
 
         assert!(
             !alive(&app, stand_in),
