@@ -2380,7 +2380,7 @@ fn setup_world(
     let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
     let camera_offset = if config.interactive_world_physics() {
         let tuning = tuning.as_deref().cloned().unwrap_or_default();
-        Vec3::Y * (tuning.eye_height + tuning.capsule_standing_height * 0.5 + 16.0)
+        crate::physics::player_start_camera(&tuning, Vec3::ZERO)
     } else {
         camera_offset(&config)
     };
@@ -2398,6 +2398,20 @@ fn setup_world(
     } else {
         Transform::from_translation(camera_position).looking_at(target, Vec3::Y)
     };
+    if let Some(position) = config.start_position {
+        let feet = crate::shots::shot_camera_translation(
+            position,
+            IVec2::new(config.start_grid.0, config.start_grid.1),
+        );
+        let tuning = tuning.as_deref().cloned().unwrap_or_default();
+        camera_transform.translation = if config.interactive_world_physics() {
+            crate::physics::player_start_camera(&tuning, feet)
+        } else {
+            feet + Vec3::Y * tuning.eye_height
+        };
+        camera_transform.rotation =
+            crate::streaming::creation_rotation_to_bevy([0.0, 0.0, config.start_yaw]);
+    }
     let mut perspective = PerspectiveProjection { far, ..default() };
     if let Some(pose) = start_camera {
         camera_transform.translation = crate::shots::shot_camera_translation(
@@ -2466,7 +2480,7 @@ fn setup_world(
         assets = %config.assets_dir.display(),
         worldspace = format_args!("{:08X}", config.worldspace_id),
         ground_height,
-        camera = ?camera_position,
+        camera = ?camera_transform.translation,
         target = ?target,
         "Mudcrab runtime initialized"
     );
@@ -2493,15 +2507,15 @@ fn initial_walk_ground_height(
     cache: &CellCache,
     shot: Option<&crate::shots::Shot>,
 ) -> Result<Option<f32>> {
-    let sample_position = shot.map_or_else(
-        || {
+    let sample_position = shot
+        .map(|shot| Vec2::new(shot.position[0], shot.position[1]))
+        .or_else(|| config.start_position.map(|p| Vec2::new(p[0], p[1])))
+        .unwrap_or_else(|| {
             Vec2::new(
                 (config.start_grid.0 as f32 + 0.5) * crate::world::components::CELL_SIZE,
                 (config.start_grid.1 as f32 + 0.5) * crate::world::components::CELL_SIZE,
             )
-        },
-        |shot| Vec2::new(shot.position[0], shot.position[1]),
-    );
+        });
     if !sample_position.is_finite()
         || (sample_position.x / crate::world::components::CELL_SIZE).floor() as i32
             != config.start_grid.0
@@ -5061,7 +5075,7 @@ mod tests {
     }
 
     #[test]
-    fn walk_spawn_ground_query_interpolates_at_authored_shot_xy() {
+    fn walk_spawn_ground_query_respects_shot_authored_start_and_cell_centre_precedence() {
         let database_directory = tempfile::tempdir().unwrap();
         let database_path = database_directory.path().join("skyrim_world.db");
         let connection = Connection::open(&database_path).unwrap();
@@ -5078,7 +5092,7 @@ mod tests {
         let cache_directory = tempfile::tempdir().unwrap();
         let cache_path = cache_directory.path().join("cell_cache.rkyv");
         let heights = (0..33)
-            .flat_map(|y| (0..33).map(move |x| (x + y) as f32))
+            .flat_map(|y| (0..33).map(move |x| (x + 2 * y) as f32))
             .collect();
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&shared::CellCache {
             version: shared::CELL_CACHE_VERSION,
@@ -5120,7 +5134,47 @@ mod tests {
 
         assert_eq!(
             initial_walk_ground_height(&config, &database_path, &cache, Some(&shot)).unwrap(),
-            Some(32.0)
+            Some(56.0)
+        );
+        // The asymmetric slope distinguishes the shot (56), authored start (40), and centre (48).
+        assert_eq!(
+            initial_walk_ground_height(&config, &database_path, &cache, None).unwrap(),
+            Some(48.0)
+        );
+        let mut config = EngineConfig {
+            start_position: Some([
+                crate::world::components::CELL_SIZE * 0.75,
+                crate::world::components::CELL_SIZE * 0.25,
+                -500.0,
+            ]),
+            ..config
+        };
+        assert_eq!(
+            initial_walk_ground_height(&config, &database_path, &cache, None).unwrap(),
+            Some(40.0)
+        );
+        assert_eq!(
+            initial_walk_ground_height(&config, &database_path, &cache, Some(&shot)).unwrap(),
+            Some(56.0)
+        );
+        // A configured point is validated, not silently replaced by the cell centre.
+        for position in [[f32::NAN, 0.0, 0.0], [-1.0, 0.0, 0.0]] {
+            config.start_position = Some(position);
+            assert_eq!(
+                initial_walk_ground_height(&config, &database_path, &cache, None).unwrap(),
+                None
+            );
+        }
+        // The shot still wins even when the lower-priority authored point is invalid.
+        assert_eq!(
+            initial_walk_ground_height(&config, &database_path, &cache, Some(&shot)).unwrap(),
+            Some(56.0)
+        );
+        config.start_position = None;
+        config.worldspace_id = 8;
+        assert_eq!(
+            initial_walk_ground_height(&config, &database_path, &cache, None).unwrap(),
+            None
         );
     }
 

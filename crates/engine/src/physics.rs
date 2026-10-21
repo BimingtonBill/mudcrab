@@ -876,6 +876,25 @@ fn validate_physics_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_camera_keeps_capsule_bottom_above_authored_feet_for_custom_tuning() {
+        for (radius, height, eye) in [(28.0, 100.8, 89.6), (19.0, 136.0, 70.0)] {
+            let tuning = MovementTuning {
+                capsule_radius: radius,
+                capsule_standing_height: height,
+                eye_height: eye,
+                ..default()
+            };
+            let feet = Vec3::new(17.0, -153.0, -29.0);
+            let camera = player_start_camera(&tuning, feet);
+            let body = camera - Vec3::Y * tuning.eye_height;
+            let capsule = Collider::capsule_y(tuning.capsule_half_height(), tuning.capsule_radius);
+            let bounds = capsule.raw.compute_local_aabb();
+            assert!((body.y + bounds.mins.y - feet.y - PLAYER_SPAWN_CLEARANCE).abs() < 0.001);
+            assert_eq!(camera.xz(), feet.xz());
+        }
+    }
+
     use bevy::ecs::system::RunSystemOnce;
 
     #[test]
@@ -1898,6 +1917,14 @@ pub struct TeleportPlayer {
 /// How far the body's origin (the capsule centre) sits above the feet.
 pub fn body_height_above_feet(tuning: &MovementTuning) -> f32 {
     tuning.capsule_half_height() + tuning.capsule_radius
+}
+
+/// Existing manual-start clearance, shared by default and authored foot starts.
+pub const PLAYER_SPAWN_CLEARANCE: f32 = 16.0;
+
+/// Convert a startup foot position using the same capsule geometry as teleports.
+pub fn player_start_camera(tuning: &MovementTuning, feet: Vec3) -> Vec3 {
+    body_and_camera_for_feet(tuning, feet + Vec3::Y * PLAYER_SPAWN_CLEARANCE).1
 }
 
 /// Where the body goes and where the camera goes for feet at `feet`, in the feet's space.

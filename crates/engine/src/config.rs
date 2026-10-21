@@ -84,6 +84,10 @@ pub struct EngineConfig {
     pub bug_report_dir: Option<PathBuf>,
     pub worldspace_id: u32,
     pub start_grid: (i32, i32),
+    /// Authored feet in Creation units; shot camera framing takes precedence.
+    pub start_position: Option<[f32; 3]>,
+    /// Authored heading in Creation radians about Z.
+    pub start_yaw: f32,
     pub stream_radius: i32,
     pub unload_radius: i32,
     /// Optional upper bound for sun-shadow cascades from `[Display] fShadowDistance`.
@@ -396,6 +400,8 @@ impl Default for EngineConfig {
             bug_report_dir: None,
             worldspace_id: 0x3c,
             start_grid: (0, 0),
+            start_position: None,
+            start_yaw: 0.0,
             // Skyrim's default `uGridsToLoad=5`.
             stream_radius: 2,
             unload_radius: 3,
@@ -539,6 +545,8 @@ Assets and start position:
   --worldspace <id>                     worldspace form id, decimal or 0x-hex (default: 0x3c)
   --grid-x <cell>                       starting cell x (default: 0)
   --grid-y <cell>                       starting cell y (default: 0)
+  --start-position <x> <y> <z>         authored feet in Creation units
+  --start-yaw <radians>                authored start heading
   --start-shot <file>                  start the live camera at one exterior shot pose
   --stdin-console                     accept developer console commands on stdin
   --no-render-diagnostics             disable GPU timing and pipeline-statistics queries
@@ -1549,6 +1557,43 @@ impl EngineConfig {
                 "--shots" => {
                     config.shots = Some(take_value("--shots", "a shots file path", args.next())?);
                 }
+                "--start-position" => {
+                    let mut position = [0.0f32; 3];
+                    for slot in &mut position {
+                        let raw =
+                            take_raw("--start-position", "three finite coordinates", args.next())?;
+                        *slot = raw
+                            .parse::<f32>()
+                            .ok()
+                            .filter(|v| v.is_finite())
+                            .ok_or_else(|| {
+                                ConfigError::invalid_value(
+                                    "--start-position",
+                                    Some(raw),
+                                    "three finite coordinates",
+                                )
+                            })?;
+                    }
+                    config.start_position = Some(position);
+                    config.start_grid = (
+                        (position[0] / CELL_SIZE).floor() as i32,
+                        (position[1] / CELL_SIZE).floor() as i32,
+                    );
+                }
+                "--start-yaw" => {
+                    let raw = take_raw("--start-yaw", "a finite heading in radians", args.next())?;
+                    config.start_yaw = raw
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .ok_or_else(|| {
+                            ConfigError::invalid_value(
+                                "--start-yaw",
+                                Some(raw),
+                                "a finite heading in radians",
+                            )
+                        })?;
+                }
                 "--start-shot" => {
                     config.start_shot = Some(take_value(
                         "--start-shot",
@@ -2323,6 +2368,28 @@ mod tests {
 
     fn run_config(arguments: &[&str]) -> EngineConfig {
         EngineConfig::run_from_args(arguments.iter().map(|argument| (*argument).to_owned()))
+    }
+
+    #[test]
+    fn authored_start_parses_finite_feet_and_heading() {
+        let config = EngineConfig::run_from_args(
+            [
+                "--start-position",
+                "-100",
+                "8200",
+                "5",
+                "--start-yaw",
+                "1.5",
+            ]
+            .map(String::from),
+        );
+        assert_eq!(config.start_position, Some([-100.0, 8200.0, 5.0]));
+        assert_eq!(config.start_grid, (-1, 2));
+        assert_eq!(config.start_yaw, 1.5);
+        assert!(
+            EngineConfig::from_args(["--start-position", "NaN", "0", "0"].map(String::from))
+                .is_err()
+        );
     }
 
     #[test]
