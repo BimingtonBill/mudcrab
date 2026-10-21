@@ -565,7 +565,6 @@ fn spawn_render_mesh(
     bounds: Option<Aabb>,
 ) -> Entity {
     let mut entity = commands.spawn((
-        NoAutoAabb,
         Mesh3d(mesh),
         MeshMaterial3d(state.material.clone()),
         crate::swap_bridge::SwapSurface::new(state.material.id().untyped(), []),
@@ -574,8 +573,11 @@ fn spawn_render_mesh(
         visibility,
         ChildOf(root),
     ));
+    // Opting out of automatic bounds is only valid together with explicit bounds: a hidden
+    // empty selection has none yet, so Bevy keeps computing them until activation supplies the
+    // exact selected box.
     if let Some(bounds) = bounds {
-        entity.insert(bounds);
+        entity.insert((NoAutoAabb, bounds));
     }
     if let Some(layers) = state.layers.clone() {
         entity.insert(layers);
@@ -1170,6 +1172,7 @@ fn activate_uploaded_batch(
     if let Some(bounds) = bounds {
         commands.entity(batch.entity).insert((
             Mesh3d(batch.mesh.clone()),
+            NoAutoAabb,
             bounds,
             Visibility::Inherited,
         ));
@@ -2077,6 +2080,8 @@ mod tests {
             .visibility_dirty = true;
         app.update();
         let revision = app.world().resource::<LodStreaming>().visibility_revision;
+        // The changed mask is covered by exact temporary source copies until its upload
+        // completes, then stock transfer releases them (cluster ownership is not configured).
         assert_eq!(
             app.world()
                 .get::<LodTerrainBatches>(fixture.root)
@@ -2084,7 +2089,7 @@ mod tests {
                 .batches[0]
                 .fallback_entities
                 .len(),
-            0
+            3
         );
         acknowledge_uploads_and_draws(&mut app, fixture.root);
         app.update();
@@ -2100,7 +2105,7 @@ mod tests {
                 .batches[0]
                 .fallback_entities
                 .len(),
-            3
+            0
         );
         assert_eq!(
             app.world()
@@ -2861,6 +2866,44 @@ mod tests {
                 .get(&second_mesh)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn hidden_empty_selection_never_opts_out_of_bounds_without_a_box() {
+        let mut app = test_app();
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        let mut prepared = prepare(&mut app, &fixture).unwrap();
+        prepared[0].selected = 0;
+        install_fixture(&mut app, &fixture, prepared);
+        let (entity, mesh) = {
+            let batches = app.world().get::<LodTerrainBatches>(fixture.root).unwrap();
+            (batches.batches[0].entity, batches.batches[0].mesh.clone())
+        };
+        let unbounded = |app: &mut App| {
+            let world = app.world_mut();
+            world
+                .query_filtered::<Entity, (With<Mesh3d>, With<NoAutoAabb>, Without<Aabb>)>()
+                .iter(world)
+                .count()
+        };
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).unwrap(),
+            Visibility::Hidden
+        );
+        assert!(app.world().get::<NoAutoAabb>(entity).is_none());
+        assert_eq!(unbounded(&mut app), 0);
+        // A later nonempty selection takes the exact box and only then opts out.
+        app.world_mut()
+            .run_system_once(|mut batches: LodBatchVisibility| {
+                batches.update(&HashMap::from([((IVec2::ZERO, 0), Some(LodTier::Tier4))]));
+            })
+            .unwrap();
+        acknowledge_uploads_and_draws(&mut app, fixture.root);
+        assert!(finalize_initial(&mut app));
+        let _ = mesh;
+        assert!(app.world().get::<NoAutoAabb>(entity).is_some());
+        assert!(app.world().get::<Aabb>(entity).is_some());
+        assert_eq!(unbounded(&mut app), 0);
     }
 
     #[test]
