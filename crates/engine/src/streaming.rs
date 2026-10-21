@@ -300,6 +300,7 @@ impl Plugin for StreamingPlugin {
                         .chain(),
                     (
                         apply_effect_palettes,
+                        enable_non_portal_terrain_colliders,
                         track_surface_readiness,
                         track_merged_surface_readiness,
                         lod::track_lod_readiness,
@@ -950,6 +951,9 @@ pub struct StreamingMetrics {
     /// itself never stitches.
     pub terrain_edges_left_as_authored: u64,
     pub terrain_validation_failures: u64,
+    /// Failed authored normal bindings rendered with the stock geometric-normal behavior.
+    /// These do not disable collision or fail an otherwise valid terrain surface.
+    pub terrain_normal_map_failures: u64,
     /// Fixed placements represented by NIF-authored Havok shapes.
     pub static_colliders_authored: u64,
     /// Authored colliders that also contain shape families this extractor could not decode.
@@ -4433,8 +4437,8 @@ struct PendingTerrainProfile {
     cell_id: u32,
     quadrant: u8,
     images: Vec<Handle<Image>>,
-    /// Authored normal maps are required dependencies when declared. Their failure refuses
-    /// the surface through the same recorded AssetFailed path as diffuse-map failure.
+    /// Authored normal maps wait for loading, but a reported failure removes the failed
+    /// binding and uses the geometric normal, matching stock terrain rendering.
     normals: Vec<Handle<Image>>,
 }
 
@@ -5696,11 +5700,10 @@ fn weld_merged_cell(
     Ok(())
 }
 
-/// Makes a spawned merged terrain mesh visible and its collider live. Its arrays were validated
-/// before any cell was committed, so there is nothing left to wait for.
+/// Makes a spawned merged terrain mesh visible. Collision has its independent space gate.
+/// Its arrays were validated before any cell was committed, so there is nothing left to wait for.
 fn track_merged_surface_readiness(
     mut commands: Commands,
-    config: Res<EngineConfig>,
     pending: Query<Entity, With<PendingMergedTerrain>>,
     mut lod_streaming: ResMut<lod::LodStreaming>,
     mut metrics: ResMut<StreamingMetrics>,
@@ -5713,20 +5716,43 @@ fn track_merged_surface_readiness(
             .entity(entity)
             .insert((Visibility::Inherited, TerrainSurfaceReady))
             .remove::<PendingMergedTerrain>();
-        if !config.seamless_doors() {
-            commands.entity(entity).try_remove::<ColliderDisabled>();
-        }
         lod_streaming.visibility_dirty = true;
     }
 }
 
+/// Collision depends on validated geometry and active space, never on material assets.
+/// Seamless runs retain the portal space gate as their sole collision authority.
+fn enable_non_portal_terrain_colliders(
+    mut commands: Commands,
+    config: Res<EngineConfig>,
+    colliders: Query<Entity, (With<TerrainCollider>, With<ColliderDisabled>)>,
+) {
+    if config.seamless_doors() {
+        return;
+    }
+    for entity in &colliders {
+        commands.entity(entity).try_remove::<ColliderDisabled>();
+    }
+}
+
+type PendingTerrainSurfaces<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut PendingTerrainProfile,
+        Option<&'static MeshMaterial3d<TerrainMaterial>>,
+        Option<&'static mut SwapSurface>,
+    ),
+>;
+
 #[allow(clippy::too_many_arguments)]
 fn track_surface_readiness(
     mut commands: Commands,
-    config: Res<EngineConfig>,
     asset_server: Res<AssetServer>,
     images: Res<Assets<Image>>,
-    terrain: Query<(Entity, &PendingTerrainProfile)>,
+    mut terrain: PendingTerrainSurfaces,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
     water: Query<(Entity, &PendingWaterProfile)>,
     mut lod_streaming: ResMut<lod::LodStreaming>,
     mut metrics: ResMut<StreamingMetrics>,
@@ -5734,7 +5760,43 @@ fn track_surface_readiness(
 ) {
     metrics.pending_surface_instances = terrain.iter().count() + water.iter().count();
     let mut completed = 0usize;
-    for (entity, pending) in &terrain {
+    for (entity, mut pending, material, mut surface) in &mut terrain {
+        let mut failed_normals = Vec::new();
+        for normal in &pending.normals {
+            if let SurfaceDependencyState::Failed(reason) = validate_surface_dependencies(
+                &asset_server,
+                &images,
+                std::slice::from_ref(normal),
+                SurfaceImageKind::TerrainNormal,
+            ) {
+                failed_normals.push((normal.id(), reason));
+            }
+        }
+        if !failed_normals.is_empty() {
+            failed_normals.sort_by_key(|(id, _)| *id);
+            failed_normals.dedup_by_key(|(id, _)| *id);
+            // A material must be updated before readiness can discharge its old bindings.
+            // Otherwise the render bridge would still wait for the failed GPU images.
+            let Some(mut material) = material.and_then(|handle| materials.get_mut(&handle.0))
+            else {
+                continue;
+            };
+            for (id, reason) in &failed_normals {
+                material.extension.remove_normal(*id);
+                pending.normals.retain(|normal| normal.id() != *id);
+                metrics.terrain_normal_map_failures =
+                    metrics.terrain_normal_map_failures.saturating_add(1);
+                profiler.increment("terrain/normal_map_failures", 1);
+                let path = asset_server
+                    .get_path(*id)
+                    .map_or_else(|| format!("{id:?}"), |path| path.to_string());
+                error!(asset = %path, cell = pending.cell_id, quadrant = pending.quadrant,
+                    %reason, "terrain normal map failed; using geometric normal");
+            }
+            if let Some(surface) = surface.as_deref_mut() {
+                surface.set_images(material.extension.image_ids());
+            }
+        }
         let state = terrain_dependency_state(
             validate_surface_dependencies(
                 &asset_server,
@@ -5769,9 +5831,6 @@ fn track_surface_readiness(
                 commands
                     .entity(entity)
                     .try_remove::<PendingTerrainProfile>();
-                if !config.seamless_doors() {
-                    commands.entity(entity).try_remove::<ColliderDisabled>();
-                }
                 completed += 1;
             }
             SurfaceDependencyState::Failed(reason) => {
@@ -5880,7 +5939,7 @@ enum SurfaceDependencyState {
     Failed(String),
 }
 
-/// Undeclared normals require no assets; declared normals must validate without substitution.
+/// Failed normal bindings are reported and removed before this readiness decision.
 fn terrain_dependency_state(
     diffuse: SurfaceDependencyState,
     normals: impl FnOnce() -> SurfaceDependencyState,
@@ -8223,10 +8282,53 @@ mod tests {
     use bevy::asset::{AssetApp, AssetPlugin};
     use bevy::ecs::system::SystemState;
 
+    #[test]
+    fn terrain_collision_keeps_the_portal_space_gate_as_its_authority() {
+        let mut config = EngineConfig::default();
+        config.portal.load_doors = crate::config::LoadDoors::Seamless;
+        let mut app = App::new();
+        app.insert_resource(config)
+            .add_systems(Update, enable_non_portal_terrain_colliders);
+        let entity = app
+            .world_mut()
+            .spawn((TerrainCollider, ColliderDisabled))
+            .id();
+        app.update();
+        assert!(app.world().get::<ColliderDisabled>(entity).is_some());
+    }
+
+    #[test]
+    fn terrain_collision_is_live_while_surface_assets_are_pending() {
+        let mut app = App::new();
+        app.init_resource::<EngineConfig>()
+            .add_systems(Update, enable_non_portal_terrain_colliders);
+        let entity = app
+            .world_mut()
+            .spawn((
+                TerrainCollider,
+                ColliderDisabled,
+                Visibility::Hidden,
+                PendingTerrainProfile {
+                    cell_id: 7,
+                    quadrant: 0,
+                    images: vec![],
+                    normals: vec![],
+                },
+            ))
+            .id();
+        app.update();
+        assert!(app.world().get::<ColliderDisabled>(entity).is_none());
+        assert!(app.world().get::<PendingTerrainProfile>(entity).is_some());
+        assert_eq!(
+            app.world().get::<Visibility>(entity),
+            Some(&Visibility::Hidden)
+        );
+    }
+
     /// Exercise the real readiness system. AssetServer::add queues a procedural image
     /// synchronously, so no filesystem, loader sleep or private fixture is involved.
     #[test]
-    fn invalid_authored_normal_records_failure_instead_of_revealing_the_surface() {
+    fn invalid_authored_normal_preserves_collision_and_reveals_the_surface() {
         use bevy::asset::RenderAssetUsages;
         use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
         let mut app = App::new();
@@ -8237,7 +8339,10 @@ mod tests {
             .init_resource::<lod::LodStreaming>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
-            .add_systems(Update, track_surface_readiness);
+            .add_systems(
+                Update,
+                (enable_non_portal_terrain_colliders, track_surface_readiness).chain(),
+            );
         // sRGB is invalid for a declared linear terrain normal, even when fully loaded.
         let image = Image::new_fill(
             Extent3d {
@@ -8250,6 +8355,10 @@ mod tests {
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::default(),
         );
+        let mut valid_image = image.clone();
+        valid_image.texture_descriptor.format = TextureFormat::Rgba8Unorm;
+        valid_image.sampler = ImageSampler::Descriptor(crate::render::terrain_layer_sampler());
+        let valid = app.world().resource::<AssetServer>().add(valid_image);
         let normal = app.world().resource::<AssetServer>().add(image);
         app.update();
         assert!(
@@ -8257,51 +8366,76 @@ mod tests {
                 .resource::<AssetServer>()
                 .is_loaded_with_dependencies(normal.id())
         );
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<TerrainMaterial>>()
+            .add(TerrainMaterial {
+                base: StandardMaterial::default(),
+                extension: TerrainExtension::default().with_test_normals([
+                    Some(normal.clone()),
+                    Some(valid.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                ]),
+            });
         let entity = app
             .world_mut()
             .spawn((
+                TerrainCollider,
+                ColliderDisabled,
+                MeshMaterial3d(material.clone()),
                 PendingTerrainProfile {
                     cell_id: 7,
                     quadrant: 2,
                     images: vec![],
-                    normals: vec![normal.clone()],
+                    normals: vec![normal.clone(), valid.clone()],
                 },
                 Visibility::Hidden,
-                SwapSurface::new(
-                    Handle::<TerrainMaterial>::default().id().untyped(),
-                    [normal.id()],
-                ),
+                SwapSurface::new(material.id().untyped(), [normal.id(), valid.id()]),
                 SwapWaiting,
             ))
             .id();
         app.update();
-        assert!(app.world().get::<AssetFailed>(entity).is_some());
+        assert!(app.world().get::<AssetFailed>(entity).is_none());
+        assert!(app.world().get::<ColliderDisabled>(entity).is_none());
         assert_eq!(
             app.world().get::<Visibility>(entity),
-            Some(&Visibility::Hidden)
+            Some(&Visibility::Inherited)
         );
-        assert!(app.world().get::<TerrainSurfaceReady>(entity).is_none());
+        assert!(app.world().get::<TerrainSurfaceReady>(entity).is_some());
+        assert!(app.world().get::<PendingTerrainProfile>(entity).is_none());
         assert!(app.world().get::<SwapWaiting>(entity).is_some());
+        let bindings: Vec<_> = app
+            .world()
+            .resource::<Assets<TerrainMaterial>>()
+            .get(&material)
+            .unwrap()
+            .extension
+            .image_ids()
+            .collect();
+        assert!(!bindings.contains(&normal.id()));
+        assert!(bindings.contains(&valid.id()));
+        let declaration = app.world().get::<SwapSurface>(entity).unwrap().image_ids();
+        assert!(!declaration.contains(&normal.id()));
+        assert!(declaration.contains(&valid.id()));
         let metrics = app.world().resource::<StreamingMetrics>();
-        assert_eq!(metrics.terrain_validation_failures, 1);
-        assert_eq!(metrics.terrain_patches_validated, 0);
-        assert!(
-            metrics.asset_failures[0]
-                .dependency_chain
-                .iter()
-                .any(|reason| reason.contains("wrong color space"))
-        );
+        assert_eq!(metrics.terrain_validation_failures, 0);
+        assert_eq!(metrics.terrain_normal_map_failures, 1);
+        assert_eq!(metrics.terrain_patches_validated, 1);
+        assert_eq!(metrics.asset_load_failures, 0);
         app.update();
         assert_eq!(
             app.world()
                 .resource::<StreamingMetrics>()
-                .terrain_validation_failures,
+                .terrain_normal_map_failures,
             1
         );
     }
 
     #[test]
-    fn declared_terrain_normal_failure_refuses_readiness_with_its_reason() {
+    fn unresolved_terrain_dependencies_wait_or_report_their_reason() {
         let state = terrain_dependency_state(SurfaceDependencyState::Ready, || {
             SurfaceDependencyState::Failed("normal image has wrong color space".into())
         });

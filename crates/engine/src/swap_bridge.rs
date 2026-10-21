@@ -160,6 +160,11 @@ impl SwapSurface {
     pub fn stand_in(&self) -> Option<Entity> {
         self.stand_in
     }
+
+    #[cfg(test)]
+    pub(crate) fn image_ids(&self) -> &[AssetId<Image>] {
+        &self.images
+    }
 }
 
 /// The render world has everything this surface's draw needs, seen in the extract *after* the

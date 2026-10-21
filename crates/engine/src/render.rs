@@ -658,6 +658,45 @@ pub struct TerrainImages {
 }
 
 impl TerrainExtension {
+    #[cfg(test)]
+    pub(crate) fn with_test_normals(mut self, normals: [Option<Handle<Image>>; 6]) -> Self {
+        self.settings.set_normal_layers(&normals);
+        [
+            self.normal_0,
+            self.normal_1,
+            self.normal_2,
+            self.normal_3,
+            self.normal_4,
+            self.normal_5,
+        ] = normals;
+        self
+    }
+
+    /// Remove a failed authored normal binding. An absent binding uses the geometric normal,
+    /// matching stock terrain behavior, while retaining every valid layer's normal map.
+    pub(crate) fn remove_normal(&mut self, failed: bevy::asset::AssetId<Image>) {
+        for normal in [
+            &mut self.normal_0,
+            &mut self.normal_1,
+            &mut self.normal_2,
+            &mut self.normal_3,
+            &mut self.normal_4,
+            &mut self.normal_5,
+        ] {
+            if normal.as_ref().is_some_and(|image| image.id() == failed) {
+                *normal = None;
+            }
+        }
+        self.settings.set_normal_layers(&[
+            self.normal_0.clone(),
+            self.normal_1.clone(),
+            self.normal_2.clone(),
+            self.normal_3.clone(),
+            self.normal_4.clone(),
+            self.normal_5.clone(),
+        ]);
+    }
+
     /// The exact image resources retained by this quadrant's material.
     pub(crate) fn image_ids(&self) -> impl Iterator<Item = bevy::asset::AssetId<Image>> + '_ {
         [
@@ -4176,6 +4215,26 @@ mod tests {
     /// The shader tiles every layer by the shared LAND repeats per cell, so the layer textures
     /// must be sampled with a repeating address mode. Bevy's default clamps to the edge, which
     /// stretched the textures in the frames: everything past the first tile read the edge texels.
+    #[test]
+    fn failed_terrain_normal_removes_only_its_bindings_and_shader_flags() {
+        let mut images = Assets::<Image>::default();
+        let failed = images.add(Image::default());
+        let valid = images.add(Image::default());
+        let mut extension = TerrainExtension {
+            normal_0: Some(failed.clone()),
+            normal_1: Some(valid.clone()),
+            normal_4: Some(failed.clone()),
+            ..default()
+        };
+        extension.remove_normal(failed.id());
+        assert!(extension.normal_0.is_none());
+        assert!(extension.normal_4.is_none());
+        assert_eq!(extension.normal_1, Some(valid));
+        assert_eq!(extension.settings.normal_layers_0, Vec4::Y);
+        assert_eq!(extension.settings.normal_layers_1, Vec4::ZERO);
+        assert!(!extension.image_ids().any(|id| id == failed.id()));
+    }
+
     #[test]
     fn authored_terrain_normal_bindings_and_flags_are_preserved() {
         let mut extension = TerrainExtension::default();
