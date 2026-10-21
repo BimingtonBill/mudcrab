@@ -327,6 +327,33 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // The run fingerprint is measurement data: an ordinary play session neither builds one nor
     // pays for the startup system that reads it.
     let records_measurements = crate::fingerprint::records_measurements(&config);
+    // `--cull-counter` needs Bevy's debug copy flag on the indirect buffers, so `RenderPlugin` is
+    // built with it whenever the counter asks.
+    let cull_counter = crate::cull_counter::CullCounterPlugin::from_config(&config);
+    let cull_counter_flags = crate::cull_counter::CullCounterPlugin::render_debug_flags(&config);
+    // `RenderPlugin` is installed by `RendererInitPlugin` at its usual place in the group, which
+    // applies the selected backend's feature policy (the DX12 indirect-count workaround) and
+    // carries the `--render-backends` settings and the debug flags.
+    let default_plugins = DefaultPlugins
+        .build()
+        .disable::<bevy::render::RenderPlugin>()
+        .add_before::<bevy::render::RenderPlugin>(RendererInitPlugin::new(
+            bevy::render::settings::WgpuSettings::default(),
+            cull_counter_flags,
+        ))
+        .set(asset_plugin)
+        .set(world_gltf_plugin())
+        .set(WindowPlugin {
+            primary_window: window,
+            ..default()
+        })
+        .set(LogPlugin {
+            level: Level::INFO,
+            custom_layer: crate::bug_report::logging::report_log_layer,
+            // Bevy's default filter plus: gilrs logs an unknown-gamepad-mapping line and
+            // this engine has no gamepad input.
+            ..default()
+        });
     app.insert_resource(config.color_grade)
         .insert_resource(config.visual_preset)
         .insert_resource(sky_palette)
@@ -336,23 +363,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .insert_resource(origin)
         .insert_resource(render_asset_budget)
         .init_resource::<StreamingMetrics>()
-        .add_plugins(
-            DefaultPlugins
-                .build()
-                .disable::<bevy::render::RenderPlugin>()
-                .add_before::<bevy::render::RenderPlugin>(RendererInitPlugin::default())
-                .set(asset_plugin)
-                .set(world_gltf_plugin())
-                .set(WindowPlugin {
-                    primary_window: window,
-                    ..default()
-                })
-                .set(LogPlugin {
-                    level: Level::INFO,
-                    custom_layer: crate::bug_report::logging::report_log_layer,
-                    ..default()
-                }),
-        )
+        .add_plugins(default_plugins)
         .add_plugins((
             FrameTimeDiagnosticsPlugin::default(),
             LogDiagnosticsPlugin {
@@ -361,19 +372,6 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             },
             AcceptanceMetricsPlugin,
             ProfilingPlugin,
-        ))
-        .add_plugins((
-            VercidiumRendererPlugin,
-            crate::visibility_optimization::VisibilityOptimizationPlugin,
-            crate::terrain_upload::TerrainUploadPlugin,
-            crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
-            crate::mesh_residency_audit::MeshResidencyAuditPlugin,
-            SkyPlugin,
-            SkyrimCinematicPostPlugin,
-            ConsolePlugin,
-            crate::bug_report::BugReportPlugin,
-            crate::nif_material::NifMaterialPlugin,
-            crate::emittance::EmittancePlugin,
         ))
         // The render→main "prepared and drawable" bridge. Registered for every
         // run: it is what publishes the render world's own answer to "is this surface drawn?" into
@@ -389,6 +387,20 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     if interactive_world_physics {
         app.add_plugins(crate::settings_ui::SettingsPlugin);
     }
+    app.add_plugins((cull_counter, crate::aabb_guard::AabbGuardPlugin))
+        .add_plugins((
+            SkyPlugin,
+            VercidiumRendererPlugin,
+            crate::visibility_optimization::VisibilityOptimizationPlugin,
+            crate::terrain_upload::TerrainUploadPlugin,
+            crate::mesh_residency_audit::MeshResidencyAuditPlugin,
+            SkyrimCinematicPostPlugin,
+            crate::bug_report::BugReportPlugin,
+            crate::emittance::EmittancePlugin,
+            crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
+            ConsolePlugin,
+            crate::nif_material::NifMaterialPlugin,
+        ));
     add_camera_and_capture_systems(&mut app);
     if let Some(terrain_merge) = terrain_merge {
         app.insert_resource(terrain_merge);
@@ -2322,9 +2334,11 @@ fn setup_world(
         SkyCamera,
         Msaa::Off,
         DepthPrepass,
-        OcclusionCulling,
         RenderLayers::from_layers(MAIN_VIEW_LAYERS),
     ));
+    if config.main_occlusion {
+        camera.insert(OcclusionCulling);
+    }
     if let Some(output) = shot_output {
         camera.insert((
             bevy::camera::RenderTarget::Image(output.0.clone().into()),

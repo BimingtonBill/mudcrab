@@ -193,6 +193,14 @@ pub struct EngineConfig {
     pub profile_dirty_worktree: bool,
     pub profile_hardware: String,
     pub acceptance_screenshot: Option<PathBuf>,
+    /// `--cull-counter`: read the GPU culling result back every few frames and report how many
+    /// instances the main views submit and draw (`renderer.json`, `cull`). Off by default: it asks
+    /// Bevy to let the indirect draw buffers be copied, which Bevy documents as a debugging
+    /// feature that may cost performance. See [`crate::cull_counter`].
+    pub cull_counter: bool,
+    /// Whether the main camera carries `OcclusionCulling`: on, unless `--no-main-occlusion`. The
+    /// switch exists to measure the culling by running a route with and without it.
+    pub main_occlusion: bool,
     pub screenshot_camera_offset: Option<(f32, f32, f32)>,
     /// `--shots <file>`: render the camera poses in a shots file, one PNG each, and exit instead of
     /// running interactively. See [`crate::shots`].
@@ -307,6 +315,8 @@ impl Default for EngineConfig {
             profile_dirty_worktree: false,
             profile_hardware: "unspecified".into(),
             acceptance_screenshot: None,
+            cull_counter: false,
+            main_occlusion: true,
             screenshot_camera_offset: None,
             shots: None,
             matched_route: None,
@@ -410,6 +420,9 @@ Benchmark and profiling:
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
   --shots-settle-timeout <seconds>      maximum settling time per shot (default: 30, maximum: 600)
   --shots-out <dir>                     where the shots' PNGs and shots.log go (default: beside the shots file)
+  --cull-counter                        report submitted and drawn instances per render phase from the GPU
+                                        culling result (renderer.json, cull); Bevy debug copies, off by default
+  --no-main-occlusion                   leave OcclusionCulling off the main camera (to measure what it culls)
   --profile-output <dir>                profile bundle directory (default: no bundle)
   --profile-gpu-inventory               expensive GPU inventory diagnostic; requires --profile-output
   --profile-scenario <name>             scenario name recorded in the profile (default: adhoc)
@@ -928,6 +941,8 @@ impl EngineConfig {
                         (millis * 1_000.0).round().clamp(1.0, u64::MAX as f64) as u64;
                 }
                 "--benchmark-only" => config.benchmark_only = true,
+                "--cull-counter" => config.cull_counter = true,
+                "--no-main-occlusion" => config.main_occlusion = false,
                 "--benchmark-frames" => {
                     config.benchmark_frames = Some(take_value(
                         "--benchmark-frames",

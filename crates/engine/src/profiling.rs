@@ -1524,7 +1524,7 @@ fn unavailable_render_metrics(
     [
         ("draw_calls", "Bevy's built-in render diagnostics do not expose draw-call count for every render phase"),
         ("indirect_draw_count", "the native GPU preprocessing path does not currently publish this counter"),
-        ("occlusion_rejected_instances", "OcclusionCulling does not export the rejected instance count to the main world"),
+        ("occlusion_rejected_instances", "OcclusionCulling does not export a rejected instance count: the GPU keeps it, and the run reads it back only with --cull-counter (renderer.json, cull)"),
     ]
     .into_iter()
     .filter(|(name, _)| !render.keys().any(|path| path.ends_with(name)))
@@ -1600,6 +1600,23 @@ fn summary_markdown(
             "| {name} | {:.3} | {:.3} |\n",
             value.mean, value.p95
         ));
+    }
+    if !renderer.cull.is_empty() {
+        output.push_str(
+            "\n## GPU culling (`--cull-counter`)\n\n| View | Phase | Samples | Submitted mean | Drawn mean | Rejected mean | Rejected % |\n|---|---|---:|---:|---:|---:|---:|\n",
+        );
+        for (view, phases) in &renderer.cull {
+            for (phase, cull) in phases {
+                output.push_str(&format!(
+                    "| {view} | {phase} | {} | {:.0} | {:.0} | {:.0} | {:.1} |\n",
+                    cull.samples,
+                    cull.submitted_mean,
+                    cull.drawn_mean,
+                    cull.rejected_mean,
+                    cull.rejected_fraction * 100.0,
+                ));
+            }
+        }
     }
     if let Some(streaming) = streaming {
         output.push_str(&format!(

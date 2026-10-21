@@ -1,3 +1,4 @@
+pub mod aabb_guard;
 pub mod app;
 pub mod bug_report;
 mod capture_frame;
@@ -5,6 +6,7 @@ pub mod cell_commands;
 pub mod color_pipeline;
 pub mod config;
 pub mod console;
+pub mod cull_counter;
 pub mod door_crossing;
 pub mod doors;
 pub mod emittance;

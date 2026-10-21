@@ -11,13 +11,16 @@ remote = ["bevy/bevy_remote"]
 shared = { path = "../shared" }
 bevy.workspace = true
 gltf = { version = "1.4", default-features = false }
-wgpu = { version = "=29.0.4", default-features = false }
 bevy_rapier3d = { version = "0.36.0", default-features = false, features = ["dim3", "debug-render-3d"] }
 mlua.workspace = true
 rusqlite.workspace = true
 rkyv.workspace = true
 memmap2.workspace = true
 color-eyre.workspace = true
+# The `--render-backends vulkan` pre-check (render_backend.rs) and the adapter-aware renderer init
+# (renderer_init.rs) use wgpu directly; pinned to the version and features Bevy already unifies, so
+# nothing new is compiled.
+wgpu = { version = "=29.0.4", default-features = false }
 crossbeam-channel.workspace = true
 serde.workspace = true
 serde_json.workspace = true

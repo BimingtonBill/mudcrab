@@ -203,6 +203,9 @@ pub struct RendererMetrics {
     pub proof_frames: u64,
     pub renderer_fixture_validated: bool,
     pub renderer_validation_failures: u64,
+    /// What the GPU culling did, per render phase: instances submitted, drawn and rejected. Empty
+    /// unless the run asked for `--cull-counter` ([`crate::cull_counter`]).
+    pub cull: crate::cull_counter::CullTotals,
 }
 
 impl RendererMetrics {
@@ -284,7 +287,14 @@ fn sample_renderer_path(
     bridge.0.frames.fetch_add(1, Ordering::Relaxed);
 }
 
-fn sync_renderer_metrics(bridge: Res<RendererProofBridge>, mut metrics: ResMut<RendererMetrics>) {
+fn sync_renderer_metrics(
+    bridge: Res<RendererProofBridge>,
+    cull: Option<Res<crate::cull_counter::CullCounterBridge>>,
+    mut metrics: ResMut<RendererMetrics>,
+) {
+    if let Some(cull) = cull {
+        metrics.cull = cull.snapshot();
+    }
     metrics.gpu_preprocessing_active = bridge.0.gpu_preprocessing.load(Ordering::Relaxed);
     metrics.gpu_culling_active = bridge.0.gpu_culling.load(Ordering::Relaxed);
     metrics.indirect_drawing_active = bridge.0.indirect_drawing.load(Ordering::Relaxed);
@@ -1868,6 +1878,35 @@ mod tests {
         );
         assert!(shader.contains("let phase = time * water.wave_scale_speed_strength.y;"));
     }
+    #[test]
+    fn final_renderer_requires_every_gpu_path_signal() {
+        let complete = RendererMetrics {
+            gpu_preprocessing_active: true,
+            gpu_culling_active: true,
+            indirect_drawing_active: true,
+            occlusion_culling_views: 1,
+            hzb_views: 1,
+            indirect_phase_buffers: 1,
+            indirect_batch_sets: 1,
+            proof_frames: 1,
+            ..default()
+        };
+        assert!(complete.final_path_active());
+        assert!(
+            !RendererMetrics {
+                hzb_views: 0,
+                ..complete.clone()
+            }
+            .final_path_active()
+        );
+        assert!(
+            !RendererMetrics {
+                renderer_validation_failures: 1,
+                ..complete
+            }
+            .final_path_active()
+        );
+    }
 
     #[test]
     fn reflects_camera_above_and_below_the_water_plane() {
@@ -2092,36 +2131,6 @@ mod tests {
                 "a reference and everything below it must carry the placed-object layer"
             );
         }
-    }
-
-    #[test]
-    fn final_renderer_requires_every_gpu_path_signal() {
-        let complete = RendererMetrics {
-            gpu_preprocessing_active: true,
-            gpu_culling_active: true,
-            indirect_drawing_active: true,
-            occlusion_culling_views: 1,
-            hzb_views: 1,
-            indirect_phase_buffers: 1,
-            indirect_batch_sets: 1,
-            proof_frames: 1,
-            ..default()
-        };
-        assert!(complete.final_path_active());
-        assert!(
-            !RendererMetrics {
-                hzb_views: 0,
-                ..complete.clone()
-            }
-            .final_path_active()
-        );
-        assert!(
-            !RendererMetrics {
-                renderer_validation_failures: 1,
-                ..complete
-            }
-            .final_path_active()
-        );
     }
 
     /// The shader tiles every layer by the shared LAND repeats per cell, so the layer textures

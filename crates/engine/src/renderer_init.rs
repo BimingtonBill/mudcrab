@@ -4,7 +4,7 @@ use bevy::{
     app::Plugin,
     prelude::{App, Res, Startup},
     render::{
-        RenderPlugin,
+        RenderDebugFlags, RenderPlugin,
         renderer::{RenderAdapterInfo, RenderDevice},
         settings::WgpuSettings,
     },
@@ -14,8 +14,25 @@ use bevy::{
 ///
 /// Insert this at the original `RenderPlugin` position in `DefaultPlugins`, with
 /// that entry disabled, so subsequent render plugins retain their usual order.
+///
+/// The debug flags are passed through to `RenderPlugin` (`--cull-counter` needs the indirect
+/// buffers copyable).
 #[derive(Default)]
-pub struct RendererInitPlugin(WgpuSettings);
+pub struct RendererInitPlugin {
+    settings: WgpuSettings,
+    debug_flags: RenderDebugFlags,
+}
+
+impl RendererInitPlugin {
+    /// A plugin that initializes the renderer with `settings` and builds `RenderPlugin` with
+    /// `debug_flags`.
+    pub fn new(settings: WgpuSettings, debug_flags: RenderDebugFlags) -> Self {
+        Self {
+            settings,
+            debug_flags,
+        }
+    }
+}
 
 impl Plugin for RendererInitPlugin {
     /// Adds `RenderPlugin`, initialized manually when DX12 may be selected.
@@ -24,7 +41,8 @@ impl Plugin for RendererInitPlugin {
 
         #[cfg(not(target_os = "windows"))]
         app.add_plugins(RenderPlugin {
-            render_creation: self.0.clone().into(),
+            render_creation: self.settings.clone().into(),
+            debug_flags: self.debug_flags,
             ..Default::default()
         });
 
@@ -36,7 +54,7 @@ impl Plugin for RendererInitPlugin {
                 window::{PrimaryWindow, RawHandleWrapperHolder},
             };
 
-            let settings = &self.0;
+            let settings = &self.settings;
             let backends = settings
                 .backends
                 .filter(|mask| mask.contains(wgpu::Backends::DX12));
@@ -45,6 +63,7 @@ impl Plugin for RendererInitPlugin {
                 // including the explicit renderer-disabled setting.
                 app.add_plugins(RenderPlugin {
                     render_creation: settings.clone().into(),
+                    debug_flags: self.debug_flags,
                     ..Default::default()
                 });
                 return;
@@ -59,6 +78,7 @@ impl Plugin for RendererInitPlugin {
                 bevy::tasks::block_on(initialize_renderer(backends, primary_window, settings));
             app.add_plugins(RenderPlugin {
                 render_creation: RenderCreation::Manual(resources),
+                debug_flags: self.debug_flags,
                 ..Default::default()
             });
         }
@@ -357,7 +377,10 @@ mod tests {
                 DefaultPlugins
                     .build()
                     .disable::<RenderPlugin>()
-                    .add_before::<RenderPlugin>(RendererInitPlugin(settings.clone()))
+                    .add_before::<RenderPlugin>(RendererInitPlugin::new(
+                        settings.clone(),
+                        Default::default(),
+                    ))
                     .disable::<WinitPlugin>()
                     .disable::<LogPlugin>()
                     .disable::<TerminalCtrlCHandlerPlugin>()
