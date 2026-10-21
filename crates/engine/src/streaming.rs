@@ -22,6 +22,7 @@ use crate::{
             AssetCatalog, CellDetail, CellKey, CellPayload, DatabaseRequest, DatabaseResponse,
             ReferenceRow, WorldDatabase,
         },
+        is_safe_relative_asset_path,
     },
 };
 use bevy::{
@@ -51,6 +52,9 @@ use std::time::{Duration, Instant};
 
 pub(crate) mod identity_changes;
 pub(crate) mod lod;
+mod lod_objects;
+mod lod_trees;
+pub(crate) mod native_lod;
 pub(crate) mod terrain_audit;
 mod terrain_identity;
 use shared::terrain_mesh::TerrainCellMesh;
@@ -286,6 +290,13 @@ impl Plugin for StreamingPlugin {
                     end_scene_spawn_batch.after(SceneSpawnerSystems::WorldInstanceSpawn),
                 ),
             );
+        // Distant object LOD and tree billboards from the package's Skyrim LOD inventory. Inert
+        // for a package without it, and for a run that turns both off.
+        app.add_plugins((
+            lod_objects::ObjectLodPlugin,
+            lod_trees::TreeLodPlugin,
+            native_lod::NativeLodPlugin,
+        ));
         // On a profiled run, the despawns the immediate unload queues through `Commands` are
         // applied at the schedule's sync point right after `plan_cells` - exactly where Bevy
         // would insert one on its own (the exclusive `despawn_cells` forces it). These systems
@@ -849,6 +860,48 @@ pub struct StreamingMetrics {
     pub transform_bounds_fixture_validated: bool,
     pub active_requests: usize,
     pub peak_active_requests: usize,
+    /// Distant object LOD blocks (`.bto`) the plan has asked for since the run began.
+    pub lod_object_blocks_requested: u64,
+    /// Object blocks that passed their hash and bounds checks.
+    pub lod_object_blocks_ready: u64,
+    /// Object blocks that failed to load or validate, retries counted again.
+    pub lod_object_blocks_failed: u64,
+    /// Object blocks resident and ready.
+    pub resident_lod_object_blocks: usize,
+    /// Object blocks asked for and not ready yet, queued or loading.
+    pub pending_lod_object_blocks: usize,
+    pub pending_native_lod_draws: usize,
+    pub visible_native_lod_draws: usize,
+    pub native_lod_drawn_twice: usize,
+    pub native_lod_drawn_by_nothing: usize,
+    /// Object blocks hidden and waiting for the unload pacer.
+    pub retiring_lod_object_blocks: usize,
+    /// Object blocks that failed for good and are not retried.
+    pub unrecovered_lod_object_blocks: usize,
+    /// Object blocks the last plan draws.
+    pub lod_object_blocks_visible: usize,
+    /// Per-cell segments the ready blocks carry, and how many the ready cells hide now.
+    pub lod_object_segments: u64,
+    pub lod_object_segments_hidden: usize,
+    /// Object primitives the converter marked as non-rendering, kept hidden.
+    pub lod_object_excluded_primitives: u64,
+    /// Index rows left out because they failed validation (`world::object_lod`).
+    pub lod_object_rows_refused: u64,
+    /// Object blocks the unload pacer has despawned.
+    pub unloaded_lod_object_blocks: u64,
+    /// Distant tree billboard instance blocks: reads asked for, merged and spawned, failed.
+    pub lod_tree_blocks_requested: u64,
+    pub lod_tree_blocks_ready: u64,
+    pub lod_tree_blocks_failed: u64,
+    /// Reads whose block was no longer wanted when the answer came.
+    pub lod_tree_stale_responses: u64,
+    /// Tree instances merged into drawn meshes since the run began.
+    pub lod_tree_instances: u64,
+    pub resident_lod_tree_blocks: usize,
+    pub pending_lod_tree_blocks: usize,
+    pub unrecovered_lod_tree_blocks: usize,
+    /// Tree cells drawing now (cells whose full-detail model is not ready yet).
+    pub lod_tree_cells_visible: usize,
     pub lod_queries_submitted: u64,
     pub lod_query_responses: u64,
     pub lod_query_submission_failures: u64,
@@ -1191,6 +1244,18 @@ impl ActiveSpace {
 pub struct RenderOrigin(pub IVec2);
 
 impl StreamingWorld {
+    /// The exterior cells that are resident at full detail, with their roots: the cells the
+    /// distant object LOD can hand over to ([`lod_objects`]).
+    fn full_resident_cells(&self) -> impl Iterator<Item = (CellKey, Entity)> + '_ {
+        self.cells.iter().filter_map(|(key, status)| match status {
+            CellStatus::Resident {
+                root,
+                detail: CellDetail::Full,
+            } => Some((*key, *root)),
+            _ => None,
+        })
+    }
+
     /// The root entity of `key` while it is resident.
     pub(crate) fn resident_root(&self, key: CellKey) -> Option<Entity> {
         match self.cells.get(&key) {
@@ -1981,7 +2046,11 @@ fn despawn_cells(world: &mut World) {
         })
         .collect();
     let retiring_chunks = world.resource::<lod::LodStreaming>().retiring_chunks();
-    if retiring.is_empty() && retiring_chunks.is_empty() {
+    let retiring_blocks = world
+        .get_resource::<lod_objects::ObjectLodStreaming>()
+        .map(lod_objects::ObjectLodStreaming::retiring_blocks)
+        .unwrap_or_default();
+    if retiring.is_empty() && retiring_chunks.is_empty() && retiring_blocks.is_empty() {
         world.resource_mut::<StreamingWorld>().last_retire_backlog = 0;
         let mut metrics = world.resource_mut::<StreamingMetrics>();
         metrics.despawns_this_frame = 0;
@@ -1994,6 +2063,7 @@ fn despawn_cells(world: &mut World) {
     retiring.sort_by_key(|(key, _)| cell_order_key(*key));
     let cell_backlog = retiring.len();
     let chunk_backlog = retiring_chunks.len();
+    let block_backlog = retiring_blocks.len();
     // The escape trips on drain failure, not on size: a flight's burst sits above the bound the
     // frame it lands and shrinks from then on, while a pacer losing the race leaves the backlog no
     // smaller than the last frame left it. A first-ever backlog has no last frame to fail against
@@ -2005,6 +2075,8 @@ fn despawn_cells(world: &mut World) {
     let mut chunk_entities = 0usize;
     let mut cells = 0usize;
     let mut chunks = 0usize;
+    let mut blocks = 0usize;
+    let mut block_entities = 0usize;
     match spent_by {
         // The time budget: walk the stable order and read the clock after each subtree. A subtree
         // that has started always finishes, and at least one root always goes, so the backlog
@@ -2027,6 +2099,16 @@ fn despawn_cells(world: &mut World) {
                     }
                 }
             }
+            // The object LOD blocks go last, off the same clock.
+            if cells == cell_backlog && chunks == chunk_backlog {
+                for (_, root) in retiring_blocks.iter() {
+                    block_entities = block_entities.saturating_add(despawn_subtree(world, *root));
+                    blocks += 1;
+                    if started.elapsed() >= spent {
+                        break;
+                    }
+                }
+            }
         }
         // The count budget, or the escape: a fixed prefix of cells-then-chunks, the escape taking
         // the whole cell backlog.
@@ -2038,11 +2120,15 @@ fn despawn_cells(world: &mut World) {
             };
             cells = budget.min(cell_backlog);
             chunks = (budget - cells).min(chunk_backlog);
+            blocks = budget - cells - chunks;
             for (_, root) in retiring.iter().take(cells) {
                 cell_entities = cell_entities.saturating_add(despawn_subtree(world, *root));
             }
             for (_, root) in retiring_chunks.iter().take(chunks) {
                 chunk_entities = chunk_entities.saturating_add(despawn_subtree(world, *root));
+            }
+            for (_, root) in retiring_blocks.iter().take(blocks) {
+                block_entities = block_entities.saturating_add(despawn_subtree(world, *root));
             }
         }
     }
@@ -2067,6 +2153,19 @@ fn despawn_cells(world: &mut World) {
         for (key, _) in retiring_chunks.iter().take(chunks) {
             lod.chunk_despawned(*key);
         }
+    }
+    if blocks > 0 {
+        let mut objects = world.resource_mut::<lod_objects::ObjectLodStreaming>();
+        for (key, _) in retiring_blocks.iter().take(blocks) {
+            objects.block_despawned(*key);
+        }
+        let mut metrics = world.resource_mut::<StreamingMetrics>();
+        metrics.unloaded_lod_object_blocks = metrics
+            .unloaded_lod_object_blocks
+            .saturating_add(blocks as u64);
+        metrics.despawned_lod_entities = metrics
+            .despawned_lod_entities
+            .saturating_add(block_entities as u64);
     }
     for (key, _) in retiring.iter().take(cells) {
         world.resource_mut::<TerrainContinuity>().edges.remove(key);
@@ -5722,12 +5821,6 @@ pub fn converted_model_path(path: String) -> Option<String> {
     Some(converted.to_string_lossy().replace('\\', "/"))
 }
 
-fn is_safe_relative_asset_path(path: &str) -> bool {
-    std::path::Path::new(path)
-        .components()
-        .all(|component| matches!(component, std::path::Component::Normal(_)))
-}
-
 fn terrain_collider_from_mesh(mesh: &Mesh) -> Result<Collider, String> {
     let Some(VertexAttributeValues::Float32x3(positions)) =
         mesh.attribute(Mesh::ATTRIBUTE_POSITION)
@@ -6780,6 +6873,39 @@ fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
 /// Every spawned root the render origin places: an exterior cell root ([`ExteriorCellGrid`]) or a
 /// terrain LOD chunk root ([`lod::LodChunkGridOrigin`]). Interiors carry neither and sit at the
 /// origin already, so they are not touched.
+pub(crate) type CellRootTransforms<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Option<&'static ExteriorCellGrid>,
+        Option<&'static lod::LodChunkGridOrigin>,
+        &'static mut Transform,
+    ),
+    (
+        Or<(With<ExteriorCellGrid>, With<lod::LodChunkGridOrigin>)>,
+        Without<StreamingCamera>,
+        Without<crate::physics::PlayerBody>,
+        Without<crate::physics::DebugTankard>,
+    ),
+>;
+
+/// Places every spawned exterior cell root, and every terrain LOD chunk root, where `origin` says
+/// it belongs ([`CellRootTransforms`]).
+pub(crate) fn reposition_cell_roots(origin: IVec2, roots: &mut CellRootTransforms) {
+    for (cell_grid, lod_grid, mut transform) in roots.iter_mut() {
+        let Some(grid) = cell_grid
+            .map(|grid| (i64::from(grid.0.x), i64::from(grid.0.y)))
+            .or_else(|| lod_grid.map(|grid| (grid.grid_x, grid.grid_y)))
+        else {
+            continue;
+        };
+        transform.translation = Vec3::new(
+            (grid.0 - i64::from(origin.x)) as f32 * CELL_SIZE,
+            0.0,
+            -((grid.1 - i64::from(origin.y)) as f32) * CELL_SIZE,
+        );
+    }
+}
 
 type OriginParticipantFilter = (
     Or<(
@@ -8617,6 +8743,19 @@ mod tests {
             .keys()
             .copied()
             .collect()
+    }
+
+    #[test]
+    fn the_lod_horizon_is_known_per_worldspace() {
+        let mut horizon = LodHorizon::default();
+        assert_eq!(horizon.reach_in(60), None, "nothing known before an answer");
+        horizon.set(60, 372_000.0);
+        assert_eq!(horizon.reach_in(60), Some(372_000.0));
+        assert_eq!(
+            horizon.reach_in(61),
+            None,
+            "another worldspace has not answered"
+        );
     }
 
     #[test]

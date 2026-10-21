@@ -66,6 +66,7 @@ fn insert_run_fingerprint(
     adapter: Option<Res<RenderAdapterInfo>>,
     device: Option<Res<RenderDevice>>,
     database: Option<Res<crate::world::database::WorldDatabase>>,
+    settings: Option<Res<crate::graphics_settings::GraphicsSettings>>,
     windows: Query<&Window, With<PrimaryWindow>>,
 ) {
     let window = windows.iter().next();
@@ -75,6 +76,7 @@ fn insert_run_fingerprint(
         device.as_deref(),
         window,
         database.is_some(),
+        settings.as_deref(),
     ));
 }
 
@@ -145,6 +147,13 @@ pub struct GraphicsFingerprint {
     pub block_maximum_distance: f32,
     /// `fSplitDistanceMult`, the multiplier on all three block distances.
     pub split_distance_mult: f32,
+    /// The `lod-objects` graphics setting: whether the package's distant object LOD blocks were
+    /// drawn.
+    pub lod_objects: bool,
+    /// The `lod-trees` graphics setting: whether the package's distant tree billboards were drawn.
+    pub lod_trees: bool,
+    /// `fTreeLoadDistance`, how far tree billboards draw, in Creation units.
+    pub tree_load_distance: f32,
     /// MiB of newly loaded render assets a frame may prepare; `0` is unlimited.
     pub max_upload_mib_per_frame: usize,
     /// Whether streamed `LIGH` references place point lights.
@@ -169,6 +178,7 @@ impl RunFingerprint {
         device: Option<&RenderDevice>,
         window: Option<&Window>,
         opens_world_database: bool,
+        settings: Option<&crate::graphics_settings::GraphicsSettings>,
     ) -> Self {
         let features = device.map(RenderDevice::features);
         let renderer = adapter.map(|info| RendererFingerprint {
@@ -211,6 +221,9 @@ impl RunFingerprint {
                 block_level1_distance: config.terrain_lod.block_level1_distance,
                 block_maximum_distance: config.terrain_lod.block_maximum_distance,
                 split_distance_mult: config.terrain_lod.split_distance_mult,
+                lod_objects: settings.is_none_or(|settings| settings.lod_objects),
+                lod_trees: settings.is_none_or(|settings| settings.lod_trees),
+                tree_load_distance: config.object_lod.tree_load_distance,
                 max_upload_mib_per_frame: config.max_upload_mib_per_frame,
                 lights: config.lights,
                 headless: config.headless,
@@ -240,8 +253,24 @@ fn opened_world_database_schema(config: &EngineConfig) -> Option<u32> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn measured_native_visibility_uses_the_live_resource() {
+        let config = EngineConfig::default();
+        assert!(config.graphics.lod_objects && config.graphics.lod_trees);
+        let mut settings = config.graphics.clone();
+        settings.set("lod-objects", "off").unwrap();
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(settings)
+            .add_plugins(RunFingerprintPlugin);
+        app.update();
+        let fingerprint = app.world().resource::<RunFingerprint>();
+        assert!(!fingerprint.graphics.lod_objects);
+        assert!(fingerprint.graphics.lod_trees);
+    }
+
     fn fingerprint_without_renderer() -> RunFingerprint {
-        RunFingerprint::collect(&EngineConfig::default(), None, None, None, false)
+        RunFingerprint::collect(&EngineConfig::default(), None, None, None, false, None)
     }
 
     /// Every field of the fingerprint reaches the JSON, and the two the run could not read are
@@ -262,7 +291,7 @@ mod tests {
             lights: true,
             ..EngineConfig::default()
         };
-        let fingerprint = RunFingerprint::collect(&config, None, None, None, false);
+        let fingerprint = RunFingerprint::collect(&config, None, None, None, false, None);
         let value = serde_json::to_value(&fingerprint).expect("the fingerprint must serialise");
         assert_eq!(value["commit"], serde_json::json!("abc123"));
         assert_eq!(value["dirty_worktree"], serde_json::json!(true));
@@ -303,6 +332,9 @@ mod tests {
             serde_json::json!(3000.0)
         );
         assert_eq!(graphics["split_distance_mult"], serde_json::json!(1.25));
+        assert_eq!(graphics["lod_objects"], serde_json::json!(true));
+        assert_eq!(graphics["lod_trees"], serde_json::json!(true));
+        assert_eq!(graphics["tree_load_distance"], serde_json::json!(75000.0));
         assert_eq!(graphics["lights"], serde_json::json!(true));
         assert_eq!(graphics["present_mode"], serde_json::Value::Null);
     }

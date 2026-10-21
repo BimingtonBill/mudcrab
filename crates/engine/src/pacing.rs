@@ -53,6 +53,8 @@ pub struct WorldReadyInputs {
     /// will still change the frame, so the world is not ready while either is nonzero.
     pub pending_lod_queries: usize,
     pub pending_lod_chunks: usize,
+    /// Distant object blocks and tree billboard blocks requested but not yet spawned.
+    pub pending_lod_objects: usize,
 }
 
 impl WorldReadyInputs {
@@ -70,6 +72,7 @@ impl WorldReadyInputs {
             && self.pending_drawn == 0
             && self.pending_lod_queries == 0
             && self.pending_lod_chunks == 0
+            && self.pending_lod_objects == 0
     }
 
     fn from_streaming(
@@ -91,6 +94,11 @@ impl WorldReadyInputs {
             pending_drawn,
             pending_lod_queries: metrics.pending_lod_queries,
             pending_lod_chunks: metrics.pending_lod_chunks,
+            pending_lod_objects: metrics.pending_lod_object_blocks
+                + metrics.pending_lod_tree_blocks
+                + metrics.unrecovered_lod_object_blocks
+                + metrics.unrecovered_lod_tree_blocks
+                + metrics.pending_native_lod_draws,
         }
     }
 }
@@ -605,7 +613,7 @@ mod tests {
 
     #[test]
     fn each_condition_alone_holds_the_world_back() {
-        let holds_back: [fn(&mut WorldReadyInputs); 10] = [
+        let holds_back: [fn(&mut WorldReadyInputs); 11] = [
             |i| i.resident_window_cells = 24,
             |i| i.loading_cells = 1,
             |i| i.active_requests = 1,
@@ -615,6 +623,7 @@ mod tests {
             |i| i.pending_drawn = 1,
             |i| i.pending_lod_queries = 1,
             |i| i.pending_lod_chunks = 1,
+            |i| i.pending_lod_objects = 1,
             |i| i.window_cells = 0,
         ];
         for (index, hold) in holds_back.iter().enumerate() {

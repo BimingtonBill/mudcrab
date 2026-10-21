@@ -18,7 +18,7 @@ use crate::{
     sky::{FogCamera, SkyCamera, SkyPlugin},
     streaming::{
         AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, StreamingWorld,
-        build_terrain_quadrant_mesh, streaming_center, validate_standard_material,
+        build_terrain_quadrant_mesh, camera_grid, validate_standard_material,
     },
     tone_mapping::SceneToneMapSource,
     view_policy::{InvalidateSecondaryViews, ViewInvalidationReason},
@@ -310,6 +310,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));
     let mut app = App::new();
+    app.insert_resource(config.graphics.clone());
     if config.window_offscreen() {
         app.add_plugins(crate::window_parking::WindowParkingPlugin);
     }
@@ -433,9 +434,6 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     if let Some(terrain_merge) = terrain_merge {
         app.insert_resource(terrain_merge);
     }
-    if records_measurements {
-        app.add_plugins(crate::fingerprint::RunFingerprintPlugin);
-    }
     if app
         .world()
         .resource::<EngineConfig>()
@@ -446,6 +444,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .add_systems(PreUpdate, drive_streaming_benchmark_route);
     }
     add_remote_plugins(&mut app, remote);
+    if records_measurements {
+        app.add_plugins(crate::fingerprint::RunFingerprintPlugin);
+    }
     if let Some((database, catalog, features, cache, ground_height, spawn_ground_height)) =
         runtime_data
     {
@@ -1065,7 +1066,7 @@ fn cross_streaming_fixture_interior(
     let Ok(camera) = camera.single() else {
         return;
     };
-    let center = streaming_center(camera.translation, origin.0);
+    let center = camera_grid(camera.translation, origin.0);
     if state.interior.requested_frame.is_none() {
         if state.frames < STREAMING_FIXTURE_INTERIOR_FRAME {
             return;
@@ -2972,6 +2973,11 @@ fn screenshot_assets_ready(
         && metrics.loading_cells == 0
         && metrics.pending_lod_queries == 0
         && metrics.pending_lod_chunks == 0
+        && metrics.pending_lod_object_blocks == 0
+        && metrics.pending_lod_tree_blocks == 0
+        && metrics.unrecovered_lod_object_blocks == 0
+        && metrics.unrecovered_lod_tree_blocks == 0
+        && metrics.pending_native_lod_draws == 0
         && metrics.failed_cells == 0
         && metrics.unrecovered_lod_queries == 0
         && metrics.unrecovered_lod_chunks == 0

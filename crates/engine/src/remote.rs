@@ -70,6 +70,7 @@ pub fn add_remote_plugins(app: &mut App, settings: Option<RemoteSettings>) {
     ))
     // Only reflected types are visible to `world.query` and friends. Automatic registration covers
     // these on most platforms; registering them here keeps the list explicit.
+    .register_type::<crate::graphics_settings::GraphicsSettings>()
     .register_type::<FormId>()
     .register_type::<CellRef>()
     .register_type::<WorldPosition>()

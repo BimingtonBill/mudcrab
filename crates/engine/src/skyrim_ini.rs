@@ -17,6 +17,7 @@
 //! | `[TerrainManager]` | `fBlockLevel1Distance` | level-8 terrain LOD distance, before the multiplier |
 //! | `[TerrainManager]` | `fBlockMaximumDistance` | level-16 terrain LOD distance, before the multiplier |
 //! | `[TerrainManager]` | `fSplitDistanceMult` | terrain LOD multiplier on the three block distances |
+//! | `[TerrainManager]` | `fTreeLoadDistance` | how far tree billboards draw |
 
 use crate::config::{EngineConfig, MAX_STREAM_RADIUS};
 use std::{collections::HashMap, path::Path};
@@ -116,6 +117,16 @@ impl SkyrimIni {
                     config.settings_overrides.push(format!("ini:{key}"));
                 }
                 _ => eprintln!("warning: ignoring {key}={raw:?}; expected a positive number"),
+            }
+        }
+        if let Some(raw) = self.get("TerrainManager", "fTreeLoadDistance") {
+            match raw.parse::<f32>() {
+                Ok(value) if value.is_finite() && value > 0.0 => {
+                    config.object_lod.tree_load_distance = value;
+                }
+                _ => eprintln!(
+                    "warning: ignoring fTreeLoadDistance={raw:?}; expected a positive number"
+                ),
             }
         }
     }

@@ -3578,7 +3578,7 @@ swap/terrain_ready_not_drawn,swap/in_camera_view_not_drawn"
             "frame_ms_p95": 14.0,
             "passed": true
         });
-        let fingerprint = RunFingerprint::collect(&config, None, None, None, false);
+        let fingerprint = RunFingerprint::collect(&config, None, None, None, false, None);
         profiler
             .write_bundle(
                 &config,
@@ -3664,7 +3664,7 @@ swap/terrain_ready_not_drawn,swap/in_camera_view_not_drawn"
             "frame_ms_p95": 14.0,
             "passed": true
         });
-        let mut fingerprint = RunFingerprint::collect(&config, None, None, None, false);
+        let mut fingerprint = RunFingerprint::collect(&config, None, None, None, false, None);
         fingerprint.renderer = Some(renderer(true, true));
         assert!(
             profiler.render_metrics.is_empty(),

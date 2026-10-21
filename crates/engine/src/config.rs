@@ -70,11 +70,59 @@ impl TerrainLodDistances {
     }
 }
 
+impl TerrainLodDistances {
+    /// The Chebyshev cell distance from the camera's cell out to which an object LOD block of
+    /// `level` cells draws: Skyrim's block distances without the terrain multiplier (the object
+    /// LOD distances times `fSplitDistanceMult` are the terrain LOD distances, so the object
+    /// ones are the block distances as written). Levels 4 and 8 follow `fBlockLevel0Distance` and
+    /// `fBlockLevel1Distance`; 16 and 32 follow `fBlockMaximumDistance`.
+    pub fn object_reach_cells(&self, level: u8) -> i32 {
+        // A hand-tuned INI may order the distances oddly; a coarser level never reaches less far
+        // than a finer one, or the ring between them would draw nothing.
+        let level0 = self.block_level0_distance;
+        let level1 = level0.max(self.block_level1_distance);
+        let maximum = level1.max(self.block_maximum_distance);
+        let block = match level {
+            0..=4 => level0,
+            5..=8 => level1,
+            _ => maximum,
+        };
+        (f64::from(block) / f64::from(CELL_SIZE)).floor() as i32
+    }
+}
+
+/// How far the distant tree billboards of the package's Skyrim LOD inventory reach. Whether the
+/// objects and the trees draw at all is a graphics setting (`--lod-objects`, `--lod-trees`, the
+/// panel; see `crate::graphics_settings`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ObjectLodSettings {
+    /// `fTreeLoadDistance` (`[TerrainManager]`): how far tree billboards draw, in Creation units.
+    pub tree_load_distance: f32,
+}
+
+impl Default for ObjectLodSettings {
+    /// Skyrim Special Edition's `fTreeLoadDistance` of 75,000 units.
+    fn default() -> Self {
+        Self {
+            tree_load_distance: 75_000.0,
+        }
+    }
+}
+
+impl ObjectLodSettings {
+    /// The Chebyshev cell distance out to which tree billboards draw.
+    pub fn tree_reach_cells(&self) -> i32 {
+        (f64::from(self.tree_load_distance) / f64::from(CELL_SIZE)).floor() as i32
+    }
+}
+
 /// Bevy Remote Protocol's default HTTP port, used by `--remote` unless `--remote-port` is given.
 pub const DEFAULT_REMOTE_PORT: u16 = 15702;
 
 #[derive(Debug, Clone, Resource)]
 pub struct EngineConfig {
+    /// Live native LOD controls, initialized by --lod-objects and --lod-trees.
+    pub graphics: crate::graphics_settings::GraphicsSettings,
     /// Keep an automated capture window on screen instead of parking it off screen.
     pub show_window: bool,
     /// Explicit launch options. Saved interactive settings defer to these and to `--ini`.
@@ -95,6 +143,8 @@ pub struct EngineConfig {
     /// Optional sun bearing clockwise from north and elevation above the horizon, in degrees.
     pub sun_position: Option<(f32, f32)>,
     pub terrain_lod: TerrainLodDistances,
+    /// Which distant objects are drawn from the package's Skyrim LOD inventory.
+    pub object_lod: ObjectLodSettings,
     /// How far the terrain-only ring reaches, in cells from the camera cell: a cell outside
     /// [`stream_radius`](Self::stream_radius) but within this distance streams its landscape and its
     /// water plane and nothing else, so the world does not end at the full-detail edge.
@@ -394,6 +444,7 @@ impl Default for EngineConfig {
     /// Start with the standard engine settings and optional profiling diagnostics disabled.
     fn default() -> Self {
         Self {
+            graphics: crate::graphics_settings::GraphicsSettings::default(),
             settings_overrides: Vec::new(),
             show_window: false,
             assets_dir: PathBuf::from("modern_assets"),
@@ -408,6 +459,7 @@ impl Default for EngineConfig {
             sun_shadow_distance_limit: None,
             sun_position: None,
             terrain_lod: TerrainLodDistances::default(),
+            object_lod: ObjectLodSettings::default(),
             terrain_radius: DEFAULT_TERRAIN_RADIUS,
             terrain_radius_given: false,
             max_cell_commits_per_frame: 1,
@@ -626,6 +678,8 @@ Benchmark and profiling:
   --image-space-slot <slot>            sunrise|day|sunset|night; requires --image-space-weather
   --visual-preset <vivid|cool-gray>      select sky and grading look (default: cool-gray)
   --sun-position <azimuth,elevation>     sun bearing clockwise from north and elevation above horizon, degrees
+  --lod-objects <on|off>                draw native distant object blocks (default: on)
+  --lod-trees <on|off>                  draw native distant tree billboards (default: on)
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
   --shots-settle-timeout <seconds>      maximum settling time per shot (default: 30, maximum: 600)
   --shots-out <dir>                     where the shots' PNGs and shots.log go (default: beside the shots file)
@@ -1554,6 +1608,18 @@ impl EngineConfig {
                     })?);
                 }
                 "--show-window" => config.show_window = true,
+                "--lod-objects" | "--lod-trees" => {
+                    let option = if argument == "--lod-objects" {
+                        "--lod-objects"
+                    } else {
+                        "--lod-trees"
+                    };
+                    let value = take_raw(option, "on or off", args.next())?;
+                    config
+                        .graphics
+                        .set(argument.trim_start_matches("--"), &value)
+                        .map_err(ConfigError::Message)?;
+                }
                 "--shots" => {
                     config.shots = Some(take_value("--shots", "a shots file path", args.next())?);
                 }
@@ -2217,6 +2283,23 @@ fn edit_distance(left: &str, right: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn object_reach_never_shrinks_toward_a_coarser_level() {
+        let distances = TerrainLodDistances {
+            block_level0_distance: 70_000.0,
+            block_level1_distance: 35_000.0,
+            block_maximum_distance: 20_000.0,
+            ..TerrainLodDistances::default()
+        };
+        let reaches: Vec<i32> = [4, 8, 16, 32]
+            .into_iter()
+            .map(|level| distances.object_reach_cells(level))
+            .collect();
+        assert_eq!(reaches, [17, 17, 17, 17]);
+        assert_eq!(TerrainLodDistances::default().object_reach_cells(4), 8);
+        assert_eq!(TerrainLodDistances::default().object_reach_cells(16), 61);
+    }
+
     use super::*;
 
     /// This file, so the tests can read the parser's own match arms back out of

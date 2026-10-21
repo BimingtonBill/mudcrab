@@ -1,5 +1,5 @@
 use super::{
-    ActiveSpace, RenderOrigin, StreamingCommitBudget, StreamingMetrics, StreamingWorld,
+    ActiveSpace, LodHorizon, RenderOrigin, StreamingCommitBudget, StreamingMetrics, StreamingWorld,
     TerrainCoverage, TerrainSurfaceReady, requests,
 };
 use crate::{
@@ -40,6 +40,10 @@ const LOD_CHUNK_MAX_RETRIES: u8 = 3;
 const LOD_CHUNK_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 const LOD_CHUNK_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
 
+/// How far distant terrain reaches, in Creation units: where the farthest tier stops drawing.
+fn lod_horizon(distances: &TerrainLodDistances) -> f32 {
+    CELL_SIZE * distances.max_reach_cells().max(0) as f32
+}
 #[path = "terrain_batching.rs"]
 pub(crate) mod terrain_batching;
 
@@ -488,6 +492,17 @@ pub(crate) struct LodChunkGridOrigin {
     pub(super) grid_y: i64,
 }
 
+impl LodChunkGridOrigin {
+    /// The origin of a root whose nodes already carry absolute Creation coordinates (an object
+    /// LOD block): the render-origin shift places it, with no grid offset of its own.
+    pub(super) const fn world_origin() -> Self {
+        Self {
+            grid_x: 0,
+            grid_y: 0,
+        }
+    }
+}
+
 #[derive(Component)]
 pub(super) struct PendingLodChunk {
     metadata: LodChunkMetadata,
@@ -499,26 +514,26 @@ pub(super) struct PendingLodChunk {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LodChunkFailureClass {
+pub(super) enum LodChunkFailureClass {
     Transient,
     Terminal,
 }
 
 #[derive(Debug)]
-struct LodChunkFailure {
-    class: LodChunkFailureClass,
-    reason: String,
+pub(super) struct LodChunkFailure {
+    pub(super) class: LodChunkFailureClass,
+    pub(super) reason: String,
 }
 
 impl LodChunkFailure {
-    fn transient(reason: impl Into<String>) -> Self {
+    pub(super) fn transient(reason: impl Into<String>) -> Self {
         Self {
             class: LodChunkFailureClass::Transient,
             reason: reason.into(),
         }
     }
 
-    fn terminal(reason: impl Into<String>) -> Self {
+    pub(super) fn terminal(reason: impl Into<String>) -> Self {
         Self {
             class: LodChunkFailureClass::Terminal,
             reason: reason.into(),
@@ -538,7 +553,11 @@ pub(super) fn mark_lod_world_instance_ready(
 /// The worldspace whose distant terrain should be streamed, or `None` for none at all: a negative
 /// stream radius turns LOD off, and an interior has no distant terrain. Otherwise LOD follows the
 /// exterior the player is in, which a door may have changed from the configured one.
-fn lod_worldspace(stream_radius: i32, space: Option<&ActiveSpace>, configured: u32) -> Option<u32> {
+pub(super) fn lod_worldspace(
+    stream_radius: i32,
+    space: Option<&ActiveSpace>,
+    configured: u32,
+) -> Option<u32> {
     if stream_radius < 0 || space.is_some_and(|space| space.interior.is_some()) {
         return None;
     }
@@ -863,6 +882,7 @@ pub(super) fn collect_lod_chunks(
     mut camera_projection: Query<&mut Projection, With<StreamingCamera>>,
     mut full_streaming: ResMut<StreamingWorld>,
     mut streaming: ResMut<LodStreaming>,
+    mut horizon: ResMut<LodHorizon>,
     mut budget: ResMut<StreamingCommitBudget>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
@@ -904,13 +924,14 @@ pub(super) fn collect_lod_chunks(
             }
             Ok(chunks) => {
                 streaming.query_retries.remove(&response.query.tier);
-                if !chunks.is_empty()
-                    && let Ok(mut projection) = camera_projection.single_mut()
-                    && let Projection::Perspective(perspective) = &mut *projection
-                {
-                    perspective.far = perspective
-                        .far
-                        .max(lod_camera_far(config.terrain_lod.max_reach_cells()));
+                if !chunks.is_empty() {
+                    // The exterior fog reaches this far instead of ending at the ring's edge
+                    // (`crate::app::exterior_fog`), or the LOD behind the ring would be fogged
+                    // out as sky colour.
+                    horizon.set(
+                        response.query.worldspace_id,
+                        lod_horizon(&config.terrain_lod),
+                    );
                 }
                 streaming.pending_chunks.extend(
                     chunks
@@ -1907,7 +1928,7 @@ fn quadrant_from_node_name(name: &str) -> Option<u8> {
         .map(|index| index as u8)
 }
 
-fn streaming_center(screenshot: bool, origin: IVec2, camera: &Transform) -> IVec2 {
+pub(super) fn streaming_center(screenshot: bool, origin: IVec2, camera: &Transform) -> IVec2 {
     if screenshot {
         return origin;
     }
@@ -1998,7 +2019,7 @@ fn enqueue_due_lod_retries(streaming: &mut LodStreaming, now: Instant) {
     }
 }
 
-fn lod_retry_deadline(
+pub(super) fn lod_retry_deadline(
     class: LodChunkFailureClass,
     retry_count: u8,
     now: Instant,
@@ -2014,7 +2035,7 @@ fn lod_retry_deadline(
     )
 }
 
-fn classify_asset_load_failure(error: &AssetLoadError) -> LodChunkFailure {
+pub(super) fn classify_asset_load_failure(error: &AssetLoadError) -> LodChunkFailure {
     let class = match error {
         AssetLoadError::AssetReaderError(AssetReaderError::Io(error))
             if error.kind() != std::io::ErrorKind::NotFound =>
@@ -2033,7 +2054,7 @@ fn classify_asset_load_failure(error: &AssetLoadError) -> LodChunkFailure {
     }
 }
 
-fn verify_payload_hash(path: PathBuf, expected: String) -> Result<(), LodChunkFailure> {
+pub(super) fn verify_payload_hash(path: PathBuf, expected: String) -> Result<(), LodChunkFailure> {
     let bytes = std::fs::read(&path).map_err(|error| {
         let reason = format!("failed to read LOD payload {}: {error}", path.display());
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -2139,7 +2160,6 @@ fn update_counts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::LodHorizon;
 
     fn fixture_chunk_owner(world: &mut World, tier: LodTier, grid: IVec2) -> Entity {
         let worldspace_id = world.resource::<EngineConfig>().worldspace_id;

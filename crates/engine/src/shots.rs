@@ -400,6 +400,8 @@ pub struct SettleCounts {
     pub pending_batch_selection: usize,
     pub pending_specializations: Option<usize>,
     pub pending_render_transfers: Option<usize>,
+    /// Distant object blocks and tree billboard blocks requested but not yet spawned.
+    pub pending_lod_objects: usize,
 }
 
 /// The run-wide failure counters at one moment. They only ever grow, so a shot compares them with
@@ -444,6 +446,11 @@ impl SettleCounts {
     ) -> Self {
         let now = Failures::read(streaming, renderer);
         Self {
+            pending_lod_objects: streaming.pending_lod_object_blocks
+                + streaming.pending_lod_tree_blocks
+                + streaming.unrecovered_lod_object_blocks
+                + streaming.unrecovered_lod_tree_blocks
+                + streaming.pending_native_lod_draws,
             loading_cells: streaming.loading_cells,
             active_requests: streaming.active_requests,
             pending_asset_instances: streaming.pending_asset_instances,
@@ -486,6 +493,7 @@ impl SettleCounts {
             && self.arming_queue_depth == 0
             && self.retiring_cells == 0
             && self.failed_cells == 0
+            && self.pending_lod_objects == 0
             && self.asset_load_failures == 0
             && self.validation_failures == 0
             && self.renderer_ready
@@ -494,13 +502,14 @@ impl SettleCounts {
     /// The pending work and the failures, for the log line of a shot that never settled.
     pub fn describe(&self) -> String {
         format!(
-            "loading_cells={} active_requests={} pending_assets={} pending_surfaces={} \
+            "loading_cells={} active_requests={} pending_assets={} pending_surfaces={} native_lod={} \
              arming={} retiring={} failed_cells={} asset_load_failures={} validation_failures={} \
              renderer_ready={}",
             self.loading_cells,
             self.active_requests,
             self.pending_asset_instances,
             self.pending_surface_instances,
+            self.pending_lod_objects,
             self.arming_queue_depth,
             self.retiring_cells,
             self.failed_cells,
@@ -1618,6 +1627,10 @@ mod tests {
             ..ready
         };
         assert!(shots_settled(&quiet));
+        assert!(!shots_settled(&SettleCounts {
+            pending_lod_objects: 1,
+            ..quiet
+        }));
         let short = SettleCounts {
             quiet_frames: SETTLE_QUIET_FRAMES - 1,
             ..ready
