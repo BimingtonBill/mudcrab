@@ -1421,17 +1421,21 @@ fn setup_terrain_water_fixture(
     commands.spawn((
         Name::new("Terrain/water fixture water"),
         Mesh3d(meshes.add(Plane3d::default().mesh().size(2200.0, 2200.0))),
-        MeshMaterial3d(water_materials.add(WaterMaterial {
-            base: StandardMaterial {
-                base_color: Color::srgba(0.04, 0.2, 0.32, 0.7),
-                metallic: 0.15,
-                perceptual_roughness: 0.06,
-                reflectance: 0.9,
-                alpha_mode: AlphaMode::Blend,
-                ..default()
-            },
-            extension: WaterExtension::with_reflection(reflection.0.clone(), Some(flow_normal)),
-        })),
+        MeshMaterial3d(
+            water_materials.add(WaterMaterial {
+                base: StandardMaterial {
+                    base_color: Color::srgba(0.04, 0.2, 0.32, 0.7),
+                    metallic: 0.15,
+                    perceptual_roughness: 0.06,
+                    reflectance: 0.9,
+                    alpha_mode: AlphaMode::Blend,
+                    ..default()
+                },
+                // A fixed clock keeps the fixture a reproducible still.
+                extension: WaterExtension::with_reflection(reflection.0.clone(), Some(flow_normal))
+                    .with_pinned_clock(1.0),
+            }),
+        ),
         Transform::from_xyz(CELL_SIZE_HALF, 12.0, -CELL_SIZE_HALF),
         crate::world::components::WaterSurface,
         TerrainWaterFixtureWater,

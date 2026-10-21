@@ -3,15 +3,19 @@
     pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
     forward_io::{VertexOutput, FragmentOutput},
 }
-#import bevy_pbr::mesh_view_bindings::view
+#import bevy_pbr::mesh_view_bindings::{view, globals}
 
 struct WaterSettings {
+    // x = wave scale, y = wave speed, z = wave strength. w unused.
     wave_scale_speed_strength: vec4<f32>,
+    // xy = flow direction, z unused, w = 1 when the flow normal texture is present.
     flow_direction: vec4<f32>,
     // x = Fresnel Amount (Schlick F0), y = Reflectivity Amount (WATR DNAM, per-water; falls back
     // to Skyrim's DefaultWater 0.10 / 0.8 when a water has no decoded colours).
     // z = interactive reflection multiplier, w unused.
     fresnel_reflectivity: vec4<f32>,
+    // x = pinned clock in seconds, y = 1 to use it instead of the shared clock. z/w unused.
+    clock: vec4<f32>,
     // rgb = the water's Reflection Color (linear): what it reflects where the reflection image has
     // no coverage (alpha 0). Vanilla fades the reflection to this colour as reflectivity drops.
     reflection_color: vec4<f32>,
@@ -28,7 +32,9 @@ struct WaterSettings {
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     let scale = water.wave_scale_speed_strength.x;
-    let phase = water.wave_scale_speed_strength.w * water.wave_scale_speed_strength.y;
+    // The shared view clock: no per-material time, so the material is never rewritten per frame.
+    let time = select(globals.time, water.clock.x, water.clock.y > 0.5);
+    let phase = time * water.wave_scale_speed_strength.y;
     let strength = water.wave_scale_speed_strength.z;
     let p = in.world_position.xz * scale + water.flow_direction.xy * phase;
     var dx = cos(p.x + sin(p.y * 1.7)) * strength;
