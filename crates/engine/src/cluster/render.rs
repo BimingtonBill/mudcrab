@@ -117,6 +117,9 @@ pub(super) mod queue_stats {
 
     pub static BATCH_FULL: AtomicU64 = AtomicU64::new(0);
     pub static BATCH_SKIPPED: AtomicU64 = AtomicU64::new(0);
+    /// Views whose batches were walked (an input of the walk changed, or the last walk left a
+    /// batch out for want of a prepared material, mesh or pipeline).
+    pub static BATCH_WALKS: AtomicU64 = AtomicU64::new(0);
     pub static BATCH_NANOS: AtomicU64 = AtomicU64::new(0);
     pub static SHADOW_FULL: AtomicU64 = AtomicU64::new(0);
     pub static SHADOW_SKIPPED: AtomicU64 = AtomicU64::new(0);
@@ -178,10 +181,11 @@ pub(super) mod queue_stats {
         let take = |counter: &AtomicU64| counter.swap(0, Relaxed);
         let per_frame = |nanos: u64| nanos as f64 / 1.0e6 / QUEUE_REPORT_EVERY as f64;
         bevy::log::info!(
-            "cluster queue over {QUEUE_REPORT_EVERY} frames: batches {} full / {} skipped views, {:.2} ms/frame; \
+            "cluster queue over {QUEUE_REPORT_EVERY} frames: batches {} full / {} skipped views ({} walked), {:.2} ms/frame; \
              shadows {} full / {} skipped views, {:.2} ms/frame; source orders built {}; batch loader {:.2}, extract {:.2}, prepare {:.2}, cull {:.2} ms/frame (writes {:.2}, passes {:.2}); draw groups: camera {} ({} pipelines x {} material bind groups; {} of {} batches bindless), a shadow view {}",
             take(&BATCH_FULL),
             take(&BATCH_SKIPPED),
+            take(&BATCH_WALKS),
             per_frame(take(&BATCH_NANOS)),
             take(&SHADOW_FULL),
             take(&SHADOW_SKIPPED),
@@ -2329,6 +2333,7 @@ fn queue_cluster_batches(
             continue;
         }
         perf_span!("cluster::queue_batches::walk");
+        queue_stats::bump(&queue_stats::BATCH_WALKS);
         let mut incomplete = false;
         // By batch index, so the plan below does not depend on the order Bevy hands the visible
         // lists over in (parallel queues: a different order every frame).
