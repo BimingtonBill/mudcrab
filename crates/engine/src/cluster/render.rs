@@ -331,6 +331,8 @@ struct ClusterBatchMaterials {
     /// can only have changed then. The stock material table's own change tick is no use for this:
     /// something unrelated to the batches (an animated material) moves it every frame.
     version: u64,
+    /// Exact batches changed by the latest version; renderer caches still use `version`.
+    changed_batches: HashSet<usize>,
 }
 
 /// What the render world needs to place and show the instances this frame, read from the main
@@ -410,6 +412,8 @@ fn extract_batch_materials(
     let _timer = queue_stats::Timed::start(&queue_stats::EXTRACT_NANOS);
     let mut changed = false;
     let mut dirty = HashSet::new();
+    let mut changed_batches = HashSet::new();
+    let mut asset_changes = HashSet::new();
     // The handles change only while materials are being requested, so the table is read only then.
     if handles.is_changed() {
         let ids: Vec<_> = handles
@@ -418,6 +422,10 @@ fn extract_batch_materials(
             .map(|handle| handle.as_ref().map(bevy::asset::UntypedHandle::id))
             .collect();
         if out.ids != ids {
+            changed_batches.extend(
+                (0..out.ids.len().max(ids.len()))
+                    .filter(|&index| out.ids.get(index) != ids.get(index)),
+            );
             out.ids = ids;
             out.named = out.ids.iter().flatten().copied().collect();
             let named = out.named.clone();
@@ -433,6 +441,7 @@ fn extract_batch_materials(
             changed = true;
             standard_hits.push(*event);
             dirty.insert(event_asset_id(event).untyped());
+            asset_changes.insert(event_asset_id(event).untyped());
         }
     }
     let mut snow_hits = 0usize;
@@ -441,6 +450,7 @@ fn extract_batch_materials(
             changed = true;
             snow_hits += 1;
             dirty.insert(event_asset_id(event).untyped());
+            asset_changes.insert(event_asset_id(event).untyped());
         }
     }
     let mut terrain_changed = false;
@@ -449,11 +459,18 @@ fn extract_batch_materials(
             let id = event_asset_id(event).untyped();
             if out.named.contains(&id) {
                 dirty.insert(id);
+                asset_changes.insert(id);
                 terrain_changed = true;
             }
         }
     }
     changed |= terrain_changed;
+    if !asset_changes.is_empty() {
+        changed_batches.extend(out.ids.iter().enumerate().filter_map(|(index, id)| {
+            id.is_some_and(|id| asset_changes.contains(&id))
+                .then_some(index)
+        }));
+    }
     let (standard, snow, terrain) = &*assets;
     for id in dirty {
         match material_geometry(id, standard, snow.as_deref(), terrain.as_deref()) {
@@ -466,6 +483,7 @@ fn extract_batch_materials(
         }
     }
     if changed {
+        out.changed_batches = changed_batches;
         out.version += 1;
         debug!(
             version = out.version,

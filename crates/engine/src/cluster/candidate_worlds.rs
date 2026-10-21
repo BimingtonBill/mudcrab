@@ -6,6 +6,9 @@ use super::*;
 pub(super) struct CandidateWorlds {
     pub(super) all: bool,
     pub(super) worlds: HashSet<u32>,
+    pub(super) cells: HashSet<(u32, IVec2)>,
+    pub(super) batches: HashSet<usize>,
+    pub(super) global_worlds: HashSet<u32>,
 }
 
 pub(super) struct CandidateInputs<'a> {
@@ -57,9 +60,22 @@ fn changed_keys<'a, K: Eq + std::hash::Hash, V: PartialEq>(
 }
 
 impl CandidateWorlds {
+    fn cell(&mut self, world: u32, grid: IVec2) {
+        self.worlds.insert(world);
+        self.cells.insert((world, grid));
+    }
+
+    fn global(&mut self, world: u32) {
+        self.worlds.insert(world);
+        self.global_worlds.insert(world);
+    }
+
     fn reference(&mut self, input: &CandidateInputs<'_>, reference: u32) {
         if let Some(reference) = input.certificate.and_then(|c| c.reference(reference)) {
-            self.worlds.insert(reference.placed_worldspace_id);
+            self.cell(
+                reference.placed_worldspace_id,
+                IVec2::new(reference.cell.0, reference.cell.1),
+            );
         } else {
             self.all = true;
         }
@@ -74,7 +90,7 @@ impl CandidateWorlds {
             if entities.contains(owner) {
                 found.insert(*owner);
                 if let Some(record) = input.certificate.and_then(|c| c.record(key)) {
-                    self.worlds.insert(record.worldspace);
+                    self.reference(input, record.reference);
                 } else {
                     self.all = true;
                 }
@@ -88,6 +104,32 @@ impl CandidateWorlds {
         }
         self.all |= !entities.is_subset(&found);
     }
+
+    /// Names the exterior worlds an entity belonged to before and after a change. A move into an
+    /// interior (no exterior world on one side) still revokes the exterior it left; an entity
+    /// that never had an exterior world to name cannot be scoped at all.
+    fn entity_worlds<'a>(
+        &mut self,
+        inputs: impl IntoIterator<Item = &'a CandidateInputs<'a>>,
+        entity: &MainEntity,
+    ) {
+        let (mut known, mut unknown) = (false, false);
+        for input in inputs {
+            match input.worlds.get(entity) {
+                Some(Some(world)) => {
+                    known = true;
+                    self.global(*world);
+                }
+                Some(None) | None => unknown = true,
+            }
+        }
+        self.all |= unknown && !known;
+    }
+}
+
+/// Slots whose readiness differs, in either direction and across a change of length.
+fn changed_slots(old: &[bool], new: &[bool]) -> impl Iterator<Item = usize> {
+    (0..old.len().max(new.len())).filter(move |&index| old.get(index) != new.get(index))
 }
 
 pub(super) fn candidate_worlds(
@@ -100,14 +142,19 @@ pub(super) fn candidate_worlds(
         _ => false,
     };
     let mut delta = CandidateWorlds {
-        all: !same_certificate
-            || old.templates != new.templates
-            || old.normal_maps != new.normal_maps,
+        all: !same_certificate,
         ..default()
     };
     if delta.all {
         return delta;
     }
+    // Shared batches are resolved to the cells of their members when the destination is judged.
+    delta
+        .batches
+        .extend(changed_slots(old.templates, new.templates));
+    delta
+        .batches
+        .extend(changed_slots(old.normal_maps, new.normal_maps));
     for reference in old.present.symmetric_difference(new.present) {
         delta.reference(old, *reference);
         delta.reference(new, *reference);
@@ -125,7 +172,7 @@ pub(super) fn candidate_worlds(
     }
     for key in changed_keys(old.bound, new.bound) {
         if let Some(record) = old.certificate.and_then(|c| c.record(key)) {
-            delta.worlds.insert(record.worldspace);
+            delta.reference(old, record.reference);
         } else {
             delta.all = true;
         }
@@ -152,32 +199,26 @@ pub(super) fn candidate_worlds(
             .collect();
         delta.entities(input, &owned);
     }
+    // A camera or light changing world changes what every destination in that world is lit and
+    // viewed by, so it stays world-wide within the worlds it names.
     for entity in changed_keys(old.worlds, new.worlds) {
-        delta
-            .worlds
-            .extend(old.worlds.get(entity).copied().flatten());
-        delta
-            .worlds
-            .extend(new.worlds.get(entity).copied().flatten());
+        delta.entity_worlds([old, new], entity);
     }
     for entity in changed_keys(old.light_dependencies, new.light_dependencies) {
-        for input in [old, new] {
-            if input.light_dependencies.contains_key(entity) {
-                match input.worlds.get(entity) {
-                    Some(world) => delta.worlds.extend(world),
-                    None => delta.all = true,
-                }
-            }
-        }
+        let owners: Vec<_> = [old, new]
+            .into_iter()
+            .filter(|input| input.light_dependencies.contains_key(entity))
+            .collect();
+        delta.entity_worlds(owners, entity);
     }
     if terrain_map_change(old.terrain, new.terrain) == TerrainMapChange::Invalidating {
         for entity in changed_keys(old.terrain, new.terrain) {
             debug!(?entity, previous = ?old.terrain.get(entity), current = ?new.terrain.get(entity),
                 "cluster terrain candidate identity changed");
             for input in [old, new] {
-                delta
-                    .worlds
-                    .extend(input.terrain.get(entity).map(|t| t.worldspace_id));
+                if let Some(identity) = input.terrain.get(entity) {
+                    delta.cell(identity.worldspace_id, identity.grid);
+                }
             }
         }
     }
@@ -185,7 +226,7 @@ pub(super) fn candidate_worlds(
         debug!(?entity, previous = ?old.terrain.get(entity), current = ?new.terrain.get(entity),
             "cluster terrain candidate visibility withdrawn");
         if let Some(identity) = old.terrain.get(entity) {
-            delta.worlds.insert(identity.worldspace_id);
+            delta.cell(identity.worldspace_id, identity.grid);
         } else {
             delta.all = true;
         }
@@ -225,6 +266,16 @@ mod tests {
         let delta = candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs());
         assert!(!delta.all);
         assert_eq!(delta.worlds, HashSet::from([child.worldspace]));
+        let snapshot = certificate.reference(child.reference).unwrap();
+        assert_eq!(
+            delta.cells,
+            HashSet::from([(
+                snapshot.placed_worldspace_id,
+                IVec2::new(snapshot.cell.0, snapshot.cell.1),
+            )])
+        );
+        assert!(delta.global_worlds.is_empty());
+        assert!(delta.batches.is_empty());
         let mut generations = Generations::default();
         let ready_key = DestinationKey {
             view: ViewKey {
@@ -256,6 +307,16 @@ mod tests {
             .insert(*key, MainEntity::from(Entity::from_bits(124)));
         let delta = candidate_worlds(&old.candidate_inputs(), &replacement.candidate_inputs());
         assert_eq!(delta.worlds, HashSet::from([child.worldspace]));
+        let snapshot = certificate.reference(child.reference).unwrap();
+        assert_eq!(
+            delta.cells,
+            HashSet::from([(
+                snapshot.placed_worldspace_id,
+                IVec2::new(snapshot.cell.0, snapshot.cell.1),
+            )])
+        );
+        assert!(delta.global_worlds.is_empty());
+        assert!(delta.batches.is_empty());
         assert!(!delta.all);
     }
 
@@ -282,6 +343,11 @@ mod tests {
         let delta = candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs());
         assert_eq!(delta.worlds, HashSet::from([100, 200]));
         assert!(!delta.all);
+        assert_eq!(
+            delta.cells,
+            HashSet::from([(100, IVec2::ZERO), (200, IVec2::ZERO)])
+        );
+        assert!(delta.global_worlds.is_empty());
         old.worlds.insert(entity, Some(100));
         new.worlds.insert(entity, Some(200));
         old.light_dependencies.insert(entity, Some(HashSet::new()));
@@ -289,20 +355,218 @@ mod tests {
         let delta = candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs());
         assert_eq!(delta.worlds, HashSet::from([100, 200]));
         assert!(!delta.all);
+        assert_eq!(delta.global_worlds, HashSet::from([100, 200]));
     }
 
     #[test]
-    fn unknown_ownership_and_global_templates_fail_closed() {
+    fn unknown_reference_and_entity_ownership_fail_closed() {
         let old = Sources::default();
         let mut new = Sources::default();
         new.present.insert(999);
         assert!(candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs()).all);
         new.present.clear();
-        new.templates.push(true);
-        assert!(candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs()).all);
-        new.templates.clear();
         new.retired_materials
             .insert(MainEntity::from(Entity::from_bits(123)), None);
+        assert!(candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs()).all);
+    }
+
+    #[test]
+    fn readiness_arrays_track_changed_slots_in_both_directions_and_lengths() {
+        for normal_maps in [false, true] {
+            for (before, after, expected) in [
+                (
+                    vec![false, true, true],
+                    vec![true, true, false],
+                    HashSet::from([0, 2]),
+                ),
+                (vec![true], vec![true, false, true], HashSet::from([1, 2])),
+                (vec![true, false, true], vec![true], HashSet::from([1, 2])),
+            ] {
+                let mut old = Sources::default();
+                let mut new = Sources::default();
+                if normal_maps {
+                    old.normal_maps = before;
+                    new.normal_maps = after;
+                } else {
+                    old.templates = before;
+                    new.templates = after;
+                }
+                let delta = candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs());
+                assert_eq!(delta.batches, expected, "normal_maps={normal_maps}");
+                assert!(!delta.all);
+                assert!(delta.cells.is_empty());
+                assert!(delta.worlds.is_empty());
+                assert!(delta.global_worlds.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn unchanged_shared_batches_produce_no_delta() {
+        let old = Sources {
+            templates: vec![true, false, true],
+            normal_maps: vec![false, true, false],
+            ..default()
+        };
+        let new = Sources {
+            templates: old.templates.clone(),
+            normal_maps: old.normal_maps.clone(),
+            ..default()
+        };
+        assert_eq!(
+            candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs()),
+            CandidateWorlds::default()
+        );
+    }
+
+    #[test]
+    fn same_world_terrain_changes_preserve_exact_old_and_new_cells() {
+        let entity = MainEntity::from(Entity::from_bits(123));
+        let identity = crate::streaming::TerrainPrimitiveIdentity {
+            worldspace_id: 100,
+            grid: IVec2::new(-3, 7),
+            quadrant: 0,
+            tier: None,
+        };
+        let mut old = Sources::default();
+        Arc::make_mut(&mut old.terrain).insert(entity, identity);
+        let mut new = Sources::default();
+        let next_grid = IVec2::new(8, -2);
+        Arc::make_mut(&mut new.terrain).insert(
+            entity,
+            crate::streaming::TerrainPrimitiveIdentity {
+                grid: next_grid,
+                ..identity
+            },
+        );
+        let delta = candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs());
+        assert_eq!(
+            delta.cells,
+            HashSet::from([(100, identity.grid), (100, next_grid)])
+        );
+        assert_eq!(delta.worlds, HashSet::from([100]));
+        assert!(delta.global_worlds.is_empty());
+        assert!(!delta.all);
+    }
+
+    #[test]
+    fn terrain_visibility_withdrawal_scopes_unchanged_identity() {
+        let entity = MainEntity::from(Entity::from_bits(123));
+        let identity = crate::streaming::TerrainPrimitiveIdentity {
+            worldspace_id: 100,
+            grid: IVec2::new(5, -9),
+            quadrant: 0,
+            tier: None,
+        };
+        let mut old = Sources::default();
+        Arc::make_mut(&mut old.terrain).insert(entity, identity);
+        old.terrain_visible.insert(entity);
+        let new = Sources {
+            terrain: old.terrain.clone(),
+            ..default()
+        };
+        let delta = candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs());
+        assert_eq!(delta.cells, HashSet::from([(100, identity.grid)]));
+        assert_eq!(delta.worlds, HashSet::from([100]));
+        assert!(delta.global_worlds.is_empty());
+        assert!(!delta.all);
+    }
+
+    #[test]
+    fn bound_and_retired_entity_changes_use_child_reference_cell() {
+        let directory = published_for_loader();
+        let certificate = Arc::new(
+            crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
+        );
+        let (key, record) = certificate
+            .records()
+            .find(|(key, record)| key.worldspace != record.worldspace)
+            .unwrap();
+        let snapshot = certificate.reference(record.reference).unwrap();
+        let expected = HashSet::from([(
+            snapshot.placed_worldspace_id,
+            IVec2::new(snapshot.cell.0, snapshot.cell.1),
+        )]);
+        let entity = MainEntity::from(Entity::from_bits(123));
+        let mut old = Sources {
+            certificate: Some(certificate.clone()),
+            ..default()
+        };
+        old.bound.insert(*key, entity);
+        let mut new = Sources {
+            certificate: Some(certificate.clone()),
+            ..default()
+        };
+        // No presence delta can mask an incorrectly scoped binding delta.
+        let delta = candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs());
+        assert_eq!(delta.cells, expected);
+        assert!(!delta.all);
+        new.bound = old.bound.clone();
+        new.retired_materials.insert(entity, None);
+        for (before, after) in [(&old, &new), (&new, &old)] {
+            let delta = candidate_worlds(&before.candidate_inputs(), &after.candidate_inputs());
+            assert_eq!(delta.cells, expected);
+            assert_eq!(delta.worlds, HashSet::from([snapshot.placed_worldspace_id]));
+            assert!(delta.global_worlds.is_empty());
+            assert!(!delta.all);
+        }
+        old.bound.clear();
+        new.bound.clear();
+        old.stock_primitives.insert((record.reference, 0), entity);
+        new.stock_primitives = old.stock_primitives.clone();
+        let delta = candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs());
+        assert_eq!(delta.cells, expected);
+        assert!(!delta.all);
+    }
+
+    #[test]
+    fn world_and_light_changes_remain_global_within_known_worlds() {
+        let entity = MainEntity::from(Entity::from_bits(123));
+        let mut old = Sources::default();
+        old.worlds.insert(entity, Some(100));
+        let mut new = Sources::default();
+        new.worlds.insert(entity, Some(200));
+        let delta = candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs());
+        assert_eq!(delta.global_worlds, HashSet::from([100, 200]));
+        assert_eq!(delta.worlds, delta.global_worlds);
+        assert!(delta.cells.is_empty());
+        assert!(!delta.all);
+        new.worlds = old.worlds.clone();
+        old.light_dependencies.insert(entity, Some(HashSet::new()));
+        new.light_dependencies.insert(entity, None);
+        let delta = candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs());
+        assert_eq!(delta.global_worlds, HashSet::from([100]));
+        assert!(delta.cells.is_empty());
+        assert!(!delta.all);
+    }
+
+    #[test]
+    fn unknown_world_and_light_ownership_fail_closed() {
+        let old = Sources::default();
+        let entity = MainEntity::from(Entity::from_bits(123));
+        let mut new = Sources::default();
+        new.worlds.insert(entity, None);
+        assert!(candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs()).all);
+        new.worlds.clear();
+        new.light_dependencies.insert(entity, None);
+        assert!(candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs()).all);
+    }
+
+    #[test]
+    fn certificate_replacement_invalidates_all_scopes() {
+        let directory = published_for_loader();
+        let old = Sources {
+            certificate: Some(Arc::new(
+                crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
+            )),
+            ..default()
+        };
+        let new = Sources {
+            certificate: Some(Arc::new(
+                crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
+            )),
+            ..default()
+        };
         assert!(candidate_worlds(&old.candidate_inputs(), &new.candidate_inputs()).all);
     }
 }

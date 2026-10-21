@@ -53,6 +53,21 @@ pub(super) fn install(app: &mut App) {
 
 /// Eligibility/composition changes invalidate old reports; becoming drawable does
 /// not invalidate its own new Ready report on every pipeline-preparation step.
+#[path = "destination_scope.rs"]
+mod destination_scope;
+
+#[derive(Default)]
+struct CandidateObserver {
+    versions: Option<(u64, u64)>,
+    certificate: Option<Arc<crate::cluster::reader::CertifiedPackage>>,
+    scene_present: bool,
+    index: destination_scope::BatchCells,
+    worlds: HashSet<WorldId>,
+    // Keep the dependency scope of stored reports after their request is withdrawn.
+    // A later change must revoke those reports as well as pending requests.
+    scopes: HashMap<DestinationKey, Arc<[CellKey]>>,
+}
+
 fn observe_candidates(
     sources: Res<Sources>,
     materials: Res<ClusterBatchMaterials>,
@@ -60,95 +75,155 @@ fn observe_candidates(
     mut main: ResMut<MainWorld>,
     frame: Option<Res<RenderFrame>>,
     invalidations: Option<ResMut<RenderInvalidations>>,
-    mut previous: Local<Option<(u64, u64, HashSet<WorldId>)>>,
+    mut previous: Local<CandidateObserver>,
 ) {
-    if previous
-        .as_ref()
-        .is_some_and(|(version, material_version, _)| {
-            *version == sources.candidate_version
-                && *material_version == materials.version
-                && !scene.as_ref().is_some_and(|scene| scene.is_changed())
+    let pending: HashSet<_> = main
+        .get_resource::<DestinationRequests>()
+        .into_iter()
+        .flat_map(|requests| requests.iter())
+        .map(|(_, request)| {
+            previous
+                .scopes
+                .insert(request.key, Arc::clone(&request.coverage));
+            request.key
         })
-    {
+        .collect();
+    previous.scopes.retain(|key, _| {
+        let current = main
+            .get_resource::<Generations>()
+            .is_none_or(|generations| generations.current(key.world) == key.generation);
+        current
+            && (pending.contains(key)
+                || main
+                    .get_resource::<DestinationReports>()
+                    .is_some_and(|reports| reports.get(key).is_some()))
+    });
+    let same_certificate = match (&previous.certificate, &sources.certificate) {
+        (Some(old), Some(new)) => Arc::ptr_eq(old, new),
+        (None, None) => true,
+        _ => false,
+    };
+    let scope_changed = !same_certificate
+        || previous.scene_present != scene.is_some()
+        || scene.as_ref().is_some_and(|scene| scene.is_changed());
+    if !scope_changed && previous.versions == Some((sources.candidate_version, materials.version)) {
         return;
     }
+    let source_changed = previous
+        .versions
+        .is_none_or(|(source, _)| source != sources.candidate_version);
+    let materials_changed = previous
+        .versions
+        .is_none_or(|(_, material)| material != materials.version);
+    let old_worlds = previous.worlds.clone();
+    if scope_changed || previous.versions.is_none() {
+        previous.index = scene
+            .as_ref()
+            .map_or_else(destination_scope::BatchCells::default, |scene| {
+                destination_scope::BatchCells::build(scene, sources.certificate.as_deref())
+            });
+        previous.worlds = sources
+            .certificate
+            .as_ref()
+            .into_iter()
+            .flat_map(|certificate| certificate.records())
+            .map(|(_, record)| WorldId::exterior(record.worldspace))
+            .chain(
+                scene
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|scene| scene.terrain_blocks.iter())
+                    .map(|block| WorldId::exterior(block.worldspace_id)),
+            )
+            .collect();
+        previous.certificate = sources.certificate.clone();
+        previous.scene_present = scene.is_some();
+    }
+    previous.worlds.extend(
+        sources
+            .worlds
+            .values()
+            .flatten()
+            .copied()
+            .map(WorldId::exterior),
+    );
+    let empty_delta = CandidateWorlds::default();
+    let empty_batches = HashSet::new();
+    let mut effects = destination_scope::Effects::from_delta(
+        if source_changed {
+            &sources.candidate_worlds
+        } else {
+            &empty_delta
+        },
+        if materials_changed {
+            &materials.changed_batches
+        } else {
+            &empty_batches
+        },
+        &previous.index,
+    );
+    // A delta belongs to one version only. A missed version, absent material
+    // dependency information, or replacement of the whole scope fails closed.
+    effects.all |= scope_changed
+        || previous.versions.is_none()
+        || previous.versions.is_some_and(|(source, material)| {
+            (source_changed && source.wrapping_add(1) != sources.candidate_version)
+                || (materials_changed && material.wrapping_add(1) != materials.version)
+        })
+        || (materials_changed && materials.changed_batches.is_empty());
+    let mut changed = effects.changed_worlds();
+    if effects.all {
+        changed.extend(&previous.worlds);
+        changed.extend(old_worlds);
+    }
+    let mut revoke = HashSet::new();
+    let mut remove = Vec::new();
+    for world in changed {
+        let mut observed = false;
+        for (key, coverage) in previous.scopes.iter().filter(|(key, _)| key.world == world) {
+            observed = true;
+            if effects.affects(world, coverage) {
+                if pending.contains(key) {
+                    revoke.insert(world);
+                } else {
+                    remove.push(*key);
+                }
+            }
+        }
+        // Unknown/manual report scopes retain conservative world invalidation.
+        if !observed {
+            revoke.insert(world);
+        }
+    }
+    if let Some(mut reports) = main.get_resource_mut::<DestinationReports>() {
+        for key in &remove {
+            reports.remove(key);
+        }
+    }
+    for key in &remove {
+        previous.scopes.remove(key);
+    }
     debug!(
-        source_version = sources.version,
-        candidate_version = sources.candidate_version,
+        source_version = sources.candidate_version,
         material_version = materials.version,
-        previous_candidate_version = previous.as_ref().map(|(source, _, _)| *source),
-        previous_material_version = previous.as_ref().map(|(_, material, _)| *material),
-        scene_changed = scene.as_ref().is_some_and(|scene| scene.is_changed()),
-        "cluster destination candidate inputs changed"
+        global = effects.all,
+        affected_cells = effects.cells.len(),
+        affected_batches = sources.candidate_worlds.batches.len(),
+        material_batches = materials.changed_batches.len(),
+        ?revoke,
+        stored_reports_removed = remove.len(),
+        pending_requests = pending.len(),
+        "cluster destination scoped invalidation"
     );
-    let worlds: HashSet<_> = sources
-        .certificate
-        .as_ref()
-        .into_iter()
-        .flat_map(|certificate| certificate.records())
-        .map(|(_, record)| WorldId::exterior(record.worldspace))
-        .chain(
-            scene
-                .as_ref()
-                .into_iter()
-                .flat_map(|scene| scene.terrain_blocks.iter())
-                .map(|block| WorldId::exterior(block.worldspace_id)),
-        )
-        .chain(
-            sources
-                .worlds
-                .values()
-                .flatten()
-                .copied()
-                .map(WorldId::exterior),
-        )
-        .collect();
-    let global = previous
-        .as_ref()
-        .is_none_or(|(_, old_materials, _)| *old_materials != materials.version)
-        || scene.as_ref().is_some_and(|scene| scene.is_changed());
-    let candidate_changed = previous
-        .as_ref()
-        .is_none_or(|(version, _, _)| *version != sources.candidate_version);
-    let mut changed = HashSet::new();
-    if global || (candidate_changed && sources.candidate_worlds.all) {
-        changed.extend(&worlds);
-        if let Some((_, _, old)) = previous.as_ref() {
-            changed.extend(old);
-        }
-    } else if candidate_changed {
-        changed.extend(
-            sources
-                .candidate_worlds
-                .worlds
-                .iter()
-                .copied()
-                .map(WorldId::exterior),
-        );
-    }
-    debug!(
-        ?changed,
-        global,
-        candidate_all = sources.candidate_worlds.all,
-        "cluster destination affected worlds"
-    );
-    if bevy::log::tracing::enabled!(bevy::log::Level::DEBUG)
-        && let Some(requests) = main.get_resource::<DestinationRequests>()
-    {
-        for (_, request) in requests.iter() {
-            debug!(key = ?request.key, coverage = ?request.coverage,
-                "cluster destination invalidation coverage");
-        }
-    }
     if let (Some(frame), Some(mut invalidations), Some(mut generations)) =
         (frame, invalidations, main.get_resource_mut::<Generations>())
     {
-        for world in changed {
+        for world in revoke {
             generations.bump(world, InvalidationCause::Candidate);
             invalidations.revoke(world, *frame, InvalidationCause::Candidate);
         }
     }
-    *previous = Some((sources.candidate_version, materials.version, worlds));
+    previous.versions = Some((sources.candidate_version, materials.version));
 }
 
 fn selected(view: &ViewGpu, index: u32) -> bool {
@@ -1124,6 +1199,7 @@ mod terrain_candidate_regressions {
         h.render.resource_mut::<Sources>().candidate_worlds = CandidateWorlds {
             all: false,
             worlds: HashSet::from([foreign_world]),
+            ..default()
         };
         h.observer.run(&mut h.render);
         assert!(
@@ -1148,6 +1224,91 @@ mod terrain_candidate_regressions {
         h.render.resource_mut::<ClusterBatchMaterials>().version += 1;
         h.observer.run(&mut h.render);
         assert!(!h.ready());
+    }
+
+    fn cover(grid: IVec2) -> CellKey {
+        CellKey::Exterior {
+            worldspace_id: WORLD,
+            grid_x: grid.x,
+            grid_y: grid.y,
+        }
+    }
+
+    /// A pending request for the harness's key, as the crossing code holds while it waits.
+    fn request_coverage(h: &mut Harness, coverage: Vec<CellKey>) -> RequestId {
+        let mut requests = DestinationRequests::default();
+        let id = requests.request(DestinationRequest {
+            key: h.key,
+            passes: PassFamilies::NONE,
+            coverage: Arc::from(coverage),
+            handoff: Handoff::NotRequired,
+        });
+        h.render
+            .resource_mut::<MainWorld>()
+            .insert_resource(requests);
+        // The observer records a request's coverage the first time it sees it.
+        h.observer.run(&mut h.render);
+        id
+    }
+
+    fn near_withdrawal() -> HashMap<MainEntity, TerrainPrimitiveIdentity> {
+        let mut current = near_map();
+        current.remove(&main(100));
+        current
+    }
+
+    fn generation(h: &Harness) -> Generation {
+        h.render
+            .resource::<MainWorld>()
+            .resource::<Generations>()
+            .current(h.key.world)
+    }
+
+    #[test]
+    fn same_world_change_outside_a_pending_destinations_coverage_does_not_bump_it() {
+        let mut h = Harness::ready_on_stock();
+        request_coverage(&mut h, vec![cover(GRID + IVec2::X)]);
+        let before = generation(&h);
+        assert_eq!(
+            h.apply_terrain(near_withdrawal()),
+            TerrainMapChange::Invalidating
+        );
+        assert_eq!(
+            generation(&h),
+            before,
+            "an unrelated cell must not restart it"
+        );
+        assert!(h.ready());
+    }
+
+    #[test]
+    fn same_world_change_inside_a_pending_destinations_coverage_bumps_it() {
+        let mut h = Harness::ready_on_stock();
+        request_coverage(&mut h, vec![cover(GRID + IVec2::X), cover(GRID)]);
+        let before = generation(&h);
+        h.apply_terrain(near_withdrawal());
+        assert_ne!(generation(&h), before);
+        assert!(!h.ready());
+    }
+
+    #[test]
+    fn stored_report_keeps_its_scope_after_the_request_is_withdrawn() {
+        let mut h = Harness::ready_on_stock();
+        let id = request_coverage(&mut h, vec![cover(GRID + IVec2::X)]);
+        h.render
+            .resource_mut::<MainWorld>()
+            .resource_mut::<DestinationRequests>()
+            .withdraw(id);
+        h.observer.run(&mut h.render);
+        h.apply_terrain(near_withdrawal());
+        assert!(h.ready(), "its coverage never included the changed cell");
+        let mut moved = near_withdrawal();
+        moved.get_mut(&main(101)).unwrap().grid = GRID + IVec2::X;
+        h.apply_terrain(moved);
+        assert!(
+            !h.ready(),
+            "a change that reaches its coverage revokes the stored report"
+        );
     }
 
     #[test]
