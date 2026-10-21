@@ -59,6 +59,7 @@ mod lod_objects;
 mod lod_trees;
 pub(crate) mod native_lod;
 pub(crate) mod terrain_audit;
+pub(crate) mod terrain_handoff;
 mod terrain_identity;
 use shared::terrain_mesh::TerrainCellMesh;
 use std::sync::Arc;
@@ -176,6 +177,11 @@ pub(crate) struct TerrainWorldspace(u32);
 
 #[derive(Component)]
 struct TerrainSurfaceReady;
+
+/// Terrain-only allocation retained as a reversible stand-in within the ordinary cell keep-set.
+/// The LOD selector owns its visibility; readiness and world identity remain the ordinary ones.
+#[derive(Component)]
+struct RingTerrain;
 
 /// The time since `started` in whole microseconds, saturating at `u64::MAX`.
 fn elapsed_micros(started: Instant) -> u64 {
@@ -306,6 +312,7 @@ impl Plugin for StreamingPlugin {
             lod_objects::ObjectLodPlugin,
             lod_trees::TreeLodPlugin,
             native_lod::NativeLodPlugin,
+            terrain_handoff::TerrainHandoffPlugin,
         ));
         // On a profiled run, the despawns the immediate unload queues through `Commands` are
         // applied at the schedule's sync point right after `plan_cells` - exactly where Bevy
@@ -762,8 +769,8 @@ pub struct StreamingMetrics {
     pub cells_downgraded: u64,
     /// Detail changes whose stand-in outlived
     /// [`MAX_SWAP_HOLD_FRAMES`](crate::swap_bridge::MAX_SWAP_HOLD_FRAMES): the root the cell was
-    /// drawn by was despawned anyway, so what it covered is unguarded from that frame on. A failure
-    /// count, not a wait - every one of them is warned about as well.
+    /// drawn by remains alive until the replacement draws or is cancelled. Each slow hold is
+    /// counted and warned about once; the diagnostic threshold never authorizes retirement.
     pub swap_hold_timeouts: u64,
     /// Ring grids that held nothing: the ones a worldspace does not reach, and cells whose
     /// landscape the cell cache does not carry. Deliberately not part of [`Self::failed_cells`]:
@@ -1512,13 +1519,9 @@ fn plan_cells(
         return;
     };
     let center = window_center(&config, camera.translation, origin.0);
-    // The ring of the worldspace the camera is in, resolved this frame: a run that did not name one
-    // draws none where the world has its own terrain LOD, and keeps it where it has none
-    // ([`EngineConfig::effective_terrain_radius`]). Resolved here rather than read from a resource
-    // so the plan cannot run on a ring from the space the camera was in last frame.
-    let terrain_radius = config.effective_terrain_radius(
-        database.has_lod_for(space.exterior_worldspace(config.worldspace_id)),
-    );
+    // Keep LAND stand-ins resident through drawable coverage withdrawal. Inventory does not
+    // authorize retirement; the existing LOD index arbitrates each surface's visibility below.
+    let terrain_radius = config.effective_terrain_radius(false);
     let mut wanted = wanted_cells(
         &space,
         config.worldspace_id,
@@ -1526,6 +1529,7 @@ fn plan_cells(
         terrain_radius,
         center,
     );
+    wanted.retain(|(key, detail)| terrain_request_required(&database, *key, *detail));
     let controlled = config.streaming_controls_enabled();
     if config.prioritize_streaming || controlled {
         // Keep door prestreams and full-detail cells ahead of the terrain ring,
@@ -3421,6 +3425,21 @@ fn retry_failed_interior(
     streaming.failed_retries.get(key).copied().unwrap_or(0) < MAX_CELL_LOAD_RETRIES
 }
 
+/// Whether this request has any terrain work; full loads still own references without LAND.
+fn terrain_request_required(database: &WorldDatabase, key: CellKey, detail: CellDetail) -> bool {
+    match (key, detail) {
+        (
+            CellKey::Exterior {
+                worldspace_id,
+                grid_x,
+                grid_y,
+            },
+            CellDetail::Terrain,
+        ) => database.requires_terrain(worldspace_id, [grid_x, grid_y]),
+        _ => true,
+    }
+}
+
 /// The cells the active cell wants resident, and what it wants of each: the interior the camera is
 /// in, or the exterior grid of `stream_radius` around it in full and the terrain-only ring out to
 /// `terrain_radius` beyond â€” plus everything the transition layer pre-streamed for a nearby load
@@ -3450,10 +3469,15 @@ fn wanted_cells(
         let mut grid = Vec::new();
         for y in -radius..=radius {
             for x in -radius..=radius {
+                let (Some(grid_x), Some(grid_y)) =
+                    (center.x.checked_add(x), center.y.checked_add(y))
+                else {
+                    continue;
+                };
                 let key = CellKey::Exterior {
                     worldspace_id: active.exterior_worldspace(configured_worldspace),
-                    grid_x: center.x + x,
-                    grid_y: center.y + y,
+                    grid_x,
+                    grid_y,
                 };
                 if let Some(detail) = wanted_detail(
                     active,
@@ -3505,10 +3529,12 @@ fn wanted_detail(
             if worldspace_id != active.exterior_worldspace(configured_worldspace) {
                 return None;
             }
-            let distance = (grid_x - center.x).abs().max((grid_y - center.y).abs());
-            if distance <= stream_radius {
+            let distance = (i64::from(grid_x) - i64::from(center.x))
+                .abs()
+                .max((i64::from(grid_y) - i64::from(center.y)).abs());
+            if distance <= i64::from(stream_radius) {
                 Some(CellDetail::Full)
-            } else if distance <= terrain_radius {
+            } else if distance <= i64::from(terrain_radius) {
                 Some(CellDetail::Terrain)
             } else {
                 None
@@ -3809,6 +3835,9 @@ fn spawn_cell_with_options(
                     SwapWaiting,
                     surface,
                 ));
+                if detail == CellDetail::Terrain {
+                    patch.insert(RingTerrain);
+                }
                 if let Some(grid) = terrain_grid {
                     patch.insert(MergedTerrainCoverage { grid });
                     if let CellKey::Exterior { worldspace_id, .. } = payload.key {
@@ -3875,6 +3904,9 @@ fn spawn_cell_with_options(
                     SwapWaiting,
                     surface,
                 ));
+                if detail == CellDetail::Terrain {
+                    patch.insert(RingTerrain);
+                }
                 if let Some(grid) = terrain_grid {
                     patch.insert(TerrainCoverage {
                         grid,
@@ -7171,7 +7203,7 @@ struct LifecycleQueries<'w, 's> {
 #[allow(clippy::too_many_arguments)]
 fn validate_streaming_lifecycle(
     config: Res<EngineConfig>,
-    database: Option<Res<WorldDatabase>>,
+    _database: Option<Res<WorldDatabase>>,
     active: Res<ActiveSpace>,
     origin: Res<RenderOrigin>,
     streaming: Res<StreamingWorld>,
@@ -7239,12 +7271,9 @@ fn validate_streaming_lifecycle(
         // The same ring the plan keeps cells by this frame, resolved the same way: a check that
         // read the configured ring where the plan drew none would accept a cell the plan has
         // stopped wanting (`EngineConfig::effective_terrain_radius`).
-        let has_lod = database.as_ref().is_some_and(|database| {
-            database.has_lod_for(active.exterior_worldspace(config.worldspace_id))
-        });
-        let terrain_radius = config.effective_terrain_radius(has_lod);
         camera.single().map_or(0, |camera| {
             let center = window_center(&config, camera.translation, origin.0);
+            let terrain_radius = config.effective_terrain_radius(false);
             let limit = config.unload_radius.max(terrain_radius.saturating_add(1));
             streaming
                 .cells
@@ -8348,6 +8377,44 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn ring_planning_uses_land_not_empty_cells_or_worldspace_chunk_presence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database_with_lod_for(&path, 60);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch("INSERT INTO cells VALUES(101,60,-3,0,NULL,0),(102,60,-2,0,NULL,0),(103,61,-3,0,NULL,0);
+            INSERT INTO land VALUES(101,x'00'),(103,x'00');").unwrap();
+        drop(connection);
+        let database = WorldDatabase::open(&path).unwrap();
+        let exterior = |worldspace_id, grid_x| CellKey::Exterior {
+            worldspace_id,
+            grid_x,
+            grid_y: 0,
+        };
+        assert!(
+            terrain_request_required(&database, exterior(60, -3), CellDetail::Terrain),
+            "LAND source hole must still request its stand-in"
+        );
+        assert!(
+            !terrain_request_required(&database, exterior(60, -2), CellDetail::Terrain),
+            "empty CELL is no phantom terrain"
+        );
+        assert!(
+            !terrain_request_required(&database, exterior(62, -3), CellDetail::Terrain),
+            "another world cannot satisfy this request"
+        );
+        assert!(terrain_request_required(
+            &database,
+            exterior(61, -3),
+            CellDetail::Terrain
+        ));
+        assert!(
+            terrain_request_required(&database, exterior(60, -2), CellDetail::Full),
+            "full cells still load references even without LAND"
+        );
+    }
+
     /// A cell cache holding one flat landscape without layers, encoded as the converter writes it.
     /// Without layers no layer texture is ever looked up, which is what lets the test use an empty
     /// asset catalogue.
@@ -9081,10 +9148,28 @@ mod tests {
     }
 
     #[test]
-    fn the_terrain_ring_follows_the_active_worldspaces_lod_data() {
+    fn sparse_lod_in_another_worldspace_does_not_remove_the_terrain_ring() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
         write_plan_database_with_lod_for(&path, 614);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        for (world_index, world) in [60, 614].into_iter().enumerate() {
+            for y in -2..=2 {
+                for x in -2..=2 {
+                    let id = 1000 + world_index as i32 * 100 + (y + 2) * 5 + x + 2;
+                    connection
+                        .execute(
+                            "INSERT INTO cells VALUES(?1,?2,?3,?4,NULL,0)",
+                            rusqlite::params![id, world, x, y],
+                        )
+                        .unwrap();
+                    connection
+                        .execute("INSERT INTO land VALUES(?1,x'00')", [id])
+                        .unwrap();
+                }
+            }
+        }
+        drop(connection);
         let config = EngineConfig {
             stream_radius: 1,
             terrain_radius: 2,
@@ -9148,8 +9233,8 @@ mod tests {
         let lod = planned_keys(&app);
         assert_eq!(
             lod.len(),
-            9,
-            "a worldspace with LOD data plans its full-detail grid and leaves the ring to the LOD"
+            25,
+            "a single source cell does not cover the requested terrain ring"
         );
         assert!(lod.iter().all(|key| matches!(
             key,
@@ -9159,12 +9244,12 @@ mod tests {
             }
         )));
         assert!(
-            !lod.contains(&CellKey::Exterior {
+            lod.contains(&CellKey::Exterior {
                 worldspace_id: 614,
                 grid_x: center.x + 2,
                 grid_y: center.y,
             }),
-            "the cell the LOD draws is not planned as a ring cell"
+            "an uncovered ring cell must still be requested"
         );
         assert!(
             !lod.contains(&ring_cell),
@@ -10476,6 +10561,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
         write_plan_database(&path);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO cells VALUES(101,60,2,0,NULL,0); INSERT INTO land VALUES(101,x'00');",
+            )
+            .unwrap();
         let config = EngineConfig {
             stream_radius: 1,
             terrain_radius: 3,
@@ -10648,6 +10739,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
         write_plan_database(&path);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO cells VALUES(101,60,-2,0,NULL,0); INSERT INTO land VALUES(101,x'00');",
+            )
+            .unwrap();
         let config = EngineConfig {
             stream_radius: 1,
             terrain_radius: 2,

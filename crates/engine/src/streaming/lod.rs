@@ -1169,6 +1169,7 @@ pub(super) fn track_lod_readiness(
     children: Query<&Children>,
     names: Query<&Name>,
     mesh_handles: Query<&Mesh3d>,
+    materials: Query<&MeshMaterial3d<StandardMaterial>>,
     mut pending_chunks: Query<(Entity, &LodChunkRoot, &mut PendingLodChunk)>,
     roots: Query<Option<&LodChunkRoot>>,
     mut debug_previous: Local<HashMap<ChunkKey, String>>,
@@ -1259,6 +1260,18 @@ pub(super) fn track_lod_readiness(
             }
         };
         for (patch, coverage) in &patches {
+            // Validation requires exactly one primitive under each coverage node. Its material
+            // bind group cannot be prepared until its bound images are GPU resident.
+            if let Ok(nodes) = children.get(*patch) {
+                for primitive in nodes.iter().filter(|child| mesh_handles.contains(*child)) {
+                    if let Ok(material) = materials.get(primitive) {
+                        commands.entity(primitive).insert((
+                            crate::swap_bridge::SwapSurface::new(material.0.id().untyped(), []),
+                            crate::swap_bridge::SwapWaiting,
+                        ));
+                    }
+                }
+            }
             commands
                 .entity(*patch)
                 .insert((*coverage, TerrainSurfaceReady, Visibility::Hidden));
@@ -1913,7 +1926,7 @@ impl TestTerrainAvailability for &HashSet<LodTier> {
     }
 }
 
-fn chebyshev_grid_distance(left: IVec2, right: IVec2) -> i32 {
+pub(super) fn chebyshev_grid_distance(left: IVec2, right: IVec2) -> i32 {
     left.x
         .saturating_sub(right.x)
         .saturating_abs()

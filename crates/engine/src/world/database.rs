@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use shared::cluster_recipe::classify::CELL_SIZE;
 use shared::lod::{ChunkAnchor, ChunkKey, LodOrigin, LodTier, chunk_payload_path};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::Path,
     sync::{
         Arc,
@@ -276,6 +276,8 @@ pub struct WorldDatabase {
     /// the conversion never writes it while a run holds it (`--reuse-assets` builds elsewhere), so
     /// the answer cannot go stale within a run.
     lod_worldspaces: HashSet<u32>,
+    /// Immutable published LAND requirements. None is reserved for channel-only test doubles.
+    terrain_cells: Option<HashMap<u32, HashSet<[i32; 2]>>>,
     /// The receiving end [`WorldDatabase::saturated_queue`] keeps open so its one request slot
     /// fills. `None` in every run: a real database's worker owns the receiving end. See
     /// [`Drop`], which releases it before the shutdown request.
@@ -452,6 +454,7 @@ impl WorldDatabase {
                 worker_stopped: Arc::new(AtomicBool::new(true)),
                 // No database behind this one, so it holds no LOD data either.
                 lod_worldspaces: HashSet::new(),
+                terrain_cells: None,
                 held_receiver: None,
             },
             request_rx,
@@ -476,6 +479,7 @@ impl WorldDatabase {
         // rather than in the worker because a run resolves the ring on the frame the space changes
         // and cannot wait for a query to come back (`EngineConfig::effective_terrain_radius`).
         let lod_worldspaces = lod_worldspaces(&path);
+        let terrain_cells = Some(read_terrain_cells(&path)?);
         let (request_tx, request_rx) = bounded(128);
         // Responses must not block shutdown if the main world stops polling.
         let (response_tx, response_rx) = unbounded();
@@ -496,6 +500,7 @@ impl WorldDatabase {
             worker: Some(worker),
             worker_stopped,
             lod_worldspaces,
+            terrain_cells,
             #[cfg(test)]
             held_receiver: None,
         })
@@ -519,6 +524,16 @@ impl WorldDatabase {
     /// its whole reach (the converter walks the grid), so the assumption is the conversion's.
     pub fn has_lod_for(&self, worldspace_id: u32) -> bool {
         self.lod_worldspaces.contains(&worldspace_id)
+    }
+
+    /// A terrain-only request is meaningful only for an actual LAND cell in this world.
+    /// Missing LAND does not require a replacement and must not create a failed phantom request.
+    pub fn requires_terrain(&self, world: u32, cell: [i32; 2]) -> bool {
+        self.terrain_cells.as_ref().is_none_or(|worlds| {
+            worlds
+                .get(&world)
+                .is_some_and(|cells| cells.contains(&cell))
+        })
     }
 
     pub fn request(&self, request: DatabaseRequest) -> Result<()> {
@@ -557,6 +572,7 @@ impl WorldDatabase {
             // No database behind this one, so it holds no LOD data either; every worldspace gets
             // the ring (`EngineConfig::effective_terrain_radius`).
             lod_worldspaces: HashSet::new(),
+            terrain_cells: None,
             // Held open and never read, so the one slot fills: dropping the receiver instead would
             // refuse requests as `Disconnected`, which is the stopped-worker case rather than a
             // full queue.
@@ -919,6 +935,34 @@ fn has_lod_table(connection: &Connection) -> rusqlite::Result<bool> {
         [],
         |row| row.get(0),
     )
+}
+
+fn has_table(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    let count: i64 = connection
+        .prepare_cached("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1")?
+        .query_row([table], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// LAND, not a rectangular chunk bound or an empty CELL record, defines required terrain.
+fn read_terrain_cells(path: &Path) -> Result<HashMap<u32, HashSet<[i32; 2]>>> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut worlds: HashMap<u32, HashSet<[i32; 2]>> = HashMap::new();
+    if !has_table(&connection, "land")? {
+        return Ok(worlds);
+    }
+    let mut query = connection.prepare(
+        "SELECT c.worldspace_id,c.grid_x,c.grid_y FROM cells c JOIN land l ON l.cell_id=c.id \
+         WHERE c.worldspace_id IS NOT NULL AND c.grid_x IS NOT NULL AND c.grid_y IS NOT NULL",
+    )?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        worlds
+            .entry(row.get(0)?)
+            .or_default()
+            .insert([row.get(1)?, row.get(2)?]);
+    }
+    Ok(worlds)
 }
 
 /// The worldspaces [`WorldDatabase::has_lod_for`] answers true for: the ones with at least one
@@ -1611,6 +1655,25 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<(ReferenceRow, Ini
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_requirements_ignore_empty_cells_and_preserve_world_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
+            CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
+            INSERT INTO cells VALUES(1,7,-3,-2),(2,7,-2,-2),(3,8,-3,-2);
+            INSERT INTO land VALUES(1),(3);").unwrap();
+        drop(connection);
+        let required = read_terrain_cells(&path).unwrap();
+        assert_eq!(required[&7], HashSet::from([[-3, -2]]));
+        assert_eq!(required[&8], HashSet::from([[-3, -2]]));
+        assert!(!required[&7].contains(&[-2, -2]));
+        // A source hole at [-2,-2] must not be mistaken for missing LAND.
+        assert_eq!(required[&7].len(), 1);
+        assert!(!required.contains_key(&9));
+    }
 
     #[test]
     fn lod_query_classification_preserves_transient_sqlite_causes_through_context() {

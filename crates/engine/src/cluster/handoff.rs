@@ -2219,6 +2219,9 @@ pub(super) fn install(app: &mut App) {
     render
         .init_resource::<Sources>()
         .init_resource::<Filters>()
+        // Standalone cluster fixtures have no streaming plugin to populate terrain.
+        .init_resource::<crate::streaming::terrain_handoff::RenderTerrain>()
+        .init_resource::<crate::streaming::terrain_handoff::ClusterCoverage>()
         .add_systems(
             ExtractSchedule,
             extract_sources.in_set(super::SourceExtraction),
@@ -2226,6 +2229,7 @@ pub(super) fn install(app: &mut App) {
         .add_systems(
             Render,
             select_instances
+                .in_set(crate::streaming::terrain_handoff::TerrainHandoffSystems::Cluster)
                 .after(crate::streaming::native_lod::NativeLodSystems::Filter)
                 .in_set(RenderSystems::Queue)
                 .before(RenderSystems::QueueMeshes)
@@ -2236,6 +2240,7 @@ pub(super) fn install(app: &mut App) {
         .add_systems(
             Render,
             finalize_terrain_clips
+                .after(crate::streaming::terrain_handoff::TerrainHandoffSystems::Filter)
                 .after(RenderSystems::PrepareBindGroups)
                 .before(crate::swap_bridge::systems::DestinationSystems::Evaluate)
                 .before(RenderSystems::Render),
@@ -2243,6 +2248,7 @@ pub(super) fn install(app: &mut App) {
         .add_systems(
             Render,
             restore_stock
+                .in_set(crate::streaming::terrain_handoff::TerrainHandoffSystems::ClusterRestore)
                 .in_set(RenderSystems::Cleanup)
                 .before(crate::streaming::native_lod::NativeLodSystems::Restore),
         );
@@ -2258,6 +2264,7 @@ fn finalize_terrain_clips(
     sources: Res<Sources>,
     queue: Res<RenderQueue>,
     stock: super::super::stock_drawable::StockDrawable,
+    terrain: Res<crate::streaming::terrain_handoff::RenderTerrain>,
     phases: crate::swap_bridge::systems::QueuePhases,
     views: Query<(
         Entity,
@@ -2319,18 +2326,24 @@ fn finalize_terrain_clips(
             .into_iter()
             .flat_map(|class| class.iter_visible())
         {
-            let Some(identity) = sources.terrain.get(main) else {
+            let Some(surface) = terrain.surfaces.get(main) else {
                 continue;
             };
-            if Some(identity.worldspace_id) != world {
+            if !stock.matches_mesh(*main, surface.mesh) {
                 continue;
             }
-            let quadrant = (identity.grid, identity.quadrant);
+            let quadrants = || {
+                surface
+                    .keys
+                    .iter()
+                    .filter(|identity| Some(identity.world) == world)
+                    .map(|identity| (identity.grid, identity.quadrant))
+            };
             if !shadow
                 && forward_members.queued(*main)
                 && stock.drawable(*main, key, StockPassFamily::Forward)
             {
-                forward_covered.insert(quadrant);
+                forward_covered.extend(quadrants());
             }
             if depth_members.queued(*main)
                 && stock.drawable(
@@ -2343,7 +2356,7 @@ fn finalize_terrain_clips(
                     },
                 )
             {
-                depth_covered.insert(quadrant);
+                depth_covered.extend(quadrants());
             }
         }
         #[cfg(feature = "tracy")]
@@ -2474,18 +2487,8 @@ fn table_group(view: &ViewGpu, batch: usize) -> Option<u32> {
         .then(|| u32::from_le_bytes(row[4..8].try_into().unwrap()))
 }
 
-/// Every batch's [`batch_ready`] for one view. Each check is a handful of independent lookups and
-/// a scene has thousands of batches, every one checked for every view every frame, so the batches
-/// are split across the compute task pool; the result is in batch order, as a sequential pass
-/// would give it.
-/// [`views_batch_readiness`], reusing the view's last answer while nothing it was decided from has
-/// changed. A batch's readiness reads the view's plan (draws, memo, representatives, prepass and
-/// shadow pipelines) and the prepared materials. The plan comes from the queue
-/// walk, whose stamp is kept only when the walk left nothing out and moves with the batch
-/// materials' version (bumped by any asset event naming a batch material), the instance layout
-/// and generation; the plan epoch moves with the plan; the pipeline maps are hashed here. Under the
-/// same inputs a ready batch stays ready, so only the batches that were not are checked again
-/// (a pipeline still compiling, a material still preparing).
+/// Evaluate every batch against this render invocation's exact view plan and
+/// resources. Successful readiness is revalidated too; it is not monotonic.
 fn cached_batch_readiness(
     gpu: &mut ClusterGpu,
     key: RetainedViewEntity,
@@ -2498,51 +2501,10 @@ fn cached_batch_readiness(
         &MaterialBindGroupAllocators,
     ),
 ) -> Vec<bool> {
-    use std::hash::{Hash, Hasher};
-    let view = &gpu.views[&key];
-    // A camera view's plan is the walk's; a shadow view's comes from the shadow queue, whose
-    // plan hash covers the batches' generation and layout but not their materials, so the
-    // materials' version is part of the stamp too.
-    let stamp = (shadow || view.walk_stamp.is_some()).then(|| {
-        perf_span!("cluster::readiness::stamp");
-        let mut hasher = std::hash::DefaultHasher::new();
-        view.walk_stamp.hash(&mut hasher);
-        view.plan_hash.hash(&mut hasher);
-        materials_version.hash(&mut hasher);
-        view.plan_epoch.hash(&mut hasher);
-        for pipelines in [&view.prepass_pipelines, &view.shadow_pipelines] {
-            let mut sorted: Vec<_> = pipelines
-                .iter()
-                .map(|(group, id)| (*group, id.id()))
-                .collect();
-            sorted.sort_unstable();
-            sorted.hash(&mut hasher);
-        }
-        (shadow, prepass).hash(&mut hasher);
-        (gpu.generation, gpu.layout_epoch, gpu.batches.len()).hash(&mut hasher);
-        hasher.finish()
-    });
-    let readiness = match (&view.readiness_memo, stamp) {
-        (Some((previous, cached)), Some(stamp)) if *previous == stamp => {
-            let mut readiness = cached.clone();
-            for (batch, ready) in readiness.iter_mut().enumerate() {
-                if !*ready {
-                    *ready = batch_ready(gpu, view, batch, shadow, prepass, dependencies);
-                }
-            }
-            readiness
-        }
-        _ => views_batch_readiness(gpu, view, shadow, prepass, dependencies),
-    };
-    // Preserve the cache's allocation on a hit without weakening its exact stamp.
-    let memo = &mut gpu.views.get_mut(&key).unwrap().readiness_memo;
-    if let (Some((previous, cached)), Some(stamp)) = (memo.as_mut(), stamp) {
-        *previous = stamp;
-        cached.clone_from(&readiness);
-    } else {
-        *memo = stamp.map(|stamp| (stamp, readiness.clone()));
-    }
-    readiness
+    // Revalidate successful predicates too. Material slabs, pipeline state and material
+    // bindings are current render facts, not a monotonic historical receipt.
+    let _ = materials_version;
+    views_batch_readiness(gpu, &gpu.views[&key], shadow, prepass, dependencies)
 }
 
 fn views_batch_readiness(
@@ -3267,13 +3229,16 @@ fn select_instances(
     mut shadows: Query<&mut RenderShadowMapVisibleEntities>,
     scene: Option<Res<ClusterScene>>,
     mut filters: ResMut<Filters>,
-    (native, settings, batch_materials, runtime_state): (
+    (native, settings, batch_materials, runtime_state, mut terrain_coverage): (
         Option<Res<crate::streaming::native_lod::FarNativePolicy>>,
         Option<Res<ClusterSettings>>,
         Option<Res<super::ClusterBatchMaterials>>,
         Option<Res<super::super::runtime_state::RuntimeReferenceState>>,
+        ResMut<crate::streaming::terrain_handoff::ClusterCoverage>,
     ),
 ) {
+    // Clear even if a withdrawn GPU/package means this frame has no selection.
+    terrain_coverage.views.clear();
     let Some(mut gpu) = gpu else {
         return;
     };
@@ -3545,27 +3510,8 @@ fn select_instances(
                 let terrain_blocks = base.terrain_blocks.clone();
                 let (suppressed_contributors, suppressed_trees) =
                     (base.suppressed_contributors, base.suppressed_trees);
-                // Only far stock is replaced. Near stock remains and clips the cluster
-                // in this view once its own mesh/material/passes are drawable.
-                // With owned statics cluster terrain owns the far terrain it covers: the terrain
-                // LOD pass does not draw those stock patches (`update_terrain_lod_visibility`),
-                // so no view filters them here.
-                if !own_statics {
-                    let covered: HashSet<IVec2> = terrain_blocks
-                        .iter()
-                        .flat_map(|index| gpu.terrain_blocks[*index as usize].cells.iter().copied())
-                        .collect();
-                    let hides = |identity: &crate::streaming::TerrainPrimitiveIdentity| {
-                        identity.tier.is_some()
-                            && Some(identity.worldspace_id) == world
-                            && covered.contains(&identity.grid)
-                    };
-                    for main in &facts.visible {
-                        if sources.terrain.get(main).is_some_and(hides) {
-                            hidden.insert(*main);
-                        }
-                    }
-                }
+                // Terrain is complemented by terrain_handoff after this selection.
+                // Never hide stock terrain from a global/main-world readiness set.
                 gpu.views.get_mut(key).unwrap().selection = Some(Selection {
                     stamp,
                     visible: selection_inputs,
@@ -3585,6 +3531,27 @@ fn select_instances(
                 info!(view=?key,contributor_data_missing=selected.suppressed_contributors,tree_relation_proof_missing=selected.suppressed_trees,
                     "native far LOD retained; certified far clusters suppressed");
             }
+            let view = &gpu.views[key];
+            terrain_coverage.views.insert(
+                *key,
+                crate::streaming::terrain_handoff::ClusterViewCoverage {
+                    generation: gpu.generation,
+                    layout: gpu.layout_epoch,
+                    plan: view.plan_epoch,
+                    cells: selected
+                        .terrain_blocks
+                        .iter()
+                        .flat_map(|index| {
+                            let block = &gpu.terrain_blocks[*index as usize];
+                            block
+                                .cells
+                                .iter()
+                                .copied()
+                                .map(move |cell| (block.worldspace_id, cell))
+                        })
+                        .collect(),
+                },
+            );
             let hidden = &selected.hidden;
             perf_span!("cluster::select::joint");
             joint = Some(intersect_hidden(joint, hidden));

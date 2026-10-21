@@ -25,7 +25,10 @@ pub mod assets;
 pub mod destination;
 pub mod systems;
 
-use bevy::pbr::{PreparedMaterial, SpecializedMaterialPipelineCache};
+use bevy::pbr::{
+    MaterialBindGroupAllocators, PreparedMaterial, RenderMaterialInstances, RenderMeshInstances,
+    SpecializedMaterialPipelineCache,
+};
 use bevy::{
     asset::{AssetId, UntypedAssetId},
     ecs::system::SystemState,
@@ -172,10 +175,26 @@ pub struct SwapPrepared {
     pub since: u32,
 }
 
-/// The render world has confirmed this surface drawable: its own specialized pipeline resolved
-/// `Ok` while a view could see it, so that frame's queue pass drew it.
+/// Historical render-queue observation for a waiting surface: its declared mesh/material
+/// instance, prepared assets and material slab matched, and every currently seeing camera
+/// had queued forward membership and an Ok specialization. This is not a GPU fence or
+/// pixel-coverage proof, and never authorizes current-view fallback suppression.
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct SwapDrawn;
+
+/// Exact asset identity of a bridge observation. Retirement/diagnostic evidence,
+/// never authority to suppress resident fallback in a current render view.
+#[derive(Component, Debug, Clone, Copy)]
+pub(crate) struct SwapDrawReceipt {
+    pub mesh: AssetId<Mesh>,
+    pub material: UntypedAssetId,
+}
+
+impl SwapDrawReceipt {
+    pub(crate) fn matches(&self, mesh: AssetId<Mesh>, surface: &SwapSurface) -> bool {
+        self.mesh == mesh && self.material == surface.material
+    }
+}
 
 /// Diagnostic threshold for a slow detail handover. Crossing it reports once;
 /// elapsed frames never authorize removing terrain that still covers a replacement.
@@ -320,6 +339,10 @@ fn swap_bridge(
     render_meshes: Res<RenderAssets<RenderMesh>>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     materials: Res<ErasedRenderAssets<PreparedMaterial>>,
+    allocators: Res<MaterialBindGroupAllocators>,
+    mesh_instances: Res<RenderMeshInstances>,
+    material_instances: Res<RenderMaterialInstances>,
+    phases: systems::QueuePhases,
     specialized: Option<Res<SpecializedMaterialPipelineCache>>,
     pipelines: Res<PipelineCache>,
     views: Query<(&ExtractedView, &RenderVisibleEntities)>,
@@ -345,9 +368,7 @@ fn swap_bridge(
             let seen = views
                 .iter()
                 .any(|(_, visible)| view_sees(visible, MainEntity::from(entity)));
-            let facts = if prepared.is_some() {
-                SwapSurfaceFacts::assets_ready()
-            } else {
+            let facts = {
                 gather_surface_facts(
                     mesh,
                     surface,
@@ -355,15 +376,23 @@ fn swap_bridge(
                     &render_meshes,
                     &gpu_images,
                     &materials,
+                    &allocators,
                 )
             };
             let facts = SwapSurfaceFacts {
-                pipeline_ok: pipeline_resolved(
-                    MainEntity::from(entity),
-                    &views,
-                    &specialized,
-                    &pipelines,
-                ),
+                pipeline_ok: mesh_instances.mesh_asset_id(MainEntity::from(entity))
+                    == Some(mesh.0.id())
+                    && material_instances
+                        .instances
+                        .get(&MainEntity::from(entity))
+                        .is_some_and(|instance| instance.asset_id == surface.material)
+                    && pipeline_resolved(
+                        MainEntity::from(entity),
+                        &views,
+                        &specialized,
+                        &pipelines,
+                        &phases,
+                    ),
                 ..facts
             };
             let readiness = swap_readiness(&facts);
@@ -371,6 +400,8 @@ fn swap_bridge(
             if readiness != SwapReadiness::Waiting || in_view_changed.is_some() {
                 decisions.push(SwapDecision {
                     entity,
+                    mesh: mesh.0.id(),
+                    material: surface.material,
                     insert_prepared: readiness != SwapReadiness::Waiting && prepared.is_none(),
                     drawn: readiness == SwapReadiness::Drawn,
                     stand_in: surface.stand_in(),
@@ -389,7 +420,13 @@ fn swap_bridge(
             });
         }
         if decision.drawn {
-            entity.insert(SwapDrawn);
+            entity.insert((
+                SwapDrawn,
+                SwapDrawReceipt {
+                    mesh: decision.mesh,
+                    material: decision.material,
+                },
+            ));
         }
         match decision.in_view {
             Some(true) => {
@@ -407,6 +444,8 @@ fn swap_bridge(
 #[derive(Debug, Clone, Copy)]
 struct SwapDecision {
     entity: Entity,
+    mesh: AssetId<Mesh>,
+    material: UntypedAssetId,
     /// Whether `SwapPrepared` still has to be written (it need not be re-written every frame a
     /// surface waits for its pipeline: that would churn change detection for nothing).
     insert_prepared: bool,
@@ -425,6 +464,7 @@ fn gather_surface_facts(
     render_meshes: &RenderAssets<RenderMesh>,
     gpu_images: &RenderAssets<GpuImage>,
     materials: &ErasedRenderAssets<PreparedMaterial>,
+    allocators: &MaterialBindGroupAllocators,
 ) -> SwapSurfaceFacts {
     let mesh_id = mesh.0.id();
     SwapSurfaceFacts {
@@ -436,12 +476,18 @@ fn gather_surface_facts(
             .filter(|image| gpu_images.get(**image).is_some())
             .count(),
         images_declared: surface.images.len(),
-        material: materials.get(surface.material).is_some(),
+        material: materials.get(surface.material).is_some_and(|material| {
+            allocators
+                .get(&surface.material.type_id())
+                .and_then(|allocator| allocator.get(material.binding.group))
+                .is_some_and(|slab| slab.bind_group().is_some())
+        }),
         pipeline_ok: false,
     }
 }
 
-/// Whether the entity's specialized pipeline for a view that can see it resolves `Ok`.
+/// Whether every camera that can see the entity has its own queued forward entry
+/// and a resolved specialized pipeline. At least one seeing camera is required.
 ///
 /// The pipeline cache is keyed by view and by main-world entity, and Bevy specializes an entity
 /// only for the views whose visible set holds it - but the visible set is read here too, so the
@@ -452,8 +498,17 @@ fn pipeline_resolved(
     views: &Query<(&ExtractedView, &RenderVisibleEntities)>,
     specialized: &SpecializedMaterialPipelineCache,
     pipelines: &PipelineCache,
+    phases: &systems::QueuePhases,
 ) -> bool {
+    let mut seen = false;
     for (view, visible) in views.iter() {
+        if !view_sees(visible, entity) {
+            continue;
+        }
+        seen = true;
+        if !phases.forward(&view.retained_view_entity).queued(entity) {
+            return false;
+        }
         // The cheap half first: a view with no cache entry or no pipeline for the entity cannot
         // have drawn it, and costs one lookup each.
         let Some(cached) = specialized
@@ -461,19 +516,16 @@ fn pipeline_resolved(
             .and_then(|by_entity| by_entity.get(&entity))
             .copied()
         else {
-            continue;
+            return false;
         };
-        if !view_sees(visible, entity) {
-            continue;
-        }
-        if matches!(
+        if !matches!(
             pipelines.get_render_pipeline_state(cached),
             CachedPipelineState::Ok(_)
         ) {
-            return true;
+            return false;
         }
     }
-    false
+    seen
 }
 
 /// Whether a view's visible set holds the entity: it is in the CPU-culled list (a sorted list, so

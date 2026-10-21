@@ -782,7 +782,12 @@ impl Plugin for ClusterRenderPlugin {
             .add_systems(
                 Render,
                 (
-                    prepare_cluster_gpu.in_set(RenderSystems::PrepareResources),
+                    // Freeze this frame's appended layout before queue planning and
+                    // complementary stock selection. Appending in PrepareResources
+                    // would change layout after the fallback's phase removal.
+                    prepare_cluster_gpu
+                        .in_set(RenderSystems::Queue)
+                        .before(queue_cluster_batches),
                     queue_cluster_batches
                         .in_set(RenderSystems::Queue)
                         .before(RenderSystems::QueueMeshes),
@@ -875,9 +880,6 @@ struct ViewGpu {
     /// What the last walk over the batches was made from, kept only when it left nothing out for
     /// want of a prepared material, mesh or pipeline: the same again means the same plan.
     walk_stamp: Option<[u64; 8]>,
-    /// Per batch, whether it was drawable in this view, and what that was decided from
-    /// (`handoff::cached_batch_readiness`).
-    readiness_memo: Option<(u64, Vec<bool>)>,
     /// The cull epoch each prepass draw group last drew in (see [`DrawClusterIndirect`]'s `ONCE`).
     prepass_drawn: std::sync::Mutex<HashMap<u32, u32>>,
     walk_carriers: Vec<Option<(Entity, MainEntity)>>,
@@ -3183,7 +3185,6 @@ fn new_view_gpu(
         memo: vec![None; gpu.batches.len()],
         plan_hash: None,
         walk_stamp: None,
-        readiness_memo: None,
         prepass_drawn: std::sync::Mutex::new(HashMap::new()),
         walk_carriers: Vec::new(),
         plan_items: Vec::new(),

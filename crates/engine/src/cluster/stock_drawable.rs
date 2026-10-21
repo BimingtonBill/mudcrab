@@ -49,6 +49,19 @@ pub(crate) struct StockDrawable<'w> {
 }
 
 impl StockDrawable<'_> {
+    /// Bind replacement proof to the immutable mesh extracted for this frame,
+    /// rather than a prior entity instance with the same coverage identity.
+    pub(crate) fn matches_mesh(
+        &self,
+        main: MainEntity,
+        mesh: bevy::asset::AssetId<bevy::prelude::Mesh>,
+    ) -> bool {
+        self.mesh_instances
+            .as_ref()
+            .and_then(|instances| instances.mesh_asset_id(main))
+            == Some(mesh)
+    }
+
     /// A missing required pipeline/resource fails closed. A material with no
     /// applicable prepass/shadow pass does not require that pass's pipeline.
     /// `true` is pre-queue evidence only, never a promise that stock drew.

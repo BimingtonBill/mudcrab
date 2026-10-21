@@ -69,6 +69,18 @@ pub(crate) fn install_terrain(world: &mut World) {
             });
         },
     ));
+    world.spawn(Observer::new(
+        |event: On<Discard, ChildOf>, world: &World, mut commands: Commands| {
+            let parent = world.get::<ChildOf>(event.entity).map(ChildOf::parent);
+            if let Some(parent) = parent {
+                commands.queue(move |world: &mut World| {
+                    world
+                        .resource_mut::<Messages<TerrainNodeChanged>>()
+                        .write(TerrainNodeChanged(parent));
+                });
+            }
+        },
+    ));
     // Replacing Children with relationship hooks skipped can remove backlinks without
     // changing ChildOf. Snapshot only this event's former siblings before replacement;
     // raw World access includes disabled parents. Check after queued hooks have run.
@@ -101,6 +113,8 @@ pub(crate) fn install_terrain(world: &mut World) {
         world.register_component::<super::lod::LodChunkRoot>(),
         world.register_component::<super::TerrainSurfaceReady>(),
         world.register_component::<super::TerrainPatch>(),
+        world.register_component::<super::RingTerrain>(),
+        world.register_component::<crate::swap_bridge::SwapDrawn>(),
         world.register_component::<Visibility>(),
     ];
     components.extend(disablers.iter().copied());

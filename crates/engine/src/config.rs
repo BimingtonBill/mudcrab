@@ -153,16 +153,13 @@ pub struct EngineConfig {
     /// ring (`--stream-radius 2` with the default) and what a benchmark run that wants the old
     /// numbers passes. Interior cells are never terrain-only.
     ///
-    /// This is the ring an explicit `--terrain-radius` asks for, or [`DEFAULT_TERRAIN_RADIUS`]; the
-    /// ring a run actually draws is [`EngineConfig::effective_terrain_radius`]'s answer, which
-    /// leaves the ring off where the worldspace draws its own terrain LOD ([`Self::terrain_radius_given`]).
+    /// This is the residency envelope, whether explicit or [`DEFAULT_TERRAIN_RADIUS`]. Only actual
+    /// LAND cells require terrain requests. The LOD selector can hide a resident stand-in once
+    /// its exact replacement draws, and restore it if that coverage withdraws.
     pub terrain_radius: i32,
-    /// Whether `--terrain-radius` named the ring. A named ring is drawn as given, in every
-    /// worldspace; an unnamed one is the engine's own choice: [`DEFAULT_TERRAIN_RADIUS`] where the
-    /// worldspace has no terrain LOD data, and no ring (LOD covers that distance) where it has,
-    /// the way the game's own terrain LOD does not sit under a second copy of the same landscape.
-    /// The benchmark rule below writes [`Self::terrain_radius`] without setting this, so a
-    /// benchmark still measures the ring it always did.
+    /// Whether `--terrain-radius` named the detailed ring. Explicit detailed terrain remains
+    /// authoritative; an automatic ring may yield visually to draw-confirmed LOD while retaining
+    /// its allocation for coverage withdrawal. Benchmark defaults still choose an empty ring.
     pub terrain_radius_given: bool,
     /// The cluster overlay (ADR-0013 output, `<assets>/derived/clusters-<settings-id>`) to draw
     /// objects from, as clusters in place of the stock models it owns. `--clusters [label |
@@ -1000,26 +997,11 @@ impl EngineConfig {
             .then(|| self.max_upload_mib_per_frame.saturating_mul(1024 * 1024))
     }
 
-    /// The ring a run draws in a worldspace that has (`has_lod`) or lacks terrain LOD data: the one
-    /// resolver for [`Self::terrain_radius`], and the one place the three rules live.
-    ///
-    /// 1. A ring `--terrain-radius` named wins as given, in every worldspace.
-    /// 2. Otherwise a worldspace with LOD data draws no ring: [`Self::stream_radius`], which leaves
-    ///    the ring empty (see [`Self::terrain_radius`]). The LOD draws everything beyond the
-    ///    full-detail grid, which is what the game does - its own terrain LOD has no full-detail
-    ///    ring under it - and the ring is a second copy of that ground at 264 extra cells' cost.
-    /// 3. Otherwise - no LOD data, so nothing would draw beyond the full-detail grid -
-    ///    [`DEFAULT_TERRAIN_RADIUS`] keeps the world from ending in a cliff.
-    ///
-    /// `has_lod` is the caller's answer for the worldspace it is asking about
-    /// ([`WorldDatabase::has_lod_for`](crate::world::database::WorldDatabase::has_lod_for)), so the
-    /// answer is per worldspace and follows a door into another one.
-    pub fn effective_terrain_radius(&self, has_lod: bool) -> i32 {
-        if self.terrain_radius_given || !has_lod {
-            self.terrain_radius
-        } else {
-            self.stream_radius
-        }
+    /// Residency envelope for reversible LAND stand-ins. Authored LOD inventory cannot prove
+    /// drawable replacement coverage, so it never shrinks this envelope. The existing argument
+    /// remains source-compatible; the LOD visibility index alone decides which surface draws.
+    pub fn effective_terrain_radius(&self, _has_lod: bool) -> i32 {
+        self.terrain_radius
     }
 
     /// Interactive exterior play owns the mouse/controller; automated camera paths keep their
@@ -4754,16 +4736,16 @@ mod tests {
         assert_eq!(asked.terrain_radius, 8);
     }
 
-    /// The one resolver: a named ring wins; an unnamed one is off where the worldspace draws its
-    /// own terrain LOD and stays [`DEFAULT_TERRAIN_RADIUS`] where it does not.
+    /// Inventory, explicit configuration, benchmark defaults and invalid input all use the
+    /// configured residency envelope; renderer coverage only controls reversible visibility.
     #[test]
-    fn an_unnamed_ring_is_off_where_the_worldspace_has_lod_data() {
+    fn lod_inventory_never_shrinks_the_resident_terrain_envelope() {
         let plain = EngineConfig::default();
         assert!(!plain.terrain_radius_given, "nothing named a ring");
         assert_eq!(
             plain.effective_terrain_radius(true),
-            plain.stream_radius,
-            "LOD draws everything beyond the full-detail grid, so no ring is drawn"
+            plain.terrain_radius,
+            "inventory never removes the resident LAND stand-ins"
         );
         assert_eq!(
             plain.effective_terrain_radius(false),
@@ -4796,7 +4778,7 @@ mod tests {
             EngineConfig::run_from_args(["--terrain-radius", "not-a-number"].map(str::to_owned));
         assert!(!typo.terrain_radius_given);
         assert_eq!(typo.terrain_radius, DEFAULT_TERRAIN_RADIUS);
-        assert_eq!(typo.effective_terrain_radius(true), typo.stream_radius);
+        assert_eq!(typo.effective_terrain_radius(true), DEFAULT_TERRAIN_RADIUS);
         assert_eq!(typo.effective_terrain_radius(false), DEFAULT_TERRAIN_RADIUS);
     }
 
