@@ -23,6 +23,7 @@ pub mod indirect_metrics;
 pub mod lights;
 mod live_console;
 mod matched_route;
+pub mod material_animation;
 pub mod mesh_preparation_retry;
 pub mod metrics;
 pub mod nif_depth;

@@ -9,13 +9,17 @@ use crate::{
 };
 use bevy::{
     app::{HierarchyPropagatePlugin, PropagateOver, PropagateSet},
-    asset::embedded_asset,
+    asset::{LoadContext, embedded_asset},
     camera::{
         Exposure, RenderTarget,
         primitives::{Aabb, Frustum},
         visibility::{RenderLayers, VisibilitySystems},
     },
     core_pipeline::{mip_generation::experimental::depth::ViewDepthPyramid, prepass::DepthPrepass},
+    gltf::{
+        GltfMaterial,
+        extensions::{ErasedGltfExtensionHandler, GltfExtensionHandler, GltfExtensionHandlers},
+    },
     image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor},
     light::{Cascades, SimulationLightSystems},
     pbr::{
@@ -80,6 +84,7 @@ impl Plugin for VercidiumRendererPlugin {
             crate::shadow_route::ShadowRoutePlugin,
             crate::render_skip::RenderSkipPlugin,
         ));
+        install_material_animation(app);
         app.add_plugins((
             crate::billboard::BillboardPlugin,
             MaterialPlugin::<TerrainMaterial>::default(),
@@ -106,6 +111,7 @@ impl Plugin for VercidiumRendererPlugin {
 
         let bridge = RendererProofBridge::default();
         app.insert_resource(bridge.clone());
+        register_skyrim_material_handler(app);
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .insert_resource(bridge)
@@ -1397,6 +1403,96 @@ fn reflected_camera_transform(main: &GlobalTransform, water_y: f32) -> Transform
     let mut forward = main.forward().as_vec3();
     forward.y = -forward.y;
     Transform::from_translation(position).looking_to(forward, Vec3::Y)
+}
+
+const MUDCRAB_MATERIAL_EXTENSION: &str = "MUDCRAB_material";
+const MATERIAL_ANIMATION_EXTENSION: &str = "OPEN_SKYRIM_material_animation";
+
+#[derive(Default, Clone)]
+struct SkyrimMaterialHandler {
+    material_extensions: bool,
+    animations: Option<crate::material_animation::MaterialAnimationRegistry>,
+}
+
+impl GltfExtensionHandler for SkyrimMaterialHandler {
+    fn dyn_clone(&self) -> Box<dyn ErasedGltfExtensionHandler> {
+        Box::new(self.clone())
+    }
+
+    fn on_material(
+        &mut self,
+        load_context: &mut LoadContext<'_>,
+        gltf_material: &bevy::gltf::gltf::Material,
+        _material: Handle<GltfMaterial>,
+        _material_asset: &GltfMaterial,
+        material_label: &str,
+    ) {
+        if let Some(registry) = &self.animations
+            && let Some(animation) = material_animation_of(gltf_material, self.material_extensions)
+        {
+            registry.insert(
+                format!("{}#{material_label}/std", load_context.path()),
+                animation,
+            );
+        }
+    }
+}
+
+/// Loader tasks may consume extension payloads only after validating the manifest capability.
+fn material_extensions_enabled(app: &App) -> bool {
+    app.world()
+        .get_resource::<crate::extensions::DataSetExtensions>()
+        .is_some_and(|extensions| {
+            extensions
+                .status(crate::extensions::Feature::Material)
+                .is_present()
+        })
+}
+
+fn install_material_animation(app: &mut App) {
+    if material_extensions_enabled(app) {
+        app.add_plugins(crate::material_animation::MaterialAnimationPlugin);
+    }
+}
+
+fn material_animation_of(
+    material: &bevy::gltf::gltf::Material,
+    material_extensions: bool,
+) -> Option<crate::material_animation::MaterialAnimation> {
+    if !material_extensions {
+        return None;
+    }
+    material
+        .extension_value(MATERIAL_ANIMATION_EXTENSION)
+        .and_then(|animation| {
+            crate::material_animation::MaterialAnimation::from_extensions(
+                animation,
+                material.extension_value(MUDCRAB_MATERIAL_EXTENSION),
+            )
+        })
+        .filter(crate::material_animation::MaterialAnimation::plays_anything)
+}
+
+fn register_skyrim_material_handler(app: &mut App) {
+    let material_extensions = material_extensions_enabled(app);
+    let animations = material_extensions.then(|| {
+        let registry = crate::material_animation::MaterialAnimationRegistry::default();
+        app.insert_resource(registry.clone());
+        registry
+    });
+    let Some(handlers) = app.world().get_resource::<GltfExtensionHandlers>() else {
+        warn!(
+            "the glTF extension handlers are unavailable; published material animations cannot be registered"
+        );
+        return;
+    };
+    handlers
+        .0
+        .write_blocking()
+        .push(Box::new(SkyrimMaterialHandler {
+            material_extensions,
+            animations,
+        }));
 }
 
 #[cfg(test)]
@@ -3609,6 +3705,44 @@ mod tests {
             layers,
             water_height: None,
             water_type_form_id: None,
+        }
+    }
+
+    #[test]
+    fn material_manifest_validity_controls_animation_installation() {
+        use crate::extensions::{
+            DataSetExtensions,
+            fixtures::{data_set, manifest},
+            read_data_extensions,
+        };
+        use crate::material_animation::{MaterialAnimationPlugin, MaterialAnimationRegistry};
+        use shared::extensions::MATERIAL;
+        for (entries, expected) in [
+            (vec![], false),
+            (vec![(MATERIAL, 1, "core")], true),
+            (vec![(MATERIAL, 1, "older")], false),
+            (vec![(MATERIAL, 2, "core")], false),
+        ] {
+            let directory = data_set(&manifest(&entries), Some("core"), &[]);
+            let data = read_data_extensions(directory.path()).unwrap();
+            let mut app = App::new();
+            app.init_resource::<GltfExtensionHandlers>();
+            app.insert_resource(DataSetExtensions::new(data));
+            install_material_animation(&mut app);
+            register_skyrim_material_handler(&mut app);
+            assert_eq!(app.is_plugin_added::<MaterialAnimationPlugin>(), expected);
+            assert_eq!(
+                app.world().contains_resource::<MaterialAnimationRegistry>(),
+                expected
+            );
+            assert_eq!(
+                app.world()
+                    .resource::<GltfExtensionHandlers>()
+                    .0
+                    .read_blocking()
+                    .len(),
+                1
+            );
         }
     }
 }
