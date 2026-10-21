@@ -1,6 +1,7 @@
 use crate::collision;
 use crate::material::{
-    NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract, publish_gltf_materials,
+    NifAnimationSkips, NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract,
+    publish_gltf_materials,
 };
 use crate::texture::TextureSemantic;
 use color_eyre::{
@@ -66,6 +67,10 @@ pub struct NifParseDiagnostics {
     pub validated_material_shape_count: usize,
     pub excluded_material_shape_count: usize,
     pub material_exclusions: BTreeMap<String, usize>,
+    /// Shader float controllers dropped instead of published as material
+    /// animation, by reason. A dropped controller costs one still frame and
+    /// never fails the conversion, so the counts are the only trace of it.
+    pub animation_skipped_channels: BTreeMap<String, usize>,
 }
 
 impl MeshConverter {
@@ -887,7 +892,7 @@ fn empty_scene_glb(name: &str) -> Vec<u8> {
     glb
 }
 
-fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
+pub(crate) fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
     ensure!(
         bytes.len() >= 20 && &bytes[..4] == b"glTF",
         "invalid GLB container"
@@ -1176,7 +1181,9 @@ fn open_nif_resilient(
         .count();
     diagnostics.max_scene_depth = nif_scene_depth(&blocks);
     let nif = NifFile { header, blocks };
-    let material_contract = build_nif_material_contract(&nif, path)?;
+    let mut animation_skips = NifAnimationSkips::new();
+    let material_contract = build_nif_material_contract(&nif, path, &mut animation_skips)?;
+    diagnostics.animation_skipped_channels = animation_skips;
     diagnostics.material_shape_count = material_contract.len();
     for shape in &material_contract {
         match &shape.disposition {
@@ -2785,6 +2792,7 @@ mod tests {
                         emissive_multiple: 1.0,
                         double_sided: true,
                         textures: Vec::new(),
+                        animation: Vec::new(),
                     },
                 },
             }
@@ -2910,7 +2918,9 @@ mod tests {
                     )
                     .unwrap()
                     .1;
-                    let contract = build_nif_material_contract(&nif, &input).unwrap();
+                    let mut animation_skips = NifAnimationSkips::new();
+                    let contract =
+                        build_nif_material_contract(&nif, &input, &mut animation_skips).unwrap();
                     assert_eq!(
                         matches!(
                             &contract[0].disposition,
@@ -2947,7 +2957,8 @@ mod tests {
         p.uv_offset.0 = project_wormhole_shared::glam::Vec2::new(0.25, -0.125);
         p.uv_scale.0 = project_wormhole_shared::glam::Vec2::new(2.0, -3.0);
         p.texture_clamp_mode = TexClampMode::WrapSClampT;
-        let contract = build_nif_material_contract(&nif, &input).unwrap();
+        let mut animation_skips = NifAnimationSkips::new();
+        let contract = build_nif_material_contract(&nif, &input, &mut animation_skips).unwrap();
         let NifMaterialDisposition::Validated { material } = &contract[0].disposition else {
             unreachable!()
         };

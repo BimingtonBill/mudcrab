@@ -90,6 +90,73 @@ them, so a NIF naming a texture Bethesda never shipped still publishes and rende
 remaining maps. The dropped paths are recorded per mesh under `pruned_texture_references` in
 `conversion-manifest.json` and do not make the conversion incomplete.
 
+### 4.1 Material animation (`OPEN_SKYRIM_material_animation`)
+
+Skyrim animates hearth flames, lava, steam and glow cards by driving one shader variable from a
+keyframe controller: a float controller on the shader property's `NiObjectNET` controller reference,
+chained to further controllers through `next_controller`. Nothing in glTF animates a material
+variable, so the channels are published on the shape's material as their own extension, beside
+`OPEN_SKYRIM_material` and `MUDCRAB_material` (§4):
+
+```json
+"extensions": {
+  "OPEN_SKYRIM_material_animation": {
+    "channels": [{
+      "variable": "vOffset",
+      "interpolation": "LINEAR" | "QUADRATIC" | "STEP",
+      "times": [0.0, 5.6667],
+      "values": [0.0, 1.0],
+      "tangents": [[1.0, 0.0], [0.0, 1.0]],
+      "loop": "cycle" | "reverse" | "clamp",
+      "frequency": 1.0, "phase": 0.0, "start": 0.0, "stop": 5.6667
+    }]
+  }
+}
+```
+
+* One channel per float controller in the chain, in chain order.
+* `variable` is the controlled shader variable in the camelCase spelling of the nif.xml enums.
+  Effect shaders (`EffectShaderControlledVariable`): `emissiveMultiple`, `falloffStartAngle`,
+  `falloffStopAngle`, `falloffStartOpacity`, `falloffStopOpacity`, `alpha`, `uOffset`, `uScale`,
+  `vOffset`, `vScale`. Lighting shaders (`LightingShaderControlledVariable`) share those names for
+  the variables the enums share and add `refractionStrength`, `environmentMapScale`, `glossiness`
+  and `specularStrength`.
+* `interpolation` is the key type: `LINEAR` (1) and `STEP` (5) keys store `(time, value)`;
+  `QUADRATIC` (2) keys also store a forward and a backward tangent, published as `tangents`.
+* A `uOffset`/`vOffset`/`uScale`/`vScale` channel replaces the matching component of
+  `MUDCRAB_material`'s `uvOffset`/`uvScale` (§4) at playback; the other, unanimated component
+  keeps its static value from there. Every other channel variable (`alpha`, `emissiveMultiple`,
+  `glossiness`, ...) replaces its own static field the same way, wherever this document or the
+  material contract publishes it.
+* Units and timing, from the controller's `NiTimeController` fields:
+  - `times`, `start` and `stop` are in seconds, as Skyrim's animation clock ticks them.
+  - `phase` is also in seconds; it is added to the point in the cycle after scaling by
+    `frequency`, i.e. the evaluated time is `now * frequency + phase`, wrapped into `[start, stop]`
+    by `loop`.
+  - `loop` is the cycle mode in flags bits 1-2 (0 cycle, 1 reverse, 2 clamp): `cycle` restarts at
+    `start` once playback passes `stop`; `reverse` means ping-pong - playback runs forward to
+    `stop`, then backward to `start`, and repeats; `clamp` holds the value at `stop` (or `start`,
+    running backward) once playback reaches it, instead of restarting.
+* `tangents` (`QUADRATIC` only) is one `[outgoing, incoming]` pair per key, in value units per
+  key interval (the segment parameter `x` runs 0 to 1). The segment from key i to key i+1 is the
+  Hermite curve `v = v_i (2x^3 - 3x^2 + 1) + v_{i+1} (-2x^3 + 3x^2) + t1 (x^3 - 2x^2 + x) +
+  t2 (x^3 - x^2)` with `t1 = tangents[i][0]` and `t2 = tangents[i+1][1]`. The NIF names the two
+  fields the other way round: `outgoing` is the key's `Backward` field and `incoming` its `Forward`
+  field, as NifSkope's evaluator reads them (`src/gl/glcontroller.cpp`). The hearth flames publish
+  `[[1, 0], [0, 1]]`: a steady scroll.
+* Colour controllers (`BSEffectShaderPropertyColorController`, `BSLightingShaderPropertyColorController`,
+  keyed by an `NiPoint3Interpolator` → `NiPosData`) publish `emissiveColor` (effect colour 0,
+  lighting colour 1) or `specularColor` (lighting colour 0) with `"components": 3`. `values` then
+  holds three floats per key, key-major (`[r0, g0, b0, r1, ...]`), in the space the static
+  colour is published in; `tangents` holds one `[outgoing, incoming]` pair per component, in the
+  same order. Each component evaluates like a float channel. `components` is omitted when it is 1.
+* The extension is listed in `extensionsUsed`, never `extensionsRequired`: a consumer that does not
+  play it renders the shape's still frame.
+* A controller with no interpolator, no float data, an unknown variable, an unsupported key type,
+  an unknown cycle mode or non-finite key data is dropped and counted in the mesh stage's
+  `NifParseDiagnostics::animation_skipped_channels` (reason → count). Animation never fails a
+  conversion.
+
 ---
 
 ## 5. Rust Implementation (`mesh_tools` Builder Architecture)
