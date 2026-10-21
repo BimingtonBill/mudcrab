@@ -156,6 +156,11 @@ impl SwapSurface {
         self
     }
 
+    /// The exact material asset declared for this surface's draw.
+    pub(crate) fn material_id(&self) -> UntypedAssetId {
+        self.material
+    }
+
     /// The surface's stand-in, if it declares one.
     pub fn stand_in(&self) -> Option<Entity> {
         self.stand_in

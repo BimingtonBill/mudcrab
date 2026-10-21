@@ -1831,6 +1831,14 @@ pub(super) fn batch_ready_lod_chunks(
         return;
     }
     if !terrain_batch_budget_available(&budget, config.max_commit_micros_per_frame) {
+        if pending_cpu != 0 {
+            profiler.increment("lod/terrain_batch_budget_deferrals", 1);
+            if budget.remaining == 0 {
+                profiler.increment("lod/terrain_batch_slot_deferrals", 1);
+            } else {
+                profiler.increment("lod/terrain_batch_deadline_deferrals", 1);
+            }
+        }
         return;
     }
     // The generation and key ordering gives a stable oldest-first cadence for arrived chunks.

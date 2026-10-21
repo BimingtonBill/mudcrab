@@ -109,6 +109,15 @@ struct Filters {
 pub(super) struct TerrainHandoffPlugin;
 impl Plugin for TerrainHandoffPlugin {
     fn build(&self, app: &mut App) {
+        // Cluster package/terrain are startup options, not mutable graphics-menu controls.
+        // Install no terrain complement systems when their owner is absent.
+        let enabled = app
+            .world()
+            .get_resource::<crate::config::EngineConfig>()
+            .is_some_and(|config| config.clusters.is_some() && config.cluster_terrain);
+        if !enabled {
+            return;
+        }
         let Some(render) = app.get_sub_app_mut(RenderApp) else {
             return;
         };

@@ -357,6 +357,14 @@ impl Plugin for StreamingPlugin {
             native_lod::NativeLodPlugin,
             terrain_handoff::TerrainHandoffPlugin,
         ));
+        // Offscreen-only initial batch transfer needs this frame's completed visibility checks.
+        if app
+            .world()
+            .get_resource::<EngineConfig>()
+            .is_some_and(|config| config.clusters.is_some() && config.cluster_terrain)
+        {
+            app.add_systems(Last, lod::terrain_batching::finalize_unviewed_lod_batches);
+        }
         // On a profiled run, the despawns the immediate unload queues through `Commands` are
         // applied at the schedule's sync point right after `plan_cells` - exactly where Bevy
         // would insert one on its own (the exclusive `despawn_cells` forces it). These systems

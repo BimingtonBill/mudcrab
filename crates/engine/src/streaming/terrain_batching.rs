@@ -9,6 +9,7 @@ use crate::terrain_upload::TerrainMeshUploadReadiness;
 use crate::visibility_optimization::StructuralHierarchyNode;
 use bevy::{
     animation::AnimatedBy,
+    app::{Inherited, Propagate},
     asset::RenderAssetUsages,
     camera::{
         primitives::{Aabb, Frustum, Sphere},
@@ -99,6 +100,7 @@ struct TerrainBatch {
     state: RenderState,
     pending_upload: bool,
     fallback_entities: Vec<Entity>,
+    fallback_selected: u16,
 }
 
 struct BatchMember {
@@ -174,10 +176,20 @@ type UnsupportedNode = Or<(
     )>,
 )>;
 
+type StructuralLayers<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static RenderLayers,
+        Option<&'static Inherited<RenderLayers>>,
+        Has<Propagate<RenderLayers>>,
+    ),
+>;
+
 #[derive(SystemParam)]
 pub(crate) struct LodBatchPreparation<'w, 's> {
     transforms: Query<'w, 's, (&'static Transform, Option<&'static Visibility>)>,
-    layers: Query<'w, 's, &'static RenderLayers>,
+    layers: StructuralLayers<'w, 's>,
     render_states: Query<'w, 's, PrimitiveRenderState>,
     unsupported: Query<'w, 's, Entity, UnsupportedNode>,
     culling: Query<'w, 's, PrimitiveCullingState>,
@@ -293,7 +305,16 @@ impl LodBatchPreparation<'_, '_> {
                     .get(entity)
                     .map(Name::as_str)
                     .map_err(|_| "scene contains an unnamed non-terrain node")?;
-                if self.layers.contains(entity)
+                // RenderLayers inherited from the LOD root's engine-owned propagation are
+                // routing state, not extra authored scene behavior. Preserve refusal for a
+                // local source or an unproven/different layer value on structural nodes.
+                let owns_layers =
+                    self.layers
+                        .get(entity)
+                        .is_ok_and(|(layers, inherited, source)| {
+                            source || inherited.is_none_or(|inherited| inherited.0 != *layers)
+                        });
+                if owns_layers
                     || mesh_handles.contains(entity)
                     || !(name.starts_with("chunk_")
                         || name.starts_with("cell_")
@@ -521,6 +542,7 @@ pub(super) fn install(
                 state: prepared.state,
                 pending_upload: prepared.selected != 0,
                 fallback_entities: Vec::new(),
+                fallback_selected: 0,
             }
         })
         .collect();
@@ -593,6 +615,8 @@ impl LodBatchActivation<'_, '_> {
 
 #[derive(SystemParam)]
 pub(crate) struct LodBatchVisibility<'w, 's> {
+    config: Option<Res<'w, crate::config::EngineConfig>>,
+    cluster_terrain: Option<Res<'w, crate::cluster::terrain::ClusterTerrain>>,
     chunks: Query<
         'w,
         's,
@@ -605,6 +629,14 @@ pub(crate) struct LodBatchVisibility<'w, 's> {
     removed: RemovedComponents<'w, 's, LodTerrainBatches>,
     roots: Query<'w, 's, &'static super::LodChunkRoot>,
     drawn: Query<'w, 's, &'static crate::swap_bridge::SwapDrawReceipt>,
+    prepared: Query<
+        'w,
+        's,
+        (&'static Mesh3d, &'static crate::swap_bridge::SwapSurface),
+        With<crate::swap_bridge::SwapPrepared>,
+    >,
+    coverage_requests: Query<'w, 's, (), With<crate::swap_bridge::SwapCoverageRoot>>,
+    coverage_views: Query<'w, 's, &'static crate::swap_bridge::SwapCoverageInCameraView>,
     source_states: Query<'w, 's, (&'static TerrainCoverage, Has<TerrainSurfaceReady>)>,
     meshes: Option<ResMut<'w, Assets<Mesh>>>,
     commands: Commands<'w, 's>,
@@ -612,6 +644,29 @@ pub(crate) struct LodBatchVisibility<'w, 's> {
 }
 
 impl LodBatchVisibility<'_, '_> {
+    fn cluster_fallback_cells(&self) -> HashSet<(u32, IVec2)> {
+        if !self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.cluster_terrain && config.clusters.is_some())
+        {
+            return HashSet::new();
+        }
+        self.cluster_terrain
+            .iter()
+            .flat_map(|terrain| &terrain.blocks)
+            // Registration means this block can participate in cluster terrain selection.
+            // Pending package inventory alone owns no draw and adds no retirement obligation.
+            .filter(|block| block.batch.is_some())
+            .flat_map(|block| {
+                block
+                    .cells
+                    .iter()
+                    .map(move |grid| (block.worldspace_id, *grid))
+            })
+            .collect()
+    }
+
     pub(super) fn pending_count(&self) -> usize {
         self.chunks
             .iter()
@@ -633,6 +688,16 @@ impl LodBatchVisibility<'_, '_> {
     /// representation of the same ready coverage, so its exact source removal events can be
     /// ignored by the next selector pass rather than rebuilding the tier map again.
     pub(super) fn finalize_one(&mut self, replaced_sources: &mut HashSet<Entity>) -> bool {
+        self.finalize_one_with_current_visibility(replaced_sources, None)
+    }
+
+    // Only the Last-schedule caller may supply current visibility: Update precedes CheckVisibility.
+    fn finalize_one_with_current_visibility(
+        &mut self,
+        replaced_sources: &mut HashSet<Entity>,
+        current: Option<&crate::swap_bridge::CurrentCoverageVisibility>,
+    ) -> bool {
+        let fallback_cells = self.cluster_fallback_cells();
         let Some(readiness) = self.readiness.as_deref() else {
             return false;
         };
@@ -641,18 +706,49 @@ impl LodBatchVisibility<'_, '_> {
         }
         // Reveal uploaded initial batches while the source is still present. Waiting
         // for a draw on a Hidden staging mesh would deadlock the handoff.
-        for (_, mut chunk, ready) in &mut self.chunks {
+        for (entity, mut chunk, ready) in &mut self.chunks {
+            let world = self
+                .roots
+                .get(entity)
+                .ok()
+                .map(|root| root.key.worldspace_id);
             if ready.is_some() && chunk.source_children.is_some() {
+                if chunk
+                    .batches
+                    .iter()
+                    .any(|batch| owned_source_mask(batch, world, &fallback_cells) != 0)
+                    && !self.coverage_requests.contains(entity)
+                {
+                    self.commands
+                        .entity(entity)
+                        .insert(crate::swap_bridge::SwapCoverageRoot);
+                }
                 for batch in &mut chunk.batches {
-                    if batch.pending_upload && readiness.is_ready(batch.mesh.id()) {
-                        activate_uploaded_batch(batch, readiness, &mut self.commands);
+                    let owned = owned_source_mask(batch, world, &fallback_cells);
+                    if owned != 0 && batch.pending_upload && readiness.is_ready(batch.mesh.id()) {
+                        activate_uploaded_batch(batch, readiness, owned, &mut self.commands);
                     }
                 }
             }
         }
         let candidate = self.chunks.iter().find_map(|(entity, chunk, ready)| {
+            let world = self
+                .roots
+                .get(entity)
+                .ok()
+                .map(|root| root.key.worldspace_id);
             chunk.source_children.as_ref()?;
             ready?;
+            if current.is_some()
+                && !chunk
+                    .batches
+                    .iter()
+                    .any(|batch| owned_source_mask(batch, world, &fallback_cells) != 0)
+            {
+                return None;
+            }
+            let source_unviewed_now =
+                current.is_some_and(|visibility| visibility.is_unviewed(entity));
             // CPU source readiness does not prove GPU preparation. Keep the source scene until
             // the immutable source buffers are prepared as well: later index-mask transitions
             // use those retained buffers for their exact coverage fallback.
@@ -674,19 +770,47 @@ impl LodBatchVisibility<'_, '_> {
             }
             (sources_ready
                 && chunk.batches.iter().all(|batch| {
-                    batch.selected == 0
-                        || (!batch.pending_upload
-                            && self.drawn.get(batch.entity).is_ok_and(|receipt| {
-                                receipt.mesh == batch.mesh.id()
-                                    && receipt.material == batch.state.material.id().untyped()
-                            }))
+                    if batch.selected == 0 {
+                        true
+                    } else if owned_source_mask(batch, world, &fallback_cells) == 0 {
+                        !batch.pending_upload || readiness.is_ready(batch.mesh.id())
+                    } else {
+                        let drawn = self.drawn.get(batch.entity).is_ok_and(|receipt| {
+                            receipt.mesh == batch.mesh.id()
+                                && receipt.material == batch.state.material.id().untyped()
+                        });
+                        // Prepared offscreen transfer requires an observation of the entire old
+                        // hierarchy, never absence of the replacement batch alone. Unknown holds.
+                        let unviewed_ready = source_unviewed_now
+                            && self.coverage_views.get(entity).is_ok_and(|view| !view.0)
+                            && current
+                                .is_some_and(|visibility| visibility.is_unviewed(batch.entity))
+                            && self
+                                .prepared
+                                .get(batch.entity)
+                                .is_ok_and(|(mesh, surface)| {
+                                    mesh.0.id() == batch.mesh.id()
+                                        && surface.material_id()
+                                            == batch.state.material.id().untyped()
+                                });
+                        !batch.pending_upload && (drawn || unviewed_ready)
+                    }
                 }))
             .then_some(entity)
         });
         let Some(entity) = candidate else {
             return false;
         };
+        let world = self
+            .roots
+            .get(entity)
+            .ok()
+            .map(|root| root.key.worldspace_id);
         let (_, mut chunk, _) = self.chunks.get_mut(entity).expect("selected chunk exists");
+        self.commands.entity(entity).remove::<(
+            crate::swap_bridge::SwapCoverageRoot,
+            crate::swap_bridge::SwapCoverageInCameraView,
+        )>();
         // Unregister before despawning so the retained immutable GLB cannot respawn duplicates.
         self.commands.entity(entity).remove::<WorldAssetRoot>();
         self.commands.entity(entity).remove::<WorldInstance>();
@@ -705,7 +829,10 @@ impl LodBatchVisibility<'_, '_> {
             // Keep compact source primitives extracted after hierarchy retirement.
             // Current-view selection can revive these immediately if the batch's
             // pipeline, material or generation withdraws, even beyond the LAND ring.
-            select_source_fallbacks(batch, entity, 0, &mut self.commands);
+            let owned = owned_source_mask(batch, world, &fallback_cells);
+            // Stock transfer reveals the uploaded batch only after the old hierarchy is removed.
+            activate_uploaded_batch(batch, readiness, owned, &mut self.commands);
+            select_source_fallbacks(batch, entity, owned, &mut self.commands);
         }
         true
     }
@@ -773,19 +900,26 @@ impl LodBatchVisibility<'_, '_> {
     /// Upload completion cannot change selected coverage. Activate only the stored current IDs;
     /// a semantic change always updates masks first through `update` instead of this fast path.
     pub(super) fn finish_uploads(&mut self) {
+        let fallback_cells = self.cluster_fallback_cells();
         let Some(readiness) = self.readiness.as_deref() else {
             return;
         };
         if !readiness.has_ready_uploads() {
             return;
         }
-        for (_, mut chunk, ready) in &mut self.chunks {
+        for (entity, mut chunk, ready) in &mut self.chunks {
+            let world = self
+                .roots
+                .get(entity)
+                .ok()
+                .map(|root| root.key.worldspace_id);
             if ready.is_none() || chunk.source_children.is_some() {
                 continue;
             }
             for batch in &mut chunk.batches {
                 if batch.pending_upload && readiness.is_ready(batch.mesh.id()) {
-                    activate_uploaded_batch(batch, readiness, &mut self.commands);
+                    let owned = owned_source_mask(batch, world, &fallback_cells);
+                    activate_uploaded_batch(batch, readiness, owned, &mut self.commands);
                 }
             }
         }
@@ -813,6 +947,7 @@ impl LodBatchVisibility<'_, '_> {
         selected_tiers: &HashMap<(IVec2, u8), Option<LodTier>, S>,
         world: Option<Option<u32>>,
     ) -> (usize, usize, usize) {
+        let fallback_cells = self.cluster_fallback_cells();
         let Some(meshes) = self.meshes.as_deref_mut() else {
             return (0, 0, 0);
         };
@@ -823,6 +958,7 @@ impl LodBatchVisibility<'_, '_> {
         let mut visible_batches = 0;
         let mut changed_batches = 0;
         for (root, mut chunk, ready) in &mut self.chunks {
+            let chunk_world = self.roots.get(root).ok().map(|root| root.key.worldspace_id);
             let in_world = world.is_none_or(|world| {
                 self.roots
                     .get(root)
@@ -864,7 +1000,6 @@ impl LodBatchVisibility<'_, '_> {
                     readiness.forget(batch.mesh.id());
                     meshes.remove(batch.mesh.id());
                     batch.mesh = replacement;
-                    let previous_selection = batch.selected;
                     batch.selected = selected;
                     batch.pending_upload = selected != 0;
                     self.commands
@@ -882,12 +1017,7 @@ impl LodBatchVisibility<'_, '_> {
                     if !initial_upload {
                         // Preserve the entity and pipeline identity of every still-selected
                         // source. Only sources that leave semantic demand may be removed.
-                        select_source_fallbacks(
-                            batch,
-                            root,
-                            previous_selection,
-                            &mut self.commands,
-                        );
+                        select_source_fallbacks(batch, root, selected, &mut self.commands);
                     }
                     if selected != 0 {
                         readiness.request(batch.mesh.id());
@@ -897,9 +1027,14 @@ impl LodBatchVisibility<'_, '_> {
                     && batch.pending_upload
                     && readiness.is_ready(batch.mesh.id())
                 {
-                    activate_uploaded_batch(batch, readiness, &mut self.commands);
+                    let owned = owned_source_mask(batch, chunk_world, &fallback_cells);
+                    activate_uploaded_batch(batch, readiness, owned, &mut self.commands);
                 }
                 if !initial_upload {
+                    if !batch.pending_upload {
+                        let owned = owned_source_mask(batch, chunk_world, &fallback_cells);
+                        select_source_fallbacks(batch, root, owned, &mut self.commands);
+                    }
                     visible_batches += usize::from(selected != 0 && !batch.pending_upload);
                 }
             }
@@ -908,21 +1043,83 @@ impl LodBatchVisibility<'_, '_> {
     }
 }
 
+/// Current visibility authority exists only after PostUpdate CheckVisibility. This shares the
+/// ordinary commit/time ledger and never changes Update's draw-receipt retirement contract.
+pub(in crate::streaming) fn finalize_unviewed_lod_batches(
+    config: Res<crate::config::EngineConfig>,
+    mut budget: ResMut<crate::streaming::StreamingCommitBudget>,
+    mut streaming: ResMut<super::LodStreaming>,
+    mut profiler: ResMut<crate::profiling::ProfilingState>,
+    mut batches: LodBatchVisibility,
+    current: crate::swap_bridge::CurrentCoverageVisibility,
+) {
+    if !config.cluster_terrain
+        || config.clusters.is_none()
+        || streaming.terrain_batch_commit_used
+        || !super::terrain_batch_budget_available(&budget, config.max_commit_micros_per_frame)
+    {
+        return;
+    }
+    if batches.finalize_one_with_current_visibility(
+        &mut streaming.replaced_source_quadrants,
+        Some(&current),
+    ) {
+        streaming.terrain_batch_commit_used = true;
+        streaming.terrain_batch_activated_chunks += 1;
+        budget.remaining -= 1;
+        budget.commits = budget.commits.saturating_add(1);
+        profiler.increment("lod/terrain_batch_chunks_activated", 1);
+        let pending_cpu = streaming.terrain_batch_pending_cpu_chunks;
+        super::record_terrain_batch_progress(
+            &mut streaming,
+            &mut profiler,
+            pending_cpu,
+            batches.pending_count(),
+        );
+    }
+}
+
+fn owned_source_mask(
+    batch: &TerrainBatch,
+    world: Option<u32>,
+    owned: &HashSet<(u32, IVec2)>,
+) -> u16 {
+    let Some(world) = world else {
+        return 0;
+    };
+    batch
+        .members
+        .iter()
+        .enumerate()
+        .fold(0, |mask, (index, member)| {
+            mask | if batch.selected & (1 << index) != 0
+                && owned.contains(&(world, member.coverage.grid))
+            {
+                1 << index
+            } else {
+                0
+            }
+        })
+}
+
 fn select_source_fallbacks(
     batch: &mut TerrainBatch,
     root: Entity,
-    previous: u16,
+    selected: u16,
     commands: &mut Commands,
 ) {
+    if batch.fallback_selected == selected & batch.selected {
+        return;
+    }
     let mut retained: HashMap<_, _> = batch
         .members
         .iter()
         .enumerate()
-        .filter_map(|(index, _)| (previous & (1 << index) != 0).then_some(index))
+        .filter_map(|(index, _)| (batch.fallback_selected & (1 << index) != 0).then_some(index))
         .zip(std::mem::take(&mut batch.fallback_entities))
         .collect();
     for (index, member) in batch.members.iter().enumerate() {
-        if batch.selected & (1 << index) != 0 {
+        if selected & batch.selected & (1 << index) != 0 {
             let entity = retained.remove(&index).unwrap_or_else(|| {
                 spawn_render_mesh(
                     commands,
@@ -936,6 +1133,7 @@ fn select_source_fallbacks(
             batch.fallback_entities.push(entity);
         }
     }
+    batch.fallback_selected = selected & batch.selected;
     for entity in retained.into_values() {
         commands.entity(entity).try_despawn();
     }
@@ -944,6 +1142,7 @@ fn select_source_fallbacks(
 fn activate_uploaded_batch(
     batch: &mut TerrainBatch,
     readiness: &TerrainMeshUploadReadiness,
+    retained: u16,
     commands: &mut Commands,
 ) {
     if batch.pending_upload && !readiness.is_ready(batch.mesh.id()) {
@@ -951,8 +1150,22 @@ fn activate_uploaded_batch(
     }
     readiness.forget(batch.mesh.id());
     batch.pending_upload = false;
-    // Upload acknowledgment only reveals the batch. Source fallback remains
-    // resident; terrain_handoff suppresses it per current render view.
+    // Stock LOD transfers on GPU upload readiness, including offscreen batches.
+    // Reversible persistent fallback is confined to the cluster-terrain option.
+    let previous = batch.fallback_selected;
+    let mut entities = std::mem::take(&mut batch.fallback_entities).into_iter();
+    for index in 0..batch.members.len() {
+        if previous & (1 << index) != 0
+            && let Some(entity) = entities.next()
+        {
+            if retained & (1 << index) != 0 {
+                batch.fallback_entities.push(entity);
+            } else {
+                commands.entity(entity).try_despawn();
+            }
+        }
+    }
+    batch.fallback_selected &= retained;
     let (_, bounds) = selected_geometry(&batch.members, batch.selected);
     if let Some(bounds) = bounds {
         commands.entity(batch.entity).insert((
@@ -1004,7 +1217,15 @@ impl LodTerrainBatches {
                     false,
                 ));
             }
-            for (entity, member) in batch.fallback_entities.iter().zip(selected) {
+            let fallback_members =
+                batch
+                    .members
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, member)| {
+                        (batch.fallback_selected & (1 << index) != 0).then_some(member)
+                    });
+            for (entity, member) in batch.fallback_entities.iter().zip(fallback_members) {
                 out.push((*entity, member.source.clone(), vec![member.coverage], true));
             }
         }
@@ -1302,6 +1523,28 @@ mod tests {
         }
     }
 
+    fn enable_cluster_fallback(app: &mut App) {
+        use crate::cluster::terrain::{ClusterTerrain, TerrainBlock};
+        app.init_resource::<EngineConfig>();
+        let world = {
+            let mut config = app.world_mut().resource_mut::<EngineConfig>();
+            config.cluster_terrain = true;
+            config.clusters = Some(String::new());
+            config.worldspace_id
+        };
+        app.insert_resource(ClusterTerrain::for_blocks_test(vec![TerrainBlock {
+            mesh_hash: String::new(),
+            primitive_index: 0,
+            worldspace_id: world,
+            anchor: IVec2::ZERO,
+            side_cells: 4,
+            instance_path: String::new(),
+            cells: vec![IVec2::ZERO, IVec2::new(2, 0)],
+            material: Handle::default(),
+            batch: Some(0),
+        }]));
+    }
+
     // Synthetic protocol fixtures only: these do not represent GPU execution.
     fn acknowledge_uploads_and_draws(app: &mut App, root: Entity) {
         acknowledge_uploads(app, root);
@@ -1337,6 +1580,32 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    fn finalize_unviewed_initial(app: &mut App) -> bool {
+        app.world_mut()
+            .run_system_once(
+                |mut batches: LodBatchVisibility,
+                 mut streaming: ResMut<LodStreaming>,
+                 current: crate::swap_bridge::CurrentCoverageVisibility| {
+                    batches.finalize_one_with_current_visibility(
+                        &mut streaming.replaced_source_quadrants,
+                        Some(&current),
+                    )
+                },
+            )
+            .unwrap()
+    }
+
+    fn unview_fixture_meshes(app: &mut App, fixture: &Fixture, batch: Entity) {
+        for &entity in &fixture.primitives {
+            app.world_mut()
+                .entity_mut(entity)
+                .insert(ViewVisibility::default());
+        }
+        app.world_mut()
+            .entity_mut(batch)
+            .insert(ViewVisibility::default());
     }
 
     fn reset_submission_budget(mut budget: ResMut<StreamingCommitBudget>) {
@@ -1815,7 +2084,7 @@ mod tests {
                 .batches[0]
                 .fallback_entities
                 .len(),
-            3
+            0
         );
         acknowledge_uploads_and_draws(&mut app, fixture.root);
         app.update();
@@ -2373,7 +2642,7 @@ mod tests {
                 .iter()
                 .all(|&entity| app.world().get_entity(entity).is_err())
         );
-        assert_eq!(app.world().get::<Children>(fixture.root).unwrap().len(), 5);
+        assert_eq!(app.world().get::<Children>(fixture.root).unwrap().len(), 1);
         assert!(app.world().get::<WorldAssetRoot>(fixture.root).is_none());
         let original = app.world().get::<Mesh3d>(entity).unwrap().0.clone();
         let full_detail = full_quadrant(&mut app, IVec2::ZERO, 0);
@@ -2465,7 +2734,7 @@ mod tests {
             .get::<LodTerrainBatches>(fixture.root)
             .unwrap()
             .batches[0];
-        assert_eq!(batch.fallback_entities.len(), 4);
+        assert!(batch.fallback_entities.is_empty());
         assert_eq!(
             *app.world().get::<Visibility>(entity).unwrap(),
             Visibility::Inherited
@@ -2841,8 +3110,570 @@ mod tests {
     }
 
     #[test]
+    fn propagated_lod_chunk_layers_prepare_without_authored_behavior_fallback() {
+        use bevy::app::HierarchyPropagatePlugin;
+        for layers in [
+            crate::render::reflectable_world_layers(),
+            RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+            RenderLayers::none(),
+        ] {
+            let mut app = selection_app();
+            app.add_plugins(HierarchyPropagatePlugin::<RenderLayers>::new(PostUpdate));
+            let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+            app.world_mut()
+                .entity_mut(fixture.root)
+                .insert((layers.clone(), Propagate(layers.clone())));
+            ready_source(&mut app, &fixture);
+            // Allow real propagation to stamp every chunk/cell/group/quadrant wrapper before
+            // CPU admission, reproducing delayed runtime batching rather than a bare fixture.
+            app.update();
+            for node in [
+                fixture.scene_root,
+                fixture.patches[0].0,
+                fixture.primitives[0],
+            ] {
+                assert_eq!(app.world().get::<RenderLayers>(node), Some(&layers));
+                assert_eq!(
+                    app.world()
+                        .get::<Inherited<RenderLayers>>(node)
+                        .map(|value| &value.0),
+                    Some(&layers)
+                );
+            }
+            queue_source(&mut app, &fixture);
+            app.update();
+            let streaming = app.world().resource::<LodStreaming>();
+            assert_eq!(streaming.terrain_batch_prepared_chunks, 1);
+            assert_eq!(streaming.terrain_batch_fallback_chunks, 0);
+            let chunk = app.world().get::<LodTerrainBatches>(fixture.root).unwrap();
+            assert!(!chunk.batches.is_empty());
+            assert!(
+                chunk
+                    .batches
+                    .iter()
+                    .all(|batch| batch.state.layers.as_ref() == Some(&layers))
+            );
+        }
+    }
+
+    #[test]
+    fn authored_or_divergent_structural_layers_still_refuse_batching() {
+        let mut app = test_app();
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        let original = RenderLayers::layer(1);
+        let changed = RenderLayers::layer(2);
+        app.world_mut()
+            .entity_mut(fixture.scene_root)
+            .insert(original.clone());
+        assert!(prepare(&mut app, &fixture).is_err());
+        app.world_mut()
+            .entity_mut(fixture.scene_root)
+            .insert(Inherited(changed));
+        assert!(prepare(&mut app, &fixture).is_err());
+        app.world_mut()
+            .entity_mut(fixture.scene_root)
+            .insert((Inherited(original.clone()), Propagate(original)));
+        assert!(prepare(&mut app, &fixture).is_err());
+    }
+
+    #[test]
+    fn stock_lod_far_cpu_preparation_queue_and_uploads_drain() {
+        let mut app = selection_app();
+        let mut roots = Vec::new();
+        for index in 0..97 {
+            let fixture = fixture(&mut app, &[IVec2::new(index * 2, 0)], LodTier::Tier4);
+            ready_source(&mut app, &fixture);
+            queue_source(&mut app, &fixture);
+            roots.push(fixture.root);
+        }
+        let pending_cpu = |app: &mut App| {
+            let world = app.world_mut();
+            world
+                .query_filtered::<Entity, With<PendingLodTerrainBatching>>()
+                .iter(world)
+                .count()
+        };
+        assert_eq!(pending_cpu(&mut app), 97);
+        // The production preparation system runs once per reset frame budget. The bound permits
+        // one preparation and one initial transfer per root plus the final counter publication.
+        for _ in 0..(roots.len() * 2 + 2) {
+            app.update();
+            for &root in &roots {
+                if app.world().get::<LodTerrainBatches>(root).is_some() {
+                    acknowledge_uploads(&app, root);
+                }
+            }
+        }
+        assert_eq!(pending_cpu(&mut app), 0);
+        let streaming = app.world().resource::<LodStreaming>();
+        assert_eq!(streaming.terrain_batch_pending_cpu_chunks, 0);
+        assert_eq!(streaming.terrain_batch_prepared_chunks, roots.len() as u64);
+        assert_eq!(streaming.terrain_batch_activated_chunks, roots.len() as u64);
+        let pending_uploads = app
+            .world_mut()
+            .run_system_once(|batches: LodBatchVisibility| {
+                (batches.pending_count(), batches.pending_selection_uploads())
+            })
+            .unwrap();
+        assert_eq!(pending_uploads, (0, 0));
+        for root in roots {
+            let chunk = app.world().get::<LodTerrainBatches>(root).unwrap();
+            assert!(chunk.source_children.is_none());
+            assert!(
+                chunk
+                    .batches
+                    .iter()
+                    .all(|batch| batch.fallback_entities.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn last_transfer_uses_postupdate_visibility_over_previous_offscreen_observation() {
+        use crate::swap_bridge::{SwapCoverageInCameraView, SwapPrepared};
+        for changed_source in [None, Some(true), Some(false)] {
+            let mut app = test_app();
+            enable_cluster_fallback(&mut app);
+            let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+            ready_source(&mut app, &fixture);
+            let prepared = prepare(&mut app, &fixture).unwrap();
+            install_fixture(&mut app, &fixture, prepared);
+            acknowledge_uploads(&app, fixture.root);
+            assert!(!finalize_initial(&mut app));
+            let batch = app
+                .world()
+                .get::<LodTerrainBatches>(fixture.root)
+                .unwrap()
+                .batches[0]
+                .entity;
+            unview_fixture_meshes(&mut app, &fixture, batch);
+            app.world_mut()
+                .entity_mut(fixture.root)
+                .insert(SwapCoverageInCameraView(false));
+            app.world_mut().entity_mut(batch).insert(SwapPrepared {
+                stand_in: None,
+                since: 1,
+            });
+            let entering_view =
+                changed_source.map(|source| if source { fixture.primitives[0] } else { batch });
+            app.init_resource::<StreamingCommitBudget>()
+                .init_resource::<ProfilingState>()
+                .add_systems(Update, reset_submission_budget)
+                .add_systems(
+                    PostUpdate,
+                    move |mut visibility: Query<&mut ViewVisibility>| {
+                        if let Some(entity) = entering_view {
+                            *visibility.get_mut(entity).unwrap() = ViewVisibility::VISIBLE;
+                        }
+                    },
+                )
+                .add_systems(Last, finalize_unviewed_lod_batches);
+            app.update();
+            let retired = changed_source.is_none();
+            assert_eq!(
+                app.world()
+                    .get::<LodTerrainBatches>(fixture.root)
+                    .unwrap()
+                    .source_children
+                    .is_none(),
+                retired,
+                "current visibility overrides stale false; only known-unviewed source and batch retire"
+            );
+            assert!(
+                fixture
+                    .primitives
+                    .iter()
+                    .all(|entity| app.world().get_entity(*entity).is_err() == retired)
+            );
+            assert_eq!(
+                app.world()
+                    .resource::<LodStreaming>()
+                    .terrain_batch_activated_chunks,
+                u64::from(retired)
+            );
+            assert_eq!(
+                app.world().resource::<StreamingCommitBudget>().remaining,
+                if retired { 3 } else { 4 }
+            );
+        }
+    }
+
+    #[test]
+    fn last_transfer_keeps_unknown_current_source_visibility() {
+        use crate::swap_bridge::{SwapCoverageInCameraView, SwapPrepared};
+        let mut app = test_app();
+        enable_cluster_fallback(&mut app);
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        ready_source(&mut app, &fixture);
+        let prepared = prepare(&mut app, &fixture).unwrap();
+        install_fixture(&mut app, &fixture, prepared);
+        acknowledge_uploads(&app, fixture.root);
+        assert!(!finalize_initial(&mut app));
+        let batch = app
+            .world()
+            .get::<LodTerrainBatches>(fixture.root)
+            .unwrap()
+            .batches[0]
+            .entity;
+        unview_fixture_meshes(&mut app, &fixture, batch);
+        app.world_mut()
+            .entity_mut(fixture.root)
+            .insert(SwapCoverageInCameraView(false));
+        app.world_mut().entity_mut(batch).insert(SwapPrepared {
+            stand_in: None,
+            since: 1,
+        });
+        let unknown = fixture.primitives[0];
+        app.init_resource::<StreamingCommitBudget>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, reset_submission_budget)
+            .add_systems(PostUpdate, move |mut commands: Commands| {
+                commands.entity(unknown).remove::<ViewVisibility>();
+            })
+            .add_systems(Last, finalize_unviewed_lod_batches);
+        app.update();
+        assert!(
+            app.world()
+                .get::<LodTerrainBatches>(fixture.root)
+                .unwrap()
+                .source_children
+                .is_some()
+        );
+        assert_eq!(
+            app.world()
+                .resource::<LodStreaming>()
+                .terrain_batch_activated_chunks,
+            0
+        );
+    }
+
+    #[test]
+    fn owned_prepared_offscreen_batches_retire_only_after_whole_source_observation() {
+        use crate::swap_bridge::{SwapCoverageInCameraView, SwapCoverageRoot, SwapPrepared};
+        for observed in [None, Some(true), Some(false)] {
+            let mut app = test_app();
+            enable_cluster_fallback(&mut app);
+            let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+            ready_source(&mut app, &fixture);
+            let prepared = prepare(&mut app, &fixture).unwrap();
+            install_fixture(&mut app, &fixture, prepared);
+            acknowledge_uploads(&app, fixture.root);
+            assert!(
+                !finalize_initial(&mut app),
+                "unobserved hierarchy must remain"
+            );
+            assert!(app.world().get::<SwapCoverageRoot>(fixture.root).is_some());
+            let batch_entity = app
+                .world()
+                .get::<LodTerrainBatches>(fixture.root)
+                .unwrap()
+                .batches[0]
+                .entity;
+            app.world_mut()
+                .entity_mut(batch_entity)
+                .insert(SwapPrepared {
+                    stand_in: None,
+                    since: 1,
+                });
+            if let Some(in_view) = observed {
+                app.world_mut()
+                    .entity_mut(fixture.root)
+                    .insert(SwapCoverageInCameraView(in_view));
+            }
+            unview_fixture_meshes(&mut app, &fixture, batch_entity);
+            assert!(
+                !finalize_initial(&mut app),
+                "Update cannot use previous-frame invisibility"
+            );
+            let retired = finalize_unviewed_initial(&mut app);
+            assert_eq!(retired, observed == Some(false));
+            let chunk = app.world().get::<LodTerrainBatches>(fixture.root).unwrap();
+            assert_eq!(chunk.source_children.is_none(), retired);
+            assert_eq!(
+                app.world().get::<SwapCoverageRoot>(fixture.root).is_none(),
+                retired
+            );
+            if retired {
+                assert!(
+                    app.world()
+                        .get::<SwapCoverageInCameraView>(fixture.root)
+                        .is_none()
+                );
+                assert_eq!(chunk.batches[0].fallback_entities.len(), 4);
+                assert!(
+                    fixture
+                        .primitives
+                        .iter()
+                        .all(|entity| app.world().get_entity(*entity).is_err())
+                );
+            } else {
+                assert!(
+                    fixture
+                        .primitives
+                        .iter()
+                        .all(|entity| app.world().get_entity(*entity).is_ok())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offscreen_initial_retirement_requires_current_batch_asset_identity() {
+        use crate::swap_bridge::{SwapCoverageInCameraView, SwapPrepared};
+        let mut app = test_app();
+        enable_cluster_fallback(&mut app);
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        ready_source(&mut app, &fixture);
+        let prepared = prepare(&mut app, &fixture).unwrap();
+        install_fixture(&mut app, &fixture, prepared);
+        acknowledge_uploads(&app, fixture.root);
+        assert!(!finalize_initial(&mut app));
+        let batch_entity = app
+            .world()
+            .get::<LodTerrainBatches>(fixture.root)
+            .unwrap()
+            .batches[0]
+            .entity;
+        app.world_mut()
+            .entity_mut(fixture.root)
+            .insert(SwapCoverageInCameraView(false));
+        assert!(
+            !finalize_initial(&mut app),
+            "unviewed upload without preparation still holds"
+        );
+        app.world_mut()
+            .entity_mut(batch_entity)
+            .insert(SwapPrepared {
+                stand_in: None,
+                since: 1,
+            });
+        unview_fixture_meshes(&mut app, &fixture, batch_entity);
+        let current = app.world().get::<Mesh3d>(batch_entity).unwrap().0.clone();
+        app.world_mut()
+            .entity_mut(batch_entity)
+            .insert(Mesh3d(Handle::default()));
+        assert!(
+            !finalize_unviewed_initial(&mut app),
+            "an old preparation cannot cover a changed mesh"
+        );
+        app.world_mut()
+            .entity_mut(batch_entity)
+            .insert(Mesh3d(current));
+        unview_fixture_meshes(&mut app, &fixture, batch_entity);
+        assert!(!finalize_initial(&mut app));
+        assert!(finalize_unviewed_initial(&mut app));
+    }
+
+    #[test]
+    fn partial_cluster_inventory_retains_only_owned_batch_members() {
+        let mut app = test_app();
+        enable_cluster_fallback(&mut app);
+        let mixed = fixture(&mut app, &[IVec2::ZERO, IVec2::new(1, 0)], LodTier::Tier4);
+        let unrelated = fixture(&mut app, &[IVec2::new(4, 0)], LodTier::Tier4);
+        for fixture in [&mixed, &unrelated] {
+            ready_source(&mut app, fixture);
+            let prepared = prepare(&mut app, fixture).unwrap();
+            install_fixture(&mut app, fixture, prepared);
+            acknowledge_uploads(&app, fixture.root);
+        }
+        // Only the owned mixed batch waits for a draw; another chunk in that world transfers
+        // on upload proof and acquires no persistent compact source copies.
+        assert!(finalize_initial(&mut app));
+        assert!(
+            app.world()
+                .get::<LodTerrainBatches>(unrelated.root)
+                .unwrap()
+                .source_children
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .get::<LodTerrainBatches>(unrelated.root)
+                .unwrap()
+                .batches
+                .iter()
+                .all(|batch| batch.fallback_entities.is_empty())
+        );
+        assert!(
+            app.world()
+                .get::<LodTerrainBatches>(mixed.root)
+                .unwrap()
+                .source_children
+                .is_some()
+        );
+        acknowledge_uploads_and_draws(&mut app, mixed.root);
+        assert!(finalize_initial(&mut app));
+        let chunk = app.world().get::<LodTerrainBatches>(mixed.root).unwrap();
+        assert_eq!(
+            chunk
+                .batches
+                .iter()
+                .map(|batch| batch.fallback_entities.len())
+                .sum::<usize>(),
+            4
+        );
+        let fallback_coverage: Vec<_> = chunk
+            .render_surfaces()
+            .into_iter()
+            .filter(|(_, _, _, source)| *source)
+            .flat_map(|(_, _, coverage, _)| coverage)
+            .collect();
+        assert_eq!(fallback_coverage.len(), 4);
+        assert!(
+            fallback_coverage
+                .iter()
+                .all(|coverage| coverage.grid == IVec2::ZERO)
+        );
+        // Newly selected unowned coverage still gets a temporary upload fallback, then drains.
+        app.world_mut()
+            .run_system_once(|mut batches: LodBatchVisibility| {
+                batches.update(&HashMap::from([(
+                    (IVec2::new(1, 0), 0),
+                    Some(LodTier::Tier4),
+                )]));
+            })
+            .unwrap();
+        acknowledge_uploads(&app, mixed.root);
+        app.world_mut()
+            .run_system_once(|mut batches: LodBatchVisibility| batches.finish_uploads())
+            .unwrap();
+        assert!(
+            app.world()
+                .get::<LodTerrainBatches>(mixed.root)
+                .unwrap()
+                .batches
+                .iter()
+                .all(|batch| batch.fallback_entities.is_empty())
+        );
+    }
+
+    #[test]
+    fn cluster_settings_without_world_ownership_keep_stock_transfer() {
+        for inventory in [0, 1, 2, 3] {
+            let mut app = test_app();
+            enable_cluster_fallback(&mut app);
+            match inventory {
+                0 => {
+                    app.world_mut()
+                        .remove_resource::<crate::cluster::terrain::ClusterTerrain>();
+                }
+                1 => {
+                    app.world_mut()
+                        .resource_mut::<crate::cluster::terrain::ClusterTerrain>()
+                        .blocks
+                        .clear();
+                }
+                2 => {
+                    app.world_mut()
+                        .resource_mut::<crate::cluster::terrain::ClusterTerrain>()
+                        .blocks[0]
+                        .worldspace_id += 1;
+                }
+                _ => {
+                    app.world_mut()
+                        .resource_mut::<crate::cluster::terrain::ClusterTerrain>()
+                        .blocks[0]
+                        .batch = None;
+                }
+            }
+            let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+            ready_source(&mut app, &fixture);
+            let prepared = prepare(&mut app, &fixture).unwrap();
+            install_fixture(&mut app, &fixture, prepared);
+            acknowledge_uploads(&app, fixture.root);
+            assert!(finalize_initial(&mut app));
+            let chunk = app.world().get::<LodTerrainBatches>(fixture.root).unwrap();
+            assert!(chunk.source_children.is_none());
+            assert!(
+                chunk
+                    .batches
+                    .iter()
+                    .all(|batch| batch.fallback_entities.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn stock_lod_far_batches_drain_without_camera_draw_receipts() {
+        let mut app = test_app();
+        app.insert_resource(EngineConfig::default());
+        let mut roots = Vec::new();
+        // Many demand-selected chunks can be behind the camera. GPU upload completes for all;
+        // actual camera draws are deliberately absent, as in a settled stock lod-far view.
+        for index in 0..97 {
+            let fixture = fixture(&mut app, &[IVec2::new(index * 2, 0)], LodTier::Tier4);
+            ready_source(&mut app, &fixture);
+            let prepared = prepare(&mut app, &fixture).unwrap();
+            install_fixture(&mut app, &fixture, prepared);
+            acknowledge_uploads(&app, fixture.root);
+            roots.push(fixture.root);
+        }
+        let pending = |app: &mut App| {
+            app.world_mut()
+                .run_system_once(|batches: LodBatchVisibility| {
+                    (batches.pending_count(), batches.pending_selection_uploads())
+                })
+                .unwrap()
+        };
+        assert_eq!(pending(&mut app), (97, 0));
+        for _ in &roots {
+            assert!(finalize_initial(&mut app));
+        }
+        assert!(!finalize_initial(&mut app));
+        assert_eq!(pending(&mut app), (0, 0));
+        for &root in &roots {
+            let chunk = app.world().get::<LodTerrainBatches>(root).unwrap();
+            assert!(chunk.source_children.is_none());
+            for batch in &chunk.batches {
+                assert!(!batch.pending_upload);
+                assert!(batch.fallback_entities.is_empty());
+                assert!(
+                    app.world()
+                        .get::<crate::swap_bridge::SwapDrawReceipt>(batch.entity)
+                        .is_none()
+                );
+                assert_eq!(
+                    app.world().get::<Visibility>(batch.entity),
+                    Some(&Visibility::Inherited)
+                );
+            }
+        }
+        // A changed mask still gets temporary exact source coverage until its immutable mesh
+        // upload completes, then releases that fallback just as the upstream stock path does.
+        app.world_mut()
+            .run_system_once(|mut batches: LodBatchVisibility| {
+                batches.update(&HashMap::from([((IVec2::ZERO, 0), Some(LodTier::Tier4))]));
+            })
+            .unwrap();
+        assert_eq!(pending(&mut app), (0, 1));
+        assert_eq!(
+            app.world()
+                .get::<LodTerrainBatches>(roots[0])
+                .unwrap()
+                .batches[0]
+                .fallback_entities
+                .len(),
+            1
+        );
+        acknowledge_uploads(&app, roots[0]);
+        app.world_mut()
+            .run_system_once(|mut batches: LodBatchVisibility| batches.finish_uploads())
+            .unwrap();
+        assert_eq!(pending(&mut app), (0, 0));
+        assert!(
+            app.world()
+                .get::<LodTerrainBatches>(roots[0])
+                .unwrap()
+                .batches[0]
+                .fallback_entities
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn upload_reveals_before_exact_draw_and_keeps_resident_sources() {
         let mut app = test_app();
+        enable_cluster_fallback(&mut app);
         let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
         ready_source(&mut app, &fixture);
         let prepared = prepare(&mut app, &fixture).unwrap();
@@ -3026,6 +3857,8 @@ mod tests {
         )
         .insert_resource(EngineConfig {
             stream_radius: 0,
+            cluster_terrain: true,
+            clusters: Some(String::new()),
             ..default()
         })
         .insert_resource(RenderOrigin(IVec2::ZERO))
@@ -3038,6 +3871,7 @@ mod tests {
             crate::swap_bridge::SwapBridgePlugin,
             crate::streaming::terrain_handoff::TerrainHandoffPlugin,
         ));
+        enable_cluster_fallback(&mut app);
         crate::streaming::identity_changes::install_terrain(app.world_mut());
         app.sub_app_mut(RenderApp)
             .init_resource::<SelectedClusterCells>()
@@ -3075,7 +3909,7 @@ mod tests {
                 .has_render_backend()
         );
 
-        // Clusters OFF: execute initial reveal, exact bridge receipt, source
+        // Cluster fallback enabled, coverage absent: execute reveal, exact receipt, source
         // retirement, compact fallback's own queue/bridge cycle, then dormancy.
         let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
         ready_source(&mut app, &fixture);
