@@ -118,17 +118,23 @@ fn loaded_bytes(path: &'static str, bytes: Vec<u8>) -> Loaded {
                 .0
                 .is_empty()
         );
-        let mut query = template.world.try_query::<(Entity, &Mesh3d)>().unwrap();
-        query
-            .iter(&template.world)
-            .map(|(entity, mesh)| {
-                assert_eq!(
-                    template.world.get::<SourceStaticModel>(entity),
-                    Some(&SourceStaticModel(true))
-                );
-                mesh.0.id()
+        // A scene without meshes never registers `Mesh3d` in its world.
+        template
+            .world
+            .try_query::<(Entity, &Mesh3d)>()
+            .map(|mut query| {
+                query
+                    .iter(&template.world)
+                    .map(|(entity, mesh)| {
+                        assert_eq!(
+                            template.world.get::<SourceStaticModel>(entity),
+                            Some(&SourceStaticModel(true))
+                        );
+                        mesh.0.id()
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     };
     drop(root);
     until(&mut app, |app| {
@@ -369,6 +375,7 @@ fn actual_source_modification_evicts_no_clip_and_reclaims_its_existing_reference
     let mut loaded = loaded();
     let entity = reference(&mut loaded, 1);
     let old_source = static_answer(&loaded.app, entity);
+    let scene_root: Entity;
     {
         let mut scenes = loaded.app.world_mut().resource_mut::<Assets<WorldAsset>>();
         let mut template = scenes.get_mut(&loaded.source).unwrap();
@@ -377,25 +384,27 @@ fn actual_source_modification_evicts_no_clip_and_reclaims_its_existing_reference
             .query_filtered::<Entity, With<SourceClips>>()
             .iter(&template.world)
             .collect();
-        for id in ids {
-            template.world.entity_mut(id).remove::<SourceClips>();
+        assert_eq!(ids.len(), 1, "the loader marks exactly one scene root");
+        for id in &ids {
+            template.world.entity_mut(*id).remove::<SourceClips>();
         }
+        scene_root = ids[0];
     } // Real Assets mutation emits Modified; the real spawner replaces the live instance.
     until(&mut loaded.app, |app| {
         app.world().get_entity(old_source).is_err()
             && app.world().get::<SourceClipBinding>(entity).is_none()
     });
+    // The world-asset spawner debounces `Modified` events that arrive within a few frames of the
+    // previous one (it assumes they are not a real change), so the second edit waits them out.
+    for _ in 0..4 {
+        loaded.app.update();
+    }
     {
         let mut scenes = loaded.app.world_mut().resource_mut::<Assets<WorldAsset>>();
         let mut template = scenes.get_mut(&loaded.source).unwrap();
-        let root = template
-            .world
-            .query_filtered::<Entity, With<bevy::gltf::GltfSceneName>>()
-            .single(&template.world)
-            .unwrap();
         template
             .world
-            .entity_mut(root)
+            .entity_mut(scene_root)
             .insert(SourceClips::default());
     }
     until(&mut loaded.app, |app| {

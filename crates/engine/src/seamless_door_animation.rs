@@ -3328,7 +3328,13 @@ mod tests {
         );
         assert_eq!(state(&app, model.door), DoorState::Open { animated: true });
         assert!(app.world().get::<ReattachPose>(model.door).is_none());
-        assert!((leaf_degrees(&app, model.moved) - WIDE_SWING_DEGREES).abs() < 0.1);
+        // The restored Open clip is evaluated by the following animation pass.
+        app.update();
+        assert!(
+            (leaf_degrees(&app, model.moved) - WIDE_SWING_DEGREES).abs() < 0.1,
+            "leaf at {} degrees",
+            leaf_degrees(&app, model.moved)
+        );
         assert!(
             player(&app, model.player)
                 .playing_animations()
@@ -7797,7 +7803,13 @@ mod tests {
                     .expect("the far Open curve plays");
                 let near_fraction = swing_fraction(&app, &near).unwrap();
                 assert!((fraction - near_fraction).abs() <= STEP_SECONDS / CLIP_SECONDS + 1e-4);
-                assert!(leaf_degrees(&app, far.moved) > 0.0);
+                // A newly installed graph is evaluated by the following animation pass.
+                app.update();
+                assert!(
+                    leaf_degrees(&app, far.moved) > 0.0,
+                    "far leaf at {} degrees, fraction {fraction}",
+                    leaf_degrees(&app, far.moved)
+                );
             } else {
                 assert_eq!(state(&app, far.door), DoorState::Open { animated: false });
             }
