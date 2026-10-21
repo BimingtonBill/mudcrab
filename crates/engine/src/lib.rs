@@ -15,6 +15,7 @@ pub mod cull_counter;
 pub mod door_crossing;
 pub mod doors;
 pub mod emittance;
+pub mod extensions;
 pub mod fingerprint;
 pub mod frame_budget;
 pub mod indirect_metrics;

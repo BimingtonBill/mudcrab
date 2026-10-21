@@ -101,6 +101,8 @@ const DEFERRED_RUNTIME_TABLES: &[&str] = &[
     "scripts",
     "script_properties",
     "script_property_values",
+    // Derived runtime views of the portal tree, deferred with the rest.
+    "door_links",
     "room_bounds",
     "room_portals",
     "room_links",

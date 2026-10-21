@@ -7,6 +7,7 @@ pub mod check;
 pub mod collision;
 pub mod config;
 pub mod esm;
+pub mod extensions;
 pub mod integration;
 pub mod lip;
 pub mod lod;

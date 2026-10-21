@@ -105,6 +105,10 @@ struct InspectionReport {
     converter_manifest: ContractStatus,
     integration_report: ContractStatus,
     lod_manifest: LodContractStatus,
+    /// The data set's extensions with the status this engine gives each; absent for a data set
+    /// that lists none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    extensions: Vec<engine::extensions::ExtensionLine>,
     summary: InspectionSummary,
     cells: Vec<CellReport>,
     lod_chunks: Vec<LodChunkReport>,
@@ -281,6 +285,8 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
     );
     let cache = CellCache::open(&assets.join("cell_cache.rkyv"))?;
     let lod_manifest = lod_contract_status(&assets, &connection);
+    let extensions =
+        engine::extensions::describe(&engine::extensions::read_data_extensions(&assets)?);
     let lod_chunks = load_lod_chunks(&connection, &assets, options.worldspace)?;
     let mut cells = Vec::new();
     let mut rows = Vec::new();
@@ -395,6 +401,7 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
         converter_manifest: contract_status(&assets.join("conversion-manifest.json"), "complete"),
         integration_report: contract_status(&assets.join("integration-report.json"), "passed"),
         lod_manifest,
+        extensions,
         summary,
         cells,
         lod_chunks,

@@ -39,10 +39,10 @@ normal paths. Both frontends project TX06 into `detail_path` and TX07 into
 `specular_path`, as documented above. Schema 9 also
 projects only XESP byte 4 into `enable_parent_flags`. Separate candidate fixes
 used producer 25/world 8 for different contracts; the combined output first shipped
-as 26/9, and producer 27 keeps world schema 9.
+as 26/9, and producers 27 and 28 keep world schema 9.
 The engine, `world-inspect` and launcher accept world schemas **3 through 9**, using
 `shared::supports_runtime_world_database_schema`. Complete converter packages
-support schemas **15 through 27**. Legacy worlds render full detail without
+support schemas **15 through 28**. Legacy worlds render full detail without
 LOD; an advertised LOD package requires the current database contract.
 
 Converter producer 26 also corrects the texture encodings chosen from those
@@ -1199,3 +1199,11 @@ it through a `LEFT JOIN` on `references`, only when the table exists with every 
 | Door without `XTEL`, or with a malformed one | no row | scenery |
 | Destination cell has no resolvable record | no row | scenery |
 | Row with a NULL arrival value | n/a | not a load door |
+### 18. Extensions (tables beyond the core)
+
+Tables, indexes, files and glTF extension names that `main`'s converter does not write are not part of this schema.
+They are **extensions**: named, versioned, listed with a content hash in the `extensions` key of
+`conversion-manifest.json`. An extension never adds a column to a core table or changes a core table's rows; the snow
+materials of a static are the side table `static_materials`, not columns of `statics`. A reader probes the manifest
+(`shared::extensions::DataExtensions`) instead of probing tables. The five extensions the converter writes today, their
+owned items and the hash are specified in `docs/specs/converters/extensions.md`.

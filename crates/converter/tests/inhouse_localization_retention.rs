@@ -994,6 +994,8 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
             "scripts",
             "script_properties",
             "script_property_values",
+            // Derived runtime views of the portal tree, deferred with the rest.
+            "door_links",
             "room_bounds",
             "room_portals",
             "room_links",

@@ -647,6 +647,8 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
     }
     report.failures = manifest.failures.clone();
     manifest.complete = false;
+    // Repair rewrote meshes and the database: recompute what the extension list describes.
+    crate::extensions::refresh_manifest(&mut manifest, &staged)?;
     manifest.save(&staged.join("conversion-manifest.json"))?;
     fs::write(
         directory.join("repair-report.json"),

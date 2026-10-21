@@ -1,6 +1,6 @@
 use color_eyre::{
     Result,
-    eyre::{WrapErr, bail},
+    eyre::{WrapErr, bail, ensure},
 };
 use converter::archive::IngestionSync;
 use converter::config::RecordReader;
@@ -216,6 +216,9 @@ async fn main() -> Result<()> {
     {
         println!("{}", usage());
         return Ok(());
+    }
+    if args.first().and_then(|argument| argument.to_str()) == Some("refresh-extensions") {
+        return refresh_extensions(&args[1..]);
     }
     let command = parse_command(args)?;
     let mo2 = match &command {
@@ -707,6 +710,197 @@ fn suppress_caught_nif_parser_panics() {
             report_panic(info);
         }
     }));
+}
+
+/// `converter refresh-extensions <output directory>`: recomputes the manifest's `extensions` list
+/// (its content hash and stats) from the folder as it is now, and saves the manifest. For a data
+/// set whose list is stale or was written by an older hash implementation; a normal conversion,
+/// metadata rebuild or repair does this by itself.
+///
+/// This repairs hashes, not payloads: it never re-derives an extension's content and never restamps
+/// its provenance. Everything it cannot prove against the folder as it is now refuses the whole
+/// operation, before the manifest is written:
+///
+/// * a listed extension whose `built_from` is not the data set's current core identity,
+/// * a listed extension whose content is gone from the folder,
+/// * a listed extension at a version or with an ownership this converter does not write,
+/// * content for an extension the manifest never listed (unknown provenance),
+/// * any other holder of the folder's asset lock.
+///
+/// An extension this converter does not write keeps its original JSON fields and values.
+fn refresh_extensions(args: &[OsString]) -> Result<()> {
+    let [folder] = args else {
+        color_eyre::eyre::bail!("usage: converter refresh-extensions <output directory>");
+    };
+    let folder = std::path::Path::new(folder);
+    // The lock a conversion takes, held before the manifest is read and until it is replaced, so a
+    // concurrent conversion, repair or engine read cannot interleave with this refresh.
+    let _lock = shared::asset_lock::AssetLock::acquire_exclusive(folder)
+        .wrap_err("cannot refresh an asset directory in use")?;
+    let path = folder.join("conversion-manifest.json");
+    // Only the `extensions` key is replaced: the manifest is edited as plain JSON so nothing else
+    // in it (entries, failures, hashes) goes through a load filter or is dropped.
+    let text = std::fs::read(&path)
+        .map_err(|error| color_eyre::eyre::eyre!("reading {}: {error}", path.display()))?;
+    let mut manifest: serde_json::Value = serde_json::from_slice(&text)?;
+    ensure!(manifest.is_object(), "the manifest is not a JSON object");
+    let before: Vec<serde_json::Value> = match manifest.get("extensions") {
+        Some(listed) => serde_json::from_value(listed.clone())?,
+        None => Vec::new(),
+    };
+    let mut listed_ids = std::collections::BTreeSet::new();
+    for raw in &before {
+        let id = raw
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| color_eyre::eyre::eyre!("extension entry has no string id"))?;
+        ensure!(
+            listed_ids.insert(id.to_owned()),
+            "extension {id} is listed twice"
+        );
+    }
+    let specs = converter::extensions::specs();
+    for spec in &specs {
+        if !listed_ids.contains(spec.id) && extension_has_owned_content(folder, spec)? {
+            bail!(
+                "the data set holds {} content but {} has no extension entry for it; \
+                convert the data set again so the conversion records where it came from",
+                spec.id,
+                path.display()
+            );
+        }
+    }
+    let now = converter::extensions::build_entries(folder)?;
+    let mut entries = Vec::with_capacity(before.len());
+    for raw in &before {
+        let id = raw["id"].as_str().expect("entry ids validated above");
+        let Some(spec) = specs.iter().find(|spec| spec.id == id) else {
+            // Preserve foreign fields, including fields this engine does not deserialize.
+            entries.push(raw.clone());
+            continue;
+        };
+        let old: shared::extensions::ExtensionEntry = serde_json::from_value(raw.clone())?;
+        // A payload of another version or shape is not ours to interpret as the current one.
+        ensure!(
+            old.version == spec.version,
+            "{} lists extension {} version {}, but this converter writes version {}; \
+             convert the data set again instead of refreshing its hashes",
+            path.display(),
+            old.id,
+            old.version,
+            spec.version
+        );
+        let expected_owns = serde_json::to_value(&spec.owns)?;
+        ensure!(
+            old.owns == spec.owns
+                && raw["owns"].as_object().is_some_and(|owns| {
+                    owns.keys().all(|key| expected_owns.get(key).is_some())
+                }),
+            "{} lists extension {} owning content this converter does not write; \
+             convert the data set again instead of refreshing its hashes",
+            path.display(),
+            old.id
+        );
+        let Some(fresh) = now.iter().find(|entry| entry.id == old.id) else {
+            bail!(
+                "{} lists extension {} but the data set no longer holds its content; refresh \
+                 repairs hashes, not payloads — convert the data set again",
+                path.display(),
+                old.id
+            );
+        };
+        // `fresh.built_from` is the folder's current core identity. An entry derived from another
+        // conversion cannot be re-hashed without re-deriving its payload, and re-hashing it here
+        // would bless content this converter never wrote.
+        ensure!(
+            fresh.built_from == old.built_from,
+            "{} records extension {} built from {}, but the data set's core is now {}; \
+             convert the data set again instead of refreshing its hashes",
+            path.display(),
+            old.id,
+            old.built_from,
+            fresh.built_from
+        );
+        let mut updated = raw.clone();
+        updated["sha256"] = serde_json::to_value(&fresh.sha256)?;
+        updated["stats"] = serde_json::to_value(&fresh.stats)?;
+        entries.push(updated);
+    }
+    // Content for an extension the manifest never listed carries no provenance this command can
+    // vouch for: refresh must not invent an entry for it.
+    for fresh in &now {
+        ensure!(
+            listed_ids.contains(&fresh.id),
+            "the data set holds {} content but {} has no extension entry for it; \
+             convert the data set again so the conversion records where it came from",
+            fresh.id,
+            path.display()
+        );
+    }
+
+    if entries == before {
+        println!("{}: extension entries unchanged", folder.display());
+        return Ok(());
+    }
+    for entry in &now {
+        println!(
+            "{} v{} {}: refreshed",
+            entry.id, entry.version, entry.sha256
+        );
+    }
+    let object = manifest
+        .as_object_mut()
+        .ok_or_else(|| color_eyre::eyre::eyre!("the manifest is not a JSON object"))?;
+    // Never empty here: a listed extension that lost its content is refused above, and a manifest
+    // with no entries at all returns before this point.
+    object.insert("extensions".to_owned(), serde_json::to_value(&entries)?);
+    let staged = path.with_extension("json.refresh");
+    std::fs::write(&staged, serde_json::to_vec_pretty(&manifest)?)?;
+    std::fs::rename(&staged, &path)?;
+    Ok(())
+}
+
+/// Detect any owned table/index/file, even when the extension is incomplete. glTF-only payloads
+/// are detected by build_entries, whose glTF specs do not require database tables.
+fn extension_has_owned_content(
+    folder: &Path,
+    spec: &converter::extensions::ExtensionSpec,
+) -> Result<bool> {
+    let database = folder.join("skyrim_world.db");
+    if database.is_file() && (!spec.owns.tables.is_empty() || !spec.owns.indexes.is_empty()) {
+        let connection = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        for (kind, names) in [("table", &spec.owns.tables), ("index", &spec.owns.indexes)] {
+            for name in names {
+                let exists: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
+                    [kind, name.as_str()],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    for name in &spec.owns.files {
+        let path = folder.join(name);
+        if name.ends_with('/') {
+            if !path.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(path) {
+                if entry?.file_type().is_file() {
+                    return Ok(true);
+                }
+            }
+        } else if path.is_file() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Exit code: 0 all good, 1 problems found, 2 the manifest could not be read.
@@ -1202,6 +1396,7 @@ fn usage() -> &'static str {
                  [--terrain-ini FILE] [--terrain-allow-downscale]
                  [--plugins-file FILE] [--skyrim-ccc-file FILE] [--skyrim-ini-file FILE]
        converter check <output directory> [--full]
+       converter refresh-extensions <output directory>
        converter repair-failed <Skyrim Data> <output directory> [--mo2-instance DIR]
                  [--mo2-profile NAME] [--no-lod] [--apply]
                  [--texture-encoder cpu|gpu] [--gpu-quality N] [--gpu-batch-mb N]

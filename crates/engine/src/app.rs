@@ -2,6 +2,7 @@ use crate::{
     color_pipeline::{SceneGradeSource, SkyrimCinematicPostPlugin},
     config::{EngineConfig, MAX_IO_THREADS},
     console::{ConsolePlugin, console_closed},
+    extensions::{open_features, read_data_extensions},
     metrics::AcceptanceMetricsPlugin,
     physics::{MovementTuning, PhysicsFixturePlugin, WorldPlayerPlugin},
     profiling::{ProfilingPlugin, ProfilingState},
@@ -171,9 +172,15 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let mut route_ground = None;
     let runtime_data = if config.streaming_fixture {
         let database_path = config.assets_dir.join("skyrim_world.db");
+        // The fixture is a synthetic `main`-shaped data set: no manifest, so no extension.
+        let features = open_features(
+            &config.assets_dir,
+            read_data_extensions(&config.assets_dir)?,
+        )?;
         Some((
-            WorldDatabase::open(&database_path)?,
+            WorldDatabase::open_with(&database_path, features.world_database())?,
             AssetCatalog::open(&database_path)?,
+            features,
             CellCache::open(&config.assets_dir.join("cell_cache.rkyv"))?,
             InitialCameraGroundHeight(0.0),
             None,
@@ -209,9 +216,16 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 &cache,
             )?);
         }
+        // The extensions of the data set, read once: each feature that reads one is opened here or
+        // reported off with its reason (`crate::extensions`).
+        let features = open_features(
+            &config.assets_dir,
+            read_data_extensions(&config.assets_dir)?,
+        )?;
         Some((
-            WorldDatabase::open(&database_path)?,
+            WorldDatabase::open_with(&database_path, features.world_database())?,
             AssetCatalog::open(&database_path)?,
+            features,
             cache,
             InitialCameraGroundHeight(ground_height),
             spawn_ground_height,
@@ -355,6 +369,11 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             // this engine has no gamepad input.
             ..default()
         });
+    // The loader is registered while renderer plugins build, before the world readers below are
+    // installed. Give it the validated data-set capability now, before any mesh can be loaded.
+    if let Some((_, _, features, _, _, _)) = &runtime_data {
+        app.insert_resource(features.extensions.clone());
+    }
     app.insert_resource(config.color_grade)
         .insert_resource(config.visual_preset)
         .insert_resource(sky_palette)
@@ -427,10 +446,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .add_systems(PreUpdate, drive_streaming_benchmark_route);
     }
     add_remote_plugins(&mut app, remote);
-    if let Some((database, catalog, cache, ground_height, spawn_ground_height)) = runtime_data {
+    if let Some((database, catalog, features, cache, ground_height, spawn_ground_height)) =
+        runtime_data
+    {
         if let Some(environment) = environment {
             app.insert_resource(environment);
         }
+        // Install validated capabilities before streaming registers its readers.
+        features.install(&mut app);
         app.insert_resource(database)
             .insert_resource(catalog)
             .insert_resource(cache)
@@ -2034,14 +2057,12 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
     )
     .wrap_err("invalid integration report")?;
     if !shared::supports_runtime_world_database_schema(report.schema_version) {
+        let rejection = AssetSetRejection::WorldDatabaseSchema {
+            found: report.schema_version,
+        };
         color_eyre::eyre::bail!(
             "{}",
-            asset_set_rejection_message(
-                &config.assets_dir,
-                AssetSetRejection::WorldDatabaseSchema {
-                    found: report.schema_version,
-                }
-            )
+            asset_set_rejection_message(&config.assets_dir, rejection)
         );
     }
     color_eyre::eyre::ensure!(
@@ -4577,7 +4598,10 @@ mod tests {
         .unwrap();
         std::fs::write(
             directory.path().join("integration-report.json"),
-            br#"{"schema_version":3,"passed":true}"#,
+            format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ),
         )
         .unwrap();
         let config = EngineConfig {

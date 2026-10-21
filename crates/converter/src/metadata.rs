@@ -658,6 +658,16 @@ async fn rebuild_into(
         )
         .await?;
     }
+    // Retained assets keep their original producer provenance, while metadata
+    // and the DDS source contract below describe this current-schema rebuild.
+    manifest.schema_version = CONVERTER_SCHEMA_VERSION;
+    manifest.retained_mesh_schema_version = Some(provenance.source_retained_mesh_schema);
+    manifest.retained_asset_configuration_hash =
+        Some(provenance.retained_asset_configuration_hash.clone());
+    manifest.configuration_hash = configuration_hash(config)?;
+    manifest.schema_addons = config.schemas()?.identities().to_vec();
+    // No archive extraction cache is copied by this route.
+    manifest.archives.clear();
     let integration = finalize_world_database(staging)?
         .ok_or_else(|| color_eyre::eyre::eyre!("missing rebuilt world database"))?;
     ensure!(
@@ -692,16 +702,11 @@ async fn rebuild_into(
         hash_file(&source.join("conversion-manifest.json"))? == provenance.source_manifest_hash,
         "source manifest changed during metadata rebuild"
     );
-    manifest.schema_version = CONVERTER_SCHEMA_VERSION;
-    manifest.retained_mesh_schema_version = Some(provenance.source_retained_mesh_schema);
-    manifest.retained_asset_configuration_hash =
-        Some(provenance.retained_asset_configuration_hash.clone());
-    manifest.configuration_hash = configuration_hash(config)?;
-    manifest.schema_addons = config.schemas()?.identities().to_vec();
-    // No archive extraction cache is copied by this route.
-    manifest.archives.clear();
     report.complete = conversion_is_complete(&report);
     manifest.complete = report.complete;
+    // The database was rebuilt, so the source pack's extension list no longer describes it.
+    // The base never carries cluster data: those extensions live in a derived overlay.
+    crate::extensions::refresh_manifest_with_finalized(manifest, staging, &[])?;
     manifest.save(&staging.join("conversion-manifest.json"))?;
     fs::write(
         staging.join("metadata-source-conversion-manifest.json"),

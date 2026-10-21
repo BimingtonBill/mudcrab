@@ -535,6 +535,8 @@ impl AssetPipeline {
             record_data_complete: Some(true),
             configuration_hash: expected_configuration.clone(),
             schema_addons: config.schemas()?.identities().to_vec(),
+            // Filled in right before the manifest is saved, when the output is final.
+            extensions: Vec::new(),
             asset_configuration_hashes: ["nif", "dds", "pex"]
                 .into_iter()
                 .map(|kind| {
@@ -1574,6 +1576,9 @@ impl AssetPipeline {
         manifest.complete = conversion_is_complete(&report);
         report.complete = manifest.complete;
         report.inputs_by_kind = manifest.inputs_by_kind.clone();
+        // The database and meshes are final here: list the extensions with their content hashes.
+        // The base never carries cluster data: those extensions live in a derived overlay.
+        crate::extensions::refresh_manifest_with_finalized(&mut manifest, staging, &[])?;
         manifest.save(&staging.join("conversion-manifest.json"))?;
         report
             .artifacts
@@ -5240,7 +5245,7 @@ mod tests {
         );
     }
 
-    /// A known adapter-10 combined settings proof preserves eligible producer-26 candidates.
+    /// A known adapter-10 combined settings proof preserves eligible current-producer candidates.
     #[test]
     fn adapter10_combined_asset_proof_reuses_eligible_candidates_without_relabeling() {
         let directory = tempfile::tempdir().unwrap();

@@ -292,6 +292,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     // `CREATE TABLE IF NOT EXISTS` leaves a reused older table as it was; give it the columns
     // later exports added, so a complete export can still insert into it.
     add_missing_columns(conn, "references", &[("emittance_id", "INTEGER")])?;
+    // The stamped version is the shared contract; never spell it out as a
+    // literal here, or a schema bump lands in exactly one of the two copies.
     conn.prepare_cached(
         "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
     )?
@@ -464,6 +466,7 @@ fn replace_complete_snapshot(tx: &Transaction<'_>) -> Result<()> {
         DROP TABLE IF EXISTS movement_types;
         DROP TABLE IF EXISTS npcs;
         DROP TABLE IF EXISTS lights;
+        DROP TABLE IF EXISTS door_links;
         DROP TABLE IF EXISTS statics;
         DROP TABLE IF EXISTS land;
         DROP TABLE IF EXISTS exterior_spatial;
@@ -1290,6 +1293,7 @@ mod tests {
             "worldspaces",
             "cells",
             "references",
+            "door_links",
             "land",
             "statics",
             "lights",
@@ -1315,6 +1319,23 @@ mod tests {
             assert_eq!(present, 1, "missing semantic table {table}");
         }
         validate_database(&conn).unwrap();
+    }
+
+    #[test]
+    fn stamps_the_database_with_the_shared_schema_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        // A second call must not append a second row: the runtime reads the
+        // first row of `schema_info`.
+        create_tables(&conn).unwrap();
+        let rows: Vec<u32> = conn
+            .prepare("SELECT version FROM schema_info")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows, vec![shared::WORLD_DATABASE_SCHEMA_VERSION]);
     }
 
     #[test]

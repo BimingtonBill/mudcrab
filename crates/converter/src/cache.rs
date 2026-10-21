@@ -300,6 +300,11 @@ pub struct ConversionManifest {
     /// Ordered identities of the runtime schema add-ons used by this pack.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schema_addons: Vec<crate::records::addons::SchemaAddonIdentity>,
+    /// Derived output beyond `main`'s core schema, each with a content hash
+    /// (`docs/specs/converters/extensions.md`). Absent when the data set has none, so a
+    /// data set without extensions has `main`'s manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<shared::extensions::ExtensionEntry>,
     /// Original producer settings of each converted asset kind, independent of
     /// record-reader metadata. A metadata-only migration retains these values.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
