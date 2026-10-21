@@ -773,6 +773,12 @@ fn a_merged_cell_spawns_one_terrain_entity_with_one_collider() {
         .iter(world)
         .count();
     assert_eq!(patches, 1, "one terrain patch for the whole cell");
+    let mut terrain_layers = world.query_filtered::<&RenderLayers, With<TerrainPatch>>();
+    assert_eq!(
+        terrain_layers.single(world).unwrap(),
+        &crate::render::reflectable_world_layers(),
+        "merged terrain retains the same content on both reflection routes"
+    );
     let merged = world
         .query_filtered::<Entity, With<MergedTerrainCell>>()
         .iter(world)

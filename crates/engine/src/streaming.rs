@@ -1525,6 +1525,7 @@ fn spawn_cell(
                     MeshMaterial3d(material),
                     Transform::default(),
                     TerrainPatch,
+                    crate::render::reflectable_world_layers(),
                     MergedTerrainCell,
                     Visibility::Hidden,
                     PendingMergedTerrain,
@@ -1576,6 +1577,7 @@ fn spawn_cell(
                     MeshMaterial3d(material),
                     Transform::default(),
                     TerrainPatch,
+                    crate::render::reflectable_world_layers(),
                     Visibility::Hidden,
                     PendingTerrainProfile {
                         cell_id: terrain.cell_id,
@@ -6863,6 +6865,11 @@ mod tests {
             .collect();
         assert_eq!(quadrants.len(), 4, "the cell has four terrain quadrants");
         for layers in quadrants {
+            assert_eq!(
+                layers,
+                crate::render::reflectable_world_layers(),
+                "streamed terrain retains the same content on both reflection routes"
+            );
             assert!(
                 layers.intersects(&RenderLayers::layer(crate::render::WORLD_LAYER)),
                 "terrain is what the reflection pass draws"

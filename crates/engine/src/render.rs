@@ -99,10 +99,8 @@ impl Plugin for VercidiumRendererPlugin {
             prepare_water_reflection.in_set(ViewPolicySystems::Prepare),
         );
 
-        // `--reflection-cascades N`: the default is 0 (an unshadowed reflection), so the limit is
-        // installed on every run; `--reflection-cascades all` (or 4) keeps every cascade of the sun
-        // and leaves the system out of the frame. Without an `EngineConfig` (unit tests) nothing is
-        // limited.
+        // `--reflection-cascades N` installs a limit only when explicitly requested.
+        // The default, `all`, and 4 keep every cascade and leave the limiting system out.
         add_configured_water_reflection_cascade_limit(app);
 
         let bridge = RendererProofBridge::default();
@@ -943,8 +941,8 @@ const WATER_REFLECTION_FRUSTUM_MARGIN: f32 = 512.0;
 /// The policy is the one `--water-reflection-preset` chose ([`water_reflection_policy`]; baseline
 /// when there is no configuration), its target scaled by `--reflection-scale`. The baseline camera
 /// keeps the components the reflection cost flags give it
-/// ([`ReflectionOptions`](crate::config::ReflectionOptions): no depth prepass by default, occlusion
-/// culling only with one). The water preset throttles the camera, and a throttled camera must not keep occlusion
+/// ([`ReflectionOptions`](crate::config::ReflectionOptions): depth prepass and occlusion culling
+/// on by default). The water preset throttles the camera, and a throttled camera must not keep occlusion
 /// history or multisampling: it is spawned without [`OcclusionCulling`], whatever
 /// `--reflection-occlusion` says, and with [`Msaa::Off`].
 fn setup_water_reflection(
@@ -1008,8 +1006,8 @@ fn setup_water_reflection(
         },
         WaterReflectionCamera,
     ));
-    // The prepass is off by default and `--reflection-prepass=on` brings it back, with occlusion
-    // culling unless `--reflection-occlusion=off` (`ReflectionOptions`). Without the prepass the view has no prepass phase to queue, sort,
+    // The prepass is on by default; `--reflection-prepass=off` disables it and occlusion culling.
+    // Without the prepass the view has no prepass phase to queue, sort,
     // batch and draw (`bevy_core_pipeline-0.19.0/src/prepass/node.rs`), and a card's soft edge
     // (`effect_palette.wgsl`'s `DEPTH_PREPASS` block) is compiled out for this view. Without
     // occlusion culling the view skips the two-phase early/late prepass split
@@ -1610,16 +1608,16 @@ mod tests {
     }
 
     #[test]
-    fn the_default_reflection_camera_has_no_prepass_or_occlusion_and_a_full_target() {
+    fn the_default_reflection_camera_keeps_prepass_and_occlusion_and_a_full_target() {
         let (app, camera) = spawned_reflection_camera(&[]);
         let camera = app.world().entity(camera);
-        assert!(!camera.contains::<DepthPrepass>());
-        assert!(!camera.contains::<OcclusionCulling>());
+        assert!(camera.contains::<DepthPrepass>());
+        assert!(camera.contains::<OcclusionCulling>());
         assert_eq!(reflection_target_size(&app), UVec2::new(1024, 576));
     }
 
     #[test]
-    fn the_reflection_prepass_flag_brings_back_the_prepass_and_occlusion() {
+    fn the_reflection_prepass_on_flag_preserves_the_prepass_and_occlusion() {
         let (app, camera) = spawned_reflection_camera(&["--reflection-prepass=on"]);
         let camera = app.world().entity(camera);
         assert!(camera.contains::<DepthPrepass>());
@@ -2279,8 +2277,8 @@ mod tests {
         let (app, camera) = spawned_preset_reflection_camera(WaterReflectionPreset::Baseline);
         let camera = app.world().entity(camera);
         assert_eq!(camera.get::<ViewPolicy>(), Some(&ViewPolicy::baseline()));
-        assert!(!camera.contains::<DepthPrepass>());
-        assert!(!camera.contains::<OcclusionCulling>());
+        assert!(camera.contains::<DepthPrepass>());
+        assert!(camera.contains::<OcclusionCulling>());
         // The spawn sets no `Msaa`; it is not the same as "not multisampled". In the shipped app
         // `CameraPlugin` registers `Msaa` as a required component of `Camera`
         // (`bevy_render-0.19.1/src/camera.rs:65`), so this camera gets Bevy's default `Sample4`

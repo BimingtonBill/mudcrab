@@ -241,9 +241,8 @@ pub struct EngineConfig {
     /// water reflection camera is given. `baseline` is the full-size, every-frame reflection the
     /// engine has always drawn.
     pub water_reflection_preset: WaterReflectionPreset,
-    /// `--water-reflection <on|off|planar|ssr>`: whether the water reflection view is drawn at
-    /// all (`off` is the measurement switch; `on` and `planar` draw it, and `ssr` is the Water Plus
-    /// reflection of [`Self::water_reflection_mode`]). See [`HELP_TEXT`].
+    /// `--water-reflection <on|off>`: whether the water reflection view is drawn.
+    /// Defaults to on; off is an explicit measurement switch. See [`HELP_TEXT`].
     pub water_reflection: bool,
 }
 
@@ -479,6 +478,7 @@ Benchmark and profiling:
   --profile-commit <hash>               commit recorded in the profile (default: unknown)
   --profile-dirty-worktree              record uncommitted worktree changes in the profile
   --profile-hardware <text>             hardware recorded in the profile (default: unspecified)
+  --water-reflection <on|off>           draw the water reflection view (default: on); measurement switch
   --water-reflection-preset <name>      water reflection cost: baseline (full size, every frame, shadowed)
                                         or water (quarter size, every other frame, shadowless) (default: baseline);
   --probe-retire-visibility <dir>       record whether a draining retiring cell ever shows, write retire-visibility.json and PNGs here, then exit
@@ -1379,6 +1379,9 @@ impl EngineConfig {
                 }
                 "--lights" => config.lights = true,
                 "--physics-fixture" => config.physics_fixture = true,
+                "--water-reflection" => {
+                    config.water_reflection = take_on_off("--water-reflection", args.next())?;
+                }
                 "--water-reflection-preset" => {
                     const EXPECTED: &str = "baseline or water";
                     let raw = take_raw("--water-reflection-preset", EXPECTED, args.next())?;
@@ -1530,23 +1533,20 @@ const SUN_POSITION_EXPECTED: &str =
 /// work, so the portal bench can measure them one at a time (`crate::render`'s
 /// `setup_water_reflection` and `limit_water_reflection_cascades` read them).
 ///
-/// The default is the cheaper reflection (the user's decision, 2026-09-26): no depth prepass (so no
-/// occlusion culling) and no shadow cascades, which cut the render thread 1.0-1.4 ms at Riften's
-/// water door (`local/bench/portal-bench-2026-09-26_16-42-33`). The full reflection as it was
-/// before comes back with `--reflection-prepass=on --reflection-cascades all`.
+/// The default preserves upstream's depth prepass, occlusion culling, full target size and all
+/// shadow cascades. Cost reductions require explicit flags or the optional water preset.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReflectionOptions {
-    /// Whether the reflection camera has a `DepthPrepass`: off by default, `--reflection-prepass=on`
-    /// opts back in. Bevy's occlusion culling needs the prepass, so without it
-    /// [`occlusion`](Self::occlusion) has no effect.
+    /// Whether the reflection camera has a `DepthPrepass`: on by default.
+    /// `--reflection-prepass=off` disables it. Without the prepass Bevy's occlusion culling
+    /// cannot run, so [`occlusion`](Self::occlusion) has no effect.
     pub prepass: bool,
     /// `--reflection-occlusion=off`: no `OcclusionCulling` on the reflection camera even when it
-    /// has its depth prepass (on by default, so `--reflection-prepass=on` brings occlusion culling
-    /// back with it).
+    /// has its depth prepass. On by default; disabling the prepass also disables occlusion culling.
     pub occlusion: bool,
     /// `--reflection-cascades N` (0 to [`MAX_REFLECTION_CASCADES`], or `all`): the reflection view
-    /// keeps only the first `N` shadow cascades of the sun; 0 (the default) draws the reflection
-    /// unshadowed. `None` (`all`, or `N` = [`MAX_REFLECTION_CASCADES`]) keeps every cascade the sun
+    /// keeps only the first `N` shadow cascades of the sun; 0 draws the reflection unshadowed.
+    /// The default `None` (`all`, or `N` = [`MAX_REFLECTION_CASCADES`]) keeps every cascade the sun
     /// has and installs no limiting system.
     pub cascades: Option<usize>,
     /// `--reflection-scale S` (above 0, at most 1): the reflection target's size as a fraction of
@@ -1564,9 +1564,9 @@ const MIN_REFLECTION_SIDE: u32 = 16;
 impl Default for ReflectionOptions {
     fn default() -> Self {
         Self {
-            prepass: false,
+            prepass: true,
             occlusion: true,
-            cascades: Some(0),
+            cascades: None,
             scale: 1.0,
         }
     }
@@ -4148,7 +4148,7 @@ mod tests {
     #[test]
     fn a_measurement_switch_refuses_any_other_value() {
         for option in ["--water-reflection"] {
-            for value in ["no", "true", "0", "OFF"] {
+            for value in ["no", "true", "0", "OFF", "planar", "ssr"] {
                 assert!(
                     matches!(
                         parse_error(&[option, value]),
@@ -4157,6 +4157,10 @@ mod tests {
                     "{option} accepted {value}"
                 );
             }
+            assert!(matches!(
+                parse_error(&[option, "--headless"]),
+                ConfigError::InvalidValue { value: Some(ref given), .. } if given == "--headless"
+            ));
             assert!(matches!(
                 parse_error(&[option]),
                 ConfigError::InvalidValue { value: None, .. }
@@ -4184,17 +4188,19 @@ mod tests {
     }
 
     #[test]
-    fn reflection_options_default_to_no_prepass_and_no_cascades() {
+    fn reflection_options_preserve_upstream_prepass_and_all_cascades() {
         let options = EngineConfig::run_from_args(Vec::<String>::new()).reflection;
         assert_eq!(options, ReflectionOptions::default());
-        assert!(!options.prepass);
-        assert!(!options.occlusion_culling());
-        assert_eq!(options.cascades, Some(0));
+        assert!(options.prepass);
+        assert!(options.occlusion);
+        assert!(options.occlusion_culling());
+        assert_eq!(options.cascades, None);
+        assert_eq!(options.scale, 1.0);
         assert_eq!(options.target_size(), REFLECTION_SIZE);
     }
 
     #[test]
-    fn the_opt_back_in_flags_give_the_full_reflection() {
+    fn explicit_full_reflection_flags_preserve_the_default() {
         let parse = |args: &[&str]| {
             EngineConfig::run_from_args(args.iter().map(|arg| (*arg).to_owned())).reflection
         };
@@ -4219,7 +4225,7 @@ mod tests {
             "--reflection-scale",
             "0.5",
         ]);
-        assert!(!options.prepass);
+        assert!(options.prepass);
         assert!(!options.occlusion_culling());
         assert_eq!(options.cascades, Some(1));
         assert_eq!(options.target_size(), (512, 288));
