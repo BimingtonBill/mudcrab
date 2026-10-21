@@ -3580,7 +3580,10 @@ fn walk_intent_system(
         return;
     };
     // Yaw moves body, pitch moves view (V9).
-    body.rotation = Quat::from_axis_angle(Vec3::Y, look.yaw);
+    let yaw_rotation = Quat::from_axis_angle(Vec3::Y, look.yaw);
+    if body.rotation != yaw_rotation {
+        body.rotation = yaw_rotation;
+    }
     let forward = Vec3::new(-look.yaw.sin(), 0.0, -look.yaw.cos());
     let right = Vec3::new(look.yaw.cos(), 0.0, -look.yaw.sin());
     let strafe = Vec2::new(
