@@ -5,6 +5,7 @@ mod renderdoc_trigger;
 
 pub mod aabb_guard;
 pub mod app;
+pub mod billboard;
 pub mod bug_report;
 mod capture_frame;
 pub mod cell_commands;

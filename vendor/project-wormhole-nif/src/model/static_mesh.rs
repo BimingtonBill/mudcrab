@@ -21,6 +21,9 @@ pub struct StaticSceneNode {
     pub scale: f32,
     pub children: Vec<u32>,
     pub mesh: Option<usize>,
+    /// The `NiBillboardNode` mode (nif.xml `BillboardMode`) when this node turns to face the
+    /// camera; `None` for an ordinary node.
+    pub billboard_mode: Option<u16>,
 }
 
 impl StaticSceneNode {
@@ -77,7 +80,12 @@ impl StaticMesh {
             ));
         }
         if self.positions.len() != self.normals.len() && self.normals.len() != 0 {
-            let msg = format!("StaticMesh [{:?}]: Number of positions [{}] does not match numbers of normals [{}]", self.name, self.positions.len(), self.normals.len());
+            let msg = format!(
+                "StaticMesh [{:?}]: Number of positions [{}] does not match numbers of normals [{}]",
+                self.name,
+                self.positions.len(),
+                self.normals.len()
+            );
             debug!("{}", msg);
             return Err(msg);
         }

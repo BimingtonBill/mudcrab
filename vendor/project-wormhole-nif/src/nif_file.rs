@@ -15,7 +15,7 @@ use gltf::json::mesh::Primitive;
 use gltf::json::scene::UnitQuaternion;
 use gltf::json::texture::Info;
 use gltf::json::validation::{Checked, USize64};
-use gltf::{json::*, Semantic};
+use gltf::{Semantic, json::*};
 use project_wormhole_ba2::dev::ensure_texture_parent;
 use project_wormhole_ba2::dev::normalize_esm_path;
 use project_wormhole_esm::structs::geometry::Quaternion;
@@ -517,6 +517,7 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
                 NifBlock::NiNode(_)
                     | NifBlock::BSFadeNode(_)
                     | NifBlock::BSMultiBoundNode(_)
+                    | NifBlock::NiBillboardNode(_)
                     | NifBlock::BSTriShape(_)
                     | NifBlock::BSDynamicTriShape(_)
                     | NifBlock::BSSubIndexTriShape(_)
@@ -558,6 +559,22 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
                         .collect(),
                     None,
                 ));
+            }
+            NifBlock::NiBillboardNode(billboard) => {
+                let node = &billboard.node;
+                let mut scene_node = static_node_from_av(
+                    nif,
+                    block_index,
+                    &node.av,
+                    node.children
+                        .iter()
+                        .copied()
+                        .filter(|child| supported_blocks.contains(child))
+                        .collect(),
+                    None,
+                );
+                scene_node.billboard_mode = Some(billboard.billboard_mode);
+                model.static_nodes.push(scene_node);
             }
             NifBlock::BSTriShape(shape) => {
                 push_modern_static_shape(
@@ -609,6 +626,7 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
                         scale: shape.scale,
                         children: Vec::new(),
                         mesh: None,
+                        billboard_mode: None,
                     });
                     continue;
                 }
@@ -642,6 +660,7 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
                     scale: shape.scale,
                     children: Vec::new(),
                     mesh: Some(mesh_index),
+                    billboard_mode: None,
                 });
             }
             _ => {}
@@ -876,11 +895,12 @@ fn static_node_from_av(
             .get_string(av.object.name as usize)
             .ok()
             .map(str::to_owned),
-        translation: av.translation.0 .0,
-        rotation: av.rotation.0 .0,
+        translation: av.translation.0.0,
+        rotation: av.rotation.0.0,
         scale: av.scale.0,
         children,
         mesh,
+        billboard_mode: None,
     }
 }
 
@@ -1577,7 +1597,16 @@ impl Parse<&[u8]> for NifFileV3 {
 
 impl std::fmt::Debug for NifFileV3 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "NifFileV3\nHeader: {:#?}\nNodes: {}\nSkins: {}\nMaterials: {}\nShapes: {}\nSegShapes: {}", self.header, self.nodes.len(), self.skins.len(), self.materials.len(), self.shapes.len(), self.seg_shapes.len())
+        write!(
+            f,
+            "NifFileV3\nHeader: {:#?}\nNodes: {}\nSkins: {}\nMaterials: {}\nShapes: {}\nSegShapes: {}",
+            self.header,
+            self.nodes.len(),
+            self.skins.len(),
+            self.materials.len(),
+            self.shapes.len(),
+            self.seg_shapes.len()
+        )
     }
 }
 
@@ -1620,16 +1649,16 @@ pub fn push_nodes_to_root(root: &mut Root, nif: &NifFileV3) -> Result<(), String
             None
         } else {
             Some([
-                node.av.translation.0 .0.x,
-                node.av.translation.0 .0.y,
-                node.av.translation.0 .0.z,
+                node.av.translation.0.0.x,
+                node.av.translation.0.0.y,
+                node.av.translation.0.0.z,
             ])
         };
 
         let rotation = if node.av.rotation == NifRotation::default() {
             None
         } else {
-            let q = glam::Quat::from_mat3(&node.av.rotation.0 .0);
+            let q = glam::Quat::from_mat3(&node.av.rotation.0.0);
 
             Some(UnitQuaternion([q.x, q.y, q.z, q.w]))
 

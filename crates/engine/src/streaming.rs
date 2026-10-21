@@ -1909,7 +1909,7 @@ fn static_proxy_from_hierarchy(
     path: &str,
     root: Entity,
     children: &Query<&Children>,
-    transforms: &Query<(&Transform, &GlobalTransform)>,
+    transforms: &SpawnedNodeQuery,
     primitives: &RenderPrimitiveQuery,
     meshes: &Assets<Mesh>,
     materials: &Assets<StandardMaterial>,
@@ -1921,7 +1921,7 @@ fn static_proxy_from_hierarchy(
         stack.extend(kids.iter().map(|child| (child, Affine3A::IDENTITY)));
     }
     while let Some((entity, parent_to_root)) = stack.pop() {
-        let (local, _) = transforms
+        let (local, _, _) = transforms
             .get(entity)
             .map_err(|_| format!("static proxy node {entity:?} has no transform"))?;
         let node_to_root = parent_to_root * local.compute_affine();
@@ -2027,6 +2027,18 @@ fn drop_malformed_bodies(collision: &mut serde_json::Value) {
         }
     }
 }
+
+/// Hierarchy transforms used by the authored-bounds validator.
+/// Camera-facing nodes retain their authored rotation for this comparison.
+type SpawnedNodeQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        &'static Transform,
+        &'static GlobalTransform,
+        Option<&'static crate::billboard::Billboard>,
+    ),
+>;
 
 fn authored_collision_from_hierarchy(
     root: Entity,
@@ -2390,7 +2402,7 @@ fn static_collision_from_hierarchy(
     root: Entity,
     children: &Query<&Children>,
     scene_extras: &Query<&GltfSceneExtras>,
-    transforms: &Query<(&Transform, &GlobalTransform)>,
+    transforms: &SpawnedNodeQuery,
     primitives: &RenderPrimitiveQuery,
     meshes: &Assets<Mesh>,
     materials: &Assets<StandardMaterial>,
@@ -2770,7 +2782,7 @@ fn track_asset_readiness(
     children: Query<&Children>,
     scene_extras: Query<&GltfSceneExtras>,
     primitives: RenderPrimitiveQuery,
-    transforms: Query<(&Transform, &GlobalTransform)>,
+    transforms: SpawnedNodeQuery,
     images: Res<Assets<Image>>,
     world_assets: Res<Assets<WorldAsset>>,
     mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
@@ -3591,7 +3603,7 @@ fn validate_spawned_transforms_and_bounds(
     expected: Option<&ExpectedModelBounds>,
     converted_model: Option<&WorldAsset>,
     children: &Query<&Children>,
-    transforms: &Query<(&Transform, &GlobalTransform)>,
+    transforms: &SpawnedNodeQuery,
     primitives: &RenderPrimitiveQuery,
     meshes: &Assets<Mesh>,
 ) -> Result<TransformValidationSummary, String> {
@@ -3716,7 +3728,7 @@ fn accumulate_relative_bounds(
     entity: Entity,
     relative_to_root: Affine3A,
     children: &Query<&Children>,
-    transforms: &Query<(&Transform, &GlobalTransform)>,
+    transforms: &SpawnedNodeQuery,
     primitives: &RenderPrimitiveQuery,
     meshes: &Assets<Mesh>,
     nodes: &mut usize,
@@ -3728,11 +3740,12 @@ fn accumulate_relative_bounds(
     // stack. Children are pushed in reverse so they are visited in order, as before.
     let mut stack = vec![(entity, relative_to_root)];
     while let Some((entity, parent_to_root)) = stack.pop() {
-        let (local, global) = transforms
+        let (local, global, billboard) = transforms
             .get(entity)
             .map_err(|_| format!("hierarchy node {entity:?} has no local/global transform"))?;
         validate_transform(&format!("hierarchy node {entity:?}"), local, global)?;
         *nodes += 1;
+        let local = crate::billboard::authored_transform(local, billboard);
         let relative_to_root = parent_to_root * local.compute_affine();
         if let Ok((mesh_handle, _, _, _, _)) = primitives.get(entity) {
             let mesh = meshes.get(mesh_handle).ok_or_else(|| {
@@ -4985,7 +4998,7 @@ mod tests {
                     .run_system_once(
                         move |children: Query<&Children>,
                               scene_extras: Query<&GltfSceneExtras>,
-                              transforms: Query<(&Transform, &GlobalTransform)>,
+                              transforms: SpawnedNodeQuery,
                               primitives: RenderPrimitiveQuery,
                               meshes: Res<Assets<Mesh>>,
                               materials: Res<Assets<StandardMaterial>>| {
@@ -5048,7 +5061,7 @@ mod tests {
             .run_system_once(
                 move |children: Query<&Children>,
                       scene_extras: Query<&GltfSceneExtras>,
-                      transforms: Query<(&Transform, &GlobalTransform)>,
+                      transforms: SpawnedNodeQuery,
                       primitives: RenderPrimitiveQuery,
                       meshes: Res<Assets<Mesh>>,
                       materials: Res<Assets<StandardMaterial>>| {
@@ -5183,7 +5196,7 @@ mod tests {
             .world_mut()
             .run_system_once(
                 move |children: Query<&Children>,
-                      transforms: Query<(&Transform, &GlobalTransform)>,
+                      transforms: SpawnedNodeQuery,
                       primitives: RenderPrimitiveQuery,
                       meshes: Res<Assets<Mesh>>,
                       materials: Res<Assets<StandardMaterial>>| {
@@ -5298,7 +5311,7 @@ mod tests {
             .world_mut()
             .run_system_once(
                 move |children: Query<&Children>,
-                      transforms: Query<(&Transform, &GlobalTransform)>,
+                      transforms: SpawnedNodeQuery,
                       primitives: RenderPrimitiveQuery,
                       meshes: Res<Assets<Mesh>>,
                       materials: Res<Assets<StandardMaterial>>| {
@@ -5357,7 +5370,7 @@ mod tests {
             .world_mut()
             .run_system_once(
                 move |children: Query<&Children>,
-                      transforms: Query<(&Transform, &GlobalTransform)>,
+                      transforms: SpawnedNodeQuery,
                       primitives: RenderPrimitiveQuery,
                       meshes: Res<Assets<Mesh>>,
                       materials: Res<Assets<StandardMaterial>>| {
@@ -7783,7 +7796,7 @@ mod tests {
         #[allow(clippy::type_complexity)]
         let mut system_state: SystemState<(
             Query<&Children>,
-            Query<(&Transform, &GlobalTransform)>,
+            SpawnedNodeQuery,
             RenderPrimitiveQuery,
         )> = SystemState::new(&mut world);
         let (children, transforms, primitives) = system_state.get(&world).unwrap();
@@ -7803,7 +7816,7 @@ mod tests {
             let aabb = mesh.compute_aabb().unwrap();
             let center = Vec3::from(aabb.center);
             let half_extents = Vec3::from(aabb.half_extents);
-            let (_, global) = transforms.get(descendant).unwrap();
+            let (_, global, _) = transforms.get(descendant).unwrap();
             let relative = Mat4::from(root_inverse * global.affine());
             let transformed =
                 InstanceBounds::transformed(center - half_extents, center + half_extents, relative);
@@ -7925,7 +7938,7 @@ mod tests {
         #[allow(clippy::type_complexity)]
         let mut system_state: SystemState<(
             Query<&Children>,
-            Query<(&Transform, &GlobalTransform)>,
+            SpawnedNodeQuery,
             RenderPrimitiveQuery,
         )> = SystemState::new(&mut world);
         let (children, transforms, primitives) = system_state.get(&world).unwrap();
@@ -9037,6 +9050,152 @@ mod tests {
                 .get::<FormId>(),
             Some(&FormId(0x100)),
             "and the reference is still spawned"
+        );
+    }
+
+    #[derive(Resource, Default)]
+    struct BoundsOutcome {
+        check: Option<Result<TransformValidationSummary, String>>,
+    }
+
+    fn run_bounds_check(
+        mut outcome: ResMut<BoundsOutcome>,
+        roots: Query<(
+            Entity,
+            &Transform,
+            &GlobalTransform,
+            &WorldTransform,
+            Option<&ExpectedModelBounds>,
+        )>,
+        transforms: SpawnedNodeQuery,
+        children: Query<&Children>,
+        primitives: RenderPrimitiveQuery,
+        meshes: Res<Assets<Mesh>>,
+    ) {
+        let Ok((root, local, global, world_transform, expected)) = roots.single() else {
+            panic!("the fixture must spawn exactly one model root");
+        };
+        outcome.check = Some(super::validate_spawned_transforms_and_bounds(
+            root,
+            local,
+            global,
+            world_transform,
+            expected,
+            None,
+            &children,
+            &transforms,
+            &primitives,
+            &meshes,
+        ));
+    }
+
+    fn spawn_bounds_fixture(
+        world: &mut World,
+        root_local: Transform,
+        node_local: Transform,
+        mesh_local: Transform,
+        mesh_shift: Vec3,
+        mesh: Handle<Mesh>,
+    ) -> (Entity, ExpectedModelBounds) {
+        let (min, max) = {
+            let aabb = world
+                .resource::<Assets<Mesh>>()
+                .get(&mesh)
+                .and_then(|mesh| mesh.compute_aabb())
+                .expect("the fixture mesh has finite POSITION bounds");
+            let center = Vec3::from(aabb.center);
+            let half_extents = Vec3::from(aabb.half_extents);
+            let converted = InstanceBounds::transformed(
+                center - half_extents,
+                center + half_extents,
+                node_local.to_matrix() * mesh_local.to_matrix(),
+            );
+            (converted.min, converted.max)
+        };
+        let root_global = GlobalTransform::from(root_local.to_matrix());
+        let root = world
+            .spawn((
+                root_local,
+                root_global,
+                WorldTransform(root_local.to_matrix()),
+                ExpectedModelBounds { min, max },
+            ))
+            .id();
+        let node_global = root_global.mul_transform(node_local);
+        let node = world.spawn((node_local, node_global, ChildOf(root))).id();
+        let mut mesh_local = mesh_local;
+        mesh_local.translation += mesh_shift;
+        world.spawn((
+            mesh_local,
+            node_global.mul_transform(mesh_local),
+            Mesh3d(mesh),
+            ChildOf(node),
+        ));
+        (root, ExpectedModelBounds { min, max })
+    }
+
+    fn scene_node() -> Transform {
+        Transform::from_rotation(Quat::from_rotation_x(-0.55) * Quat::from_rotation_z(0.3))
+            .with_translation(Vec3::new(-1.23, 4.07, 0.61))
+    }
+
+    fn rotated_mesh_node() -> Transform {
+        Transform::from_rotation(
+            Quat::from_rotation_y(0.7) * Quat::from_rotation_x(0.35) * Quat::from_rotation_z(-0.2),
+        )
+        .with_translation(Vec3::new(3.37, 0.51, -2.19))
+        .with_scale(Vec3::new(1.5, 0.75, 2.0))
+    }
+
+    fn turned_node_case(billboard: bool) -> Result<TransformValidationSummary, String> {
+        let mut app = App::new();
+        let mut meshes = Assets::<Mesh>::default();
+        let mesh = meshes.add(Cuboid::new(2.0, 4.0, 6.0));
+        app.insert_resource(meshes);
+        spawn_bounds_fixture(
+            app.world_mut(),
+            Transform::default(),
+            scene_node(),
+            rotated_mesh_node(),
+            Vec3::ZERO,
+            mesh,
+        );
+        let world = app.world_mut();
+        let node = world
+            .query_filtered::<Entity, With<Mesh3d>>()
+            .single(world)
+            .expect("the fixture has one mesh node");
+        let authored = rotated_mesh_node().rotation;
+        let mut entity = world.entity_mut(node);
+        entity.get_mut::<Transform>().unwrap().rotation = Quat::from_rotation_y(1.1) * authored;
+        if billboard {
+            entity.insert(crate::billboard::Billboard {
+                mode: crate::billboard::BillboardMode::TurnAboutUp,
+                authored,
+            });
+        }
+        app.init_resource::<BoundsOutcome>()
+            .add_systems(Update, run_bounds_check);
+        app.update();
+        app.world_mut()
+            .remove_resource::<BoundsOutcome>()
+            .expect("the bounds check system ran")
+            .check
+            .expect("the bounds check ran")
+    }
+
+    #[test]
+    fn bounds_check_measures_a_billboard_at_its_authored_rotation() {
+        let turned_billboard = turned_node_case(true);
+        assert!(
+            turned_billboard.is_ok(),
+            "a billboard turned toward the camera must pass: {turned_billboard:?}"
+        );
+        let reason = turned_node_case(false)
+            .expect_err("the same turn on an ordinary node is a real divergence");
+        assert!(
+            reason.contains("spawned hierarchy bounds diverge from conversion"),
+            "{reason}"
         );
     }
 }

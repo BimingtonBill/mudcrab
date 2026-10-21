@@ -81,6 +81,7 @@ impl Plugin for VercidiumRendererPlugin {
             crate::render_skip::RenderSkipPlugin,
         ));
         app.add_plugins((
+            crate::billboard::BillboardPlugin,
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
             crate::prepass_vertex_alpha::PrepassVertexAlphaPlugin,

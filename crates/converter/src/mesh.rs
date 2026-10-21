@@ -2756,6 +2756,7 @@ mod tests {
                 scale: 1.0,
                 children: Vec::new(),
                 mesh: Some(mesh),
+                billboard_mode: None,
             }
         }
 
