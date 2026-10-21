@@ -86,8 +86,11 @@ pub(super) fn install(app: &mut App) {
         Last,
         publish.after(super::terrain_identity::validate_relationships),
     );
-    // Before the cluster renderer is introduced, ordinary streaming is the identity consumer.
-    app.add_systems(PostUpdate, audit_stock_identities);
+    if app.world().resource::<EngineConfig>().clusters.is_none() {
+        // Cluster extraction normally owns this cache. Without clusters, the opt-in diagnostic
+        // supplies the consumer so both indices can still check themselves in a played build.
+        app.add_systems(PostUpdate, audit_stock_identities);
+    }
     info!("terrain full-rebuild audits enabled, once per wall-clock second per index");
 }
 
@@ -206,13 +209,11 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(EngineConfig {
             terrain_audit: true,
+            clusters: Some("fixture".into()),
             ..default()
         });
         app.init_resource::<ProfilingState>();
-        // This test drives the actual audit publisher in isolation; the stock consumer has
-        // its own installation regression above and must not add an extra identity sample.
-        app.init_resource::<TerrainAudit>()
-            .add_systems(Last, publish);
+        install(&mut app);
         let audit = app.world().resource::<TerrainAudit>();
         audit.record(
             AuditIndex::Identity,

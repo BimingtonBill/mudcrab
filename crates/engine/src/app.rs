@@ -467,6 +467,44 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // The startup plugin lifts pacing until the world is ready unless --paced-startup
         // was requested. The cover is opt-in and is never applied to shots.
         app.add_plugins(crate::pacing::startup::StartupLoadPlugin);
+        let cluster_config = app.world().resource::<EngineConfig>();
+        let selector = cluster_config.clusters.clone();
+        let base = cluster_config.assets_dir.clone();
+        let preload = cluster_config.cluster_preload_batches;
+        let min_instance_pixels = cluster_config.cluster_min_instance_pixels;
+        let prepass = cluster_config.cluster_prepass;
+        let quality = cluster_config.graphics.clone();
+        if let Some(selector) = selector {
+            if preload {
+                app.insert_resource(crate::cluster::package::ClusterBatchPreload);
+            }
+            app.insert_resource(crate::cluster::render::ClusterSettings {
+                error_pixels: quality.cluster_error_pixels,
+                terrain_error_pixels: quality.cluster_terrain_error_pixels,
+                min_instance_pixels: min_instance_pixels.unwrap_or(0.0),
+                prepass,
+                ..default()
+            });
+            // Resolve the overlay among the base's own (`<assets>/derived`). Asynchronous
+            // certification checks its binding once under reader locks before any overlay read;
+            // a missing, ambiguous or foreign overlay stops the requested cluster run.
+            let overlay = shared::cluster_overlay::resolve_overlay(&base, &selector)
+                .wrap_err("--clusters")?;
+            // The blocks reach the GPU nearest the start position first. A block's bounds are in
+            // Creation coordinates (z up), unlike its instances' transforms, so the start position
+            // is compared as it is.
+            let priority_point = app
+                .world()
+                .resource::<EngineConfig>()
+                .start_position
+                .map(Vec3::from);
+            app.add_plugins(crate::cluster::package::ClusterPackagePlugin {
+                base,
+                overlay,
+                terrain: false,
+                priority_point,
+            });
+        }
         if let (Some(plan), Some(ground)) = (route, route_ground) {
             info!(
                 route = %plan.source,
@@ -2025,7 +2063,7 @@ struct RuntimeIntegrationReport {
     passed: bool,
 }
 
-fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
+pub(crate) fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
     for required in ["skyrim_world.db", "cell_cache.rkyv"] {
         color_eyre::eyre::ensure!(
             config.assets_dir.join(required).is_file(),
@@ -5075,7 +5113,8 @@ mod tests {
             .unwrap()
             .execute_batch("CREATE TABLE cluster_meshes(x INTEGER);")
             .unwrap();
-        for _ in [()] {
+        for clusters in [None, Some("default".into())] {
+            config.clusters = clusters;
             let error = format!("{:#}", validate_runtime_assets(&config).unwrap_err());
             assert!(
                 error.contains("old full-copy cluster dataset")

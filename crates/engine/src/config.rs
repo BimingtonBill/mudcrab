@@ -121,7 +121,7 @@ pub const DEFAULT_REMOTE_PORT: u16 = 15702;
 
 #[derive(Debug, Clone, Resource)]
 pub struct EngineConfig {
-    /// Live native LOD controls, initialized by --lod-objects and --lod-trees.
+    /// Live native LOD and cluster quality controls, initialized by their graphics flags.
     pub graphics: crate::graphics_settings::GraphicsSettings,
     /// Keep an automated capture window on screen instead of parking it off screen.
     pub show_window: bool,
@@ -164,6 +164,20 @@ pub struct EngineConfig {
     /// The benchmark rule below writes [`Self::terrain_radius`] without setting this, so a
     /// benchmark still measures the ring it always did.
     pub terrain_radius_given: bool,
+    /// The cluster overlay (ADR-0013 output, `<assets>/derived/clusters-<settings-id>`) to draw
+    /// objects from as additional cluster draws. `--clusters [label |
+    /// settings-id | path]`: the text names one overlay of `--assets`, empty for the only one.
+    /// Unset draws nothing extra.
+    pub clusters: Option<String>,
+    /// `--cluster-preload-batches`: request every cluster batch's material during the startup
+    /// load, nearest first, instead of as each comes into view. The startup cover then waits for
+    /// all of them, and nothing a view or a crossing proof depends on changes during play.
+    pub cluster_preload_batches: bool,
+    /// `--cluster-min-instance-pixels`: instances whose bounding sphere spans fewer pixels than
+    /// this across are not drawn (default 0: every instance).
+    pub cluster_min_instance_pixels: Option<f32>,
+    /// `--no-cluster-prepass`: leave the cluster batches out of the camera's prepass.
+    pub cluster_prepass: bool,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
     /// Retiring roots - cell roots and LOD chunks - a frame may despawn. `0` despawns every one at
@@ -461,6 +475,10 @@ impl Default for EngineConfig {
             terrain_lod: TerrainLodDistances::default(),
             object_lod: ObjectLodSettings::default(),
             terrain_radius: DEFAULT_TERRAIN_RADIUS,
+            clusters: None,
+            cluster_preload_batches: false,
+            cluster_min_instance_pixels: None,
+            cluster_prepass: true,
             terrain_radius_given: false,
             max_cell_commits_per_frame: 1,
             max_commit_micros_per_frame: 16_670,
@@ -640,6 +658,13 @@ Streaming:
   --auto-fly-speed <units/s>            fly the camera forward at this speed; 0 holds it still
   --terrain-radius <cells>              terrain-only ring around the streamed cells (default: 8, off
                                         where the worldspace has terrain LOD data; vanilla's view)
+  --clusters [label|settings-id|path]   draw this cluster overlay of --assets (built by converter
+                                        derive-clusters under <assets>/derived) as GPU-selected
+                                        clusters (ADR-0013)
+  --cluster-preload-batches             load every cluster batch during the startup load instead
+                                        of as it comes into view (requires --clusters)
+  --cluster-min-instance-pixels <px>    skip instances whose bounding sphere spans fewer pixels (default: 0, none)
+  --no-cluster-prepass                  leave cluster batches out of the camera's depth/normal/motion prepass
   --route <file>                        follow a route file's waypoints at its speed (a JSON file; see scripts/routes)
 
 Benchmark and profiling:
@@ -678,6 +703,8 @@ Benchmark and profiling:
   --image-space-slot <slot>            sunrise|day|sunset|night; requires --image-space-weather
   --visual-preset <vivid|cool-gray>      select sky and grading look (default: cool-gray)
   --sun-position <azimuth,elevation>     sun bearing clockwise from north and elevation above horizon, degrees
+  --cluster-error-pixels <px>          object cluster error threshold (default: 1; above 0, at most 16)
+  --cluster-terrain-error-pixels <px>  terrain cluster error threshold (default: 1; above 0, at most 16)
   --lod-objects <on|off>                draw native distant object blocks (default: on)
   --lod-trees <on|off>                  draw native distant tree billboards (default: on)
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
@@ -1178,6 +1205,37 @@ impl EngineConfig {
                         config.terrain_radius_given = true;
                     }
                 }
+                "--cluster-preload-batches" => config.cluster_preload_batches = true,
+                "--clusters" => {
+                    // The selector is optional: bare `--clusters` means the only overlay.
+                    let named = args.peek().is_some_and(|next| !next.starts_with("--"));
+                    let selector = if named {
+                        args.next().unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    config.clusters = Some(selector);
+                }
+                "--no-cluster-prepass" => config.cluster_prepass = false,
+                "--cluster-min-instance-pixels" => {
+                    let raw = take_raw(
+                        "--cluster-min-instance-pixels",
+                        "a pixel count, 0 for every instance",
+                        args.next(),
+                    )?;
+                    config.cluster_min_instance_pixels = Some(
+                        raw.parse::<f32>()
+                            .ok()
+                            .filter(|pixels| pixels.is_finite() && *pixels >= 0.0)
+                            .ok_or_else(|| {
+                                ConfigError::invalid_value(
+                                    "--cluster-min-instance-pixels",
+                                    Some(raw),
+                                    "a pixel count, 0 for every instance",
+                                )
+                            })?,
+                    );
+                }
                 "--headless" => config.headless = true,
                 "--hidden-window" => config.hidden_window = true,
                 "--max-unloads-per-frame" => {
@@ -1608,6 +1666,21 @@ impl EngineConfig {
                     })?);
                 }
                 "--show-window" => config.show_window = true,
+                "--cluster-error-pixels" | "--cluster-terrain-error-pixels" => {
+                    let value = take_raw(
+                        if argument == "--cluster-error-pixels" {
+                            "--cluster-error-pixels"
+                        } else {
+                            "--cluster-terrain-error-pixels"
+                        },
+                        "a pixel count above 0, at most 16",
+                        args.next(),
+                    )?;
+                    config
+                        .graphics
+                        .set(argument.trim_start_matches("--"), &value)
+                        .map_err(ConfigError::Message)?;
+                }
                 "--lod-objects" | "--lod-trees" => {
                     let option = if argument == "--lod-objects" {
                         "--lod-objects"
@@ -1782,6 +1855,13 @@ impl EngineConfig {
             });
         }
         config.drop_jump_the_run_would_overwrite();
+        if config.cluster_preload_batches && config.clusters.is_none() {
+            return Err(ConfigError::invalid_value(
+                "--cluster-preload-batches",
+                None,
+                "--clusters",
+            ));
+        }
         Ok(ConfigAction::Run(Box::new(config)))
     }
 
@@ -2310,16 +2390,30 @@ mod tests {
     /// audit tools and launch wrappers. Wrappers also contain engine invocations,
     /// so every other scanned `--flag` must be accepted by the engine parser.
     const NON_ENGINE_FLAGS: &[&str] = &[
-        "--all",                 // cargo fmt
-        "--all-targets",         // cargo test, cargo clippy
-        "--bin",                 // cargo test
-        "--bins",                // cargo build
-        "--check",               // cargo fmt
-        "--release",             // cargo build
-        "--workspace",           // cargo build, cargo test, cargo clippy
-        "--ignore-submodules",   // git diff
-        "--quiet",               // git diff
-        "--short",               // git rev-parse
+        "--bench-baked",                // cluster_bench.py
+        "--cluster-triangle-threshold", // cluster_bench.py
+        "--converted",                  // cluster_bench.py
+        "--keep-work",                  // cluster_bench.py
+        "--lod-mode",                   // cluster_bench.py
+        "--package-seconds",            // cluster_bench.py
+        "--plugin",                     // cluster_bench.py
+        "--previous",                   // cluster_bench.py
+        "--simulate-plugin-change",     // cluster_bench.py
+        "--terrain-lod-seconds",        // cluster_bench.py
+        "--threshold",                  // cluster_bench.py
+        "--work",                       // cluster_bench.py
+        "--work-root",                  // cluster_bench.py
+        "--overlay",                    // cluster_repro_check.py, extension_hash.py
+        "--all",                        // cargo fmt
+        "--all-targets",                // cargo test, cargo clippy
+        "--bin",                        // cargo test
+        "--bins",                       // cargo build
+        "--check",                      // cargo fmt
+        "--release",                    // cargo build
+        "--workspace",                  // cargo build, cargo test, cargo clippy
+        "--ignore-submodules",          // git diff
+        "--quiet",                      // git diff
+        "--short",                      // git rev-parse
         "--output", // world-inspect, profiling, startup runner, repeat-terrain-startup.py
         "--pairs-output", // correlate_drawables.py
         "--radius", // world-inspect
@@ -2483,6 +2577,90 @@ mod tests {
         assert!(!EngineConfig::default().terrain_audit);
         assert!(EngineConfig::from_args(["--terrain-audit".to_owned()]).is_ok());
         assert!(run_config(&["--terrain-audit"]).terrain_audit);
+    }
+
+    #[test]
+    fn batch_preload_is_off_by_default_and_requires_a_package() {
+        assert!(!EngineConfig::default().cluster_preload_batches);
+        assert!(EngineConfig::from_args(["--cluster-preload-batches".to_owned()]).is_err());
+        let config = run_config(&["--clusters", "fixture", "--cluster-preload-batches"]);
+        assert!(config.cluster_preload_batches);
+    }
+
+    #[test]
+    fn clusters_takes_an_optional_selector() {
+        assert_eq!(EngineConfig::default().clusters, None);
+        assert_eq!(
+            run_config(&["--clusters", "dense"]).clusters.as_deref(),
+            Some("dense")
+        );
+        // Bare, before another option or at the end: the only overlay.
+        assert_eq!(run_config(&["--clusters"]).clusters.as_deref(), Some(""));
+        let config = run_config(&["--clusters", "--cluster-preload-batches"]);
+        assert_eq!(config.clusters.as_deref(), Some(""));
+        assert!(config.cluster_preload_batches);
+        // The old option is gone.
+        assert!(EngineConfig::from_args(["--cluster-package".to_owned(), "x".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn cluster_instance_size_and_prepass_flags_preserve_their_defaults_and_ranges() {
+        let defaults = EngineConfig::default();
+        assert_eq!(defaults.cluster_min_instance_pixels, None);
+        assert!(defaults.cluster_prepass);
+        assert!(!run_config(&["--no-cluster-prepass"]).cluster_prepass);
+        for (raw, expected) in [("0", 0.0), ("0.5", 0.5), ("128", 128.0)] {
+            assert_eq!(
+                run_config(&["--cluster-min-instance-pixels", raw]).cluster_min_instance_pixels,
+                Some(expected)
+            );
+        }
+        for raw in ["-1", "NaN", "inf", "-inf", "1e99", "invalid"] {
+            assert!(
+                EngineConfig::from_args(["--cluster-min-instance-pixels", raw].map(str::to_owned))
+                    .is_err(),
+                "accepted {raw}"
+            );
+        }
+        assert!(EngineConfig::from_args(["--cluster-min-instance-pixels".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn cluster_quality_flags_validate_before_startup_and_update_the_public_resource() {
+        let defaults = EngineConfig::default();
+        assert_eq!(defaults.graphics.cluster_error_pixels, 1.0);
+        assert_eq!(defaults.graphics.cluster_terrain_error_pixels, 1.0);
+        let config = run_config(&[
+            "--cluster-error-pixels",
+            "2",
+            "--cluster-terrain-error-pixels",
+            "4",
+            "--lod-objects",
+            "off",
+            "--lod-trees",
+            "off",
+        ]);
+        assert_eq!(config.graphics.cluster_error_pixels, 2.0);
+        assert_eq!(config.graphics.cluster_terrain_error_pixels, 4.0);
+        assert!(!config.graphics.lod_objects && !config.graphics.lod_trees);
+        for flag in ["--cluster-error-pixels", "--cluster-terrain-error-pixels"] {
+            let settings = run_config(&[flag, "16"]).graphics;
+            let actual = if flag == "--cluster-error-pixels" {
+                settings.cluster_error_pixels
+            } else {
+                settings.cluster_terrain_error_pixels
+            };
+            assert_eq!(actual, crate::graphics_settings::MAX_CLUSTER_ERROR_PIXELS);
+            assert!(parser_options().contains(&flag));
+            assert!(help_names(flag));
+            assert!(EngineConfig::from_args([flag.to_owned()]).is_err());
+            for raw in ["0", "-1", "NaN", "inf", "-inf", "16.01", "1e99", "bad"] {
+                assert!(
+                    EngineConfig::from_args([flag, raw].map(str::to_owned)).is_err(),
+                    "{flag} accepted {raw}"
+                );
+            }
+        }
     }
 
     fn parse_error(arguments: &[&str]) -> ConfigError {

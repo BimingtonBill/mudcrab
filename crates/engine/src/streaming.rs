@@ -915,6 +915,10 @@ pub struct StreamingMetrics {
     pub unrecovered_lod_chunks: usize,
     pub resident_lod_chunks: usize,
     pub pending_lod_chunks: usize,
+    /// Cluster batches whose material is wanted by a view but not yet loaded.
+    pub pending_cluster_batches: usize,
+    /// Demanded cluster source/material loads that failed permanently; never readiness.
+    pub failed_cluster_batches: usize,
     pub ready_lod_terrain_patches: u64,
     pub visible_lod_terrain_patches: usize,
     pub total_lod_query_micros: u64,

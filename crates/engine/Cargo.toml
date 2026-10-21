@@ -37,6 +37,9 @@ crossbeam-channel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# Reuse Bevy's locked dependency to borrow serialized u32 upload bytes without
+# copying a whole world on the render thread (native little-endian targets).
+bytemuck = { version = "=1.25.0", features = ["derive"] }
 ktx2.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 libc = "0.2"

@@ -114,3 +114,14 @@ pub(crate) mod overlay_fixture;
 pub mod reader;
 pub(crate) mod stock_drawable;
 pub(crate) mod stock_visibility;
+
+mod instance_identity;
+pub mod package;
+pub mod render;
+/// GPU-free cluster residency bookkeeping.
+pub mod residency;
+/// Stable shadow-view draw buckets.
+pub mod shadow_buckets;
+pub mod source_identity;
+/// Shared terrain material and validated package consumer.
+pub mod terrain;

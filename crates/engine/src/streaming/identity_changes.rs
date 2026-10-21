@@ -131,7 +131,10 @@ pub(crate) fn install(world: &mut World) {
     if world.contains_resource::<StructureEpoch>() {
         return;
     }
-    use crate::world::components::{CellRef, FormId, MeshHandle};
+    use crate::{
+        cluster::source_identity::*,
+        world::components::{CellRef, FormId, MeshHandle},
+    };
     macro_rules! ids { ($($ty:ty),* $(,)?) => { vec![$(world.register_component::<$ty>()),*] }; }
     let mut components = ids![
         Transform,
@@ -144,6 +147,11 @@ pub(crate) fn install(world: &mut World) {
         Visibility,
         InheritedVisibility,
         bevy::camera::visibility::RenderLayers,
+        SourcePrimitive,
+        SourcePrimitiveMesh,
+        SourcePrimitiveTransform,
+        SourceStaticModel,
+        SourceNodePose,
         super::RetireHidden,
         super::AssetFailed,
         super::TerrainCoverage,
