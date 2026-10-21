@@ -50,7 +50,8 @@ pub struct WorldReference {
 }
 
 /// Base types whose converted resting model can participate in cluster replacement.
-/// Runtime state changes revoke a reference's resting representation independently of type.
+/// State-changing types remain in the mapping scope so their refusal is explicit.
+/// They are not eligible until production state writers revoke their cluster representation.
 /// Actor geometry is excluded; tree inclusion remains an explicit recipe setting.
 pub const RESTING_MODEL_TYPES: &[&str] = &[
     "STAT", "MSTT", "ACTI", "FLOR", "FURN", "MISC", "CONT", "ALCH", "WEAP", "INGR", "ARMO", "BOOK",
@@ -511,7 +512,7 @@ fn reference_sql(snow_source: SnowSource, has_static_flags: bool, condition: &st
     format!(
         "SELECT r.id, r.base_form_id, r.pos_x, r.pos_y, r.pos_z, r.rot_x, r.rot_y, r.rot_z,
                 r.scale, r.header_flags, r.enable_parent_id, rec.record_type, s.model_path,
-                0,
+                EXISTS(SELECT 1 FROM scripts sc WHERE sc.form_id = r.id OR sc.form_id = r.base_form_id),
                 {snow_expression}, r.cell_id,
                 r.data,
                 rec.data,
@@ -544,6 +545,7 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         record_type: row.get::<_, Option<String>>(11)?,
         static_flags: row.get::<_, Option<u32>>(19)?,
         model_path: row.get::<_, Option<String>>(12)?,
+        scripted: row.get::<_, bool>(13)?,
         snow_material: row.get::<_, i64>(14)? as u32,
         cell_id: row.get::<_, Option<u32>>(15)?.unwrap_or_default(),
         data_hash: hash(&reference_blob),
@@ -625,6 +627,7 @@ struct Row {
     record_type: Option<String>,
     static_flags: Option<u32>,
     model_path: Option<String>,
+    scripted: bool,
     snow_material: u32,
     cell_id: u32,
     data_hash: Option<String>,
@@ -653,10 +656,16 @@ fn classify_row(
     if row.enable_parent.is_some() {
         return Err("enable_parent".into());
     }
+    if row.scripted {
+        return Err("scripted".into());
+    }
     let glb_path = row
         .model_path
         .as_deref()
         .ok_or_else(|| "no_model".to_string())?;
+    if !matches!(row.record_type.as_deref(), Some("STAT" | "TREE")) {
+        return Err("state_change_writer_unavailable".into());
+    }
     let glb_path = model_glb_path(glb_path).ok_or_else(|| "model_path_excluded".to_string())?;
     if !row
         .position
@@ -951,6 +960,7 @@ mod tests {
             record_type: Some("STAT".into()),
             static_flags: None,
             model_path: Some("Architecture\\Whiterun\\WRBuilding01.nif".into()),
+            scripted: false,
             snow_material: 0x25129,
             cell_id: 0x30,
             data_hash: None,
@@ -987,6 +997,7 @@ mod tests {
             (Box::new(|r| r.header_flags = 0x800), "initially_disabled"),
             (Box::new(|r| r.header_flags = 0x20), "deleted"),
             (Box::new(|r| r.enable_parent = Some(5)), "enable_parent"),
+            (Box::new(|r| r.scripted = true), "scripted"),
             (Box::new(|r| r.model_path = None), "no_model"),
             (
                 Box::new(|r| r.model_path = Some("Markers\\XMarker.nif".into())),
@@ -1002,11 +1013,20 @@ mod tests {
     }
 
     #[test]
-    fn every_resting_model_type_is_eligible_but_actors_and_doors_stay_out() {
+    fn state_changing_types_require_production_state_writers() {
         for &kind in RESTING_MODEL_TYPES {
             let mut candidate = row();
             candidate.record_type = Some(kind.into());
-            assert!(classify_row(&candidate, 1, 0, false).is_ok(), "{kind}");
+            let result = classify_row(&candidate, 1, 0, false);
+            if kind == "STAT" {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "state_change_writer_unavailable",
+                    "{kind}"
+                );
+            }
         }
         for kind in ["NPC_", "ACHR", "DOOR"] {
             assert!(!base_type_in_scope(kind, true), "{kind}");

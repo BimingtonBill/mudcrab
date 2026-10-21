@@ -345,7 +345,7 @@ fn the_stage_writes_a_mapping_the_authority_certifies() {
     let authority = authority(&dataset, &settings, builder);
     let done = finalize(&dataset, &authority).unwrap();
     assert_eq!(done.extension.built_from, CORE.repeat(32));
-    assert_eq!(done.extension.stats["instance_map_rows"], 6);
+    assert_eq!(done.extension.stats["instance_map_rows"], 5);
 
     let connection = Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
     let state = |id| coverage_state(&connection, id).unwrap();
@@ -384,9 +384,9 @@ fn the_stage_writes_a_mapping_the_authority_certifies() {
         .map(Result::unwrap)
         .collect();
     // The shared pair model is drawn for the reference in the deeper folder too.
-    assert_eq!(mapped, [0x100, 0x101, 0x102, 0x106, 0x10a, 0x10b]);
+    assert_eq!(mapped, [0x100, 0x101, 0x102, 0x10a, 0x10b]);
     assert_eq!(state(0x102), CoverageState::Complete);
-    assert_eq!(state(0x106), CoverageState::Complete);
+    assert_eq!(state(0x106), CoverageState::NotEligible);
     assert_eq!(state(0x10b), CoverageState::Complete);
     assert_eq!(state(0x10a), CoverageState::Partial);
 }
@@ -846,7 +846,7 @@ fn a_model_a_mod_emptied_to_hide_an_object_is_certified_with_nothing_to_draw() {
 }
 
 #[test]
-fn a_loose_item_uses_the_same_certified_resting_mapping_as_its_model() {
+fn a_loose_item_is_refused_until_production_state_writers_exist() {
     let dataset = dataset();
     let connection = Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
     connection
@@ -860,16 +860,40 @@ fn a_loose_item_uses_the_same_certified_resting_mapping_as_its_model() {
     let builder = run(&dataset, &settings);
     let authority = authority(&dataset, &settings, builder);
     let done = finalize(&dataset, &authority).unwrap();
-    assert_eq!(done.extension.stats["instance_map_rows"], 6);
+    assert_eq!(done.extension.stats["instance_map_rows"], 4);
     let connection = Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
     assert_eq!(
         coverage_state(&connection, 0x100).unwrap(),
-        CoverageState::Complete
+        CoverageState::NotEligible
     );
     assert_eq!(
         coverage_state(&connection, 0x106).unwrap(),
-        CoverageState::Complete
+        CoverageState::NotEligible
     );
+}
+
+#[test]
+fn scripts_on_either_reference_or_base_prevent_cluster_replacement() {
+    for scripted_form in [0x100, 0x11] {
+        let dataset = dataset();
+        let connection =
+            Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
+        connection
+            .execute("INSERT INTO scripts (form_id, script_name, vmad, properties_json) VALUES (?1, 'Quest', x'00', '{}')", [scripted_form])
+            .unwrap();
+        drop(connection);
+        let settings = settings();
+        let builder = run(&dataset, &settings);
+        let authority = authority(&dataset, &settings, builder);
+        let done = finalize(&dataset, &authority).unwrap();
+        assert_eq!(done.extension.stats["instance_map_rows"], 4);
+        let connection =
+            Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
+        assert_eq!(
+            coverage_state(&connection, 0x100).unwrap(),
+            CoverageState::NotEligible
+        );
+    }
 }
 
 #[test]
