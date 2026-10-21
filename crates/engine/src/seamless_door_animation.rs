@@ -2734,7 +2734,12 @@ fn drive_far_doors(
                 }
             }
         }
-        pair.near_open = Some(near_state.is_open());
+        // A refused request has not consumed the near edge. Retry with the current near
+        // fraction once the far source/player is ready. An already matching state also accepts
+        // the edge, so a later hand-close is not fought by repeatedly reopening the far door.
+        if far_state.is_open() == near_state.is_open() {
+            pair.near_open = Some(near_state.is_open());
+        }
         true
     });
 }
@@ -7593,6 +7598,117 @@ mod tests {
         for (was_open, near, fraction, wanted, what) in cases {
             assert_eq!(far_door_follow(was_open, near, fraction), wanted, "{what}");
         }
+    }
+
+    /// Keep the drive pending while the public source has no inventory. Publishing either a
+    /// static answer or real curves must service the original edge without another near toggle.
+    #[test]
+    fn unresolved_far_open_retries_when_static_or_animated_source_becomes_ready() {
+        for animated in [false, true] {
+            let mut app = door_app();
+            let near = animated_door(&mut app);
+            let far = pending_far_model(&mut app, near.door, DoorState::Closed);
+            portal_draws_through(&mut app, near.door, far.door);
+            app.update();
+            activate(&mut app, near.door);
+            step(&mut app, 2);
+            assert_eq!(state(&app, far.door), DoorState::Closed);
+            assert!(app.world().get::<SourceClipBinding>(far.door).is_none());
+
+            publish_far_source(&mut app, &far, animated);
+            app.update();
+            assert!(app.world().get::<SourceClipBinding>(far.door).is_some());
+            if animated {
+                assert_eq!(state(&app, far.door), DoorState::Opening);
+                let animation = app.world().get::<DoorAnimation>(far.door).unwrap();
+                let fraction = clip_fraction(player(&app, far.player), animation.open.unwrap())
+                    .expect("the far Open curve plays");
+                let near_fraction = swing_fraction(&app, &near).unwrap();
+                assert!((fraction - near_fraction).abs() <= STEP_SECONDS / CLIP_SECONDS + 1e-4);
+                assert!(leaf_degrees(&app, far.moved) > 0.0);
+            } else {
+                assert_eq!(state(&app, far.door), DoorState::Open { animated: false });
+            }
+            step(&mut app, 12);
+            assert!(state(&app, far.door).is_open());
+            activate(&mut app, far.door);
+            step(&mut app, 12);
+            assert_eq!(state(&app, far.door), DoorState::Closed);
+            assert!(state(&app, near.door).is_open());
+        }
+    }
+
+    #[test]
+    fn unresolved_far_close_retries_when_static_or_animated_source_becomes_ready() {
+        for animated in [false, true] {
+            let mut app = door_app();
+            let near = animated_door(&mut app);
+            activate(&mut app, near.door);
+            step(&mut app, 12);
+            let far = pending_far_model(&mut app, near.door, DoorState::Open { animated: false });
+            portal_draws_through(&mut app, near.door, far.door);
+            app.update();
+            activate(&mut app, near.door);
+            step(&mut app, 2);
+            assert!(state(&app, far.door).is_open());
+            assert!(app.world().get::<SourceClipBinding>(far.door).is_none());
+
+            publish_far_source(&mut app, &far, animated);
+            app.update();
+            assert_eq!(
+                state(&app, far.door),
+                if animated {
+                    DoorState::Closing
+                } else {
+                    DoorState::Closed
+                },
+            );
+            if animated {
+                let close = app
+                    .world()
+                    .get::<DoorAnimation>(far.door)
+                    .unwrap()
+                    .close
+                    .unwrap();
+                assert!(player(&app, far.player).animation(close.node).is_some());
+            }
+            step(&mut app, 12);
+            assert_eq!(state(&app, far.door), DoorState::Closed);
+            if animated {
+                assert!(leaf_degrees(&app, far.moved) < 1e-3);
+            }
+        }
+    }
+
+    fn pending_far_model(app: &mut App, near: Entity, state: DoorState) -> ModelDoor {
+        let far = door_with_model(app, WIDE_SWING_DEGREES);
+        let row = far_row(app, near);
+        app.world_mut().entity_mut(far.door).insert((
+            row,
+            state,
+            Transform::default(),
+            GlobalTransform::default(),
+        ));
+        // Disable only the synthetic inventory bridge; readiness still uses the public resolver.
+        app.world_mut()
+            .get_mut::<PendingDoorModel>(far.door)
+            .unwrap()
+            .model = None;
+        far
+    }
+
+    fn publish_far_source(app: &mut App, far: &ModelDoor, animated: bool) {
+        let mut inventory = Vec::new();
+        if animated {
+            let target = *app.world().get::<AnimationTargetId>(far.moved).unwrap();
+            let mut clips = app.world_mut().resource_mut::<Assets<AnimationClip>>();
+            let open = clips.add(clip_swinging(CLIP_SECONDS, target, 0.0, WIDE_SWING_DEGREES));
+            let close = clips.add(clip_swinging(CLIP_SECONDS, target, WIDE_SWING_DEGREES, 0.0));
+            inventory.extend([("Open".into(), open), ("Close".into(), close)]);
+        }
+        app.world_mut()
+            .entity_mut(far.player)
+            .insert(SourceClips(inventory));
     }
 
     /// The window shows the far door's own leaf, so it has to stand where the near door's does: the
