@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+// The archived subrecord list lives in `shared::records` so readers decode the same bytes.
 pub use shared::records::{
     ArchivedArchivedRecordData, ArchivedArchivedSubRecord, ArchivedRecordData, ArchivedSubRecord,
 };

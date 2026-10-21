@@ -2,6 +2,8 @@
 
 pub mod asset_lock;
 pub mod cluster;
+pub mod cluster_mapping;
+pub mod cluster_recipe;
 pub mod collision;
 pub mod coordinates;
 pub mod extensions;

@@ -327,3 +327,23 @@ mod subrecord_tests {
         assert!(extract_subrecords(&[]).unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+mod archive_parity_tests {
+    use super::serialize_subrecords;
+
+    /// The bytes `shared::records` pins for the same sample: the exporter writes what every
+    /// reader decodes, and the digest hashes these blobs, so the layout must not drift.
+    #[test]
+    fn the_exporter_writes_the_archive_bytes_shared_pins() {
+        let bytes = serialize_subrecords(&[
+            (b"XALP".to_vec(), vec![1, 0]),
+            (b"MODS".to_vec(), vec![1, 0, 0, 0]),
+        ]);
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            hex,
+            "010001000000000058414c50f4ffffff020000004d4f4453eaffffff04000000e8ffffff02000000"
+        );
+    }
+}
