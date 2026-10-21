@@ -118,6 +118,7 @@ pub(crate) mod stock_visibility;
 mod instance_identity;
 pub mod package;
 pub mod render;
+pub mod runtime_state;
 /// GPU-free cluster residency bookkeeping.
 pub mod residency;
 /// Stable shadow-view draw buckets.

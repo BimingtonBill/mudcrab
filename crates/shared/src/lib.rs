@@ -9,6 +9,7 @@ pub mod collision;
 pub mod coordinates;
 pub mod extensions;
 pub mod lod;
+pub mod material_depth;
 pub mod plugin_selection;
 pub mod records;
 pub mod streaming_costs;

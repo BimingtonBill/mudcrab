@@ -32,7 +32,7 @@ pub(crate) struct OwnershipFacts {
 pub(crate) struct OwnershipReference(pub(crate) u32);
 
 #[derive(Component)]
-struct OwnershipApplied;
+struct OwnershipApplied(Option<Visibility>);
 
 type OwnershipPrimitiveQuery<'w, 's> = Query<
     'w,
@@ -54,6 +54,7 @@ struct OwnershipDeferred;
 #[derive(SystemParam)]
 pub(crate) struct OwnershipGate<'w, 's> {
     facts: Option<Res<'w, OwnershipFacts>>,
+    runtime_state: Option<Res<'w, super::runtime_state::RuntimeReferenceState>>,
     counters: Option<ResMut<'w, OwnershipCounters>>,
     references: Query<'w, 's, &'static OwnershipReference>,
     deferred: Query<'w, 's, (), With<OwnershipDeferred>>,
@@ -79,7 +80,12 @@ impl OwnershipGate<'_, '_> {
         let Ok(reference) = self.references.get(entity) else {
             return true;
         };
-        if facts.can_spawn(reference.0) {
+        if self
+            .runtime_state
+            .as_ref()
+            .is_some_and(|state| state.contains(reference.0))
+            || facts.can_spawn(reference.0)
+        {
             return true;
         }
         // An asset load failure must still reach the ordinary readiness/error
@@ -138,6 +144,13 @@ pub(crate) fn install(app: &mut App) {
     app.init_resource::<OwnershipFacts>()
         .init_resource::<OwnershipCounters>()
         .add_observer(hide_owned_instance)
+        .add_observer(revoke_owned_reference)
+        .add_systems(
+            PostUpdate,
+            restore_changed_owned_references
+                .after(super::runtime_state::RuntimeStateSystems::Observe)
+                .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
+        )
         .add_systems(Last, report);
     info!("cluster static ownership experiment enabled");
 }
@@ -234,7 +247,10 @@ impl OwnershipFacts {
 fn hide_owned_instance(
     ready: On<WorldInstanceReady>,
     mut commands: Commands,
-    facts: Res<OwnershipFacts>,
+    (facts, runtime_state): (
+        Res<OwnershipFacts>,
+        Option<Res<super::runtime_state::RuntimeReferenceState>>,
+    ),
     mut counters: ResMut<OwnershipCounters>,
     references: Query<&OwnershipReference>,
     children: Query<&Children>,
@@ -243,6 +259,12 @@ fn hide_owned_instance(
     let Ok(reference) = references.get(ready.entity) else {
         return;
     };
+    if runtime_state
+        .as_ref()
+        .is_some_and(|state| state.contains(reference.0))
+    {
+        return;
+    }
     // WorldInstanceReady is flushed in SpawnScene, before PostUpdate visibility
     // propagation and render extraction. Write Visibility directly here, on the
     // cloned primitive only; no root, mesh, material or template is changed.
@@ -253,6 +275,7 @@ fn hide_owned_instance(
         if applied {
             continue;
         }
+        let original = *visibility;
         match facts.decision(reference.0, tag) {
             Decision::Owned => {
                 *visibility = Visibility::Hidden;
@@ -266,9 +289,67 @@ fn hide_owned_instance(
                 continue;
             }
         }
-        commands.entity(entity).try_insert(OwnershipApplied);
+        commands.entity(entity).try_insert(OwnershipApplied(
+            (*visibility == Visibility::Hidden && original != Visibility::Hidden)
+                .then_some(original),
+        ));
     }
     counters.log_deferral();
+}
+
+/// Restore only visibility this ownership experiment changed, before propagation.
+/// The runtime state survives streaming, so a later ready observer cannot hide it again.
+type IncludeDisabled = bevy::ecs::query::Allow<bevy::ecs::entity_disabling::Disabled>;
+
+#[derive(SystemParam)]
+struct RestoreOwnership<'w, 's> {
+    commands: Commands<'w, 's>,
+    references: Query<'w, 's, (Entity, &'static OwnershipReference), IncludeDisabled>,
+    children: Query<'w, 's, &'static Children, IncludeDisabled>,
+    primitives:
+        Query<'w, 's, (&'static mut Visibility, &'static mut OwnershipApplied), IncludeDisabled>,
+}
+
+impl RestoreOwnership<'_, '_> {
+    fn matching(&mut self, matches: impl Fn(u32) -> bool) {
+        for (root, reference) in &self.references {
+            if !matches(reference.0) {
+                continue;
+            }
+            for entity in self.children.iter_descendants(root) {
+                if let Ok((mut visibility, mut applied)) = self.primitives.get_mut(entity) {
+                    // Consume the permission immediately, even before deferred removal.
+                    // A state writer may set a new hide after triggering revocation.
+                    if let Some(original) = applied.0.take() {
+                        *visibility = original;
+                    }
+                    self.commands.entity(entity).remove::<OwnershipApplied>();
+                }
+            }
+        }
+    }
+}
+
+fn revoke_owned_reference(
+    event: On<super::runtime_state::ReferenceStateChanged>,
+    mut restore: RestoreOwnership,
+) {
+    restore.matching(|reference| reference == event.reference);
+}
+
+fn restore_changed_owned_references(
+    state: Option<Res<super::runtime_state::RuntimeReferenceState>>,
+    mut previous: Local<u64>,
+    mut restore: RestoreOwnership,
+) {
+    let Some(state) = state else {
+        return;
+    };
+    if *previous == state.revision {
+        return;
+    }
+    *previous = state.revision;
+    restore.matching(|reference| state.contains(reference));
 }
 
 impl OwnershipCounters {
@@ -535,5 +616,121 @@ mod tests {
                 .owned_hidden,
             template_count
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_revocation_tests {
+    use super::*;
+    use crate::cluster::runtime_state::{ReferenceStateChanged, RuntimeReferenceState};
+
+    #[test]
+    fn revocation_restores_owned_visibility_but_preserves_authored_hides() {
+        let mut app = App::new();
+        crate::cluster::runtime_state::install(&mut app);
+        install(&mut app);
+        let root = app.world_mut().spawn(OwnershipReference(7)).id();
+        let owned = app
+            .world_mut()
+            .spawn((
+                ChildOf(root),
+                Visibility::Hidden,
+                OwnershipApplied(Some(Visibility::Inherited)),
+            ))
+            .id();
+        let authored = app
+            .world_mut()
+            .spawn((ChildOf(root), Visibility::Hidden, OwnershipApplied(None)))
+            .id();
+        let other_root = app.world_mut().spawn(OwnershipReference(8)).id();
+        let other = app
+            .world_mut()
+            .spawn((
+                ChildOf(other_root),
+                Visibility::Hidden,
+                OwnershipApplied(Some(Visibility::Inherited)),
+            ))
+            .id();
+        app.world_mut()
+            .trigger(ReferenceStateChanged { reference: 7 });
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(owned),
+            Some(&Visibility::Inherited)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(authored),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(other),
+            Some(&Visibility::Hidden)
+        );
+        assert!(app.world().get::<OwnershipApplied>(owned).is_none());
+        assert!(app.world().resource::<RuntimeReferenceState>().contains(7));
+    }
+
+    #[test]
+    fn synchronous_revocation_preserves_a_later_gameplay_hide() {
+        let mut app = App::new();
+        crate::cluster::runtime_state::install(&mut app);
+        install(&mut app);
+        let root = app.world_mut().spawn(OwnershipReference(7)).id();
+        let child = app
+            .world_mut()
+            .spawn((
+                ChildOf(root),
+                Visibility::Hidden,
+                OwnershipApplied(Some(Visibility::Inherited)),
+            ))
+            .id();
+        app.world_mut()
+            .trigger(ReferenceStateChanged { reference: 7 });
+        assert_eq!(
+            app.world().get::<Visibility>(child),
+            Some(&Visibility::Inherited)
+        );
+        *app.world_mut().get_mut::<Visibility>(child).unwrap() = Visibility::Hidden;
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(child),
+            Some(&Visibility::Hidden)
+        );
+    }
+
+    #[test]
+    fn disabled_reference_restores_its_stock_before_reenable() {
+        use crate::cluster::runtime_state::RestingReferencePose;
+        use bevy::ecs::entity_disabling::Disabled;
+        let mut app = App::new();
+        crate::cluster::runtime_state::install(&mut app);
+        install(&mut app);
+        let root = app
+            .world_mut()
+            .spawn((
+                OwnershipReference(7),
+                crate::world::components::FormId(7),
+                RestingReferencePose(Transform::default()),
+                Transform::default(),
+            ))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((
+                ChildOf(root),
+                Visibility::Hidden,
+                OwnershipApplied(Some(Visibility::Inherited)),
+            ))
+            .id();
+        app.world_mut().entity_mut(root).insert(Disabled);
+        app.update();
+        app.world_mut().entity_mut(root).remove::<Disabled>();
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(child),
+            Some(&Visibility::Inherited)
+        );
+        assert!(app.world().get::<OwnershipApplied>(child).is_none());
+        assert!(app.world().resource::<RuntimeReferenceState>().contains(7));
     }
 }

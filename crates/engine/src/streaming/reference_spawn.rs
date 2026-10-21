@@ -132,8 +132,9 @@ pub(crate) fn spawn_reference(
                 shared::cluster_recipe::classify::base_type_in_scope(kind, true)
             })
         {
-            entity.insert(crate::cluster::ownership::OwnershipReference(
-                reference.form_id,
+            entity.insert((
+                crate::cluster::ownership::OwnershipReference(reference.form_id),
+                crate::cluster::runtime_state::RestingReferencePose(transform),
             ));
         }
         model_requested = true;

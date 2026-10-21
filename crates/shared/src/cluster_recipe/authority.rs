@@ -977,7 +977,15 @@ mod tests {
                         .as_deref(),
                     Some("no_model")
                 );
-                assert!(authority.preloaded_reference(259).is_none());
+                // ACTI belongs to resting-model scope; this fixture omits its model row.
+                assert_eq!(
+                    authority
+                        .preloaded_reference(259)
+                        .unwrap()
+                        .refusal
+                        .as_deref(),
+                    Some("no_model")
+                );
                 assert!(authority.preloaded_reference(261).is_none());
                 assert!(authority.preloaded_reference(263).is_none());
                 assert!(authority.preloaded_reference(265).is_none());

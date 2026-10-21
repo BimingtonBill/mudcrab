@@ -345,7 +345,7 @@ fn the_stage_writes_a_mapping_the_authority_certifies() {
     let authority = authority(&dataset, &settings, builder);
     let done = finalize(&dataset, &authority).unwrap();
     assert_eq!(done.extension.built_from, CORE.repeat(32));
-    assert_eq!(done.extension.stats["instance_map_rows"], 4);
+    assert_eq!(done.extension.stats["instance_map_rows"], 6);
 
     let connection = Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
     let state = |id| coverage_state(&connection, id).unwrap();
@@ -354,13 +354,7 @@ fn the_stage_writes_a_mapping_the_authority_certifies() {
     assert_eq!(state(0x101), CoverageState::Partial);
     // Refused as wholes, with their reasons; never drawn.
     for (id, status, reason) in [
-        (
-            0x102u32,
-            "not_eligible",
-            "unresolved_base_alternate_textures",
-        ),
         (0x104, "not_eligible", "unresolved_reference_override:XALP"),
-        (0x106, "not_eligible", "scripted"),
         (0x105, "unknown", "model_not_converted"),
         (0x107, "unknown", "unparsed_reference_data"),
         (0x108, "unknown", "unparsed_base_record"),
@@ -390,7 +384,9 @@ fn the_stage_writes_a_mapping_the_authority_certifies() {
         .map(Result::unwrap)
         .collect();
     // The shared pair model is drawn for the reference in the deeper folder too.
-    assert_eq!(mapped, [0x100, 0x101, 0x10a, 0x10b]);
+    assert_eq!(mapped, [0x100, 0x101, 0x102, 0x106, 0x10a, 0x10b]);
+    assert_eq!(state(0x102), CoverageState::Complete);
+    assert_eq!(state(0x106), CoverageState::Complete);
     assert_eq!(state(0x10b), CoverageState::Complete);
     assert_eq!(state(0x10a), CoverageState::Partial);
 }
@@ -847,4 +843,108 @@ fn a_model_a_mod_emptied_to_hide_an_object_is_certified_with_nothing_to_draw() {
         coverage_state(&connection, 0x10c).unwrap(),
         CoverageState::Partial
     );
+}
+
+#[test]
+fn a_loose_item_uses_the_same_certified_resting_mapping_as_its_model() {
+    let dataset = dataset();
+    let connection = Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE records SET record_type='MISC' WHERE form_id=0x11",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let settings = settings();
+    let builder = run(&dataset, &settings);
+    let authority = authority(&dataset, &settings, builder);
+    let done = finalize(&dataset, &authority).unwrap();
+    assert_eq!(done.extension.stats["instance_map_rows"], 6);
+    let connection = Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
+    assert_eq!(
+        coverage_state(&connection, 0x100).unwrap(),
+        CoverageState::Complete
+    );
+    assert_eq!(
+        coverage_state(&connection, 0x106).unwrap(),
+        CoverageState::Complete
+    );
+}
+
+#[test]
+fn plain_pbr_shader_metadata_and_emission_keep_the_source_material_identity() {
+    let bytes = grid_glb(false, None);
+    let source = gltf::Gltf::from_slice(&bytes).unwrap();
+    let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let document: serde_json::Value = serde_json::from_slice(&bytes[20..20 + json_len]).unwrap();
+    for kind in [
+        "environment_map",
+        "multi_layer_parallax",
+        "glow",
+        "parallax",
+        "sparkle_snow",
+    ] {
+        let mut material_document = document.clone();
+        material_document["materials"][0]["extras"]["openSkyrim"]["lightingShaderType"] =
+            json!(kind);
+        material_document["materials"][0]["emissiveFactor"] = json!([0.2, 0.4, 0.1]);
+        let converted = glb(&material_document, source.blob.as_ref().unwrap());
+        let loaded =
+            converter::cluster::glb_input::load_model(&converted, "meshes/test.glb").unwrap();
+        let facts = shared::cluster_recipe::model_facts::model_facts_from_json(
+            &serde_json::to_vec(&material_document).unwrap(),
+            "meshes/test.glb",
+        )
+        .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].reject.is_none(), "{kind}: {:?}", loaded[0].reject);
+        assert_eq!(loaded[0].material_key, facts.materials[&0].material_key);
+        material_document["materials"][0]["extras"]["openSkyrim"]["shaderFlags1"] =
+            json!(shared::material_depth::DEPTH_TEST | shared::material_depth::DECAL);
+        material_document["materials"][0]["extras"]["openSkyrim"]["shaderFlags2"] =
+            json!(shared::material_depth::DEPTH_WRITE);
+        let converted = glb(&material_document, source.blob.as_ref().unwrap());
+        let loaded =
+            converter::cluster::glb_input::load_model(&converted, "meshes/test.glb").unwrap();
+        assert_eq!(
+            loaded[0].reject.as_ref().unwrap().reason,
+            converter::cluster::model::RejectReason::NotOpaque
+        );
+        assert!(
+            loaded[0]
+                .reject
+                .as_ref()
+                .unwrap()
+                .detail
+                .contains("sorted color pass")
+        );
+    }
+}
+
+#[test]
+fn changing_mods_rekeys_only_references_of_that_base_without_changing_model_identity() {
+    use shared::cluster_mapping::AuthoritativeInputs;
+    let dataset = dataset();
+    let settings = settings();
+    let builder = run(&dataset, &settings);
+    let before = authority(&dataset, &settings, builder.clone());
+    let modified = before.reference(0x102).unwrap();
+    let untouched = before.reference(0x100).unwrap();
+    assert_eq!(
+        modified.eligibility,
+        shared::cluster_mapping::Eligibility::Eligible
+    );
+    drop(before);
+    let connection = Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
+    let changed = serialize_subrecords(&[(b"MODS".to_vec(), vec![2, 0, 0, 0])]);
+    connection
+        .execute("UPDATE records SET data=?1 WHERE form_id=0x12", [changed])
+        .unwrap();
+    drop(connection);
+    let after = authority(&dataset, &settings, builder);
+    let modified_after = after.reference(0x102).unwrap();
+    assert_ne!(modified.digest, modified_after.digest);
+    assert_eq!(modified.model, modified_after.model);
+    assert_eq!(untouched.digest, after.reference(0x100).unwrap().digest);
 }

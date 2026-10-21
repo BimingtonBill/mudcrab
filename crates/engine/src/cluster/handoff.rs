@@ -619,12 +619,11 @@ fn model_matrix(entity: Entity, root: Entity, nodes: &Query<NodeState>) -> Optio
         if !seen.insert(at) {
             return None;
         }
-        let (pose, baseline, parent, extras, billboard, skin, morph, animation, mesh_morph) =
+        let (pose, baseline, parent, extras, billboard, skin, morph, _animation, mesh_morph) =
             nodes.get(at).ok()?;
         if billboard
             || skin
             || morph
-            || animation
             || mesh_morph
             || extras.is_some_and(|extras| {
                 crate::billboard::BillboardMode::from_extras(&extras.value).is_some()
@@ -682,9 +681,6 @@ fn template_valid(asset: &WorldAsset, invalid: &HashSet<AssetId<Mesh>>) -> bool 
                 || world.get::<bevy::mesh::morph::MorphWeights>(at).is_some()
                 || world
                     .get::<bevy::mesh::morph::MeshMorphWeights>(at)
-                    .is_some()
-                || world
-                    .get::<bevy::animation::AnimationTargetId>(at)
                     .is_some()
                 || world
                     .get::<bevy::gltf::GltfExtras>(at)
@@ -1553,7 +1549,7 @@ struct Filters {
 }
 
 pub(super) struct Selection {
-    stamp: [u64; 6],
+    stamp: [u64; 7],
     visible: bevy::platform::collections::HashSet<MainEntity>,
     readiness: Vec<bool>,
     stock_materials: HashMap<MainEntity, Option<bevy::asset::UntypedAssetId>>,
@@ -2641,10 +2637,11 @@ fn select_instances(
     mut shadows: Query<&mut RenderShadowMapVisibleEntities>,
     scene: Option<Res<ClusterScene>>,
     mut filters: ResMut<Filters>,
-    (native, settings, batch_materials): (
+    (native, settings, batch_materials, runtime_state): (
         Option<Res<crate::streaming::native_lod::FarNativePolicy>>,
         Option<Res<ClusterSettings>>,
         Option<Res<super::ClusterBatchMaterials>>,
+        Option<Res<super::super::runtime_state::RuntimeReferenceState>>,
     ),
 ) {
     let Some(mut gpu) = gpu else {
@@ -2764,6 +2761,7 @@ fn select_instances(
                 world.map_or(0, |world| u64::from(world) + 1),
                 u64::from(compute_ready && same_certificate),
                 native.as_ref().map_or(0, |policy| policy.revision),
+                runtime_state.as_ref().map_or(0, |state| state.revision),
             ];
             // The visible set changes nearly every frame and the instantiated references change
             // while cells load; neither touches most of the selection. The base pass reruns only
@@ -2853,6 +2851,12 @@ fn select_instances(
                     &sources.present
                 };
                 for reference in present {
+                    if runtime_state
+                        .as_ref()
+                        .is_some_and(|state| state.contains(*reference))
+                    {
+                        continue;
+                    }
                     for &(batch, position) in
                         index.by_reference.get(reference).into_iter().flatten()
                     {
@@ -2890,6 +2894,21 @@ fn select_instances(
                             hidden.insert(*main);
                         }
                         mask.set(object.index, true)
+                            .expect("GPU instance fits allocated capacity");
+                    }
+                }
+                // Revoke every occurrence of this reference, including unloaded sources,
+                // before publishing ANY view's stock-hide decision. Shared meshes are untouched.
+                for reference in runtime_state
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|state| state.references())
+                {
+                    for &(batch, position) in
+                        index.by_reference.get(&reference).into_iter().flatten()
+                    {
+                        let object = &index.batches[batch as usize].objects[position as usize];
+                        mask.set(object.index, false)
                             .expect("GPU instance fits allocated capacity");
                     }
                 }
@@ -3069,7 +3088,7 @@ fn restore_stock(
 impl Selection {
     fn matches(
         &self,
-        stamp: [u64; 6],
+        stamp: [u64; 7],
         visible: &bevy::platform::collections::HashSet<MainEntity>,
         readiness: &[bool],
         stock_materials: &HashMap<MainEntity, Option<bevy::asset::UntypedAssetId>>,
@@ -3436,7 +3455,7 @@ mod selection_regressions {
 
     fn selection(ids: &[u32], capacity: u32) -> Selection {
         Selection {
-            stamp: [7, 11, 13, 17, 1, 0],
+            stamp: [7, 11, 13, 17, 1, 0, 0],
             visible: visible(ids),
             readiness: vec![true],
             stock_materials: ids.iter().map(|id| (main(*id), None)).collect(),
@@ -3732,7 +3751,7 @@ mod source_proof_tests {
     }
 
     #[test]
-    fn every_runtime_deformation_marker_revokes_template_and_instance_proof() {
+    fn deformation_revokes_proof_but_rigid_animation_targets_keep_only_their_rest_pose() {
         for variant in 0..5 {
             let mut input = fixture();
             {
@@ -3760,16 +3779,32 @@ mod source_proof_tests {
                     _ => unreachable!(),
                 }
             }
-            assert!(
-                !template_valid(&input.asset, &HashSet::new()),
+            let rigid_rest_pose = variant == 3;
+            assert_eq!(
+                template_valid(&input.asset, &HashSet::new()),
+                rigid_rest_pose,
                 "variant {variant}"
             );
             let wrapper = add_wrapper(&mut input);
             assert_eq!(
                 evaluate_model(&mut input.asset.world, input.primitive, wrapper),
-                None,
+                rigid_rest_pose.then_some(input.model_matrix),
                 "variant {variant}"
             );
+            if rigid_rest_pose {
+                input
+                    .asset
+                    .world
+                    .get_mut::<Transform>(input.primitive)
+                    .unwrap()
+                    .translation
+                    .x += 1.0;
+                assert!(!template_valid(&input.asset, &HashSet::new()));
+                assert_eq!(
+                    evaluate_model(&mut input.asset.world, input.primitive, wrapper),
+                    None
+                );
+            }
         }
     }
 

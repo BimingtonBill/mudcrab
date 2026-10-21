@@ -6,14 +6,17 @@
 //! scope this code can produce.
 
 use super::{
-    classify::SnowSource,
-    overrides::{BASE_ALTERNATE_TEXTURES_TAG, MINIMUM_REFERENCE_OVERRIDE_TAGS},
+    classify::{RESTING_MODEL_TYPES, SnowSource},
+    overrides::MINIMUM_REFERENCE_OVERRIDE_TAGS,
 };
-use crate::{cluster::canonical_json, cluster_mapping::DIGEST_VERSION};
+use crate::{
+    cluster::canonical_json,
+    cluster_mapping::{DIGEST_VERSION, MATERIAL_RESOLVER},
+};
 use serde_json::{Value, json};
 
 /// Version of the scope description itself.
-pub const SCOPE_VERSION: u32 = 1;
+pub const SCOPE_VERSION: u32 = 2;
 
 /// A rectangle of exterior cells of one worldspace, both corners inclusive (cell grid
 /// coordinates: the cell a reference's position falls in).
@@ -104,7 +107,7 @@ impl Scope {
                 "max": [area.max.0, area.max.1],
             })
         });
-        let mut base_types = vec!["STAT"];
+        let mut base_types = RESTING_MODEL_TYPES.to_vec();
         if self.include_trees {
             base_types.push("TREE");
         }
@@ -117,10 +120,8 @@ impl Scope {
             "area": area,
             "snow_material_source": self.snow_source.as_str(),
             "reference_override_tags": MINIMUM_REFERENCE_OVERRIDE_TAGS,
-            "base_alternate_textures_tag": BASE_ALTERNATE_TEXTURES_TAG,
-            // Not a setting: nothing resolves alternate textures yet, so a parsed MODS is refused
-            // as a whole and unparsed data is unknown.
-            "base_alternate_textures": "not_eligible",
+            "material_resolver": MATERIAL_RESOLVER,
+            "runtime_state": "per_reference_suppression/1",
         });
         String::from_utf8(canonical_json(&value)).expect("canonical JSON is UTF-8")
     }
@@ -134,11 +135,10 @@ impl Scope {
             serde_json::from_str(text).map_err(|error| format!("not JSON: {error}"))?;
         let number = |value: &Value| value.as_i64().and_then(|n| i32::try_from(n).ok());
         let field = |name: &str| value.get(name).ok_or_else(|| format!("no {name}"));
-        let include_trees = match field("base_record_types")?.as_array().map(Vec::as_slice) {
-            Some([a]) if *a == "STAT" => false,
-            Some([a, b]) if *a == "STAT" && *b == "TREE" => true,
-            _ => return Err("unknown base_record_types".into()),
-        };
+        let declared_types = field("base_record_types")?
+            .as_array()
+            .ok_or("base_record_types is not a list")?;
+        let include_trees = declared_types.iter().any(|kind| kind == "TREE");
         let child_worldspaces = field("child_worldspaces")?
             .as_array()
             .ok_or("child_worldspaces is not a list")?
@@ -224,12 +224,8 @@ mod tests {
     }
 
     #[test]
-    fn alternate_textures_are_refused_by_declaration_not_by_setting() {
-        assert!(
-            scope()
-                .json()
-                .contains("\"base_alternate_textures\":\"not_eligible\"")
-        );
+    fn material_resolution_and_runtime_suppression_are_declared() {
+        assert!(scope().json().contains(MATERIAL_RESOLVER));
     }
 
     #[test]
@@ -261,10 +257,10 @@ mod tests {
         let text = scope().json();
         assert!(Scope::from_declared_json(&text).is_ok());
         for bad in [
-            text.replace("\"scope_version\":1", "\"scope_version\":2"),
-            text.replace("\"not_eligible\"", "\"clear\""),
-            text.replace("MODS", "MODX"),
-            text.replace("\"STAT\"]", "\"STAT\",\"NPC_\"]"),
+            text.replace("\"scope_version\":2", "\"scope_version\":1"),
+            text.replace(MATERIAL_RESOLVER, "different_material_resolver/1"),
+            text.replace("per_reference_suppression/1", "unknown_suppression/1"),
+            text.replace("\"STAT\"", "\"NPC_\""),
             text.replace("{", "{\"extra\":1,"),
             text.replace("\"static_materials\"", "\"somewhere\""),
             String::new(),

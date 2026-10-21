@@ -100,9 +100,6 @@ fn read_primitive(
     let family = open_skyrim
         .and_then(|value| value.get("shaderFamily"))
         .and_then(Value::as_str);
-    let lighting_type = open_skyrim
-        .and_then(|value| value.get("lightingShaderType"))
-        .and_then(Value::as_str);
     let non_rendering = open_skyrim
         .and_then(|value| value.get("nonRenderingExclusion"))
         .is_some_and(|value| value.as_bool() != Some(false))
@@ -217,9 +214,16 @@ fn read_primitive(
             RejectReason::NonRendering,
             "non-rendering stand-in",
         ))
+    } else if stock_requires_sorted_depth(material, alpha) {
+        Some(Reject::new(
+            RejectReason::NotOpaque,
+            "stock native depth material requires the sorted color pass",
+        ))
     } else {
-        unsupported_feature(material, family, lighting_type)
-            .map(|feature| Reject::new(RejectReason::UnsupportedMaterialFeature, feature))
+        // The draw uses the stock StandardMaterial fragment shader and the exact same
+        // material handle. Metadata for effects absent from stock is not a refusal;
+        // stock-supported emission is evaluated by that shared fragment shader.
+        None
     };
     let baked_ok =
         structural.is_none() && alpha != AlphaMode::Blend && !effect && !skinned && !non_rendering;
@@ -237,43 +241,24 @@ fn read_primitive(
     }
 }
 
-/// The stock lighting path's supported set: base colour, normal, specular, vertex colour,
-/// double-sided. Anything else the converter recorded (shader types such as environment map,
-/// glow, parallax, skin tint, emissive output) is a reject reason until the engine draws it.
-fn unsupported_feature(
-    material: &Value,
-    family: Option<&str>,
-    lighting_type: Option<&str>,
-) -> Option<String> {
-    if family != Some("lighting") {
-        return Some(format!("shaderFamily {}", family.unwrap_or("none")));
-    }
-    if let Some(kind) = lighting_type.filter(|kind| *kind != "default") {
-        return Some(format!("lightingShaderType {kind}"));
-    }
-    // Only the directx-convention tangent-space normal map is shaded the way the stock path
-    // does it; a model-space normal map would shade wrongly once node transforms are baked in.
-    if let Some(convention) = material
-        .pointer("/extras/openSkyrim/normalConvention")
-        .and_then(Value::as_str)
-        .filter(|convention| *convention != "directx")
-    {
-        return Some(format!("normalConvention {convention}"));
-    }
-    for flag in ["premultipliedAlpha", "screenDoorAlphaFade"] {
-        let pointer = format!("/extensions/OPEN_SKYRIM_material/{flag}");
-        if material.pointer(&pointer).and_then(Value::as_bool) == Some(true) {
-            return Some(flag.to_owned());
-        }
-    }
-    if material.get("emissiveTexture").is_some() {
-        return Some("emissive texture".into());
-    }
-    let emissive = material
-        .get("emissiveFactor")
-        .and_then(Value::as_array)
-        .is_some_and(|factor| factor.iter().any(|v| v.as_f64().is_some_and(|v| v > 0.0)));
-    emissive.then(|| "emissive factor".into())
+fn stock_requires_sorted_depth(material: &Value, alpha: AlphaMode) -> bool {
+    let flags = |name: &str| {
+        material
+            .get("extras")?
+            .get("openSkyrim")?
+            .get(name)?
+            .as_u64()
+            .and_then(|flags| u32::try_from(flags).ok())
+    };
+    flags("shaderFlags1")
+        .zip(flags("shaderFlags2"))
+        .is_some_and(|(flags_1, flags_2)| {
+            shared::material_depth::requires_sorted_depth_pass(
+                flags_1,
+                flags_2,
+                alpha == AlphaMode::Blend,
+            )
+        })
 }
 
 fn primitive_has_exclusion(primitive: &gltf::Primitive<'_>) -> bool {

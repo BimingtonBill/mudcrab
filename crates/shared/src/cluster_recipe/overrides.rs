@@ -2,8 +2,9 @@
 //!
 //! A reference can carry subrecords that change how its object is drawn (a material swap, an alpha
 //! or emittance override), and its base record can carry alternate textures. The cluster path
-//! draws the converted model as is, so a reference with one of these must stay on the stock path
-//! with a visible reason until a resolver proves the right inputs. The guards here read the
+//! draws the converted model as stock does. Reference overrides whose stock result is not
+//! represented remain refused. MODS is ignored by both current material paths, so its presence
+//! does not refuse an otherwise valid archived base record. The guards here read the
 //! archived subrecord list the way the exporter wrote it (`serialize_subrecords`), so only a real
 //! subrecord tag counts, never bytes that happen to spell one inside another subrecord's payload.
 //!
@@ -13,11 +14,11 @@
 
 use crate::cluster_mapping::{
     Eligibility, REASON_UNPARSED_BASE_RECORD, REASON_UNPARSED_REFERENCE_DATA,
-    REASON_UNRESOLVED_BASE_ALTERNATE_TEXTURES, REASON_UNRESOLVED_REFERENCE_OVERRIDE,
+    REASON_UNRESOLVED_REFERENCE_OVERRIDE,
 };
 use crate::records::ArchivedRecordData;
 
-pub use crate::cluster_mapping::{BASE_ALTERNATE_TEXTURES_TAG, MINIMUM_REFERENCE_OVERRIDE_TAGS};
+pub use crate::cluster_mapping::MINIMUM_REFERENCE_OVERRIDE_TAGS;
 
 /// What a guard found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,8 +45,7 @@ impl Guard {
     /// The reason for a reference whose base record this guard refuses.
     pub fn base_record_reason(self) -> Option<String> {
         match self {
-            Self::Clear => None,
-            Self::Unresolved(_) => Some(REASON_UNRESOLVED_BASE_ALTERNATE_TEXTURES.to_owned()),
+            Self::Clear | Self::Unresolved(_) => None,
             Self::Unparsed => Some(REASON_UNPARSED_BASE_RECORD.to_owned()),
         }
     }
@@ -75,9 +75,10 @@ pub fn check_reference(blob: &[u8]) -> Guard {
     guard(blob, &MINIMUM_REFERENCE_OVERRIDE_TAGS)
 }
 
-/// Guards a base record's `records.data` blob against alternate textures (`MODS`).
+/// Validates the archived base record; alternate textures use the same unresolved stock material.
 pub fn check_base_record(blob: &[u8]) -> Guard {
-    guard(blob, &[BASE_ALTERNATE_TEXTURES_TAG])
+    // Stock loads the converted GLB material unchanged; MODS does not alter either path.
+    guard(blob, &[])
 }
 
 /// The guards of a reference's two blobs; an absent blob is `Unparsed`.
@@ -193,10 +194,10 @@ mod tests {
     #[test]
     fn base_alternate_textures_are_found_as_a_tag_only() {
         let with = blob(&[(b"MODL", b"a.nif"), (b"MODS", &[1, 0, 0, 0])]);
-        assert_eq!(check_base_record(&with), Guard::Unresolved("MODS"));
+        assert_eq!(check_base_record(&with), Guard::Clear);
         assert_eq!(
             check_base_record(&with).base_record_reason().as_deref(),
-            Some("unresolved_base_alternate_textures")
+            None
         );
         let without = blob(&[(b"MODL", b"MODS.nif"), (b"MODT", &[0; 8])]);
         assert_eq!(check_base_record(&without), Guard::Clear);
@@ -225,7 +226,7 @@ mod tests {
         );
         assert_eq!(
             verdict(None, Some(&clear), Some(&alternate), None),
-            Eligibility::NotEligible("unresolved_base_alternate_textures".to_owned())
+            Eligibility::Eligible
         );
         // Missing or unparseable data is unknown, and so is an unresolved model: never eligible.
         assert_eq!(

@@ -334,16 +334,14 @@ impl From<rusqlite::Error> for MappingError {
 /// `XEMI` (emittance). A MINIMUM, not a certified exhaustive list; written into the provenance
 /// `classifier_scope`. The parser that finds them in a record is the converter's.
 pub const MINIMUM_REFERENCE_OVERRIDE_TAGS: [&str; 3] = ["XMSP", "XALP", "XEMI"];
-/// The base-record subrecord that lists alternate textures for the model.
-pub const BASE_ALTERNATE_TEXTURES_TAG: &str = "MODS";
+/// Material interpretation shared with the stock converted-GLB path. Change when either resolver changes.
+pub const MATERIAL_RESOLVER: &str = "stock_original_materials/1";
 
 /// Coverage `reason` values the classifier and the guards write, so a reader can name them.
 /// A reference with a guarded override is refused as `not_eligible` with this prefix and the tag.
 pub const REASON_UNRESOLVED_REFERENCE_OVERRIDE: &str = "unresolved_reference_override:";
 /// The reference's data could not be parsed: nothing is known, so `unknown`.
 pub const REASON_UNPARSED_REFERENCE_DATA: &str = "unparsed_reference_data";
-/// The base record carries alternate textures nothing resolves yet: `not_eligible`.
-pub const REASON_UNRESOLVED_BASE_ALTERNATE_TEXTURES: &str = "unresolved_base_alternate_textures";
 /// The base record could not be parsed: `unknown`.
 pub const REASON_UNPARSED_BASE_RECORD: &str = "unparsed_base_record";
 /// The converted model could not be read: `unknown`.

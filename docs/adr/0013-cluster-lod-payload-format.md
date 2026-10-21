@@ -660,3 +660,27 @@ swapped for something else.
   identities reserved for #185, overrides and saves untouched, the stock path always drawable.
 - **Aligned and licence-clean:** meshoptimizer and `clusterlod.h` are MIT and vendored with
   their licence; no GPL source is read or copied.
+
+
+## 2026-10-21: resting references and current stock material parity
+
+The cluster demo's classifier scope version 2 supersedes the original scripted/movable
+reference exclusion above for converted resting models. The supported object types are
+declared by the shared recipe, alongside the optional TREE setting. Actors, doors, transparent
+primitives and worldspaces without the existing LOD-grid contract keep their separate paths.
+Effects model paths remain excluded because the ordinary stock path excludes them too.
+
+Scripted references and dynamic or loose objects receive the same initial resting model as
+stock. A logical state change revokes only that placed reference's cluster representation,
+across all views and streaming lifetimes. Stock remains responsible for its changed state.
+Transform and explicit hide changes are observed; gameplay writers also have an explicit
+ReferenceStateChanged event for harvesting, disabling and other changes without a transform.
+This is a session-local revocation, not a save-game identity contract replacing issue #185.
+
+The material resolver is stock_original_materials/1. Both paths use the converted model's
+own material, including stock-supported emission; unresolved MODS is ignored by both.
+Environment-map, parallax, glow and similar metadata that stock does not implement does not
+refuse otherwise drawable geometry. This does not claim retail Skyrim shader parity.
+The resolver identifier is part of the exact classifier-scope declaration. A future shared
+material resolver must change it and update both stock and clusters together. Raw winning
+base-record bytes remain in the per-reference digest, so MODS edits still invalidate mapping.

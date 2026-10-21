@@ -39,7 +39,8 @@ pub struct SourcePrimitiveMesh(pub Handle<Mesh>);
 #[reflect(Component)]
 pub struct SourcePrimitiveTransform(pub Mat4);
 
-/// True only when the raw document has no animations, skins or morph targets.
+/// True when the raw document admits rigid resting geometry: no skins or morph targets.
+/// Node animation is permitted; a runtime pose change revokes its resting instance.
 /// This is a baseline fact, not a runtime permission to replace this entity.
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Reflect)]
 #[reflect(Component)]
@@ -81,8 +82,7 @@ impl Clone for SourceIdentityHandler {
 impl SourceIdentityHandler {
     fn begin_document(&mut self, source: &gltf::Gltf) {
         self.observed.clear();
-        self.static_model = source.animations().next().is_none()
-            && source.skins().next().is_none()
+        self.static_model = source.skins().next().is_none()
             && !source.meshes().any(|mesh| {
                 mesh.primitives()
                     .any(|primitive| primitive.morph_targets().next().is_some())
@@ -529,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_animations_skins_and_morph_targets_each_disable_the_static_baseline() {
+    fn raw_node_animation_keeps_resting_geometry_but_skin_and_morph_do_not() {
         for variant in 0..3 {
             let mut value = serde_json::to_value(source(0).document.as_json()).unwrap();
             match variant {
@@ -551,14 +551,14 @@ mod tests {
             let scene = dynamic.scenes().next().unwrap();
             let mut handler = SourceIdentityHandler::default();
             handler.begin_document(&dynamic);
-            assert!(!handler.static_model, "variant {variant}");
+            assert_eq!(handler.static_model, variant == 0, "variant {variant}");
             let mut world = World::new();
             let entities = observe(&mut handler, &mut world, &scene_primitives(&scene));
             assert!(handler.complete_scene(&scene, &mut world));
             for entity in entities {
                 assert_eq!(
                     world.get::<SourceStaticModel>(entity),
-                    Some(&SourceStaticModel(false))
+                    Some(&SourceStaticModel(variant == 0))
                 );
             }
             // Reusing a handler for a static document recomputes the trait.

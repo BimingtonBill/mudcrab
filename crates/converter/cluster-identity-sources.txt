@@ -19,6 +19,7 @@ src/lod/albedo.rs
 src/lod/terrain.rs
 ../shared/src/cluster.rs
 ../shared/src/cluster_mapping.rs
+../shared/src/material_depth.rs
 ../shared/src/cluster_recipe/authority.rs
 ../shared/src/cluster_recipe/classify.rs
 ../shared/src/cluster_recipe/mod.rs

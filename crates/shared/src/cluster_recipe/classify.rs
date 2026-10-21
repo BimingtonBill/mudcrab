@@ -49,11 +49,17 @@ pub struct WorldReference {
     pub transform: [f32; 12],
 }
 
-/// Whether a base record type is in the declared scope of the reference mapping: statics, and
-/// trees when the run includes them. References of any other base type are never cluster
-/// candidates and carry no coverage row.
+/// Base types whose converted resting model can participate in cluster replacement.
+/// Runtime state changes revoke a reference's resting representation independently of type.
+/// Actor geometry is excluded; tree inclusion remains an explicit recipe setting.
+pub const RESTING_MODEL_TYPES: &[&str] = &[
+    "STAT", "MSTT", "ACTI", "FLOR", "FURN", "MISC", "CONT", "ALCH", "WEAP", "INGR", "ARMO", "BOOK",
+    "AMMO", "SLGM", "SCRL", "KEYM", "APPA", "TACT", "ADDN", "ARTO",
+];
+
+/// Whether this type belongs to the declared resting-model scope.
 pub fn base_type_in_scope(record_type: &str, include_trees: bool) -> bool {
-    record_type == "STAT" || (include_trees && record_type == "TREE")
+    RESTING_MODEL_TYPES.contains(&record_type) || (include_trees && record_type == "TREE")
 }
 
 /// One reference in the declared scope, with everything the digest, the verdict and the mapping
@@ -505,10 +511,10 @@ fn reference_sql(snow_source: SnowSource, has_static_flags: bool, condition: &st
     format!(
         "SELECT r.id, r.base_form_id, r.pos_x, r.pos_y, r.pos_z, r.rot_x, r.rot_y, r.rot_z,
                 r.scale, r.header_flags, r.enable_parent_id, rec.record_type, s.model_path,
-                EXISTS(SELECT 1 FROM scripts sc WHERE sc.form_id = r.id OR sc.form_id = r.base_form_id),
+                0,
                 {snow_expression}, r.cell_id,
-                CASE WHEN rec.record_type IN ('STAT', 'TREE') THEN r.data END,
-                CASE WHEN rec.record_type IN ('STAT', 'TREE') THEN rec.data END,
+                r.data,
+                rec.data,
                 r.worldspace_id, {static_flags}
          FROM \"references\" r
          LEFT JOIN records rec ON rec.form_id = r.base_form_id
@@ -538,7 +544,6 @@ fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         record_type: row.get::<_, Option<String>>(11)?,
         static_flags: row.get::<_, Option<u32>>(19)?,
         model_path: row.get::<_, Option<String>>(12)?,
-        scripted: row.get::<_, bool>(13)?,
         snow_material: row.get::<_, i64>(14)? as u32,
         cell_id: row.get::<_, Option<u32>>(15)?.unwrap_or_default(),
         data_hash: hash(&reference_blob),
@@ -577,9 +582,10 @@ fn scoped_reference(
         base_form_id: row.base_form_id,
         record_type: record_type.to_owned(),
         is_tree: record_type == "TREE"
-            || row
-                .static_flags
-                .is_some_and(|flags| flags & STATIC_FLAG_HAS_TREE_LOD != 0),
+            || (record_type == "STAT"
+                && row
+                    .static_flags
+                    .is_some_and(|flags| flags & STATIC_FLAG_HAS_TREE_LOD != 0)),
         base_has_distant_lod: row
             .static_flags
             .map(|flags| flags & STATIC_FLAG_HAS_DISTANT_LOD != 0),
@@ -619,7 +625,6 @@ struct Row {
     record_type: Option<String>,
     static_flags: Option<u32>,
     model_path: Option<String>,
-    scripted: bool,
     snow_material: u32,
     cell_id: u32,
     data_hash: Option<String>,
@@ -635,8 +640,7 @@ fn classify_row(
     include_trees: bool,
 ) -> Result<WorldReference, String> {
     match row.record_type.as_deref() {
-        Some("STAT") => {}
-        Some("TREE") if include_trees => {}
+        Some(kind) if base_type_in_scope(kind, include_trees) => {}
         Some(other) => return Err(format!("base_not_static:{other}")),
         None => return Err("base_unresolved".into()),
     }
@@ -648,9 +652,6 @@ fn classify_row(
     }
     if row.enable_parent.is_some() {
         return Err("enable_parent".into());
-    }
-    if row.scripted {
-        return Err("scripted".into());
     }
     let glb_path = row
         .model_path
@@ -795,7 +796,7 @@ mod scoped_id_tests {
                      id INTEGER PRIMARY KEY, base_form_id INTEGER, pos_x, pos_y,
                      is_exterior INTEGER, worldspace_id
                  );
-                 INSERT INTO records VALUES (101, 'STAT'), (102, 'TREE'), (103, 'ACTI');
+                 INSERT INTO records VALUES (101, 'STAT'), (102, 'TREE'), (103, 'NPC_');
                  INSERT INTO \"references\" VALUES
                      (1, 101, 4096, -1, 1, 10),
                      (2, 102, -1, 8192, 1, 20),
@@ -950,7 +951,6 @@ mod tests {
             record_type: Some("STAT".into()),
             static_flags: None,
             model_path: Some("Architecture\\Whiterun\\WRBuilding01.nif".into()),
-            scripted: false,
             snow_material: 0x25129,
             cell_id: 0x30,
             data_hash: None,
@@ -987,7 +987,6 @@ mod tests {
             (Box::new(|r| r.header_flags = 0x800), "initially_disabled"),
             (Box::new(|r| r.header_flags = 0x20), "deleted"),
             (Box::new(|r| r.enable_parent = Some(5)), "enable_parent"),
-            (Box::new(|r| r.scripted = true), "scripted"),
             (Box::new(|r| r.model_path = None), "no_model"),
             (
                 Box::new(|r| r.model_path = Some("Markers\\XMarker.nif".into())),
@@ -1000,6 +999,36 @@ mod tests {
             mutate(&mut candidate);
             assert_eq!(classify_row(&candidate, 1, 0, false).unwrap_err(), reason);
         }
+    }
+
+    #[test]
+    fn every_resting_model_type_is_eligible_but_actors_and_doors_stay_out() {
+        for &kind in RESTING_MODEL_TYPES {
+            let mut candidate = row();
+            candidate.record_type = Some(kind.into());
+            assert!(classify_row(&candidate, 1, 0, false).is_ok(), "{kind}");
+        }
+        for kind in ["NPC_", "ACHR", "DOOR"] {
+            assert!(!base_type_in_scope(kind, true), "{kind}");
+        }
+        assert!(!base_type_in_scope("TREE", false));
+        assert!(base_type_in_scope("TREE", true));
+    }
+
+    #[test]
+    fn nonstatic_header_bits_do_not_claim_a_native_tree_relation() {
+        let mut candidate = row();
+        candidate.record_type = Some("ACTI".into());
+        candidate.static_flags = Some(STATIC_FLAG_HAS_TREE_LOD);
+        let outcome = classify_row(&candidate, 1, 0, true);
+        let scoped =
+            scoped_reference(&candidate, 1, 1, &outcome, true, LodOrigin::new(0, 0)).unwrap();
+        assert!(!scoped.is_tree);
+        candidate.record_type = Some("STAT".into());
+        let outcome = classify_row(&candidate, 1, 0, true);
+        let scoped =
+            scoped_reference(&candidate, 1, 1, &outcome, true, LodOrigin::new(0, 0)).unwrap();
+        assert!(scoped.is_tree);
     }
 
     #[test]

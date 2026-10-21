@@ -618,6 +618,7 @@ pub struct ClusterRenderPlugin;
 
 impl Plugin for ClusterRenderPlugin {
     fn build(&self, app: &mut App) {
+        super::runtime_state::install(app);
         handoff::install(app);
         embedded_asset!(app, "shaders/cluster_cull.wgsl");
         embedded_asset!(app, "shaders/cluster_draw.wgsl");
