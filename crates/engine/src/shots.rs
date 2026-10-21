@@ -1116,10 +1116,10 @@ impl DoorWorld<'_, '_> {
         }
         let (animation, _) = self.animations.get(door).ok()?;
         let player = animation.player()?;
-        if let Ok(derived) = self.derived_graphs.get(door) {
-            if self.graph_handles.get(player).ok()?.0 != derived.0 {
-                return None;
-            }
+        if let Ok(derived) = self.derived_graphs.get(door)
+            && self.graph_handles.get(player).ok()?.0 != derived.0
+        {
+            return None;
         }
         self.players.get(player).ok()
     }

@@ -1252,8 +1252,7 @@ mod tests {
     fn external_controller_keeps_its_target_and_e_is_not_activated_twice() {
         let (mut app, _) = app_with(interior_door());
         let target = app.world().resource::<DoorTarget>().clone();
-        app.world_mut()
-            .spawn(crate::doors::ExternalDoorTargetOwner::default());
+        app.world_mut().spawn(crate::doors::ExternalDoorTargetOwner);
         // Deliberately leave CursorCapture present: ownership, not coincidence,
         // must prevent a second handler from consuming the portal's snapshot.
         press_e(&mut app);

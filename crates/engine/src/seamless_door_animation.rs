@@ -1715,6 +1715,11 @@ fn withdraw_source_binding_playback(
 /// rest pose, and `DoorState::Closed` is what the re-claim writes over whatever the door was - which
 /// is a door that lies about itself: it is open, its doorway is the one the player is walking
 /// through, and its leaf is drawn across it ([`restore_lost_swings`]).
+#[expect(
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    reason = "One lost-player sweep reads every component a door's private animation owns."
+)]
 fn forget_lost_door_players(
     mut commands: Commands,
     doors: Query<(

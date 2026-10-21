@@ -112,6 +112,7 @@ pub struct InvalidSourceClip;
 
 #[expect(
     clippy::type_complexity,
+    clippy::too_many_arguments,
     reason = "One source resolver serves authored doors and ambient references."
 )]
 pub(crate) fn resolve_source_clips(
@@ -243,6 +244,10 @@ pub(crate) fn resolve_source_clips(
     }
 }
 
+#[expect(
+    clippy::type_complexity,
+    reason = "The ambient-idle filter names the two exclusions a door and a started idle impose."
+)]
 fn play_idle_clips(
     mut commands: Commands,
     references: Query<

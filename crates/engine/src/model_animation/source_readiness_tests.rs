@@ -567,9 +567,11 @@ mod named_actual_loader {
         let root: Handle<Gltf> = app
             .world()
             .resource::<AssetServer>()
-            .load_with_settings(path, move |settings: &mut GltfLoaderSettings| {
+            .load_builder()
+            .with_settings(move |settings: &mut GltfLoaderSettings| {
                 settings.load_animations = animations
-            });
+            })
+            .load(path);
         wait_for_loaded(app, &root);
         let gltfs = app.world().resource::<Assets<Gltf>>();
         let gltf = gltfs.get(&root).unwrap();
