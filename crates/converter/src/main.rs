@@ -47,6 +47,10 @@ struct Cli {
     invalidate_cache: bool,
     verify_cache: bool,
     no_lod: bool,
+    discard_derived: bool,
+    lod_mode: converter::cluster::LodMode,
+    cluster_triangle_threshold: u32,
+    cluster_bench_baked: bool,
     merged_terrain: bool,
     terrain_default_texture: TerrainDefaultTexture,
     terrain_ini: Option<PathBuf>,
@@ -71,6 +75,10 @@ impl Cli {
         config.invalidate_cache = self.invalidate_cache;
         config.verify_cache = self.verify_cache;
         config.no_lod = self.no_lod;
+        config.discard_derived = self.discard_derived;
+        config.lod_mode = self.lod_mode;
+        config.cluster_triangle_threshold = self.cluster_triangle_threshold;
+        config.cluster_bench_baked = self.cluster_bench_baked;
         config.merged_terrain = self.merged_terrain;
         config.terrain_default_texture = self.terrain_default_texture;
         config.terrain_ini = self.terrain_ini.clone();
@@ -219,6 +227,9 @@ async fn main() -> Result<()> {
     }
     if args.first().and_then(|argument| argument.to_str()) == Some("refresh-extensions") {
         return refresh_extensions(&args[1..]);
+    }
+    if args.first().and_then(|argument| argument.to_str()) == Some("derive-clusters") {
+        return derive_clusters(&args[1..]);
     }
     let command = parse_command(args)?;
     let mo2 = match &command {
@@ -580,6 +591,9 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
             command.push_str(&format!(" {flag} \"{}\"", path.display()));
         }
     }
+    if cli.discard_derived {
+        command.push_str(" --discard-derived");
+    }
     if cli.extract_all_archive_files {
         command.push_str(" --extract-all-archive-files");
     }
@@ -597,6 +611,18 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
     });
     for path in &cli.schema_addons {
         command.push_str(&format!(" --schema-addon \"{}\"", path.display()));
+    }
+    if cli.lod_mode != converter::cluster::LodMode::default() {
+        command.push_str(&format!(" --lod-mode {}", cli.lod_mode));
+    }
+    if cli.cluster_triangle_threshold != converter::cluster::DEFAULT_TRIANGLE_THRESHOLD {
+        command.push_str(&format!(
+            " --cluster-triangle-threshold {}",
+            cli.cluster_triangle_threshold
+        ));
+    }
+    if cli.cluster_bench_baked {
+        command.push_str(" --cluster-bench-baked");
     }
     // A resumed run must build the same generated outputs: the terrain stage is rebuilt from
     // the records on every run, so dropping the option would publish without it, and an option
@@ -710,6 +736,73 @@ fn suppress_caught_nif_parser_panics() {
             report_panic(info);
         }
     }));
+}
+
+/// Derive optional extensions in a new dataset without repairing or relabelling its core.
+fn parse_derive_options(args: &[OsString]) -> Result<converter::derive_extensions::DeriveOptions> {
+    use converter::derive_extensions::DeriveOptions;
+    ensure!(
+        !args.is_empty(),
+        "usage: converter derive-clusters <base> [--label L] [--replace] [--keep-failed-staging] [--include-trees] [--jobs N] [--triangle-threshold N]"
+    );
+    let mut options = DeriveOptions {
+        source: PathBuf::from(&args[0]),
+        label: "default".into(),
+        replace: false,
+        keep_failed_staging: false,
+        jobs: std::thread::available_parallelism().map_or(1, usize::from),
+        triangle_threshold: converter::cluster::DEFAULT_TRIANGLE_THRESHOLD,
+        include_trees: false,
+    };
+    let mut flags = args[1..].iter().cloned();
+    while let Some(flag) = flags.next() {
+        match flag.to_str() {
+            Some("--label") => {
+                options.label = next_value(&mut flags, "--label")?
+                    .into_string()
+                    .map_err(|_| color_eyre::eyre::eyre!("label must be UTF-8"))?
+            }
+            Some("--replace") => options.replace = true,
+            Some("--keep-failed-staging") => options.keep_failed_staging = true,
+            Some("--include-trees") => options.include_trees = true,
+            Some("--jobs") => {
+                options.jobs = parse_u32(next_value(&mut flags, "--jobs")?, "--jobs")? as usize
+            }
+            Some("--triangle-threshold") => {
+                options.triangle_threshold = parse_u32(
+                    next_value(&mut flags, "--triangle-threshold")?,
+                    "--triangle-threshold",
+                )?
+            }
+            _ => bail!("unknown derive-clusters option {flag:?}"),
+        }
+    }
+    Ok(options)
+}
+
+fn derive_clusters(args: &[OsString]) -> Result<()> {
+    if args.len() == 1 && matches!(args[0].to_str(), Some("--help" | "-h")) {
+        println!(
+            "usage: converter derive-clusters <base> [--label L] [--replace] [--keep-failed-staging] [--include-trees] [--jobs N] [--triangle-threshold N]"
+        );
+        return Ok(());
+    }
+    let options = parse_derive_options(args)?;
+    let report = converter::derive_extensions::run(&options)?;
+    println!(
+        "Derived {} cluster extensions in {}",
+        report.extensions.len(),
+        report.output.display()
+    );
+    for notice in report.notices {
+        eprintln!("notice: {notice}");
+    }
+    if report.incomplete_core {
+        eprintln!(
+            "DEVELOPMENT DATASET: core record warnings remain. Cluster certification does not certify global data completeness."
+        );
+    }
+    Ok(())
 }
 
 /// `converter refresh-extensions <output directory>`: recomputes the manifest's `extensions` list
@@ -1078,6 +1171,10 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut invalidate_cache = false;
     let mut verify_cache = true;
     let mut no_lod = false;
+    let mut discard_derived = false;
+    let mut lod_mode = converter::cluster::LodMode::default();
+    let mut cluster_triangle_threshold = converter::cluster::DEFAULT_TRIANGLE_THRESHOLD;
+    let mut cluster_bench_baked = false;
     let mut merged_terrain = false;
     let mut terrain_default_texture = TerrainDefaultTexture::default();
     let mut terrain_ini = None;
@@ -1186,6 +1283,23 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
             Some("--invalidate-cache") => invalidate_cache = true,
             Some("--no-verify-cache") => verify_cache = false,
             Some("--no-lod") => no_lod = true,
+            Some("--discard-derived") => discard_derived = true,
+            Some("--lod-mode") => {
+                let value = next_value(&mut args, "--lod-mode")?;
+                lod_mode = value
+                    .to_str()
+                    .and_then(|value| value.parse().ok())
+                    .ok_or_else(|| {
+                        color_eyre::eyre::eyre!("--lod-mode must be auto, cluster or baked")
+                    })?;
+            }
+            Some("--cluster-triangle-threshold") => {
+                cluster_triangle_threshold = parse_u32(
+                    next_value(&mut args, "--cluster-triangle-threshold")?,
+                    "--cluster-triangle-threshold",
+                )?
+            }
+            Some("--cluster-bench-baked") => cluster_bench_baked = true,
             Some("--merged-terrain") => merged_terrain = true,
             Some("--terrain-default-texture") => {
                 terrain_option.get_or_insert("--terrain-default-texture");
@@ -1322,6 +1436,10 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         invalidate_cache,
         verify_cache,
         no_lod,
+        discard_derived,
+        lod_mode,
+        cluster_triangle_threshold,
+        cluster_bench_baked,
         merged_terrain,
         terrain_default_texture,
         terrain_ini,
@@ -1395,8 +1513,10 @@ fn usage() -> &'static str {
                  [--merged-terrain] [--terrain-default-texture white|skyrim-ini]
                  [--terrain-ini FILE] [--terrain-allow-downscale]
                  [--plugins-file FILE] [--skyrim-ccc-file FILE] [--skyrim-ini-file FILE]
+                 [--lod-mode auto|cluster|baked] [--cluster-triangle-threshold N]
        converter check <output directory> [--full]
        converter refresh-extensions <output directory>
+       converter derive-clusters <base> [--label L] [--replace] [--keep-failed-staging] [--include-trees] [--jobs N] [--triangle-threshold N]
        converter repair-failed <Skyrim Data> <output directory> [--mo2-instance DIR]
                  [--mo2-profile NAME] [--no-lod] [--apply]
                  [--texture-encoder cpu|gpu] [--gpu-quality N] [--gpu-batch-mb N]
@@ -1454,8 +1574,19 @@ Archive ingestion extracts the formats used by conversion and English string ban
 flushes each unique derived payload; none skips extraction flushes for regenerable bytes
 and requires verified reuse. Runtime package publication keeps its durability contract.
 
+--discard-derived retires existing derived overlays only when the new base publishes successfully.
+A failed reconversion preserves the previous base and its overlays.
 --no-lod skips terrain LOD compilation in conversion and metadata rebuilds. Full-detail
 terrain and ordinary assets remain available. Omit it on a later run to build LOD.
+
+--lod-mode chooses how distant opaque static objects are prepared (ADR-0013). `baked` (the
+default) adds nothing. `cluster` and `auto` publish the base first, then derive a cluster overlay
+under <base>/derived/. The adapter is probed once and recorded; offline derivation runs even
+when an auto probe reports missing runtime features. A derivation error leaves the base valid
+and prints the command to retry just the overlay.
+--cluster-triangle-threshold sets the smallest primitive that gets clusters (default 1024).
+--cluster-bench-baked is refused in full conversions. Use standalone cluster-stage --bench-baked
+against the published base for the measurement-only baked comparison.
 
 --merged-terrain builds the merged terrain of #215 after the world database and the land
 textures: the land texture arrays, one merged mesh per exterior cell and the terrain chunk
@@ -2050,6 +2181,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_cluster_selection_reaches_the_pipeline_and_resume_command() {
+        let cli = parse_cli(args(&[
+            "Data",
+            "--lod-mode",
+            "cluster",
+            "--cluster-triangle-threshold",
+            "2048",
+            "--cluster-bench-baked",
+        ]))
+        .unwrap();
+        let config = cli.pipeline_config();
+        assert_eq!(config.lod_mode, converter::cluster::LodMode::Cluster);
+        assert_eq!(config.cluster_triangle_threshold, 2048);
+        assert!(config.cluster_bench_baked);
+        let resumed = resume_command("converter", &cli, Path::new("staging"));
+        assert!(resumed.contains("--lod-mode cluster"), "{resumed}");
+        assert!(
+            resumed.contains("--cluster-triangle-threshold 2048"),
+            "{resumed}"
+        );
+        assert!(resumed.contains("--cluster-bench-baked"), "{resumed}");
+    }
+
     /// Selection inputs survive parsing and the command printed after interruption.
     #[test]
     fn explicit_plugin_paths_are_preserved_in_resume_commands() {
@@ -2153,6 +2308,10 @@ mod tests {
             invalidate_cache: false,
             verify_cache: true,
             no_lod: false,
+            discard_derived: false,
+            lod_mode: converter::cluster::LodMode::default(),
+            cluster_triangle_threshold: converter::cluster::DEFAULT_TRIANGLE_THRESHOLD,
+            cluster_bench_baked: false,
             merged_terrain: false,
             terrain_default_texture: TerrainDefaultTexture::White,
             terrain_ini: None,
@@ -2708,6 +2867,456 @@ mod tests {
             fs::read_dir(directory.path()).unwrap().count(),
             1,
             "temporary report files were not cleaned up"
+        );
+    }
+
+    use rusqlite::Connection;
+
+    use shared::extensions::{ExtensionEntry, SPACE_LIGHTING};
+
+    struct RefreshDataSet {
+        _root: tempfile::TempDir,
+        assets: PathBuf,
+    }
+
+    impl RefreshDataSet {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let assets = root.path().join("assets");
+            fs::create_dir(&assets).unwrap();
+            Self {
+                _root: root,
+                assets,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.assets
+        }
+    }
+
+    /// A tiny converted data set: an (empty) world database carrying every extension's tables and
+    /// one `lod_build` row (core identity `core`), plus a manifest holding `entries`. No game data.
+    fn data_set(entries: &[ExtensionEntry]) -> RefreshDataSet {
+        let directory = RefreshDataSet::new();
+        let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        converter::esm::exporter::create_tables(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO lod_build(id, build_identity) VALUES (1, 'core')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        write_manifest(directory.path(), entries);
+        directory
+    }
+
+    fn write_manifest(folder: &Path, entries: &[ExtensionEntry]) {
+        let manifest = serde_json::json!({
+            "schema_version": converter::cache::CONVERTER_SCHEMA_VERSION,
+            "complete": true,
+            "extensions": serde_json::to_value(entries).unwrap(),
+        });
+        fs::write(
+            folder.join("conversion-manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn manifest_text(folder: &Path) -> Vec<u8> {
+        fs::read(folder.join("conversion-manifest.json")).unwrap()
+    }
+
+    fn manifest_entries(folder: &Path) -> Vec<ExtensionEntry> {
+        let value: serde_json::Value = serde_json::from_slice(&manifest_text(folder)).unwrap();
+        serde_json::from_value(value["extensions"].clone()).unwrap()
+    }
+
+    /// The entries `build_entries` writes for the folder's content as it is now.
+    fn current_entries(folder: &Path) -> Vec<ExtensionEntry> {
+        converter::extensions::build_entries(folder).unwrap()
+    }
+
+    fn entry_of<'a>(entries: &'a [ExtensionEntry], id: &str) -> &'a ExtensionEntry {
+        entries.iter().find(|entry| entry.id == id).unwrap()
+    }
+
+    fn entry_mut<'a>(entries: &'a mut [ExtensionEntry], id: &str) -> &'a mut ExtensionEntry {
+        entries.iter_mut().find(|entry| entry.id == id).unwrap()
+    }
+
+    fn refresh(folder: &Path) -> Result<()> {
+        refresh_extensions(&[folder.as_os_str().to_os_string()])
+    }
+
+    /// A manifest with no extension entries over a folder that holds none is a no-op.
+    #[test]
+    fn refresh_without_extensions_leaves_the_manifest_alone() {
+        let directory = RefreshDataSet::new();
+        let folder = directory.path();
+        write_manifest(folder, &[]);
+        let before = manifest_text(folder);
+        refresh(folder).unwrap();
+        assert_eq!(manifest_text(folder), before);
+    }
+
+    #[test]
+    fn refresh_rejects_a_non_object_manifest_even_without_payloads() {
+        let directory = RefreshDataSet::new();
+        let folder = directory.path();
+        fs::write(folder.join("conversion-manifest.json"), b"[]").unwrap();
+        assert!(
+            refresh(folder)
+                .unwrap_err()
+                .to_string()
+                .contains("not a JSON object")
+        );
+        assert_eq!(manifest_text(folder), b"[]");
+    }
+
+    /// A data set whose core did not change: the hashes and stats of every listed extension are
+    /// recomputed and each entry keeps the provenance it recorded.
+    #[test]
+    fn refresh_recomputes_hashes_and_keeps_the_recorded_provenance() {
+        let directory = data_set(&[]);
+        let folder = directory.path();
+        let mut entries = current_entries(folder);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            converter::extensions::specs()
+                .into_iter()
+                .filter(|spec| !spec.owns.tables.is_empty())
+                .map(|spec| spec.id)
+                .collect::<Vec<_>>(),
+            "the fixture database carries every table extension"
+        );
+        for entry in &mut entries {
+            entry.sha256 = "0".repeat(64);
+            entry.stats.clear();
+        }
+        write_manifest(folder, &entries);
+        refresh(folder).unwrap();
+        let after = manifest_entries(folder);
+        assert_eq!(
+            after,
+            current_entries(folder),
+            "the fresh hashes and stats were written"
+        );
+        assert_ne!(after, entries, "the stub hashes were replaced");
+        assert!(after.iter().all(|entry| entry.built_from == "core"));
+    }
+
+    /// An extension derived from another core build is refused and the manifest is left exactly as
+    /// it was: re-hashing it here would bless a payload this converter did not write.
+    #[test]
+    fn refresh_refuses_a_stale_extension_and_leaves_the_manifest_alone() {
+        let directory = data_set(&[]);
+        let folder = directory.path();
+        let mut entries = current_entries(folder);
+        entry_mut(&mut entries, SPACE_LIGHTING).built_from = "an older core".to_owned();
+        write_manifest(folder, &entries);
+        let before = manifest_text(folder);
+        let error = refresh(folder).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("an older core")
+                && message.contains("the data set's core is now core"),
+            "{message}"
+        );
+        assert!(message.contains("convert the data set again"), "{message}");
+        assert_eq!(manifest_text(folder), before);
+        assert!(
+            !folder.join("conversion-manifest.json.refresh").exists(),
+            "a refused refresh left its staged manifest behind"
+        );
+    }
+
+    /// A recognised extension at a version or with an ownership this converter does not write is
+    /// refused rather than read as the current one.
+    #[test]
+    fn refresh_refuses_a_version_or_ownership_it_does_not_write() {
+        let directory = data_set(&[]);
+        let folder = directory.path();
+        let mut entries = current_entries(folder);
+        entry_mut(&mut entries, SPACE_LIGHTING).version = 2;
+        write_manifest(folder, &entries);
+        let before = manifest_text(folder);
+        let error = refresh(folder).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("version 2") && message.contains("convert the data set again"),
+            "{message}"
+        );
+        assert_eq!(manifest_text(folder), before);
+
+        let other = data_set(&[]);
+        let mut entries = current_entries(other.path());
+        entry_mut(&mut entries, SPACE_LIGHTING).owns.tables =
+            vec!["space_lighting_extra".to_owned()];
+        write_manifest(other.path(), &entries);
+        let before = manifest_text(other.path());
+        let error = refresh(other.path()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("owning content"), "{message}");
+        assert_eq!(manifest_text(other.path()), before);
+    }
+
+    /// An extension this converter does not write is preserved while the entries
+    /// around it are refreshed.
+    #[test]
+    fn refresh_keeps_an_unknown_extension_unchanged() {
+        let directory = data_set(&[]);
+        let folder = directory.path();
+        let mut entries = current_entries(folder);
+        entry_mut(&mut entries, SPACE_LIGHTING).sha256 = "f".repeat(64);
+        let foreign = ExtensionEntry {
+            id: "acme.other_tool".to_owned(),
+            version: 9,
+            owns: Default::default(),
+            sha256: "ab".repeat(32),
+            built_from: "another tool".to_owned(),
+            stats: Default::default(),
+        };
+        entries.push(foreign.clone());
+        write_manifest(folder, &entries);
+        refresh(folder).unwrap();
+        let after = manifest_entries(folder);
+        assert_eq!(
+            after.last(),
+            Some(&foreign),
+            "the unknown entry is untouched"
+        );
+        assert_ne!(
+            entry_of(&after, SPACE_LIGHTING).sha256,
+            "f".repeat(64),
+            "the known entry next to it was refreshed"
+        );
+        assert_eq!(
+            entry_of(&after, SPACE_LIGHTING).sha256,
+            entry_of(&current_entries(folder), SPACE_LIGHTING).sha256
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_foreign_json_fields_and_omitted_defaults() {
+        let directory = data_set(&[]);
+        let folder = directory.path();
+        let mut entries = current_entries(folder);
+        entry_mut(&mut entries, SPACE_LIGHTING).sha256 = "0".repeat(64);
+        write_manifest(folder, &entries);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_text(folder)).unwrap();
+        let foreign = serde_json::json!({"id":"acme.foreign", "version":9,
+            "owns":{"future_payloads":["custom.bin"]}, "future_field":{"mode":"special"}});
+        manifest["extensions"]
+            .as_array_mut()
+            .unwrap()
+            .push(foreign.clone());
+        fs::write(
+            folder.join("conversion-manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        refresh(folder).unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&manifest_text(folder)).unwrap();
+        assert_eq!(
+            after["extensions"].as_array().unwrap().last(),
+            Some(&foreign)
+        );
+    }
+
+    #[test]
+    fn refresh_refuses_duplicate_extension_ids_without_writing() {
+        let directory = data_set(&[]);
+        let folder = directory.path();
+        let mut entries = current_entries(folder);
+        entries.push(entry_of(&entries, SPACE_LIGHTING).clone());
+        write_manifest(folder, &entries);
+        let before = manifest_text(folder);
+        assert!(
+            refresh(folder)
+                .unwrap_err()
+                .to_string()
+                .contains("listed twice")
+        );
+        assert_eq!(manifest_text(folder), before);
+    }
+
+    #[test]
+    fn refresh_refuses_unknown_ownership_fields_on_a_known_extension() {
+        let directory = data_set(&[]);
+        let folder = directory.path();
+        write_manifest(folder, &current_entries(folder));
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_text(folder)).unwrap();
+        let entry = manifest["extensions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["id"] == SPACE_LIGHTING)
+            .unwrap();
+        entry["owns"]["future_payloads"] = serde_json::json!(["custom.bin"]);
+        fs::write(
+            folder.join("conversion-manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let before = manifest_text(folder);
+        assert!(
+            refresh(folder)
+                .unwrap_err()
+                .to_string()
+                .contains("owning content")
+        );
+        assert_eq!(manifest_text(folder), before);
+    }
+
+    #[test]
+    fn refresh_refuses_unlisted_partial_tables_or_files() {
+        for table_payload in [true, false] {
+            let directory = RefreshDataSet::new();
+            let folder = directory.path();
+            write_manifest(folder, &[]);
+            if table_payload {
+                let connection = Connection::open(folder.join("skyrim_world.db")).unwrap();
+                connection
+                    .execute("CREATE TABLE matos(id INTEGER PRIMARY KEY)", [])
+                    .unwrap();
+            } else {
+                fs::create_dir_all(folder.join("meshes/terrain")).unwrap();
+                fs::write(folder.join("meshes/terrain/block.bin"), b"partial payload").unwrap();
+            }
+            let before = manifest_text(folder);
+            assert!(
+                refresh(folder)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no extension entry")
+            );
+            assert_eq!(manifest_text(folder), before);
+        }
+    }
+
+    /// A listed extension whose content is gone is refused, not silently dropped from the manifest.
+    #[test]
+    fn refresh_refuses_a_listed_extension_whose_content_is_missing() {
+        let directory = data_set(&[]);
+        let folder = directory.path();
+        write_manifest(folder, &current_entries(folder));
+        let connection = Connection::open(folder.join("skyrim_world.db")).unwrap();
+        connection.execute("DROP TABLE space_lighting", []).unwrap();
+        drop(connection);
+        let before = manifest_text(folder);
+        let error = refresh(folder).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(SPACE_LIGHTING) && message.contains("convert the data set again"),
+            "{message}"
+        );
+        assert_eq!(manifest_text(folder), before);
+    }
+
+    /// Content for an extension the manifest never listed carries no provenance to record: it is
+    /// refused rather than added.
+    #[test]
+    fn refresh_refuses_content_without_a_listed_entry() {
+        let directory = data_set(&[]);
+        let folder = directory.path();
+        let mut entries = current_entries(folder);
+        entries.retain(|entry| entry.id != SPACE_LIGHTING);
+        write_manifest(folder, &entries);
+        let before = manifest_text(folder);
+        let error = refresh(folder).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("no extension entry for it") && message.contains(SPACE_LIGHTING),
+            "{message}"
+        );
+        assert_eq!(manifest_text(folder), before);
+    }
+
+    /// The command takes the same exclusive asset lock a conversion does, before it reads anything:
+    /// another holder of the folder refuses it, and the manifest is left alone.
+    #[test]
+    fn refresh_refuses_a_data_set_another_holder_locks() {
+        let directory = data_set(&[]);
+        let folder = directory.path();
+        write_manifest(folder, &current_entries(folder));
+        let before = manifest_text(folder);
+        let reader = shared::asset_lock::AssetLock::acquire_shared(folder).unwrap();
+        let error = refresh(folder).unwrap_err();
+        // The report's chain names both this command's context and the held lock.
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("cannot refresh an asset directory in use")
+                && message.contains("incompatible lock"),
+            "{message}"
+        );
+        drop(reader);
+        let writer = shared::asset_lock::AssetLock::acquire_exclusive(folder).unwrap();
+        let error = refresh(folder).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("incompatible lock"),
+            "{error:?}"
+        );
+        drop(writer);
+        assert_eq!(manifest_text(folder), before);
+        // With the holder gone the same data set refreshes.
+        refresh(folder).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod overlay_cli_tests {
+    use super::*;
+
+    #[test]
+    fn derive_cluster_cli_accepts_one_base_and_explicit_overlay_controls() {
+        let args: Vec<_> = [
+            "base",
+            "--label",
+            "fixture",
+            "--replace",
+            "--keep-failed-staging",
+            "--jobs",
+            "2",
+            "--triangle-threshold",
+            "1",
+        ]
+        .map(OsString::from)
+        .into();
+        let options = parse_derive_options(&args).unwrap();
+        assert_eq!(options.source, PathBuf::from("base"));
+        assert_eq!(options.label, "fixture");
+        assert!(options.replace && options.keep_failed_staging);
+        assert_eq!(options.jobs, 2);
+        assert_eq!(options.triangle_threshold, 1);
+        assert!(parse_derive_options(&["base".into(), "old-full-copy-output".into()]).is_err());
+        assert!(parse_derive_options(&[]).is_err());
+    }
+
+    #[test]
+    fn discard_derived_is_explicit_and_survives_resume_commands() {
+        let cli = parse_cli(vec![
+            "Data".into(),
+            "Output".into(),
+            "--discard-derived".into(),
+        ])
+        .unwrap();
+        assert!(cli.pipeline_config().discard_derived);
+        assert!(
+            resume_command("converter", &cli, Path::new("staging")).contains("--discard-derived")
+        );
+        assert!(
+            !parse_cli(vec!["Data".into(), "Output".into()])
+                .unwrap()
+                .pipeline_config()
+                .discard_derived
         );
     }
 }

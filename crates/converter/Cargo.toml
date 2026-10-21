@@ -3,9 +3,15 @@ name = "converter"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# `converter::test_support`: a small synthetic complete base conversion, so another crate's tests (the engine's
+# producer/consumer proof) can run the real `derive_extensions::run` on it. Test-only; off by default.
+test-support = []
+
 [dependencies]
 shared = { path = "../shared" }
 mo2 = { path = "../mo2" }
+meshopt-cluster = { path = "../meshopt-cluster" }
 mesh-tools.workspace = true
 basis-universal.workspace = true
 ddsfile.workspace = true
@@ -38,13 +44,14 @@ zstd = "0.13"
 # The encoder runs on native Vulkan, Metal or DX12 only (no GL, no WebGPU).
 wgpu = { version = "29.0.4", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
 tempfile = "3.20"
+# Reads converted GLB primitives for the cluster LOD stage (the tests already use it).
+gltf = { version = "1.4", default-features = false, features = ["utils", "extras", "extensions"] }
 
 [target.'cfg(all(target_arch = "aarch64", target_family = "unix"))'.dependencies]
 # sha2's AArch64 hardware backend is gated by its asm feature.
 sha2 = { workspace = true, features = ["asm"] }
 
 [dev-dependencies]
-gltf = { version = "1.4", default-features = false, features = ["utils"] }
 insta = { version = "1.48", features = ["json", "redactions"] }
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 ruzstd = "0.9.1"
@@ -54,6 +61,10 @@ dummy-content = { path = "../dummy-content" }
 cc = "1.2"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }

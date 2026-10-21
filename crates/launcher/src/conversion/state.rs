@@ -1379,6 +1379,7 @@ mod tests {
             lod_elapsed_ms: 0,
             publication_elapsed_ms: 0,
             lod_warnings: vec!["Solstheim terrain skipped".into()],
+            cluster: None,
             elapsed_ms: 18_450_000,
             integration: None,
             ..Default::default()

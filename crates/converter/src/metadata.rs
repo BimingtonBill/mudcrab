@@ -73,15 +73,33 @@ impl AssetPipeline {
     /// Reader data-loss warnings keep the rebuilt report and manifest incomplete;
     /// successful compatibility notices do not affect their shared completeness rule.
     pub async fn rebuild_metadata_async(
+        config: PipelineConfig,
+        source_assets: &Path,
+        progress_tx: Sender<ProgressEvent>,
+    ) -> Result<PipelineReport> {
+        Self::rebuild_metadata_with_post_publish(
+            config,
+            source_assets,
+            progress_tx,
+            crate::cluster::PostPublish::REAL,
+        )
+        .await
+    }
+
+    /// The rebuild with its post-publish overlay step injectable (tests only substitute the
+    /// environment, never the base publication or the derivation).
+    pub(crate) async fn rebuild_metadata_with_post_publish(
         mut config: PipelineConfig,
         source_assets: &Path,
         progress_tx: Sender<ProgressEvent>,
+        post_publish: crate::cluster::PostPublish,
     ) -> Result<PipelineReport> {
         ensure!(
             config.mo2.is_none(),
             "metadata rebuild does not support MO2 selection; use normal conversion"
         );
         config.validate()?;
+        crate::cluster::validate_request(&config)?;
         config.freeze_schema_addons()?;
         ensure!(
             config.resume_staging.is_none()
@@ -97,6 +115,7 @@ impl AssetPipeline {
         // Both leases stay with the rebuild until publication; the terrain worker holds clones.
         let source_lock = Arc::new(AssetLock::acquire_shared(&source)?);
         let output_lock = Arc::new(AssetLock::acquire_exclusive(&config.output_dir)?);
+        config.protect_derived()?;
         let source_manifest = fs::read(source.join("conversion-manifest.json"))?;
         // Read the original version; normal cache loading deliberately invalidates
         // incompatible assets during migration, which this explicit route verifies instead.
@@ -176,6 +195,9 @@ impl AssetPipeline {
         let plugins = matched_plugins(&source, &config.data_dir)?;
         let staging = staging_path(&config.output_dir);
         fs::create_dir(&staging)?;
+        // The one adapter probe of this run, asked before any LOD work; the overlay derivation
+        // after publication receives it instead of probing again.
+        let early_probe = (post_publish.probe)(&config);
         let result = rebuild_into(
             &config,
             &source,
@@ -216,6 +238,25 @@ impl AssetPipeline {
             return Err(error);
         }
         report.publication_elapsed_ms = publication_started.elapsed().as_millis();
+        // The rebuilt base is published and valid, with no cluster data. Release its exclusive
+        // writer lock so the derivation takes its own shared lock; the published output keeps its
+        // `vfs`, which holds the raw terrain DDS the derivation reads in place.
+        drop(output_lock);
+        if crate::cluster::derive_requested(&config) {
+            progress_event(
+                &progress_tx,
+                ProgressStage::Publishing,
+                "Deriving cluster overlay",
+            )
+            .await;
+        }
+        crate::cluster::derive_after_publish(
+            &config,
+            &config.output_dir,
+            early_probe,
+            &post_publish,
+        )?
+        .record(&mut report);
         report.elapsed_ms = started.elapsed().as_millis();
         Ok(report)
     }
@@ -408,6 +449,7 @@ fn matched_plugins(source: &Path, data: &Path) -> Result<(Vec<PathBuf>, Vec<Stri
 }
 
 /// Rebuild requested metadata while publishing the already verified original asset provenance.
+#[allow(clippy::too_many_arguments)]
 async fn rebuild_into(
     config: &PipelineConfig,
     source: &Path,
