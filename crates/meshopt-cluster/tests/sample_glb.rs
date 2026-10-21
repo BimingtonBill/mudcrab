@@ -1,19 +1,16 @@
-//! Runs the builder on a converted game mesh. Reads the file only, skips when it is missing.
-//! Override the path with `MESHOPT_CLUSTER_SAMPLE`. Run with `--nocapture` to see the numbers.
+//! Runs the builder on a generated GLB with no private files or game data.
+//! Run with `--nocapture` to see diagnostic build numbers.
 
-use std::path::Path;
 use std::time::Instant;
 
 use meshopt_cluster::{Config, Mesh, build};
 
-const DEFAULT_SAMPLE: &str = "C:/Modding/Mudcrab/SkyrimConverted-portal-rooms/meshes/dungeons/dwemer/animated/astrolabe/armillary/dweastrolabearmillary01.glb";
-
 type Primitive = (Vec<[f32; 3]>, Vec<u32>);
 
-fn load_primitives(path: &Path) -> Vec<Primitive> {
-    // Buffers only: the sample carries images in encodings this test does not decode.
-    let gltf::Gltf { document, blob } = gltf::Gltf::open(path).expect("gltf open");
-    let buffers = gltf::import_buffers(&document, path.parent(), blob).expect("gltf buffers");
+fn load_primitives(bytes: &[u8]) -> Vec<Primitive> {
+    // Decode the generated geometry buffers without adding image-loader dependencies.
+    let gltf::Gltf { document, blob } = gltf::Gltf::from_slice(bytes).expect("gltf open");
+    let buffers = gltf::import_buffers(&document, None, blob).expect("gltf buffers");
     let mut out = Vec::new();
     for mesh in document.meshes() {
         for primitive in mesh.primitives() {
@@ -29,6 +26,50 @@ fn load_primitives(path: &Path) -> Vec<Primitive> {
     out
 }
 
+/// An indexed, nonplanar 32 x 32 grid exercises multiple clusters and simplification.
+/// The GLB is assembled here so the integration also exercises glTF buffer/accessor decoding.
+fn generated_glb() -> Vec<u8> {
+    let mut bin = Vec::new();
+    for y in 0..=32 {
+        for x in 0..=32 {
+            for value in [x as f32, y as f32, ((x * y) as f32 * 0.03).sin()] {
+                bin.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    let position_bytes = bin.len();
+    for y in 0..32_u32 {
+        for x in 0..32_u32 {
+            let a = y * 33 + x;
+            for index in [a, a + 1, a + 33, a + 1, a + 34, a + 33] {
+                bin.extend_from_slice(&index.to_le_bytes());
+            }
+        }
+    }
+    let mut json = format!(
+        r#"{{"asset":{{"version":"2.0"}},"buffers":[{{"byteLength":{}}}],
+        "bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":{}}},{{"buffer":0,"byteOffset":{},"byteLength":{}}}],
+        "accessors":[{{"bufferView":0,"componentType":5126,"count":1089,"type":"VEC3","min":[0,0,-1],"max":[32,32,1]}},
+        {{"bufferView":1,"componentType":5125,"count":6144,"type":"SCALAR"}}],
+        "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1}}]}}]}}"#,
+        bin.len(), position_bytes, position_bytes, bin.len() - position_bytes,
+    ).into_bytes();
+    while !json.len().is_multiple_of(4) {
+        json.push(b' ');
+    }
+    let mut glb = Vec::new();
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2_u32.to_le_bytes());
+    glb.extend_from_slice(&((12 + 8 + json.len() + 8 + bin.len()) as u32).to_le_bytes());
+    glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json);
+    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"BIN\0");
+    glb.extend_from_slice(&bin);
+    glb
+}
+
 fn median_ms(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(f64::total_cmp);
     samples[samples.len() / 2]
@@ -36,14 +77,9 @@ fn median_ms(mut samples: Vec<f64>) -> f64 {
 
 #[test]
 fn sample_glb_hierarchy_invariants_and_numbers() {
-    let path =
-        std::env::var("MESHOPT_CLUSTER_SAMPLE").unwrap_or_else(|_| DEFAULT_SAMPLE.to_string());
-    if !Path::new(&path).exists() {
-        eprintln!("skipped: sample {path} not found");
-        return;
-    }
-
-    let primitives = load_primitives(Path::new(&path));
+    let primitives = load_primitives(&generated_glb());
+    assert_eq!(primitives.len(), 1);
+    assert_eq!(primitives[0].1.len() / 3, 2048);
     let input_triangles: usize = primitives.iter().map(|(_, i)| i.len() / 3).sum();
 
     for (label, config) in [("classic", Config::classic(128)), ("rt", Config::rt(128))] {
@@ -94,13 +130,15 @@ fn sample_glb_hierarchy_invariants_and_numbers() {
             }
         }
 
+        assert!(groups > 1, "{label}: fixture must build a hierarchy");
+        assert!(max_depth > 0, "{label}: fixture must simplify");
         assert_eq!(
             source_triangles, input_triangles,
             "{label}: source triangles not all covered"
         );
 
         println!(
-            "astrolabe sample [{label}, 128]: {} primitives, {} input triangles, {} groups, {} clusters, DAG depth max {}, payload {:.1} B/triangle, build {:.2} ms total ({:.0} ms per million input triangles)",
+            "generated grid [{label}, 128]: {} primitives, {} input triangles, {} groups, {} clusters, DAG depth max {}, payload {:.1} B/triangle, build {:.2} ms total ({:.0} ms per million input triangles)",
             primitives.len(),
             input_triangles,
             groups,
