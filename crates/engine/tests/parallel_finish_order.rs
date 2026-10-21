@@ -73,11 +73,13 @@ fn copy_3_to_4_and_4_to_5(mut context: RenderContext, chain: Res<Chain>) {
 
 fn gpu() -> Option<RenderResources> {
     let created = std::panic::catch_unwind(|| {
-        bevy::tasks::block_on(bevy::render::renderer::initialize_renderer_without_callbacks(
-            Backends::all(),
-            None,
-            &WgpuSettings::default(),
-        ))
+        bevy::tasks::block_on(
+            bevy::render::renderer::initialize_renderer_without_callbacks(
+                Backends::all(),
+                None,
+                &WgpuSettings::default(),
+            ),
+        )
     });
     created.ok()
 }

@@ -1313,7 +1313,7 @@ struct View {
     world_position: vec3<f32>,
     viewport: vec4<f32>,
 }
-struct Globals { time: f32, delta_time: f32, frame_count: u32 }
+struct Globals { time: f32, delta_time: f32, frame_count: u32, time_unwrapped: f32 }
 struct Fog { base_color: vec4<f32> }
 @group(0) @binding(0) var<uniform> view: View;
 @group(0) @binding(13) var<uniform> fog: Fog;

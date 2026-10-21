@@ -346,6 +346,26 @@ release, then removed. Baselines and
 now a different, about twice as dense place. The scripts do not map an old `dense` entry to
 `dense-legacy`: compare an old `dense` median with a new `dense-legacy` median by hand.
 
+### The portal scenes (portal branch only)
+
+The portal branch adds four scenes to both scripts, none in a default set (`-Scenarios portal` runs
+all four). They load the portal's converted assets, so `-Assets` must name those
+(`C:\Modding\Mudcrab\SkyrimConverted-portal-lod`), and they are defined in
+`phase2-profile.ps1` (`Get-PortalSceneArguments`), where each scene's pose is written out.
+
+| Scene | What it is | Window |
+|---|---|---|
+| `portal-door-tour` | The demo door tour: `--demo riverwood --demo-tour <dir> --tour-doors 2 --tour-repeat 3`. The world settles for about 10 s, the tour crosses into Sven's House at about 20 s and back out at about 30 s (quick build), so the window holds the approach, the open doorway with the portal drawing the room beyond it, and both crossings. The tour's own screenshots are part of the load. Portal's default terrain ring (8). | `-PortalTourSeconds`, 40 s |
+| `portal-heavy` | A standing view with one open portal view: 350 units in front of Sven's House door (`0001CBB0`), the first shot of `tools/reference/doorway_shots.json` at 1600x900 (`tools/reference/baseline_portal_heavy.json`). A `--shots` run that is also a benchmark opens the door and holds the view instead of photographing it. Default ring (8). | `-DurationSeconds` |
+| `lod-far` | A high vantage above Riverwood looking north up the valley, where native terrain LOD (#105) reaches the horizon: 20500,-45500,6000 in Tamriel, yaw 0, pitch 8, hfov 90 (`tools/reference/baseline_lod_far.json`, the `a-north` shot of `local/reference/lod-check`). `--terrain-radius 2`. | `-DurationSeconds` |
+| `lod-flythrough` | From the same vantage (yaw 0, level), the camera flies north at 1500 units a second over the full-detail grid and the LOD terrain beyond it, turning back after four cells, so the window crosses between LOD and full detail again and again. A moving scene: it gets a standing-still window and a streaming window. `--terrain-radius 2`. | `-DurationSeconds` |
+
+A benchmark run turns the terrain ring off unless `--terrain-radius` names it, so every portal scene
+names its ring: the LOD scenes use 2, because the default ring's fog hides the LOD. All four use a
+1600x900 window like every other scene, so one campaign can hold them (a campaign refuses windows
+whose resolutions differ). The baseline measures and does not judge: an engine exit caused by its own
+gates (the commit budget, for one) is kept as a measured window with a warning naming the gate.
+
 Both scripts need PowerShell 7 (`pwsh`): they read reports with `ConvertFrom-Json -AsHashtable`.
 The command builds the engine once (`cargo build --release --bin engine`, skipped with `-NoBuild`,
 and the binary is looked for under `CARGO_TARGET_DIR` when that is set), prints the number of

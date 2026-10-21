@@ -1,0 +1,224 @@
+record_sig	subrecord_sig	how_read	evidence	stored_in	notes
+*	(header)	partial	crates/converter/src/esm/binary.rs:138	RawRecord.form_id, .record_type, .flags; data_size slices the payload	24-byte record header: type_tag 0..4, data_size 4..8, flags 8..12, form_id 12..16, version_control 16..20, version 20..22, unknown 22..24. version_control, version and unknown are decoded and then dropped.
+*	(header)	partial	crates/converter/src/esm/binary.rs:249	-	Header flag FLAG_COMPRESSED (0x00040000, binary.rs:19): the payload then starts with a u32 inflated size and the rest is zlib. Read to size the buffer and to skip the prefix, not stored.
+*	(whole)	raw	crates/converter/src/esm/extractors.rs:43	records.data, cells.data, and every type-specific table	Every subrecord of every record is split out and kept verbatim. exporter.rs:404 writes the rkyv blob into records.data, exporter.rs:377 into cells.data, exporter.rs:1081 into references.data, exporter.rs:596 into waters.data.
+GRUP	(header)	partial	crates/converter/src/esm/binary.rs:164	RawRecord.cell_form_id, .worldspace_form_id	data_size 4..8, label 8..12, group_type 12..16 are read; the trailing 8 bytes are skipped. group_type 6/8/9/10 makes label the parent cell and 1 makes it the parent worldspace (binary.rs:223).
+XXXX	(whole)	full	crates/converter/src/esm/extractors.rs:26	-	Extended subrecord length: a u32 that replaces the next subrecord's u16 length. Consumed, never stored.
+TES4	MAST	full	crates/converter/src/esm/binary.rs:57	PluginMetadata.masters	Read once per plugin to build the load order; NUL trimmed. Only MAST subrecords of the TES4 header are read here; every other subrecord of the header, DATA included, is filtered out (binary.rs:54).
+CELL	XCLC	partial	crates/converter/src/esm/extractors.rs:81	cells.grid_x, cells.grid_y	First 8 bytes only: i32 grid_x 0..4, i32 grid_y 4..8. Anything past byte 8 in the same subrecord is not read. Requires at least 8 bytes.
+CELL	EDID	full	crates/converter/src/esm/extractors.rs:85	cells.interior_name	Read for every CELL, exterior ones included, into a column named interior_name; NUL trimmed; overwrites any earlier EDID in the same record.
+LAND	VHGT	raw	crates/converter/src/esm/extractors.rs:61	land.heightmap (exporter.rs:462)	Cloned verbatim on this path; the same bytes are decoded separately by cell_cache.rs:177.
+LAND	VTEX	raw	crates/converter/src/esm/extractors.rs:62	land.vtex (exporter.rs:462)	Cloned verbatim. This is the raw VTEX payload, not the per-layer BTXT/ATXT list.
+LAND	VCLR	raw	crates/converter/src/esm/extractors.rs:63	land.vclr (exporter.rs:462)	Cloned verbatim.
+LAND	VNML	raw	crates/converter/src/esm/extractors.rs:64	land.normals (exporter.rs:462)	Cloned verbatim on this path; the same bytes are decoded separately by cell_cache.rs:203.
+*	OBND	full	crates/converter/src/esm/extractors.rs:169	SubrecordOBND (six i16)	Helper SubrecordView::get_obnd, reached only from TreeRecord::parse (records/tree.rs:45), which no conversion path calls. Decodes x1,y1,z1,x2,y2,z2 from bytes 0..12; needs at least 12 bytes.
+*	VMAD	full	crates/converter/src/esm/extractors.rs:182	VmadSubrecord	Helper SubrecordView::get_vmad, reached only from AchrRecord::parse (records/achr.rs:183), which no conversion path calls. The live path is exporter.rs:423.
+*	MODS	full	crates/converter/src/esm/extractors.rs:190	Vec<AlternateTexture>	Helper SubrecordView::get_alternate_textures with a caller-supplied tag. Reached from get_model_with_tags and from one integration test (crates/converter/tests/plugin_references.rs:161); no conversion path calls it. Payload: u32 count, then per entry a u32 name length, the name, a u32 texture FormID and a u32 3D index.
+*	MODL	full	crates/converter/src/esm/extractors.rs:261	String	Helper SubrecordView::get_model_with_tags; reachable only through get_model (extractors.rs:276), called from records/tree.rs:47, which no conversion path reaches.
+*	MODT	raw	crates/converter/src/esm/extractors.rs:262	SubrecordMODT.raw_data	Same helper. The MODT payload is kept as raw bytes and never decoded.
+*	MODS	full	crates/converter/src/esm/extractors.rs:266	Vec<AlternateTexture>	Same helper called with b"MODS" for the standard MODL+MODT+MODS triplet.
+*	VMAD	full	crates/converter/src/esm/exporter.rs:423	scripts.script_name, scripts.vmad, scripts.properties_json	Decoded for every record type by parse_vmad (vmad.rs:346): version, object format, script count, and per script its name, flags and properties (each with name, type and value, including object/alias properties and the five array kinds), then the INFO/PACK/PERK/QUST/SCEN fragment block. If the trailing bytes are not one of those five record types parse_vmad fails and no scripts row is written at all; the raw VMAD bytes are stored regardless.
+GRAS	DATA	partial	crates/converter/src/esm/exporter.rs:681	grass_types.density, .min_slope, .max_slope, .units_from_water, .water_comparison, .position_range, .height_range, .color_range, .wave_period, .flags	Reads byte 0, byte 1, byte 2, u16 4..6, u32 8..12, f32 12, f32 16, f32 20, f32 24 and byte 28. Not read: byte 3, bytes 6..8, and every byte from 29 on.
+GRAS	MODL	full	crates/converter/src/esm/exporter.rs:689	grass_types.model_path	Mesh path canonicalised to a .glb asset path; a path that fails canonicalisation stores NULL rather than failing.
+GRAS	EDID	full	crates/converter/src/esm/exporter.rs:695	grass_types.editor_id	
+WRLD	EDID	full	crates/converter/src/esm/exporter.rs:443	worldspaces.editor_id	Falls back to the literal string WRLD_<formid> when the subrecord is absent.
+WRLD	WNAM	full	crates/converter/src/esm/exporter.rs:447	worldspaces.parent_world	First u32.
+REFR|ACHR|ACRE|PGRE|PMIS	DATA	partial	crates/converter/src/esm/exporter.rs:1056	references.pos_x, .pos_y, .pos_z, .rot_x, .rot_y, .rot_z	Every 4-byte chunk is decoded but only the first six f32 (offsets 0..24) are used. A missing or short DATA stores zeros and never errors.
+REFR|ACHR|ACRE|PGRE|PMIS	XSCL	partial	crates/converter/src/esm/exporter.rs:1068	references.scale	First f32 only, only when at least 4 bytes; absent means 1.0.
+REFR|ACHR|ACRE|PGRE|PMIS	NAME	full	crates/converter/src/esm/exporter.rs:1072	references.base_form_id	First u32; absent means 0.
+REFR|ACHR|ACRE|PGRE|PMIS	XRDS	partial	crates/converter/src/esm/exporter.rs:1088	references.radius_override	First f32 only, only when at least 4 bytes. Stored for every reference that carries it although the engine reads it for light references alone.
+REFR|ACHR|ACRE|PGRE|PMIS	XESP	partial	crates/converter/src/esm/exporter.rs:1093	references.enable_parent_id, references.enable_parent_flags	u32 parent 0..4 and u32 flags 4..8; needs at least 8 bytes. The trailing unused bytes the 8-byte layout allows are not read.
+REFR|ACHR|ACRE|PGRE|PMIS	XTEL	partial	crates/converter/src/esm/exporter.rs:1111	door_links.destination_ref_id, .pos_x/.pos_y/.pos_z, .rot_x/.rot_y/.rot_z	door_link (exporter.rs:932): u32 destination FormID 0..4 then six f32, creating position 4..16 and rotation 16..28. Needs at least 28 bytes; on the 32-byte form the trailing flags are not read. A short XTEL prints a warning and writes no door_links row.
+LIGH	DATA	partial	crates/converter/src/esm/exporter.rs:1009	lights.radius, .color_r, .color_g, .color_b, .flags, .falloff	radius u32 4..8, colour bytes 8, 9, 10, flags u32 12..16, falloff f32 16..20. Not read: i32 time 0..4, byte 11, and every byte from 20 on (FOV, near clip, flicker period, flicker intensity, flicker movement, value, weight). Under 20 bytes drops the whole light with a warning instead of guessing.
+LIGH	FNAM	partial	crates/converter/src/esm/exporter.rs:1026	lights.fade	First f32 only, only when at least 4 bytes.
+LIGH	EDID	full	crates/converter/src/esm/exporter.rs:1034	lights.editor_id	
+LIGH	MODL	full	crates/converter/src/esm/exporter.rs:476	statics.model_path, statics.editor_id, statics.flags	Only when the path is present and non-empty; a model-less light gets a lights row and no statics row.
+STAT|MSTT|FURN|TREE|FLOR|CONT|DOOR|ACTI|WEAP|MISC|BOOK|AMMO|ALCH|INGR|SLGM|KEYM|SCRL	MODL	full	crates/converter/src/esm/exporter.rs:498	statics.model_path	A record with no MODL stores NULL and is skipped at spawn time. The same arm also writes EDID (exporter.rs:511) and the header flags.
+STAT|MSTT|FURN|TREE|FLOR|CONT|DOOR|ACTI|WEAP|MISC|BOOK|AMMO|ALCH|INGR|SLGM|KEYM|SCRL	EDID	full	crates/converter/src/esm/exporter.rs:511	statics.editor_id	
+ARMO	MOD2	full	crates/converter/src/esm/exporter.rs:495	statics.model_path	ARMO sits in the same match arm but does not read MODL: its world model is the male MOD2, with MOD3 as fallback. Both may be absent, giving NULL.
+ARMO	MOD3	full	crates/converter/src/esm/exporter.rs:496	statics.model_path	Read only when MOD2 is absent.
+STAT	DNAM	partial	crates/converter/src/esm/exporter.rs:504	statics.material_object, statics.material_max_angle	Guarded by record.record_type == *b"STAT"; handled by static_directional_material (directional_material.rs:108) and parse_static_dnam (directional_material.rs:72): f32 max angle 0..4, MATO FormID 4..8. Needs at least 8 bytes; bytes past 8 are not read. No DNAM leaves both columns NULL.
+MATO	DATA	partial	crates/converter/src/esm/exporter.rs:520	matos (eleven float columns plus single_pass)	directional_material.rs:117 then parse_directional_material (directional_material.rs:83): eleven f32 at 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40 and a u32 flag 44..48. The three colour f32 at 32, 36, 40 are clamped to 0..1, scaled by 255 and rounded to u8. Not read: bytes 42 and 43, and anything past 48. Under 48 bytes is treated as unreadable: a warning and no matos row.
+MATO	EDID	full	crates/converter/src/esm/exporter.rs:526	matos.editor_id	
+NPC_	EDID	full	crates/converter/src/esm/exporter.rs:547	npcs.editor_id	
+NPC_	FULL	full	crates/converter/src/esm/exporter.rs:547	npcs.full_name	
+NPC_	RNAM	full	crates/converter/src/esm/exporter.rs:547	npcs.race_id	First u32; absent means NULL.
+NPC_	CNAM	full	crates/converter/src/esm/exporter.rs:547	npcs.class_id	First u32; absent means NULL.
+RACE	WKMV	partial	crates/converter/src/esm/exporter.rs:551	race_movement_links.walk_movt_id	optional_race_movement_link (exporter.rs:74): a 4-byte FormID, refused unless the length is exactly 4; 0 stores NULL.
+RACE	RNMV	partial	crates/converter/src/esm/exporter.rs:552	race_movement_links.run_movt_id	Same helper, the run movement.
+MOVT	EDID	full	crates/converter/src/esm/exporter.rs:29	movement_types.editor_id	Read only for the record whose FormID is 0x0003580D (exporter.rs:558) - a hardcoded Skyrim FormID. The value must be exactly NPC_Default_MT or the conversion fails; the constant is what is written.
+MOVT	SPED	partial	crates/converter/src/esm/exporter.rs:36	movement_types.left_walk through .back_run	Eight f32 at 0..32 of a 40- or 44-byte payload; the 4 bytes past 32 are not read. Every value must be finite and positive or the conversion fails.
+GMST	EDID	full	crates/converter/src/esm/exporter.rs:566	movement_game_settings.editor_id	Read for every GMST; only fMoveCharWalkBase and fJumpHeightMin (exporter.rs:568, matched case-insensitively) go on to be stored. The other several thousand GMSTs are parsed and dropped.
+GMST	DATA	full	crates/converter/src/esm/exporter.rs:59	movement_game_settings.value	Only for those two settings. Must be exactly 4 bytes and a finite f32; anything else fails the conversion.
+WATR	EDID	full	crates/converter/src/esm/exporter.rs:587	waters.editor_id	
+WATR	ANAM	partial	crates/converter/src/esm/exporter.rs:588	waters.opacity	First byte only; the rest of ANAM is not read.
+WATR	DNAM	partial	crates/converter/src/esm/exporter.rs:582	waters.reflectivity, .fresnel, .shallow_color, .deep_color, .reflection_color	parse_water_dnam (exporter.rs:984): f32 reflectivity 20..24, f32 fresnel 24..28, colour u32 shallow 40..44, deep 44..48, reflection 48..52. Nothing before offset 20 or after 52 is read. Under 52 bytes returns None and all five columns stay NULL; the module comment says real records are 228 or 232 bytes.
+WATR	NAM5	full	crates/converter/src/esm/exporter.rs:949	waters.flow_normal_path	Texture path canonicalised to .dds with the leading textures/ stripped.
+TXST	EDID	full	crates/converter/src/esm/exporter.rs:606	texture_sets.editor_id	
+TXST	TX00	full	crates/converter/src/esm/exporter.rs:607	texture_sets.diffuse_path	
+TXST	TX01	full	crates/converter/src/esm/exporter.rs:608	texture_sets.normal_path	
+TXST	TX02	full	crates/converter/src/esm/exporter.rs:609	texture_sets.glow_path	
+TXST	TX03	full	crates/converter/src/esm/exporter.rs:610	texture_sets.height_path	
+TXST	TX04	full	crates/converter/src/esm/exporter.rs:611	texture_sets.environment_path	
+TXST	TX05	full	crates/converter/src/esm/exporter.rs:612	texture_sets.mask_path	
+TXST	TX06	full	crates/converter/src/esm/exporter.rs:613	texture_sets.specular_path	
+TXST	TX07	full	crates/converter/src/esm/exporter.rs:614	texture_sets.detail_path	
+LTEX	EDID	full	crates/converter/src/esm/exporter.rs:628	landscape_textures.editor_id	
+LTEX	TNAM	full	crates/converter/src/esm/exporter.rs:628	landscape_textures.texture_set_id	First u32.
+LTEX	MNAM	full	crates/converter/src/esm/exporter.rs:628	landscape_textures.material_type	First u32.
+LTEX	HNAM	partial	crates/converter/src/esm/exporter.rs:620	landscape_textures.friction, .restitution	Byte 0 becomes friction and byte 1 restitution, each widened u8 to f32 (0x1E reads 30.0, not a denormal). Bytes past 2 are not read.
+LTEX	GNAM	partial	crates/converter/src/esm/exporter.rs:636	landscape_texture_grasses.gras_id	Every GNAM occurrence of the record is walked. Only a payload of exactly 4 bytes is accepted and a zero FormID is skipped; a record with no GNAM deletes its grass list.
+LGTM	DATA	partial	crates/converter/src/esm/exporter.rs:739	space_lighting columns for interior cells	parse_lighting (lighting.rs:149) reads 14 fields at offsets 0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x48, 0x4C, 0x50, 0x54. Offsets 0x28..0x48 are never read. Under 40 bytes returns None. The template's own EDID is not read.
+CLMT	WLST	partial	crates/converter/src/esm/lighting.rs:258	Climate.weathers; only the first entry is published	Every WLST occurrence: u32 weather 0..4, u32 chance 4..8, u32 global 8..12 (both trailing fields default to 0 when truncated). Climate::first_weather (lighting.rs:247) then keeps only the first entry with a non-zero chance (or the first entry), so the remaining entries are decoded and dropped.
+CLMT	EDID	full	crates/converter/src/esm/lighting.rs:275	-	Parsed into Climate.editor_id by the editor_id helper (lighting.rs:124, the line that finds EDID) and never published by export_space_lighting.
+WTHR	NAM0	partial	crates/converter/src/esm/lighting.rs:313	space_lighting.ambient, .directional, .sky_upper, .sky_fog, .sky_lower, .sun	One 4-byte colour per 16-byte group, at group*16 + 4 - the "day" slot of each group. Only groups 0, 1, 3, 4, 5, 7 and 12 are then used (lighting.rs:55-61); the other three colours of every group, and every group past the ones the record holds, are not read.
+WTHR	FNAM	partial	crates/converter/src/esm/lighting.rs:319	space_lighting.fog_near, .fog_far, .fog_power	Eight f32 at 0, 4, 8, 0x0C, 0x10, 0x14, 0x18, 0x1C; needs at least 32 bytes. day_max (0x18) and night_max (0x1C) are decoded but never published; a short FNAM leaves all three fog columns NULL.
+WTHR	EDID	full	crates/converter/src/esm/lighting.rs:336	-	Parsed into Weather.editor_id by the same editor_id helper (lighting.rs:124) and never published.
+CELL	XCLL	partial	crates/converter/src/esm/lighting.rs:174	space_lighting (the interior columns off resolve_lighting)	parse_lighting (lighting.rs:149), same 14 fields as LGTM DATA. Also the only source of the eleven inherit flags at 0x58 (lighting.rs:190); a cell whose XCLL is shorter than 92 bytes inherits nothing.
+CELL	LTMP	full	crates/converter/src/esm/exporter.rs:773	space_lighting.template_id	Interior cells only; the referenced LGTM may be absent, in which case the cell's own XCLL stands.
+CELL	DATA	partial	crates/converter/src/esm/exporter.rs:763	space_lighting.is_interior	Only bit 0x01 of byte 0, read to tell an interior cell from an exterior one. The whole DATA also reaches cells.data as raw bytes via exporter.rs:377.
+WRLD	CNAM	full	crates/converter/src/esm/exporter.rs:798	space_lighting.climate_id	First u32; the referenced climate must be in the merged set for a weather_id to follow.
+WRLD	LTMP	full	crates/converter/src/esm/exporter.rs:799	space_lighting.template_id	First u32; used as the fallback when the climate resolves no weather.
+LAND	VHGT	full	crates/converter/src/esm/cell_cache.rs:17	CachedLand.heights	Two reads: cell_cache.rs:21 validates the f32 offset at 0..4 is finite, cell_cache.rs:177 decode_vhgt turns the offset and the 1089 i8 deltas at 4.. into absolute heights, 8 units per step. Needs at least 4 + 1089 bytes; an absent VHGT yields all-zero heights, a short one is rejected.
+LAND	VNML	full	crates/converter/src/esm/cell_cache.rs:37	CachedLand.normals	decode_normals (cell_cache.rs:203): three i8 per vertex over 1089 vertices, kept as authored unless a triple is (0,0,0), in which case it is rebuilt from the height field. A wrong length is rejected.
+LAND	VCLR	raw	crates/converter/src/esm/cell_cache.rs:38	CachedLand.vertex_colors	Bytes kept as they are; only the length is checked (empty, or 1089 * 3).
+LAND	BTXT	partial	crates/converter/src/esm/cell_cache.rs:273	TerrainLayer.texture_form_id, .quadrant, .is_base	u32 texture FormID 0..4, quadrant byte 4, is_base = true. Byte 5 and the u16 at 6..8 are not read on this branch. Needs at least 8 bytes.
+LAND	ATXT	partial	crates/converter/src/esm/cell_cache.rs:273	TerrainLayer.texture_form_id, .quadrant, .layer	u32 FormID 0..4, quadrant byte 4, u16 layer index 6..8. Byte 5 is not read. Needs at least 8 bytes.
+LAND	VTXT	partial	crates/converter/src/esm/cell_cache.rs:300	TerrainLayer.weights[].vertex, .opacity	Per 8-byte entry: u16 vertex 0..2 and f32 opacity 4..8; the u16 at 2..4 is not read. Requires a preceding ATXT and a payload whose length is a multiple of 8.
+WRLD	DNAM	partial	crates/converter/src/esm/cell_cache.rs:130	CachedLand.water_height	Only the second f32, at 4..8 - the worldspace's default water height; the first f32 at 0..4 is not read. Needs at least 8 bytes. A height with |h| >= 1e5 is treated as "no water" (cell_cache.rs:167).
+WRLD	NAM2	full	crates/converter/src/esm/cell_cache.rs:136	CachedLand.water_type_form_id	First u32; the default water type for the worldspace's cells.
+CELL	XCLW	partial	crates/converter/src/esm/cell_cache.rs:145	CachedLand.water_height	First f32 only, needs 4 bytes. A height with |h| >= 1e7 is the FLT_MAX "no water" sentinel and stores NULL, falling back to the worldspace default.
+CELL	XCWT	full	crates/converter/src/esm/cell_cache.rs:156	CachedLand.water_type_form_id	First u32; falls back to the worldspace's NAM2.
+REFR	NAME	full	crates/converter/src/esm/rooms.rs:443	-	Base FormID, used only to test whether the reference is a room marker or a portal marker. Both are compared against local constants (ROOM_MARKER_BASE 0x1F, rooms.rs:16; PORTAL_MARKER_BASE 0x20, rooms.rs:18), not against anything read from the plugin.
+REFR	DATA	partial	crates/converter/src/esm/rooms.rs:409	room_bounds / room_portals position and rotation	First six f32 (position 0..3, rotation 3..6); anything past is dropped. A missing DATA means zeros (transform_of, rooms.rs:408).
+REFR	XPRM	partial	crates/converter/src/esm/rooms.rs:455	room_bounds.half_x, .half_y, .half_z	Room path: three f32 at 0, 4, 8, plus a u32 shape at 28 that must be 1 (box) or the marker is counted as skipped. Needs at least 32 bytes.
+REFR	XPRM	partial	crates/converter/src/esm/rooms.rs:522	room_portals.half_x, .half_z	Portal path, a different layout read from the same tag: f32 half_x at 0 and f32 half_z at 8 only. Needs at least 12 bytes.
+REFR	XRMR	partial	crates/converter/src/esm/rooms.rs:479	room_bounds.flags	Byte 1 as the low 8 bits and the u16 at 2..4 shifted into bits 8..24. Byte 0 is not read; needs at least 4 bytes.
+REFR	LNAM	full	crates/converter/src/esm/rooms.rs:496	room_bounds.lighting_template_id	Needs a payload of exactly 4 bytes; 0 stores NULL.
+REFR	INAM	full	crates/converter/src/esm/rooms.rs:497	room_bounds.image_space_id	Needs a payload of exactly 4 bytes; 0 stores NULL.
+REFR	XLRM	partial	crates/converter/src/esm/rooms.rs:500	room_links.linked_ref	Every XLRM occurrence, first u32 only, and only when the payload is exactly 4 bytes.
+REFR	XPOD	partial	crates/converter/src/esm/rooms.rs:540	room_portals.room_a, room_portals.room_b	Pairs of u32 (origin at pair*8, destination at pair*8+4) per xEdit. A length that is not a multiple of 8 counts a report field and the trailing bytes are dropped; a portal with no complete pair still gets one row with both sides NULL.
+*	XTEL	partial	crates/converter/src/esm/mod.rs:326	the same subrecord bytes, with the destination FormID rewritten	Load-order remap path for placed references (REFR|ACHR|ACRE|PGRE|PMIS, mod.rs:379). Only the 4-byte FormID at offset 0 is touched, and only when the payload is at least 4 bytes.
+CLMT	WLST	partial	crates/converter/src/esm/mod.rs:330	the same subrecord bytes, with the weather FormID rewritten	Remap path. The FormID is at offset 0; the chance and global that follow are left as they are.
+STAT	DNAM	partial	crates/converter/src/esm/mod.rs:334	the same subrecord bytes, with the MATO FormID rewritten	Remap path. The FormID sits at offset 4, so a DNAM shorter than 8 bytes has nothing to remap and is left alone.
+TES4|CLFM|AACT	*	skipped	crates/converter/src/esm/mod.rs:341	-	No subrecord of a TES4, CLFM or AACT is ever rewritten as a FormID, whatever its tag. The comment (mod.rs:304) names the reason: CNAM and SNAM on these types hold strings or RGBA colour structs, not FormIDs.
+TREE	CNAM	skipped	crates/converter/src/esm/mod.rs:342	-	Never rewritten: on TREE the tag holds trunk flexibility floats (48 bytes), not a FormID.
+TREE	SNAM|PFIG	full	crates/converter/src/esm/mod.rs:343	the same subrecord bytes, FormID rewritten	Remap path, 4-byte payloads only.
+LTEX	TNAM|GNAM|MNAM	full	crates/converter/src/esm/mod.rs:344	the same subrecord bytes, FormID rewritten	Remap path, 4-byte payloads only.
+CELL	XCWT	full	crates/converter/src/esm/mod.rs:345	the same subrecord bytes, FormID rewritten	Remap path, 4-byte payloads only.
+WRLD	NAM2|NAM3	full	crates/converter/src/esm/mod.rs:346	the same subrecord bytes, FormID rewritten	Remap path, 4-byte payloads only.
+WRLD	WNAM|CNAM|RNAM|TNAM	full	crates/converter/src/esm/mod.rs:347	the same subrecord bytes, FormID rewritten	Remap path, 4-byte payloads only.
+CELL	XOWN|XGLB|XEZN|XLCN|XLRL	full	crates/converter/src/esm/mod.rs:348	the same subrecord bytes, FormID rewritten	Remap path, 4-byte payloads only.
+CELL|WRLD	LTMP	full	crates/converter/src/esm/mod.rs:350	the same subrecord bytes, FormID rewritten	Remap path, 4-byte payloads only.
+NPC_	RNAM|CNAM|INAM	full	crates/converter/src/esm/mod.rs:351	the same subrecord bytes, FormID rewritten	Remap path, 4-byte payloads only.
+RACE	WKMV|RNMV	full	crates/converter/src/esm/mod.rs:352	the same subrecord bytes, FormID rewritten	Remap path, 4-byte payloads only.
+NPC_	SNAM	full	crates/converter/src/esm/mod.rs:353	the same subrecord bytes, FormID rewritten	Remap path, 4 bytes or longer.
+REFR|ACHR|ACRE|PGRE|PMIS|PHZD|PARW|PBAR|PBEA|PCON|PFLA	NAME|XOWN|XGLB|XEZN|XLCN|XLRL	full	crates/converter/src/esm/mod.rs:355	the same subrecord bytes, FormID rewritten	Remap path, 4-byte payloads only.
+*	XOWN|XGLB|XEZN|XLCN|XLRL	full	crates/converter/src/esm/mod.rs:359	the same subrecord bytes, FormID rewritten	Remap path for every other record type, 4-byte payloads only.
+REFR|ACHR|ACRE|PGRE|PMIS|PHZD|PARW|PBAR|PBEA|PCON|PFLA	XTEL	partial	crates/converter/src/esm/mod.rs:396	the same subrecord bytes, FormID rewritten	form_id_layout remap path (mod.rs:376): a 32-byte payload with the FormID at 0. A payload of any other length is dropped from the record entirely (mod.rs:571) and counted in a warning.
+REFR|ACHR|ACRE|PGRE|PMIS|PHZD|PARW|PBAR|PBEA|PCON|PFLA	XESP	full	crates/converter/src/esm/mod.rs:398	the same subrecord bytes, FormID rewritten	form_id_layout: an 8-byte payload with the FormID at 0; the flags and unused bytes follow.
+REFR|ACHR|ACRE|PGRE|PMIS|PHZD|PARW|PBAR|PBEA|PCON|PFLA	XLKR	partial	crates/converter/src/esm/mod.rs:401	the same subrecord bytes, FormIDs rewritten	form_id_layout: either 8 bytes with FormIDs at 0 and 4, or the older 4-byte form with one FormID at 0.
+REFR|ACHR|ACRE|PGRE|PMIS|PHZD|PARW|PBAR|PBEA|PCON|PFLA	XNDP	full	crates/converter/src/esm/mod.rs:403	the same subrecord bytes, FormID rewritten	form_id_layout: an 8-byte payload with the navmesh FormID at 0.
+REFR|ACHR|ACRE|PGRE|PMIS|PHZD|PARW|PBAR|PBEA|PCON|PFLA	XEMI	full	crates/converter/src/esm/mod.rs:405	the same subrecord bytes, FormID rewritten	form_id_layout: a 4-byte payload.
+REFR|ACHR|ACRE|PGRE|PMIS|PHZD|PARW|PBAR|PBEA|PCON|PFLA	XAPR	partial	crates/converter/src/esm/mod.rs:407	the same subrecord bytes, FormID rewritten	form_id_layout: an 8-byte payload with the activate-parent FormID at 0 and an f32 delay after it. Repeated per parent; only malformed occurrences are removed.
+REFR|ACHR|ACRE|PGRE|PMIS|PHZD|PARW|PBAR|PBEA|PCON|PFLA	XLRT	full	crates/converter/src/esm/mod.rs:409	the same subrecord bytes, FormIDs rewritten	form_id_layout: an array of 4-byte FormIDs, one per entry.
+ACHR	XHOR	full	crates/converter/src/esm/mod.rs:411	the same subrecord bytes, FormID rewritten	form_id_layout: a 4-byte payload.
+CELL|WRLD	LTMP	full	crates/converter/src/esm/mod.rs:413	the same subrecord bytes, FormID rewritten	form_id_layout: a 4-byte payload. Same tag the exporter reads, different path.
+CELL	XCIM|XCMO|XCAS|XCCM	full	crates/converter/src/esm/mod.rs:416	the same subrecord bytes, FormID rewritten	form_id_layout: a 4-byte payload each. A record with none of these is unaffected; the exporter never reads them, so nothing but the remap looks at them.
+REFR	XPOD	full	crates/converter/src/esm/mod.rs:424	the same subrecord bytes, FormIDs rewritten	form_id_layout: an array of 4-byte FormIDs, so both halves of each origin/destination pair. A length that is not a multiple of 4 drops the whole subrecord.
+REFR	XLRM|LNAM|INAM	full	crates/converter/src/esm/mod.rs:425	the same subrecord bytes, FormID rewritten	form_id_layout: a 4-byte payload each.
+CELL	XCLR	full	crates/converter/src/esm/mod.rs:427	the same subrecord bytes, FormIDs rewritten	form_id_layout: an array of 4-byte FormIDs (the regions a cell belongs to). Nothing else in the converter reads XCLR.
+GRAS	MODS	partial	crates/converter/src/esm/mod.rs:494	the same subrecord bytes, the texture FormID rewritten	u32 count 0..4, then per entry a u32 name length, the name, a u32 texture FormID (rewritten) and a u32 3D index. Trailing bytes are an error.
+LAND	BTXT|ATXT	partial	crates/converter/src/esm/mod.rs:518	the same subrecord bytes, the texture FormID rewritten	Needs exactly 8 bytes: the FormID at 0..4 is remapped, the quadrant and layer bytes are left alone.
+LAND	VTEX	full	crates/converter/src/esm/mod.rs:524	the same subrecord bytes, FormIDs rewritten	An array of 4-byte LTEX FormIDs; the length must be a multiple of 4.
+*	VMAD	partial	crates/converter/src/esm/mod.rs:534	the same subrecord bytes, object-property FormIDs rewritten	remap_primary_form_ids (vmad.rs:591) walks the script properties and rewrites only the object-property FormIDs, leaving fragments untouched. Parse failures abort the conversion.
+*	EDID	full	crates/converter/src/esm/mod.rs:215	GameSettingIdentities.canonical_ids key	Read for every GMST record before merging to key settings by name rather than by FormID; lower-cased. Not read for any other record type on this path.
+AACT	EDID	full	crates/converter/src/esm/records/aact.rs:35	AactRecord.editor_id	Record extractor that no conversion path calls; only a unit test could.
+AACT	CNAM	partial	crates/converter/src/esm/records/aact.rs:37	AactRecord.color	Same unused extractor. Bytes 0, 1, 2 as red, green, blue; needs at least 3 bytes.
+ACHR	NAME	full	crates/converter/src/esm/records/achr.rs:124	AchrRecord.base_npc	Unused extractor (parse returns None when NAME is absent). The live REFR path is exporter.rs:1072.
+ACHR	EDID	full	crates/converter/src/esm/records/achr.rs:125	AchrRecord.editor_id	Same unused extractor.
+ACHR	XEZN	full	crates/converter/src/esm/records/achr.rs:126	AchrRecord.encounter_zone	Same unused extractor.
+ACHR	XPRD	partial	crates/converter/src/esm/records/achr.rs:127	AchrRecord.patrol_idle	Same unused extractor; first f32 of the vector only.
+ACHR	PDTO	partial	crates/converter/src/esm/records/achr.rs:129	AchrRecord.topic_data	Same unused extractor. u32 topic type 0..4 and four data bytes 4..8; needs at least 8.
+ACHR	XRGD	raw	crates/converter/src/esm/records/achr.rs:135	AchrRecord.ragdoll_data	Same unused extractor; the payload is copied as bytes and never decoded.
+ACHR	XLCM	full	crates/converter/src/esm/records/achr.rs:136	AchrRecord.level_modifier	Same unused extractor; i32 read as u32.
+ACHR	XAPD	partial	crates/converter/src/esm/records/achr.rs:137	AchrRecord.activate_parent_flags	Same unused extractor; first byte only.
+ACHR	XAPR	partial	crates/converter/src/esm/records/achr.rs:139	AchrRecord.activate_parent	Same unused extractor. u32 parent 0..4 and f32 delay 4..8; needs at least 8 bytes.
+ACHR	XLRT	full	crates/converter/src/esm/records/achr.rs:148	AchrRecord.location_ref_types	Same unused extractor; every XLRT occurrence, first u32 each, needs at least 4 bytes.
+ACHR	XHOR	full	crates/converter/src/esm/records/achr.rs:153	AchrRecord.horse_id	Same unused extractor.
+ACHR	XESP	partial	crates/converter/src/esm/records/achr.rs:155	AchrRecord.enable_parent	Same unused extractor. u32 parent 0..4 and u32 flags 4..8; needs at least 8 bytes.
+ACHR	XOWN	full	crates/converter/src/esm/records/achr.rs:162	AchrRecord.owner	Same unused extractor.
+ACHR	XLCN	partial	crates/converter/src/esm/records/achr.rs:164	AchrRecord.location	Same unused extractor, with XLRL as fallback.
+ACHR	XLKR	partial	crates/converter/src/esm/records/achr.rs:167	AchrRecord.location_route	Same unused extractor. u32 keyword 0..4 and u32 target 4..8; needs at least 8 bytes.
+ACHR	XIS2	presence	crates/converter/src/esm/records/achr.rs:174	AchrRecord.ignored_by_sandbox	Same unused extractor; only whether the subrecord exists, its bytes are not read.
+ACHR	XSCL	partial	crates/converter/src/esm/records/achr.rs:175	AchrRecord.scale	Same unused extractor; first f32 only.
+ACHR	DATA	partial	crates/converter/src/esm/records/achr.rs:177	AchrRecord.transform	Same unused extractor; six f32, needs at least 6 values.
+CLFM	EDID	full	crates/converter/src/esm/records/clfm.rs:58	ClfmRecord.editor_id	Unused extractor; no conversion path calls it.
+CLFM	FULL	full	crates/converter/src/esm/records/clfm.rs:59	ClfmRecord.full_name	Same unused extractor.
+CLFM	CNAM	partial	crates/converter/src/esm/records/clfm.rs:61	ClfmRecord.color	Same unused extractor. Red, green, blue at bytes 0, 1, 2 and an unused byte 3; needs at least 4.
+CLFM	FNAM	full	crates/converter/src/esm/records/clfm.rs:69	ClfmRecord.color_flags	Same unused extractor; i32 read as u32, bit 0 (flag 0x1) means playable.
+TES4	HEDR	partial	crates/converter/src/esm/records/tes4.rs:72	Tes4Record.header	Unused extractor. f32 version 0..4, u32 num records 4..8, u32 next object id 8..12; needs at least 12 bytes and the remaining HEDR fields are not read.
+TES4	CNAM	full	crates/converter/src/esm/records/tes4.rs:88	Tes4Record.author	Same unused extractor; the same tag that holds a FormID on many other record types holds the author string here.
+TES4	SNAM	full	crates/converter/src/esm/records/tes4.rs:89	Tes4Record.description	Same unused extractor.
+TES4	MAST	full	crates/converter/src/esm/records/tes4.rs:97	Tes4Record.masters[].name	Same unused extractor; each MAST starts a master entry, and the DATA that follows it supplies its size.
+TES4	DATA	partial	crates/converter/src/esm/records/tes4.rs:104	Tes4Record.masters[].data_size	Same unused extractor. u64 at 0..8 (0 when shorter) belonging to the master named by the preceding MAST. Not to be confused with the 4-byte DATA of other record types.
+TES4	ONAM	partial	crates/converter/src/esm/records/tes4.rs:127	Tes4Record.overrides	Same unused extractor; an array of 4-byte FormIDs, one per complete chunk.
+TES4	INTV	full	crates/converter/src/esm/records/tes4.rs:133	Tes4Record.num_taggables	Same unused extractor; i32 read as u32.
+TES4	INCC	full	crates/converter/src/esm/records/tes4.rs:134	Tes4Record.master_count	Same unused extractor; i32 read as u32.
+TREE	EDID	full	crates/converter/src/esm/records/tree.rs:44	TreeRecord.editor_id	Unused extractor; no conversion path calls it.
+TREE	OBND	full	crates/converter/src/esm/records/tree.rs:45	TreeRecord.object_bounds	Same unused extractor, through the get_obnd helper at extractors.rs:169.
+TREE	MODL	partial	crates/converter/src/esm/records/tree.rs:47	TreeRecord.model	Same unused extractor, through get_model (extractors.rs:276); the MODL string plus the optional MODT and MODS of the same triplet.
+TREE	PFIG	full	crates/converter/src/esm/records/tree.rs:48	TreeRecord.result_item	Same unused extractor.
+TREE	SNAM	full	crates/converter/src/esm/records/tree.rs:49	TreeRecord.use_sound	Same unused extractor.
+TREE	PFPC	partial	crates/converter/src/esm/records/tree.rs:51	TreeRecord.percent_chance	Same unused extractor; four bytes 0..4, needs at least 4.
+TREE	FULL	full	crates/converter/src/esm/records/tree.rs:55	TreeRecord.name	Same unused extractor.
+TREE	CNAM	partial	crates/converter/src/esm/records/tree.rs:56	TreeRecord.data	Same unused extractor. Twelve f32 at 0..48: trunk flexibility at 0, branch flexibility at 4, eight unnamed floats at 8..40, leaf amplitude at 40 and leaf frequency at 44. Needs at least 48 bytes.
+IMGS	EDID	full	crates/converter/src/esm/imagespace.rs:79	imagespace.editor_id	
+IMGS	HNAM	full	crates/converter/src/esm/imagespace.rs:98	imagespace.eye_adapt_speed, .bloom_blur_radius, .bloom_threshold, .bloom_scale, .receive_bloom_threshold, .white, .sunlight_scale, .sky_scale, .eye_adapt_strength	Nine f32 at 0..36; a missing or non-finite float is NULL.
+IMGS	CNAM	full	crates/converter/src/esm/imagespace.rs:98	imagespace.saturation, .brightness, .contrast	Three f32 at 0..12.
+IMGS	TNAM	full	crates/converter/src/esm/imagespace.rs:98	imagespace.tint_amount, .tint_r, .tint_g, .tint_b	Four f32 at 0..16; colour 0..1.
+IMGS	DNAM	full	crates/converter/src/esm/imagespace.rs:147	imagespace.dof_strength, .dof_distance, .dof_range, .dof_blur_radius, .dof_sky, .dof_blur_raw	16 bytes: three f32, an unused word, then a packed word (upper half of an f32: 2 + 8 * radius with sky, 6 + 8 * radius without; decode_dof_blur, imagespace.rs:69). 12-byte form: floats only. Absent (17 vanilla records): all NULL.
+IMGS	ENAM	full	crates/converter/src/esm/imagespace.rs:100	imagespace.* (same columns), .is_legacy, .legacy_enam	Legacy 56-byte form, 14 f32: HNAM fields without White and Eye Adapt Strength, then CNAM, then TNAM. Only DefaultImageSpaceInterior and Exterior. A record with a current-form subrecord uses that instead.
+VOLI	EDID	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.editor_id	
+VOLI	CNAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.intensity	One f32.
+VOLI	DNAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.custom_color_contribution	One f32.
+VOLI	ENAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.color_r	One f32.
+VOLI	FNAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.color_g	One f32.
+VOLI	GNAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.color_b	One f32.
+VOLI	HNAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.density_contribution	One f32.
+VOLI	INAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.density_size	One f32.
+VOLI	JNAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.density_wind_speed	One f32.
+VOLI	KNAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.density_falling_speed	One f32.
+VOLI	LNAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.phase_function_contribution	One f32.
+VOLI	MNAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.phase_function_scattering	One f32.
+VOLI	NNAM	full	crates/converter/src/esm/imagespace.rs:196	volumetric_lighting.sampling_repartition_range_factor	One f32.
+WTHR	EDID	full	crates/converter/src/esm/weather.rs:130	weather.editor_id	
+WTHR	NAM0	full	crates/converter/src/esm/weather.rs:223	weather_color.*	17, 14 or 13 colour types x 4 times x RGBA bytes; a short form has no rows for missing types.
+WTHR	FNAM	full	crates/converter/src/esm/weather.rs:136	weather.fog_day_near .. fog_night_max	Eight f32: day near, day far, night near, night far, day power, night power, day max, night max.
+WTHR	DATA	full	crates/converter/src/esm/weather.rs:137	weather.wind_speed .. wind_direction_range	19 bytes stored raw; bytes 1 and 2 (unused in vanilla) not stored; shorter records leave later fields NULL.
+WTHR	IMSP	full	crates/converter/src/esm/weather.rs:196	weather.imagespace_sunrise, _day, _sunset, _night	Four FormIDs, remapped; 0 is NULL.
+WTHR	HNAM	full	crates/converter/src/esm/weather.rs:196	weather.volumetric_sunrise, _day, _sunset, _night	Four FormIDs, remapped; 0 is NULL.
+WTHR	MNAM	full	crates/converter/src/esm/weather.rs:130	weather.precipitation_id	FormID, remapped; 0 is NULL.
+WTHR	NNAM	full	crates/converter/src/esm/weather.rs:130	weather.visual_effect_id	FormID, remapped; 0 is NULL.
+WTHR	SNAM	full	crates/converter/src/esm/weather.rs:233	weather_sound.sound_id, .kind	8 bytes per subrecord: sound FormID, u32 kind; repeated, stored order.
+WTHR	DALC	full	crates/converter/src/esm/weather.rs:244	weather_ambient_cube.*, weather_dalc.*	One per time of day: six tints, specular, Fresnel; the 24-byte form leaves specular and Fresnel NULL.
+CLMT	EDID	full	crates/converter/src/esm/weather.rs:268	climate.editor_id	
+CLMT	TNAM	full	crates/converter/src/esm/weather.rs:276	climate.sunrise_begin .. moons	Six raw bytes.
+CLMT	WLST	full	crates/converter/src/esm/weather.rs:297	climate_weather.weather_id, .chance, .global_id	12-byte entries in stored order; weather and global remapped.
+CLMT	FNAM	full	crates/converter/src/esm/weather.rs:268	climate.sun_texture	
+CLMT	GNAM	full	crates/converter/src/esm/weather.rs:268	climate.glare_texture	
+CLMT	MODL	full	crates/converter/src/esm/weather.rs:268	climate.night_sky_model	
+REGN	EDID	full	crates/converter/src/esm/region.rs:107	region.editor_id	
+REGN	RCLR	full	crates/converter/src/esm/region.rs:114	region.map_color_r, _g, _b	
+REGN	WNAM	full	crates/converter/src/esm/region.rs:121	region.worldspace_id	Remapped; 0 is NULL.
+REGN	RPLI	full	crates/converter/src/esm/region.rs:135	region_area.edge_falloff	One per polygon.
+REGN	RPLD	full	crates/converter/src/esm/region.rs:142	region_point.x, .y	Eight bytes per point, stored order.
+REGN	RDAT	full	crates/converter/src/esm/region.rs:161	region_data.data_type, .flags, .priority	Opens a data section; following entries belong to it until the next RDAT.
+REGN	RDWT	full	crates/converter/src/esm/region.rs:175	region_weather.*	12-byte entries; weather and global remapped.
+REGN	RDSA	full	crates/converter/src/esm/region.rs:190	region_sound.*	12-byte entries; sound remapped.
+REGN	RDOT	full	crates/converter/src/esm/region.rs:205	region_object.object_id, .data	52-byte entries, object remapped, rest raw; empty in vanilla.
+REGN	RDGS	full	crates/converter/src/esm/region.rs:213	region_grass.grass_id, .unknown	Eight-byte entries; absent from vanilla.
+REGN	RDMP	full	crates/converter/src/esm/region.rs:221	region_data.map_name_ref	String table reference, raw.
+REGN	RDMO	full	crates/converter/src/esm/region.rs:227	region_data.music_id	FormID, remapped.
+CELL	XCLR	full	crates/converter/src/esm/region.rs:241	cell_region (source 0)	Region list, remapped.
+CELL	XCCM	full	crates/converter/src/esm/region.rs:241	cell_region (source 1)	Region an interior takes its sky and weather from, remapped.

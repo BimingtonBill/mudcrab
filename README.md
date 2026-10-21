@@ -187,6 +187,11 @@ reconstructs missing or damaged files; archive ordering still determines
 which override wins. Containing directories are also flushed on Unix;
 portable directory flushing remains a Windows limitation.
 
+4. **Walk the demo (optional):** convert your own Skyrim SE install with
+   `tools/demo/setup-demo.ps1` and walk from the Alftand entrance down to Blackreach with no
+   loading screens. See **[`docs/demo/README.md`](docs/demo/README.md)** for prerequisites, the
+   build → convert → run path, controls and troubleshooting.
+
 ---
 
 ## 📚 Technical Specifications (`docs/specs/`)

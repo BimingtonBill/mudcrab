@@ -45,6 +45,16 @@ The engine, `world-inspect` and launcher accept world schemas **3 through 9**, u
 support schemas **15 through 28**. Legacy worlds render full detail without
 LOD; an advertised LOD package requires the current database contract.
 
+The database stamps its own version in `schema_info` (`shared::WORLD_DATABASE_SCHEMA_VERSION`).
+On main it is **9** (schema 6 added the terrain-chunk LOD tables; 9 corrects the TXST roles and
+stores XESP flags as one byte). The `dev` tree writes `main`'s numbers (world database 9,
+converter 28) and takes the ranges above; what it adds beyond `main` is listed as
+extensions in the manifest. Until 2026-10-16 it numbered its output privately
+(`100_000 + main_version * 100 + revision`, e.g. world database 100_701 and converter 102_401
+in `SkyrimConverted-portal-rooms-terrain`); the converter still reads such a manifest as a
+producer it cannot reuse meshes from (`cache::legacy_dev_schema_to_main`), and the engine
+refuses it as a newer schema.
+
 Converter producer 26 also corrects the texture encodings chosen from those
 columns. Producer 27 adds sphere, multi-sphere and cylinder collision shapes
 and more physical layers to the GLB collision data; the database stays at

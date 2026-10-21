@@ -1,0 +1,28 @@
+# Goal
+Fix the land-texture array builder (`crates/converter/src/terrain_arrays.rs`) against the findings of two reviews, so it never lowers quality, handles every converter output format, follows the KTX2 spec and stays within bounded memory. Phase 1 track, #186 (terrain merge).
+
+# Context
+- Worktree: `C:/Modding/Mudcrab/worktrees/p1-terrain-merge` (branch `phase1/terrain-merge`). The file was written by DeepSeek impl #895 and copied here uncommitted, together with `crates/converter/src/terrain_chunks.rs` (lead's; do not edit), `crates/converter/src/lib.rs` (both `pub mod` lines already in) and a one-constant change in `crates/shared/src/terrain_mesh.rs` (`DEFAULT_MAX_LAND_TEXTURE_ARRAY_LAYERS`, lead's; do not edit).
+- Agreed format: `C:/Modding/Mudcrab/mudcrab/local/research/terrain-merge/format-proposal.md` (the "v3" section governs). Original brief: `C:/Modding/Mudcrab/mudcrab/tasks/deepseek/impl-895-p1-land-texture-arrays.md`.
+- Reviews: `C:/Modding/Mudcrab/mudcrab/local/agents/runs/review-897-p1-terrain-arrays-chunks.1/report.md` (DeepSeek) and `C:/Modding/Mudcrab/mudcrab/local/agents/runs/review-897.1-p1-terrain-arrays-chunks-sol.1/report.md` (Sol). Read both, section A.
+
+# Fixes (decided by the lead)
+1. **Mips, no loss:** every array in a class has the full mip chain for its size (`max_mip_levels(size, size, 1)`). A source's authored levels are always block-copied as they are; only levels the source lacks are generated (decode the smallest authored level, downscale, encode in the class's format with the existing encoders; intel_tex_2 has BC1/BC3/BC5/BC7). Remove the majority-depth vote. Report each texture whose tail was generated (how many levels).
+2. **Every converter output format is accepted:** a UASTC source (vkFormat 0, written by `texture.rs` for L8, 16-bit and palette DDS) is transcoded to BC7 with the converter's existing basis-universal transcoder and placed in the BC7 class of its usage, reported as "re-encoded: UASTC -> BC7". Any other source the builder cannot read is skipped by name in `ArrayReport` with the reason (its cells then fall back), never an error that stops the conversion. Size-limit errors (above 4096 without the downscale option, above the layer limit) stay errors.
+3. **KTX2 conformance:** per the KTX2 spec (sections 3.9.7 and 3.13, https://registry.khronos.org/KTX/specs/2.0/ktxspec.v2.html), level data is stored in the file from the smallest mip to the largest, while the level index keeps largest-first entries. Write the arrays that way. Add a test that reads the level index and checks the offsets increase from the last level to level 0. (The converter's other KTX2 writer has the same issue; the lead reports that separately; do not change texture.rs.)
+4. **Bounded memory:** do not hold a whole class uncompressed. Stream each member level into its level's output as it is appended (for example one zstd stream encoder per level, or per-level spill files), so memory is bounded by about one source texture plus the compressed output. Say in the report what the peak is for a 2048-layer 4096 class.
+5. **Atomic publication:** write the arrays and `land-textures.json` into a staging folder next to the target (`terrain.staging-<pid>/` under the output root), and replace the target files only after all are written, file by file with rename-over (no window where the table is missing: write the table last and rename it over the old one). Document that the conversion's own staging is the outer transaction.
+6. **Shared constants:** use `shared::terrain_mesh::LAND_TEXTURE_TABLE_PATH` and `DEFAULT_MAX_LAND_TEXTURE_ARRAY_LAYERS` instead of local literals.
+7. **Tests that discriminate:** a mixed-depth class (one full chain, one short chain): the full one's levels are byte-identical copies, the short one gets generated levels; a UASTC source (build it with the converter's own UASTC path) lands in BC7 and decodes to roughly its source colours (not white); a resized source's decoded centre texel matches the source colour within a tolerance (catches "rebuild as white"); the size-class tests use a tiny class set through `ArrayOptions::size_classes` (if `LandTextureTable::validate` rejects non-production sizes, validate with production classes in production and test the tiny path without calling validate, and say so).
+
+# Checks (machine-wide build gate, AGENTS.md)
+Heavy cargo goes through the gate: `python C:/Users/Brannock/AppData/Local/mudcrab/build-gate/build_gate.py run -- cargo clippy --workspace --all-targets --all-features -- -D warnings` and `python C:/Users/Brannock/AppData/Local/mudcrab/build-gate/build_gate.py run -- cargo nextest run -p converter --all-targets -E "test(terrain_)"`, with `CARGO_TARGET_DIR=D:/Mudcrab/builds/p1-target`. `cargo fmt --all` runs directly. Before the first heavy command run `python C:/Users/Brannock/AppData/Local/mudcrab/build-gate/build_gate.py status`: if it lists any hold, do NOT build; finish the code and tests and report "written, unbuilt". If a gated command is refused by your permissions, stop and report; do not work around it.
+
+# Foundations check (state it)
+No shortcuts (no quality lowered without the user's option, nothing silently dropped), flexible (any mod list, any formats the converter writes), moddable. Say what shortcut, if any, remains.
+
+# Rules
+Edit only `crates/converter/src/terrain_arrays.rs`. Do not commit (the lead commits after review). Never git stash, rebase, amend or push. Foreground commands only.
+
+# Report (under 350 words)
+What changed per fix, test names and results (or "unbuilt"), the memory peak estimate, the foundations check, and anything left.

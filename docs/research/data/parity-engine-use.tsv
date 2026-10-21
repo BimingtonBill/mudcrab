@@ -1,0 +1,322 @@
+table	column	written_at	engine_use	engine_evidence	notes
+schema_info	version	crates/converter/src/esm/exporter.rs:99	consumed	crates/shared/src/world_assets.rs:11	gates the run: an unsupported schema refuses the database (engine/src/app.rs:1922 calls it via validate_runtime_assets).
+plugins	id	crates/converter/src/esm/exporter.rs:101	read_unused	crates/engine/src/physics.rs:135	join key only; its value picks the plugin name that labels the movement source in a debug log (physics.rs:328).
+plugins	name	crates/converter/src/esm/exporter.rs:101	read_unused	crates/engine/src/physics.rs:134	feeds the plugin label of DirectionalMovementSpeeds.source, read only by report_movement_tuning's debug! (physics.rs:328).
+plugins	priority	crates/converter/src/esm/exporter.rs:101	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "priority": no query selects it	the only hits are view_policy.rs's own priority field.
+plugins	checksum	crates/converter/src/esm/exporter.rs:101	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "checksum": no hit	not read anywhere outside the converter.
+records	form_id	crates/converter/src/esm/exporter.rs:104	consumed	crates/engine/src/world/database.rs:1341	join key b.form_id=r.base_form_id attaches the base record's type and (physics.rs:108) the RACE row.
+records	record_type	crates/converter/src/esm/exporter.rs:104	consumed	crates/engine/src/world/database.rs:1316	value used at streaming.rs:3427 (exempt_record_type), streaming.rs:5133 (static_proxy_eligible) and physics.rs:113.
+records	cell_id	crates/converter/src/esm/exporter.rs:104	not_read	searched crates/engine/src and crates/shared/src: the only records queries are database.rs:1341/pyhsics.rs:108	they select form_id and record_type only.
+records	worldspace_id	crates/converter/src/esm/exporter.rs:105	not_read	searched crates/engine/src and crates/shared/src: the only records queries are database.rs:1341/physics.rs:108	never selected.
+records	load_order	crates/converter/src/esm/exporter.rs:105	not_read	searched crates/engine/src and crates/shared/src: the only records queries are database.rs:1341/physics.rs:108	never selected.
+records	data	crates/converter/src/esm/exporter.rs:105	not_read	searched crates/engine/src and crates/shared/src for "ArchivedRecordData": no hit	the rkyv subrecord blob is never deserialized by the engine.
+worldspaces	id	crates/converter/src/esm/exporter.rs:110	consumed	crates/engine/src/world/database.rs:698	row key and join key (database.rs:998, lighting.rs:372).
+worldspaces	editor_id	crates/converter/src/esm/exporter.rs:110	consumed	crates/engine/src/world/database.rs:949	label of a door whose destination is a worldspace, drawn on the activation prompt.
+worldspaces	parent_world	crates/converter/src/esm/exporter.rs:110	consumed	crates/engine/src/world/lighting.rs:372	inherit_parent_worlds (lighting.rs:386) copies the parent's lighting row onto a child worldspace.
+worldspaces	flags	crates/converter/src/esm/exporter.rs:110	not_read	searched crates/engine/src and crates/shared/src for "FROM worldspaces" and "JOIN worldspaces": three queries	none selects flags.
+worldspaces	lod_origin_x	crates/converter/src/esm/exporter.rs:111	consumed	crates/engine/src/world/database.rs:698	builds LodOrigin (database.rs:708) used to place every distant chunk.
+worldspaces	lod_origin_y	crates/converter/src/esm/exporter.rs:111	consumed	crates/engine/src/world/database.rs:698	same as lod_origin_x.
+cells	id	crates/converter/src/esm/exporter.rs:114	consumed	crates/engine/src/world/database.rs:20	EXTERIOR_CELL_ID_SQL resolves a grid cell to this id, which keys the cell payload.
+cells	worldspace_id	crates/converter/src/esm/exporter.rs:114	consumed	crates/engine/src/world/database.rs:22	filters the cell by worldspace.
+cells	grid_x	crates/converter/src/esm/exporter.rs:114	consumed	crates/engine/src/world/database.rs:22	filters the cell by grid column.
+cells	grid_y	crates/converter/src/esm/exporter.rs:114	consumed	crates/engine/src/world/database.rs:22	filters the cell by grid row.
+cells	interior_name	crates/converter/src/esm/exporter.rs:115	consumed	crates/engine/src/world/database.rs:949	door destination label drawn on the prompt (door_label, database.rs:987).
+cells	flags	crates/converter/src/esm/exporter.rs:115	not_read	searched crates/engine/src and crates/shared/src for "FROM cells": four queries (database.rs:20, 998, portal_graph.rs:125, world-inspect.rs:294)	none selects cells.flags.
+cells	data	crates/converter/src/esm/exporter.rs:115	not_read	searched crates/engine/src and crates/shared/src for "FROM cells": four queries	none selects cells.data.
+"references"	id	crates/converter/src/esm/exporter.rs:119	consumed	crates/engine/src/world/database.rs:936	FormId component of the spawned reference (streaming.rs:3392) and door/rlink keys.
+"references"	cell_id	crates/converter/src/esm/exporter.rs:119	consumed	crates/engine/src/world/database.rs:936	CellRef component (streaming.rs:3393); the interior WHERE clause (database.rs:1416).
+"references"	worldspace_id	crates/converter/src/esm/exporter.rs:119	not_read	searched crates/engine/src and crates/shared/src for "r.worldspace_id" and "worldspace_id": no query on "references" selects it	its name appears only in test-fixture CREATE TABLE strings (streaming.rs:6989, transition.rs:3611).
+"references"	base_form_id	crates/converter/src/esm/exporter.rs:120	consumed	crates/engine/src/world/database.rs:936	snow material lookup (streaming.rs:3411), asset and record type (streaming.rs:3465-3466).
+"references"	is_exterior	crates/converter/src/esm/exporter.rs:120	not_read	searched crates/engine/src and crates/shared/src for "is_exterior": only test-fixture CREATE TABLE strings	match hit: portal.rs:6814, streaming.rs:6989, transition.rs:3611 (all fixtures).
+"references"	pos_x	crates/converter/src/esm/exporter.rs:121	consumed	crates/engine/src/world/database.rs:937	Transform position (streaming.rs:3367) and door distance tests.
+"references"	pos_y	crates/converter/src/esm/exporter.rs:121	consumed	crates/engine/src/world/database.rs:937	same as pos_x.
+"references"	pos_z	crates/converter/src/esm/exporter.rs:121	consumed	crates/engine/src/world/database.rs:937	same as pos_x.
+"references"	local_x	crates/converter/src/esm/exporter.rs:122	not_read	searched crates/engine/src and crates/shared/src for "local_x": only test-fixture CREATE TABLE strings	also matched streaming.rs:5608, which is a worldspace-local grid loop, not the column.
+"references"	local_y	crates/converter/src/esm/exporter.rs:122	not_read	searched crates/engine/src and crates/shared/src for "local_y": only test-fixture CREATE TABLE strings	never selected.
+"references"	rot_x	crates/converter/src/esm/exporter.rs:122	consumed	crates/engine/src/world/database.rs:937	Transform rotation (streaming.rs:3376).
+"references"	rot_y	crates/converter/src/esm/exporter.rs:122	consumed	crates/engine/src/world/database.rs:937	same as rot_x.
+"references"	rot_z	crates/converter/src/esm/exporter.rs:122	consumed	crates/engine/src/world/database.rs:937	same as rot_x; also door outward (doors.rs via doorway_placements).
+"references"	scale	crates/converter/src/esm/exporter.rs:123	consumed	crates/engine/src/world/database.rs:937	Transform scale (streaming.rs:3379).
+"references"	radius_override	crates/converter/src/esm/exporter.rs:124	consumed	crates/engine/src/world/database.rs:965	wins over the record radius in radius_of (lights.rs:322).
+"references"	header_flags	crates/converter/src/esm/exporter.rs:124	not_read	searched crates/engine/src and crates/shared/src for "header_flags": no hit	not selected by any query.
+"references"	enable_parent_id	crates/converter/src/esm/exporter.rs:125	not_read	searched crates/engine/src and crates/shared/src for "enable_parent": no hit	not selected by any query.
+"references"	enable_parent_flags	crates/converter/src/esm/exporter.rs:125	not_read	searched crates/engine/src and crates/shared/src for "enable_parent": no hit	not selected by any query.
+"references"	data	crates/converter/src/esm/exporter.rs:125	not_read	searched crates/engine/src and crates/shared/src for a reference query beyond REFERENCE_COLUMNS (database.rs:935-941)	only two reference queries exist (database.rs:1402, 1416) and neither selects data.
+exterior_spatial	id	crates/converter/src/esm/exporter.rs:129	consumed	crates/engine/src/world/database.rs:1402	rtree key joined to "references".id.
+exterior_spatial	minX	crates/converter/src/esm/exporter.rs:129	consumed	crates/engine/src/world/database.rs:1403	spatial filter for the cell's X range.
+exterior_spatial	maxX	crates/converter/src/esm/exporter.rs:129	not_read	searched crates/engine/src and crates/shared/src for "maxX": only test-fixture CREATE TABLE/INSERT strings	the two real queries filter on minX/minY only.
+exterior_spatial	minY	crates/converter/src/esm/exporter.rs:129	consumed	crates/engine/src/world/database.rs:1403	spatial filter for the cell's Y range.
+exterior_spatial	maxY	crates/converter/src/esm/exporter.rs:129	not_read	searched crates/engine/src and crates/shared/src for "maxY": only test-fixture CREATE TABLE/INSERT strings	not filtered on.
+exterior_spatial	minZ	crates/converter/src/esm/exporter.rs:129	not_read	searched crates/engine/src and crates/shared/src for "minZ": only test-fixture CREATE TABLE/INSERT strings	not filtered on.
+exterior_spatial	maxZ	crates/converter/src/esm/exporter.rs:129	not_read	searched crates/engine/src and crates/shared/src for "maxZ": only test-fixture CREATE TABLE/INSERT strings	not filtered on.
+exterior_spatial	cell_id	crates/converter/src/esm/exporter.rs:129	not_read	searched crates/engine/src and crates/shared/src for "x.cell_id": no hit	the queries take the cell from the grid params, not from the rtree.
+exterior_spatial	worldspace_id	crates/converter/src/esm/exporter.rs:129	consumed	crates/engine/src/world/database.rs:1403	filters the spatial query by worldspace.
+door_links	ref_id	crates/converter/src/esm/exporter.rs:132	consumed	crates/engine/src/world/database.rs:996	join to the door's own reference; the key of return_links (database.rs:1092).
+door_links	destination_ref_id	crates/converter/src/esm/exporter.rs:133	consumed	crates/engine/src/world/database.rs:947	destination door: destination_doorway (database.rs:1433) and the graph's destination (portal_graph.rs:144).
+door_links	pos_x	crates/converter/src/esm/exporter.rs:134	consumed	crates/engine/src/world/database.rs:948	arrival_position (database.rs:1469) the player is placed at on crossing.
+door_links	pos_y	crates/converter/src/esm/exporter.rs:134	consumed	crates/engine/src/world/database.rs:948	same as pos_x.
+door_links	pos_z	crates/converter/src/esm/exporter.rs:134	consumed	crates/engine/src/world/database.rs:948	same as pos_x.
+door_links	rot_x	crates/converter/src/esm/exporter.rs:135	consumed	crates/engine/src/world/database.rs:948	arrival_rotation (database.rs:1470).
+door_links	rot_y	crates/converter/src/esm/exporter.rs:135	consumed	crates/engine/src/world/database.rs:948	same as rot_x.
+door_links	rot_z	crates/converter/src/esm/exporter.rs:135	consumed	crates/engine/src/world/database.rs:948	same as rot_x; also the return link's facing (database.rs:1242).
+door_links	destination_cell_id	crates/converter/src/esm/exporter.rs:136	consumed	crates/engine/src/world/database.rs:947	which interior the door leads to (streaming.rs:3499) and the graph's destination space (portal_graph.rs:137).
+door_links	destination_worldspace_id	crates/converter/src/esm/exporter.rs:137	consumed	crates/engine/src/world/database.rs:947	exterior destination (streaming.rs:3506) and the graph's destination space (portal_graph.rs:136).
+land	cell_id	crates/converter/src/esm/exporter.rs:140	consumed	crates/engine/src/world/database.rs:21	JOIN and ORDER BY only: a cell that has terrain wins over a duplicate cell row.
+land	heightmap	crates/converter/src/esm/exporter.rs:140	not_read	searched crates/engine/src and crates/shared/src for "heightmap": no hit	terrain heights come from cell_cache.rkyv (world/cache.rs).
+land	vtex	crates/converter/src/esm/exporter.rs:140	not_read	searched crates/engine/src and crates/shared/src for "vtex": no hit	terrain layers come from cell_cache.rkyv.
+land	vclr	crates/converter/src/esm/exporter.rs:140	not_read	searched crates/engine/src and crates/shared/src for "vclr": no hit	vertex colours come from cell_cache.rkyv.
+land	normals	crates/converter/src/esm/exporter.rs:140	not_read	searched crates/engine/src and crates/shared/src for "FROM land": the only query is database.rs:21	it selects cell_id alone.
+statics	id	crates/converter/src/esm/exporter.rs:143	consumed	crates/engine/src/world/database.rs:936	join key s.id=r.base_form_id; the snow lookup keys on it (database.rs:1092, snow.rs:369).
+statics	editor_id	crates/converter/src/esm/exporter.rs:143	consumed	crates/engine/src/world/database.rs:975	AUTO_LOAD_COLUMN marks AutoLoadDoor* bases, which cross on contact instead of the E key (player.rs:1568).
+statics	model_path	crates/converter/src/esm/exporter.rs:143	consumed	crates/engine/src/world/database.rs:936	which mesh asset is loaded (streaming.rs:3449); also the auto-load marker rule (database.rs:976).
+statics	flags	crates/converter/src/esm/exporter.rs:143	not_read	searched crates/engine/src and crates/shared/src for "s.flags" and for statics queries: database.rs:936-941, 1179, snow.rs:364	no query selects statics.flags.
+statics	bounds_min_x	crates/converter/src/esm/exporter.rs:144	consumed	crates/engine/src/world/database.rs:938	model bounds box, culling and the doorway box (streaming.rs:3382).
+statics	bounds_min_y	crates/converter/src/esm/exporter.rs:144	consumed	crates/engine/src/world/database.rs:938	same as bounds_min_x.
+statics	bounds_min_z	crates/converter/src/esm/exporter.rs:144	consumed	crates/engine/src/world/database.rs:938	same as bounds_min_x.
+statics	bounds_max_x	crates/converter/src/esm/exporter.rs:145	consumed	crates/engine/src/world/database.rs:939	same as bounds_min_x.
+statics	bounds_max_y	crates/converter/src/esm/exporter.rs:145	consumed	crates/engine/src/world/database.rs:939	same as bounds_min_x.
+statics	bounds_max_z	crates/converter/src/esm/exporter.rs:145	consumed	crates/engine/src/world/database.rs:939	same as bounds_min_x.
+statics	bounds_valid	crates/converter/src/esm/exporter.rs:147	consumed	crates/engine/src/world/database.rs:940	false disables the bounds box (streaming.rs:3380) and the doorway (database.rs:1203).
+statics	material_object	crates/converter/src/esm/exporter.rs:148	consumed	crates/engine/src/snow.rs:364	which MATO a static's snow uses (coverage_for, streaming.rs:3411).
+statics	material_max_angle	crates/converter/src/esm/exporter.rs:149	consumed	crates/engine/src/snow.rs:364	the snow cone's half angle for that static.
+matos	id	crates/converter/src/esm/exporter.rs:153	consumed	crates/engine/src/snow.rs:328	key of the material map the statics resolve against.
+matos	editor_id	crates/converter/src/esm/exporter.rs:153	not_read	searched crates/engine/src and crates/shared/src for "FROM matos": one query (snow.rs:328)	that query's column list does not include editor_id.
+matos	falloff_scale	crates/converter/src/esm/exporter.rs:154	consumed	crates/engine/src/snow.rs:328	fills DirectionalMaterial.falloff_scale, which the snow shader reads.
+matos	falloff_bias	crates/converter/src/esm/exporter.rs:154	consumed	crates/engine/src/snow.rs:328	fills DirectionalMaterial.falloff_bias.
+matos	noise_uv_scale	crates/converter/src/esm/exporter.rs:155	not_read	searched crates/engine/src and crates/shared/src for "noise_uv_scale": no hit	not in the snow.rs query (snow.rs:328-329).
+matos	material_uv_scale	crates/converter/src/esm/exporter.rs:155	not_read	searched crates/engine/src and crates/shared/src for "material_uv_scale": no hit	not in the snow.rs query.
+matos	dir_proj_x	crates/converter/src/esm/exporter.rs:156	consumed	crates/engine/src/snow.rs:328	fills dir_proj, converted to engine axes (snow.rs:339).
+matos	dir_proj_y	crates/converter/src/esm/exporter.rs:156	consumed	crates/engine/src/snow.rs:328	same as dir_proj_x.
+matos	dir_proj_z	crates/converter/src/esm/exporter.rs:156	consumed	crates/engine/src/snow.rs:328	same as dir_proj_x.
+matos	normal_dampener	crates/converter/src/esm/exporter.rs:157	consumed	crates/engine/src/snow.rs:328	fills DirectionalMaterial.normal_dampener, read by the snow shader.
+matos	single_pass_color	crates/converter/src/esm/exporter.rs:158	consumed	crates/engine/src/snow.rs:328	unpacked to the material colour (snow.rs:343).
+matos	single_pass	crates/converter/src/esm/exporter.rs:158	consumed	crates/engine/src/snow.rs:328	fills DirectionalMaterial.single_pass, read by the snow shader.
+space_lighting	space_id	crates/converter/src/esm/exporter.rs:161	consumed	crates/engine/src/world/lighting.rs:278	key of the per-space lighting map (lighting.rs:312).
+space_lighting	is_interior	crates/converter/src/esm/exporter.rs:162	consumed	crates/engine/src/world/lighting.rs:286	decides interior fog and the sky/backdrop branch (atmosphere.rs:336, 356, 373).
+space_lighting	template_id	crates/converter/src/esm/exporter.rs:163	read_unused	crates/engine/src/world/lighting.rs:287	deserialized into SpaceLighting.template_id and never read; the module says the LTMP was already applied by the converter (lighting.rs:155).
+space_lighting	ambient	crates/converter/src/esm/exporter.rs:164	consumed	crates/engine/src/world/lighting.rs:288	ambient colour and brightness (atmosphere.rs:342).
+space_lighting	directional	crates/converter/src/esm/exporter.rs:164	consumed	crates/engine/src/world/lighting.rs:289	sun colour fallback and its luminance (atmosphere.rs:508).
+space_lighting	fog	crates/converter/src/esm/exporter.rs:164	consumed	crates/engine/src/world/lighting.rs:290	fog colour fallback (atmosphere.rs:559-561).
+space_lighting	fog_near	crates/converter/src/esm/exporter.rs:165	consumed	crates/engine/src/world/lighting.rs:291	fog distance (atmosphere.rs:358).
+space_lighting	fog_far	crates/converter/src/esm/exporter.rs:165	consumed	crates/engine/src/world/lighting.rs:292	fog distance (atmosphere.rs:359).
+space_lighting	fog_power	crates/converter/src/esm/exporter.rs:165	read_unused	crates/engine/src/world/lighting.rs:293	"carried, not applied" (lighting.rs:166) - Bevy's fog has no power; nothing reads the field.
+space_lighting	fog_clip	crates/converter/src/esm/exporter.rs:165	read_unused	crates/engine/src/world/lighting.rs:294	"carried for the same reason" (lighting.rs:170); no reader in the engine.
+space_lighting	direction_rot_xy	crates/converter/src/esm/exporter.rs:166	read_unused	crates/engine/src/world/lighting.rs:295	"carried; the engine's sun is one directional light for the whole world" (lighting.rs:173).
+space_lighting	direction_rot_z	crates/converter/src/esm/exporter.rs:166	read_unused	crates/engine/src/world/lighting.rs:296	same as direction_rot_xy.
+space_lighting	direction_fade	crates/converter/src/esm/exporter.rs:166	read_unused	crates/engine/src/world/lighting.rs:297	same as direction_rot_xy.
+space_lighting	sky_upper	crates/converter/src/esm/exporter.rs:167	consumed	crates/engine/src/world/lighting.rs:298	sky palette upper colour and the ambient tint (atmosphere.rs:349, 419).
+space_lighting	sky_fog	crates/converter/src/esm/exporter.rs:167	consumed	crates/engine/src/world/lighting.rs:299	sky palette horizon colour (atmosphere.rs:422, 559).
+space_lighting	sky_lower	crates/converter/src/esm/exporter.rs:167	consumed	crates/engine/src/world/lighting.rs:300	sky palette lower colour (atmosphere.rs:420).
+space_lighting	sun	crates/converter/src/esm/exporter.rs:168	consumed	crates/engine/src/world/lighting.rs:301	the sun light's colour (atmosphere.rs:587).
+space_lighting	sun_illuminance	crates/converter/src/esm/exporter.rs:168	consumed	crates/engine/src/world/lighting.rs:302	the sun's illuminance and its shadow decision (atmosphere.rs:508, 779).
+space_lighting	climate_id	crates/converter/src/esm/exporter.rs:169	consumed	crates/engine/src/world/lighting.rs:303	a worldspace with no climate inherits its parent's row (lighting.rs:388).
+space_lighting	weather_id	crates/converter/src/esm/exporter.rs:169	read_unused	crates/engine/src/world/lighting.rs:304	deserialized into SpaceLighting.weather_id; no reader outside lighting.rs.
+space_lighting	has_sky	crates/converter/src/esm/exporter.rs:170	consumed	crates/engine/src/world/lighting.rs:305	whether the space draws a sky (atmosphere.rs:388); also the inheritance test (lighting.rs:388).
+space_lighting	fog_far_color	crates/converter/src/esm/exporter.rs:174	consumed	crates/engine/src/world/lighting.rs:331	the interior backdrop colour (atmosphere.rs:373).
+space_lighting	fog_max	crates/converter/src/esm/exporter.rs:174	read_unused	crates/engine/src/world/lighting.rs:346	assigned to SpaceLighting.fog_max and never read again.
+space_lighting	light_fade_begin	crates/converter/src/esm/exporter.rs:175	read_unused	crates/engine/src/world/lighting.rs:347	assigned to SpaceLighting.light_fade_begin and never read again.
+space_lighting	light_fade_end	crates/converter/src/esm/exporter.rs:175	read_unused	crates/engine/src/world/lighting.rs:348	assigned to SpaceLighting.light_fade_end and never read again.
+lights	id	crates/converter/src/esm/exporter.rs:178	consumed	crates/engine/src/world/database.rs:1002	join key l.id=r.base_form_id attaches the base LIGH row to every placement.
+lights	editor_id	crates/converter/src/esm/exporter.rs:179	not_read	searched crates/engine/src and crates/shared/src for a lights query: only LIGHT_COLUMNS (database.rs:957)	that column list has no editor_id.
+lights	radius	crates/converter/src/esm/exporter.rs:180	consumed	crates/engine/src/lights.rs:325	the point light's range when the reference carries no XRDS override.
+lights	color_r	crates/converter/src/esm/exporter.rs:181	consumed	crates/engine/src/lights.rs:299	the point light's colour.
+lights	color_g	crates/converter/src/esm/exporter.rs:181	consumed	crates/engine/src/lights.rs:299	same as color_r.
+lights	color_b	crates/converter/src/esm/exporter.rs:181	consumed	crates/engine/src/lights.rs:299	same as color_r.
+lights	flags	crates/converter/src/esm/exporter.rs:182	consumed	crates/engine/src/lights.rs:289	negative and off-by-default flags drop the light entirely.
+lights	falloff	crates/converter/src/esm/exporter.rs:183	read_unused	crates/engine/src/world/database.rs:957	read into LightRow.falloff; no reader (lights.rs:112 says the exponent is loaded but not applied).
+lights	fade	crates/converter/src/esm/exporter.rs:184	read_unused	crates/engine/src/world/database.rs:957	read into LightRow.fade; no code reads LightRow.fade.
+npcs	id	crates/converter/src/esm/exporter.rs:187	consumed	crates/engine/src/physics.rs:104	row key: the player's NPC_ 00000007 row.
+npcs	editor_id	crates/converter/src/esm/exporter.rs:187	not_read	searched crates/engine/src and crates/shared/src for "FROM npcs": one query (physics.rs:104)	that query selects race_id only.
+npcs	full_name	crates/converter/src/esm/exporter.rs:187	not_read	searched crates/engine/src and crates/shared/src for "full_name": no hit	not selected by any query.
+npcs	race_id	crates/converter/src/esm/exporter.rs:188	consumed	crates/engine/src/physics.rs:104	selects the RACE row whose movement profile the player walks with.
+npcs	class_id	crates/converter/src/esm/exporter.rs:188	not_read	searched crates/engine/src and crates/shared/src for "class_id": no hit	not selected by any query.
+npcs	flags	crates/converter/src/esm/exporter.rs:188	not_read	searched crates/engine/src and crates/shared/src for "FROM npcs": one query (physics.rs:104)	that query's column list is race_id alone.
+lod_grid	worldspace_id	crates/converter/src/esm/exporter.rs:192	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "lod_grid": no query hit	the only hits are a streaming/lod.rs test name (lod.rs:2277) and a shadowing loop variable (streaming.rs:5877).
+lod_grid	origin_x	crates/converter/src/esm/exporter.rs:192	not_read	searched crates/engine/src for "lod_grid" and "origin_x": no hit outside test names	the engine's LOD origin comes from worldspaces.lod_origin_x.
+lod_grid	origin_y	crates/converter/src/esm/exporter.rs:192	not_read	searched crates/engine/src for "lod_grid" and "origin_y": no hit outside test names	same as origin_x.
+lod_grid	levels	crates/converter/src/esm/exporter.rs:193	not_read	searched crates/engine/src for "lod_grid": no match outside a test name	nothing selects it.
+lod_block	worldspace_id	crates/converter/src/esm/exporter.rs:196	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "lod_block": no query hit	the table is written by the converter's portal LOD pass and never read.
+lod_block	kind	crates/converter/src/esm/exporter.rs:196	not_read	searched crates/engine/src and crates/shared/src for "lod_block": no hit	never selected.
+lod_block	level	crates/converter/src/esm/exporter.rs:196	not_read	searched crates/engine/src and crates/shared/src for "lod_block": no hit	never selected.
+lod_block	block_x	crates/converter/src/esm/exporter.rs:197	not_read	searched crates/engine/src and crates/shared/src for "lod_block": no hit	never selected.
+lod_block	block_y	crates/converter/src/esm/exporter.rs:197	not_read	searched crates/engine/src and crates/shared/src for "lod_block": no hit	never selected.
+lod_block	mesh_path	crates/converter/src/esm/exporter.rs:197	not_read	searched crates/engine/src and crates/shared/src for "lod_block": no hit	never selected.
+lod_block	bounds_min_x	crates/converter/src/esm/exporter.rs:198	not_read	searched crates/engine/src and crates/shared/src for "lod_block": no hit	never selected.
+lod_block	bounds_min_y	crates/converter/src/esm/exporter.rs:198	not_read	searched crates/engine/src and crates/shared/src for "lod_block": no hit	never selected.
+lod_block	bounds_min_z	crates/converter/src/esm/exporter.rs:198	not_read	searched crates/engine/src and crates/shared/src for "lod_block": no hit	never selected.
+lod_block	bounds_max_x	crates/converter/src/esm/exporter.rs:199	not_read	searched crates/engine/src and crates/shared/src for "lod_block": no hit	never selected.
+lod_block	bounds_max_y	crates/converter/src/esm/exporter.rs:199	not_read	searched crates/engine/src and crates/shared/src for "lod_block": no hit	never selected.
+lod_block	bounds_max_z	crates/converter/src/esm/exporter.rs:199	not_read	searched crates/engine/src and crates/shared/src for "lod_block": no hit	never selected.
+lod_tree_type	worldspace_id	crates/converter/src/esm/exporter.rs:203	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "lod_tree": no query hit	only lod_tree_instance's index name (exporter.rs) and converter code match.
+lod_tree_type	tree_index	crates/converter/src/esm/exporter.rs:203	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_type": no hit	never selected.
+lod_tree_type	mesh_path	crates/converter/src/esm/exporter.rs:203	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_type": no hit	never selected.
+lod_tree_type	size_x	crates/converter/src/esm/exporter.rs:204	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_type": no hit	never selected.
+lod_tree_type	size_y	crates/converter/src/esm/exporter.rs:204	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_type": no hit	never selected.
+lod_tree_type	u0	crates/converter/src/esm/exporter.rs:205	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_type": no hit	never selected.
+lod_tree_type	v0	crates/converter/src/esm/exporter.rs:205	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_type": no hit	never selected.
+lod_tree_type	u1	crates/converter/src/esm/exporter.rs:205	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_type": no hit	never selected.
+lod_tree_type	v1	crates/converter/src/esm/exporter.rs:205	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_type": no hit	never selected.
+lod_tree_instance	worldspace_id	crates/converter/src/esm/exporter.rs:209	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "lod_tree": no query hit	trees in the distance are baked into the LOD chunk meshes.
+lod_tree_instance	block_x	crates/converter/src/esm/exporter.rs:209	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_instance": no hit	never selected.
+lod_tree_instance	block_y	crates/converter/src/esm/exporter.rs:209	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_instance": no hit	never selected.
+lod_tree_instance	tree_index	crates/converter/src/esm/exporter.rs:210	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_instance": no hit	never selected.
+lod_tree_instance	pos_x	crates/converter/src/esm/exporter.rs:210	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_instance": no hit	never selected.
+lod_tree_instance	pos_y	crates/converter/src/esm/exporter.rs:210	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_instance": no hit	never selected.
+lod_tree_instance	pos_z	crates/converter/src/esm/exporter.rs:210	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_instance": no hit	never selected.
+lod_tree_instance	rotation	crates/converter/src/esm/exporter.rs:211	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_instance": no hit	never selected.
+lod_tree_instance	scale	crates/converter/src/esm/exporter.rs:211	not_read	searched crates/engine/src and crates/shared/src for "lod_tree_instance": no hit	never selected.
+movement_types	id	crates/converter/src/esm/exporter.rs:214	consumed	crates/engine/src/physics.rs:132	row key: MOVT 0003580D NPC_Default_MT; a missing row stops the run.
+movement_types	editor_id	crates/converter/src/esm/exporter.rs:214	consumed	crates/engine/src/physics.rs:132	must equal "NPC_Default_MT" or the run refuses (physics.rs:160).
+movement_types	left_walk	crates/converter/src/esm/exporter.rs:215	consumed	crates/engine/src/physics.rs:132	strafe target speed (physics.rs:201).
+movement_types	left_run	crates/converter/src/esm/exporter.rs:215	consumed	crates/engine/src/physics.rs:132	strafe run target speed.
+movement_types	right_walk	crates/converter/src/esm/exporter.rs:216	consumed	crates/engine/src/physics.rs:132	strafe target speed.
+movement_types	right_run	crates/converter/src/esm/exporter.rs:216	consumed	crates/engine/src/physics.rs:132	strafe run target speed.
+movement_types	forward_walk	crates/converter/src/esm/exporter.rs:217	consumed	crates/engine/src/physics.rs:132	forward target speed (physics.rs:170 walk_speed).
+movement_types	forward_run	crates/converter/src/esm/exporter.rs:217	consumed	crates/engine/src/physics.rs:132	forward run target speed (physics.rs:171 run_speed).
+movement_types	back_walk	crates/converter/src/esm/exporter.rs:218	consumed	crates/engine/src/physics.rs:132	backward target speed.
+movement_types	back_run	crates/converter/src/esm/exporter.rs:218	consumed	crates/engine/src/physics.rs:132	backward run target speed.
+movement_types	load_order	crates/converter/src/esm/exporter.rs:219	read_unused	crates/engine/src/physics.rs:135	join key to plugins.id; its only effect is the plugin name in the movement debug log (physics.rs:328).
+race_movement_links	id	crates/converter/src/esm/exporter.rs:222	consumed	crates/engine/src/physics.rs:119	row key: the RACE whose links must be unset.
+race_movement_links	walk_movt_id	crates/converter/src/esm/exporter.rs:222	consumed	crates/engine/src/physics.rs:119	must be NULL; a value stops the run (physics.rs:126).
+race_movement_links	run_movt_id	crates/converter/src/esm/exporter.rs:222	consumed	crates/engine/src/physics.rs:119	must be NULL; a value stops the run (physics.rs:126).
+race_movement_links	load_order	crates/converter/src/esm/exporter.rs:223	not_read	searched crates/engine/src and crates/shared/src for a race_movement_links query: one (physics.rs:119)	that query selects walk_movt_id and run_movt_id only.
+movement_game_settings	id	crates/converter/src/esm/exporter.rs:226	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "movement_game_settings": no query hit	the table is written and never read.
+movement_game_settings	editor_id	crates/converter/src/esm/exporter.rs:226	not_read	searched crates/engine/src and crates/shared/src for "movement_game_settings": no hit	never selected.
+movement_game_settings	value	crates/converter/src/esm/exporter.rs:227	not_read	searched crates/engine/src and crates/shared/src for "movement_game_settings": no hit	never selected.
+movement_game_settings	load_order	crates/converter/src/esm/exporter.rs:227	not_read	searched crates/engine/src and crates/shared/src for "movement_game_settings": no hit	never selected.
+lod	cell_id	crates/converter/src/esm/exporter.rs:230	not_read	searched crates/engine/src and crates/shared/src for "FROM lod" and "mesh_data": no query hit	the per-cell LOD blob table is superseded by lod_chunks.
+lod	lod_level	crates/converter/src/esm/exporter.rs:230	not_read	searched crates/engine/src and crates/shared/src for "lod_level": no hit	never selected.
+lod	mesh_data	crates/converter/src/esm/exporter.rs:230	not_read	searched crates/engine/src and crates/shared/src for "mesh_data": no hit	never selected.
+lod_chunks	worldspace_id	crates/converter/src/esm/exporter.rs:234	consumed	crates/engine/src/world/database.rs:736	filters the chunk query and is validated against the request (database.rs:853); also the has-lod set (database.rs:801).
+lod_chunks	tier	crates/converter/src/esm/exporter.rs:234	consumed	crates/engine/src/world/database.rs:736	selects the LOD tier (lod_tier_from_database, database.rs:900).
+lod_chunks	anchor_x	crates/converter/src/esm/exporter.rs:235	consumed	crates/engine/src/world/database.rs:736	part of the chunk key and of its payload path (database.rs:864).
+lod_chunks	anchor_y	crates/converter/src/esm/exporter.rs:235	consumed	crates/engine/src/world/database.rs:736	same as anchor_x.
+lod_chunks	payload_path	crates/converter/src/esm/exporter.rs:236	consumed	crates/engine/src/world/database.rs:736	the GLB chunk the engine loads, checked canonical (database.rs:868).
+lod_chunks	content_hash	crates/converter/src/esm/exporter.rs:236	consumed	crates/engine/src/world/database.rs:736	checked as a SHA-256 and carried with the chunk (database.rs:872).
+lod_chunks	bounds_min_x	crates/converter/src/esm/exporter.rs:237	consumed	crates/engine/src/world/database.rs:737	LOD chunk bounds, validated then used to place and cull the chunk.
+lod_chunks	bounds_min_y	crates/converter/src/esm/exporter.rs:237	consumed	crates/engine/src/world/database.rs:737	same as bounds_min_x.
+lod_chunks	bounds_min_z	crates/converter/src/esm/exporter.rs:237	consumed	crates/engine/src/world/database.rs:737	same as bounds_min_x.
+lod_chunks	bounds_max_x	crates/converter/src/esm/exporter.rs:238	consumed	crates/engine/src/world/database.rs:737	same as bounds_min_x.
+lod_chunks	bounds_max_y	crates/converter/src/esm/exporter.rs:238	consumed	crates/engine/src/world/database.rs:737	same as bounds_min_x.
+lod_chunks	bounds_max_z	crates/converter/src/esm/exporter.rs:238	consumed	crates/engine/src/world/database.rs:737	same as bounds_min_x.
+lod_chunks	source_cells	crates/converter/src/esm/exporter.rs:239	consumed	crates/engine/src/world/database.rs:738	parsed into grid coordinates (database.rs:893) and used to patch cells a chunk covers (streaming/lod.rs:1234).
+lod_chunks_spatial	id	crates/converter/src/esm/exporter.rs:243	not_read	crates/engine/src/world/database.rs:741	the rtree's own id is never selected; the query joins on worldspace_id/tier/anchors.
+lod_chunks_spatial	minX	crates/converter/src/esm/exporter.rs:243	consumed	crates/engine/src/world/database.rs:742	spatial overlap filter.
+lod_chunks_spatial	maxX	crates/converter/src/esm/exporter.rs:243	consumed	crates/engine/src/world/database.rs:742	spatial overlap filter.
+lod_chunks_spatial	minY	crates/converter/src/esm/exporter.rs:243	consumed	crates/engine/src/world/database.rs:742	spatial overlap filter.
+lod_chunks_spatial	maxY	crates/converter/src/esm/exporter.rs:243	consumed	crates/engine/src/world/database.rs:742	spatial overlap filter.
+lod_chunks_spatial	worldspace_id	crates/converter/src/esm/exporter.rs:243	consumed	crates/engine/src/world/database.rs:741	join and filter on the requested worldspace.
+lod_chunks_spatial	tier	crates/converter/src/esm/exporter.rs:243	consumed	crates/engine/src/world/database.rs:741	join and filter on the requested tier (r.tier=?2 at database.rs:741).
+lod_chunks_spatial	anchor_x	crates/converter/src/esm/exporter.rs:243	consumed	crates/engine/src/world/database.rs:739	join to lod_chunks.anchor_x.
+lod_chunks_spatial	anchor_y	crates/converter/src/esm/exporter.rs:243	consumed	crates/engine/src/world/database.rs:740	join to lod_chunks.anchor_y.
+lod_build	id	crates/converter/src/esm/exporter.rs:246	consumed	crates/engine/src/world/database.rs:725	row key: WHERE id=1.
+lod_build	build_identity	crates/converter/src/esm/exporter.rs:246	consumed	crates/engine/src/world/database.rs:725	validated against lod-manifest.json (shared/world_assets.rs:92); a mismatch stops the run.
+waters	id	crates/converter/src/esm/exporter.rs:250	consumed	crates/engine/src/world/database.rs:334	key of the water asset maps (database.rs:336).
+waters	editor_id	crates/converter/src/esm/exporter.rs:250	not_read	searched crates/engine/src and crates/shared/src for "FROM waters": two queries (database.rs:334, 349)	neither selects editor_id.
+waters	opacity	crates/converter/src/esm/exporter.rs:250	not_read	searched crates/engine/src and crates/shared/src for "opacity" in a waters query: no hit	the engine's water alpha is a constant plus the shallow/deep colours (streaming.rs:3313).
+waters	flags	crates/converter/src/esm/exporter.rs:250	not_read	searched crates/engine/src and crates/shared/src for "FROM waters": two queries	neither selects flags.
+waters	shallow_color	crates/converter/src/esm/exporter.rs:251	consumed	crates/engine/src/world/database.rs:349	water base colour (streaming.rs:3313).
+waters	deep_color	crates/converter/src/esm/exporter.rs:251	consumed	crates/engine/src/world/database.rs:349	water base colour (streaming.rs:3313).
+waters	reflection_color	crates/converter/src/esm/exporter.rs:251	consumed	crates/engine/src/world/database.rs:349	water reflection tint.
+waters	fresnel	crates/converter/src/esm/exporter.rs:252	consumed	crates/engine/src/world/database.rs:349	water fresnel factor (streaming.rs:3317).
+waters	reflectivity	crates/converter/src/esm/exporter.rs:252	consumed	crates/engine/src/world/database.rs:349	water reflectivity factor (streaming.rs:3317).
+waters	flow_normal_path	crates/converter/src/esm/exporter.rs:253	consumed	crates/engine/src/world/database.rs:334	the flow-map texture the water shader samples (water.wgsl:285).
+waters	data	crates/converter/src/esm/exporter.rs:253	not_read	searched crates/engine/src and crates/shared/src for "FROM waters": two queries	neither selects data.
+texture_sets	id	crates/converter/src/esm/exporter.rs:256	consumed	crates/engine/src/world/database.rs:305	join key t.id=l.texture_set_id.
+texture_sets	editor_id	crates/converter/src/esm/exporter.rs:256	not_read	searched crates/engine/src and crates/shared/src for "JOIN texture_sets": two queries (database.rs:305, 320)	neither selects editor_id.
+texture_sets	diffuse_path	crates/converter/src/esm/exporter.rs:256	consumed	crates/engine/src/world/database.rs:305	the terrain's diffuse texture (render.rs:669).
+texture_sets	normal_path	crates/converter/src/esm/exporter.rs:256	consumed	crates/engine/src/world/database.rs:320	the terrain's normal map (render.rs:657).
+texture_sets	glow_path	crates/converter/src/esm/exporter.rs:257	not_read	searched crates/engine/src and crates/shared/src for "glow_path": no hit	not in either query's column list.
+texture_sets	height_path	crates/converter/src/esm/exporter.rs:257	not_read	searched crates/engine/src and crates/shared/src for "height_path": no hit	not selected.
+texture_sets	environment_path	crates/converter/src/esm/exporter.rs:257	not_read	searched crates/engine/src and crates/shared/src for "environment_path": no hit	not selected.
+texture_sets	mask_path	crates/converter/src/esm/exporter.rs:257	not_read	searched crates/engine/src and crates/shared/src for "mask_path": no hit	not selected.
+texture_sets	specular_path	crates/converter/src/esm/exporter.rs:258	not_read	searched crates/engine/src and crates/shared/src for "specular_path": no hit	not selected.
+texture_sets	detail_path	crates/converter/src/esm/exporter.rs:258	not_read	searched crates/engine/src and crates/shared/src for "detail_path": no hit	not selected.
+landscape_textures	id	crates/converter/src/esm/exporter.rs:261	consumed	crates/engine/src/world/database.rs:305	the landscape texture FormID a LAND layer names (streaming.rs:5576).
+landscape_textures	editor_id	crates/converter/src/esm/exporter.rs:261	not_read	searched crates/engine/src and crates/shared/src for "FROM landscape_textures": two queries (database.rs:305, 320)	neither selects editor_id.
+landscape_textures	texture_set_id	crates/converter/src/esm/exporter.rs:261	consumed	crates/engine/src/world/database.rs:305	join key to texture_sets.
+landscape_textures	material_type	crates/converter/src/esm/exporter.rs:262	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "material_type": only test-fixture CREATE TABLE strings (portal.rs:6825, transition.rs:3622)	not selected by any query.
+landscape_textures	friction	crates/converter/src/esm/exporter.rs:262	not_read	searched crates/engine/src and crates/shared/src for "friction": only shared/collision.rs's own CollisionAsset field	the engine's friction comes from the collision asset, not the database.
+landscape_textures	restitution	crates/converter/src/esm/exporter.rs:262	not_read	searched crates/engine/src and crates/shared/src for "restitution": only shared/collision.rs's CollisionAsset field	same as friction.
+grass_types	id	crates/converter/src/esm/exporter.rs:265	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "grass_types": one hit, a test fixture (database.rs:1686)	no runtime query reads the table.
+grass_types	editor_id	crates/converter/src/esm/exporter.rs:265	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	model_path	crates/converter/src/esm/exporter.rs:265	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	density	crates/converter/src/esm/exporter.rs:266	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	min_slope	crates/converter/src/esm/exporter.rs:266	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	max_slope	crates/converter/src/esm/exporter.rs:266	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	units_from_water	crates/converter/src/esm/exporter.rs:267	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	water_comparison	crates/converter/src/esm/exporter.rs:267	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	position_range	crates/converter/src/esm/exporter.rs:268	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	height_range	crates/converter/src/esm/exporter.rs:268	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	color_range	crates/converter/src/esm/exporter.rs:268	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	wave_period	crates/converter/src/esm/exporter.rs:269	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	flags	crates/converter/src/esm/exporter.rs:269	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+grass_types	load_order	crates/converter/src/esm/exporter.rs:269	not_read	searched crates/engine/src and crates/shared/src for "grass_types": one hit, a test fixture	never selected.
+landscape_texture_grasses	ltex_id	crates/converter/src/esm/exporter.rs:272	not_read	searched crates/engine/src and crates/shared/src for "landscape_texture_grasses": one hit, a test fixture (database.rs:1686)	the engine draws no grass.
+landscape_texture_grasses	gras_id	crates/converter/src/esm/exporter.rs:272	not_read	searched crates/engine/src and crates/shared/src for "landscape_texture_grasses": one hit, a test fixture	never selected.
+scripts	form_id	crates/converter/src/esm/exporter.rs:276	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "FROM scripts" and "INSERT INTO scripts": no query hit	the script table is converted and never read; papyrus_runtime.rs takes its data elsewhere.
+scripts	script_name	crates/converter/src/esm/exporter.rs:276	not_read	searched crates/engine/src and crates/shared/src for a scripts query: no hit	never selected.
+scripts	vmad	crates/converter/src/esm/exporter.rs:277	not_read	searched crates/engine/src and crates/shared/src for a scripts query: no hit	never selected.
+scripts	properties_json	crates/converter/src/esm/exporter.rs:277	not_read	searched crates/engine/src and crates/shared/src for a scripts query: no hit	never selected.
+formid_map	form_id	crates/converter/src/esm/exporter.rs:281	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "formid_map": no query hit	a converter bookkeeping table.
+formid_map	plugin_name	crates/converter/src/esm/exporter.rs:281	not_read	searched crates/engine/src and crates/shared/src for "formid_map": no hit	never selected.
+formid_map	internal_id	crates/converter/src/esm/exporter.rs:281	not_read	searched crates/engine/src and crates/shared/src for "formid_map": no hit	never selected.
+formid_map	record_type	crates/converter/src/esm/exporter.rs:281	not_read	searched crates/engine/src and crates/shared/src for "formid_map": no hit	the engine reads records.record_type instead.
+conversion_cache	plugin_path	crates/converter/src/esm/exporter.rs:284	not_read	searched crates/engine/src, crates/shared/src and crates/launcher/src for "conversion_cache": no query hit	a converter resume table.
+conversion_cache	file_hash	crates/converter/src/esm/exporter.rs:284	not_read	searched crates/engine/src and crates/shared/src for "conversion_cache": no hit	never selected.
+conversion_cache	last_converted	crates/converter/src/esm/exporter.rs:284	not_read	searched crates/engine/src and crates/shared/src for "conversion_cache": no hit	never selected.
+room_bounds	ref_id	crates/converter/src/esm/rooms.rs:25	consumed	crates/engine/src/room_culling.rs:621	room box key; the room graph decides which rooms are drawn.
+room_bounds	cell_id	crates/converter/src/esm/rooms.rs:25	consumed	crates/engine/src/room_culling.rs:622	selects the rooms of the cell being loaded.
+room_bounds	pos_x	crates/converter/src/esm/rooms.rs:26	consumed	crates/engine/src/room_culling.rs:621	box placement (Room::from_creation, room_culling.rs:625).
+room_bounds	pos_y	crates/converter/src/esm/rooms.rs:26	consumed	crates/engine/src/room_culling.rs:621	same as pos_x.
+room_bounds	pos_z	crates/converter/src/esm/rooms.rs:26	consumed	crates/engine/src/room_culling.rs:621	same as pos_x.
+room_bounds	rot_x	crates/converter/src/esm/rooms.rs:27	consumed	crates/engine/src/room_culling.rs:621	box orientation.
+room_bounds	rot_y	crates/converter/src/esm/rooms.rs:27	consumed	crates/engine/src/room_culling.rs:621	same as rot_x.
+room_bounds	rot_z	crates/converter/src/esm/rooms.rs:27	consumed	crates/engine/src/room_culling.rs:621	same as rot_x.
+room_bounds	half_x	crates/converter/src/esm/rooms.rs:28	consumed	crates/engine/src/room_culling.rs:621	box half extents.
+room_bounds	half_y	crates/converter/src/esm/rooms.rs:28	consumed	crates/engine/src/room_culling.rs:621	same as half_x.
+room_bounds	half_z	crates/converter/src/esm/rooms.rs:28	consumed	crates/engine/src/room_culling.rs:621	same as half_x.
+room_bounds	lighting_template_id	crates/converter/src/esm/rooms.rs:29	not_read	searched crates/engine/src and crates/shared/src for "lighting_template_id": one hit, a test fixture (room_culling.rs:1073)	the lighting comes from space_lighting, not from a room.
+room_bounds	image_space_id	crates/converter/src/esm/rooms.rs:29	not_read	searched crates/engine/src and crates/shared/src for "image_space_id": one hit, a test fixture (room_culling.rs:1073)	never selected.
+room_bounds	flags	crates/converter/src/esm/rooms.rs:30	not_read	searched crates/engine/src and crates/shared/src for a room_bounds query: one (room_culling.rs:620-622)	its column list has no flags.
+room_portals	ref_id	crates/converter/src/esm/rooms.rs:34	consumed	crates/engine/src/room_culling.rs:643	portal placement key (Portal::from_creation, room_culling.rs:652).
+room_portals	pair_index	crates/converter/src/esm/rooms.rs:34	not_read	crates/engine/src/room_culling.rs:643	not in the SELECT list: both rows of a paired marker come back and are used for their own geometry.
+room_portals	cell_id	crates/converter/src/esm/rooms.rs:35	consumed	crates/engine/src/room_culling.rs:644	selects the portals of the cell being loaded.
+room_portals	pos_x	crates/converter/src/esm/rooms.rs:36	consumed	crates/engine/src/room_culling.rs:643	portal quad placement.
+room_portals	pos_y	crates/converter/src/esm/rooms.rs:36	consumed	crates/engine/src/room_culling.rs:643	same as pos_x.
+room_portals	pos_z	crates/converter/src/esm/rooms.rs:36	consumed	crates/engine/src/room_culling.rs:643	same as pos_x.
+room_portals	rot_x	crates/converter/src/esm/rooms.rs:37	consumed	crates/engine/src/room_culling.rs:643	portal orientation.
+room_portals	rot_y	crates/converter/src/esm/rooms.rs:37	consumed	crates/engine/src/room_culling.rs:643	same as rot_x.
+room_portals	rot_z	crates/converter/src/esm/rooms.rs:37	consumed	crates/engine/src/room_culling.rs:643	same as rot_x.
+room_portals	half_x	crates/converter/src/esm/rooms.rs:38	consumed	crates/engine/src/room_culling.rs:643	portal half extents.
+room_portals	half_z	crates/converter/src/esm/rooms.rs:38	consumed	crates/engine/src/room_culling.rs:643	same as half_x.
+room_portals	room_a	crates/converter/src/esm/rooms.rs:39	consumed	crates/engine/src/room_culling.rs:643	which rooms the portal joins (room_culling.rs:657).
+room_portals	room_b	crates/converter/src/esm/rooms.rs:39	consumed	crates/engine/src/room_culling.rs:643	same as room_a.
+room_links	room_ref	crates/converter/src/esm/rooms.rs:44	consumed	crates/engine/src/room_culling.rs:666	which rooms see through each other (room_culling.rs:677).
+room_links	linked_ref	crates/converter/src/esm/rooms.rs:44	consumed	crates/engine/src/room_culling.rs:666	same as room_ref.
+reference_rooms	reference_id	crates/converter/src/esm/rooms.rs:48	consumed	crates/engine/src/room_culling.rs:701	which reference is in a room, keyed into the cell's membership (room_culling.rs:717).
+reference_rooms	room_ref	crates/converter/src/esm/rooms.rs:48	consumed	crates/engine/src/room_culling.rs:701	which room it is in.
+reference_rooms	contained	crates/converter/src/esm/rooms.rs:49	consumed	crates/engine/src/room_culling.rs:701	contained vs merely overlapping decides the visibility test (room_culling.rs:718-721).
+room_graph_stats	name	crates/converter/src/esm/rooms.rs:54	not_read	crates/engine/src/room_culling.rs:592	the module states the table "is a report counter and is not required"; no query selects it.
+room_graph_stats	value	crates/converter/src/esm/rooms.rs:54	not_read	crates/engine/src/room_culling.rs:594	not among the four REQUIRED_TABLES and never queried.
+rkyv:CellCache	version	crates/shared/src/lib.rs:95	consumed	crates/engine/src/world/cache.rs:43	must equal CELL_CACHE_VERSION or the cache is refused.
+rkyv:CellCache	cells	crates/shared/src/lib.rs:96	consumed	crates/engine/src/world/cache.rs:48	indexed by cell id; every terrain lookup goes through it.
+rkyv:CachedLand	cell_id	crates/shared/src/lib.rs:78	consumed	crates/engine/src/world/cache.rs:52	the lookup key.
+rkyv:CachedLand	width	crates/shared/src/lib.rs:79	consumed	crates/engine/src/world/cache.rs:69	terrain grid width (mesh build, streaming.rs:5550).
+rkyv:CachedLand	height	crates/shared/src/lib.rs:80	consumed	crates/engine/src/world/cache.rs:70	terrain grid height.
+rkyv:CachedLand	heights	crates/shared/src/lib.rs:82	consumed	crates/engine/src/world/cache.rs:71	terrain vertex heights (streaming.rs:3084).
+rkyv:CachedLand	normals	crates/shared/src/lib.rs:84	consumed	crates/engine/src/world/cache.rs:72	the terrain's normals.
+rkyv:CachedLand	vertex_colors	crates/shared/src/lib.rs:86	consumed	crates/engine/src/world/cache.rs:73	underlay/overlay colour weights (streaming.rs:5565).
+rkyv:CachedLand	layers	crates/shared/src/lib.rs:87	consumed	crates/engine/src/world/cache.rs:74	which textures a quadrant draws with (streaming.rs:5470).
+rkyv:CachedLand	water_height	crates/shared/src/lib.rs:88	consumed	crates/engine/src/world/cache.rs:89	the water plane's height (streaming.rs:3287).
+rkyv:CachedLand	water_type_form_id	crates/shared/src/lib.rs:89	consumed	crates/engine/src/world/cache.rs:90	selects the WATR row (streaming.rs:3296).
+rkyv:TerrainLayer	texture_form_id	crates/shared/src/lib.rs:61	consumed	crates/engine/src/world/cache.rs:78	the landscape texture to sample (streaming.rs:5576).
+rkyv:TerrainLayer	quadrant	crates/shared/src/lib.rs:62	consumed	crates/engine/src/world/cache.rs:79	which quadrant the layer belongs to (streaming.rs:5472).
+rkyv:TerrainLayer	layer	crates/shared/src/lib.rs:63	consumed	crates/engine/src/world/cache.rs:80	overlay slot order (streaming.rs:5474).
+rkyv:TerrainLayer	is_base	crates/shared/src/lib.rs:64	consumed	crates/engine/src/world/cache.rs:81	base vs overlay layer (streaming.rs:5478, 5573).
+rkyv:TerrainLayer	weights	crates/shared/src/lib.rs:65	consumed	crates/engine/src/world/cache.rs:82	per-vertex overlay opacity (streaming.rs:5501).
+rkyv:TerrainWeight	vertex	crates/shared/src/lib.rs:71	consumed	crates/engine/src/world/cache.rs:85	which grid vertex the weight applies to.
+rkyv:TerrainWeight	opacity	crates/shared/src/lib.rs:72	consumed	crates/engine/src/world/cache.rs:85	the weight itself (streaming.rs:5529).
+rkyv:ArchivedRecordData	subrecords	crates/converter/src/esm/types.rs:12	not_read	searched crates/engine/src and crates/shared/src for "ArchivedRecordData": no hit	the blob in records.data is written at exporter.rs:377/404/1081 and never read by the engine.
+rkyv:ArchivedSubRecord	tag	crates/converter/src/esm/types.rs:6	not_read	searched crates/engine/src and crates/shared/src for "ArchivedSubRecord": no hit	read only by converter tools (bin/movement-profile-annotate.rs:46) and converter tests.
+rkyv:ArchivedSubRecord	data	crates/converter/src/esm/types.rs:7	not_read	searched crates/engine/src and crates/shared/src for "ArchivedSubRecord": no hit	same as tag.

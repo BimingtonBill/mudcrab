@@ -376,7 +376,8 @@ impl<'w> FlushCommands<'w> {
     pub fn flush(&mut self) {
         let buffers = {
             #[cfg(feature = "trace")]
-            let _span = info_span!("render::pending_finish", pending = self.pending.len()).entered();
+            let _span =
+                info_span!("render::pending_finish", pending = self.pending.len()).entered();
             self.pending.take()
         };
         if !buffers.is_empty() {

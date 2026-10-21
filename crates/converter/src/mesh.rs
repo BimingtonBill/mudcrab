@@ -221,12 +221,10 @@ impl MeshConverter {
             &shape_blocks,
             output,
         )?;
+        // Only a model with a controller manager can carry a clip, so the extra read and header
+        // parse below is paid by the ~1% of NIFs that have one (every door that animates).
         let glb = if diagnostics.block_types.contains_key("NiControllerManager") {
-            let (animated, warnings) = crate::nif_animation::append_nif_animations(&glb, nif_path)?;
-            for warning in warnings {
-                eprintln!("{}: {warning}", nif_path.display());
-            }
-            animated
+            append_nif_animations(glb, nif_path)
         } else {
             glb
         };
@@ -1335,6 +1333,26 @@ pub struct TextureDependency {
     pub uri: String,
     pub semantic: TextureSemantic,
     pub required: bool,
+}
+
+/// Appends a NIF's controller sequences (`Open`, `Close`, ...) to the converted GLB.
+///
+/// Animated models - load doors, gates, secret doors - carry their clips in `NiControllerManager`
+/// blocks the vendored exporter ignores. Nothing about them is fatal: a model whose animation
+/// cannot be read still exports, with a warning naming what was skipped.
+fn append_nif_animations(glb: Vec<u8>, nif_path: &Path) -> Vec<u8> {
+    match crate::nif_animation::append_nif_animations(&glb, nif_path) {
+        Ok((glb, warnings)) => {
+            for warning in warnings {
+                eprintln!("{}: {warning}", nif_path.display());
+            }
+            glb
+        }
+        Err(error) => {
+            eprintln!("{}: skipping animations: {error:#}", nif_path.display());
+            glb
+        }
+    }
 }
 
 fn write_glb_atomic(output: &Path, bytes: &[u8]) -> Result<()> {

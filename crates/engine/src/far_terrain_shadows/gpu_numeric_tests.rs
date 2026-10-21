@@ -343,9 +343,11 @@ impl Gpu {
         let resources = block_on(super::initialize_renderer(backends, None, &settings));
         // This is exactly RendererInitPlugin's non-Windows initialization path.
         #[cfg(not(target_os = "windows"))]
-        let resources = block_on(bevy::render::renderer::initialize_renderer_without_callbacks(
-            backends, None, &settings,
-        ));
+        let resources = block_on(
+            bevy::render::renderer::initialize_renderer_without_callbacks(
+                backends, None, &settings,
+            ),
+        );
         eprintln!(
             "S5 numeric GPU adapter={} backend={:?} type={:?} created_limits={:?}",
             resources.2.name,

@@ -1,0 +1,27 @@
+# Goal
+Step 1 of the engine pacing rework (upstream issue Mudcrab-Team/mudcrab#117): measure where world-loading time goes. Add the measurements a benchmark run needs to report three things together: time until the world around the camera is fully loaded, how far behind loading falls while flying fast, and per-stage costs on the frames that spike. Measurement only: no change to what the engine loads, in what order, or how fast.
+
+# Context
+- Track: Phase 2. Upstream commit style (`feat(engine): ...` / `fix(engine): ...`). Worktree `D:/Mudcrab/worktrees/p2-pacing`, branch `phase2/pacing-measure` at upstream main 461517bf. CARGO_TARGET_DIR=D:/Mudcrab/builds/p2-pacing on every cargo command (empty, so the first build is slow).
+- The plan: https://claude.ai/code/artifact/4487deb3-0d57-4e6a-a392-0607aa54bec9 (you can't open it; the parts you need are here). Code inventory of today's streaming, with file:line for every stage, budget, metric and span: `C:/Users/Brannock/.claude-deepseek/agents/runs/research-650-p2-pacing-inventory.1/report.md`. Read it first.
+- Benchmarks already exist: `--benchmark-*` flags, `metrics.rs` (benchmark report JSON), `profiling.rs` (spans, gauges, events, `--profile-output`), `render_timing.rs` (render-world phase timings), `scripts/phase2-*.ps1`. Extend these; do not build a parallel system.
+- Chef owns LOD (upstream #105, #106): do not touch LOD code paths.
+
+# What to add
+1. **Fix the broken span:** `streaming/terrain_mesh` records the elapsed time of an `Instant` created on the line before (streaming.rs, in `spawn_cell`'s terrain loop), so it always reads ~0. Make it time the real terrain mesh and collider build, and add separate spans for the reference spawn loop inside `spawn_cell` and for terrain validation and seam welding in `collect_cells`. Record per committed cell: number of references, number of model loads issued, and its total commit time (a profiler event with those values is enough).
+2. **Time to world ready:** one predicate "the world around the camera is fully loaded": every cell in the stream window resident at full detail, no loading cells, no active database requests, the model arming queue empty, `pending_asset_instances == 0`, `pending_surface_instances == 0`. Record in the benchmark report the time from the first frame to the first frame it holds (`time_to_world_ready_ms`), and the frame count. Reuse the existing metrics; the report must say when it never became ready.
+3. **A jump:** a new flag `--benchmark-jump <grid-x>,<grid-y>` (same worldspace): once the world is first ready, move the camera to the centre of that cell (keep its height logic the same as startup, i.e. ground height plus the usual offset), and record `time_to_world_ready_after_jump_ms` the same way. Validate the flag like the others (bad value: clear error).
+4. **Falling behind at speed:** while `--auto-fly-speed` is set, when a model finishes loading (becomes ready in the readiness scan), record its horizontal distance from the camera. Report in the benchmark JSON: the count of models that became ready within one cell (4096 units) of the camera, and the 5th percentile and minimum of that distance. Keep the existing peak arming queue depth in the report.
+5. **Render side:** test the hypothesis that the worst frames are graphics pipelines being built on first use. In the render world, count per frame how many render pipelines became ready (or were queued for creation) using Bevy 0.19's `PipelineCache` (find the right API in the bevy_render 0.19 source in `C:/Users/Brannock/.cargo/registry/src`), and record it with the per-frame render timings so a spike frame can be matched with pipeline creation. If no clean API exists, say so in the report instead of guessing.
+6. **Docs:** a short section in `docs/` where the benchmarks are documented (find it; e.g. the Phase 2 profiling or acceptance doc) listing the new metrics and the flag, with one example command.
+
+# Scope
+Engine crate (`crates/engine/**`) and that one docs file. No changes to crates/converter, crates/shared, crates/dummy-content, launcher, scripts (unless a script parses the benchmark JSON strictly and would break; then keep it working and say so). No new dependencies. Defaults unchanged: a normal run and every existing benchmark behaves exactly as before, apart from the new report fields.
+
+# Done when
+- Unit tests: the world-ready predicate (each condition can hold it back), the jump flag parsing (good, bad, missing value), the distance percentile helper, and the terrain span now measuring a non-zero span in a headless commit test if one exists to extend.
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run -p engine` pass. The test `streaming_fixture_loads_its_interior_by_id_and_keeps_it_while_the_camera_crosses_exteriors` is known to fail under heavy CPU load from other sessions; rerun it once before treating it as yours.
+- ONE commit: `feat(engine): measure time to a loaded world, loading lag at speed and per-stage commit costs`, files added by name, trailer `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`. Never push, never amend, never run engine.exe.
+
+# Report
+Commit id; changed lines per file; the new report fields with one example of each value's meaning; what you found about the pipeline-cache API; test count before and after; anything you could not do. Under 350 words.

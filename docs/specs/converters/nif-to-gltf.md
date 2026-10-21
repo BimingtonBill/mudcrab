@@ -91,6 +91,30 @@ them, so a NIF naming a texture Bethesda never shipped still publishes and rende
 remaining maps. The dropped paths are recorded per mesh under `pruned_texture_references` in
 `conversion-manifest.json` and do not make the conversion incomplete.
 
+Both shader families also carry a static UV transform (`BSLightingShaderProperty.uv_offset` /
+`.uv_scale`, `BSEffectShaderProperty.uv_offset` / `.uv_scale` in the vendored parser), published as
+`uvOffset: [u, v]` and `uvScale: [u, v]` on `MUDCRAB_material` (data-set extension
+`mudcrab.material`, version 1). `OPEN_SKYRIM_material` is exactly the core extension of `main` (same
+keys, same values, skipped for a material with no auxiliary texture slot and neither alpha flag), so
+a mesh from `main`'s converter has no UV keys, no falloff and no blend factors, and a reader treats
+an absent `MUDCRAB_material` (or key) as identity UVs, no falloff and the default blend. The
+extension is written for a material only when it has a non-default value among its fields (a UV
+transform other than the identity `[0, 0]`/`[1, 1]`, effect falloff, blend factors); it is listed in
+`extensionsUsed`, never `extensionsRequired`. A
+`uOffset`/`vOffset`/`uScale`/`vScale` animation channel (below) replaces the matching one of these
+two components at runtime; the other component keeps its static value from here. Every other
+animated variable (`alpha`, `emissiveMultiple`, `glossiness`, ...) replaces its own static field
+instead, wherever this document or the material contract publishes it.
+
+An effect-shader material also carries its view-angle fade and soft-edge depth exactly as the NIF
+stores them, in `MUDCRAB_material`: `falloffStartAngle`, `falloffStopAngle`, `falloffStartOpacity`, `falloffStopOpacity`
+and `softFalloffDepth`. Despite their names the two angles are stored as cosines, and the shader
+compares them with `|N·V|` directly: `s = smoothstep(saturate((|N·V| - start) / (stop - start)))`,
+then `opacity = lerp(startOpacity, stopOpacity, s)`. The fade applies only when `shaderFlags1` has
+`Use_Falloff` (bit 6), and the soft edge only with `Soft_Effect` (bit 30). The fields share their
+names with the float-controller variables that animate them, so an animated channel replaces its
+static field like any other. A material with a non-finite value omits all five.
+
 ### 4.1 Material animation (`OPEN_SKYRIM_material_animation`)
 
 Skyrim animates hearth flames, lava, steam and glow cards by driving one shader variable from a

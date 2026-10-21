@@ -1,5 +1,11 @@
 # SPEC
 
+> **On the `portal` branch:** this is main's player-movement spec for the rapier world player
+> (`WorldPlayerPlugin`, tankard bindings, `MovementTuning` as the runtime owner). The portal runs
+> its own `crate::player::PlayerPlugin` (`--walk`, `F` to fly, no tankards) because main's capsule
+> player knows nothing of doors. Only `--physics-fixture` and the `MovementTuning` gravity are
+> live here.
+
 ## §G GOAL
 
 Build Skyrim-derived player movement in phases. First milestone: retain working Riverwood WALK/NOCLIP controller, drive walk/run speeds from resolved game records in Creation units, and keep basic jump working while resolving its record-backed parameters. Expand record conversion and behavior only when later phases need them; full controller parity remains long-term goal.
