@@ -89,6 +89,8 @@ pub(crate) struct ClusterViewCoverage {
 #[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum TerrainHandoffSystems {
     Cluster,
+    /// Before mesh queueing: fallback terrain under this frame's selected cluster cells.
+    Gate,
     Filter,
     Restore,
     ClusterRestore,
@@ -105,6 +107,12 @@ struct Filters {
     saved: HashMap<Domain, ClassFilter>,
     active: Vec<Domain>,
 }
+
+/// The pre-queue stage of the terrain complement. It hides fallback terrain whose every cell is
+/// in the current cluster plan, so Bevy's retained queues dequeue it once and then never visit
+/// it again until the plan withdraws it.
+#[derive(Resource, Default)]
+struct GateFilters(Filters);
 
 /// Profiling inventory only: exact renderable native and compact LOD meshes. It carries no
 /// coverage, ancestry, ownership or stand-in state and never authorizes draw suppression.
@@ -283,13 +291,23 @@ impl Plugin for TerrainHandoffPlugin {
             .init_resource::<RenderTerrain>()
             .init_resource::<ClusterCoverage>()
             .init_resource::<Filters>()
+            .init_resource::<GateFilters>()
             .add_systems(ExtractSchedule, extract)
+            .add_systems(
+                Render,
+                gate.in_set(RenderSystems::Queue)
+                    .in_set(TerrainHandoffSystems::Gate)
+                    .after(super::native_lod::NativeLodSystems::Filter)
+                    .after(TerrainHandoffSystems::Cluster)
+                    .before(RenderSystems::QueueMeshes),
+            )
             .add_systems(
                 Render,
                 filter
                     .after(RenderSystems::Queue)
                     .in_set(TerrainHandoffSystems::Filter)
                     .after(super::native_lod::NativeLodSystems::Filter)
+                    .after(TerrainHandoffSystems::Gate)
                     .after(TerrainHandoffSystems::Cluster)
                     .before(RenderSystems::PhaseSort),
             )
@@ -486,6 +504,20 @@ fn domain(entity: Entity, key: RetainedViewEntity, light: Option<&LightEntity>) 
     }
 }
 
+/// A fallback whose whole coverage the current cluster plan draws. The plan already contains its
+/// own exact compute, material, forward, prepass, shadow and far-binding qualification, so no
+/// stock queue proof is needed to yield. Protected surfaces (outstanding own-draw obligations and
+/// live named holds) never yield.
+fn cluster_owned(surface: &Surface, cluster: &HashSet<(u32, IVec2)>) -> bool {
+    matches!(surface.kind, Kind::Native | Kind::Batch | Kind::Source)
+        && !surface.protected
+        && !surface.keys.is_empty()
+        && surface
+            .keys
+            .iter()
+            .all(|key| cluster.contains(&(key.world, key.grid)))
+}
+
 /// Pure complement rule. `drawable` is the current view's prepared stock proof;
 /// `cluster` is this invocation's exact selected plan, never asynchronous history.
 fn hidden_for_view(
@@ -653,6 +685,83 @@ type TerrainViews<'w, 's> = Query<
     ),
 >;
 
+/// Hide cluster-owned fallbacks BEFORE Bevy queues meshes. `ClassFilter` reports a newly hidden
+/// entity as removed (its bins are emptied once) and an entity that stops being hidden as added,
+/// so a stable owned fallback costs no queue work per frame while its extracted instance and
+/// allocations stay resident, and a withdrawn plan re-arms it in this same frame: the plan is
+/// rebuilt before this system runs and mesh queueing runs after it.
+fn gate(
+    terrain: Res<RenderTerrain>,
+    clusters: Res<ClusterCoverage>,
+    mut filters: ResMut<GateFilters>,
+    mut views: TerrainViews,
+    mut shadows: Query<&mut RenderShadowMapVisibleEntities>,
+) {
+    let filters = &mut filters.0;
+    assert!(filters.active.is_empty(), "terrain gate was not restored");
+    let mut wanted: HashMap<Domain, bevy::platform::collections::HashSet<MainEntity>> =
+        HashMap::new();
+    for (entity, view, light, visible, ..) in &views {
+        let key = view.retained_view_entity;
+        let domain = domain(entity, key, light);
+        let visible = match domain {
+            Domain::Camera(_) => visible,
+            Domain::Shadow(light, key) => shadows
+                .get(light)
+                .ok()
+                .and_then(|shadow| shadow.subviews.get(&key)),
+        };
+        let empty = HashSet::new();
+        let cells = clusters
+            .views
+            .get(&key)
+            .map_or(&empty, |coverage| &coverage.cells);
+        let owned: bevy::platform::collections::HashSet<MainEntity> = visible
+            .and_then(|visible| visible.get::<Mesh3d>())
+            .into_iter()
+            .filter(|_| !cells.is_empty())
+            .flat_map(|class| class.iter_visible())
+            .filter(|(_, main)| {
+                terrain
+                    .surfaces
+                    .get(*main)
+                    .is_some_and(|surface| cluster_owned(surface, cells))
+            })
+            .map(|(_, main)| *main)
+            .collect();
+        // Shared point/spot domains yield only after every consumer agrees.
+        wanted
+            .entry(domain)
+            .and_modify(|joint| joint.retain(|main| owned.contains(main)))
+            .or_insert(owned);
+    }
+    filters
+        .saved
+        .retain(|domain, _| wanted.contains_key(domain));
+    for (domain, hidden) in wanted {
+        let class = match domain {
+            Domain::Camera(entity) => views
+                .get_mut(entity)
+                .ok()
+                .and_then(|(_, _, _, visible, ..)| visible)
+                .map(|visible| visible.into_inner()),
+            Domain::Shadow(light, key) => shadows
+                .get_mut(light)
+                .ok()
+                .and_then(|shadow| shadow.into_inner().subviews.get_mut(&key)),
+        }
+        .and_then(|visible| visible.classes.get_mut(&std::any::TypeId::of::<Mesh3d>()));
+        if let Some(class) = class {
+            filters
+                .saved
+                .entry(domain)
+                .or_default()
+                .apply(class, &hidden);
+            filters.active.push(domain);
+        }
+    }
+}
+
 fn filter(
     terrain: Res<RenderTerrain>,
     clusters: Res<ClusterCoverage>,
@@ -787,8 +896,19 @@ fn filter(
 
 fn restore(
     mut filters: ResMut<Filters>,
+    mut gate: ResMut<GateFilters>,
     mut views: Query<&mut RenderVisibleEntities>,
     mut shadows: Query<&mut RenderShadowMapVisibleEntities>,
+) {
+    // Reverse of application order: the post-queue filter, then the pre-queue gate.
+    restore_filters(&mut filters, &mut views, &mut shadows);
+    restore_filters(&mut gate.0, &mut views, &mut shadows);
+}
+
+fn restore_filters(
+    filters: &mut Filters,
+    views: &mut Query<&mut RenderVisibleEntities>,
+    shadows: &mut Query<&mut RenderShadowMapVisibleEntities>,
 ) {
     for domain in std::mem::take(&mut filters.active) {
         let class = match domain {
@@ -829,6 +949,10 @@ mod tests {
         if !world.resource::<Schedules>().contains(label.clone()) {
             return Vec::new();
         }
+        // Extract parameters read the main world while a schedule is initialized.
+        if !world.contains_resource::<MainWorld>() {
+            world.insert_resource(MainWorld::default());
+        }
         world.schedule_scope(label, |world, schedule| {
             schedule.initialize(world).unwrap();
             schedule
@@ -862,6 +986,7 @@ mod tests {
                 let extracted = scheduled_systems(world, ExtractSchedule);
                 let rendered = scheduled_systems(world, Render);
                 assert!(!extracted.contains(&identity(extract)));
+                assert!(!rendered.contains(&identity(gate)));
                 assert!(!rendered.contains(&identity(filter)));
                 assert!(!rendered.contains(&identity(restore)));
                 assert!(!world.contains_resource::<RenderTerrain>());
@@ -903,6 +1028,7 @@ mod tests {
         let world = app.get_sub_app_mut(RenderApp).unwrap().world_mut();
         assert!(scheduled_systems(world, ExtractSchedule).contains(&identity(extract)));
         let rendered = scheduled_systems(world, Render);
+        assert!(rendered.contains(&identity(gate)));
         assert!(rendered.contains(&identity(filter)));
         assert!(rendered.contains(&identity(restore)));
         assert!(world.contains_resource::<RenderTerrain>());
@@ -1045,6 +1171,206 @@ mod tests {
             ]),
             ..default()
         }
+    }
+
+    fn gate_world(cells: &[(u32, IVec2)]) -> (World, Entity, RetainedViewEntity) {
+        use bevy::render::view::{ColorGrading, RenderVisibleEntitiesClass};
+        let mut world = World::new();
+        let covered = key(7, 0);
+        let other = SurfaceKey {
+            grid: IVec2::new(9, 9),
+            ..covered
+        };
+        let mut protected = surface(Kind::Source, vec![covered]);
+        protected.protected = true;
+        world.insert_resource(RenderTerrain {
+            surfaces: HashMap::from([
+                // Owned: every cell in the plan.
+                (main(1), surface(Kind::Source, vec![covered])),
+                (main(2), surface(Kind::Batch, vec![covered])),
+                // Never yield: ring, detail, protected, partly covered, uncovered.
+                (main(3), surface(Kind::Ring, vec![covered])),
+                (main(4), surface(Kind::Detail, vec![covered])),
+                (main(5), protected),
+                (main(6), surface(Kind::Source, vec![covered, other])),
+                (main(7), surface(Kind::Source, vec![other])),
+            ]),
+            ..default()
+        });
+        let view = RetainedViewEntity::new(main(50), None, 0);
+        let mut coverage = ClusterCoverage::default();
+        if !cells.is_empty() {
+            coverage.views.insert(
+                view,
+                ClusterViewCoverage {
+                    generation: 1,
+                    layout: 1,
+                    plan: 1,
+                    cells: cells.iter().copied().collect(),
+                },
+            );
+        }
+        world.insert_resource(coverage);
+        world.init_resource::<GateFilters>();
+        let mut visible = RenderVisibleEntities::default();
+        visible.classes.insert(
+            std::any::TypeId::of::<Mesh3d>(),
+            RenderVisibleEntitiesClass {
+                entities_cpu_culling: (1..=7)
+                    .map(|id| (Entity::from_raw_u32(100 + id).unwrap(), main(id)))
+                    .collect(),
+                ..default()
+            },
+        );
+        let camera = world
+            .spawn((
+                ExtractedView {
+                    retained_view_entity: view,
+                    clip_from_view: Mat4::IDENTITY,
+                    world_from_view: GlobalTransform::IDENTITY,
+                    clip_from_world: None,
+                    target_format: bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+                    viewport: UVec4::new(0, 0, 8, 8),
+                    color_grading: ColorGrading::default(),
+                    invert_culling: false,
+                },
+                visible,
+            ))
+            .id();
+        (world, camera, view)
+    }
+
+    fn gate_class(
+        world: &World,
+        camera: Entity,
+    ) -> &bevy::render::view::RenderVisibleEntitiesClass {
+        world
+            .get::<RenderVisibleEntities>(camera)
+            .unwrap()
+            .get::<Mesh3d>()
+            .unwrap()
+    }
+
+    fn gate_frame(world: &mut World, camera: Entity, plan: &[(u32, IVec2)]) {
+        use bevy::ecs::system::RunSystemOnce;
+        // Render's next frame starts from the raw visible set with empty deltas.
+        let mut visible = world.get_mut::<RenderVisibleEntities>(camera).unwrap();
+        let class = visible
+            .classes
+            .get_mut(&std::any::TypeId::of::<Mesh3d>())
+            .unwrap();
+        class.added_entities.clear();
+        class.removed_entities.clear();
+        let view = world
+            .get::<ExtractedView>(camera)
+            .unwrap()
+            .retained_view_entity;
+        let mut coverage = world.resource_mut::<ClusterCoverage>();
+        coverage.views.clear();
+        if !plan.is_empty() {
+            coverage.views.insert(
+                view,
+                ClusterViewCoverage {
+                    generation: 1,
+                    layout: 1,
+                    plan: 1,
+                    cells: plan.iter().copied().collect(),
+                },
+            );
+        }
+        world.run_system_once(gate).unwrap();
+    }
+
+    fn gate_restore(world: &mut World) {
+        use bevy::ecs::system::RunSystemOnce;
+        world.init_resource::<Filters>();
+        world.run_system_once(restore).unwrap();
+    }
+
+    fn delta_ids(pairs: &[(Entity, MainEntity)]) -> Vec<u32> {
+        let mut ids: Vec<_> = pairs
+            .iter()
+            .map(|(_, main)| main.id().index_u32())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn gate_visible(world: &World, camera: Entity) -> Vec<u32> {
+        let mut ids: Vec<_> = gate_class(world, camera)
+            .iter_visible()
+            .map(|(_, main)| main.id().index_u32())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn cluster_owned_fallbacks_leave_queueing_once_and_return_in_the_withdrawal_frame() {
+        let covered = key(7, 0);
+        let plan = [(covered.world, covered.grid)];
+        let (mut world, camera, _) = gate_world(&plan);
+        // Frame 1: the plan covers entities 1 and 2 only. Each is dequeued exactly once.
+        gate_frame(&mut world, camera, &plan);
+        assert_eq!(gate_visible(&world, camera), vec![3, 4, 5, 6, 7]);
+        let class = gate_class(&world, camera);
+        assert!(class.added_entities.is_empty());
+        assert_eq!(delta_ids(&class.removed_entities), vec![1, 2]);
+        gate_restore(&mut world);
+        assert_eq!(gate_visible(&world, camera), vec![1, 2, 3, 4, 5, 6, 7]);
+        // Frames 2..N: an unchanged plan produces no queue delta at all, so Bevy's retained
+        // queues do no specialization or queue work for the owned fallbacks.
+        for _ in 0..5 {
+            gate_frame(&mut world, camera, &plan);
+            assert_eq!(gate_visible(&world, camera), vec![3, 4, 5, 6, 7]);
+            let class = gate_class(&world, camera);
+            assert!(class.added_entities.is_empty() && class.removed_entities.is_empty());
+            gate_restore(&mut world);
+        }
+        // The plan withdraws: both fallbacks are visible and ADDED in this very frame, which
+        // is what makes mesh queueing, running after the gate, draw them again.
+        gate_frame(&mut world, camera, &[]);
+        assert_eq!(gate_visible(&world, camera), vec![1, 2, 3, 4, 5, 6, 7]);
+        let class = gate_class(&world, camera);
+        assert_eq!(delta_ids(&class.added_entities), vec![1, 2]);
+        assert!(class.removed_entities.is_empty());
+        gate_restore(&mut world);
+        // And a withdrawn-then-restored plan is a single further dequeue, not per-frame churn.
+        gate_frame(&mut world, camera, &plan);
+        assert_eq!(gate_class(&world, camera).removed_entities.len(), 2);
+        gate_restore(&mut world);
+        gate_frame(&mut world, camera, &plan);
+        assert!(gate_class(&world, camera).removed_entities.is_empty());
+        gate_restore(&mut world);
+    }
+
+    #[test]
+    fn cluster_gate_never_hides_rings_detail_protected_or_partly_covered_fallbacks() {
+        let covered = key(7, 0);
+        let other = SurfaceKey {
+            grid: IVec2::new(9, 9),
+            ..covered
+        };
+        let terrain = gate_world(&[])
+            .0
+            .remove_resource::<RenderTerrain>()
+            .unwrap();
+        let cells: HashSet<_> = [(covered.world, covered.grid)].into_iter().collect();
+        let owned: Vec<_> = (1..=7)
+            .filter(|id| cluster_owned(&terrain.surfaces[&main(*id)], &cells))
+            .collect();
+        assert_eq!(owned, vec![1, 2]);
+        let both: HashSet<_> = cells
+            .iter()
+            .copied()
+            .chain([(other.world, other.grid)])
+            .collect();
+        let owned: Vec<_> = (1..=7)
+            .filter(|id| cluster_owned(&terrain.surfaces[&main(*id)], &both))
+            .collect();
+        // Protected, ring and detail surfaces still never yield; the partly covered source does.
+        assert_eq!(owned, vec![1, 2, 6, 7]);
+        assert!(!cluster_owned(&surface(Kind::Source, Vec::new()), &both));
     }
 
     #[test]
