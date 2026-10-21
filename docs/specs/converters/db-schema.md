@@ -77,8 +77,8 @@ metadata retention preserves the producer identity of the retained bytes.
 │  │   `cells`                │   `references`       │ `refs_rtree`        │  │
 │  │   (Cell Grid & Names)    │   (3D World Placements)│ (3D Spatial R-Tree) │  │
 │  ├──────────────────────────┼──────────────────────┼─────────────────────┤  │
-│  │   `land`                 │   `lod`              │ `scripts`           │  │
-│  │   (Terrain Heightmaps)   │  (Unused LOD Table)  │ (Papyrus Bytecode)  │  │
+│  │   `land`                 │   `lod_grid` …       │ `scripts`           │  │
+│  │   (Terrain Heightmaps)   │   (Distant LOD)      │ (Papyrus Bytecode)  │  │
 │  ├──────────────────────────┴──────────────────────┴─────────────────────┤  │
 │  │   `formid_map` & `conversion_cache`                                   │  │
 │  │   (32-bit to 64-bit ID Bridge & Cache Hashes)                        │  │
@@ -663,13 +663,66 @@ CREATE TABLE IF NOT EXISTS land (
 
 ---
 
-### 8. Level of Detail (`lod_chunks`, `lod_chunks_spatial`, `lod_build`)
+### 8. Distant Level of Detail (`lod_grid`, `lod_block`, `lod_tree_type`, `lod_tree_instance`, `lod_chunks`, `lod_chunks_spatial`, `lod_build`)
 
-Schema 5 stores spatial metadata and file-backed GLB payloads, not geometry
-blobs. Source-cell names are serialized text used for full-detail handoff.
-Bounds are world-space Creation units; `payload_path` is relative to the asset
-root and `content_hash` is the payload's SHA-256. The single build row matches
-`lod-manifest.json`.
+Two inventories share this section. The first is the distant-LOD inventory the
+runtime streams beyond the full-detail cells: the per-worldspace grid header
+(`lodsettings/<worldspace>.lod`), the terrain and object block meshes
+(`meshes/terrain/<worldspace>/[objects/]<worldspace>.<level>.<x>.<y>.btr|bto`,
+converted to GLB with `meshes/**` paths), and the tree billboards (`.lst` types
+plus `.btt` instances). Block availability comes from the files that exist, never
+from the `.lod` extents. Written after the mesh stage of the conversion
+(`crates/converter/src/portal_lod.rs`) and validated by
+`crates/converter/src/integration.rs`. This replaced the never-written `lod`
+table in schema 4.
+
+```sql
+CREATE TABLE IF NOT EXISTS lod_grid (       -- from lodsettings/<ws>.lod
+    worldspace_id INTEGER PRIMARY KEY,
+    origin_x INTEGER NOT NULL, origin_y INTEGER NOT NULL,   -- grid south-west, in cells
+    levels TEXT NOT NULL                    -- declared block levels, e.g. '4,8,16,32'
+);
+CREATE TABLE IF NOT EXISTS lod_block (      -- one converted GLB per block
+    worldspace_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,                     -- 'terrain' | 'objects'
+    level INTEGER NOT NULL,
+    block_x INTEGER NOT NULL,               -- south-west cell X (a multiple of level)
+    block_y INTEGER NOT NULL,
+    mesh_path TEXT NOT NULL,                -- 'meshes/terrain/...' GLB
+    bounds_min_x REAL, bounds_min_y REAL, bounds_min_z REAL,
+    bounds_max_x REAL, bounds_max_y REAL, bounds_max_z REAL,
+    PRIMARY KEY (worldspace_id, kind, level, block_x, block_y)
+);
+CREATE TABLE IF NOT EXISTS lod_tree_type (  -- one billboard mesh per .lst entry
+    worldspace_id INTEGER NOT NULL,
+    tree_index INTEGER NOT NULL,            -- .lst position, also the .btt group key
+    mesh_path TEXT NOT NULL,
+    size_x REAL NOT NULL, size_y REAL NOT NULL,                 -- Creation units at scale 1
+    u0 REAL NOT NULL, v0 REAL NOT NULL, u1 REAL NOT NULL, v1 REAL NOT NULL,  -- atlas rect, v from the top
+    PRIMARY KEY (worldspace_id, tree_index)
+);
+CREATE TABLE IF NOT EXISTS lod_tree_instance (  -- from <ws>.4.<x>.<y>.btt
+    worldspace_id INTEGER NOT NULL,
+    block_x INTEGER NOT NULL, block_y INTEGER NOT NULL,         -- level-4 block south-west cell
+    tree_index INTEGER NOT NULL,            -- lod_tree_type.tree_index
+    pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,  -- z is the tree's base
+    rotation REAL NOT NULL DEFAULT 0,       -- yaw in radians
+    scale REAL NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_lod_tree_block ON lod_tree_instance(worldspace_id, block_x, block_y);
+```
+
+A block whose converted mesh carries no bounds is still recorded, with NULL
+bounds, and counted the way statics with unbounded models are; the runtime
+treats NULL as an unbounded block. Tree LOD is only generated for levels the
+files actually use (level 4), and a worldspace whose `.lst` has no entries
+(`dlc01soulcairn`, `dlc2apocryphaworld`) has no types and no instances.
+
+The second inventory is the terrain-chunk LOD (#105): schema 6 stores spatial
+metadata and file-backed GLB payloads, not geometry blobs. Source-cell names are
+serialized text used for full-detail handoff. Bounds are world-space Creation
+units; `payload_path` is relative to the asset root and `content_hash` is the
+payload's SHA-256. The single build row matches `lod-manifest.json`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS lod_chunks (

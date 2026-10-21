@@ -188,6 +188,10 @@ pub enum IngestionSelection {
     /// Runtime mesh/texture/script inputs, LOD settings, and English string banks.
     RuntimeEnglishV1,
     ConverterInputsV1,
+    /// English runtime inputs plus native terrain/object LOD meshes and tree inventory inputs.
+    RuntimeEnglishV2,
+    /// All-language converter inputs plus native LOD meshes and tree inventory inputs.
+    ConverterInputsV2,
 }
 
 impl IngestionSelection {
@@ -195,6 +199,12 @@ impl IngestionSelection {
         self == Self::All
             || self == requested
             || (self == Self::ConverterInputsV1 && requested == Self::RuntimeEnglishV1)
+            || (self == Self::ConverterInputsV2
+                && matches!(
+                    requested,
+                    Self::RuntimeEnglishV2 | Self::ConverterInputsV1 | Self::RuntimeEnglishV1
+                ))
+            || (self == Self::RuntimeEnglishV2 && requested == Self::RuntimeEnglishV1)
     }
 }
 

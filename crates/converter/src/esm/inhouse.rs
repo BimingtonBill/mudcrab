@@ -393,6 +393,7 @@ fn write_record_archive_scope(output: &Path, complete: bool, signatures: &[[u8; 
                 "inhouse_terrain_layers", "inhouse_unresolved_terrain_textures", "record_overrides", "inhouse_plugin_masters", "inhouse_schema_addons", "record_diagnostics"],
         "deferred_runtime_tables": DEFERRED_RUNTIME_TABLES,
         "unchanged_auxiliary_tables": ["conversion_cache", "lod", "lod_chunks", "lod_build",
+            "lod_grid", "lod_block", "lod_tree_type", "lod_tree_instance",
             "lod_chunks_spatial", "lod_chunks_spatial_node", "lod_chunks_spatial_parent", "lod_chunks_spatial_rowid"],
             "preserved_cache_files": ["cell_cache.rkyv", "cell_cache_preserved.rkyv"],
             "typed_signatures": typed_signatures,

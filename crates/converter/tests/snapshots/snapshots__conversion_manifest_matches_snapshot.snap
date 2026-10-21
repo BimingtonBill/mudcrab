@@ -14,8 +14,8 @@ expression: manifest
         }
       ],
       "reader_version": 1,
-      "recipe": "runtime-english-v1",
-      "selection": "runtime_english_v1",
+      "recipe": "runtime-english-v2",
+      "selection": "runtime_english_v2",
       "source_hash": "[source_hash]"
     },
     "skyrim - misc.bsa": {
@@ -32,8 +32,8 @@ expression: manifest
         }
       ],
       "reader_version": 1,
-      "recipe": "runtime-english-v1",
-      "selection": "runtime_english_v1",
+      "recipe": "runtime-english-v2",
+      "selection": "runtime_english_v2",
       "source_hash": "[source_hash]"
     },
     "skyrim - textures.ba2": {
@@ -69,8 +69,8 @@ expression: manifest
           "size": 2892
         }
       ],
-      "recipe": "runtime-english-v1",
-      "selection": "runtime_english_v1",
+      "recipe": "runtime-english-v2",
+      "selection": "runtime_english_v2",
       "source_hash": "[source_hash]"
     }
   },
@@ -137,6 +137,37 @@ expression: manifest
       "source_hash": "[source_hash]"
     }
   },
+  "extensions": [
+    {
+      "built_from": "87c5e0a8c34c155d989f10462f6c5b518fa9fd883bdd2f5f78843d118cbfc5e7",
+      "id": "mudcrab.lod_inventory",
+      "owns": {
+        "files": [
+          "meshes/terrain/"
+        ],
+        "gltf_extensions": [],
+        "indexes": [
+          "idx_lod_tree_block"
+        ],
+        "tables": [
+          "lod_block",
+          "lod_grid",
+          "lod_tree_instance",
+          "lod_tree_type"
+        ]
+      },
+      "sha256": "05684fff956d8f52cf3d006330d4f4a8cfafd2348371fd660ccbc6eb88f3a3b9",
+      "stats": {
+        "lod_block": 0,
+        "lod_block_objects": 0,
+        "lod_block_terrain": 0,
+        "lod_grid": 1,
+        "lod_tree_instance": 0,
+        "lod_tree_type": 0
+      },
+      "version": 1
+    }
+  ],
   "failures": {},
   "inputs_by_kind": {
     "dds": 6,

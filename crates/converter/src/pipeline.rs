@@ -3,7 +3,7 @@ use crate::{
         ArchiveExtractor, ExtractOptions, ExtractionProgress, ExtractionTimings,
         RawIngestionSession, prune_stale_reader_packs,
     },
-    asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
+    asset_path::{AssetKind, canonical_asset_path, normalize_separators, resolve_asset_uri},
     cache::{
         CONVERTER_SCHEMA_VERSION, CacheEntry, ConversionManifest, IngestionJournal,
         IngestionSelection, StagedOutput, StagingJournal, asset_configuration_hash_for_schema,
@@ -29,6 +29,7 @@ use crate::{
         },
     },
     mesh::MeshConverter,
+    portal_lod,
     progress::{AssetOutcome, ProgressEvent, ProgressStage},
     script::ScriptConverter,
     texture::{TextureConverter, TextureEncoding, TextureSemantic, publish_ktx2_file},
@@ -153,6 +154,10 @@ pub struct PipelineReport {
     pub inputs_by_kind: BTreeMap<String, u64>,
     pub elapsed_ms: u128,
     pub integration: Option<IntegrationReport>,
+    /// Distant-LOD inventory written into the world database, absent when the
+    /// asset set has no world database or no LOD assets.
+    #[serde(default)]
+    pub lod: Option<portal_lod::LodInventoryReport>,
 }
 
 /// A run is complete when no asset conversion was skipped and no conversion warnings remain.
@@ -780,9 +785,9 @@ impl AssetPipeline {
             extraction_options.selection = if config.extract_all_archive_files {
                 IngestionSelection::All
             } else if crate::esm::inhouse::is_english(&config.language) {
-                IngestionSelection::RuntimeEnglishV1
+                IngestionSelection::RuntimeEnglishV2
             } else {
-                IngestionSelection::ConverterInputsV1
+                IngestionSelection::ConverterInputsV2
             };
             extraction_options.sync = config.ingestion_sync;
             extraction_options.reuse_cache = !config.invalidate_cache;
@@ -1245,7 +1250,7 @@ impl AssetPipeline {
                 .convert_kind(
                     &vfs_files,
                     &source_paths,
-                    "nif",
+                    &["nif", "btr", "bto"],
                     ProgressStage::Meshes,
                     None,
                     &restored_meshes,
@@ -1262,6 +1267,32 @@ impl AssetPipeline {
             .map(|path| path.to_string_lossy().replace('\\', "/"))
             .collect();
         invalidate_staged_mesh_outputs(staging, &accepted_meshes)?;
+        // Distant-LOD inventory. It needs the world database and the converted
+        // block GLBs, and must run before the texture stage so the tree atlas
+        // is encoded as a base colour texture and its sRGB alias is published
+        // for the generated billboards.
+        let lod = portal_lod::record_lod_inventory(staging, &plugins)?;
+        report.artifacts.extend(lod.billboards.iter().cloned());
+        // Only defects that leave the inventory incomplete fail the run; a
+        // block without bounds or a stale instance is counted in the report.
+        report.warnings.extend(lod.errors.iter().cloned());
+        if lod.worldspaces > 0 {
+            eprintln!(
+                "distant LOD inventory: {} worldspaces, {} grids, {} terrain and {} object blocks,                  {} tree types, {} tree instances ({} unresolved), {} trailing-byte blocks,                  {} unbounded blocks, {} error(s), {} issue(s)",
+                lod.worldspaces,
+                lod.grids,
+                lod.terrain_blocks,
+                lod.object_blocks,
+                lod.tree_types,
+                lod.tree_instances,
+                lod.tree_instances_unresolved,
+                lod.trailing_blocks,
+                lod.unbounded_blocks,
+                lod.errors.len(),
+                lod.issues.len(),
+            );
+        }
+        report.lod = Some(lod);
         let texture_semantics = collect_texture_semantics(staging, &source_textures)?;
         report.phase_elapsed_ms.insert(
             "meshes_and_texture_semantics".into(),
@@ -1284,7 +1315,7 @@ impl AssetPipeline {
                 .convert_kind(
                     &vfs_files,
                     &source_paths,
-                    "dds",
+                    &["dds"],
                     ProgressStage::Textures,
                     Some(&texture_semantics),
                     &BTreeSet::new(),
@@ -1439,7 +1470,7 @@ impl AssetPipeline {
                 .convert_kind(
                     &vfs_files,
                     &source_paths,
-                    "pex",
+                    &["pex"],
                     ProgressStage::Scripts,
                     None,
                     &BTreeSet::new(),
@@ -1743,25 +1774,31 @@ impl ConversionBatch<'_> {
         &mut self,
         files: &[PathBuf],
         source_paths: &BTreeMap<PathBuf, PathBuf>,
-        source_ext: &str,
+        source_exts: &[&str],
         stage: ProgressStage,
         texture_semantics: Option<&BTreeMap<String, BTreeSet<TextureSemantic>>>,
         force_reconvert: &BTreeSet<String>,
     ) -> Result<()> {
         let selected_paths: Vec<_> = files
             .iter()
-            .filter(|path| extension(path, &[source_ext]))
+            .filter(|path| extension(path, source_exts))
             .cloned()
             .collect();
 
-        let (target_ext, asset_kind) = match source_ext {
-            "dds" => ("ktx2", AssetKind::Texture),
-            "nif" => ("glb", AssetKind::Mesh),
-            "pex" => ("luau", AssetKind::Script),
+        let (target_ext, asset_kind) = match source_exts {
+            ["dds"] => ("ktx2", AssetKind::Texture),
+            // `btr`/`bto` are Skyrim's distant terrain and object LOD meshes:
+            // NIFs in a different container, converted like any other mesh.
+            ["nif", "btr", "bto"] => ("glb", AssetKind::Mesh),
+            ["pex"] => ("luau", AssetKind::Script),
             _ => unreachable!(),
         };
         let staging_vfs = self.staging.join("vfs");
         let mut target_sources = BTreeMap::<String, PathBuf>::new();
+        // The group's primary extension is always recorded, even at zero; the secondary
+        // distant-LOD containers appear only when an install actually has some.
+        let mut inputs_by_kind = BTreeMap::<String, u64>::new();
+        inputs_by_kind.insert(source_exts[0].to_owned(), 0);
         let mut selected = Vec::with_capacity(selected_paths.len());
         // The source sizes are one `stat` each and give the status line something to weigh the
         // stage by: a mesh and a texture are the same "item" but not the same work.
@@ -1769,6 +1806,13 @@ impl ConversionBatch<'_> {
         let mut bytes_total = 0u64;
         for source in selected_paths {
             let relative = source.strip_prefix(&staging_vfs)?.to_owned();
+            let source_ext = relative
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!("asset has no extension: {}", relative.display())
+                })?;
             let target_key =
                 canonical_asset_path(&relative.to_string_lossy(), asset_kind, target_ext)?;
             if let Some(previous) = target_sources.insert(target_key.clone(), relative.clone()) {
@@ -1779,7 +1823,7 @@ impl ConversionBatch<'_> {
                 );
             }
             let source_key =
-                canonical_asset_path(&relative.to_string_lossy(), asset_kind, source_ext)?;
+                canonical_asset_path(&relative.to_string_lossy(), asset_kind, &source_ext)?;
             let encoding = if source_ext == "dds" {
                 let known_semantics = texture_semantics
                     .and_then(|semantics| semantics.get(&target_key))
@@ -1790,6 +1834,7 @@ impl ConversionBatch<'_> {
                 None
             };
             let source = source_paths.get(&source).unwrap_or(&source).clone();
+            *inputs_by_kind.entry(source_ext).or_default() += 1;
             let source_bytes = fs::metadata(&source).map_or(0, |metadata| metadata.len());
             bytes_total += source_bytes;
             source_sizes.insert(source_key.clone(), source_bytes);
@@ -1802,9 +1847,9 @@ impl ConversionBatch<'_> {
             ));
         }
 
-        self.manifest
-            .inputs_by_kind
-            .insert(source_ext.to_owned(), selected.len() as u64);
+        for (source_ext, count) in inputs_by_kind {
+            self.manifest.inputs_by_kind.insert(source_ext, count);
+        }
 
         if selected.is_empty() {
             return Ok(());
@@ -1817,7 +1862,7 @@ impl ConversionBatch<'_> {
 
         let staging_root = self.staging.to_path_buf();
         let output_dir = self.config.output_dir.clone();
-        let source_kind = source_ext.to_owned();
+        let is_texture_pass = source_exts.contains(&"dds");
         let mesh_sources = source_paths
             .iter()
             .map(|(path, source)| {
@@ -1835,8 +1880,11 @@ impl ConversionBatch<'_> {
         let cpu_jobs = self.config.cpu_jobs;
         let previous_entries = self.previous.entries.clone();
         let staged_outputs = Arc::clone(&self.staged);
-        let expected_configuration =
-            asset_configuration_hash_for_schema(self.config, CONVERTER_SCHEMA_VERSION, source_ext)?;
+        let expected_configuration = asset_configuration_hash_for_schema(
+            self.config,
+            CONVERTER_SCHEMA_VERSION,
+            source_exts[0],
+        )?;
         let worker_configuration = expected_configuration.clone();
         let force_reconvert = force_reconvert.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1846,7 +1894,7 @@ impl ConversionBatch<'_> {
         let rayon_handle = spawn_blocking(move || -> Result<()> {
             use rayon::prelude::*;
 
-            let gpu = if source_kind == "dds" {
+            let gpu = if is_texture_pass {
                 if let TextureEncoder::Gpu { quality, batch_mb } = texture_encoder {
                     match GpuUastc::new(quality, batch_mb) {
                         Ok(mut gpu) => {
@@ -1977,6 +2025,14 @@ impl ConversionBatch<'_> {
                         // Retry a mesh whose pruned source or scoped fallback is back. General
                         // mesh hashes omit texture bytes, and the volcanic presence bits alone
                         // cannot detect a failed fallback DDS repaired in place.
+                        // A mesh whose pruned texture source is back must be converted again:
+                        // the mesh cache does not hash texture dependencies, so a reused GLB
+                        // would never regain the reference.
+                        let source_kind = relative
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
                         let forced =
                             force_reconvert.contains(target_rel.to_string_lossy().as_ref());
                         let target = staging_root.join(&target_rel);
@@ -2119,7 +2175,7 @@ impl ConversionBatch<'_> {
                                     )
                                     .is_ok()
                                 }),
-                                "nif" | "pex" => true,
+                                "nif" | "btr" | "bto" | "pex" => true,
                                 _ => false,
                             };
 
@@ -2198,6 +2254,11 @@ impl ConversionBatch<'_> {
                                             &target,
                                             skeleton.as_deref(),
                                         ),
+                                        // Distant LOD meshes are NIF-shaped containers with no
+                                        // skeleton dependency.
+                                        "btr" | "bto" => {
+                                            MeshConverter::convert_nif_to_glb(&source, &target)
+                                        }
                                         "pex" => {
                                             ScriptConverter::convert_pex_to_luau(&source, &target)
                                         }
@@ -2820,23 +2881,46 @@ pub(crate) fn validate_artifact(
     Ok(())
 }
 
+/// Loose distant-LOD billboard metadata: the
+/// `meshes/terrain/<worldspace>/trees/<worldspace>.lst` table and the `.btt`
+/// blocks beside it. The pipeline only ever reads them back, but the game lets a
+/// loose copy of either replace the archived one — which is how LOD mods such as
+/// DynDOLOD ship — so they are overlaid like a converted asset. The
+/// `lodsettings/<worldspace>.lod` header has its own [`AssetKind`], so it goes
+/// through `canonical_asset_path` with the other converted assets.
+const LOD_METADATA_EXTENSIONS: [&str; 2] = ["lst", "btt"];
+
 pub(crate) fn overlay_loose_assets(data: &Path, vfs: &Path, files: &[PathBuf]) -> Result<()> {
     let mut seen = BTreeMap::<String, PathBuf>::new();
-    for source in files
-        .iter()
-        .filter(|path| extension(path, &["dds", "nif", "pex", "lod"]))
-    {
+    for source in files.iter().filter(|path| {
+        extension(path, &["dds", "nif", "btr", "bto", "pex", "lod"])
+            || extension(path, &LOD_METADATA_EXTENSIONS)
+    }) {
         let relative = source.strip_prefix(data)?;
-        let (kind, extension) = if extension(source, &["dds"]) {
-            (AssetKind::Texture, "dds")
-        } else if extension(source, &["nif"]) {
-            (AssetKind::Mesh, "nif")
-        } else if extension(source, &["pex"]) {
-            (AssetKind::Script, "pex")
+        let canonical = if extension(source, &LOD_METADATA_EXTENSIONS) {
+            // The `trees/` tables are neither meshes nor any kind's extension,
+            // so `canonical_asset_path` would re-root or rewrite them. The
+            // inventory finds them where the archive put them, and lowercasing
+            // keeps the loose path the archive's own collision rule already
+            // compares case-insensitively, which is what makes a loose copy
+            // replace the archived one.
+            normalize_separators(relative).to_ascii_lowercase()
         } else {
-            (AssetKind::LodSettings, "lod")
+            let (kind, extension) = if extension(source, &["dds"]) {
+                (AssetKind::Texture, "dds")
+            } else if extension(source, &["nif"]) {
+                (AssetKind::Mesh, "nif")
+            } else if extension(source, &["btr"]) {
+                (AssetKind::Mesh, "btr")
+            } else if extension(source, &["bto"]) {
+                (AssetKind::Mesh, "bto")
+            } else if extension(source, &["pex"]) {
+                (AssetKind::Script, "pex")
+            } else {
+                (AssetKind::LodSettings, "lod")
+            };
+            canonical_asset_path(&relative.to_string_lossy(), kind, extension)?
         };
-        let canonical = canonical_asset_path(&relative.to_string_lossy(), kind, extension)?;
         if let Some(previous) = seen.insert(canonical.clone(), source.to_owned()) {
             bail!(
                 "loose assets contain normalized path collision for {canonical}: {} and {}",
@@ -2851,10 +2935,44 @@ pub(crate) fn overlay_loose_assets(data: &Path, vfs: &Path, files: &[PathBuf]) -
         // A reused archive entry links its `vfs` file to the cache blob, so this override has to
         // replace the path rather than write through it: copying over the link would truncate the
         // file every other name shares, the blob and the previous output included.
+        //
+        // Written beside the destination and renamed, so a kill mid-copy cannot leave a torn file
+        // under the real name for a resumed run to accept. The fallible copy comes first, so a
+        // failed one leaves the previous file in place.
+        let temporary = destination.with_file_name(format!(
+            ".{}.{}.partial",
+            destination
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            std::process::id()
+        ));
+        if let Err(error) = fs::copy(source, &temporary) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source.display(),
+                    temporary.display()
+                )
+            });
+        }
+        // Flushed before the rename, like the converter's other writers, so a crash right after
+        // it cannot leave a torn file under the real name.
+        // Opened for writing: on Windows a flush needs write access.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
+            .and_then(|file| file.sync_all())
+            .wrap_err_with(|| format!("failed to flush {}", temporary.display()))?;
         if destination.exists() {
             fs::remove_file(&destination)?;
         }
-        fs::copy(source, destination)?;
+        fs::rename(&temporary, &destination)
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&temporary);
+            })
+            .wrap_err_with(|| format!("failed to publish {}", destination.display()))?;
     }
     Ok(())
 }
@@ -6688,6 +6806,62 @@ mod tests {
         assert_eq!(fs::read(&previous_blob).unwrap(), b"archive bytes");
     }
 
+    /// Every file under `root` whose name looks like a writer's leftover.
+    fn temporaries_under(root: &Path) -> Vec<PathBuf> {
+        WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry.file_name().to_string_lossy().ends_with(".partial")
+            })
+            .map(|entry| entry.path().to_path_buf())
+            .collect()
+    }
+
+    /// The override copies through a temporary name and renames it into place, so the destination
+    /// name never holds half a file: a failed copy leaves the previous file untouched rather than
+    /// removed or torn.
+    #[test]
+    fn a_loose_override_never_leaves_a_temporary_under_the_destination_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_vfs = directory.path().join("staging/vfs");
+        let destination = staging_vfs.join("textures/rock.dds");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"archive bytes").unwrap();
+
+        // A source the copy cannot read: a directory where a file is expected.
+        let data = directory.path().join("Data");
+        let loose = data.join("textures/rock.dds");
+        fs::create_dir_all(&loose).unwrap();
+
+        assert!(
+            overlay_loose_assets(&data, &staging_vfs, std::slice::from_ref(&loose)).is_err(),
+            "copying a directory as a file fails"
+        );
+
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"archive bytes",
+            "a failed override destroyed the previous file"
+        );
+        assert!(
+            temporaries_under(&staging_vfs).is_empty(),
+            "a failed override left a temporary behind"
+        );
+
+        // The successful copy publishes the new bytes and still leaves no temporary.
+        fs::remove_dir_all(&loose).unwrap();
+        fs::write(&loose, b"loose override").unwrap();
+        overlay_loose_assets(&data, &staging_vfs, std::slice::from_ref(&loose)).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"loose override");
+        assert!(
+            temporaries_under(&staging_vfs).is_empty(),
+            "an override left a temporary behind"
+        );
+    }
+
     /// MO2 activity accepts the same exact/space/dash/underscore boundary as installed ownership.
     #[test]
     fn mo2_archives_use_shared_owner_separator_rule() {
@@ -8949,7 +9123,7 @@ mod tests {
         fs::write(data.join("review.ba2"), &archive).unwrap();
         let recipe = PathBuf::from("batches")
             .join(hash_bytes(&archive))
-            .join("runtime-english-v1");
+            .join(IngestionSelection::RuntimeEnglishV2.recipe());
         let pack_directory = staging.join(".ingestion-cache").join(&recipe);
         fs::create_dir_all(&pack_directory).unwrap();
         let abandoned = [

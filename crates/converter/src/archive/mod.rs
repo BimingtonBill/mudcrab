@@ -467,6 +467,8 @@ impl IngestionSelection {
             Self::All => "all-v1",
             Self::ConverterInputsV1 => "converter-inputs-v1",
             Self::RuntimeEnglishV1 => "runtime-english-v1",
+            Self::ConverterInputsV2 => "converter-inputs-v2",
+            Self::RuntimeEnglishV2 => "runtime-english-v2",
         }
     }
 
@@ -479,6 +481,8 @@ impl IngestionSelection {
             "" | "all-v1" => Self::All,
             "converter-inputs-v1" => Self::ConverterInputsV1,
             "runtime-english-v1" => Self::RuntimeEnglishV1,
+            "converter-inputs-v2" => Self::ConverterInputsV2,
+            "runtime-english-v2" => Self::RuntimeEnglishV2,
             _ => return false,
         };
         proven.can_satisfy(self)
@@ -508,7 +512,7 @@ impl ExtractOptions {
         Self {
             cpu_jobs,
             io_jobs,
-            selection: ArchiveSelection::ConverterInputsV1,
+            selection: ArchiveSelection::ConverterInputsV2,
             checkpoint_dir,
             reuse_cache: true,
             sync: IngestionSync::Archive,
@@ -687,6 +691,20 @@ impl ArchiveExtractor {
         output_root: &Path,
     ) -> Result<Vec<ExtractedFile>> {
         extract_selected_reporting(archive_path, output_root, is_lod_setting, None, None)
+    }
+
+    /// portal: extracts the files the distant-LOD inventory reads, and nothing else.
+    pub(crate) fn extract_lod_inventory_inputs(
+        archive_path: &Path,
+        output_root: &Path,
+    ) -> Result<Vec<ExtractedFile>> {
+        extract_selected_reporting(
+            archive_path,
+            output_root,
+            crate::portal_lod::is_inventory_input,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn extract_paths(
@@ -899,6 +917,19 @@ fn extract_selected_with_sync_reporting(
 }
 
 fn selection_includes(selection: IngestionSelection, path: &Path) -> bool {
+    // Keep V1's meaning immutable: old filtered inventories do not prove native LOD coverage.
+    // The inventory consumer owns the added namespace; extensions elsewhere stay unselected.
+    match selection {
+        IngestionSelection::ConverterInputsV2 => {
+            return selection_includes(IngestionSelection::ConverterInputsV1, path)
+                || crate::portal_lod::is_inventory_input(path);
+        }
+        IngestionSelection::RuntimeEnglishV2 => {
+            return selection_includes(IngestionSelection::RuntimeEnglishV1, path)
+                || crate::portal_lod::is_inventory_input(path);
+        }
+        _ => {}
+    }
     if selection == IngestionSelection::ConverterInputsV1 {
         return path
             .extension()
@@ -1229,7 +1260,10 @@ pub(crate) fn safe_relative_path(name: &str) -> Result<PathBuf> {
     let kind = extension.and_then(|extension| {
         if extension.eq_ignore_ascii_case("dds") {
             Some(AssetKind::Texture)
-        } else if extension.eq_ignore_ascii_case("nif") {
+        } else if extension.eq_ignore_ascii_case("nif")
+            || extension.eq_ignore_ascii_case("btr")
+            || extension.eq_ignore_ascii_case("bto")
+        {
             Some(AssetKind::Mesh)
         } else if extension.eq_ignore_ascii_case("pex") {
             Some(AssetKind::Script)
@@ -2116,6 +2150,350 @@ mod tests {
         }
     }
 
+    fn native_lod_archive(root: &Path, ba2: bool) -> PathBuf {
+        let entries = [
+            dummy_content::Entry::new("textures/test.dds", b"texture"),
+            dummy_content::Entry::new("strings/test_english.strings", b"english"),
+            dummy_content::Entry::new("strings/test_french.strings", b"french"),
+            dummy_content::Entry::new("meshes/terrain/testworld/testworld.4.0.0.btr", b"terrain"),
+            dummy_content::Entry::new(
+                "meshes/terrain/testworld/objects/testworld.4.0.0.bto",
+                b"object",
+            ),
+            dummy_content::Entry::new("meshes/terrain/testworld/trees/testworld.lst", b"tree list"),
+            dummy_content::Entry::new(
+                "meshes/terrain/testworld/trees/testworld.4.0.0.btt",
+                b"tree block",
+            ),
+            dummy_content::Entry::new("docs/unrelated.btr", b"not terrain"),
+            dummy_content::Entry::new("docs/unrelated.bto", b"not objects"),
+            dummy_content::Entry::new("docs/unrelated.lst", b"not a tree list"),
+            dummy_content::Entry::new("docs/unrelated.btt", b"not a tree block"),
+            dummy_content::Entry::new("sound/test.wav", b"sound"),
+        ];
+        let (name, bytes) = if ba2 {
+            (
+                "native.ba2",
+                dummy_content::ba2::general(&entries, dummy_content::ba2::Compression::None)
+                    .unwrap(),
+            )
+        } else {
+            (
+                "native.bsa",
+                dummy_content::bsa::v105(&entries, dummy_content::bsa::Compression::None).unwrap(),
+            )
+        };
+        let archive = root.join(name);
+        fs::write(&archive, bytes).unwrap();
+        archive
+    }
+
+    fn assert_native_lod_inputs(output: &Path) {
+        for (path, payload) in [
+            (
+                "meshes/terrain/testworld/testworld.4.0.0.btr",
+                b"terrain".as_slice(),
+            ),
+            (
+                "meshes/terrain/testworld/objects/testworld.4.0.0.bto",
+                b"object".as_slice(),
+            ),
+            (
+                "meshes/terrain/testworld/trees/testworld.lst",
+                b"tree list".as_slice(),
+            ),
+            (
+                "meshes/terrain/testworld/trees/testworld.4.0.0.btt",
+                b"tree block".as_slice(),
+            ),
+        ] {
+            assert_eq!(fs::read(output.join(path)).unwrap(), payload, "{path}");
+        }
+        for path in [
+            "meshes/docs/unrelated.btr",
+            "meshes/docs/unrelated.bto",
+            "docs/unrelated.lst",
+            "docs/unrelated.btt",
+            "sound/test.wav",
+        ] {
+            assert!(!output.join(path).exists(), "{path}");
+        }
+    }
+
+    #[test]
+    fn expanded_policies_extract_native_lod_inputs_and_keep_language_and_path_boundaries() {
+        for ba2 in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let archive = native_lod_archive(directory.path(), ba2);
+            for (selection, count, french) in [
+                (IngestionSelection::RuntimeEnglishV2, 6, false),
+                (IngestionSelection::ConverterInputsV2, 7, true),
+            ] {
+                let root = directory.path().join(selection.recipe());
+                let output = root.join("vfs");
+                let mut options = ExtractOptions::converter(1, 1, None);
+                options.selection = selection;
+                let outcome = ArchiveExtractor::extract_batched(
+                    &archive,
+                    &output,
+                    Path::new("unused"),
+                    &root.join("cache"),
+                    None,
+                    true,
+                    &options,
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert!(!outcome.cache_hit);
+                assert_eq!(outcome.files.len(), count);
+                assert_eq!(outcome.cache_entry.selection, selection);
+                assert_eq!(outcome.cache_entry.recipe, selection.recipe());
+                assert_native_lod_inputs(&output);
+                assert!(output.join("strings/test_english.strings").is_file());
+                assert_eq!(output.join("strings/test_french.strings").is_file(), french);
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_policies_reextract_old_filtered_inventories_and_resume_current_packs() {
+        for old in [
+            IngestionSelection::RuntimeEnglishV1,
+            IngestionSelection::ConverterInputsV1,
+        ] {
+            for requested in [
+                IngestionSelection::RuntimeEnglishV2,
+                IngestionSelection::ConverterInputsV2,
+            ] {
+                for same_cache in [false, true] {
+                    for with_manifest in [false, true] {
+                        let directory = tempfile::tempdir().unwrap();
+                        let archive = native_lod_archive(directory.path(), false);
+                        let old_cache = directory.path().join("old/cache");
+                        let mut options = ExtractOptions::converter(1, 1, None);
+                        options.selection = old;
+                        let previous = ArchiveExtractor::extract_batched(
+                            &archive,
+                            &directory.path().join("old/vfs"),
+                            Path::new("unused"),
+                            &old_cache,
+                            None,
+                            true,
+                            &options,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            previous.files.len(),
+                            if old == IngestionSelection::RuntimeEnglishV1 {
+                                2
+                            } else {
+                                3
+                            }
+                        );
+                        assert!(!previous.cache_entry.covers(requested));
+                        let cache = if same_cache {
+                            old_cache.clone()
+                        } else {
+                            directory.path().join("new/cache")
+                        };
+                        let output = directory.path().join("new/vfs");
+                        options.selection = requested;
+                        let expanded = ArchiveExtractor::extract_batched(
+                            &archive,
+                            &output,
+                            &old_cache,
+                            &cache,
+                            with_manifest.then_some(&previous.cache_entry),
+                            true,
+                            &options,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        assert!(
+                            !expanded.cache_hit,
+                            "{old:?} -> {requested:?}, same_cache={same_cache}, manifest={with_manifest}"
+                        );
+                        assert!(expanded.timings.payload_writes >= 4);
+                        assert_native_lod_inputs(&output);
+                        assert_eq!(
+                            expanded.files.len(),
+                            if requested == IngestionSelection::RuntimeEnglishV2 {
+                                6
+                            } else {
+                                7
+                            }
+                        );
+                        assert_eq!(
+                            output.join("strings/test_french.strings").is_file(),
+                            requested == IngestionSelection::ConverterInputsV2
+                        );
+                        let resumed_output = directory.path().join("resumed/vfs");
+                        let resumed = ArchiveExtractor::extract_batched(
+                            &archive,
+                            &resumed_output,
+                            &cache,
+                            &cache,
+                            None,
+                            true,
+                            &options,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        assert!(
+                            resumed.cache_hit,
+                            "current sealed packs support manifest-free resume"
+                        );
+                        assert_eq!(resumed.timings.payload_writes, 0);
+                        assert_native_lod_inputs(&resumed_output);
+                        assert_eq!(resumed.cache_entry, expanded.cache_entry);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_superset_supplies_english_but_all_requires_unselected_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = native_lod_archive(directory.path(), false);
+        let cache = directory.path().join("cache");
+        let mut options = ExtractOptions::converter(1, 1, None);
+        let converter = ArchiveExtractor::extract_batched(
+            &archive,
+            &directory.path().join("converter/vfs"),
+            &cache,
+            &cache,
+            None,
+            true,
+            &options,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(converter.files.len(), 7);
+        options.selection = IngestionSelection::RuntimeEnglishV2;
+        let english_output = directory.path().join("english/vfs");
+        let english = ArchiveExtractor::extract_batched(
+            &archive,
+            &english_output,
+            &cache,
+            &cache,
+            Some(&converter.cache_entry),
+            true,
+            &options,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(english.cache_hit);
+        assert_eq!(english.files.len(), 6);
+        assert_native_lod_inputs(&english_output);
+        assert!(!english_output.join("strings/test_french.strings").exists());
+
+        options.selection = IngestionSelection::All;
+        let all_output = directory.path().join("all/vfs");
+        let all = ArchiveExtractor::extract_batched(
+            &archive,
+            &all_output,
+            &cache,
+            &cache,
+            Some(&english.cache_entry),
+            true,
+            &options,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!all.cache_hit);
+        assert_eq!(all.files.len(), 12);
+        assert_eq!(all.cache_entry.recipe, "all-v1");
+        for path in [
+            "meshes/docs/unrelated.btr",
+            "meshes/docs/unrelated.bto",
+            "docs/unrelated.lst",
+            "docs/unrelated.btt",
+            "sound/test.wav",
+            "strings/test_french.strings",
+        ] {
+            assert!(all_output.join(path).is_file(), "{path}");
+        }
+    }
+
+    #[test]
+    fn expanded_cache_coverage_requires_both_selection_and_recipe_proofs() {
+        for requested in [
+            IngestionSelection::RuntimeEnglishV2,
+            IngestionSelection::ConverterInputsV2,
+        ] {
+            for (selection, recipe) in [
+                (IngestionSelection::RuntimeEnglishV1, "runtime-english-v1"),
+                (IngestionSelection::ConverterInputsV1, "converter-inputs-v1"),
+                (IngestionSelection::All, "converter-inputs-v1"),
+                (IngestionSelection::All, "runtime-english-v1"),
+                (IngestionSelection::RuntimeEnglishV1, requested.recipe()),
+                (IngestionSelection::ConverterInputsV1, requested.recipe()),
+                (requested, "converter-inputs-v1"),
+                (requested, "runtime-english-v1"),
+                (requested, "future-unknown-v99"),
+            ] {
+                let entry = IngestionCacheEntry {
+                    source_hash: "source".into(),
+                    selection,
+                    recipe: recipe.into(),
+                    files: Vec::new(),
+                    reader_version: BSA_READER_VERSION,
+                };
+                assert!(
+                    !entry.covers(requested),
+                    "{selection:?}, {recipe} -> {requested:?}"
+                );
+            }
+            let legacy_all: IngestionCacheEntry = serde_json::from_value(serde_json::json!({
+                "source_hash": "source", "files": []
+            }))
+            .unwrap();
+            assert!(legacy_all.covers(requested));
+        }
+        assert!(
+            IngestionSelection::ConverterInputsV2.can_satisfy(IngestionSelection::RuntimeEnglishV2)
+        );
+        assert!(
+            !IngestionSelection::RuntimeEnglishV2
+                .can_satisfy(IngestionSelection::ConverterInputsV2)
+        );
+    }
+
+    #[test]
+    fn expanded_native_lod_selection_is_case_insensitive_and_inventory_scoped() {
+        for selection in [
+            IngestionSelection::RuntimeEnglishV2,
+            IngestionSelection::ConverterInputsV2,
+        ] {
+            for (path, expected) in [
+                ("Meshes/Terrain/TestWorld/TestWorld.4.0.0.BTR", true),
+                ("meshes/terrain/testworld/objects/testworld.4.0.0.bto", true),
+                ("meshes/terrain/testworld/trees/testworld.lst", true),
+                ("meshes/terrain/testworld/trees/testworld.4.0.0.btt", true),
+                ("meshes/other/unused.btr", false),
+                ("meshes/other/unused.bto", false),
+                ("other/unused.lst", false),
+                ("other/unused.btt", false),
+                ("meshes/terrain/unused.hkx", false),
+            ] {
+                assert_eq!(
+                    selection_includes(selection, Path::new(path)),
+                    expected,
+                    "{selection:?}: {path}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn all_cache_can_supply_runtime_subset_but_subset_requires_full_reextraction() {
         let directory = tempfile::tempdir().unwrap();
@@ -2363,6 +2741,18 @@ mod tests {
     }
 
     #[test]
+    fn lod_mesh_archive_paths_are_canonical() {
+        assert_eq!(
+            safe_relative_path(r"Meshes\Terrain\Tamriel\X.BTR").unwrap(),
+            PathBuf::from("meshes/terrain/tamriel/x.btr")
+        );
+        assert_eq!(
+            safe_relative_path(r"Meshes\Terrain\Tamriel\Objects\X.BTO").unwrap(),
+            PathBuf::from("meshes/terrain/tamriel/objects/x.bto")
+        );
+    }
+
+    #[test]
     fn rejects_normalized_collisions_within_an_archive() {
         let mut seen = BTreeMap::new();
         detect_archive_collision(&mut seen, Path::new("textures/a.dds"), "Textures/A.DDS").unwrap();
@@ -2399,6 +2789,30 @@ mod tests {
         assert!(ArchiveExtractor::extract(&archive, &output).is_err());
         assert!(!directory.path().join("escape").exists());
         assert!(!directory.path().parent().unwrap().join("escape").exists());
+        // Even an entry outside the filtered inputs must pass namespace validation first.
+        for selection in [
+            IngestionSelection::RuntimeEnglishV2,
+            IngestionSelection::ConverterInputsV2,
+        ] {
+            let mut options = ExtractOptions::converter(1, 1, None);
+            options.selection = selection;
+            assert!(
+                ArchiveExtractor::extract_batched(
+                    &archive,
+                    &output,
+                    Path::new("unused"),
+                    &directory.path().join(selection.recipe()),
+                    None,
+                    true,
+                    &options,
+                    None,
+                    None,
+                )
+                .is_err()
+            );
+            assert!(!directory.path().join("escape").exists());
+            assert!(!directory.path().parent().unwrap().join("escape").exists());
+        }
     }
 
     /// Whether the filesystem holding `directory` can hard-link. Where it cannot, `link_or_copy`

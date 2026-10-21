@@ -243,6 +243,10 @@ pub fn finalize_world_database_with_sources(
             }
         }
     }
+    // Extension `mudcrab.lod_inventory`: distant-LOD meshes are published by the pipeline before
+    // the textures are converted, so a missing one here means the block would spawn nothing.
+    // The tables are not core: they are read only when the database has them.
+    let missing_lod_meshes = check_lod_inventory_meshes(&connection, &files, &mut report)?;
     let cache_path = staging.join("cell_cache.rkyv");
     if cache_path.is_file() {
         let mmap = crate::esm::cell_cache::validate_cell_cache(&cache_path)?;
@@ -267,7 +271,8 @@ pub fn finalize_world_database_with_sources(
         && report.missing_model_count == 0
         && report.invalid_model_count == 0
         && report.missing_texture_count == 0
-        && report.cache_cells == report.terrain_cells;
+        && report.cache_cells == report.terrain_cells
+        && missing_lod_meshes == 0;
     let output = staging.join("integration-report.json");
     // Staged outputs may share an inode with a previous pack via
     // hard link; replace the path instead of writing through it.
@@ -277,6 +282,45 @@ pub fn finalize_world_database_with_sources(
     fs::write(&output, serde_json::to_vec_pretty(&report)?)
         .wrap_err_with(|| format!("failed to write {}", output.display()))?;
     Ok(Some(report))
+}
+
+/// Reports every distant-LOD mesh named in `lod_block` or `lod_tree_type` that was not converted.
+/// Returns how many are missing; each one is also an entry of `issues`.
+fn check_lod_inventory_meshes(
+    connection: &Connection,
+    files: &HashMap<String, PathBuf>,
+    report: &mut IntegrationReport,
+) -> Result<u64> {
+    let mut mesh_paths = Vec::new();
+    for table in ["lod_block", "lod_tree_type"] {
+        let present: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !present {
+            continue;
+        }
+        let mut statement = connection.prepare(&format!(
+            "SELECT DISTINCT mesh_path FROM {table} WHERE mesh_path IS NOT NULL"
+        ))?;
+        for path in statement.query_map([], |row| row.get::<_, String>(0))? {
+            mesh_paths.push(path?);
+        }
+    }
+    mesh_paths.sort_unstable();
+    mesh_paths.dedup();
+    let mut missing = 0;
+    for mesh_path in mesh_paths {
+        if !files.contains_key(&normalize(Path::new(&mesh_path))) {
+            missing += 1;
+            issue(
+                report,
+                format!("missing converted distant LOD mesh {mesh_path}"),
+            );
+        }
+    }
+    Ok(missing)
 }
 
 fn source_file_index(staging: &Path) -> Result<HashMap<String, PathBuf>> {
@@ -1160,5 +1204,60 @@ mod tests {
             crate::esm::rooms::add_overlap_rows(&mut connection).unwrap(),
             0
         );
+    }
+
+    fn lod_block_database(directory: &Path) -> Connection {
+        let connection = Connection::open(directory.join("skyrim_world.db")).unwrap();
+        crate::esm::exporter::create_tables(&connection).unwrap();
+        connection
+    }
+
+    /// Extension `mudcrab.lod_inventory`: a block naming a mesh that was not converted fails the
+    /// run and is listed in `issues`; a converted one passes.
+    #[test]
+    fn fails_when_a_listed_lod_mesh_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = lod_block_database(directory.path());
+        connection
+            .execute(
+                "INSERT INTO lod_block(worldspace_id,kind,level,block_x,block_y,mesh_path)
+                 VALUES(1,'terrain',4,0,0,'meshes/terrain/w/w.4.0.0.glb')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        empty_cache(directory.path());
+
+        let report = finalize_world_database(directory.path()).unwrap().unwrap();
+        assert!(!report.passed);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue
+                    == "missing converted distant LOD mesh meshes/terrain/w/w.4.0.0.glb"),
+            "{:?}",
+            report.issues
+        );
+
+        let mesh = directory.path().join("meshes/terrain/w/w.4.0.0.glb");
+        fs::create_dir_all(mesh.parent().unwrap()).unwrap();
+        fs::write(mesh, b"glb").unwrap();
+        let report = finalize_world_database(directory.path()).unwrap().unwrap();
+        assert!(report.passed, "{:?}", report.issues);
+    }
+
+    /// A `main`-shaped database has no LOD inventory tables; the check does not read them.
+    #[test]
+    fn passes_without_the_lod_inventory_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = lod_block_database(directory.path());
+        connection
+            .execute_batch("DROP TABLE lod_block; DROP TABLE lod_tree_type;")
+            .unwrap();
+        drop(connection);
+        empty_cache(directory.path());
+        let report = finalize_world_database(directory.path()).unwrap().unwrap();
+        assert!(report.passed, "{:?}", report.issues);
     }
 }

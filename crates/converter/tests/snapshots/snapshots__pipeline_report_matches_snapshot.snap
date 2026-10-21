@@ -143,6 +143,23 @@ expression: report
   "load_order": [
     "Skyrim.esm"
   ],
+  "lod": {
+    "billboards": [],
+    "errors": [],
+    "grids": 1,
+    "issues": [],
+    "missing_blocks": 0,
+    "object_blocks": 0,
+    "out_of_range_groups": 0,
+    "terrain_blocks": 0,
+    "trailing_blocks": 0,
+    "trailing_bytes": 0,
+    "tree_instances": 0,
+    "tree_instances_unresolved": 0,
+    "tree_types": 0,
+    "unbounded_blocks": 0,
+    "worldspaces": 1
+  },
   "lod_cache_hits": 0,
   "lod_chunks": 6,
   "lod_cpu_fallback_chunks": 0,

@@ -823,7 +823,11 @@ fn pack_directory(cache: &Path, source_hash: &str, recipe: &str) -> Result<PathB
     ensure!(
         matches!(
             recipe,
-            "all-v1" | "converter-inputs-v1" | "runtime-english-v1"
+            "all-v1"
+                | "converter-inputs-v1"
+                | "runtime-english-v1"
+                | "converter-inputs-v2"
+                | "runtime-english-v2"
         ),
         "unknown ingestion recipe"
     );
@@ -1149,6 +1153,8 @@ pub(crate) fn prune_stale_reader_packs(
         for recipe in [
             ArchiveSelection::RuntimeEnglishV1.recipe(),
             ArchiveSelection::ConverterInputsV1.recipe(),
+            ArchiveSelection::RuntimeEnglishV2.recipe(),
+            ArchiveSelection::ConverterInputsV2.recipe(),
             ArchiveSelection::All.recipe(),
         ] {
             let recipe_dir = source_dir.join(recipe);
@@ -1225,6 +1231,8 @@ fn restore_pack_inventory(
         }
         for recipe in BTreeSet::from([
             selection.recipe(),
+            ArchiveSelection::RuntimeEnglishV2.recipe(),
+            ArchiveSelection::ConverterInputsV2.recipe(),
             ArchiveSelection::ConverterInputsV1.recipe(),
             ArchiveSelection::All.recipe(),
         ]) {
@@ -1945,7 +1953,7 @@ mod tests {
         assert_eq!(current.files.len(), 7);
         assert!(!output.join("sound/a.fuz").exists());
         assert!(!output.join("docs/a.txt").exists());
-        assert_eq!(current.cache_entry.recipe, "converter-inputs-v1");
+        assert_eq!(current.cache_entry.recipe, "converter-inputs-v2");
         assert!(!packs(&cache).is_empty());
         // A filtered inventory must never be treated as proof of a full archive.
         let all = ArchiveExtractor::extract_cached(

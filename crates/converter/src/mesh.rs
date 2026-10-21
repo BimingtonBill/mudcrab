@@ -10,6 +10,7 @@ use color_eyre::{
 };
 use project_wormhole_esm::structs::strings::{SizedString8, SizedString32, StringN};
 use project_wormhole_nif::{
+    model::all::Model,
     nif_block::NifBlock,
     nif_file::{NifFile, nif_to_model, nif_to_static_model},
     nif_header::{Endianess, NifFileVersion, NifHeader},
@@ -24,6 +25,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
+
+mod lod_segments;
 
 pub struct MeshConverter;
 
@@ -96,6 +99,15 @@ impl MeshConverter {
         skeleton_path: Option<&Path>,
     ) -> Result<()> {
         let (nif, diagnostics, material_contract) = open_nif_resilient(nif_path)?;
+        // Distant-LOD blocks (`.btr` terrain, `.bto` objects) are drawn by Skyrim's LOD shader
+        // techniques, not the per-shape vertex-colour rule below: their shader flags carry no
+        // `Vertex_Colors` bit, yet their vertex colours are the LOD tint. They keep them as authored.
+        let distant_lod = nif_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("btr") || extension.eq_ignore_ascii_case("bto")
+            });
         let mut collision = collision::from_nif(nif_path, &nif)?;
         let skeleton = if nif.has_skeleton() {
             let skeleton_path = skeleton_path.ok_or_else(|| {
@@ -124,11 +136,13 @@ impl MeshConverter {
                 (static_model, true)
             }
         };
-        model.scene_root_rotation = Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+        place_converted_model(&mut model, distant_lod);
         model
             .validate()
             .map_err(|error| color_eyre::eyre::eyre!("invalid converted NIF model: {error}"))?;
-        apply_vertex_color_contract(&mut model, &nif, &material_contract)?;
+        if !distant_lod {
+            apply_vertex_color_contract(&mut model, &nif, &material_contract)?;
+        }
         let name = nif_path
             .file_stem()
             .unwrap_or_default()
@@ -161,9 +175,10 @@ impl MeshConverter {
         if glb_bounds_from_bytes(&glb).is_err() && !used_static_fallback {
             let mut static_model = nif_to_static_model(&nif)
                 .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))?;
-            static_model.scene_root_rotation =
-                Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
-            apply_vertex_color_contract(&mut static_model, &nif, &material_contract)?;
+            place_converted_model(&mut static_model, distant_lod);
+            if !distant_lod {
+                apply_vertex_color_contract(&mut static_model, &nif, &material_contract)?;
+            }
             ensure!(
                 !static_model.static_meshes.is_empty(),
                 "NIF contains no supported mesh geometry"
@@ -189,6 +204,7 @@ impl MeshConverter {
             .collect::<Result<Vec<_>>>()?;
         let glb = rewrite_materials_and_texture_uris(
             glb,
+            &nif,
             &exported_material_contract,
             &shape_blocks,
             output,
@@ -812,6 +828,47 @@ fn retain_bodies_with_nodes(
                 body.target, body.node
             ));
         }
+    }
+}
+
+/// Wraps a converted model in the Creation-to-glTF basis. A model a reference places also drops
+/// its root block's transform ([`prepare_for_placement`]); a distant-LOD block is placed by its
+/// grid, not by a reference, and keeps its root as authored.
+fn place_converted_model(model: &mut Model, distant_lod: bool) {
+    if distant_lod {
+        model.scene_root_rotation = Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+    } else {
+        prepare_for_placement(model);
+    }
+}
+
+/// Prepares a converted NIF for placement by a Creation reference: the scene
+/// is wrapped in the Creation-to-glTF basis change, and the NIF root block's
+/// own local transform is discarded.
+fn prepare_for_placement(model: &mut Model) {
+    model.scene_root_rotation = Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+    discard_root_block_transform(model);
+}
+
+/// The NIF root block (block 0) is the node a placed reference drives. When
+/// the game loads a reference, the reference's position, rotation and scale
+/// replace the root node's local transform instead of composing with it, so a
+/// model authored with a turned root (a counter corner with a 90 degree root
+/// yaw, for example) sits the way its neighbours expect. Exporting the root's
+/// transform would apply it a second time on top of the reference's. Every
+/// other node, including the root's children, keeps its transform. Skinned
+/// exports take their node tree from the skeleton file, not from the model's
+/// root block, and are unaffected.
+fn discard_root_block_transform(model: &mut Model) {
+    if let Some(root) = model
+        .static_nodes
+        .iter_mut()
+        .find(|node| node.block_index == 0)
+    {
+        // glam's defaults are the identity rotation and the zero vector.
+        root.translation = Default::default();
+        root.rotation = Default::default();
+        root.scale = 1.0;
     }
 }
 
@@ -1724,6 +1781,7 @@ impl BoundsAccumulator {
 
 fn rewrite_materials_and_texture_uris(
     glb: Vec<u8>,
+    nif: &NifFile,
     material_contract: &[NifShapeMaterial],
     shape_blocks: &[u32],
     glb_output_path: &Path,
@@ -1742,6 +1800,11 @@ fn rewrite_materials_and_texture_uris(
         .ok_or_else(|| color_eyre::eyre::eyre!("truncated GLB JSON chunk"))?;
     let mut document: serde_json::Value =
         serde_json::from_slice(json_bytes).wrap_err("NIF exporter produced invalid glTF JSON")?;
+    // Split segmented `.bto` shapes into one primitive per non-empty cell
+    // before materials are published, so publication assigns the same
+    // material (and merges its own extras) onto every primitive a mesh now
+    // has instead of assuming exactly one.
+    lod_segments::split_lod_segments(&mut document, nif, shape_blocks)?;
     publish_gltf_materials(
         &mut document,
         material_contract,
@@ -2126,6 +2189,26 @@ mod tests {
         assert_eq!(check(Some(Vec::new())), 0);
     }
 
+    /// A real, minimal `NifFile` with no `BSSubIndexTriShape` blocks: enough
+    /// for tests that exercise `rewrite_materials_and_texture_uris` against a
+    /// hand-built glTF document rather than the NIF's own conversion, and so
+    /// need a `NifFile` only so `lod_segments::split_lod_segments` has one to inspect.
+    fn nif_fixture_without_lod_shapes() -> NifFile {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixture.nif");
+        let shape = dummy_content::nif::StaticShape {
+            name: "Fixture",
+            positions: &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+            normals: &[[0.0, 0.0, 1.0]; 3],
+            uvs: &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+            indices: &[[0, 1, 2]],
+            diffuse: "textures/fixture.dds",
+            normal_texture: "textures/fixture_n.dds",
+        };
+        fs::write(&path, dummy_content::nif::static_shape(&shape).unwrap()).unwrap();
+        open_nif_resilient(&path).unwrap().0
+    }
+
     /// Verifies legacy skin partitions parse without an SSE vertex buffer and fail under the wrong layout.
     #[test]
     fn skin_partition_uses_legacy_layout_and_rejects_oversized_sse_buffer() {
@@ -2276,9 +2359,15 @@ mod tests {
                 reason: "fixture".to_owned(),
             },
         }];
-        let rewritten =
-            rewrite_materials_and_texture_uris(glb, &contract, &[7], Path::new("meshes/a.glb"))
-                .unwrap();
+        let nif = nif_fixture_without_lod_shapes();
+        let rewritten = rewrite_materials_and_texture_uris(
+            glb,
+            &nif,
+            &contract,
+            &[7],
+            Path::new("meshes/a.glb"),
+        )
+        .unwrap();
         assert_eq!(
             u32::from_le_bytes(rewritten[8..12].try_into().unwrap()) as usize,
             rewritten.len()
