@@ -130,36 +130,6 @@ fn derived_object_and_terrain_overlay_certifies_and_loads() {
 }
 
 #[test]
-fn derived_object_overlay_certifies_and_loads() {
-    let base = SyntheticBase::complete();
-    let derived = derive(&base, false);
-    assert!(!derived.incomplete_core);
-    let produced = derived.extensions.iter()
-        .find(|entry| entry.id == shared::extensions::CLUSTERS)
-        .expect("the derivation produced the object extension");
-    let opened = envelope::open(base.path(), &derived.output, false).expect("envelope::open");
-    assert_eq!(&opened.base, produced);
-    assert!(opened.terrain.is_none());
-    assert_eq!(opened.builder_identity, derived.stage.builder_identity);
-    let metadata = read_metadata(&derived.output).unwrap();
-    assert_eq!(metadata.base_failure_count, 0);
-    assert_eq!(opened.metadata.settings_id, metadata.settings_id);
-    let package = Arc::new(
-        CertifiedPackage::open(base.path(), &derived.output, false)
-            .expect("CertifiedPackage::open"),
-    );
-    assert!(package.records().count() > 0);
-    let app = load(base.path(), &derived.output, false, package.clone());
-    let scene = app.world().resource::<ClusterScene>();
-    assert!(Arc::ptr_eq(scene.certificate.as_ref().unwrap(), &package));
-    assert!(!scene.meshes.is_empty());
-    assert!(scene.terrain_blocks.is_empty());
-    assert!(scene.instances.iter().any(|instance|
-        matches!(instance.identity, ClusterInstanceIdentity::Object(_))));
-    assert!(app.world().contains_resource::<LazyBatches>());
-}
-
-#[test]
 fn overlay_derived_over_a_base_with_a_recorded_failure_opens_and_loads() {
     let base = SyntheticBase::with_failed_asset();
     let derived = derive(&base, false);

@@ -1,0 +1,18 @@
+{
+  "width": 1600,
+  "height": 900,
+  "shots": [
+    {
+      "name": "lod-far-north",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [20500, -45500, 6000],
+      "yaw": 0,
+      "pitch": 8,
+      "hfov": 90,
+      "open_door": null,
+      "reference": null,
+      "note": "The phase 2 baseline's lod-far scene: the a-north shot of local/reference/lod-check/lod-check.json, a high vantage above Riverwood looking north up the valley, where the native terrain LOD (#105) reaches the horizon with --terrain-radius 2 (portal's default ring of 8 fogs the LOD out). Held for the benchmark window rather than photographed."
+    }
+  ]
+}

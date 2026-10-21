@@ -15,6 +15,7 @@
 //!
 
 use crate::{
+    cluster::package::PackageValidationStatus,
     render::RendererMetrics,
     streaming::{ActiveSpace, RenderOrigin, StreamingMetrics, StreamingWorld},
     swap_bridge::{SwapInCameraView, SwapWaiting, pending_drawn},
@@ -481,6 +482,17 @@ pub struct SettleCounts {
     /// LOD chunks requested but not yet spawned.
     pub pending_lod_chunks: usize,
     /// Cluster batches whose material a view wants and that have not loaded.
+    pub pending_cluster_batches: usize,
+    /// Demanded cluster source/material loads that cannot complete.
+    pub failed_cluster_batches: usize,
+    /// Exact distant stock requests not yet submitted to the database.
+    pub queued_far_stock_queries: usize,
+    /// Exact distant stock requests submitted but not yet committed.
+    pub pending_far_stock_queries: usize,
+    /// Current distant stock still awaiting fresh scoped render qualification feedback.
+    pub pending_far_stock_qualification: usize,
+    /// Current demanded distant stock sources that cannot complete.
+    pub failed_far_stock_sources: usize,
     /// Distant object blocks and tree billboard blocks requested but not yet spawned.
     pub pending_lod_objects: usize,
     /// LOD chunks whose load failed and was never recovered: a terminal failure, counted so a
@@ -538,6 +550,12 @@ impl SettleCounts {
         let now = Failures::read(streaming, renderer);
         Self {
             scope: SettleScope::Capture,
+            pending_cluster_batches: streaming.pending_cluster_batches,
+            failed_cluster_batches: streaming.failed_cluster_batches,
+            queued_far_stock_queries: streaming.queued_far_stock_queries,
+            pending_far_stock_queries: streaming.pending_far_stock_queries,
+            pending_far_stock_qualification: streaming.pending_far_stock_qualification,
+            failed_far_stock_sources: streaming.failed_far_stock_sources,
             pending_lod_objects: streaming.pending_lod_object_blocks
                 + streaming.pending_lod_tree_blocks
                 + streaming.unrecovered_lod_object_blocks
@@ -596,6 +614,12 @@ impl SettleCounts {
             && self.pending_drawn == 0
             && self.pending_lod_queries == 0
             && self.pending_lod_chunks == 0
+            && self.pending_cluster_batches == 0
+            && self.failed_cluster_batches == 0
+            && self.queued_far_stock_queries == 0
+            && self.pending_far_stock_queries == 0
+            && self.pending_far_stock_qualification == 0
+            && self.failed_far_stock_sources == 0
             && self.pending_lod_objects == 0
     }
 
@@ -620,6 +644,7 @@ impl SettleCounts {
         format!(
             "cell_resident={} cell_failed={} loading_cells={} active_requests={} \
              pending_assets={} pending_surfaces={} pending_drawn={} pending_lod_queries={} pending_lod_chunks={} \
+             pending_cluster_batches={} failed_cluster_batches={} queued_far_stock_queries={} pending_far_stock_queries={} pending_far_stock_qualification={} failed_far_stock_sources={} \
              failed_lod_chunks={} unrecovered_lod_queries={} \
              unrecovered_lod_chunks={} pending_lod_objects={}",
             self.space_resident,
@@ -631,6 +656,12 @@ impl SettleCounts {
             self.pending_drawn,
             self.pending_lod_queries,
             self.pending_lod_chunks,
+            self.pending_cluster_batches,
+            self.failed_cluster_batches,
+            self.queued_far_stock_queries,
+            self.pending_far_stock_queries,
+            self.pending_far_stock_qualification,
+            self.failed_far_stock_sources,
             self.failed_lod_chunks,
             self.unrecovered_lod_queries,
             self.unrecovered_lod_chunks,
@@ -717,6 +748,19 @@ fn settle_step_with_timeout(
             shot.name,
             counts.describe()
         ))
+    } else if counts.failed_cluster_batches != 0 || counts.failed_far_stock_sources != 0 {
+        // The producer may still describe the previous pose in this Update.
+        // Never capture a failed view, but allow fresh demand facts to replace
+        // an old failure before the existing settle deadline.
+        if waited < timeout {
+            SettleStep::Waiting
+        } else {
+            SettleStep::Failed(format!(
+                "shot \"{}\": a demanded cluster or distant stock source failed to load ({})",
+                shot.name,
+                counts.describe()
+            ))
+        }
     } else if settled {
         SettleStep::Ready
     } else if waited >= timeout {
@@ -805,6 +849,10 @@ pub struct ShotsRun {
     log_failed: bool,
     frames_without_camera: u32,
     /// Seconds the current shot's view took to settle, for the log.
+    startup_held: bool,
+    package_wait_noted: bool,
+    initial_load_ready: bool,
+    initial_upload_wait_noted: bool,
     settle_seconds: f32,
     quiet_frames: u32,
     resident_meshes: usize,
@@ -881,6 +929,10 @@ impl ShotsRun {
             phase: Phase::Move,
             timer: 0.0,
             capture: None,
+            startup_held: false,
+            package_wait_noted: false,
+            initial_load_ready: false,
+            initial_upload_wait_noted: false,
             settle_seconds: 0.0,
             quiet_frames: 0,
             resident_meshes: 0,
@@ -888,6 +940,81 @@ impl ShotsRun {
             written: false,
             failed: false,
         }
+    }
+
+    fn note_initial_upload_wait(
+        &mut self,
+        scene: Option<&crate::cluster::render::ClusterScene>,
+        metrics: Option<&StreamingMetrics>,
+    ) {
+        if self.initial_upload_wait_noted {
+            return;
+        }
+        let total = scene.map_or(0, |scene| scene.blocks.len());
+        let resident = scene.map_or(0, |scene| {
+            scene
+                .blocks
+                .iter()
+                .filter(|block| block.resident.load(std::sync::atomic::Ordering::Acquire))
+                .count()
+        });
+        self.note(format!(
+            "certified; waiting for initial cluster load (resident_blocks={resident}/{total} pending_cluster_batches={:?})",
+            metrics.map(|metrics| metrics.pending_cluster_batches)
+        ));
+        self.initial_upload_wait_noted = true;
+    }
+
+    fn advance_view_automation(
+        &mut self,
+        delta: f32,
+        validation: Option<&PackageValidationStatus>,
+        scene: Option<&crate::cluster::render::ClusterScene>,
+        metrics: Option<&StreamingMetrics>,
+    ) -> bool {
+        if self.shot == 0 && !self.initial_load_ready {
+            match validation {
+                Some(PackageValidationStatus::Pending) => {
+                    if !self.package_wait_noted {
+                        self.note("waiting for requested cluster package certification");
+                        self.package_wait_noted = true;
+                    }
+                    self.timer = 0.0;
+                    self.quiet_frames = 0;
+                    self.startup_held = true;
+                    return false;
+                }
+                Some(PackageValidationStatus::Failed(reason)) => {
+                    self.fail(format!(
+                        "requested cluster package certification failed: {reason}"
+                    ));
+                    self.enter(Phase::Done);
+                    return false;
+                }
+                Some(PackageValidationStatus::Ready) | None => {
+                    if validation.is_some() && !initial_cluster_load_ready(scene, metrics) {
+                        self.note_initial_upload_wait(scene, metrics);
+                        self.timer = 0.0;
+                        self.quiet_frames = 0;
+                        self.startup_held = true;
+                        return false;
+                    }
+                    self.initial_load_ready = true;
+                    if self.package_wait_noted || self.initial_upload_wait_noted {
+                        self.note("initial cluster load ready; starting view readiness window");
+                        self.timer = 0.0;
+                        self.quiet_frames = 0;
+                        self.package_wait_noted = false;
+                    }
+                }
+            }
+        }
+        // The first ready observation ends this phase's hold; the preceding frame interval
+        // still belonged to startup. Later frames use the full unclamped real delta.
+        if !std::mem::take(&mut self.startup_held) {
+            self.timer += delta;
+        }
+        true
     }
 
     /// The window size the file asks for, in physical pixels: the scale factor is pinned to 1, so
@@ -1052,6 +1179,8 @@ fn run_shots(
     mut camera: Query<(&mut Transform, &mut Projection), With<StreamingCamera>>,
     streaming: Option<Res<StreamingWorld>>,
     metrics: Option<Res<StreamingMetrics>>,
+    validation: Option<Res<PackageValidationStatus>>,
+    scene: Option<Res<crate::cluster::render::ClusterScene>>,
     meshes: Query<(), With<Mesh3d>>,
     capture_world: CaptureWorld,
     // The surfaces the render world has not confirmed drawn while a view can see them: the settle
@@ -1171,7 +1300,6 @@ fn run_shots(
             run.next_shot();
         }
         Phase::Settle => {
-            run.timer += delta;
             let Some(mut shot) = run.file.shots.get(run.shot).cloned() else {
                 run.fail("there is no shot to render");
                 run.enter(Phase::Done);
@@ -1197,6 +1325,14 @@ fn run_shots(
                 &mut transform,
                 &mut projection,
             );
+            if !run.advance_view_automation(
+                delta,
+                validation.as_deref(),
+                scene.as_deref(),
+                metrics.as_deref(),
+            ) {
+                return;
+            }
             let view_counts = settle_counts(
                 shot.space_key(),
                 run.quiet_frames,
@@ -1595,6 +1731,18 @@ fn place_camera(
 /// door state is quiet enough to time. `pending_drawn` is the one count the streaming state cannot
 /// answer - it is a render-world fact the main world reads ([`crate::swap_bridge::pending_drawn`]),
 /// so every caller passes it in.
+pub(crate) fn initial_cluster_load_ready(
+    scene: Option<&crate::cluster::render::ClusterScene>,
+    metrics: Option<&StreamingMetrics>,
+) -> bool {
+    scene.is_some_and(|scene| {
+        scene
+            .blocks
+            .iter()
+            .all(|block| block.resident.load(std::sync::atomic::Ordering::Acquire))
+    }) && metrics.is_some_and(|metrics| metrics.pending_cluster_batches == 0)
+}
+
 pub(crate) fn settle_counts(
     key: Option<CellKey>,
     quiet_frames: u32,
@@ -1613,6 +1761,13 @@ pub(crate) fn settle_counts(
         pending_drawn,
         pending_lod_queries: metrics.map_or(0, |metrics| metrics.pending_lod_queries),
         pending_lod_chunks: metrics.map_or(0, |metrics| metrics.pending_lod_chunks),
+        pending_cluster_batches: metrics.map_or(0, |metrics| metrics.pending_cluster_batches),
+        failed_cluster_batches: metrics.map_or(0, |metrics| metrics.failed_cluster_batches),
+        queued_far_stock_queries: metrics.map_or(0, |metrics| metrics.queued_far_stock_queries),
+        pending_far_stock_queries: metrics.map_or(0, |metrics| metrics.pending_far_stock_queries),
+        pending_far_stock_qualification: metrics
+            .map_or(0, |metrics| metrics.pending_far_stock_qualification),
+        failed_far_stock_sources: metrics.map_or(0, |metrics| metrics.failed_far_stock_sources),
         pending_lod_objects: metrics.map_or(0, |metrics| {
             metrics.pending_lod_object_blocks
                 + metrics.pending_lod_tree_blocks
@@ -1659,6 +1814,263 @@ fn place_shot_space(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn initial_scene(resident: bool) -> crate::cluster::render::ClusterScene {
+        use crate::cluster::render::{ClusterScene, SceneBlock};
+        use std::sync::{Arc, atomic::AtomicBool};
+        ClusterScene {
+            certificate: None,
+            terrain_blocks: Vec::new(),
+            meshes: Vec::new(),
+            instances: Vec::new(),
+            origin_offset: Vec3::ZERO,
+            blocks: vec![SceneBlock {
+                first_instance: 0,
+                instance_count: 0,
+                meshes: Vec::new(),
+                ready: Arc::new(AtomicBool::new(true)),
+                resident: Arc::new(AtomicBool::new(resident)),
+            }],
+        }
+    }
+
+    #[test]
+    fn demanded_cluster_asset_failure_cannot_be_accepted_as_a_settled_shot() {
+        let metrics = StreamingMetrics {
+            failed_cluster_batches: 1,
+            ..default()
+        };
+        let counts = settle_counts(None, SETTLE_QUIET_FRAMES, 0, None, Some(&metrics));
+        assert_eq!(counts.failed_cluster_batches, 1);
+        let failed = SettleCounts {
+            space_resident: true,
+            ..counts
+        };
+        assert!(!shots_settled(&failed));
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).unwrap();
+        // Even a stale caller-supplied settled flag cannot bypass terminal failure.
+        assert_eq!(
+            settle_step(&file.shots[0], &failed, true, 0.0),
+            SettleStep::Waiting
+        );
+        let SettleStep::Failed(reason) =
+            settle_step(&file.shots[0], &failed, true, SETTLE_TIMEOUT_SECONDS)
+        else {
+            panic!("a failed demanded cluster load must never arm a capture");
+        };
+        assert!(reason.contains("failed_cluster_batches=1"), "{reason}");
+    }
+
+    #[test]
+    fn distant_stock_metrics_map_and_each_current_work_state_holds_settling() {
+        let metrics = StreamingMetrics {
+            queued_far_stock_queries: 2,
+            pending_far_stock_queries: 3,
+            pending_far_stock_qualification: 7,
+            failed_far_stock_sources: 5,
+            ..default()
+        };
+        let counts = settle_counts(None, SETTLE_QUIET_FRAMES, 0, None, Some(&metrics));
+        assert_eq!(counts.queued_far_stock_queries, 2);
+        assert_eq!(counts.pending_far_stock_queries, 3);
+        assert_eq!(counts.pending_far_stock_qualification, 7);
+        assert_eq!(counts.failed_far_stock_sources, 5);
+        let description = counts.describe();
+        for field in [
+            "queued_far_stock_queries=2",
+            "pending_far_stock_queries=3",
+            "pending_far_stock_qualification=7",
+            "failed_far_stock_sources=5",
+        ] {
+            assert!(description.contains(field), "{description}");
+        }
+
+        for hold in [
+            (|counts: &mut SettleCounts| counts.queued_far_stock_queries = 1)
+                as fn(&mut SettleCounts),
+            |counts| counts.pending_far_stock_queries = 1,
+            |counts| counts.pending_far_stock_qualification = 7,
+            |counts| counts.failed_far_stock_sources = 1,
+        ] {
+            let mut counts = quiet_counts();
+            hold(&mut counts);
+            assert!(!counts.is_quiet(), "{}", counts.describe());
+            assert!(!shots_settled(&counts));
+        }
+        assert!(shots_settled(&quiet_counts()));
+        let counts = SettleCounts {
+            pending_far_stock_qualification: 7,
+            ..quiet_counts()
+        };
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).unwrap();
+        assert_eq!(
+            settle_step(&file.shots[0], &counts, false, 0.0),
+            SettleStep::Waiting
+        );
+        let SettleStep::TimedOut(reason) =
+            settle_step(&file.shots[0], &counts, false, SETTLE_TIMEOUT_SECONDS)
+        else {
+            panic!("missing qualification stays pending until the existing settle deadline");
+        };
+        assert!(
+            reason.contains("pending_far_stock_qualification=7"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn distant_stock_failure_waits_for_fresh_demand_but_never_arms_capture() {
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).unwrap();
+        let shot = &file.shots[0];
+        let failed = SettleCounts {
+            failed_far_stock_sources: 1,
+            ..quiet_counts()
+        };
+        // A stale ready flag cannot capture, and a prior pose's failure gets the existing window
+        // in which the producer can replace it with this pose's current demand.
+        for waited in [0.0, SETTLE_TIMEOUT_SECONDS - 1.0] {
+            assert_eq!(
+                settle_step(shot, &failed, true, waited),
+                SettleStep::Waiting
+            );
+        }
+        assert_eq!(
+            settle_step(shot, &quiet_counts(), true, 1.0),
+            SettleStep::Ready
+        );
+        let SettleStep::Failed(reason) = settle_step(shot, &failed, true, SETTLE_TIMEOUT_SECONDS)
+        else {
+            panic!("a current demanded distant stock failure must never arm a capture");
+        };
+        assert!(reason.contains("failed_far_stock_sources=1"), "{reason}");
+    }
+
+    #[test]
+    fn initial_shot_certification_wait_preserves_the_capture_window() {
+        let phase = Phase::Settle;
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).expect("fixture parses");
+        let mut run = ShotsRun::new(file, PathBuf::from("unused-shots-output"), 60);
+        assert_eq!(
+            run.phase,
+            Phase::Move,
+            "the target pose is placed before waiting"
+        );
+        run.enter(phase);
+        run.quiet_frames = SETTLE_QUIET_FRAMES;
+        let scene = initial_scene(true);
+        let metrics = StreamingMetrics::default();
+        for _ in 0..40 {
+            assert!(!run.advance_view_automation(
+                1.0,
+                Some(&PackageValidationStatus::Pending),
+                None,
+                None
+            ));
+        }
+        assert_eq!(
+            run.phase, phase,
+            "no capture or route advance during certification"
+        );
+        assert_eq!(run.shot, 0);
+        assert_eq!(run.timer, 0.0);
+        assert_eq!(run.quiet_frames, 0);
+        assert_eq!(run.log.lines().count(), 1);
+        assert!(run.advance_view_automation(
+            0.25,
+            Some(&PackageValidationStatus::Ready),
+            Some(&scene),
+            Some(&metrics)
+        ));
+        assert_eq!(run.timer, 0.0, "the release frame's interval was held");
+        assert_eq!(run.quiet_frames, 0);
+        assert!(run.advance_view_automation(
+            0.25,
+            Some(&PackageValidationStatus::Ready),
+            Some(&scene),
+            Some(&metrics)
+        ));
+        assert_eq!(run.timer, 0.25, "ordinary window advances after release");
+    }
+
+    #[test]
+    fn certified_shots_wait_for_initial_residency_then_keep_ordinary_timeouts() {
+        let scene = initial_scene(false);
+        let mut metrics = StreamingMetrics::default();
+        assert!(!initial_cluster_load_ready(None, Some(&metrics)));
+        assert!(!initial_cluster_load_ready(Some(&scene), None));
+        assert!(!initial_cluster_load_ready(Some(&scene), Some(&metrics)));
+        let mut empty_scene = initial_scene(true);
+        empty_scene.blocks.clear();
+        assert!(
+            initial_cluster_load_ready(Some(&empty_scene), Some(&metrics)),
+            "a present legitimately empty scene needs no uploads"
+        );
+        let phase = Phase::Settle;
+        scene.blocks[0]
+            .resident
+            .store(false, std::sync::atomic::Ordering::Release);
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).expect("fixture parses");
+        let mut run = ShotsRun::new(file, PathBuf::from("unused-shots-output"), 60);
+        run.enter(phase);
+        let ready = Some(&PackageValidationStatus::Ready);
+        for _ in 0..40 {
+            assert!(!run.advance_view_automation(1.0, ready, Some(&scene), Some(&metrics)));
+        }
+        assert_eq!(run.timer, 0.0);
+        assert_eq!(run.quiet_frames, 0);
+        assert_eq!(run.phase, phase);
+        assert_eq!(run.shot, 0);
+        scene.blocks[0]
+            .resident
+            .store(true, std::sync::atomic::Ordering::Release);
+        metrics.pending_cluster_batches = 1;
+        assert!(!run.advance_view_automation(40.0, ready, Some(&scene), Some(&metrics)));
+        metrics.pending_cluster_batches = 0;
+        assert!(initial_cluster_load_ready(Some(&scene), Some(&metrics)));
+        assert!(run.advance_view_automation(0.25, ready, Some(&scene), Some(&metrics)));
+        assert_eq!(run.timer, 0.0, "the release frame's interval was held");
+        assert!(run.initial_load_ready);
+        metrics.pending_cluster_batches = 1;
+        assert!(run.advance_view_automation(
+            SETTLE_TIMEOUT_SECONDS,
+            ready,
+            Some(&scene),
+            Some(&metrics)
+        ));
+        let pending = SettleCounts {
+            pending_cluster_batches: 1,
+            ..quiet_counts()
+        };
+        assert!(matches!(
+            settle_step(&run.file.shots[0], &pending, false, run.timer),
+            SettleStep::TimedOut(_)
+        ));
+        assert_eq!(
+            run.log.matches("waiting for initial cluster load").count(),
+            1
+        );
+        assert!(run.log.contains("resident_blocks=0/1"));
+    }
+
+    #[test]
+    fn shot_certification_failure_cannot_capture_and_stock_startup_is_unchanged() {
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).expect("fixture parses");
+        let mut run = ShotsRun::new(file.clone(), PathBuf::from("unused-shots-output"), 60);
+        run.enter(Phase::Settle);
+        let failure = PackageValidationStatus::Failed("invalid certificate".into());
+        assert!(!run.advance_view_automation(20.0, Some(&failure), None, None));
+        assert_eq!(run.phase, Phase::Done);
+        assert!(run.failed);
+        assert!(run.log.contains("invalid certificate"));
+        assert_eq!(run.shot, 0);
+        assert_eq!(run.timer, 0.0);
+        let mut stock = ShotsRun::new(file, PathBuf::from("unused-shots-output"), 60);
+        stock.enter(Phase::Settle);
+        assert!(stock.advance_view_automation(0.5, None, None, None));
+        assert_eq!(stock.phase, Phase::Settle);
+        assert_eq!(stock.timer, 0.5);
+        assert!(!stock.failed);
+    }
 
     use crate::world::components::ExteriorCellGrid;
     use bevy::ecs::system::SystemState;

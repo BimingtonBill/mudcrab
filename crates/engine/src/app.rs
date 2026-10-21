@@ -3017,6 +3017,7 @@ fn screenshot_assets_ready(
         && pending_drawn == 0
         && metrics.pending_lod_queries == 0
         && metrics.pending_lod_chunks == 0
+        && metrics.pending_cluster_batches == 0
         && metrics.pending_lod_object_blocks == 0
         && metrics.pending_lod_tree_blocks == 0
         && metrics.unrecovered_lod_object_blocks == 0

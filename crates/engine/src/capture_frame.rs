@@ -441,6 +441,54 @@ pub(crate) fn validate_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extraction_keeps_fresh_cluster_and_exact_stock_blockers() {
+        for blocker in [
+            "cluster",
+            "failed_cluster",
+            "queued_stock",
+            "stock",
+            "qualification",
+            "failed_stock",
+            "native_draw",
+        ] {
+            let (mut render, ticket) = extraction_world(
+                ActiveSpace {
+                    worldspace_id: Some(17),
+                    interior: Some(83),
+                },
+                IVec2::ZERO,
+                Vec3::ZERO,
+                Failures::default(),
+            );
+            {
+                let mut main = render.resource_mut::<MainWorld>();
+                main.resource_mut::<StreamingWorld>()
+                    .set_resident_for_test(CellKey::Interior(83), Entity::PLACEHOLDER);
+                let mut metrics = main.resource_mut::<StreamingMetrics>();
+                match blocker {
+                    "cluster" => metrics.pending_cluster_batches = 1,
+                    "failed_cluster" => metrics.failed_cluster_batches = 1,
+                    "queued_stock" => metrics.queued_far_stock_queries = 1,
+                    "stock" => metrics.pending_far_stock_queries = 1,
+                    "qualification" => metrics.pending_far_stock_qualification = 1,
+                    "failed_stock" => metrics.failed_far_stock_sources = 1,
+                    "native_draw" => metrics.pending_native_lod_draws = 1,
+                    _ => unreachable!(),
+                }
+            }
+
+            let frame = extracted_receipt(&mut render, &ticket);
+            assert!(frame.work.space_resident);
+            assert_eq!(frame.work.scope, SettleScope::ViewAndCapture);
+            assert!(
+                !frame.work.is_quiet(),
+                "{blocker}: {}",
+                frame.work.describe()
+            );
+        }
+    }
     use crate::{
         shots::{Failures, SettleScope},
         streaming::{ActiveSpace, StreamingMetrics, StreamingWorld},

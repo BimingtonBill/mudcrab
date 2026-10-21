@@ -152,6 +152,10 @@ pub struct GraphicsFingerprint {
     pub lod_objects: bool,
     /// The `lod-trees` graphics setting: whether the package's distant tree billboards were drawn.
     pub lod_trees: bool,
+    /// The `cluster-error-pixels` and `cluster-terrain-error-pixels` graphics settings: the
+    /// cluster path's detail for objects and for terrain, or `null` without graphics settings.
+    pub cluster_error_pixels: Option<f32>,
+    pub cluster_terrain_error_pixels: Option<f32>,
     /// `fTreeLoadDistance`, how far tree billboards draw, in Creation units.
     pub tree_load_distance: f32,
     /// MiB of newly loaded render assets a frame may prepare; `0` is unlimited.
@@ -223,6 +227,9 @@ impl RunFingerprint {
                 split_distance_mult: config.terrain_lod.split_distance_mult,
                 lod_objects: settings.is_none_or(|settings| settings.lod_objects),
                 lod_trees: settings.is_none_or(|settings| settings.lod_trees),
+                cluster_error_pixels: settings.map(|settings| settings.cluster_error_pixels),
+                cluster_terrain_error_pixels: settings
+                    .map(|settings| settings.cluster_terrain_error_pixels),
                 tree_load_distance: config.object_lod.tree_load_distance,
                 max_upload_mib_per_frame: config.max_upload_mib_per_frame,
                 lights: config.lights,
