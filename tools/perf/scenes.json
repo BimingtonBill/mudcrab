@@ -1,0 +1,13 @@
+{
+  "_comment": "Named capture scenes for perf_capture.py (--scene). Arguments follow scripts/phase2-profile.ps1 (Get-ScenarioArguments, Get-PortalSceneArguments) so a capture and a baseline run see the same scene. {assets} is the converted asset folder (--assets), {repo} this checkout, {scratch} a scratch folder. Each scene also gets the benchmark-window and acceptance flags below; profiler runs are TEST runs and report nothing as a result.",
+  "common": ["--accept-min-fps", "0", "--accept-p95-ms", "1000000", "--accept-max-memory-growth-gib", "1000000"],
+  "scenes": {
+    "synthetic": {"seconds": 20, "assets": false, "about": "250,000 synthetic instances, no world data: render-thread and GPU stress", "args": ["--benchmark-only", "--synthetic-instances", "250000"]},
+    "rural": {"seconds": 30, "assets": true, "about": "open exterior at grid 0,0", "args": ["--worldspace", "0x3c", "--grid-x", "0", "--grid-y", "0"]},
+    "dense": {"seconds": 30, "assets": true, "about": "Riverwood, about 2,900 references within two cells", "args": ["--worldspace", "0x3c", "--grid-x", "3", "--grid-y", "-12"]},
+    "stress": {"seconds": 40, "assets": true, "about": "streaming stress: radius 3, fast auto-fly", "args": ["--worldspace", "0x3c", "--grid-x", "0", "--grid-y", "0", "--stream-radius", "3", "--auto-fly-speed", "5000"]},
+    "lod-far": {"seconds": 25, "assets": true, "about": "high vantage over Riverwood looking up the valley: terrain LOD to the horizon", "args": ["--worldspace", "0x3c", "--terrain-radius", "8", "--shots", "{repo}/tools/reference/baseline_lod_far.json"]},
+    "portal-heavy": {"seconds": 25, "assets": true, "about": "standing view with one open portal view on screen (Sven's House door)", "args": ["--worldspace", "0x3c", "--terrain-radius", "8", "--shots", "{repo}/tools/reference/baseline_portal_heavy.json"]},
+    "portal-door-tour": {"seconds": 40, "assets": true, "about": "Riverwood demo door tour, two doors: approach, crossing and the way back", "args": ["--worldspace", "0x3c", "--demo", "riverwood", "--terrain-radius", "8", "--demo-tour", "{scratch}/tour", "--tour-doors", "2", "--tour-repeat", "3"]}
+  }
+}

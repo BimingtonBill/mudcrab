@@ -2,6 +2,15 @@ use crate::{
     config::EngineConfig,
     fingerprint::{RendererFingerprint, RunFingerprint},
     render::RendererMetrics,
+    render_timing::{
+        self, CLEANUP, CycleSides, EXTRACT, EXTRACT_COMMANDS_AND_ASSETS, GRAPH_AND_PRESENT,
+        GRAPH_CAMERA_DRIVER, GRAPH_CAMERA_VIEWS, GRAPH_DRIVER_OVERHEAD, GRAPH_EARLY_POST_PROCESS,
+        GRAPH_GPU_PREPROCESS, GRAPH_MAIN_PASS, GRAPH_POST_PROCESS, GRAPH_PREPASS, GRAPH_REMAINDER,
+        GRAPH_RENDER_SET_OTHER, GRAPH_SHADOW_PASSES, GRAPH_SHADOW_VIEW_COUNT, GRAPH_SHADOW_VIEWS,
+        GRAPH_SUBMIT, GRAPH_UPSCALING, GRAPH_VIEW_COUNT, GRAPH_VIEWS, GRAPH_VIEWS_REMAINDER,
+        MAIN_WORLD, PREPARE, QUEUE, REAL_MS, REMAINDER, RENDER_THREAD, SPECIALIZE_AND_VIEWS,
+        SWAPCHAIN_ACQUIRE, WAIT_FOR_RENDER_THREAD, WALL_CYCLE_MS,
+    },
     streaming::StreamingMetrics,
     streaming_gpu_metrics::{StreamingGpuMetricsBridge, StreamingGpuMetricsPlugin},
     streaming_trace::{SceneLoadStatus, StreamingTrace},
@@ -28,20 +37,215 @@ use bevy::{
 };
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// Low-frequency wall-cost observations for TEST runs without an attached profiler.
+/// Values are inclusive; nested systems must not be added to their parents.
+#[derive(Default)]
+pub(crate) struct PeriodicTiming {
+    calls: u64,
+    total_us: f64,
+    max_us: f64,
+}
+
+impl PeriodicTiming {
+    pub(crate) fn record(&mut self, name: &'static str, elapsed: std::time::Duration) {
+        let us = elapsed.as_secs_f64() * 1.0e6;
+        self.calls += 1;
+        self.total_us += us;
+        self.max_us = self.max_us.max(us);
+        if self.calls.is_multiple_of(120) {
+            info!(
+                name,
+                calls = self.calls,
+                total_us = self.total_us,
+                mean_us = self.total_us / self.calls as f64,
+                max_us = self.max_us,
+                "CPU system wall measurements (inclusive cumulative TEST observations)"
+            );
+        }
+    }
+}
 
 const MAX_SAMPLES_PER_METRIC: usize = 200_000;
 const MAX_TIMELINE_EVENTS: usize = 100_000;
 const MAX_STREAMING_FRAMES: usize = 20_000;
 const MAX_STREAMING_SCENES: usize = 20_000;
+
+/// How many frames of the per-frame series are kept: about 28 minutes at 60 fps, and one row is
+/// under 64 bytes, so the series costs at most a few megabytes. Past this the oldest row is
+/// dropped, and the rows that carry the frame numbers say which frames the file holds.
+const MAX_FRAME_SERIES_ROWS: usize = 100_000;
+
+/// How many cycles of the per-cycle series are kept: the same order of size as the per-frame
+/// series, and one row is under 288 bytes (27 columns of numbers), so the series costs at most a
+/// few megabytes. Past this the oldest row is dropped.
+const MAX_RENDER_CYCLE_ROWS: usize = MAX_FRAME_SERIES_ROWS;
+
+/// The cycle's two clock columns, ahead of the sides: `wall_cycle_ms` is the lap from one `First`
+/// to the next, measured on the main thread — the number the row's own sides account for — and
+/// `real_ms` is the `Time<Real>` delta the next `First` read, which under pipelined rendering is
+/// render-paced and lagged (see `render_timing`), kept beside the wall lap so the skew between
+/// the two clocks is quantifiable per cycle. Both are written by the next cycle's `First`, so the
+/// run's last row keeps neither.
+const RENDER_CYCLE_CLOCKS: [&str; 2] = [WALL_CYCLE_MS, REAL_MS];
+
+/// The sides of `render-cycles.csv`'s row, in the order it writes them; the row opens with the
+/// cycle number and the two clock columns ([`RENDER_CYCLE_CLOCKS`]). The names are the spans the
+/// render timings record, imported from there, so the file's header cannot drift from them.
+const RENDER_CYCLE_SIDES: [&str; 5] = [
+    MAIN_WORLD,
+    EXTRACT,
+    WAIT_FOR_RENDER_THREAD,
+    REMAINDER,
+    RENDER_THREAD,
+];
+
+/// The render schedule's phases, one column each after [`RENDER_CYCLE_SIDES`]. The swapchain wait
+/// sits inside the prepare phase.
+const RENDER_CYCLE_PHASES: [&str; 7] = [
+    EXTRACT_COMMANDS_AND_ASSETS,
+    SPECIALIZE_AND_VIEWS,
+    QUEUE,
+    PREPARE,
+    GRAPH_AND_PRESENT,
+    CLEANUP,
+    SWAPCHAIN_ACQUIRE,
+];
+
+/// The laps inside [`GRAPH_AND_PRESENT`], one column each after [`RENDER_CYCLE_PHASES`], in the
+/// order the row writes them: the render graph's view schedules (the root `Render` set — the part
+/// of the phase that scales with views), the count of view schedules, the per-view sums of the
+/// `Core3d` schedule's prepass, main-pass and post-process stages, the graph's queue submit, and
+/// the remainder that closes the phase (see `render_timing` and
+/// `local/research/portal-heavy-render-thread-2026-10-08.md` §4 R2).
+///
+/// impl-1088's five columns follow, so the seven above keep the positions and the meaning the
+/// 2026-10-08 window's file gave them: the views lap split into the shadow-view and camera runs it
+/// is made of with the count of the shadow ones, the `EarlyPostProcess` stage split out of
+/// [`GRAPH_POST_PROCESS`] (a subset of that column, not an extra part of the phase), and the
+/// remainder that closes the views lap. [`GRAPH_VIEW_COUNT`] and [`GRAPH_SHADOW_VIEW_COUNT`] are
+/// not durations: the row writes them as whole numbers while the columns around them are
+/// milliseconds.
+///
+/// impl-1093's one column follows those twelve, so they keep the positions the 2026-10-08
+/// window's file gave them: [`GRAPH_SHADOW_PASSES`], the sun shadow-pass windows of the cycle's
+/// camera runs, which the prepass and main-pass columns above are exclusive of (`render_timing`).
+///
+/// impl-1107's five close the list, so the thirteen above keep the positions the earlier windows'
+/// files gave them: the `Render` set one level in — [`GRAPH_CAMERA_DRIVER`], the whole
+/// `camera_driver` system; [`GRAPH_RENDER_SET_OTHER`], the views lap less the driver, never
+/// negative; and [`GRAPH_DRIVER_OVERHEAD`], the driver's lap less the two view-kind sums, never
+/// negative — and, at the two levels inside a view run that used to feed that overhead,
+/// [`GRAPH_GPU_PREPROCESS`] (the camera runs' early GPU-preprocessing head windows, out of the
+/// prepass sum) and [`GRAPH_UPSCALING`] (the upscaling window, its own tile after the post-process
+/// stage, out of [`GRAPH_POST_PROCESS`]) (`render_timing`).
+const RENDER_CYCLE_GRAPH_LAPS: [&str; 18] = [
+    GRAPH_VIEWS,
+    GRAPH_VIEW_COUNT,
+    GRAPH_PREPASS,
+    GRAPH_MAIN_PASS,
+    GRAPH_POST_PROCESS,
+    GRAPH_SUBMIT,
+    GRAPH_REMAINDER,
+    GRAPH_SHADOW_VIEWS,
+    GRAPH_SHADOW_VIEW_COUNT,
+    GRAPH_CAMERA_VIEWS,
+    GRAPH_EARLY_POST_PROCESS,
+    GRAPH_VIEWS_REMAINDER,
+    GRAPH_SHADOW_PASSES,
+    GRAPH_CAMERA_DRIVER,
+    GRAPH_RENDER_SET_OTHER,
+    GRAPH_DRIVER_OVERHEAD,
+    GRAPH_GPU_PREPROCESS,
+    GRAPH_UPSCALING,
+];
+
+/// The value one graph-lap column writes for a cycle's record, or `None` for an empty column (the
+/// cycle did not measure that lap). The counts ([`GRAPH_VIEW_COUNT`], [`GRAPH_SHADOW_VIEW_COUNT`])
+/// are whole numbers; every other column is milliseconds with four decimals, like the rest of the
+/// row. Every name in [`RENDER_CYCLE_GRAPH_LAPS`] is answered here — a test pins that, so a column
+/// added to the list cannot silently write nothing.
+fn graph_lap_value(sides: &CycleSides, column: &str) -> Option<String> {
+    let ms = |value: Option<f64>| value.map(|value| format!("{value:.4}"));
+    match column {
+        GRAPH_VIEWS => ms(sides.graph_views_ms),
+        GRAPH_VIEW_COUNT => sides.graph_view_count.map(|count| count.to_string()),
+        GRAPH_PREPASS => ms(sides.graph_prepass_ms),
+        GRAPH_MAIN_PASS => ms(sides.graph_main_pass_ms),
+        GRAPH_POST_PROCESS => ms(sides.graph_post_process_ms),
+        GRAPH_SUBMIT => ms(sides.graph_submit_ms),
+        GRAPH_REMAINDER => ms(sides.graph_remainder_ms),
+        GRAPH_SHADOW_VIEWS => ms(sides.graph_shadow_views_ms),
+        GRAPH_SHADOW_VIEW_COUNT => sides.graph_shadow_view_count.map(|count| count.to_string()),
+        GRAPH_CAMERA_VIEWS => ms(sides.graph_camera_views_ms),
+        GRAPH_EARLY_POST_PROCESS => ms(sides.graph_early_post_process_ms),
+        GRAPH_VIEWS_REMAINDER => ms(sides.graph_views_remainder_ms),
+        GRAPH_SHADOW_PASSES => ms(sides.graph_shadow_passes_ms),
+        GRAPH_CAMERA_DRIVER => ms(sides.graph_camera_driver_ms),
+        GRAPH_RENDER_SET_OTHER => ms(sides.graph_render_set_other_ms),
+        GRAPH_DRIVER_OVERHEAD => ms(sides.graph_driver_overhead_ms),
+        GRAPH_GPU_PREPROCESS => ms(sides.graph_gpu_preprocess_ms),
+        GRAPH_UPSCALING => ms(sides.graph_upscaling_ms),
+        _ => None,
+    }
+}
+
+/// The names the per-frame series keeps a column for, in the order `frame-series.csv` writes them:
+/// the systems that run in every frame after a door crossing (see the analysis in
+/// `local/agents/runs/analysis-642-post-exit-burst-spans.1/report.md`), which is the burst the
+/// 160 fps goal is measured against, and the swap bridge's gauges (`crate::swap_bridge`,
+/// `streaming::record_terrain_swap_gauge`), which are counts rather than durations.
+///
+/// A span column is the frame's total for that span (`record_ms` adds up, so a span recorded more
+/// than once in a frame totals); a gauge column is the frame's last value for that gauge
+/// (`set_gauge` assigns). Both land in the same row, which is what makes a gauge readable frame by
+/// frame instead of as one final number.
+///
+/// A name here that no system records yet — the portal's five, on a branch where portal.rs does not
+/// span them — still gets its column, and the column stays zero.
+const FRAME_SERIES_COLUMNS: [&str; 6] = [
+    "streaming/plan_cells",
+    "streaming/frame_commit",
+    "lod/collect",
+    "scene/spawn_batch",
+    "lights/budget",
+    "physics/step",
+];
+
+/// One column per [`FRAME_SERIES_COLUMNS`] entry, so the two cannot drift apart.
+const FRAME_SERIES_COLUMN_COUNT: usize = FRAME_SERIES_COLUMNS.len();
+
+/// Which column a span name has in the per-frame series, or `None` for a span the series does not
+/// follow (it is still sampled into `cpu-spans.json` as before).
+fn frame_series_column(name: &str) -> Option<usize> {
+    FRAME_SERIES_COLUMNS
+        .iter()
+        .position(|column| *column == name)
+}
+
+/// One frame of the per-frame series: the frame number the profile timeline's events carry, the
+/// frame's real-clock duration, and one value per [`FRAME_SERIES_COLUMNS`] span.
+///
+/// A span recorded more than once in one frame adds up: the row is the frame's total for that span,
+/// which is what the physics step needs (a frame can run no fixed step, one, or several).
+#[derive(Clone, Copy, Default)]
+struct FrameSpans {
+    frame: u64,
+    /// The frame's own duration in milliseconds, from the real clock — the same clock the
+    /// benchmark's frame times are sampled from. `None` until the next frame closes it: a cycle's
+    /// duration is only known once it has ended, so the run's last row keeps none.
+    real_ms: Option<f32>,
+    spans: [f32; FRAME_SERIES_COLUMN_COUNT],
+}
 
 /// Why the report has no per-pass GPU times or counters: the run had no renderer, so no device
 /// measured anything. This is not the same as a device that lacks the feature, and a report must
@@ -181,11 +385,14 @@ impl Plugin for ProfilingPlugin {
         if std::env::var("MUDCRAB_PROFILE_DRAW_COUNTS").is_ok_and(|value| value == "1") {
             app.add_plugins(crate::indirect_metrics::IndirectDrawMetricsPlugin);
         }
-        if app
+        let profiling = app
             .world()
             .get_resource::<EngineConfig>()
-            .is_some_and(|config| config.profile_output_dir.is_some())
-        {
+            .is_some_and(|config| config.profile_output_dir.is_some());
+        if profiling {
+            // Frame tracing is for profile output only (the same condition as the per-frame series).
+            // The trace clock ticks the frame counter in `First`, so the series opens its row after
+            // it: a row and the events of its frame carry the same frame number.
             app.world_mut().resource_mut::<ProfilingState>().trace = Some(StreamingTrace::new(
                 MAX_STREAMING_FRAMES,
                 MAX_STREAMING_SCENES,
@@ -201,8 +408,175 @@ impl Plugin for ProfilingPlugin {
             }
             app.add_message::<AssetEvent<WorldAsset>>()
                 .add_systems(First, begin_trace_frame.after(TimeSystems));
+            app.add_systems(
+                First,
+                begin_frame_series
+                    .after(TimeSystems)
+                    .after(begin_trace_frame),
+            );
+            app.add_systems(
+                First,
+                drain_render_cycles.after(render_timing::start_main_world),
+            );
+            // PreUpdate's asset work, split: `assets/load_finalize` brackets Bevy's
+            // `handle_internal_asset_events` (the load-finalize drain), and `assets/handle_drop`
+            // brackets the `AssetTrackingSystems` set (the per-type `track_assets` systems that
+            // process handle drops - all asset types, ours and Bevy's). Only installed for a run
+            // that profiles; an ordinary run's PreUpdate is unchanged.
+            app.init_resource::<AssetSpanClock>().add_systems(
+                PreUpdate,
+                (
+                    begin_asset_load_finalize.before(bevy::asset::handle_internal_asset_events),
+                    end_asset_load_finalize
+                        .after(bevy::asset::handle_internal_asset_events)
+                        .before(bevy::asset::publish_asset_server_diagnostics),
+                    begin_asset_handle_drop.before(bevy::asset::AssetTrackingSystems),
+                    end_asset_handle_drop.after(bevy::asset::AssetTrackingSystems),
+                )
+                    .chain(),
+            );
+            // The render side of a crossing: the `RenderSystems::ExtractCommands` set applies the
+            // extract schedule's commands on the render world - the closest marker-system bracket
+            // around render-world removal. The two markers time it on the render thread into the
+            // bridge below, and `drain_extract_commands_apply` records it here.
+            let bridge = ExtractCommandsApplyBridge::default();
+            app.insert_resource(bridge.clone());
+            if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+                render_app
+                    .insert_resource(bridge)
+                    .init_resource::<ExtractCommandsApplyClock>()
+                    .add_systems(
+                        bevy::render::Render,
+                        (
+                            begin_extract_commands_apply
+                                .before(bevy::render::RenderSystems::ExtractCommands),
+                            end_extract_commands_apply
+                                .after(bevy::render::RenderSystems::ExtractCommands)
+                                .before(bevy::render::RenderSystems::PrepareAssets),
+                        ),
+                    );
+            }
+            app.add_systems(Update, drain_extract_commands_apply);
         }
     }
+}
+
+/// When the two PreUpdate asset markers opened their brackets. Held by the marker systems that
+/// span `assets/load_finalize` and the two that span `assets/handle_drop`, which only exist on a
+/// profiled run.
+#[derive(Resource, Default)]
+struct AssetSpanClock {
+    load_finalize_started: Option<Instant>,
+    handle_drop_started: Option<Instant>,
+    /// The markers' order within the frame, for the PreUpdate-order test only (compiled out
+    /// otherwise).
+    #[cfg(test)]
+    order: Vec<&'static str>,
+}
+
+/// Opens `assets/load_finalize` before Bevy's `handle_internal_asset_events` runs.
+fn begin_asset_load_finalize(mut clock: ResMut<AssetSpanClock>) {
+    clock.load_finalize_started = Some(Instant::now());
+    #[cfg(test)]
+    clock.order.push("assets/load_finalize/begin");
+}
+
+/// Closes `assets/load_finalize` after Bevy's `handle_internal_asset_events`, which is where
+/// bevy_asset finalizes finished loads (and walks hot-reload ancestors when watching).
+fn end_asset_load_finalize(
+    mut clock: ResMut<AssetSpanClock>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if let Some(started) = clock.load_finalize_started.take() {
+        profiler.record_elapsed("assets/load_finalize", started);
+    }
+    #[cfg(test)]
+    clock.order.push("assets/load_finalize/end");
+}
+
+/// Opens `assets/handle_drop` before the `AssetTrackingSystems` set (the per-type `track_assets`
+/// systems, which process handle drops for every registered asset type) runs.
+fn begin_asset_handle_drop(mut clock: ResMut<AssetSpanClock>) {
+    clock.handle_drop_started = Some(Instant::now());
+    #[cfg(test)]
+    clock.order.push("assets/handle_drop/begin");
+}
+
+/// Closes `assets/handle_drop` after the `AssetTrackingSystems` set.
+fn end_asset_handle_drop(mut clock: ResMut<AssetSpanClock>, mut profiler: ResMut<ProfilingState>) {
+    if let Some(started) = clock.handle_drop_started.take() {
+        profiler.record_elapsed("assets/handle_drop", started);
+    }
+    #[cfg(test)]
+    clock.order.push("assets/handle_drop/end");
+}
+
+/// Nanoseconds the render world's `RenderSystems::ExtractCommands` bracket measured in its latest
+/// frame. The bracket's markers run on the render thread; this bridge carries the number to the
+/// main world, where `drain_extract_commands_apply` records it as a span. Zero once drained, or
+/// while the render app is absent (a run without a renderer).
+#[derive(Resource, Clone, Default)]
+struct ExtractCommandsApplyBridge(Arc<AtomicU64>);
+
+/// When the render-side bracket opened. A resource of the render app only.
+#[derive(Resource, Default)]
+struct ExtractCommandsApplyClock(Option<Instant>);
+
+/// Opens the render-side bracket before the `RenderSystems::ExtractCommands` set applies the
+/// extract schedule's commands on the render world.
+fn begin_extract_commands_apply(mut clock: ResMut<ExtractCommandsApplyClock>) {
+    clock.0 = Some(Instant::now());
+}
+
+/// Closes the render-side bracket and hands the elapsed time to the main world.
+fn end_extract_commands_apply(
+    mut clock: ResMut<ExtractCommandsApplyClock>,
+    bridge: Res<ExtractCommandsApplyBridge>,
+) {
+    if let Some(started) = clock.0.take() {
+        bridge
+            .0
+            .store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Records the render side's latest bracket measurement as `render/extract_commands_apply`.
+/// The render thread measures asynchronously, so a frame's read may describe the previous
+/// render frame's bracket (the same fuzziness the render diagnostics' readback has).
+fn drain_extract_commands_apply(
+    bridge: Res<ExtractCommandsApplyBridge>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let nanos = bridge.0.swap(0, Ordering::Relaxed);
+    if nanos > 0 {
+        profiler.record_ms("render/extract_commands_apply", nanos as f64 / 1_000_000.0);
+    }
+}
+
+/// Opens the per-frame series' row for the frame that is starting, and closes the previous row's
+/// duration (see [`ProfilingState::begin_frame`]).
+///
+/// Ordered after Bevy's time system, whose real-clock delta is the time since the previous frame
+/// began: that is the duration of the frame the previous row recorded the spans of, which is why it
+/// closes that row rather than filling this one.
+fn begin_frame_series(mut profiler: ResMut<ProfilingState>, real_time: Res<Time<Real>>) {
+    profiler.begin_frame(real_time.delta_secs_f64() * 1000.0);
+}
+
+/// Moves the render timings' completed cycle records into the per-cycle series (see
+/// [`ProfilingState::render_cycles_csv`]).
+///
+/// Ordered after the main frame's start: a cycle's row is complete only once the next cycle's
+/// `First` has closed its remainder window. Runs only for a run that profiles, and costs nothing
+/// otherwise.
+fn drain_render_cycles(
+    mut profiler: ResMut<ProfilingState>,
+    timings: Option<Res<render_timing::RenderTimings>>,
+) {
+    let Some(timings) = timings else {
+        return;
+    };
+    profiler.extend_render_cycles(timings.take_completed_cycles());
 }
 
 #[derive(Resource)]
@@ -240,9 +614,20 @@ pub struct ProfilingState {
     staged_inventory: Option<BTreeMap<String, f64>>,
     timeline: Vec<TimelineEvent>,
     memory: Vec<MemorySample>,
+    /// The per-frame series: one row per frame, opened in `First` and written to `frame-series.csv`
+    /// (see [`ProfilingState::begin_frame`]). Empty unless the run profiles.
+    frame_series: VecDeque<FrameSpans>,
+    /// The per-cycle series: one row per main-thread cycle, drained from the render timings each
+    /// frame and written to `render-cycles.csv` beside `frame-series.csv` (see
+    /// [`ProfilingState::render_cycles_csv`]). Empty unless the run profiles.
+    render_cycles: VecDeque<(u64, CycleSides)>,
+    /// The bounded per-frame streaming trace, present only for a run with profile output.
     pub(crate) trace: Option<StreamingTrace>,
+    /// This frame's CPU span totals, in milliseconds, for the trace sample; cleared each frame.
     pub(crate) frame_cpu_spans_ms: BTreeMap<String, f64>,
+    /// This frame's asynchronous completion latencies, in milliseconds, kept apart from CPU spans.
     pub(crate) frame_completion_latencies_ms: BTreeMap<String, f64>,
+    /// The real wall-clock delta of the frame in progress, in milliseconds, for the trace sample.
     pub(crate) trace_delta_ms: f64,
 }
 
@@ -269,6 +654,8 @@ impl Default for ProfilingState {
             staged_inventory: None,
             timeline: Vec::new(),
             memory: Vec::new(),
+            frame_series: VecDeque::new(),
+            render_cycles: VecDeque::new(),
             trace: None,
             frame_cpu_spans_ms: BTreeMap::new(),
             frame_completion_latencies_ms: BTreeMap::new(),
@@ -342,11 +729,25 @@ impl ProfilingState {
         push_bounded(self.cpu_spans_ms.entry(name).or_default(), value);
     }
 
-    /// Record a CPU span in the bounded aggregate and, when enabled, sum it into this frame.
+    /// Records a span in milliseconds: its own sample, and, for a name with a column in the
+    /// per-frame series, the frame's value for that column as well.
+    ///
+    /// One record, two views of it. The span's samples are the whole-run distribution the report
+    /// summarises (`cpu-spans.json`, `summary.md`); the series is the same record per frame, which
+    /// is what lets a benchmark's slow frames be attributed one frame at a time. A span recorded
+    /// several times in one frame adds up in the frame's row (the physics step, when a frame runs
+    /// more than one fixed step). With no row open — no profiling, or before the first frame — this
+    /// is one emptiness check.
     pub fn record_ms(&mut self, name: impl Into<String>, value: f64) {
         let name = name.into();
         if self.trace.is_some() {
             *self.frame_cpu_spans_ms.entry(name.clone()).or_default() += value;
+        }
+        if let Some(row) = self.frame_series.back_mut()
+            && let Some(column) = frame_series_column(&name)
+            && value.is_finite()
+        {
+            row.spans[column] += value as f32;
         }
         push_bounded(self.cpu_spans_ms.entry(name).or_default(), value);
     }
@@ -383,18 +784,52 @@ impl ProfilingState {
             .collect()
     }
 
-    pub(crate) fn gauge(&self, name: &str) -> Option<f64> {
-        self.gauges.get(name).copied()
-    }
-
     /// Records a gauge outright: the last value written is what the bundle carries, whatever frame
     /// it was written in.
     ///
     /// The scene inventory is the one gauge set the report reads a measured number out of, so it
     /// does not come through here — it is staged with [`ProfilingState::stage_scene_inventory`] and
     /// kept only if the frame is inside the measured window.
+    /// Records a gauge: its latest value for the report, and, for a name with a column in the
+    /// per-frame series, the frame's value for that column as well.
+    ///
+    /// A gauge is a count or a level, not a duration, so a column takes the frame's *last* value for
+    /// it (a span column adds up instead): the series shows how `swap/waiting` or
+    /// `swap/terrain_ready_not_drawn` moves frame by frame, which is the whole point of recording
+    /// it. The gauge itself stays in `gauges`, where the report reads the run's final value.
     pub fn set_gauge(&mut self, name: impl Into<String>, value: f64) {
-        self.gauges.insert(name.into(), value);
+        let name = name.into();
+        if let Some(row) = self.frame_series.back_mut()
+            && let Some(column) = frame_series_column(&name)
+            && value.is_finite()
+        {
+            row.spans[column] = value as f32;
+        }
+        self.gauges.insert(name, value);
+    }
+
+    /// Records a gauge that keeps the **largest** value the run saw, rather than the last.
+    ///
+    /// [`ProfilingState::set_gauge`] is "the value now", and the report keeps the run's last one,
+    /// which is right for a counter that describes the end of the run (the resident, loading and
+    /// retiring cell counts). It is wrong for a per-frame count that is only ever nonzero on a
+    /// spike: a door crossing's unloaded roots and entities are counted on the crossing frame and
+    /// are zero on every frame after it, so the last value the report reads is always zero and the
+    /// crossing cannot be sized from it (analysis-1103 §0: `streaming/space_change_unload_roots`
+    /// and `_entities` read 0.0 in every run of the A1 window). A max keeps the crossing's own size
+    /// whatever the run did afterwards.
+    ///
+    /// The two are the same map, so the report's gauge section reads either without a change; a
+    /// gauge that is only ever set through this method is a run-level maximum, and one set through
+    /// `set_gauge` is a last value. A name must not be set through both: the last write would win.
+    pub fn set_max_gauge(&mut self, name: impl Into<String>, value: f64) {
+        let entry = self.gauges.entry(name.into()).or_insert(f64::NEG_INFINITY);
+        *entry = entry.max(value);
+    }
+
+    /// The last recorded gauge value, used by capture readiness probes and reports.
+    pub fn gauge(&self, name: &str) -> Option<f64> {
+        self.gauges.get(name).copied()
     }
 
     /// Stages the scene inventory taken this frame, to be kept only if the frame turns out to be
@@ -502,6 +937,169 @@ impl ProfilingState {
                 process_gib: process_memory_gib,
             });
         }
+    }
+
+    /// Opens the per-frame series' row for the frame that is beginning, and closes the previous
+    /// row's duration with `frame_ms`, the real-clock time since the previous frame began.
+    ///
+    /// Both halves are what keep a row's spans and its duration about the same frame. The row is
+    /// opened in `First` and stays open for the whole frame, so every span recorded between this
+    /// frame's `First` and the next one lands in this row — and the row carries the same frame
+    /// number the timeline's events carry, which `sample_frame` advances at the frame's end, which
+    /// is also the join to `render-cycles.csv`: the cycle whose window this row's spans were
+    /// recorded in is numbered one above it (see [`ProfilingState::render_cycles_csv`]). The
+    /// duration is the same story one frame later: the frame time that ends this frame is only
+    /// measured at the *next* frame's `First`, where [`begin_frame_series`] reads it and this
+    /// closes the row it belongs to. The run's last row is therefore left without one.
+    ///
+    /// Past [`MAX_FRAME_SERIES_ROWS`] the oldest row is dropped: a run longer than that keeps its
+    /// most recent frames, and the `frame` column says which.
+    pub fn begin_frame(&mut self, frame_ms: f64) {
+        if let Some(previous) = self.frame_series.back_mut()
+            && previous.real_ms.is_none()
+            && frame_ms.is_finite()
+            && frame_ms > 0.0
+        {
+            previous.real_ms = Some(frame_ms as f32);
+        }
+        if self.frame_series.len() >= MAX_FRAME_SERIES_ROWS {
+            self.frame_series.pop_front();
+        }
+        self.frame_series.push_back(FrameSpans {
+            frame: self.frame,
+            ..FrameSpans::default()
+        });
+    }
+
+    /// The per-frame series as CSV: the header naming every column, then one row per frame in the
+    /// order the frames ran. A row's `real_ms` is empty when no later frame closed it — the run's
+    /// last row, which the benchmark's own last frame time is not measured for either.
+    fn frame_series_csv(&self) -> String {
+        let mut csv = String::with_capacity(128 + self.frame_series.len() * 64);
+        csv.push_str("frame,real_ms");
+        for column in FRAME_SERIES_COLUMNS {
+            csv.push(',');
+            csv.push_str(column);
+        }
+        csv.push('\n');
+        for row in &self.frame_series {
+            match row.real_ms {
+                Some(real_ms) => csv.push_str(&format!("{},{real_ms:.4}", row.frame)),
+                None => csv.push_str(&format!("{},", row.frame)),
+            }
+            for value in row.spans {
+                csv.push_str(&format!(",{value:.4}"));
+            }
+            csv.push('\n');
+        }
+        csv
+    }
+
+    /// Appends the completed cycle records the render timings handed over, bounded like the
+    /// per-frame series.
+    fn extend_render_cycles(&mut self, rows: impl IntoIterator<Item = (u64, CycleSides)>) {
+        for (cycle, sides) in rows {
+            if self.render_cycles.len() == MAX_RENDER_CYCLE_ROWS {
+                self.render_cycles.pop_front();
+            }
+            self.render_cycles.push_back((cycle, sides));
+        }
+    }
+
+    /// The per-cycle series as CSV: the header naming every column, then one row per cycle in the
+    /// order the cycles ran.
+    ///
+    /// Row `n` is main-thread cycle `n`: the window from the `First` of one main frame to the next
+    /// frame's `First`. Its two clock columns are the wall lap between the two `First`s, measured
+    /// on the main thread — the number the row's own sides account for — and the `Time<Real>` delta
+    /// the closing `First` read, which under pipelined rendering is render-paced and lagged, kept
+    /// beside the wall lap so the skew between the two clocks is quantifiable per cycle instead of
+    /// assumed.
+    ///
+    /// Cycles are counted from one while the per-frame series' rows are counted from zero, so the
+    /// row for cycle `n` joins the `frame-series.csv` row numbered `n - 1` — the frame whose window
+    /// the cycle is — not the row with the same number, which would place every crossing spike one
+    /// frame late. That row's `real_ms` confirms the join: it is the same `Time<Real>` reading,
+    /// taken at the `First` that closed the window.
+    ///
+    /// The `render_thread` and phase columns are the render schedule that ran *during* the cycle —
+    /// under pipelined rendering the one fed by the previous window's extract, because the render
+    /// schedule that follows a window's extract runs in the next window; without it the one fed by
+    /// this window's own extract — so a crossing frame's `render_thread` time is explained by its
+    /// own cycle's phases. The graph columns that follow them ([`RENDER_CYCLE_GRAPH_LAPS`]) are the
+    /// laps inside `render/graph_and_present`, summed over the render frame: `render/graph/views`
+    /// and `render/graph/submit` are laps of the phase's own window, the stage columns are sums
+    /// over the views `render/graph/view_count` names (the post-process one covering the early
+    /// stage too, which has its own column as well), `render/graph/remainder` closes the phase, and
+    /// the views lap is split by the kind of root view `camera_driver` ran —
+    /// `render/graph/shadow_views` and `render/graph/camera_views` with the shadow view count —
+    /// with `render/graph/views_remainder` closing that split, and `render/graph/shadow_passes`
+    /// after it: the camera runs' sun shadow-pass windows, which the prepass and main-pass columns
+    /// are exclusive of, so the stages and this column add up to the camera runs. The five columns
+    /// impl-1107 appended close the list, closing the two levels above: `render/graph/camera_driver`,
+    /// the whole driver's lap, `render/graph/render_set_other`, the views lap less the driver, and
+    /// `render/graph/driver_overhead`, the driver's lap less the two view-kind sums; then the two
+    /// windows of a run that used to feed that overhead, `render/graph/gpu_preprocess` (the camera
+    /// runs' early GPU-preprocessing head windows, out of the prepass sum) and
+    /// `render/graph/upscaling` (the upscaling window, out of the post-process sum). The parts and
+    /// their remainder add up (`render/graph_and_present`, and one level in `render/graph/views`
+    /// and one more in `render/graph/camera_driver`; see `render_timing`). A
+    /// side the cycle did not measure stays an empty column, and the run's last cycle or two are
+    /// absent: their remainder window never closed, and with it neither clock column.
+    fn render_cycles_csv(&self) -> String {
+        let mut csv = String::with_capacity(288 + self.render_cycles.len() * 296);
+        csv.push_str("cycle");
+        for column in RENDER_CYCLE_CLOCKS
+            .iter()
+            .chain(RENDER_CYCLE_SIDES.iter())
+            .chain(RENDER_CYCLE_PHASES.iter())
+            .chain(RENDER_CYCLE_GRAPH_LAPS.iter())
+        {
+            csv.push(',');
+            csv.push_str(column);
+        }
+        csv.push('\n');
+        for (cycle, sides) in &self.render_cycles {
+            csv.push_str(&cycle.to_string());
+            for value in [sides.wall_ms, sides.real_ms] {
+                match value {
+                    Some(value) => csv.push_str(&format!(",{value:.4}")),
+                    None => csv.push(','),
+                }
+            }
+            for value in [
+                sides.main_ms,
+                sides.extract_ms,
+                sides.wait_ms,
+                sides.remainder_ms,
+                sides.render_ms,
+                sides.extract_commands_and_assets_ms,
+                sides.specialize_and_views_ms,
+                sides.queue_ms,
+                sides.prepare_ms,
+                sides.graph_and_present_ms,
+                sides.cleanup_ms,
+                sides.acquire_ms,
+            ] {
+                match value {
+                    Some(value) => csv.push_str(&format!(",{value:.4}")),
+                    None => csv.push(','),
+                }
+            }
+            // The graph laps, in `RENDER_CYCLE_GRAPH_LAPS` order: the counts write whole numbers,
+            // every other column milliseconds.
+            for column in RENDER_CYCLE_GRAPH_LAPS {
+                match graph_lap_value(sides, column) {
+                    Some(value) => {
+                        csv.push(',');
+                        csv.push_str(&value);
+                    }
+                    None => csv.push(','),
+                }
+            }
+            csv.push('\n');
+        }
+        csv
     }
 
     /// The per-pass GPU times, summarised over the measured window (see [`GpuPassReport`]).
@@ -820,6 +1418,8 @@ impl ProfilingState {
                 gauges: self.gauges.clone(),
             },
         )?;
+        fs::write(root.join("frame-series.csv"), self.frame_series_csv())?;
+        fs::write(root.join("render-cycles.csv"), self.render_cycles_csv())?;
         write_json(&root.join("gpu-passes.json"), &gpu)?;
         write_json(
             &root.join("streaming.json"),
@@ -2521,7 +3121,436 @@ mod tests {
         assert!((memory_slope(&samples).unwrap() - 0.1).abs() < 0.0001);
     }
 
-    /// Verify aggregate bundle files are written without a frame sidecar when tracing is disabled.
+    /// Runs one frame of the profiler through the paths the app drives it with: `First` opens the
+    /// series row with the frame time of the frame before it, the frame's systems record their
+    /// spans while it is open, and the frame's end samples it and advances the timeline's frame
+    /// counter (`metrics::collect_and_finish` calls `sample_frame` there).
+    fn run_frame(
+        profiler: &mut ProfilingState,
+        diagnostics: &DiagnosticsStore,
+        frame_ms: f64,
+        spans: &[(&str, f64)],
+    ) {
+        profiler.begin_frame(frame_ms);
+        for (name, value) in spans {
+            profiler.record_ms(*name, *value);
+        }
+        profiler.sample_frame(diagnostics, None, true, true);
+    }
+
+    /// A row holds the spans its own frame recorded, not the one before it: rows are opened in
+    /// `First` and stay open for the frame, which is why they are not opened in `sample_frame`.
+    #[test]
+    fn the_series_records_each_span_in_the_frame_that_recorded_it() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        run_frame(
+            &mut profiler,
+            &diagnostics,
+            16.0,
+            &[("portal/isolate", 4.0)],
+        );
+        run_frame(
+            &mut profiler,
+            &diagnostics,
+            9.5,
+            &[("portal/isolate", 7.0), ("streaming/cell_commit", 3.0)],
+        );
+        let rows: Vec<FrameSpans> = profiler.frame_series.iter().copied().collect();
+        assert_eq!(rows.len(), 2);
+        let isolate = frame_series_column("portal/isolate").expect("the series follows the span");
+        assert_eq!(rows[0].spans[isolate], 4.0);
+        assert_eq!(rows[1].spans[isolate], 7.0);
+        assert_eq!(
+            rows[1].spans.iter().sum::<f32>(),
+            7.0,
+            "a span with no column stays out of the row"
+        );
+        assert_eq!(profiler.span_samples("portal/isolate").len(), 2);
+        assert_eq!(profiler.span_samples("streaming/cell_commit"), &[3.0][..]);
+    }
+
+    /// A row is a frame twice over: it holds that frame's spans and it carries the frame number the
+    /// timeline's events of that frame carry.
+    #[test]
+    fn the_series_rows_carry_the_timeline_frame_number() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        for frame in 0..3u64 {
+            profiler.begin_frame(16.0);
+            profiler.event("cell", format!("frame_{frame}"), None);
+            assert_eq!(profiler.timeline.last().unwrap().frame, frame);
+            assert_eq!(profiler.frame_series.back().unwrap().frame, frame);
+            profiler.sample_frame(&diagnostics, None, true, true);
+        }
+    }
+
+    /// The CSV names every column and writes each row's values under them; a frame that recorded a
+    /// span more than once totals it, a frame's gauge column is that frame's last value (an earlier
+    /// value of the same frame is replaced, a later gauge only lands in its own frame), and the
+    /// run's last row has no duration because no later frame closed it.
+    #[test]
+    fn the_frame_series_csv_names_every_column() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        run_frame(
+            &mut profiler,
+            &diagnostics,
+            16.7,
+            &[("lights/budget", 0.25), ("physics/step", 1.5)],
+        );
+        run_frame(&mut profiler, &diagnostics, 12.0, &[("physics/step", 0.5)]);
+        let csv = profiler.frame_series_csv();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "frame,real_ms,portal/isolate,portal/colliders,portal/update,portal/floor_probe,\
+portal/propagate,streaming/plan_cells,streaming/frame_commit,lod/collect,scene/spawn_batch,\
+lights/budget,physics/step,swap/waiting,swap/prepared_not_drawn,swap/drawn_this_frame,\
+swap/terrain_ready_not_drawn,swap/in_camera_view_not_drawn"
+        );
+        let column = |name: &str| frame_series_column(name).unwrap() + 2;
+        let first: Vec<&str> = lines.next().unwrap().split(',').collect();
+        assert_eq!(first.len(), 2 + FRAME_SERIES_COLUMNS.len());
+        assert_eq!(first[0], "0");
+        assert_eq!(
+            first[1], "12.0000",
+            "a row's duration is its own frame's, the one the next frame's start measures"
+        );
+        assert_eq!(first[column("lights/budget")], "0.2500");
+        assert_eq!(first[column("physics/step")], "1.5000");
+        assert_eq!(
+            first[column("swap/waiting")],
+            "0.0000",
+            "a gauge no system set in a frame leaves its column at zero"
+        );
+        let second: Vec<&str> = lines.next().unwrap().split(',').collect();
+        assert_eq!(second[0], "1");
+        assert_eq!(second[column("physics/step")], "0.5000");
+        assert_eq!(second[1], "");
+        assert!(lines.next().is_none());
+    }
+
+    /// A gauge with a column in the series lands in the frame that recorded it, and a gauge set
+    /// twice in one frame keeps the last value: a level, not a total, unlike a span.
+    #[test]
+    fn a_gauge_column_records_the_frames_value() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        profiler.begin_frame(16.0);
+        profiler.set_gauge("swap/waiting", 41.0);
+        profiler.set_gauge("swap/waiting", 38.0);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        profiler.begin_frame(16.0);
+        profiler.set_gauge("swap/waiting", 12.0);
+        profiler.sample_frame(&diagnostics, None, true, true);
+
+        let rows: Vec<FrameSpans> = profiler.frame_series.iter().copied().collect();
+        let column = frame_series_column("swap/waiting").expect("the series follows the gauge");
+        assert_eq!(
+            rows[0].spans[column], 38.0,
+            "the frame's last value, not a sum"
+        );
+        assert_eq!(rows[1].spans[column], 12.0);
+        assert_eq!(
+            profiler.gauges.get("swap/waiting").copied(),
+            Some(12.0),
+            "the report still reads the run's latest value"
+        );
+    }
+
+    /// The series is bounded: past the cap the oldest rows go, so a long run cannot grow it without
+    /// limit, and the `frame` column says which frames the file holds.
+    #[test]
+    fn the_frame_series_keeps_its_most_recent_rows() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        for _ in 0..MAX_FRAME_SERIES_ROWS + 10 {
+            run_frame(&mut profiler, &diagnostics, 6.25, &[]);
+        }
+        assert_eq!(profiler.frame_series.len(), MAX_FRAME_SERIES_ROWS);
+        assert_eq!(profiler.frame_series.front().unwrap().frame, 10);
+        assert_eq!(
+            profiler.frame_series.back().unwrap().frame,
+            MAX_FRAME_SERIES_ROWS as u64 + 9
+        );
+    }
+
+    /// `render-cycles.csv` names every column in the documented order and writes each cycle's row
+    /// under them; a side the cycle did not measure stays an empty column, and the counts are
+    /// written as whole numbers rather than milliseconds. The seven graph columns the 2026-10-08
+    /// window was read from keep their positions; impl-1088's five follow them, impl-1093's one
+    /// (the sun shadow passes of the camera runs) follows those, and impl-1107's five (the
+    /// `camera_driver` lap, the two parts closed against it and the run's head and tail windows)
+    /// close the list.
+    #[test]
+    fn the_render_cycles_csv_names_every_column() {
+        let mut profiler = ProfilingState::default();
+        profiler.extend_render_cycles([(
+            1,
+            CycleSides {
+                wall_ms: Some(12.0),
+                real_ms: Some(12.5),
+                main_ms: Some(9.5),
+                extract_ms: Some(0.4),
+                wait_ms: Some(2.0),
+                remainder_ms: Some(0.3),
+                render_ms: Some(6.2),
+                acquire_ms: Some(1.0),
+                extract_commands_and_assets_ms: Some(0.5),
+                graph_views_ms: Some(4.0),
+                graph_view_count: Some(3),
+                graph_prepass_ms: Some(1.5),
+                graph_remainder_ms: Some(1.7),
+                graph_shadow_views_ms: Some(0.6),
+                graph_shadow_view_count: Some(1),
+                graph_camera_views_ms: Some(3.0),
+                graph_early_post_process_ms: Some(0.2),
+                graph_views_remainder_ms: Some(0.4),
+                graph_shadow_passes_ms: Some(0.5),
+                graph_camera_driver_ms: Some(3.6),
+                graph_render_set_other_ms: Some(0.4),
+                graph_driver_overhead_ms: Some(0.0),
+                graph_gpu_preprocess_ms: Some(0.9),
+                graph_upscaling_ms: Some(0.3),
+                ..Default::default()
+            },
+        )]);
+        let csv = profiler.render_cycles_csv();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "cycle,wall_cycle_ms,real_ms,main_world,extract,wait_for_render_thread,frame/remainder,\
+            render_thread,render/extract_commands_and_assets,render/specialize_and_views,render/queue,\
+            render/prepare,render/graph_and_present,render/cleanup,render/swapchain_acquire,\
+            render/graph/views,render/graph/view_count,render/graph/prepass,render/graph/main_pass,\
+            render/graph/post_process,render/graph/submit,render/graph/remainder,\
+            render/graph/shadow_views,render/graph/shadow_view_count,render/graph/camera_views,\
+            render/graph/early_post_process,render/graph/views_remainder,render/graph/shadow_passes,\
+            render/graph/camera_driver,render/graph/render_set_other,render/graph/driver_overhead,\
+            render/graph/gpu_preprocess,render/graph/upscaling"
+        );
+        let row: Vec<&str> = lines.next().unwrap().split(',').collect();
+        assert_eq!(
+            row.len(),
+            1 + RENDER_CYCLE_CLOCKS.len()
+                + RENDER_CYCLE_SIDES.len()
+                + RENDER_CYCLE_PHASES.len()
+                + RENDER_CYCLE_GRAPH_LAPS.len()
+        );
+        assert_eq!(row[0], "1");
+        assert_eq!(
+            row[1], "12.0000",
+            "the wall lap the row's sides account for"
+        );
+        assert_eq!(
+            row[2], "12.5000",
+            "the Time<Real> delta the next First read"
+        );
+        assert_eq!(row[3], "9.5000");
+        assert_eq!(row[4], "0.4000");
+        assert_eq!(row[5], "2.0000");
+        assert_eq!(row[6], "0.3000");
+        assert_eq!(row[7], "6.2000");
+        assert_eq!(row[8], "0.5000", "the extract-commands phase was measured");
+        assert_eq!(row[10], "", "no queue phase was measured in this cycle");
+        assert_eq!(
+            row[14], "1.0000",
+            "the swapchain wait closes the phase columns"
+        );
+        assert_eq!(row[15], "4.0000", "the view schedules' lap");
+        assert_eq!(
+            row[16], "3",
+            "the view count is a count, not a duration: no decimals"
+        );
+        assert_eq!(row[17], "1.5000", "the prepass sum over the views");
+        assert_eq!(row[18], "", "no main-pass lap was measured in this cycle");
+        assert_eq!(
+            row[19], "",
+            "no post-process lap was measured in this cycle"
+        );
+        assert_eq!(row[20], "", "no submit lap was measured in this cycle");
+        assert_eq!(row[21], "1.7000", "the remainder closes the row");
+        assert_eq!(
+            row[22], "0.6000",
+            "the shadow-view runs of the views lap, in the position impl-1088 appended"
+        );
+        assert_eq!(
+            row[23], "1",
+            "the shadow view count is a count too: no decimals"
+        );
+        assert_eq!(row[24], "3.0000", "the camera runs of the views lap");
+        assert_eq!(
+            row[25], "0.2000",
+            "the early-post-process stage is its own column"
+        );
+        assert_eq!(
+            row[26], "0.4000",
+            "the views remainder closes the views lap"
+        );
+        assert_eq!(
+            row[27], "0.5000",
+            "the sun shadow passes of the camera runs follow, in the position impl-1093 appended"
+        );
+        assert_eq!(
+            row[28], "3.6000",
+            "the camera_driver lap closes the row's graph columns, in the position impl-1107 \
+             appended"
+        );
+        assert_eq!(row[29], "0.4000", "the Render set less the driver follows");
+        assert_eq!(
+            row[30], "0.0000",
+            "a measured zero is written, not left empty"
+        );
+        assert_eq!(
+            row[31], "0.9000",
+            "the camera runs' GPU-preprocessing head windows follow"
+        );
+        assert_eq!(row[32], "0.3000", "the upscaling window closes the row");
+        assert!(lines.next().is_none());
+    }
+
+    /// Every column [`RENDER_CYCLE_GRAPH_LAPS`] names writes a value when the cycle measured it, so
+    /// a column added to the header cannot silently write an empty one: the counts answer with a
+    /// whole number and the durations in milliseconds, which is also the shape the row writer
+    /// relies on.
+    #[test]
+    fn every_graph_lap_column_has_a_value() {
+        let measured = CycleSides {
+            graph_views_ms: Some(1.0),
+            graph_view_count: Some(2),
+            graph_prepass_ms: Some(3.0),
+            graph_main_pass_ms: Some(4.0),
+            graph_post_process_ms: Some(5.0),
+            graph_submit_ms: Some(6.0),
+            graph_remainder_ms: Some(7.0),
+            graph_shadow_views_ms: Some(8.0),
+            graph_shadow_view_count: Some(1),
+            graph_camera_views_ms: Some(9.0),
+            graph_early_post_process_ms: Some(10.0),
+            graph_views_remainder_ms: Some(11.0),
+            graph_shadow_passes_ms: Some(12.0),
+            graph_camera_driver_ms: Some(13.0),
+            graph_render_set_other_ms: Some(14.0),
+            graph_driver_overhead_ms: Some(15.0),
+            graph_gpu_preprocess_ms: Some(16.0),
+            graph_upscaling_ms: Some(17.0),
+            ..Default::default()
+        };
+        for column in RENDER_CYCLE_GRAPH_LAPS {
+            assert!(
+                graph_lap_value(&measured, column).is_some(),
+                "the graph column {column} has no value formatter"
+            );
+            assert!(
+                graph_lap_value(&CycleSides::default(), column).is_none(),
+                "the graph column {column} writes an empty column when unmeasured"
+            );
+        }
+        assert_eq!(
+            graph_lap_value(&measured, GRAPH_VIEW_COUNT).as_deref(),
+            Some("2"),
+            "a count column writes a whole number"
+        );
+        assert_eq!(
+            graph_lap_value(&measured, GRAPH_SHADOW_VIEW_COUNT).as_deref(),
+            Some("1"),
+            "a count column writes a whole number"
+        );
+        assert_eq!(
+            graph_lap_value(&measured, GRAPH_VIEWS).as_deref(),
+            Some("1.0000"),
+            "a duration column writes milliseconds with four decimals"
+        );
+    }
+
+    /// The per-cycle series is bounded: past the cap the oldest rows go, so a long run cannot
+    /// grow it without limit.
+    #[test]
+    fn the_render_cycles_series_keeps_its_most_recent_rows() {
+        let mut profiler = ProfilingState::default();
+        for cycle in 0..(MAX_RENDER_CYCLE_ROWS + 10) as u64 {
+            profiler.extend_render_cycles([(cycle, CycleSides::default())]);
+        }
+        assert_eq!(profiler.render_cycles.len(), MAX_RENDER_CYCLE_ROWS);
+        assert_eq!(profiler.render_cycles.front().unwrap().0, 10);
+        assert_eq!(
+            profiler.render_cycles.back().unwrap().0,
+            MAX_RENDER_CYCLE_ROWS as u64 + 9
+        );
+    }
+
+    /// The join between the two files, driven at the API the two systems sit on: the per-frame
+    /// series opens a row per frame with [`ProfilingState::begin_frame`], passed the frame's
+    /// `Time<Real>` delta as `begin_frame_series` does, and advances the number the next row
+    /// carries in `sample_frame`, as `collect_and_finish` does at the frame's end; the cycles are
+    /// numbered by the render timings' `start_main`/`end_main` — the methods the plugin's systems
+    /// call — and handed over through `take_completed_cycles` and
+    /// [`ProfilingState::extend_render_cycles`], as the drain system does.
+    ///
+    /// Cycle `n` joins the frame row numbered `n - 1`: cycles are counted from one, frame rows from
+    /// zero. The two `real_ms` columns are equal across that join — both are the reading the frame
+    /// that closed the window took — and the rows the same number would match carry neighbouring
+    /// frames' readings instead, so the join cannot be read as equal numbers.
+    #[test]
+    fn a_cycle_row_joins_the_frame_series_row_one_below_it() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        let timings = crate::render_timing::RenderTimings::default();
+        timings.set_cycle_tracking(true, true);
+        // One delta per frame, all different, as a real run's `Time<Real>` readings are: the
+        // same-number mistake would compare two of them.
+        for delta_ms in [16.0, 17.5, 12.25, 21.0] {
+            profiler.begin_frame(delta_ms);
+            timings.start_main(delta_ms);
+            timings.end_main();
+            profiler.sample_frame(&diagnostics, None, true, true);
+            profiler.extend_render_cycles(timings.take_completed_cycles());
+        }
+
+        let rows: Vec<(u64, Option<f32>)> = profiler
+            .frame_series
+            .iter()
+            .map(|row| (row.frame, row.real_ms))
+            .collect();
+        let real_ms_of = |number: u64| {
+            rows.iter()
+                .find(|(frame, _)| *frame == number)
+                .and_then(|(_, real_ms)| *real_ms)
+        };
+        assert_eq!(
+            profiler
+                .render_cycles
+                .iter()
+                .map(|(cycle, _)| *cycle)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "a four-frame run completes three cycles, numbered from one"
+        );
+        for (cycle, sides) in &profiler.render_cycles {
+            let real_ms = sides
+                .real_ms
+                .expect("the `First` that closed the window read the clock");
+            let number = *cycle - 1;
+            let row_real_ms = real_ms_of(number).unwrap_or_else(|| {
+                panic!("no closed frame-series row numbered {number}: {rows:?}")
+            });
+            assert!(
+                (row_real_ms as f64 - real_ms).abs() < 0.1,
+                "cycle {cycle} joins the frame row numbered {number}: {row_real_ms} vs {real_ms}"
+            );
+            // The row the cycle number matches is the next frame's row, or none at all when the run
+            // has not closed it: never this cycle's window.
+            if let Some(same_number) = real_ms_of(*cycle) {
+                assert!(
+                    (same_number as f64 - real_ms).abs() > 0.5,
+                    "the row numbered {cycle} is a neighbouring frame's reading: {same_number} vs \
+                     {real_ms}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn writes_complete_profile_bundle() {
         let directory = tempfile::tempdir().unwrap();
@@ -2531,7 +3560,9 @@ mod tests {
             ..Default::default()
         };
         let mut profiler = ProfilingState::default();
+        profiler.begin_frame(16.0);
         profiler.record_ms("streaming/test", 2.0);
+        profiler.record_ms("lights/budget", 0.5);
         profiler.increment("test/count", 1);
         profiler.event("cell", "requested", None);
         let frame = serde_json::json!({
@@ -2554,6 +3585,8 @@ mod tests {
             "metadata.json",
             "frame-metrics.json",
             "cpu-spans.json",
+            "frame-series.csv",
+            "render-cycles.csv",
             "gpu-passes.json",
             "streaming.json",
             "renderer.json",
@@ -2562,6 +3595,24 @@ mod tests {
         ] {
             assert!(directory.path().join(name).is_file(), "missing {name}");
         }
+        let series = fs::read_to_string(directory.path().join("frame-series.csv")).unwrap();
+        let mut lines = series.lines();
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .starts_with("frame,real_ms,portal/isolate,"),
+            "the bundle's series must name its columns: {series}"
+        );
+        assert_eq!(
+            lines
+                .next()
+                .unwrap()
+                .split(',')
+                .nth(frame_series_column("lights/budget").unwrap() + 2),
+            Some("0.5000"),
+            "the bundle's series must hold the frame's spans"
+        );
         let summary = fs::read_to_string(directory.path().join("summary.md")).unwrap();
         let metadata: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.path().join("metadata.json")).unwrap())
@@ -2700,6 +3751,99 @@ mod tests {
             ))),
             Some(SceneLoadStatus::CpuLoaded)
         );
+    }
+
+    /// The PreUpdate asset markers run exactly around bevy_asset's systems: `assets/load_finalize`
+    /// brackets `handle_internal_asset_events` and `assets/handle_drop` brackets the
+    /// `AssetTrackingSystems` set. Four probes pin the markers against Bevy's own systems with
+    /// explicit edges, and the frame's marker log must read as the two spans around them.
+    #[test]
+    fn preupdate_asset_markers_run_around_bevy_asset_systems() {
+        /// A probe logs its own name into the same clock record the markers write, so the frame's
+        /// order reads as the spans around bevy_asset's systems. The probes share the markers' two
+        /// resource parameters, so every conflicting pair is ordered by an explicit edge.
+        fn probe(name: &'static str) -> impl FnMut(ResMut<AssetSpanClock>) {
+            move |mut clock: ResMut<AssetSpanClock>| clock.order.push(name)
+        }
+
+        #[derive(Asset, TypePath)]
+        struct TestSpanAsset;
+
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            profile_output_dir: Some(std::path::PathBuf::from("profiles")),
+            ..EngineConfig::default()
+        });
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        // `sample_scene_inventory` reads these two stores, and a registered type puts a real
+        // `track_assets` system in the tracked set for the handle-drop bracket.
+        app.init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<TestSpanAsset>();
+        app.add_plugins(ProfilingPlugin);
+        app.add_systems(
+            PreUpdate,
+            (
+                probe("before_internal")
+                    .after(begin_asset_load_finalize)
+                    .before(bevy::asset::handle_internal_asset_events),
+                probe("after_internal")
+                    .after(bevy::asset::handle_internal_asset_events)
+                    .before(end_asset_load_finalize),
+                probe("before_track")
+                    .after(begin_asset_handle_drop)
+                    .before(bevy::asset::AssetTrackingSystems),
+                probe("after_track")
+                    .after(bevy::asset::AssetTrackingSystems)
+                    .before(end_asset_handle_drop),
+            ),
+        );
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<AssetSpanClock>().order.clone(),
+            [
+                "assets/load_finalize/begin",
+                "before_internal",
+                "after_internal",
+                "assets/load_finalize/end",
+                "assets/handle_drop/begin",
+                "before_track",
+                "after_track",
+                "assets/handle_drop/end",
+            ],
+            "the markers bracket bevy_asset's load finalize and its handle-drop tracking"
+        );
+        assert!(
+            !app.world()
+                .resource::<ProfilingState>()
+                .span_samples("assets/load_finalize")
+                .is_empty(),
+            "the bracket between the markers was measured"
+        );
+        assert!(
+            !app.world()
+                .resource::<ProfilingState>()
+                .span_samples("assets/handle_drop")
+                .is_empty(),
+            "the bracket between the markers was measured"
+        );
+    }
+
+    /// Without profiling, the PreUpdate asset markers do not exist and nothing is recorded: an
+    /// ordinary run's PreUpdate is unchanged.
+    #[test]
+    fn no_asset_spans_without_profiling() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default());
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<Mesh>().init_asset::<Image>();
+        app.add_plugins(ProfilingPlugin);
+        app.update();
+
+        let profiler = app.world().resource::<ProfilingState>();
+        assert!(profiler.span_samples("assets/load_finalize").is_empty());
+        assert!(profiler.span_samples("assets/handle_drop").is_empty());
     }
 }
 

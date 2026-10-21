@@ -173,6 +173,9 @@ pub struct EngineConfig {
     /// `--run-label <text>`: names an automated run in its window title, e.g. a benchmark's
     /// variant and round ([`EngineConfig::window_title`]).
     pub run_label: Option<String>,
+    /// `--run-owner <text>`: the thread or person running an automated run, last in its window
+    /// title so several engines on the taskbar can be told apart.
+    pub run_owner: Option<String>,
     pub accept_min_fps: f64,
     pub accept_p95_ms: f64,
     pub accept_max_memory_growth_gib: f64,
@@ -192,6 +195,14 @@ pub struct EngineConfig {
     pub profile_commit: String,
     pub profile_dirty_worktree: bool,
     pub profile_hardware: String,
+    /// `--probe-retire-visibility <dir>`: a measurement-only run that records whether a cell held
+    /// in the retire backlog - already hidden, draining over frames under the unload budget - ever
+    /// shows in a view. On each frame with a nonzero backlog it counts the retiring roots (and
+    /// their mesh descendants) whose `ViewVisibility` is set, photographs the first few backlog
+    /// frames, then writes `retire-visibility.json` and exits when the backlog has drained
+    /// (non-zero on any hit, or if no backlog ever appeared). `None` (the default) installs no
+    /// probe system, so an ordinary run is unchanged. See [`crate::streaming`].
+    pub probe_retire_visibility: Option<PathBuf>,
     pub acceptance_screenshot: Option<PathBuf>,
     /// `--cull-counter`: read the GPU culling result back every few frames and report how many
     /// instances the main views submit and draw (`renderer.json`, `cull`). Off by default: it asks
@@ -299,6 +310,7 @@ impl Default for EngineConfig {
             benchmark_output: PathBuf::from("benchmark-report.json"),
             benchmark_frame_times: None,
             run_label: None,
+            run_owner: None,
             accept_min_fps: 60.0,
             accept_p95_ms: 16.67,
             accept_max_memory_growth_gib: 0.5,
@@ -314,6 +326,7 @@ impl Default for EngineConfig {
             profile_commit: "unknown".into(),
             profile_dirty_worktree: false,
             profile_hardware: "unspecified".into(),
+            probe_retire_visibility: None,
             acceptance_screenshot: None,
             cull_counter: false,
             main_occlusion: true,
@@ -401,6 +414,7 @@ Benchmark and profiling:
   --frame-budget-ms <ms>                frame time the report counts frames over (default: 6.25, 160 fps)
   --benchmark-frame-times [<file>]      write every measured frame time to this CSV file
   --run-label [<text>]                  name the run in the window title
+  --run-owner [<text>]                  name who runs it (the thread) at the end of the window title
   --synthetic-instances <count>         instances in the synthetic benchmark (default: 250000)
   --accept-min-fps <fps>                fail the run below this average frame rate (default: 60)
   --accept-p95-ms <ms>                  fail the run above this p95 frame time (default: 16.67)
@@ -430,6 +444,7 @@ Benchmark and profiling:
   --profile-commit <hash>               commit recorded in the profile (default: unknown)
   --profile-dirty-worktree              record uncommitted worktree changes in the profile
   --profile-hardware <text>             hardware recorded in the profile (default: unspecified)
+  --probe-retire-visibility <dir>       record whether a draining retiring cell ever shows, write retire-visibility.json and PNGs here, then exit
 
 Diagnostics:
   --bug-report-dir <dir>                local bug-report directory (default: per-user application data)
@@ -586,6 +601,38 @@ impl EngineConfig {
         !self.show_window && !self.is_benchmark_run() && self.shots.is_some()
     }
 
+    /// Describes the automated run and its owner in the window title.
+    pub fn window_title(&self) -> String {
+        let kind = if self.is_benchmark_run() {
+            Some("benchmark")
+        } else if self.matched_route.is_some() {
+            Some("matched-route")
+        } else if self.shots.is_some() {
+            Some("shots")
+        } else if self.route.is_some() {
+            Some("route")
+        } else if self.streaming_fixture {
+            Some("streaming fixture")
+        } else {
+            None
+        };
+        let class = if self.is_benchmark_run() {
+            "TIMING"
+        } else {
+            "TEST"
+        };
+        let mut title = match (kind, self.run_label.as_deref()) {
+            (Some(kind), Some(label)) => format!("Mudcrab [{class}] {kind}: {label}"),
+            (Some(kind), None) => format!("Mudcrab [{class}] {kind}"),
+            (None, Some(label)) => format!("Mudcrab - {label}"),
+            (None, None) => "Mudcrab".to_string(),
+        };
+        if let (Some(_), Some(owner)) = (kind, self.run_owner.as_deref()) {
+            title.push_str(&format!(" | {owner}"));
+        }
+        title
+    }
+
     pub fn streaming_controls_enabled(&self) -> bool {
         self.adaptive_streaming || self.max_streaming_backlog != 0 || self.streaming_memory_mib != 0
     }
@@ -715,28 +762,6 @@ impl EngineConfig {
     /// loading. Only the pacing report reads it, so a plain `--auto-fly-speed` run records nothing.
     pub fn records_fly_lag(&self) -> bool {
         self.flies() && self.measures_pacing()
-    }
-
-    /// The window's title: what kind of automated run this is and its `--run-label`, so a run on
-    /// the taskbar says what it is. An interactive run is plain "Mudcrab".
-    pub fn window_title(&self) -> String {
-        let kind = if self.is_benchmark_run() {
-            Some("benchmark")
-        } else if self.streaming_fixture {
-            Some("streaming fixture")
-        } else if self.matched_route.is_some() {
-            Some("matched-route")
-        } else if self.shots.is_some() {
-            Some("shots")
-        } else {
-            None
-        };
-        match (kind, self.run_label.as_deref()) {
-            (Some(kind), Some(label)) => format!("Mudcrab - {kind}: {label}"),
-            (Some(kind), None) => format!("Mudcrab - {kind}"),
-            (None, Some(label)) => format!("Mudcrab - {label}"),
-            (None, None) => "Mudcrab".to_owned(),
-        }
     }
 
     /// Parses a command line into a [`ConfigAction`], or names the argument it
@@ -1054,6 +1079,9 @@ impl EngineConfig {
                 "--run-label" => {
                     config.run_label = args.next_if(|value| !value.starts_with("--"));
                 }
+                "--run-owner" => {
+                    config.run_owner = args.next_if(|value| !value.starts_with("--"));
+                }
                 "--benchmark-frame-times" => {
                     if let Some(value) = args.next_if(|value| !value.starts_with("--")) {
                         config.benchmark_frame_times = Some(value.into());
@@ -1125,6 +1153,13 @@ impl EngineConfig {
                 "--profile-commit" => {
                     config.profile_commit =
                         take_value("--profile-commit", "a commit hash", args.next())?;
+                }
+                "--probe-retire-visibility" => {
+                    config.probe_retire_visibility = Some(take_value(
+                        "--probe-retire-visibility",
+                        "a directory for the retire-visibility probe's JSON and PNGs",
+                        args.next(),
+                    )?);
                 }
                 "--profile-dirty-worktree" => config.profile_dirty_worktree = true,
                 "--profile-gpu-inventory" => config.profile_gpu_inventory = true,
@@ -1772,6 +1807,7 @@ mod tests {
         "--console-open", // capture_skyrim_tonemap_state.py
         "--event",  // inspect_skyrim_gpu_capture.py, sample_skyrim_tonemap_gpu.py
         "--max-actions", // inspect_skyrim_gpu_capture.py
+        "--pairs-output", // correlate_drawables.py
         "--max-resource-mib", // inspect_skyrim_gpu_capture.py
         "--max-resources", // inspect_skyrim_gpu_capture.py
         "--max-total-mib", // inspect_skyrim_gpu_capture.py
@@ -2738,11 +2774,11 @@ mod tests {
         let args = |list: &[&str]| run_config(list);
         assert_eq!(
             args(&["--benchmark-duration", "20", "--run-label", "main rural r1"]).window_title(),
-            "Mudcrab - benchmark: main rural r1"
+            "Mudcrab [TIMING] benchmark: main rural r1"
         );
         assert_eq!(
             args(&["--benchmark-frames", "600"]).window_title(),
-            "Mudcrab - benchmark"
+            "Mudcrab [TIMING] benchmark"
         );
         // A label left out does not swallow the next option.
         let config = args(&["--run-label", "--benchmark-frames", "600"]);
@@ -2759,15 +2795,46 @@ mod tests {
         );
         assert_eq!(
             args(&["--streaming-fixture"]).window_title(),
-            "Mudcrab - streaming fixture"
+            "Mudcrab [TEST] streaming fixture"
         );
         assert_eq!(
             args(&["--shots", "poses.json", "--run-label", "riverwood"]).window_title(),
-            "Mudcrab - shots: riverwood"
+            "Mudcrab [TEST] shots: riverwood"
         );
         assert_eq!(args(&[]).window_title(), "Mudcrab");
     }
 
+    #[test]
+    fn a_run_title_names_its_class_and_owner() {
+        let args = |list: &[&str]| run_config(list);
+        assert_eq!(
+            args(&[
+                "--benchmark-frames",
+                "600",
+                "--run-label",
+                "main r1",
+                "--run-owner",
+                "Fix: doors"
+            ])
+            .window_title(),
+            "Mudcrab [TIMING] benchmark: main r1 | Fix: doors"
+        );
+        assert_eq!(
+            args(&["--shots", "s.json", "--run-owner", "Build: water"]).window_title(),
+            "Mudcrab [TEST] shots | Build: water"
+        );
+        assert_eq!(
+            args(&["--route", "r.json"]).window_title(),
+            "Mudcrab [TEST] route"
+        );
+        // An owner left out does not swallow the next option; an interactive run stays plain.
+        let config = args(&["--run-owner", "--benchmark-frames", "600"]);
+        assert_eq!(config.run_owner, None);
+        assert_eq!(
+            args(&["--walk", "--run-owner", "x"]).window_title(),
+            "Mudcrab"
+        );
+    }
     /// A file route cannot share the camera with the streaming benchmark route. Refused while the
     /// arguments are parsed, before any asset or device work starts.
     #[test]

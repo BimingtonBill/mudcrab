@@ -34,7 +34,20 @@
 //! * `gpu`: the time the render thread waited for a swapchain image (`render/swapchain_acquire`),
 //!   which is where a GPU-bound or presentation-bound frame shows up on the CPU. This is a
 //!   lower bound for the GPU: a render thread that blocks in submit or present instead is counted as
-//!   `render_thread`, because those waits are not split out of `render/graph_and_present`. GPU pass
+//!   `render_thread`, because it is the render schedule's own time. `render-cycles.csv` now splits
+//!   `render/graph_and_present` into the render graph's view schedules, their prepass, main-pass and
+//!   post-process stages with the early post-process stage split out of the last and the upscaling
+//!   window lapped after it, the sun shadow-pass windows and the early GPU-preprocessing chain of the camera runs (out
+//!   of the stages they would otherwise sit in, which are exclusive of them) and the graph's
+//!   `queue.submit` and a remainder, the
+//!   view schedules themselves into the runs of shadow views and of cameras with their own
+//!   remainder, and the `Render` set one level further into the whole `camera_driver` lap, the set's
+//!   own time beside it and the driver's overhead around the runs (`render/graph/*`), so a frame that
+//!   went over its budget can be read there — the overhead now carrying only the end-of-run deferred
+//!   flush and the `msaa_writeback` and `ui_pass` systems, which no lap can see. But the second
+//!   `queue.submit` and `present` still sit
+//!   unsplit in that remainder, and this owner rule is
+//!   unchanged by the split: a frame blocked in present still reads as `render_thread` here. GPU pass
 //!   timestamps (`gpu_passes`) are deliberately not used to assign a frame: Bevy publishes them from a
 //!   readback that arrives a frame or more late, with no frame number to match them by, so a
 //!   per-frame match would be a guess.

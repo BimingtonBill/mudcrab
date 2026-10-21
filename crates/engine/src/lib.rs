@@ -1,3 +1,8 @@
+#[macro_use]
+mod perf_span;
+#[cfg(feature = "renderdoc")]
+mod renderdoc_trigger;
+
 pub mod aabb_guard;
 pub mod app;
 pub mod bug_report;

@@ -21,6 +21,11 @@ param(
     [switch]$UpdateBaseline,
     [switch]$Quick,
     [switch]$SkipBuild,
+    # Engine switches appended to every scene's arguments, for an A/B of one switch
+    # (e.g. -ExtraEngineArgs "--water-reflection-preset water"); pair it with a distinct run label.
+    # Under `pwsh -File`, a value starting with "-" must use the colon form, or it is read as a
+    # parameter name: "-ExtraEngineArgs:--max-unload-ms-per-frame 0".
+    [string[]]$ExtraEngineArgs = @(),
     # Import the functions below and stop, instead of running a campaign: phase2-baseline.ps1
     # dot-sources this file with -AsLibrary so both scripts invoke the engine the same way.
     [switch]$AsLibrary
@@ -167,6 +172,8 @@ function Get-ScenarioArguments {
         "--accept-max-memory-growth-gib", "1000000"
     )
     if ($RunLabel) { $arguments += @("--run-label", $RunLabel) }
+    # The window title ends with the thread's name (set MUDCRAB_RUN_OWNER once per thread).
+    if ($env:MUDCRAB_RUN_OWNER) { $arguments += @("--run-owner", $env:MUDCRAB_RUN_OWNER) }
     if ($DirtyWorktree) { $arguments += "--profile-dirty-worktree" }
     if ($Name -eq "synthetic") {
         $arguments += @("--benchmark-only", "--synthetic-instances", "250000")
@@ -190,6 +197,9 @@ function Get-ScenarioArguments {
             $arguments += @("--auto-fly-speed", "900")
         }
     }
+    # A variant run (an A/B of one engine switch) appends its switches to every scene.
+    # `pwsh -File` hands a comma list over as one string, so split on commas and spaces.
+    if ($script:ExtraEngineArgs) { $arguments += @($script:ExtraEngineArgs | ForEach-Object { $_ -split '[ ,]+' } | Where-Object { $_ }) }
     return $arguments
 }
 
@@ -268,6 +278,10 @@ function Invoke-EngineWindow {
         [Parameter(Mandatory)][string]$RunDirectory,
         [Parameter(Mandatory)][string]$Label,
         [switch]$AsHashtable,
+        # The engine exits non-zero when one of its own pass gates failed (the commit budget, a
+        # streaming invariant) even though it wrote a complete report. The profiling campaign treats
+        # that as a failed run; the baseline measures and does not judge, so it reads the report
+        # anyway and warns which gates failed.
         [switch]$AllowGateFailure
     )
     New-Item -ItemType Directory -Force -Path $RunDirectory | Out-Null
@@ -325,6 +339,13 @@ function Invoke-EngineWindow {
     # one, and neither is `true` — both mean the engine failed for another reason.
     if ($exitCode -ne 0 -and $report.passed -ne $false) {
         throw "$Label exited $exitCode but its report says the run passed: the engine failed for another reason"
+    }
+    if ($exitCode -ne 0) {
+        # Only a report that says its own gates failed excuses the exit code: a crash after an older
+        # report, or an exit for any other reason, was refused above or fails the freshness checks.
+        if ($report.passed -ne $false) { throw "$Label failed with exit code $exitCode" }
+        $failedGates = @($report.thresholds.GetEnumerator() | Where-Object { $_.Value -is [bool] -and -not $_.Value } | ForEach-Object { $_.Key })
+        Write-Warning "$Label exited $exitCode because its own gates failed ($($failedGates -join ', ')): the report in $RunDirectory is kept and measured"
     }
     if ($AsHashtable) { return $report }
     return (Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json)

@@ -4,6 +4,7 @@
 use bevy::{
     ecs::system::{SystemId, SystemParam},
     input::mouse::MouseMotion,
+    platform::time::Instant,
     prelude::*,
     window::{CursorGrabMode, CursorOptions},
 };
@@ -17,6 +18,7 @@ use shared::collision::CollisionBody;
 use std::path::Path;
 
 use crate::{
+    config::EngineConfig,
     console::{AppConsoleExt, ConsoleCommand, ConsoleState, console_closed},
     profiling::ProfilingState,
     streaming::{StreamingMetrics, TerrainCollider},
@@ -463,6 +465,11 @@ pub fn debug_tankard_collider() -> Collider {
     ])
 }
 
+/// When the fixed step's rapier work began: set by [`physics_step_begin`] and read by
+/// [`physics_step_end`], which is the `physics/step` span.
+#[derive(Resource, Default)]
+struct PhysicsStepTimer(Option<Instant>);
+
 /// Rapier setup shared by the fixture and (later) streamed collision (V17).
 pub struct PhysicsCorePlugin;
 
@@ -480,7 +487,52 @@ impl Plugin for PhysicsCorePlugin {
             FixedUpdate,
             clamp_dynamic_clutter_velocities.after(PhysicsSet::Writeback),
         );
+        // The fixed step's rapier work, bracketed: everything between these two markers is
+        // `physics/step` (see [`physics_step_begin`]). They are measurement only, and they are
+        // installed only for the runs that read the spans — a run that writes a profile bundle —
+        // so an ordinary session pays nothing for them: a marker system, an `Instant::now()` and a
+        // span every fixed step is exactly the per-step cost this skips.
+        if profiles(app) {
+            app.init_resource::<PhysicsStepTimer>().add_systems(
+                FixedUpdate,
+                (
+                    physics_step_begin.before(PhysicsSet::SyncBackend),
+                    physics_step_end.after(PhysicsSet::Writeback),
+                ),
+            );
+        }
     }
+}
+
+/// Whether this run records spans into a profile bundle (`--profile-output`), the gate the
+/// `physics/step` bracket and the per-frame series share: without it nothing reads a span.
+fn profiles(app: &App) -> bool {
+    app.world()
+        .get_resource::<EngineConfig>()
+        .is_some_and(|config| config.profile_output_dir.is_some())
+}
+
+/// Opens the `physics/step` span before the fixed step's rapier work: the sync of this frame's new
+/// and changed colliders into rapier's world, the simulation step, and the writeback of the
+/// results (`PhysicsSet::SyncBackend` through `PhysicsSet::Writeback`, chained by the plugin
+/// above). It is the part of a crossing's cost no other span sees: `RunFixedMainLoop` times the
+/// schedule as a whole, and Bevy's own timers cover only the main schedules.
+///
+/// The span is everything between this marker and [`physics_step_end`], so a `FixedUpdate` system
+/// Bevy is free to place between them — an unordered one, such as `walk_movement_system` — is
+/// inside it, and the per-frame series' column for it is the frame's total when a frame runs more
+/// than one fixed step (see `crate::profiling`).
+fn physics_step_begin(mut timer: ResMut<PhysicsStepTimer>) {
+    timer.0 = Some(Instant::now());
+}
+
+/// Closes the `physics/step` span opened by [`physics_step_begin`], after the fixed step's
+/// writeback has run.
+fn physics_step_end(mut timer: ResMut<PhysicsStepTimer>, mut profiler: ResMut<ProfilingState>) {
+    let Some(started) = timer.0.take() else {
+        return;
+    };
+    profiler.record_elapsed("physics/step", started);
 }
 
 fn report_movement_tuning(tuning: Res<MovementTuning>) {
@@ -1919,7 +1971,7 @@ fn apply_teleport_player(
 #[cfg(test)]
 mod walk_tests {
     use super::*;
-    use bevy::ecs::system::RunSystemOnce;
+    use bevy::{ecs::system::RunSystemOnce, time::TimeUpdateStrategy};
 
     #[test]
     fn alt_sprint_latches_until_movement_stops_or_controls_leave_walk() {
@@ -2064,6 +2116,71 @@ mod walk_tests {
         assert_eq!(
             controller.snap_to_ground,
             Some(CharacterLength::Absolute(tuning.ground_snap))
+        );
+    }
+
+    /// A headless app with [`PhysicsCorePlugin`] and an [`EngineConfig`] that profiles — or, with
+    /// `None`, one that does not — stepped by one fixed timestep per update.
+    ///
+    /// The plugin set is the one `headless::fixture_app` uses, and for its reason: rapier's fixed
+    /// schedule includes Bevy's transform propagation, which reads `RemovedComponents<ChildOf>` and
+    /// therefore needs `TransformPlugin` and the message resources it registers to exist. Every real
+    /// run has them (`DefaultPlugins` adds `TransformPlugin`); this app is the smallest one that can
+    /// hold a physics step at all.
+    fn step_span_app(profile_output: Option<std::path::PathBuf>) -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            TransformPlugin,
+            bevy::input::InputPlugin,
+            AssetPlugin::default(),
+            bevy::mesh::MeshPlugin,
+            MaterialPlugin::<StandardMaterial>::default(),
+        ))
+        .init_asset::<Mesh>()
+        .insert_resource(EngineConfig {
+            profile_output_dir: profile_output,
+            ..Default::default()
+        })
+        .init_resource::<ProfilingState>()
+        .init_resource::<StreamingMetrics>()
+        .add_plugins(PhysicsCorePlugin)
+        .insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_secs_f32(PHYSICS_TIMESTEP),
+        ));
+        app.finish();
+        app
+    }
+
+    /// The fixed step's rapier work is bracketed by `physics/step` when — and only when — the run
+    /// writes a profile bundle, so a session that records nothing pays no marker and no span.
+    #[test]
+    fn the_physics_step_span_exists_only_for_a_profiled_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut profiled = step_span_app(Some(directory.path().to_owned()));
+        let mut plain = step_span_app(None);
+        // A fixed step runs only once the fixed clock's accumulator holds a whole timestep, which
+        // takes more than the first frame (the manual step and the schedule's own timestep are not
+        // the same float). Both apps get the same frames, so the difference is the gate alone.
+        for _ in 0..3 {
+            profiled.update();
+            plain.update();
+        }
+        let samples = profiled
+            .world()
+            .resource::<ProfilingState>()
+            .span_samples("physics/step");
+        assert!(
+            !samples.is_empty() && samples.iter().all(|value| *value > 0.0),
+            "the profiled run measures its fixed steps, not zeroes: {samples:?}"
+        );
+        assert!(
+            plain
+                .world()
+                .resource::<ProfilingState>()
+                .span_samples("physics/step")
+                .is_empty(),
+            "a run that writes no bundle installs no marker to record"
         );
     }
 }

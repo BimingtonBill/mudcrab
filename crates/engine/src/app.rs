@@ -401,6 +401,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             ConsolePlugin,
             crate::nif_material::NifMaterialPlugin,
         ));
+    // Trace features may already have installed the render diagnostics.
+    if !app.world().resource::<EngineConfig>().no_render_diagnostics
+        && !app.is_plugin_added::<RenderDiagnosticsPlugin>()
+    {
+        app.add_plugins(RenderDiagnosticsPlugin);
+    }
+    #[cfg(feature = "renderdoc")]
+    app.add_plugins(crate::renderdoc_trigger::RenderDocTriggerPlugin);
     add_camera_and_capture_systems(&mut app);
     if let Some(terrain_merge) = terrain_merge {
         app.insert_resource(terrain_merge);
@@ -480,7 +488,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         app.add_systems(Startup, setup_world);
         app.add_systems(Startup, setup_synthetic_benchmark);
     }
-    if !app.world().resource::<EngineConfig>().no_render_diagnostics {
+    if !app.world().resource::<EngineConfig>().no_render_diagnostics
+        && !app.is_plugin_added::<RenderDiagnosticsPlugin>()
+    {
         app.add_plugins(RenderDiagnosticsPlugin);
     }
     if app.world().resource::<EngineConfig>().stdin_console && !shots_active {

@@ -84,8 +84,11 @@
 //! also lights the far side of the wall it is mounted on. The reference's `XRDS` radius override *is* applied; see
 //! [`radius_of`].
 
-use crate::world::{components::StreamingCamera, database::LightRow};
-use bevy::prelude::*;
+use crate::{
+    profiling::ProfilingState,
+    world::{components::StreamingCamera, database::LightRow},
+};
+use bevy::{platform::time::Instant, prelude::*};
 use std::collections::HashSet;
 
 /// `LIGH` `DATA` flag bit: the record is off until something turns it on, so a reference to it is
@@ -308,6 +311,7 @@ fn activate_deferred_lights(
 impl Plugin for LightsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LightBudget>()
+            .init_resource::<ProfilingState>()
             .add_systems(
                 Update,
                 activate_deferred_lights.after(crate::settings_ui::SettingsUiSet),
@@ -328,6 +332,9 @@ impl Plugin for LightsPlugin {
 /// reference whose model failed strict validation - comes back on: the budget cannot tell that
 /// hiding from its own, and a light next to a missing model is not wrong. Hiding an *ancestor*
 /// needs no such care, because `Visibility::Inherited` defers to it.
+/// The system's own cost is the `lights/budget` span, which the per-frame series carries as a
+/// column (`crate::profiling`): outdoors a re-choose ranks every spawned light twice and sorts it,
+/// and a cell committed in front of the camera makes one happen.
 fn budget_lights(
     mut budget: ResMut<LightBudget>,
     camera: Query<&GlobalTransform, With<StreamingCamera>>,
@@ -335,6 +342,7 @@ fn budget_lights(
         (Entity, &GlobalTransform, &mut PointLight, &mut Visibility),
         With<SkyrimLight>,
     >,
+    mut profiler: ResMut<ProfilingState>,
     config: Option<Res<crate::config::EngineConfig>>,
     settings: Option<Res<crate::settings::RenderingSettings>>,
 ) {
@@ -361,6 +369,7 @@ fn budget_lights(
     let Ok(camera) = camera.single() else {
         return;
     };
+    let started = Instant::now();
     let camera_position = camera.translation();
     // One pass over every spawned light, allocating nothing: how many there are, and whether any of
     // them is not in the set the current selection was made from.
@@ -380,6 +389,10 @@ fn budget_lights(
         && budget.chosen.len() == spawned
         && chosen_at.distance(camera_position) <= BUDGET_RECHOOSE_DISTANCE
     {
+        // The span is recorded on this path too: the frame's cost of budgeting is the pass over the
+        // lights whether or not the selection had to be re-made, and a slow frame's row should show
+        // what the budget cost in it either way.
+        profiler.record_elapsed("lights/budget", started);
         return;
     }
 
@@ -427,6 +440,7 @@ fn budget_lights(
             "lights: budget re-chosen"
         );
     }
+    profiler.record_elapsed("lights/budget", started);
 }
 
 /// Nearest first. The entity breaks ties, so two lights at the same distance are chosen between the
@@ -781,6 +795,7 @@ mod tests {
         ))
         .init_asset::<Mesh>()
         .init_resource::<LightBudget>()
+        .init_resource::<ProfilingState>()
         .add_systems(PostUpdate, budget_lights.after(TransformSystems::Propagate));
         app.world_mut().spawn((
             Transform::from_translation(camera),
