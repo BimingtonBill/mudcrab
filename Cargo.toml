@@ -90,6 +90,6 @@ inherits = "release"
 opt-level = "s"
 strip = "debuginfo"
 
-# B04 shared clock requires the public vendored renderer uniform seam.
+# Public shared clock and destination draw proof use the vendored renderer seams.
 [patch.crates-io]
 bevy_render = { path = "vendor/bevy_render-0.19.0" }

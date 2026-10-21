@@ -22,7 +22,7 @@ use crate::{
 };
 use bevy::{
     prelude::*,
-    render::view::screenshot::{Screenshot, ScreenshotCaptured},
+    render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk},
     window::WindowResolution,
 };
 use serde::Deserialize;
@@ -32,6 +32,18 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
+
+/// Requests a one-shot capture of the primary window into `path`, the same mechanism a `--shots`
+/// run photographs a pose with: the [`Screenshot`] entity's observer writes the file after that
+/// frame renders. Used by the retire-visibility probe (`crate::streaming`) to photograph a frame
+/// that is draining retiring cells - a small hook so the probe reuses this capture path rather
+/// than a second one.
+pub(crate) fn capture_primary_window(commands: &mut Commands, path: PathBuf) {
+    commands
+        .spawn(Screenshot::primary_window())
+        .observe(save_to_disk(path));
+}
+
 
 /// Frames a view has to report nothing pending for, in a row, before it is photographed.
 ///

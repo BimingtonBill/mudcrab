@@ -3,22 +3,24 @@
 //! worst frames spend on. Measurement only: nothing here changes what the engine loads, in what
 //! order, or how fast.
 //!
-//! * **World ready** ([`WorldReadyInputs::is_ready`]): every cell of the stream window resident, no
-//!   cell loading, no database request in flight, the model arming queue empty, and no model or
-//!   terrain/water surface still pending. [`PacingTracker`] requires that predicate to hold on two
-//!   consecutive frames (a cell that just committed is resident while its references are still
-//!   being created, so the first of the two can be early) and records the time and frame count
-//!   from the first frame to the first of them.
+//! * **World ready** ([`WorldReadyInputs::is_ready`]): every cell of the stream window resident
+//!   (inside an interior, the one interior cell), no cell loading, no database request in flight,
+//!   the model arming queue empty, and no model or terrain/water surface still pending.
+//!   [`PacingTracker`] requires that predicate to hold on two consecutive frames (a cell that just
+//!   committed is resident while its references are still being created, so the first of the two
+//!   can be early) and records the time and frame count from the first frame to the first of them.
 //! * **Jump** (`--benchmark-jump`): once the world is first ready the camera moves to the centre of
 //!   another cell, and the time to be ready again is recorded the same way.
 //! * **Lag at speed** (`--auto-fly-speed`): the horizontal distance from the camera at which each
 //!   model finished loading ([`FlyLag`]). A model that completes close to the camera arrived late.
 
+pub(crate) mod startup;
 use crate::{
     app::benchmark_jump_position,
     config::EngineConfig,
     profiling::ProfilingState,
     streaming::{ActiveSpace, RenderOrigin, StreamingMetrics, StreamingWorld, window_center},
+    swap_bridge::{SwapInCameraView, SwapWaiting, pending_drawn},
     world::{cache::CellCache, components::CELL_SIZE, components::StreamingCamera},
 };
 use bevy::prelude::*;
@@ -44,6 +46,13 @@ pub struct WorldReadyInputs {
     pub arming_queue_depth: usize,
     pub pending_asset_instances: usize,
     pub pending_surface_instances: usize,
+    /// Surfaces a view can see that the render world has not confirmed drawn (design-1091 §4): the
+    /// world is not ready while the ground it shows may be a stand-in or a hole.
+    pub pending_drawn: usize,
+    /// LOD queries submitted but not answered, and LOD chunks requested but not resident: work that
+    /// will still change the frame, so the world is not ready while either is nonzero.
+    pub pending_lod_queries: usize,
+    pub pending_lod_chunks: usize,
 }
 
 impl WorldReadyInputs {
@@ -58,10 +67,14 @@ impl WorldReadyInputs {
             && self.arming_queue_depth == 0
             && self.pending_asset_instances == 0
             && self.pending_surface_instances == 0
+            && self.pending_drawn == 0
+            && self.pending_lod_queries == 0
+            && self.pending_lod_chunks == 0
     }
 
     fn from_streaming(
         metrics: &StreamingMetrics,
+        pending_drawn: usize,
         window_cells: usize,
         resident_window_cells: usize,
         failed_window_cells: usize,
@@ -75,6 +88,9 @@ impl WorldReadyInputs {
             arming_queue_depth: metrics.arming_queue_depth,
             pending_asset_instances: metrics.pending_asset_instances,
             pending_surface_instances: metrics.pending_surface_instances,
+            pending_drawn,
+            pending_lod_queries: metrics.pending_lod_queries,
+            pending_lod_chunks: metrics.pending_lod_chunks,
         }
     }
 }
@@ -89,7 +105,10 @@ struct Mark {
 /// How many consecutive frames the predicate must hold before it counts. A cell that just
 /// committed is resident while its references are still in the command buffer, so the first frame
 /// it holds can be one frame early; the second cannot.
-const READY_FRAMES_REQUIRED: u32 = 2;
+///
+/// The startup load lift ([`startup::StartupLoadPlugin`]) waits for the same two
+/// frames, so the pacing budgets come back on the frame this report latches the world ready.
+pub(crate) const READY_FRAMES_REQUIRED: u32 = 2;
 
 /// Latches "ready" once the predicate has held on [`READY_FRAMES_REQUIRED`] consecutive frames,
 /// remembering the first frame of that run.
@@ -414,6 +433,52 @@ pub fn horizontal_distance(a: Vec3, b: Vec3) -> f32 {
     Vec2::new(a.x - b.x, a.z - b.z).length()
 }
 
+/// The world-ready predicate, read from a frame's end state: the stream window around the camera,
+/// the streaming counters, and the surfaces a view can see that the render world has not confirmed
+/// drawn ([`WorldReadyInputs::is_ready`], design-1091 §4). Returns the predicate and the window's
+/// failed-cell count (which the report records next to the ready time).
+///
+/// One evaluation for both callers, so they cannot disagree about the frame the world was first
+/// ready: [`track_world_ready`] (the pacing report's latch) and the startup load lift
+/// ([`startup`]), which restores the configured pacing on that frame.
+pub(crate) fn world_ready_at_frame_end(
+    config: &EngineConfig,
+    origin: IVec2,
+    streaming: &StreamingWorld,
+    space: &ActiveSpace,
+    metrics: &StreamingMetrics,
+    camera: Vec3,
+    pending_drawn: usize,
+) -> (bool, usize) {
+    let inputs = world_ready_inputs_at_frame_end(
+        config,
+        origin,
+        streaming,
+        space,
+        metrics,
+        camera,
+        pending_drawn,
+    );
+    (inputs.is_ready(), inputs.failed_window_cells)
+}
+
+/// The facts [`world_ready_at_frame_end`] decides on, for a caller that also needs to tell
+/// whether the load is still moving (the startup lift's stall timeout).
+pub(crate) fn world_ready_inputs_at_frame_end(
+    config: &EngineConfig,
+    origin: IVec2,
+    streaming: &StreamingWorld,
+    space: &ActiveSpace,
+    metrics: &StreamingMetrics,
+    camera: Vec3,
+    pending_drawn: usize,
+) -> WorldReadyInputs {
+    let center = window_center(config, camera, origin);
+    let (window_cells, resident, failed) =
+        streaming.active_residency(space, config.worldspace_id, center, config.stream_radius);
+    WorldReadyInputs::from_streaming(metrics, pending_drawn, window_cells, resident, failed)
+}
+
 /// The frame delta the loading frame-time windows are measured with: the real wall-clock delta,
 /// never the virtual clock. Bevy clamps `Time<Virtual>` at 250 ms, so a one-second hitch would
 /// otherwise be recorded as 250 ms, which is exactly the stall those windows exist to catch. The
@@ -434,6 +499,9 @@ pub(crate) fn track_world_ready(
     metrics: Res<StreamingMetrics>,
     cache: Res<CellCache>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    // Surfaces a view can see that the render world has not confirmed drawn: "ready" means drawn,
+    // not validated (design-1091 §4).
+    waiting: Query<Has<SwapInCameraView>, With<SwapWaiting>>,
     mut tracker: ResMut<PacingTracker>,
     mut profiler: ResMut<ProfilingState>,
     // The window frame times come from the real clock; `window_delta_ms` is the one place that
@@ -444,16 +512,16 @@ pub(crate) fn track_world_ready(
         return;
     };
     let started = *tracker.started.get_or_insert_with(Instant::now);
-    let center = window_center(&config, camera.translation, origin.0);
-    let (window_cells, resident, failed) = streaming.active_residency(
+    let (ready, failed) = world_ready_at_frame_end(
+        &config,
+        origin.0,
+        &streaming,
         &space.as_deref().copied().unwrap_or_default(),
-        config.worldspace_id,
-        center,
-        config.stream_radius,
+        &metrics,
+        camera.translation,
+        pending_drawn(&waiting),
     );
-    let inputs = WorldReadyInputs::from_streaming(&metrics, window_cells, resident, failed);
     let elapsed_millis = started.elapsed().as_secs_f64() * 1000.0;
-    let ready = inputs.is_ready();
     // Frame-time windows are for benchmark runs; an ordinary session runs unbounded.
     tracker.record_frame_windows = config.is_benchmark_run();
     tracker.window_failed_cells = failed;
@@ -509,15 +577,44 @@ mod tests {
         assert!(ready_inputs().is_ready());
     }
 
+    /// "Ready" means drawn, not validated (design-1091 §4): a surface a view can see that the render
+    /// world has not confirmed drawn holds the mark, so the benchmark does not time a stand-in or a
+    /// hole - and, on its own, nothing else can be the reason.
+    #[test]
+    fn world_ready_waits_for_drawn() {
+        let drawn = ready_inputs();
+        assert!(drawn.is_ready());
+
+        let waiting = WorldReadyInputs {
+            pending_drawn: 1,
+            ..ready_inputs()
+        };
+        assert!(
+            !waiting.is_ready(),
+            "a visible surface the render world has not confirmed drawn holds the world-ready mark"
+        );
+        assert!(
+            WorldReadyInputs {
+                pending_drawn: 0,
+                ..waiting
+            }
+            .is_ready(),
+            "and once it is drawn the mark latches: nothing else about the view changed"
+        );
+    }
+
     #[test]
     fn each_condition_alone_holds_the_world_back() {
-        let holds_back: [fn(&mut WorldReadyInputs); 7] = [
+        let holds_back: [fn(&mut WorldReadyInputs); 10] = [
             |i| i.resident_window_cells = 24,
             |i| i.loading_cells = 1,
             |i| i.active_requests = 1,
             |i| i.arming_queue_depth = 1,
             |i| i.pending_asset_instances = 1,
             |i| i.pending_surface_instances = 1,
+            |i| i.pending_drawn = 1,
+            |i| i.pending_lod_queries = 1,
+            |i| i.pending_lod_chunks = 1,
             |i| i.window_cells = 0,
         ];
         for (index, hold) in holds_back.iter().enumerate() {
@@ -789,6 +886,7 @@ mod tests {
         })
         .insert_resource(RenderOrigin(IVec2::ZERO))
         .insert_resource(StreamingWorld::default())
+        .init_resource::<ActiveSpace>()
         .insert_resource(StreamingMetrics::default())
         .insert_resource(cache)
         .insert_resource(PacingTracker {

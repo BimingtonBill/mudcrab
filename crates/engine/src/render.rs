@@ -5,7 +5,10 @@ use crate::{
     view_policy::{
         SecondaryViewTarget, ViewDemand, ViewPolicy, ViewPolicySystems, ViewRequest, ViewShadows,
     },
-    world::{cache::TerrainSnapshot, database::AssetCatalog},
+    world::{
+        cache::{TerrainLayerSnapshot, TerrainSnapshot},
+        database::AssetCatalog,
+    },
 };
 use bevy::{
     app::{HierarchyPropagatePlugin, PropagateOver, PropagateSet},
@@ -323,25 +326,31 @@ struct TerrainSettings {
     weights: [Vec4; WEIGHT_FIELD_WORDS],
 }
 
-/// The sample grid of one terrain quadrant: `17x17` opacities on the same `128`-unit spacing as the
+/// The sample grid of one terrain quadrant: 17x17 opacities on the same 128-unit spacing as the
 /// quadrant's mesh columns, which is what LAND's `VTXT` entries index.
 pub(crate) const QUADRANT_WEIGHT_SAMPLES: usize = 17;
 
-/// Overlay layers a quadrant can carry beside its base: the runtime's cap, since
-/// [`crate::streaming::quadrant_layers`] rejects a quadrant with more than six layers in total.
+/// Samples per overlay that a quadrant can carry: the base layer plus five overlays, the runtime's
+/// own cap (`quadrant_layers` rejects more).
 pub(crate) const OVERLAY_WEIGHT_SLOTS: usize = 5;
 
-/// `Vec4`s per overlay in the weight field: one [`QUADRANT_WEIGHT_SAMPLES`]-square grid packed four
-/// samples to a `Vec4` and rounded up to whole `Vec4`s, so every overlay starts on a 16-byte
-/// boundary. The shader declares the same number (`WEIGHT_GRID_WORDS` in `terrain.wgsl`).
+/// Vec4s per overlay in the weight field: `289` samples four to a vec4, padded to whole vec4s so
+/// every overlay starts on a 16-byte boundary. The shader declares the same numbers
+/// (`WEIGHT_GRID_WORDS` in `terrain.wgsl`).
 pub(crate) const OVERLAY_WEIGHT_WORDS: usize =
     (QUADRANT_WEIGHT_SAMPLES * QUADRANT_WEIGHT_SAMPLES).div_ceil(4);
 
-/// The whole field one material carries: [`OVERLAY_WEIGHT_SLOTS`] overlays of
-/// [`OVERLAY_WEIGHT_WORDS`] words each. The shader declares the same number as the length of its
-/// `weights` array.
+/// The whole field the material's uniform carries: five overlays of [`OVERLAY_WEIGHT_WORDS`].
 pub(crate) const WEIGHT_FIELD_WORDS: usize = OVERLAY_WEIGHT_SLOTS * OVERLAY_WEIGHT_WORDS;
 
+/// The descriptor Bevy's asset loader uses for a `.ktx2` that requests no sampler of its own:
+/// `ImagePlugin::default`'s `ImageSamplerDescriptor::linear()`, whose address modes are
+/// `ImageAddressMode`'s default.
+fn default_linear_sampler() -> ImageSamplerDescriptor {
+    ImageSamplerDescriptor::linear()
+}
+
+/// A render layer index.
 pub type Layer = usize;
 
 /// The layer of the world: terrain, and (here) the placed objects too.
@@ -480,14 +489,13 @@ pub(crate) fn terrain_layer_sampler() -> ImageSamplerDescriptor {
         address_mode_v: ImageAddressMode::Repeat,
         address_mode_w: ImageAddressMode::Repeat,
         anisotropy_clamp: 16,
-        ..ImageSamplerDescriptor::linear()
+        ..default_linear_sampler()
     }
 }
 
-/// Packs a quadrant's overlay weight grids into the field the material uniform carries: sample `s`
-/// of overlay `o` lands in component `s % 4` of word `o * OVERLAY_WEIGHT_WORDS + s / 4`, which is
-/// where `grid_weight` in `terrain.wgsl` reads it. Grids beyond [`OVERLAY_WEIGHT_SLOTS`] and
-/// samples beyond one grid are dropped, so a malformed grid cannot write outside the field.
+/// Packs a quadrant's overlay weight grids into the material uniform's field. Sample `s` of
+/// overlay `o` lands in component `s % 4` of word `o * OVERLAY_WEIGHT_WORDS + s / 4`, the layout
+/// `grid_weight` in `terrain.wgsl` reads.
 fn weight_field(overlay_weights: &[Vec<f32>]) -> [Vec4; WEIGHT_FIELD_WORDS] {
     let mut field = [Vec4::ZERO; WEIGHT_FIELD_WORDS];
     for (overlay, grid) in overlay_weights
@@ -514,10 +522,9 @@ impl TerrainSettings {
         self.normal_layers_1 = Vec4::new(present(4), present(5), 0.0, 0.0);
     }
 
-    /// The settings of one quadrant of `terrain`: the tiling the shader repeats every layer by, the
-    /// quadrant's origin inside the cell, and its overlay weight field. The shader interpolates the
-    /// field itself, so a weight reaches the fragment stage exactly as LAND records it instead of
-    /// through a vertex attribute Bevy re-normalizes.
+    /// The settings of one streamed quadrant: the tiling the shader repeats every layer by, the
+    /// quadrant's origin inside the cell, and its overlay weight field - which the shader
+    /// interpolates itself, so the weights reach the fragment stage exactly as LAND records them.
     fn for_quadrant(quadrant: u8, layers: usize, overlay_weights: &[Vec<f32>]) -> Self {
         Self {
             tiling_and_layer_count: Vec4::new(
@@ -531,20 +538,21 @@ impl TerrainSettings {
             fallback_weights_1: Vec4::ZERO,
             // A quadrant with no overlay has nothing in the field to read, so the shader is told to
             // skip it: the packed attributes carry the same (empty) overlays.
-            normal_layers_0: Vec4::ZERO,
-            normal_layers_1: Vec4::ZERO,
             weight_source: if overlay_weights.is_empty() {
                 Vec4::ZERO
             } else {
                 Vec4::X
             },
+            normal_layers_0: Vec4::ZERO,
+            normal_layers_1: Vec4::ZERO,
             weights: weight_field(overlay_weights),
         }
     }
 
-    /// The settings of a material that carries no weight field, so the shader reads the weights the
-    /// mesh packs into its vertex attributes instead. Only the stand-in terrain a synthetic scene
-    /// draws without a LAND snapshot - the streaming and benchmark fixtures - uses it.
+    /// The settings of a material that carries no weight field: only the tiling and the fallback
+    /// weight, with the shader reading the packed vertex attributes instead. The synthetic
+    /// fixtures are built without an `Assets<Image>` or a LAND snapshot, so this is how they are
+    /// rendered; no streamed quadrant uses it.
     fn vertex_weights_only(layers: f32) -> Self {
         Self {
             tiling_and_layer_count: Vec4::new(
@@ -556,12 +564,68 @@ impl TerrainSettings {
             quadrant_origin: Vec4::ZERO,
             fallback_weights_0: Vec4::X,
             fallback_weights_1: Vec4::ZERO,
+            weight_source: Vec4::ZERO,
             normal_layers_0: Vec4::ZERO,
             normal_layers_1: Vec4::ZERO,
-            weight_source: Vec4::ZERO,
             weights: [Vec4::ZERO; WEIGHT_FIELD_WORDS],
         }
     }
+}
+
+/// The landscape texture the base layer of `quadrant` samples.
+///
+/// Some `LAND` quadrants carry no base texture: the converter publishes them with texture form id
+/// `0` (`crates/converter/src/esm/cell_cache.rs`), and Bevy binds its 1x1 white fallback to the
+/// empty slot, which paints the quadrant's whole base weight as a white square. Such a quadrant
+/// borrows a texture that is there instead: the base of the first neighbouring quadrant of the
+/// same cell that has one, in quadrant order, else the texture of its own strongest overlay.
+/// `0` still means "no texture", for a quadrant with nothing to borrow.
+pub(crate) fn quadrant_base_texture_form_id(
+    terrain: &TerrainSnapshot,
+    quadrant: u8,
+) -> Result<u32, String> {
+    let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
+    let own_base = layers
+        .iter()
+        .find(|layer| layer.is_base)
+        .filter(|base| base.texture_form_id != 0);
+    if let Some(base) = own_base {
+        return Ok(base.texture_form_id);
+    }
+    for neighbour in 0..4u8 {
+        if neighbour == quadrant {
+            continue;
+        }
+        let base = crate::streaming::quadrant_layers(terrain, neighbour)?
+            .into_iter()
+            .find(|layer| layer.is_base)
+            .filter(|base| base.texture_form_id != 0);
+        if let Some(base) = base {
+            return Ok(base.texture_form_id);
+        }
+    }
+    Ok(strongest_overlay_texture(&layers).unwrap_or(0))
+}
+
+/// The texture of the overlay that covers most of the quadrant: the one whose `VTXT` opacities sum
+/// highest, the earlier layer winning a tie so the choice is deterministic. Layers with no texture
+/// of their own cannot stand in for the base and are skipped.
+fn strongest_overlay_texture(layers: &[&TerrainLayerSnapshot]) -> Option<u32> {
+    let mut strongest: Option<(f32, u32)> = None;
+    for layer in layers.iter().filter(|layer| !layer.is_base) {
+        if layer.texture_form_id == 0 {
+            continue;
+        }
+        let covered: f32 = layer.weights.iter().map(|(_, opacity)| opacity).sum();
+        let replace = match strongest {
+            Some((best, _)) => covered > best,
+            None => true,
+        };
+        if replace {
+            strongest = Some((covered, layer.texture_form_id));
+        }
+    }
+    strongest.map(|(_, texture_form_id)| texture_form_id)
 }
 
 /// The images a terrain quadrant's material waits on, by the colour space each
@@ -603,17 +667,27 @@ impl TerrainExtension {
         catalog: &AssetCatalog,
         asset_server: &AssetServer,
     ) -> Result<(Self, TerrainImages), String> {
+        let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
+        // The layer slots in the order the shader samples them: slot 0 is the base, which a
+        // quadrant without a `BTXT` of its own samples from the texture
+        // [`quadrant_base_texture_form_id`] borrows for it.
+        let mut slots = [0u32; 6];
+        slots[0] = quadrant_base_texture_form_id(terrain, quadrant)?;
+        for (slot, layer) in layers.iter().enumerate().skip(1) {
+            slots[slot] = layer.texture_form_id;
+        }
         let mut textures: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
         let mut normals: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
-        let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
-        let mut handles = Vec::with_capacity(layers.len());
+        let mut handles = Vec::new();
         let mut normal_handles = Vec::new();
-        for ((target, normal), layer) in textures.iter_mut().zip(normals.iter_mut()).zip(&layers) {
-            if layer.texture_form_id == 0 {
-                // A preserved unresolved layer keeps its slot and weights with no image bound.
+        for (slot, texture_form_id) in slots.iter().enumerate() {
+            if *texture_form_id == 0 {
                 continue;
             }
-            if let Some(path) = catalog.landscape_normal(layer.texture_form_id) {
+            let texture_form_id = *texture_form_id;
+            // A borrowed base samples the borrowed form id's normal map too, so its detail
+            // matches the diffuse it is drawn with.
+            if let Some(path) = catalog.landscape_normal(texture_form_id) {
                 // A normal map holds directions, not colours: it must not be decoded as sRGB.
                 let handle = asset_server
                     .load_builder()
@@ -622,24 +696,22 @@ impl TerrainExtension {
                         settings.is_srgb = false;
                     })
                     .load(path.to_owned());
-                *normal = Some(handle.clone());
+                normals[slot] = Some(handle.clone());
                 normal_handles.push(handle);
             }
-            let path = catalog
-                .landscape_diffuse(layer.texture_form_id)
-                .ok_or_else(|| {
-                    format!(
-                        "LAND {:08X} quadrant {quadrant} texture {:08X} has no diffuse image",
-                        terrain.cell_id, layer.texture_form_id
-                    )
-                })?;
+            let path = catalog.landscape_diffuse(texture_form_id).ok_or_else(|| {
+                format!(
+                    "LAND {:08X} quadrant {quadrant} texture {:08X} has no diffuse image",
+                    terrain.cell_id, texture_form_id
+                )
+            })?;
             let handle = asset_server
                 .load_builder()
                 .with_settings(|settings: &mut ImageLoaderSettings| {
                     settings.sampler = ImageSampler::Descriptor(terrain_layer_sampler());
                 })
                 .load(path.to_owned());
-            *target = Some(handle.clone());
+            textures[slot] = Some(handle.clone());
             handles.push(handle);
         }
         let overlay_weights = crate::streaming::quadrant_overlay_weights(terrain, quadrant)?;
@@ -669,10 +741,6 @@ impl TerrainExtension {
         ))
     }
 
-    /// The material of one quadrant of a synthetic `terrain`, drawn with textures a fixture already
-    /// holds in memory. It carries the same settings a streamed quadrant does, so a fixture with
-    /// overlay layers shows the weight field the shader interpolates rather than only the packed
-    /// vertex attributes it falls back on.
     pub(crate) fn fixture(
         terrain: &TerrainSnapshot,
         quadrant: u8,
@@ -1497,31 +1565,6 @@ fn register_skyrim_material_handler(app: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn terrain_reservation_observes_all_six_diffuse_and_normal_layers() {
-        let mut images = Assets::<Image>::default();
-        let handles: [Handle<Image>; 12] = std::array::from_fn(|_| images.add(Image::default()));
-        let extension = TerrainExtension {
-            layer_0: Some(handles[0].clone()),
-            layer_1: Some(handles[1].clone()),
-            layer_2: Some(handles[2].clone()),
-            layer_3: Some(handles[3].clone()),
-            layer_4: Some(handles[4].clone()),
-            layer_5: Some(handles[5].clone()),
-            normal_0: Some(handles[6].clone()),
-            normal_1: Some(handles[7].clone()),
-            normal_2: Some(handles[8].clone()),
-            normal_3: Some(handles[9].clone()),
-            normal_4: Some(handles[10].clone()),
-            normal_5: Some(handles[11].clone()),
-            ..default()
-        };
-        assert_eq!(
-            extension.image_ids().collect::<Vec<_>>(),
-            handles.iter().map(Handle::id).collect::<Vec<_>>()
-        );
-    }
-
     use super::*;
 
     use crate::view_policy::ViewUpdateRate;
@@ -3637,40 +3680,6 @@ mod tests {
         }
     }
 
-    fn overlay_fixture(cell_id: u32, overlay: Vec<(u16, f32)>) -> TerrainSnapshot {
-        let layers = (0..4)
-            .flat_map(|quadrant| {
-                [
-                    TerrainLayerSnapshot {
-                        texture_form_id: 1,
-                        quadrant,
-                        layer: 0,
-                        is_base: true,
-                        weights: Vec::new(),
-                    },
-                    TerrainLayerSnapshot {
-                        texture_form_id: 7,
-                        quadrant,
-                        layer: 1,
-                        is_base: false,
-                        weights: overlay.clone(),
-                    },
-                ]
-            })
-            .collect();
-        TerrainSnapshot {
-            cell_id,
-            width: 33,
-            height: 33,
-            heights: vec![0.0; 33 * 33],
-            normals: [0, 0, 127].repeat(33 * 33),
-            vertex_colors: vec![255; 33 * 33 * 3],
-            layers,
-            water_height: None,
-            water_type_form_id: None,
-        }
-    }
-
     fn terrain_fixture_with_overlays(
         cell_id: u32,
         overlays: &[Vec<(u16, f32)>],
@@ -3744,5 +3753,474 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn terrain_reservation_observes_all_six_diffuse_and_normal_layers() {
+        let mut images = Assets::<Image>::default();
+        let handles: [Handle<Image>; 12] = std::array::from_fn(|_| images.add(Image::default()));
+        let extension = TerrainExtension {
+            layer_0: Some(handles[0].clone()),
+            layer_1: Some(handles[1].clone()),
+            layer_2: Some(handles[2].clone()),
+            layer_3: Some(handles[3].clone()),
+            layer_4: Some(handles[4].clone()),
+            layer_5: Some(handles[5].clone()),
+            normal_0: Some(handles[6].clone()),
+            normal_1: Some(handles[7].clone()),
+            normal_2: Some(handles[8].clone()),
+            normal_3: Some(handles[9].clone()),
+            normal_4: Some(handles[10].clone()),
+            normal_5: Some(handles[11].clone()),
+            ..default()
+        };
+        assert_eq!(
+            extension.image_ids().collect::<Vec<_>>(),
+            handles.iter().map(Handle::id).collect::<Vec<_>>()
+        );
+    }
+
+    /// A cell whose four quadrants each carry a base layer and one overlay with the same `VTXT`
+    /// list, so a weight measured in one quadrant can be compared with its neighbour's.
+    fn overlay_fixture(cell_id: u32, overlay: Vec<(u16, f32)>) -> TerrainSnapshot {
+        let layers = (0..4)
+            .flat_map(|quadrant| {
+                [
+                    TerrainLayerSnapshot {
+                        texture_form_id: 1,
+                        quadrant,
+                        layer: 0,
+                        is_base: true,
+                        weights: Vec::new(),
+                    },
+                    TerrainLayerSnapshot {
+                        texture_form_id: 7,
+                        quadrant,
+                        layer: 1,
+                        is_base: false,
+                        weights: overlay.clone(),
+                    },
+                ]
+            })
+            .collect();
+        TerrainSnapshot {
+            cell_id,
+            width: 33,
+            height: 33,
+            heights: vec![0.0; 33 * 33],
+            normals: [0, 0, 127].repeat(33 * 33),
+            vertex_colors: vec![255; 33 * 33 * 3],
+            layers,
+            water_height: None,
+            water_type_form_id: None,
+        }
+    }
+
+    /// The VTXT list of an overlay that has full weight on both of a quadrant's x edge columns and
+    /// none in between, so the samples one column inside an edge differ from the edge itself.
+    fn edge_columns_overlay() -> Vec<(u16, f32)> {
+        (0..QUADRANT_WEIGHT_SAMPLES as u16)
+            .flat_map(|y| [0u16, 16].map(move |x| (y * 17 + x, 1.0)))
+            .collect()
+    }
+
+    /// `terrain.wgsl`'s cell uv to quadrant-local uv, for the quadrant at `origin`.
+    fn quadrant_uv(cell_uv: [f32; 2], origin: [f32; 2]) -> [f32; 2] {
+        [cell_uv[0] * 2.0 - origin[0], cell_uv[1] * 2.0 - origin[1]]
+    }
+
+    /// Defect A, at a quadrant and at a cell boundary. Each quadrant's weight field holds that
+    /// quadrant's own samples clamped at its edge, so where neighbouring data agrees on the shared
+    /// column the two sides read the same weight - and they read the *edge* sample, not a blend
+    /// with the column behind it.
+    #[test]
+    fn adjacent_quadrants_and_cells_agree_on_their_shared_edge() {
+        let west_cell = overlay_fixture(0x0001_2345, edge_columns_overlay());
+        let east_cell = overlay_fixture(0x0001_2346, edge_columns_overlay());
+        let settings_of = |terrain: &TerrainSnapshot, quadrant: u8| {
+            let weights = crate::streaming::quadrant_overlay_weights(terrain, quadrant).unwrap();
+            TerrainSettings::for_quadrant(quadrant, weights.len() + 1, &weights)
+        };
+        let south_west = settings_of(&west_cell, 0);
+        let south_east = settings_of(&west_cell, 1);
+        let next_cell_south_west = settings_of(&east_cell, 0);
+
+        // The quadrant boundary inside one cell: quadrant 0's east column and quadrant 1's west
+        // column are the same column of ground, at cell uv x = 0.5. Both sides must read it.
+        for cell_y in [0.0_f32, 0.25, 0.5] {
+            let left = shader_weight(&south_west, 0, quadrant_uv([0.5, cell_y], [0.0, 0.0]));
+            let right = shader_weight(&south_east, 0, quadrant_uv([0.5, cell_y], [1.0, 0.0]));
+            assert!(
+                (left - 1.0).abs() < 0.01,
+                "quadrant 0's east column at cell y {cell_y}: {left}"
+            );
+            assert!(
+                (right - 1.0).abs() < 0.01,
+                "quadrant 1's west column at cell y {cell_y}: {right}"
+            );
+        }
+
+        // The cell boundary: this cell's east edge against the next cell's west edge.
+        for cell_y in [0.0_f32, 0.25, 0.5] {
+            let left = shader_weight(&south_east, 0, quadrant_uv([1.0, cell_y], [1.0, 0.0]));
+            let right = shader_weight(
+                &next_cell_south_west,
+                0,
+                quadrant_uv([0.0, cell_y], [0.0, 0.0]),
+            );
+            assert!(
+                (left - right).abs() < 0.01,
+                "adjacent cells disagree at cell y {cell_y}: {left} against {right}"
+            );
+            assert!((left - 1.0).abs() < 0.01, "the shared cell edge: {left}");
+        }
+
+        // Half a sample inside that edge the field is halfway between its two samples, which is
+        // what makes the measurements above evidence that the edge sample itself is read. Half a
+        // sample is `0.5 / 16` of a quadrant, and half that again in cell units.
+        let inside = shader_weight(
+            &south_east,
+            0,
+            quadrant_uv([1.0 - 0.5 / 32.0, 0.0], [1.0, 0.0]),
+        );
+        assert!(
+            (inside - 0.5).abs() < 0.01,
+            "half a sample inside the edge the weight ramps to 0.5: {inside}"
+        );
+    }
+
+    /// Defect B's mechanism on the CPU, with the tiling the material uses. A four-texel layer
+    /// sampled at `uv = cell_uv * tiling`: clamping reads the last texel column (and, past the
+    /// first tile in both axes, the one corner texel) wherever the tiling has moved past the
+    /// texture, which is the flat colour and the stretched streaks of the frames; repeating reads
+    /// the texel the tiling actually points at.
+    #[test]
+    fn a_clamping_sampler_smears_a_tiled_layer_across_the_cell() {
+        let tiling = TerrainExtension::default()
+            .settings
+            .tiling_and_layer_count
+            .x;
+        let texels = 4i32;
+        // A layer whose column index is its red channel, so a sample says which column it read.
+        let layer = |x: i32, _y: i32| [x as u8 * 60, 0, 0, 255];
+        let read = |cell_uv: f32, repeat: bool| -> i32 {
+            let uv = cell_uv * tiling;
+            let texel = uv * texels as f32 - 0.5;
+            let column = if repeat {
+                texel.floor().rem_euclid(texels as f32)
+            } else {
+                texel.floor().clamp(0.0, texels as f32 - 1.0)
+            };
+            i32::from(layer(column as i32, 0)[0]) / 60
+        };
+
+        // Every position past the first tile reads the edge column when clamping...
+        for cell_uv in [0.2_f32, 0.5, 0.9] {
+            assert_eq!(
+                read(cell_uv, false),
+                texels - 1,
+                "cell uv {cell_uv} clamps to the layer's edge column"
+            );
+        }
+        // ...while repeating keeps sampling the layer the tiling points at, so the texel read
+        // changes with the position instead of sticking at the edge.
+        assert_ne!(read(0.2, true), read(0.2, false));
+        assert_ne!(read(0.5, true), read(0.9, true));
+    }
+
+    /// Each blend pair the engine knows renders the way `NiAlphaProperty` asks; the pair glTF's
+    /// `BLEND` already expresses keeps it, and a pair neither can express does not silently become
+    /// an additive or multiplicative surface.
+
+    /// A cell whose four quadrants carry exactly the layers given, in quadrant order.
+    fn layer_fixture(cell_id: u32, quadrants: [Vec<TerrainLayerSnapshot>; 4]) -> TerrainSnapshot {
+        TerrainSnapshot {
+            cell_id,
+            width: 33,
+            height: 33,
+            heights: vec![0.0; 33 * 33],
+            normals: [0, 0, 127].repeat(33 * 33),
+            vertex_colors: vec![255; 33 * 33 * 3],
+            layers: quadrants.into_iter().flatten().collect(),
+            water_height: None,
+            water_type_form_id: None,
+        }
+    }
+
+    fn base_layer(quadrant: u8, texture_form_id: u32) -> TerrainLayerSnapshot {
+        TerrainLayerSnapshot {
+            texture_form_id,
+            quadrant,
+            layer: 0,
+            is_base: true,
+            weights: Vec::new(),
+        }
+    }
+
+    fn overlay_layer(
+        quadrant: u8,
+        layer: u16,
+        texture_form_id: u32,
+        weights: Vec<(u16, f32)>,
+    ) -> TerrainLayerSnapshot {
+        TerrainLayerSnapshot {
+            texture_form_id,
+            quadrant,
+            layer,
+            is_base: false,
+            weights,
+        }
+    }
+
+    /// The white squares in the visual review: a quadrant whose `LAND` carries no `BTXT` samples
+    /// Bevy's 1x1 white fallback. It takes the base of a neighbouring quadrant of the same cell
+    /// instead - the first that has one, in quadrant order - while a quadrant with its own base
+    /// keeps it.
+    #[test]
+    fn quadrant_without_a_base_texture_borrows_a_neighbouring_quadrants_base() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 3)],
+                vec![base_layer(1, 0), overlay_layer(1, 1, 9, vec![(0, 1.0)])],
+                vec![base_layer(2, 5)],
+                vec![base_layer(3, 7)],
+            ],
+        );
+        assert_eq!(quadrant_base_texture_form_id(&terrain, 0).unwrap(), 3);
+        assert_eq!(
+            quadrant_base_texture_form_id(&terrain, 1).unwrap(),
+            3,
+            "quadrant 0's base, quadrant 1's first neighbour in quadrant order, not its own overlay"
+        );
+        assert_eq!(quadrant_base_texture_form_id(&terrain, 2).unwrap(), 5);
+        assert_eq!(quadrant_base_texture_form_id(&terrain, 3).unwrap(), 7);
+
+        // Quadrant order, not proximity: quadrant 0 takes quadrant 1's base before quadrant 2's.
+        let ordered = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 0)],
+                vec![base_layer(1, 11)],
+                vec![base_layer(2, 13)],
+                vec![base_layer(3, 17)],
+            ],
+        );
+        assert_eq!(quadrant_base_texture_form_id(&ordered, 0).unwrap(), 11);
+
+        // A neighbouring quadrant whose own base is missing is skipped rather than borrowed from
+        // empty: quadrant 2's base is the first textured one after it.
+        let skipped = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 0)],
+                vec![base_layer(1, 0)],
+                vec![base_layer(2, 0)],
+                vec![base_layer(3, 17)],
+            ],
+        );
+        assert_eq!(quadrant_base_texture_form_id(&skipped, 0).unwrap(), 17);
+    }
+
+    /// With no textured neighbour the quadrant still avoids the white fallback: it samples the
+    /// overlay it paints most of itself with, and a quadrant with nothing to borrow at all keeps
+    /// the fallback rather than inventing a texture.
+    #[test]
+    fn quadrant_without_a_base_texture_or_textured_neighbour_uses_its_strongest_overlay() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![
+                    base_layer(0, 0),
+                    overlay_layer(0, 1, 9, vec![(0, 0.25)]),
+                    overlay_layer(0, 2, 11, vec![(0, 0.5), (1, 0.5)]),
+                    overlay_layer(0, 3, 13, Vec::new()),
+                ],
+                vec![base_layer(1, 0)],
+                vec![base_layer(2, 0)],
+                vec![base_layer(3, 0)],
+            ],
+        );
+        assert_eq!(
+            quadrant_base_texture_form_id(&terrain, 0).unwrap(),
+            11,
+            "the overlay covering the most of the quadrant"
+        );
+        assert_eq!(
+            quadrant_base_texture_form_id(&terrain, 1).unwrap(),
+            0,
+            "an untextured neighbour base is not borrowed, and quadrant 1 has no overlay"
+        );
+
+        // An overlay with no `VTXT` opacities covers nothing, so a stronger one wins even when its
+        // own texture sits in a later slot.
+        let weights_only = layer_fixture(
+            0x0001_2345,
+            [
+                vec![
+                    base_layer(0, 0),
+                    overlay_layer(0, 1, 9, Vec::new()),
+                    overlay_layer(0, 2, 11, vec![(0, 0.1)]),
+                ],
+                vec![base_layer(1, 0)],
+                vec![base_layer(2, 0)],
+                vec![base_layer(3, 0)],
+            ],
+        );
+        assert_eq!(quadrant_base_texture_form_id(&weights_only, 0).unwrap(), 11);
+    }
+
+    /// A catalogue answering every landscape texture form id the fixtures use, one texture set per
+    /// id so each id is its own image path.
+    fn texture_catalogue(path: &std::path::Path, form_ids: &[u32]) -> AssetCatalog {
+        catalogue_with_normal_maps(path, form_ids, &[])
+    }
+
+    /// The same catalogue, with a normal map beside the diffuse of every id in `normal_ids`, so a
+    /// quadrant can be shown to bind the normal map of the id whose diffuse it samples.
+    fn catalogue_with_normal_maps(
+        path: &std::path::Path,
+        form_ids: &[u32],
+        normal_ids: &[u32],
+    ) -> AssetCatalog {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT);
+                 CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
+                 CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);",
+            )
+            .unwrap();
+        for form_id in form_ids {
+            connection
+                .execute(
+                    "INSERT INTO landscape_textures VALUES(?1,?1)",
+                    rusqlite::params![form_id],
+                )
+                .unwrap();
+            let normal_path = normal_ids
+                .contains(form_id)
+                .then(|| format!("textures/land/{form_id}_n.dds"));
+            connection
+                .execute(
+                    "INSERT INTO texture_sets VALUES(?1,?2,?3)",
+                    rusqlite::params![form_id, format!("textures/land/{form_id}.dds"), normal_path],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        AssetCatalog::open(path).unwrap()
+    }
+
+    /// The material path, not just the choice: the quadrant the reviewer saw as a white square
+    /// binds the borrowed texture in its base slot, and a quadrant with its own base still binds
+    /// that instead.
+    #[test]
+    fn borrowed_base_texture_reaches_the_quadrant_material() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 0)],
+                vec![base_layer(1, 0)],
+                vec![base_layer(2, 5)],
+                vec![base_layer(3, 7)],
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = texture_catalogue(&directory.path().join("catalogue.db"), &[5, 7]);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Image>();
+        let asset_server = app.world().resource::<AssetServer>().clone();
+
+        let borrowed = TerrainExtension::from_quadrant(&terrain, 1, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        let sibling = TerrainExtension::from_quadrant(&terrain, 2, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        let own = TerrainExtension::from_quadrant(&terrain, 3, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        assert_eq!(
+            borrowed.layer_0, sibling.layer_0,
+            "quadrant 1 samples quadrant 2's base texture"
+        );
+        assert!(
+            borrowed.layer_0.is_some(),
+            "the base slot must not fall back to Bevy's 1x1 white image"
+        );
+        assert_ne!(
+            borrowed.layer_0, own.layer_0,
+            "a quadrant with a base of its own keeps it"
+        );
+    }
+
+    /// A quadrant that borrows a neighbour's base binds that base's normal map too, so the borrowed
+    /// layer's surface detail matches the diffuse it is drawn with.
+    #[test]
+    fn a_borrowed_base_binds_the_borrowed_layers_normal_map() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 0)],
+                vec![base_layer(1, 0)],
+                vec![base_layer(2, 5)],
+                vec![base_layer(3, 7)],
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let catalog =
+            catalogue_with_normal_maps(&directory.path().join("catalogue.db"), &[5, 7], &[5, 7]);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Image>();
+        let asset_server = app.world().resource::<AssetServer>().clone();
+
+        let borrowed = TerrainExtension::from_quadrant(&terrain, 1, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        let sibling = TerrainExtension::from_quadrant(&terrain, 2, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        assert!(borrowed.has_normal_maps(), "a borrowed base has one too");
+        assert_eq!(
+            borrowed.normal_0, sibling.normal_0,
+            "quadrant 1 samples the normal map of the base it borrows from quadrant 2"
+        );
+        assert!(borrowed.normal_0.is_some());
+        assert_eq!(borrowed.normal_1, None, "the unused slots stay unbound");
+    }
+
+    /// A layer whose form id has no normal map leaves its flag 0, so the shader never samples a
+    /// stand-in for it: the maps that are there are blended alone.
+    #[test]
+    fn a_quadrant_whose_layers_have_no_normal_maps_leaves_the_flags_clear() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 5)],
+                vec![base_layer(1, 7)],
+                vec![base_layer(2, 5)],
+                vec![base_layer(3, 7)],
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = texture_catalogue(&directory.path().join("catalogue.db"), &[5, 7]);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Image>();
+        let asset_server = app.world().resource::<AssetServer>().clone();
+
+        let extension = TerrainExtension::from_quadrant(&terrain, 0, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        assert!(!extension.has_normal_maps());
+        assert_eq!(extension.settings.normal_layers_0, Vec4::ZERO);
+        assert_eq!(extension.settings.normal_layers_1, Vec4::ZERO);
+        assert_eq!(extension.normal_0, None);
     }
 }

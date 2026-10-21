@@ -487,6 +487,15 @@ where
         }
     }
 
+    /// Every entity in this batch set's bins (Mudcrab patch, read-only: lets the destination
+    /// readiness proof ask whether a specific entity is queued here). The per-instance list is
+    /// parallel to the GPU buffer and always tightly packed.
+    pub fn entities(&self) -> impl Iterator<Item = MainEntity> + '_ {
+        self.render_binned_mesh_instances_cpu
+            .iter()
+            .map(|instance| instance.main_entity)
+    }
+
     /// Returns the first entity in the first bin (if there is one).
     pub(crate) fn representative_entity(&self) -> Option<MainEntity> {
         let first_bin_index = self.bin_key_to_bin_index.values().next()?;
@@ -2628,6 +2637,12 @@ mod tests {
                 };
                 assert!(expected[bin_key.0 as usize].contains(entity));
             }
+
+            // Mudcrab patch: the public `entities()` accessor reports exactly the entities that
+            // are present, so a removed member is gone and a present one is found.
+            let reported: MainEntityHashSet = batch_set.entities().collect();
+            let present: MainEntityHashSet = expected.iter().flatten().copied().collect();
+            assert_eq!(reported, present);
         }
 
         fn verify_indirect_parameters_offsets(

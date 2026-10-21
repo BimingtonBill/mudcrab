@@ -91,12 +91,93 @@ pub struct EngineConfig {
     /// Optional sun bearing clockwise from north and elevation above the horizon, in degrees.
     pub sun_position: Option<(f32, f32)>,
     pub terrain_lod: TerrainLodDistances,
+    /// How far the terrain-only ring reaches, in cells from the camera cell: a cell outside
+    /// [`stream_radius`](Self::stream_radius) but within this distance streams its landscape and its
+    /// water plane and nothing else, so the world does not end at the full-detail edge.
+    ///
+    /// A value at or below `stream_radius` leaves the ring empty, which is the engine without a
+    /// ring (`--stream-radius 2` with the default) and what a benchmark run that wants the old
+    /// numbers passes. Interior cells are never terrain-only.
+    ///
+    /// This is the ring an explicit `--terrain-radius` asks for, or [`DEFAULT_TERRAIN_RADIUS`]; the
+    /// ring a run actually draws is [`EngineConfig::effective_terrain_radius`]'s answer, which
+    /// leaves the ring off where the worldspace draws its own terrain LOD ([`Self::terrain_radius_given`]).
+    pub terrain_radius: i32,
+    /// Whether `--terrain-radius` named the ring. A named ring is drawn as given, in every
+    /// worldspace; an unnamed one is the engine's own choice: [`DEFAULT_TERRAIN_RADIUS`] where the
+    /// worldspace has no terrain LOD data, and no ring (LOD covers that distance) where it has,
+    /// the way the game's own terrain LOD does not sit under a second copy of the same landscape.
+    /// The benchmark rule below writes [`Self::terrain_radius`] without setting this, so a
+    /// benchmark still measures the ring it always did.
+    pub terrain_radius_given: bool,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
+    /// Retiring roots - cell roots and LOD chunks - a frame may despawn. `0` despawns every one at
+    /// once, which is the unbudgeted behaviour unloading used to have - and, with
+    /// [`Self::max_unload_ms_per_frame`] `0` too, the only setting that reproduces it exactly
+    /// (with the retire's hide, which the old path did not do, but no pacing). With this count
+    /// budget pacing instead, the drain keeps its overflow escape (streaming's retire-backlog
+    /// drain), which un-bounds a frame whose retiring backlog stopped shrinking - a trip on drain
+    /// failure, not on size, that the old unbudgeted path never had. The escape counts cells, not
+    /// chunks: it exists for sustained flight retiring cells faster than the drain, and a chunk
+    /// backlog - one entry per LOD window the camera leaves, drained at least one a frame - is
+    /// what it is by the chunk grid, not by speed. Paces the unload only while
+    /// [`Self::max_unload_ms_per_frame`] is `0`: the wall-clock budget replaces it once set.
     pub max_cell_unloads_per_frame: usize,
+    /// Wall-clock milliseconds a frame may spend despawning retiring cells. The despawn paces
+    /// itself by the clock: it unloads retiring cells in stable order until the budget is spent,
+    /// always at least one of them, so a backlog bigger than the budget drains over several frames
+    /// instead of landing on one - fast flight away from the camera retires a whole ring of cells
+    /// at once, far past what a per-frame cell count can pace.
+    ///
+    /// Scope: this paces the *distance* retires of the space the camera stands in - the far cells
+    /// a flight leaves behind - and the LOD chunks that space unloads, including the whole
+    /// exterior's distant terrain when the camera walks through a door into an interior. A door
+    /// crossing's unload of the *cells* of the space the camera left happens in `plan_cells` in
+    /// the frame it falls out (`paces_its_unload` is false for it) and is not paced here.
+    ///
+    /// Replay stability: the order the roots unload in is stable (`cell_order_key`, and
+    /// `ChunkKey`'s own order for the chunks), so a replayed crossing unloads the same roots in
+    /// the same order; which frame each one unloads on depends on machine speed, because the
+    /// budget is wall-clock.
+    ///
+    /// `0` turns the time budget off and paces by [`Self::max_cell_unloads_per_frame`]; only that
+    /// count at `0` as well is exactly the old unbudgeted path, since the drain keeps its overflow
+    /// escape (a trip on drain failure, not on size) under the count budget. The default is
+    /// provisional; see the comment on it in `Default for EngineConfig`.
+    pub max_unload_ms_per_frame: f64,
+    /// `--lod-keep-hidden-in-interiors` (off by default): on a move into a space with no distant
+    /// terrain - an interior - the exterior LOD chunks stop being drawn but stay resident and
+    /// hidden instead of retiring under the unload budget, so the return to that exterior shows
+    /// them the frame it happens instead of streaming a whole world's LOD in again. Off, the
+    /// chunks retire under the same paced unload the cells use, and a return revives whatever the
+    /// budget has not reached yet.
+    ///
+    /// The price is memory: the chunks' entities, world assets and meshes stay held for as long
+    /// as the visit lasts. There is deliberately no timeout - a timeout would put the retire cost
+    /// back on whichever frame it fired, which is what this flag exists to keep off the return,
+    /// and a long interior visit is exactly what the measurement prices.
+    pub lod_keep_hidden_in_interiors: bool,
     /// Converted models a frame may hand to Bevy's scene spawner. `0` arms every model whose asset
     /// is loaded, which is the unbudgeted behaviour a single spawn batch used to have.
     pub max_model_spawns_per_frame: usize,
+    /// Distant LOD requests (terrain LOD chunks, object and tree LOD blocks) a frame may start,
+    /// apart from the full-cell commits. `0` starts every queued request the frame's commit time
+    /// budget allows. A request is cheap, but each one loads and spawns a scene, and hundreds at
+    /// once stall the frames that land them (100-480 ms frames at Riverwood with 16 per frame,
+    /// against 16 ms at one), so while the world shows they go one a frame; the first load lifts
+    /// this with the other pacing budgets ([`crate::pacing::startup::StartupLoadPlugin`]).
+    pub max_lod_requests_per_frame: usize,
+    /// `--paced-startup`: keep the streaming pacing budgets - [`Self::max_model_spawns_per_frame`],
+    /// [`Self::max_lod_requests_per_frame`],
+    /// the two unload budgets and the render-asset upload budget - in force from the first frame.
+    /// Off by default: until the world is first ready the first load runs with all three lifted, so
+    /// it is paid for at load speed ([`crate::pacing::startup::StartupLoadPlugin`]).
+    pub paced_startup: bool,
+    /// `--startup-cover`: hold a black cover over the unpaced first load and fade it out once the
+    /// world is ready, as a door crossing does. Off by default (the user, 2026-10-09: a dev build
+    /// shows the world while it loads); kept for a release build.
+    pub startup_cover: bool,
     /// Camera and bounds based queue ordering. Off preserves fixed FIFO activation.
     pub prioritize_streaming: bool,
     /// Outstanding unique Scene(0) jobs, including recursive CPU dependencies.
@@ -187,6 +268,9 @@ pub struct EngineConfig {
     pub frame_budget_ms: f64,
     pub allow_incomplete_assets: bool,
     pub synthetic_instances: usize,
+    /// `--terrain-audit`: compare incremental terrain indices with full rebuilds once per
+    /// wall-clock second. Logs errors and counts desynchronizations; disabled by default.
+    pub terrain_audit: bool,
     pub profile_output_dir: Option<PathBuf>,
     pub profile_gpu_inventory: bool,
     pub profile_scenario: String,
@@ -270,6 +354,38 @@ impl WaterReflectionPreset {
     }
 }
 
+/// The default reach of the terrain-only ring, in cells: eight cells is 32,768 units of landscape
+/// beyond the full-detail grid, drawn from 264 cells.
+///
+/// The default only where the worldspace has no terrain LOD data of its own. Where it has - the
+/// game's own worlds do - a run that did not name a ring draws no ring at all: the LOD already
+/// covers that distance, and the ring is a second copy of landscape the game itself draws only as
+/// LOD (`--terrain-radius` restores it for a comparison). Vanilla's view is therefore the default
+/// one: full detail around the camera, the LOD beyond it, and no ring in between.
+///
+/// Chosen by measurement, on a `--shots` camera pose over the Pale from the Alftand ruins
+/// (`far-pale-yaw40`), release build, one run each, warm:
+///
+/// | `terrain_radius` | ring cells | average FPS | 95th percentile frame |
+/// |---|---|---|---|
+/// | 2 (no ring) | 0 | 180 | 6.6 ms |
+/// | 8 | 264 | 97 | 12.1 ms |
+/// | 10 | 400 | 59 | 26.5 ms |
+/// | 12 | 600 | 59 | 18.9 ms |
+/// | 16 | 1,064 | 20 | 54.2 ms |
+///
+/// Each ring cell is four landscape draws of its own - one per quadrant, each with its own
+/// material - and costs the frame about 20 µs, so a ring's price is its cell count. Eight is the
+/// largest that stays clearly above the sixty-frame acceptance gate with the whole Pale in view;
+/// ten and twelve sit on the gate and sixteen falls through it. Frames were measured while other
+/// work ran on this machine and single runs differ by a quarter either way, so read the table as
+/// order of magnitude rather than to the frame.
+pub const DEFAULT_TERRAIN_RADIUS: i32 = 8;
+
+/// The largest ring `--terrain-radius` accepts. A ring this wide is 4,225 cells and already more
+/// landscape than a run holds; the clamp is a guard against a typo asking for millions of cells.
+pub const MAX_TERRAIN_RADIUS: i32 = 32;
+
 impl Default for EngineConfig {
     /// Start with the standard engine settings and optional profiling diagnostics disabled.
     fn default() -> Self {
@@ -286,9 +402,26 @@ impl Default for EngineConfig {
             sun_shadow_distance_limit: None,
             sun_position: None,
             terrain_lod: TerrainLodDistances::default(),
+            terrain_radius: DEFAULT_TERRAIN_RADIUS,
+            terrain_radius_given: false,
             max_cell_commits_per_frame: 1,
             max_commit_micros_per_frame: 16_670,
             max_cell_unloads_per_frame: 2,
+            // PROVISIONAL until the shared timing-window A/B picks the value: an estimate from
+            // the 2026-10-08 re-profile, which measured ~0.47 ms of despawn per retiring cell
+            // (204.5 ms of `Update` unloading 434 cells on one frame). 3 ms of despawn a frame is
+            // therefore about 6 cells, so a several-hundred-cell flight backlog drains over
+            // frames instead of landing 136-205 ms on one; it is still only a few ms on a frame
+            // that is already over budget, and it shrinks with the work instead of guessing a
+            // cell count. The 434-cell unload is where the per-cell cost was measured, not a
+            // backlog this budget drains: a crossing's space-change unload runs unpaced in
+            // `plan_cells`, and this budget covers distance retires only. `0` paces by
+            // `max_cell_unloads_per_frame`, with the drain-failure escape the old path never had.
+            max_unload_ms_per_frame: 3.0,
+            // The alternative to the paced LOD retire itself: hold the exterior's LOD chunks
+            // through an interior visit instead of retiring them. Off by default - the paced
+            // retire is the behaviour every run keeps unless a measurement asks for the other.
+            lod_keep_hidden_in_interiors: false,
             // After a jump, the models of several cells are already loaded and reach the scene
             // spawner together: on the stress scenario the backlog runs to about 2,000 models. At 4
             // a frame that backlog took ~500 frames to clear; at 32 the world is ready 2.5x sooner
@@ -297,6 +430,7 @@ impl Default for EngineConfig {
             // still spreads a burst over frames; `0` arms the whole batch at once, the behaviour
             // before this budget existed (docs/roadmap/02-profiling.md, "Load speed defaults").
             max_model_spawns_per_frame: 32,
+            max_lod_requests_per_frame: 1,
             prioritize_streaming: false,
             max_scene_loads: 0,
             adaptive_streaming: false,
@@ -307,6 +441,8 @@ impl Default for EngineConfig {
             streaming_frame_ms: 16.67,
             // A quarter of the hardware threads, chosen at startup (see `app::io_pool_threads`).
             io_threads: 0,
+            paced_startup: false,
+            startup_cover: false,
             // Three 2K BC7/UASTC textures with a full mip chain (~5.3 MiB each):
             // a cell's new textures spread over a few frames instead of landing
             // in one 13 ms upload burst, and at 60 fps the budget still admits
@@ -351,6 +487,7 @@ impl Default for EngineConfig {
             frame_budget_ms: crate::frame_budget::DEFAULT_FRAME_BUDGET_MS,
             allow_incomplete_assets: false,
             synthetic_instances: 250_000,
+            terrain_audit: false,
             profile_output_dir: None,
             profile_gpu_inventory: false,
             profile_scenario: "adhoc".into(),
@@ -414,7 +551,17 @@ Streaming:
   --ini <file>                        layer Skyrim INI settings; CLI options override files
   --stream-radius <cells>               cells streamed around the camera (default: 2)
   --max-commit-ms <ms>                  cell commit time allowed per frame (default: 16.67)
+  --max-unloads-per-frame <count>       retiring cell roots and LOD chunks despawned per frame; 0
+                                        despawns all at once (default: 2)
+  --max-unload-ms-per-frame <ms>        wall-clock time a frame may spend despawning retiring roots
+                                        (cell roots and LOD chunks); 0 paces by --max-unloads-per-frame
+                                        instead (default: 3)
+  --lod-keep-hidden-in-interiors        keep exterior LOD chunks resident but hidden across an
+                                        interior visit instead of retiring them; off, they retire
+                                        under the unload budget and a return revives what is left
   --max-model-spawns-per-frame <count>  models spawned per frame; 0 spawns all at once (default: 32)
+  --max-lod-requests-per-frame <count>  distant LOD requests started per frame, lifted during the
+                                        first load; 0 starts all at once (default: 1)
   --prioritize-streaming               prioritize nearby collision and view-facing bounds
   --max-scene-loads <count>             outstanding unique scene jobs; 0 is unlimited (default: 0)
   --adaptive-streaming                 adapt startup/walking budgets; enables spatial priority
@@ -425,8 +572,14 @@ Streaming:
   --streaming-headroom-mib <mib>       system memory kept free (default: 2048)
   --streaming-frame-ms <ms>            controller frame target (default: 16.67)
   --max-upload-mib-per-frame <mib>      render-asset upload budget per frame; 0 is unlimited (default: 16)
+  --paced-startup                       pace the first load like any other; the default runs it
+                                        unpaced until the world is first ready
+  --startup-cover                       hide the unpaced first load behind a black cover that fades out
+                                        once the world is ready
   --io-threads <count>                  asset IO threads, 0 to 64; 0 sizes the pool automatically (default: 0)
   --auto-fly-speed <units/s>            fly the camera forward at this speed; 0 holds it still
+  --terrain-radius <cells>              terrain-only ring around the streamed cells (default: 8, off
+                                        where the worldspace has terrain LOD data; vanilla's view)
   --route <file>                        follow a route file's waypoints at its speed (a JSON file; see scripts/routes)
 
 Benchmark and profiling:
@@ -491,6 +644,7 @@ Diagnostics:
   --transform-bounds-fixture            run the transform-bounds fixture (no world database)
   --renderer-fixture                    run the renderer fixture (no world database)
   --physics-fixture                     run the physics fixture (no world database)
+  --terrain-audit                       audit incremental terrain indices against full rebuilds once per second
   --streaming-fixture                   stream the fixture world instead of the full asset set
 
 Remote:
@@ -535,7 +689,7 @@ pub enum ConfigError {
         /// What the option needs, phrased for the message.
         expected: &'static str,
     },
-    /// A value one of the portal's or the reflection's flags refused, already phrased as a message.
+    /// A value a reflection flag refused, already phrased as a message.
     Message(String),
     /// An option that only works together with another option that was not given.
     MissingRequirement {
@@ -748,6 +902,28 @@ impl EngineConfig {
             .then(|| self.max_upload_mib_per_frame.saturating_mul(1024 * 1024))
     }
 
+    /// The ring a run draws in a worldspace that has (`has_lod`) or lacks terrain LOD data: the one
+    /// resolver for [`Self::terrain_radius`], and the one place the three rules live.
+    ///
+    /// 1. A ring `--terrain-radius` named wins as given, in every worldspace.
+    /// 2. Otherwise a worldspace with LOD data draws no ring: [`Self::stream_radius`], which leaves
+    ///    the ring empty (see [`Self::terrain_radius`]). The LOD draws everything beyond the
+    ///    full-detail grid, which is what the game does - its own terrain LOD has no full-detail
+    ///    ring under it - and the ring is a second copy of that ground at 264 extra cells' cost.
+    /// 3. Otherwise - no LOD data, so nothing would draw beyond the full-detail grid -
+    ///    [`DEFAULT_TERRAIN_RADIUS`] keeps the world from ending in a cliff.
+    ///
+    /// `has_lod` is the caller's answer for the worldspace it is asking about
+    /// ([`WorldDatabase::has_lod_for`](crate::world::database::WorldDatabase::has_lod_for)), so the
+    /// answer is per worldspace and follows a door into another one.
+    pub fn effective_terrain_radius(&self, has_lod: bool) -> i32 {
+        if self.terrain_radius_given || !has_lod {
+            self.terrain_radius
+        } else {
+            self.stream_radius
+        }
+    }
+
     /// Interactive exterior play owns the mouse/controller; automated camera paths keep their
     /// existing movement and framing. A `--benchmark-jump` run is one of those even without a frame
     /// limit: the jump moves only the camera, and in WALK the camera follow would put it straight
@@ -792,6 +968,21 @@ impl EngineConfig {
     /// the jump is documented to run without a report and warn that it has none.
     pub fn measures_pacing(&self) -> bool {
         self.is_benchmark_run() || self.benchmark_jump.is_some()
+    }
+
+    /// Whether the first load runs with the streaming pacing lifted
+    /// ([`crate::pacing::startup::StartupLoadPlugin`]): the default; `--paced-startup` runs the old
+    /// way. A capture run is lifted too - the spawn cap binds on its startup like any run's (the
+    /// `portal-heavy` window: 342 frames to ready).
+    pub fn unpaced_startup(&self) -> bool {
+        !self.paced_startup
+    }
+
+    /// Whether the unpaced first load is also hidden behind the black cover: only with
+    /// `--startup-cover`, and never in a capture run (`--shots`), whose own settle
+    /// gate already holds it past the load and whose photographs a cover still up would black out.
+    pub fn covers_startup_load(&self) -> bool {
+        self.unpaced_startup() && self.startup_cover && self.shots.is_none()
     }
 
     /// Whether the run moves the camera on its own: `--auto-fly-speed` or `--route`.
@@ -847,7 +1038,6 @@ impl EngineConfig {
                 Ok(false) => {}
                 Err(error) => return Err(ConfigError::Message(error)),
             }
-            // The portal's own flags, parsed by one block at the end of this file.
             match argument.as_str() {
                 // The pre-scan above answers both spellings; these arms keep the
                 // option list the help-drift tests read complete.
@@ -918,12 +1108,36 @@ impl EngineConfig {
                     config.stream_radius = value;
                     config.unload_radius = value + 1;
                 }
+                "--terrain-radius" => {
+                    if let Some(value) = args.next().and_then(|value| value.parse::<i32>().ok()) {
+                        config.terrain_radius = value.clamp(0, MAX_TERRAIN_RADIUS);
+                        // A value the run named - even one the default would have chosen - is
+                        // drawn as given in every worldspace (`effective_terrain_radius`).
+                        config.terrain_radius_given = true;
+                    }
+                }
                 "--headless" => config.headless = true,
                 "--hidden-window" => config.hidden_window = true,
                 "--max-unloads-per-frame" => {
                     config.max_cell_unloads_per_frame = take_value(
                         "--max-unloads-per-frame",
                         "a cell count, 0 for unlimited",
+                        args.next(),
+                    )?;
+                }
+                "--max-unload-ms-per-frame" => {
+                    config.max_unload_ms_per_frame = take_number(
+                        "--max-unload-ms-per-frame",
+                        "a number of milliseconds, 0 for the old count budget",
+                        Bound::NonNegative,
+                        args.next(),
+                    )?;
+                }
+                "--lod-keep-hidden-in-interiors" => config.lod_keep_hidden_in_interiors = true,
+                "--max-lod-requests-per-frame" => {
+                    config.max_lod_requests_per_frame = take_value(
+                        "--max-lod-requests-per-frame",
+                        "a request count, 0 for unlimited",
                         args.next(),
                     )?;
                 }
@@ -1005,6 +1219,8 @@ impl EngineConfig {
                         args.next(),
                     )?;
                 }
+                "--paced-startup" => config.paced_startup = true,
+                "--startup-cover" => config.startup_cover = true,
                 "--max-commit-ms" => {
                     let millis: f64 = take_number(
                         "--max-commit-ms",
@@ -1369,6 +1585,7 @@ impl EngineConfig {
                 "--terrain-water-fixture" => config.terrain_water_fixture = true,
                 "--transform-bounds-fixture" => config.transform_bounds_fixture = true,
                 "--renderer-fixture" => config.renderer_fixture = true,
+                "--terrain-audit" => config.terrain_audit = true,
                 "--streaming-fixture" => config.streaming_fixture = true,
                 "--remote" => config.remote = true,
                 "--remote-port" => {
@@ -1396,10 +1613,13 @@ impl EngineConfig {
                             )
                         })?;
                 }
-                // A value that is not one stops the run rather than leaving the vanilla crossing
-                // in place of the one asked for.
                 unknown => return Err(ConfigError::unrecognized(unknown)),
             }
+        }
+        if !config.terrain_radius_given
+            && (config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some())
+        {
+            config.terrain_radius = config.stream_radius;
         }
         if config.streaming_benchmark_route_speed.is_some()
             && (config.benchmark_only
@@ -1709,6 +1929,14 @@ fn reflection_value(
         },
         None => Err(format!("{argument}: valid: {flag} <value>, {accepted}")),
     }
+}
+
+/// The exterior cell grid containing a Creation-engine position (cells are 4096 units).
+pub fn grid_of(x: f32, y: f32) -> (i32, i32) {
+    (
+        (x / CELL_SIZE).floor() as i32,
+        (y / CELL_SIZE).floor() as i32,
+    )
 }
 
 fn parse_offset(value: &str) -> Option<(f32, f32, f32)> {
@@ -2097,6 +2325,13 @@ mod tests {
         EngineConfig::run_from_args(arguments.iter().map(|argument| (*argument).to_owned()))
     }
 
+    #[test]
+    fn terrain_audit_flag_is_accepted_without_clusters() {
+        assert!(!EngineConfig::default().terrain_audit);
+        assert!(EngineConfig::from_args(["--terrain-audit".to_owned()]).is_ok());
+        assert!(run_config(&["--terrain-audit"]).terrain_audit);
+    }
+
     fn parse_error(arguments: &[&str]) -> ConfigError {
         match EngineConfig::from_args(arguments.iter().map(|argument| (*argument).to_owned())) {
             Err(error) => error,
@@ -2128,7 +2363,12 @@ mod tests {
         assert_eq!(config.max_cell_commits_per_frame, 1);
         assert_eq!(config.max_commit_micros_per_frame, 16_670);
         assert_eq!(config.max_cell_unloads_per_frame, 2);
+        // The despawn's wall-clock budget, committed provisionally at 3.0: an estimate from the
+        // 2026-10-08 re-profile's ~0.47 ms per retiring cell, until the timing-window A/B picks
+        // the value.
+        assert_eq!(config.max_unload_ms_per_frame, 3.0);
         assert_eq!(config.max_model_spawns_per_frame, 32);
+        assert_eq!(config.max_lod_requests_per_frame, 1);
         assert_eq!(config.io_threads, 0);
     }
 
@@ -2645,6 +2885,22 @@ mod tests {
     }
 
     #[test]
+    fn the_startup_load_runs_unpaced_unless_asked_otherwise() {
+        assert!(EngineConfig::default().unpaced_startup());
+        assert!(!run_config(&["--paced-startup"]).unpaced_startup());
+        // A capture run still loads unpaced, but is never covered, so a photograph cannot find a
+        // black cover up.
+        let shots = run_config(&["--shots", "poses.json"]);
+        assert!(shots.unpaced_startup());
+        assert!(!shots.covers_startup_load());
+        assert!(!run_config(&["--shots", "poses.json", "--startup-cover"]).covers_startup_load());
+        // The cover is opt-in.
+        assert!(!EngineConfig::default().covers_startup_load());
+        assert!(run_config(&["--startup-cover"]).covers_startup_load());
+        assert!(!run_config(&["--paced-startup", "--startup-cover"]).covers_startup_load());
+    }
+
+    #[test]
     fn parses_the_io_thread_count_and_refuses_one_past_the_cap() {
         assert_eq!(run_config(&["--io-threads", "6"]).io_threads, 6);
         assert_eq!(run_config(&["--io-threads", "64"]).io_threads, 64);
@@ -2743,10 +2999,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_unload_time_budget_and_lets_zero_mean_the_count_budget() {
+        assert_eq!(
+            run_config(&["--max-unload-ms-per-frame", "2.5"]).max_unload_ms_per_frame,
+            2.5
+        );
+        assert_eq!(
+            run_config(&["--max-unload-ms-per-frame", "0"]).max_unload_ms_per_frame,
+            0.0
+        );
+    }
+
+    /// The held-LOD alternative is off unless asked for: the paced retire stays the default
+    /// every run gets.
+    #[test]
+    fn the_lod_keep_hidden_flag_is_off_by_default_and_parses_as_a_switch() {
+        assert!(!EngineConfig::default().lod_keep_hidden_in_interiors);
+        assert!(run_config(&["--lod-keep-hidden-in-interiors"]).lod_keep_hidden_in_interiors);
+    }
+
+    #[test]
     fn a_negative_budget_is_refused() {
         for option in [
             "--max-unloads-per-frame",
+            "--max-unload-ms-per-frame",
             "--max-model-spawns-per-frame",
+            "--max-lod-requests-per-frame",
             "--max-upload-mib-per-frame",
         ] {
             assert!(
@@ -4060,6 +4338,109 @@ mod tests {
     fn is_number_literal(value: &str) -> bool {
         value.parse::<f64>().is_ok_and(f64::is_finite)
     }
+
+    #[test]
+    fn defaults_to_a_terrain_ring_beyond_the_full_detail_grid() {
+        let config = EngineConfig::default();
+        assert_eq!(config.stream_radius, 2);
+        assert_eq!(config.terrain_radius, DEFAULT_TERRAIN_RADIUS);
+        assert!(
+            config.terrain_radius > config.stream_radius,
+            "the default ring is a second, wider tier around the full-detail grid"
+        );
+    }
+
+    #[test]
+    fn a_benchmark_run_keeps_the_ring_off_unless_asked() {
+        let bench = EngineConfig::run_from_args(["--benchmark-frames", "100"].map(str::to_owned));
+        assert_eq!(bench.terrain_radius, bench.stream_radius);
+        let asked = EngineConfig::run_from_args(
+            ["--benchmark-frames", "100", "--terrain-radius", "8"].map(str::to_owned),
+        );
+        assert_eq!(asked.terrain_radius, 8);
+    }
+
+    /// The one resolver: a named ring wins; an unnamed one is off where the worldspace draws its
+    /// own terrain LOD and stays [`DEFAULT_TERRAIN_RADIUS`] where it does not.
+    #[test]
+    fn an_unnamed_ring_is_off_where_the_worldspace_has_lod_data() {
+        let plain = EngineConfig::default();
+        assert!(!plain.terrain_radius_given, "nothing named a ring");
+        assert_eq!(
+            plain.effective_terrain_radius(true),
+            plain.stream_radius,
+            "LOD draws everything beyond the full-detail grid, so no ring is drawn"
+        );
+        assert_eq!(
+            plain.effective_terrain_radius(false),
+            DEFAULT_TERRAIN_RADIUS,
+            "with no LOD data the ring is what keeps the world from ending in a cliff"
+        );
+
+        // A named ring is drawn as given whatever the worldspace holds - including one that names
+        // the default, and one that names a ring the auto rule would have turned off.
+        let named = EngineConfig::run_from_args(["--terrain-radius", "8"].map(str::to_owned));
+        assert!(named.terrain_radius_given);
+        assert_eq!(named.effective_terrain_radius(true), 8);
+        assert_eq!(named.effective_terrain_radius(false), 8);
+        let named_off = EngineConfig::run_from_args(["--terrain-radius", "2"].map(str::to_owned));
+        assert_eq!(
+            named_off.effective_terrain_radius(false),
+            2,
+            "a named empty ring is drawn (nothing) even where there is no LOD"
+        );
+
+        // A benchmark run's ring is written without naming it, so the rule above still decides:
+        // both answers are the empty ring it has always measured.
+        let bench = EngineConfig::run_from_args(["--benchmark-frames", "100"].map(str::to_owned));
+        assert!(!bench.terrain_radius_given);
+        assert_eq!(bench.effective_terrain_radius(true), bench.stream_radius);
+        assert_eq!(bench.effective_terrain_radius(false), bench.stream_radius);
+
+        // A value that does not parse named nothing: the default and the auto choice stand.
+        let typo =
+            EngineConfig::run_from_args(["--terrain-radius", "not-a-number"].map(str::to_owned));
+        assert!(!typo.terrain_radius_given);
+        assert_eq!(typo.terrain_radius, DEFAULT_TERRAIN_RADIUS);
+        assert_eq!(typo.effective_terrain_radius(true), typo.stream_radius);
+        assert_eq!(typo.effective_terrain_radius(false), DEFAULT_TERRAIN_RADIUS);
+    }
+
+    #[test]
+    fn parses_and_clamps_the_terrain_radius() {
+        let config = EngineConfig::run_from_args(["--terrain-radius", "16"].map(str::to_owned));
+        assert_eq!(config.terrain_radius, 16);
+        assert_eq!(
+            config.stream_radius, 2,
+            "the ring is a knob of its own, not a multiple of the full-detail grid"
+        );
+
+        // A ring at or inside the inner grid is empty: the engine as it was before the ring.
+        let config = EngineConfig::run_from_args(
+            ["--stream-radius", "5", "--terrain-radius", "2"].map(str::to_owned),
+        );
+        assert_eq!((config.stream_radius, config.unload_radius), (5, 6));
+        assert_eq!(config.terrain_radius, 2);
+
+        // A mistyped radius is clamped rather than asking the planner for millions of cells.
+        assert_eq!(
+            EngineConfig::run_from_args(["--terrain-radius", "100000"].map(str::to_owned))
+                .terrain_radius,
+            MAX_TERRAIN_RADIUS
+        );
+        assert_eq!(
+            EngineConfig::run_from_args(["--terrain-radius", "-4"].map(str::to_owned))
+                .terrain_radius,
+            0
+        );
+        assert_eq!(
+            EngineConfig::run_from_args(["--terrain-radius", "not-a-number"].map(str::to_owned))
+                .terrain_radius,
+            DEFAULT_TERRAIN_RADIUS,
+            "an unparsable value leaves the default in place"
+        );
+    }
+
     #[test]
     fn automated_runs_open_their_window_off_screen_unless_asked_not_to() {
         let args = |list: &[&str]| {

@@ -460,6 +460,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(ground_height)
             .insert_resource(crate::physics::WalkSpawnGroundHeight(spawn_ground_height))
             .add_plugins(StreamingPlugin);
+        // The startup plugin lifts pacing until the world is ready unless --paced-startup
+        // was requested. The cover is opt-in and is never applied to shots.
+        app.add_plugins(crate::pacing::startup::StartupLoadPlugin);
         if let (Some(plan), Some(ground)) = (route, route_ground) {
             info!(
                 route = %plan.source,
@@ -748,8 +751,8 @@ fn configure_benchmark_priority(_benchmark_active: bool) -> Result<()> {
 /// queues hundreds of distinct models at once (the largest interior has 522), plus its
 /// neighbours, so the reservation has to cover the whole queue, not a typical load.
 ///
-/// 128 MiB is room for about 1,500 nested loads. It is address space, not memory: the thread's stack is
-/// reserved, and pages are committed only as deep as the thread reaches.
+/// 128 MiB is room for about 1,500 nested loads. It is address space, not memory: Rust asks
+/// Windows for a stack *reservation*, and pages are committed only as deep as a thread reaches.
 const IO_TASK_STACK_BYTES: usize = 128 * 1024 * 1024;
 
 fn io_task_pool_builder(threads: usize) -> TaskPoolBuilder {
@@ -1109,7 +1112,14 @@ fn validate_streaming_fixture(
         return;
     }
     let expected_resident = ((config.stream_radius * 2 + 1).max(0) as usize).pow(2);
-    let maximum_resident = ((config.unload_radius * 2 + 1).max(0) as usize).pow(2);
+    // The plan holds the inner grid in full, and around it the terrain-only ring, which lives one
+    // cell beyond the ring's own edge. A full cell's band is `unload_radius`, wider than the ring's
+    // only when the ring is off; the plan keeps whichever is the wider of the two.
+    let outer_radius = config
+        .terrain_radius
+        .saturating_add(1)
+        .max(config.unload_radius);
+    let maximum_resident = ((outer_radius * 2 + 1).max(0) as usize).pow(2);
     let interior_roots = roots
         .iter()
         .filter(|cell| cell.0 == STREAMING_FIXTURE_INTERIOR_CELL_ID)
@@ -2196,9 +2206,23 @@ fn setup_synthetic_benchmark(
     profiler.record_elapsed("startup/synthetic_scene", started);
 }
 
-/// Creation units in a metre. A Creation unit is about 1.43 cm, and this engine renders one
-/// Creation unit as one Bevy world unit, so a distance a renderer's default expresses in metres
-/// is this many times larger here.
+/// How far the camera draws: the far corner of the terrain ring and a margin, so the whole ring is
+/// inside it. With the ring off (an effective `terrain_radius` at or below `stream_radius`) this is
+/// what it was before the ring existed, `CELL_SIZE * (stream_radius + 2) * 2` - and a worldspace
+/// whose LOD draws beyond the ring is reached by `crate::streaming::lod`'s own extension of the far
+/// plane when its first chunks arrive.
+///
+/// `terrain_radius` is the ring the run draws here, not the configured one:
+/// [`EngineConfig::effective_terrain_radius`] of the worldspace the camera starts in.
+///
+/// A long far plane costs almost nothing: Bevy uses reverse-Z, whose precision at a given distance
+/// depends on the near plane and the float's mantissa, not on where the far plane is.
+pub(crate) fn camera_far_plane(stream_radius: i32, terrain_radius: i32) -> f32 {
+    let radius = terrain_radius.max(stream_radius).max(1);
+    crate::world::components::CELL_SIZE * (radius + 2) as f32 * 2.0
+}
+
+/// Creation units in a metre. The renderer keeps one Creation unit per world unit.
 const CREATION_UNITS_PER_METRE: f32 = 70.0;
 
 /// The number of cascades the sun's shadow map is split into. Four is Bevy's default and its
@@ -2314,8 +2338,19 @@ fn sun_rotation(config: &EngineConfig) -> Quat {
 
 /// Where `setup_world` stands the camera relative to the point it looks at, the centre of the cell
 /// at the origin of the world grid: the acceptance screenshot is taken from far above it, the
-/// walk-around view from behind and above it. [`sun_shadow_cascades`] measures its range from the
-/// camera, so the offsets live here rather than in two places.
+/// Whether the worldspace the run is configured with draws its own terrain LOD data, which decides
+/// the ring it starts with ([`EngineConfig::effective_terrain_radius`]). Read through the world
+/// database when the run opened one; a run that streams no world (a fixture, `--benchmark-only`)
+/// has none, and so does a database converted before LOD existed.
+///
+/// This is the configured worldspace and not the active one: it is what the camera is placed in
+/// before the first frame, and every later space change resolves its own
+/// in the streaming planner.
+fn has_lod_data(config: &EngineConfig, database: Option<&WorldDatabase>) -> bool {
+    database.is_some_and(|database| database.has_lod_for(config.worldspace_id))
+}
+
+/// The camera offsets stay shared between startup and route driving.
 fn camera_offset(config: &EngineConfig) -> Vec3 {
     if config.streaming_benchmark_route_speed.is_some() {
         Vec3::new(0.0, 6000.0, 0.0)
@@ -2328,11 +2363,15 @@ fn camera_offset(config: &EngineConfig) -> Vec3 {
         Vec3::new(0.0, 1200.0, 2500.0)
     }
 }
-
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy injects the independent world startup resources."
+)]
 fn setup_world(
     mut commands: Commands,
     shot_output: Option<Res<ShotOutputImage>>,
     config: Res<EngineConfig>,
+    database: Option<Res<WorldDatabase>>,
     ground_height: Option<Res<InitialCameraGroundHeight>>,
     tuning: Option<Res<MovementTuning>>,
     start_camera: Option<Res<InitialWorldCameraPose>>,
@@ -2346,7 +2385,10 @@ fn setup_world(
         camera_offset(&config)
     };
     let camera_position = target + camera_offset;
-    let far = crate::world::components::CELL_SIZE * (config.stream_radius.max(1) + 2) as f32 * 2.0;
+    let far = camera_far_plane(
+        config.stream_radius,
+        config.effective_terrain_radius(has_lod_data(&config, database.as_deref())),
+    );
     let mut camera_transform = if config.interactive_world_physics() {
         Transform::from_translation(camera_position)
             .looking_at(camera_position + Vec3::NEG_Z, Vec3::Y)
@@ -2940,8 +2982,24 @@ struct ScreenshotCaptureState {
 
 #[cfg(test)]
 mod tests {
-    /// A `--route` file shares the camera with neither `--shots` nor `--matched-route`. The refusal
-    /// comes before the shots file is read, so the file names here need not exist.
+    /// The terrain fixture exercises the same overlay weight field as streamed terrain.
+    #[test]
+    fn terrain_water_fixture_quadrants_carry_their_weight_field() {
+        let terrain = terrain_water_fixture_snapshot();
+        for quadrant in 0..4 {
+            let extension = TerrainExtension::fixture(
+                &terrain,
+                quadrant,
+                std::array::from_fn(|_| Handle::<Image>::default()),
+            )
+            .expect("the canonical terrain fixture must build");
+            assert!(
+                extension.reads_weight_field(),
+                "quadrant {quadrant} must render its overlays through the weight field"
+            );
+        }
+    }
+
     #[test]
     fn a_route_refuses_shots_and_matched_route_before_reading_either() {
         for config in [
@@ -4537,6 +4595,30 @@ mod tests {
         assert!(state.offset.abs() <= AUTO_FLIGHT_HALF_SPAN);
     }
 
+    /// The far plane includes the whole terrain ring, including its far corner.
+    /// Weather fog is owned by `sky::SkyPlugin`, independently of the terrain ring.
+    #[test]
+    fn the_default_far_plane_covers_the_terrain_ring() {
+        let config = EngineConfig::default();
+        let far = camera_far_plane(config.stream_radius, config.effective_terrain_radius(false));
+        let cell = crate::world::components::CELL_SIZE;
+        assert_eq!(config.stream_radius, 2);
+        assert_eq!(config.terrain_radius, crate::config::DEFAULT_TERRAIN_RADIUS);
+        assert_eq!(far, cell * (config.terrain_radius + 2) as f32 * 2.0);
+        let corner = std::f32::consts::SQRT_2 * (config.terrain_radius as f32 + 1.0) * cell;
+        assert!(
+            corner < far,
+            "corner {corner} is outside the far plane {far}"
+        );
+    }
+
+    #[test]
+    fn without_a_ring_the_far_plane_preserves_full_detail_reach() {
+        let config = EngineConfig::default();
+        let far = camera_far_plane(config.stream_radius, config.effective_terrain_radius(true));
+        assert_eq!(far, crate::world::components::CELL_SIZE * 4.0 * 2.0);
+    }
+
     #[test]
     fn the_upload_budget_resource_carries_the_configured_option() {
         let mut app = App::new();
@@ -5076,28 +5158,7 @@ mod tests {
         );
     }
 
-    /// The terrain/water fixture is the only scene that draws terrain without game data, so its
-    /// materials have to carry the overlay weight field the streamed path reads: on the packed
-    /// vertex attributes it would show the sharpened carrier instead, and the field would go
-    /// unexercised outside a converted asset set.
-    #[test]
-    fn terrain_water_fixture_quadrants_carry_their_weight_field() {
-        let terrain = terrain_water_fixture_snapshot();
-        for quadrant in 0..4 {
-            let extension = TerrainExtension::fixture(
-                &terrain,
-                quadrant,
-                std::array::from_fn(|_| Handle::<Image>::default()),
-            )
-            .expect("the canonical terrain fixture must build");
-            assert!(
-                extension.reads_weight_field(),
-                "quadrant {quadrant} must render its overlays through the weight field"
-            );
-        }
-    }
-
-    /// The shader tiles every terrain layer across a cell, so the fixture's layer images
+    /// The shader tiles every terrain layer `8` times across a cell, so the fixture's layer images
     /// need the sampler a streamed layer is loaded with. Bevy's default clamps to the edge, which
     /// stretches the outermost texels over the rest of the tiles.
     #[test]

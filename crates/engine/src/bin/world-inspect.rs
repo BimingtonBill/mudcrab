@@ -1,4 +1,5 @@
 use color_eyre::{Result, eyre::WrapErr};
+use engine::streaming::converted_model_path;
 use engine::world::{
     cache::CellCache,
     components::{InstanceBounds, WorldPosition},
@@ -845,19 +846,6 @@ fn contract_status(path: &Path, passed_key: &str) -> ContractStatus {
             .and_then(|value| value.get(passed_key))
             .and_then(Value::as_bool),
     }
-}
-
-fn converted_model_path(path: String) -> Option<String> {
-    // Converted assets are published with lowercase canonical paths, so the
-    // lookup must lowercase too (matching the engine runtime resolver).
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    let without_prefix = normalized.strip_prefix("meshes/").unwrap_or(&normalized);
-    if without_prefix.is_empty() {
-        return None;
-    }
-    let mut converted = PathBuf::from("meshes").join(without_prefix);
-    converted.set_extension("glb");
-    Some(converted.to_string_lossy().replace('\\', "/"))
 }
 
 fn hex_id(value: u32) -> String {

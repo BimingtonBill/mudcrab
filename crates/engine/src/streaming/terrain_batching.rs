@@ -601,6 +601,7 @@ pub(crate) struct LodBatchVisibility<'w, 's> {
         ),
     >,
     removed: RemovedComponents<'w, 's, LodTerrainBatches>,
+    roots: Query<'w, 's, &'static super::LodChunkRoot>,
     source_states: Query<'w, 's, (&'static TerrainCoverage, Has<TerrainSurfaceReady>)>,
     meshes: Option<ResMut<'w, Assets<Mesh>>>,
     commands: Commands<'w, 's>,
@@ -707,10 +708,21 @@ impl LodBatchVisibility<'_, '_> {
         })
     }
 
-    pub(super) fn coverage(&self) -> impl Iterator<Item = TerrainCoverage> + '_ {
+    /// Active batch coverage belongs to its chunk's world, not to grid coordinates alone.
+    pub(super) fn coverage_for_world(
+        &self,
+        world: Option<u32>,
+    ) -> impl Iterator<Item = TerrainCoverage> + '_ {
         self.chunks
             .iter()
-            .filter(|(_, chunk, ready)| ready.is_some() && chunk.source_children.is_none())
+            .filter(move |(entity, chunk, ready)| {
+                ready.is_some()
+                    && chunk.source_children.is_none()
+                    && self
+                        .roots
+                        .get(*entity)
+                        .is_ok_and(|root| Some(root.terrain_key().worldspace_id) == world)
+            })
             .flat_map(|(_, chunk, _)| {
                 chunk
                     .batches
@@ -758,9 +770,27 @@ impl LodBatchVisibility<'_, '_> {
         }
     }
 
+    /// Selects one world's coverage and clears masks in every other retained world.
+    pub(super) fn update_for_world<S: std::hash::BuildHasher>(
+        &mut self,
+        selected_tiers: &HashMap<(IVec2, u8), Option<LodTier>, S>,
+        world: Option<u32>,
+    ) -> (usize, usize, usize) {
+        self.update_scoped(selected_tiers, Some(world))
+    }
+
+    #[cfg(test)]
     pub(super) fn update<S: std::hash::BuildHasher>(
         &mut self,
         selected_tiers: &HashMap<(IVec2, u8), Option<LodTier>, S>,
+    ) -> (usize, usize, usize) {
+        self.update_scoped(selected_tiers, None)
+    }
+
+    pub(super) fn update_scoped<S: std::hash::BuildHasher>(
+        &mut self,
+        selected_tiers: &HashMap<(IVec2, u8), Option<LodTier>, S>,
+        world: Option<Option<u32>>,
     ) -> (usize, usize, usize) {
         let Some(meshes) = self.meshes.as_deref_mut() else {
             return (0, 0, 0);
@@ -772,6 +802,11 @@ impl LodBatchVisibility<'_, '_> {
         let mut visible_batches = 0;
         let mut changed_batches = 0;
         for (root, mut chunk, ready) in &mut self.chunks {
+            let in_world = world.is_none_or(|world| {
+                self.roots
+                    .get(root)
+                    .is_ok_and(|root| Some(root.terrain_key().worldspace_id) == world)
+            });
             let initial_upload = chunk.source_children.is_some();
             for batch in &mut chunk.batches {
                 let selected =
@@ -780,7 +815,8 @@ impl LodBatchVisibility<'_, '_> {
                         .iter()
                         .enumerate()
                         .fold(0u16, |mask, (index, member)| {
-                            if ready.is_some()
+                            if in_world
+                                && ready.is_some()
                                 && selected_tiers
                                     .get(&(member.coverage.grid, member.coverage.quadrant))
                                     == Some(&member.coverage.tier)
@@ -1001,9 +1037,23 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StandardMaterial>>()
             .add(StandardMaterial::default());
+        let worldspace_id = app
+            .world()
+            .get_resource::<EngineConfig>()
+            .map_or(60, |config| config.worldspace_id);
         let root = app
             .world_mut()
             .spawn((
+                super::super::LodChunkRoot {
+                    key: shared::lod::ChunkKey::new(
+                        worldspace_id,
+                        tier,
+                        shared::lod::ChunkAnchor::new(0, 0),
+                    ),
+                    generation: 1,
+                    origin: shared::lod::LodOrigin::new(0, 0),
+                    retry_count: 0,
+                },
                 Transform::from_xyz(1000.0, 0.0, -2000.0),
                 Visibility::Hidden,
             ))
@@ -1230,9 +1280,13 @@ mod tests {
         use super::super::LodChunkRoot;
         use shared::lod::{ChunkAnchor, ChunkKey, LodOrigin};
         let tier = fixture.patches[0].1.tier.unwrap();
+        let worldspace_id = app
+            .world()
+            .get_resource::<EngineConfig>()
+            .map_or(60, |config| config.worldspace_id);
         app.world_mut().entity_mut(fixture.root).insert((
             LodChunkRoot {
-                key: ChunkKey::new(1, tier, ChunkAnchor::new(0, 0)),
+                key: ChunkKey::new(worldspace_id, tier, ChunkAnchor::new(0, 0)),
                 generation: 1,
                 origin: LodOrigin::new(0, 0),
                 retry_count: 0,
@@ -1245,8 +1299,10 @@ mod tests {
     }
 
     fn full_quadrant(app: &mut App, grid: IVec2, quadrant: u8) -> Entity {
+        let worldspace_id = app.world().resource::<EngineConfig>().worldspace_id;
         app.world_mut()
             .spawn((
+                crate::streaming::TerrainWorldspace(worldspace_id),
                 TerrainPatch,
                 TerrainCoverage {
                     grid,
@@ -1692,9 +1748,27 @@ mod tests {
         let mut app = selection_app();
         let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
         // A coarser unbatched neighbour lives in the same quadrant as the Tier4 sources.
+        let worldspace_id = app.world().resource::<EngineConfig>().worldspace_id;
+        let held_owner = app
+            .world_mut()
+            .spawn((
+                super::super::LodChunkRoot {
+                    key: shared::lod::ChunkKey::new(
+                        worldspace_id,
+                        LodTier::Tier8,
+                        shared::lod::ChunkAnchor::new(0, 0),
+                    ),
+                    generation: 0,
+                    origin: shared::lod::LodOrigin::new(0, 0),
+                    retry_count: 0,
+                },
+                Visibility::Inherited,
+            ))
+            .id();
         let held = app
             .world_mut()
             .spawn((
+                ChildOf(held_owner),
                 TerrainCoverage {
                     grid: IVec2::ZERO,
                     quadrant: 0,
@@ -1763,6 +1837,49 @@ mod tests {
                 .is_empty(),
             "neither stream produced an event, so no tracking survives"
         );
+        let worldspace_id = app.world().resource::<EngineConfig>().worldspace_id;
+        let lod_patch = |app: &mut App, worldspace_id| {
+            let owner = app
+                .world_mut()
+                .spawn((
+                    super::super::LodChunkRoot {
+                        key: shared::lod::ChunkKey::new(
+                            worldspace_id,
+                            LodTier::Tier4,
+                            shared::lod::ChunkAnchor::new(0, 0),
+                        ),
+                        generation: 0,
+                        origin: shared::lod::LodOrigin::new(0, 0),
+                        retry_count: 0,
+                    },
+                    Visibility::Inherited,
+                ))
+                .id();
+            app.world_mut()
+                .spawn((
+                    ChildOf(owner),
+                    TerrainCoverage {
+                        grid: IVec2::ZERO,
+                        quadrant: 0,
+                        tier: Some(LodTier::Tier4),
+                    },
+                    TerrainSurfaceReady,
+                    Visibility::Inherited,
+                ))
+                .id()
+        };
+        let coarse = lod_patch(&mut app, worldspace_id);
+        let foreign = lod_patch(&mut app, worldspace_id.wrapping_add(1));
+        let real = full_quadrant(&mut app, IVec2::ZERO, 0);
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(coarse),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(foreign),
+            Some(&Visibility::Hidden)
+        );
         app.world_mut()
             .resource_mut::<LodStreaming>()
             .replaced_source_quadrants
@@ -1772,7 +1889,6 @@ mod tests {
             .query_filtered::<Entity, With<StreamingCamera>>();
         let camera = cameras.single(app.world()).unwrap();
         app.world_mut().entity_mut(camera).despawn();
-        let real = full_quadrant(&mut app, IVec2::ZERO, 0);
         app.world_mut()
             .entity_mut(real)
             .remove::<TerrainSurfaceReady>();
@@ -1783,9 +1899,60 @@ mod tests {
                 .replaced_source_quadrants
                 .is_empty()
         );
+        // The maintained selector may consume invalidation without a camera. Its observable
+        // obligation is exact coverage on the first resumed frame, without stale ownership.
+        let camera = app
+            .world_mut()
+            .spawn((
+                StreamingCamera,
+                Transform::from_xyz(CELL_SIZE * 0.5, 0.0, -CELL_SIZE * 0.5),
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(coarse),
+            Some(&Visibility::Inherited)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(foreign),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .visible_lod_terrain_patches,
+            1
+        );
+
+        app.world_mut().entity_mut(camera).despawn();
+        app.world_mut()
+            .entity_mut(coarse)
+            .remove::<TerrainSurfaceReady>();
+        app.update();
+        app.world_mut().spawn((
+            StreamingCamera,
+            Transform::from_xyz(CELL_SIZE * 0.5, 0.0, -CELL_SIZE * 0.5),
+        ));
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(coarse),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(foreign),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .visible_lod_terrain_patches,
+            0
+        );
         assert!(
-            app.world().resource::<LodStreaming>().visibility_dirty,
-            "real removals remain pending semantically when no camera can run selection"
+            app.world()
+                .resource::<LodStreaming>()
+                .replaced_source_quadrants
+                .is_empty()
         );
     }
 
@@ -2098,18 +2265,7 @@ mod tests {
         assert_eq!(app.world().get::<Children>(fixture.root).unwrap().len(), 1);
         assert!(app.world().get::<WorldAssetRoot>(fixture.root).is_none());
         let original = app.world().get::<Mesh3d>(entity).unwrap().0.clone();
-        let full_detail = app
-            .world_mut()
-            .spawn((
-                TerrainPatch,
-                TerrainCoverage {
-                    grid: IVec2::ZERO,
-                    quadrant: 0,
-                    tier: None,
-                },
-                TerrainSurfaceReady,
-            ))
-            .id();
+        let full_detail = full_quadrant(&mut app, IVec2::ZERO, 0);
         app.world_mut()
             .resource_mut::<LodStreaming>()
             .visibility_dirty = true;
@@ -2517,5 +2673,59 @@ mod tests {
                 .resource::<LodStreaming>()
                 .terrain_batch_controls_warned
         );
+    }
+    #[test]
+    fn same_grid_batches_are_selected_only_in_the_demanded_world() {
+        let mut app = test_app();
+        let first = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        let second = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier8);
+        app.world_mut()
+            .get_mut::<super::super::LodChunkRoot>(second.root)
+            .unwrap()
+            .key
+            .worldspace_id = 61;
+        let prepared = prepare(&mut app, &first).unwrap();
+        install_fixture(&mut app, &first, prepared);
+        let prepared = prepare(&mut app, &second).unwrap();
+        install_fixture(&mut app, &second, prepared);
+        // Retain both representations, exactly as an interior/portal crossing can.
+        acknowledge_uploads(&app, first.root);
+        acknowledge_uploads(&app, second.root);
+        assert!(finalize_initial(&mut app));
+        assert!(finalize_initial(&mut app));
+        for (world, tier, expected) in [
+            (Some(60), LodTier::Tier4, (15, 0)),
+            (Some(60), LodTier::Tier8, (0, 0)),
+            (Some(61), LodTier::Tier8, (0, 15)),
+            (None, LodTier::Tier8, (0, 0)),
+        ] {
+            let coverage = app
+                .world_mut()
+                .run_system_once(move |mut batches: LodBatchVisibility| {
+                    let coverage: Vec<_> = batches.coverage_for_world(world).collect();
+                    let selected: HashMap<_, _> = (0..4u8)
+                        .map(|quadrant| ((IVec2::ZERO, quadrant), Some(tier)))
+                        .collect();
+                    batches.update_for_world(&selected, world);
+                    coverage
+                })
+                .unwrap();
+            assert!(coverage.iter().all(|coverage| coverage.tier
+                == world.map(|world| if world == 60 {
+                    LodTier::Tier4
+                } else {
+                    LodTier::Tier8
+                })));
+            assert_eq!(coverage.len(), if world.is_some() { 4 } else { 0 });
+            let mask = |root| {
+                app.world()
+                    .get::<LodTerrainBatches>(root)
+                    .unwrap()
+                    .batches
+                    .iter()
+                    .fold(0u16, |mask, batch| mask | batch.selected)
+            };
+            assert_eq!((mask(first.root), mask(second.root)), expected);
+        }
     }
 }

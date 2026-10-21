@@ -1,11 +1,10 @@
 use super::{
-    ActiveSpace, MergedTerrainCoverage, RenderOrigin, StreamingCommitBudget, StreamingMetrics,
-    StreamingWorld, TerrainCoverage, TerrainSurfaceReady, requests,
+    ActiveSpace, RenderOrigin, StreamingCommitBudget, StreamingMetrics, StreamingWorld,
+    TerrainCoverage, TerrainSurfaceReady, requests,
 };
 use crate::{
     config::{EngineConfig, TerrainLodDistances},
     profiling::ProfilingState,
-    swap_bridge::SwapWaiting,
     world::{
         components::{CELL_SIZE, StreamingCamera},
         database::{LodChunkMetadata, LodChunkQuery, WorldDatabase},
@@ -32,6 +31,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod visibility;
+pub(super) use visibility::update_terrain_lod_visibility;
+
 const LOD_UNLOAD_MARGIN_CELLS: i32 = 2;
 const LOD_RESPONSE_SCAN_LIMIT: usize = 32;
 const LOD_CHUNK_MAX_RETRIES: u8 = 3;
@@ -44,14 +46,44 @@ pub(crate) mod terrain_batching;
 pub(crate) use terrain_batching::LodTerrainBatch;
 
 /// A far plane that keeps every cell within `reach_cells` of the camera's cell.
-fn lod_camera_far(reach_cells: i32) -> f32 {
+pub(crate) fn lod_camera_far(reach_cells: i32) -> f32 {
     CELL_SIZE * (reach_cells as f32 + 0.5) * std::f32::consts::SQRT_2
+}
+
+/// The active exterior and its main streaming camera's cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LodDemand {
+    pub(super) world: u32,
+    pub(super) center: IVec2,
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub(super) struct LodDemandViews<'w, 's> {
+    space: Option<Res<'w, ActiveSpace>>,
+    main: Query<'w, 's, &'static Transform, With<StreamingCamera>>,
+}
+
+impl LodDemandViews<'_, '_> {
+    pub(super) fn current(&self, config: &EngineConfig, origin: IVec2) -> Option<LodDemand> {
+        let world = lod_worldspace(
+            config.stream_radius,
+            self.space.as_deref(),
+            config.worldspace_id,
+        )?;
+        let camera = self.main.single().ok()?;
+        Some(LodDemand {
+            world,
+            center: streaming_center(config.acceptance_screenshot.is_some(), origin, camera),
+        })
+    }
 }
 
 #[derive(Resource, Default)]
 pub(super) struct LodStreaming {
     generation: u64,
     center: Option<IVec2>,
+    /// Exterior demand that produced the current terrain LOD plan.
+    demand: Option<LodDemand>,
     /// The worldspace `center` belongs to; a door into another worldspace moves the centre too.
     worldspace_id: Option<u32>,
     requested_queries: HashSet<LodTier>,
@@ -62,23 +94,134 @@ pub(super) struct LodStreaming {
     queued_retry_chunks: HashSet<ChunkKey>,
     build_identity: Option<String>,
     pub(super) visibility_dirty: bool,
+    /// Whether no exterior view currently demands LOD, so the change is logged
+    /// once each way and not every frame.
+    stopped: bool,
     submission_dirty: bool,
     // Exact generational source IDs replaced after the previous selector pass. Both removal
     // streams consume this set once on the next pass, even if one stream has no matching event.
     replaced_source_quadrants: HashSet<Entity>,
     visibility_revision: u64,
     terrain_batch_commit_used: bool,
-    visibility_camera_grid: Option<IVec2>,
-    visibility_stream_radius: Option<i32>,
     terrain_batch_prepared_chunks: u64,
     terrain_batch_activated_chunks: u64,
     terrain_batch_fallback_chunks: u64,
     terrain_batch_pending_cpu_chunks: usize,
     terrain_batch_completion_report: Option<(u64, u64, u64)>,
     terrain_batch_controls_warned: bool,
+
+    /// Whether any LOD patch was drawn at the last visibility pass, logged on each change.
+    any_visible_logged: Option<bool>,
+}
+
+#[cfg(test)]
+impl LodStreaming {
+    /// Spawns a chunk root the way [`collect_lod_chunks`] does - its [`LodChunkRoot`] and the
+    /// visibility a shown root carries - records it as ready, and returns it.
+    pub(super) fn spawn_ready_chunk_for_test(
+        world: &mut World,
+        worldspace_id: u32,
+        anchor: shared::lod::ChunkAnchor,
+        origin: LodOrigin,
+    ) -> Entity {
+        Self::spawn_ready_chunk_at_tier_for_test(
+            world,
+            ChunkKey::new(worldspace_id, LodTier::Tier16, anchor),
+            origin,
+        )
+    }
+
+    /// Records a ready root with the exact world, tier and anchor owned by a visibility fixture.
+    pub(super) fn spawn_ready_chunk_at_tier_for_test(
+        world: &mut World,
+        key: ChunkKey,
+        origin: LodOrigin,
+    ) -> Entity {
+        let root = world
+            .spawn((
+                LodChunkRoot {
+                    key,
+                    generation: 0,
+                    origin,
+                    retry_count: 0,
+                },
+                Visibility::Inherited,
+            ))
+            .id();
+        world
+            .resource_mut::<LodStreaming>()
+            .chunks
+            .insert(key, LodChunkStatus::Ready { root, origin });
+        root
+    }
+
+    /// The table's entries, whatever state the chunks are in.
+    pub(super) fn resident_chunks_for_test(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Spawns a chunk root in the state [`plan_lod_chunks`] leaves a chunk that fell out of the
+    /// keep-set - hidden, with the marker the revive gives back - and records it as retiring: for
+    /// the unload pacer's tests, which cannot fill the private table themselves.
+    pub(super) fn spawn_retiring_chunk_for_test(
+        world: &mut World,
+        worldspace_id: u32,
+        anchor: shared::lod::ChunkAnchor,
+        origin: LodOrigin,
+    ) -> Entity {
+        let key = ChunkKey::new(worldspace_id, LodTier::Tier16, anchor);
+        let root = world
+            .spawn((
+                LodChunkRoot {
+                    key,
+                    generation: 0,
+                    origin,
+                    retry_count: 0,
+                },
+                super::RetireHidden(Visibility::Inherited),
+                Visibility::Hidden,
+            ))
+            .id();
+        world
+            .resource_mut::<LodStreaming>()
+            .chunks
+            .insert(key, LodChunkStatus::Retiring { root, origin });
+        root
+    }
+
+    /// The number of chunks waiting for their turn in the unload budget.
+    pub(super) fn retiring_chunks_for_test(&self) -> usize {
+        self.chunks
+            .values()
+            .filter(|status| matches!(status, LodChunkStatus::Retiring { .. }))
+            .count()
+    }
+
+    /// The number of chunks kept hidden for the return to their exterior, the state
+    /// `--lod-keep-hidden-in-interiors` leaves them in.
+    pub(super) fn held_chunks_for_test(&self) -> usize {
+        self.chunks
+            .values()
+            .filter(|status| matches!(status, LodChunkStatus::Held { .. }))
+            .count()
+    }
+
+    /// The worldspace distant terrain is being streamed for, `None` while it is stopped.
+    pub(super) fn streamed_worldspace_for_test(&self) -> Option<u32> {
+        self.worldspace_id
+    }
 }
 
 impl LodStreaming {
+    fn has_queued_chunks(&self) -> bool {
+        self.pending_chunks
+            .iter()
+            .any(|(generation, metadata, retry)| {
+                *generation == self.generation
+                    && (retry.is_some() || !self.chunks.contains_key(&metadata.key))
+            })
+    }
+
     fn query_ready(&self, tier: LodTier, now: Instant) -> bool {
         !self.requested_queries.contains(&tier)
             && self
@@ -104,13 +247,27 @@ impl LodStreaming {
         self.query_retries.insert(tier, (count, retry_at));
     }
 
-    fn has_queued_chunks(&self) -> bool {
-        self.pending_chunks
+    /// The chunks waiting for their turn in the unload budget ([`super::despawn_cells`]), in
+    /// [`ChunkKey`]'s own order (worldspace, tier, anchor): stable, so a replayed crossing
+    /// unloads the same chunks on the same frames whatever order the map iterates in. Which
+    /// frame each one falls on depends on machine speed, as it does for cells.
+    pub(super) fn retiring_chunks(&self) -> Vec<(ChunkKey, Entity)> {
+        let mut retiring: Vec<(ChunkKey, Entity)> = self
+            .chunks
             .iter()
-            .any(|(generation, metadata, retry)| {
-                *generation == self.generation
-                    && (retry.is_some() || !self.chunks.contains_key(&metadata.key))
+            .filter_map(|(key, status)| match status {
+                LodChunkStatus::Retiring { root, .. } => Some((*key, *root)),
+                _ => None,
             })
+            .collect();
+        retiring.sort_by_key(|(key, _)| *key);
+        retiring
+    }
+
+    /// Forgets the chunk whose root the unload pacer has just despawned. Held chunks are not
+    /// touched: they are the flag's to show again, not the pacer's to unload.
+    pub(super) fn chunk_despawned(&mut self, key: ChunkKey) {
+        self.chunks.remove(&key);
     }
 
     fn move_center(&mut self, center: IVec2, worldspace_id: u32, distances: &TerrainLodDistances) {
@@ -152,6 +309,31 @@ enum LodChunkStatus {
         root: Entity,
         origin: LodOrigin,
     },
+    /// The chunk has left the keep-set and is waiting for its turn in the unload budget
+    /// ([`super::despawn_cells`], which drains cells and LOD chunks under one budget).
+    ///
+    /// The map entry and the root stay, hidden the frame it retires ([`super::hide_retiring_root`],
+    /// the same hide-and-mark a retiring cell gets), so the teardown is spread over frames instead
+    /// of landing whole on the frame the camera walks through a door - and a chunk the camera
+    /// comes back to is **revived** as it is ([`revive_left_chunk`]) instead of being despawned
+    /// and streamed in again. Nothing draws it while it drains: the root is [`Visibility::Hidden`]
+    /// the frame it retires, exactly as the cell retire is.
+    Retiring {
+        root: Entity,
+        origin: LodOrigin,
+    },
+    /// The active space has no distant terrain (an interior) and `--lod-keep-hidden-in-interiors`
+    /// asked for the chunks to be kept: hidden like a retiring chunk, but with no place in the
+    /// unload queue - the return to the exterior shows them as they are
+    /// ([`revive_left_chunk`]) instead of streaming a whole world's LOD in again.
+    ///
+    /// Only the *space* leaving - an interior, or a stream radius turned off - holds a chunk this
+    /// way. A chunk that leaves the keep-set by distance retires, flag or no flag: the camera that
+    /// left it may never come back, and holding it would hold its memory for nothing.
+    Held {
+        root: Entity,
+        origin: LodOrigin,
+    },
     Failed {
         origin: LodOrigin,
         metadata: LodChunkMetadata,
@@ -165,16 +347,124 @@ impl LodChunkStatus {
         match self {
             Self::Loading { origin, .. }
             | Self::Ready { origin, .. }
+            | Self::Retiring { origin, .. }
+            | Self::Held { origin, .. }
             | Self::Failed { origin, .. } => *origin,
         }
     }
+}
 
-    fn root(&self) -> Option<Entity> {
-        match self {
-            Self::Loading { root, .. } | Self::Ready { root, .. } => Some(*root),
-            Self::Failed { .. } => None,
+/// What [`leave_keep_set`] did with a chunk that is no longer wanted, for the caller's counters
+/// and profile events.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChunkLeave {
+    /// The entry is gone: a failed chunk, which never drew a root to pace.
+    Dropped,
+    /// The chunk started leaving this frame and waits for the unload pacer.
+    Retiring,
+    /// The chunk is kept hidden for the return to its exterior
+    /// (`--lod-keep-hidden-in-interiors`).
+    Held,
+    /// The chunk was leaving already, or is held and stays held.
+    AlreadyLeaving,
+}
+
+/// The unload half of the LOD plan: what a chunk that is no longer wanted does with its root.
+///
+/// It is the cell retire's rule, reused ([`super::hide_retiring_root`]): the root is hidden the
+/// frame the chunk leaves - so a paced unload looks exactly like the unpaced one it replaced,
+/// off every camera from that frame on - the map entry and the root stay, and the unload pacer
+/// ([`super::despawn_cells`]) spreads the teardown over frames under the same budget the cells
+/// drain by. A chunk that comes back before its turn is revived, not spawned again
+/// ([`revive_left_chunk`]).
+///
+/// `hold` keeps the chunk hidden but *out of* the unload queue ([`LodChunkStatus::Held`]): the
+/// caller passes it only where the chunk's own space is not left behind but stops being drawn -
+/// the active space having no distant terrain. A held chunk the plan stops wanting anyway (a
+/// return that lands in another worldspace) starts retiring here, hidden already.
+fn leave_keep_set(
+    commands: &mut Commands,
+    chunk_visibility: &Query<'_, '_, (&Visibility, Option<&super::RetireHidden>)>,
+    status: &mut LodChunkStatus,
+    hold: bool,
+) -> ChunkLeave {
+    match status {
+        // Waiting for its turn in the budget already.
+        LodChunkStatus::Retiring { .. } => ChunkLeave::AlreadyLeaving,
+        LodChunkStatus::Held { root, origin } => {
+            if hold {
+                return ChunkLeave::AlreadyLeaving;
+            }
+            // The exterior it was held for is not the one the camera is in: it starts leaving
+            // now. It is hidden already, marker and all.
+            *status = LodChunkStatus::Retiring {
+                root: *root,
+                origin: *origin,
+            };
+            ChunkLeave::Retiring
         }
+        LodChunkStatus::Loading { root, origin, .. } | LodChunkStatus::Ready { root, origin } => {
+            let (root, origin) = (*root, *origin);
+            super::hide_retiring_root(commands, chunk_visibility, root);
+            *status = if hold {
+                LodChunkStatus::Held { root, origin }
+            } else {
+                LodChunkStatus::Retiring { root, origin }
+            };
+            if hold {
+                ChunkLeave::Held
+            } else {
+                ChunkLeave::Retiring
+            }
+        }
+        // Nothing was spawned, so there is no subtree to pace.
+        LodChunkStatus::Failed { .. } => ChunkLeave::Dropped,
     }
+}
+
+/// A chunk that comes back into the keep-set is revived as it is, the way a cell is: the root it
+/// kept draws the chunk again - the same entity, so nothing is spawned a second time - and the
+/// chunk is never requested again.
+///
+/// A chunk whose content was still loading when it left is revived *as loading*: it never showed
+/// yet, so the revive leaves the hide in place and [`track_lod_readiness`] shows it when its
+/// content is committed. Every other one is ready, and is given back exactly the visibility the
+/// leave took ([`super::RetireHidden`]); a root without that marker - one something else hid, or
+/// one never shown - is left alone.
+///
+/// Returns whether `status` was a state that comes back ([`LodChunkStatus::Retiring`] or
+/// [`LodChunkStatus::Held`]).
+fn revive_left_chunk(
+    commands: &mut Commands,
+    chunk_visibility: &Query<'_, '_, (&Visibility, Option<&super::RetireHidden>)>,
+    chunk_roots: &Query<'_, '_, (&LodChunkRoot, Option<&PendingLodChunk>)>,
+    status: &mut LodChunkStatus,
+) -> bool {
+    let (root, origin) = match *status {
+        LodChunkStatus::Retiring { root, origin } | LodChunkStatus::Held { root, origin } => {
+            (root, origin)
+        }
+        _ => return false,
+    };
+    let (generation, still_loading) =
+        chunk_roots.get(root).map_or((0, false), |(root, pending)| {
+            (root.generation, pending.is_some())
+        });
+    if still_loading {
+        *status = LodChunkStatus::Loading {
+            root,
+            generation,
+            origin,
+        };
+        return true;
+    }
+    *status = LodChunkStatus::Ready { root, origin };
+    if let Ok((_, Some(hidden))) = chunk_visibility.get(root) {
+        let original = hidden.0;
+        commands.entity(root).try_insert(original);
+        commands.entity(root).try_remove::<super::RetireHidden>();
+    }
+    true
 }
 
 #[derive(Component)]
@@ -185,8 +475,15 @@ pub(crate) struct LodChunkRoot {
     retry_count: u8,
 }
 
+impl LodChunkRoot {
+    /// Immutable placement identity; does not imply visibility or drawable assets.
+    pub(super) fn terrain_key(&self) -> ChunkKey {
+        self.key
+    }
+}
+
 #[derive(Component)]
-pub(super) struct LodChunkGridOrigin {
+pub(crate) struct LodChunkGridOrigin {
     pub(super) grid_x: i64,
     pub(super) grid_y: i64,
 }
@@ -285,26 +582,103 @@ pub(super) fn pending_fixture(metadata: LodChunkMetadata) -> PendingLodChunk {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_lod_chunks(
-    mut commands: Commands,
+    commands: Commands,
     config: Res<EngineConfig>,
-    space: Option<Res<ActiveSpace>>,
     database: Res<WorldDatabase>,
     origin: Res<RenderOrigin>,
-    camera: Query<&Transform, With<StreamingCamera>>,
+    views: LodDemandViews,
+    chunk_visibility: Query<(&Visibility, Option<&super::RetireHidden>)>,
+    chunk_roots: Query<(&LodChunkRoot, Option<&PendingLodChunk>)>,
     mut streaming: ResMut<LodStreaming>,
     mut budget: ResMut<StreamingCommitBudget>,
-    mut metrics: ResMut<StreamingMetrics>,
-    mut profiler: ResMut<ProfilingState>,
+    metrics: ResMut<StreamingMetrics>,
+    profiler: ResMut<ProfilingState>,
     runtime: Option<Res<super::runtime::StreamingRuntime>>,
     mut previous_distances: Local<Option<crate::config::TerrainLodDistances>>,
 ) {
+    if requests::enabled(&config) {
+        budget.reserve_for_lod(
+            streaming.has_queued_chunks(),
+            runtime
+                .as_ref()
+                .and_then(|runtime| runtime.decision)
+                .map_or(config.max_cell_commits_per_frame, |decision| {
+                    decision.budgets.max_cell_commits
+                }),
+        );
+    } else {
+        budget.reserved_for_lod = false;
+    }
+    let demand = views.current(&config, origin.0);
+    plan_lod_demand_controlled(
+        demand,
+        commands,
+        config,
+        database,
+        chunk_visibility,
+        chunk_roots,
+        streaming,
+        metrics,
+        profiler,
+        runtime,
+        &mut previous_distances,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn plan_lod_demand(
+    demand: Option<LodDemand>,
+    commands: Commands,
+    config: Res<EngineConfig>,
+    database: Res<WorldDatabase>,
+    chunk_visibility: Query<(&Visibility, Option<&super::RetireHidden>)>,
+    chunk_roots: Query<(&LodChunkRoot, Option<&PendingLodChunk>)>,
+    streaming: ResMut<LodStreaming>,
+    metrics: ResMut<StreamingMetrics>,
+    profiler: ResMut<ProfilingState>,
+    previous_distances: &mut Option<crate::config::TerrainLodDistances>,
+) {
+    plan_lod_demand_controlled(
+        demand,
+        commands,
+        config,
+        database,
+        chunk_visibility,
+        chunk_roots,
+        streaming,
+        metrics,
+        profiler,
+        None,
+        previous_distances,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_lod_demand_controlled(
+    demand: Option<LodDemand>,
+    mut commands: Commands,
+    config: Res<EngineConfig>,
+    database: Res<WorldDatabase>,
+    chunk_visibility: Query<(&Visibility, Option<&super::RetireHidden>)>,
+    chunk_roots: Query<(&LodChunkRoot, Option<&PendingLodChunk>)>,
+    mut streaming: ResMut<LodStreaming>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+    runtime: Option<Res<super::runtime::StreamingRuntime>>,
+    previous_distances: &mut Option<crate::config::TerrainLodDistances>,
+) {
     let started = Instant::now();
-    let Ok(camera) = camera.single() else {
-        return;
-    };
-    let Some(worldspace_id) =
-        lod_worldspace(config.stream_radius, space.as_deref(), config.worldspace_id)
-    else {
+    if streaming.demand != demand {
+        streaming.visibility_dirty = true;
+        debug!(?demand, "terrain LOD exterior demand changed");
+        streaming.demand = demand;
+    }
+    let Some(demand) = demand else {
+        if !streaming.stopped {
+            streaming.stopped = true;
+            info!("terrain LOD stopped: no exterior view demands distant terrain");
+        }
         if streaming.center.take().is_some() {
             streaming.generation = streaming.generation.wrapping_add(1);
         }
@@ -314,24 +688,57 @@ pub(super) fn plan_lod_chunks(
         streaming.query_retries.clear();
         streaming.pending_chunks.clear();
         streaming.queued_retry_chunks.clear();
+        // The chunks of the space the camera left stop being drawn this frame, in one of two
+        // ways - both off the frame that used to despawn a whole world's LOD in one flush:
+        // the paced retire ([`LodChunkStatus::Retiring`], drained by the unload pacer) by
+        // default, or [`LodChunkStatus::Held`] with `--lod-keep-hidden-in-interiors`, which
+        // keeps them for the return to the exterior.
+        let hold = config.lod_keep_hidden_in_interiors;
+        let previous_chunks = streaming.chunks.len();
+        let mut retired = 0u64;
+        let mut held = 0u64;
         streaming.chunks.retain(|key, status| {
-            if let Some(root) = status.root() {
-                commands.entity(root).try_despawn();
+            match leave_keep_set(&mut commands, &chunk_visibility, status, hold) {
+                ChunkLeave::Dropped => {
+                    profiler.event(format!("{key:?}"), "unloaded", None);
+                    false
+                }
+                ChunkLeave::Retiring => {
+                    profiler.event(format!("{key:?}"), "retiring", None);
+                    retired += 1;
+                    true
+                }
+                ChunkLeave::Held => {
+                    profiler.event(format!("{key:?}"), "held", None);
+                    held += 1;
+                    true
+                }
+                ChunkLeave::AlreadyLeaving => true,
             }
-            profiler.event(format!("{key:?}"), "unloaded", None);
-            false
         });
+        if retired > 0 {
+            profiler.increment("lod/chunks_retiring", retired);
+        }
+        if held > 0 {
+            profiler.increment("lod/chunks_held", held);
+        }
+        if streaming.chunks.len() != previous_chunks {
+            streaming.visibility_dirty = true;
+        }
         update_counts(&streaming, &mut metrics, &mut profiler);
         profiler.record_elapsed("lod/plan", started);
         return;
     };
+    let worldspace_id = demand.world;
 
-    let center = streaming_center(config.acceptance_screenshot.is_some(), origin.0, camera);
+    if streaming.stopped {
+        streaming.stopped = false;
+        info!(worldspace_id, "terrain LOD resumed for an exterior view");
+    }
+    let center = demand.center;
     let distances_changed = previous_distances.as_ref() != Some(&config.terrain_lod);
     *previous_distances = Some(config.terrain_lod);
     if distances_changed {
-        // Resident patches keep their chunks when a distance changes, so no load or removal event
-        // would otherwise re-select their tier while the camera stands still.
         streaming.visibility_dirty = true;
     }
     if streaming.center != Some(center)
@@ -373,6 +780,9 @@ pub(super) fn plan_lod_chunks(
     metrics.pending_lod_queries = streaming.pending_queries.len();
 
     let center64 = (i64::from(center.x), i64::from(center.y));
+    let previous_chunks = streaming.chunks.len();
+    let mut revived = 0u64;
+    let mut retired = 0u64;
     streaming.chunks.retain(|key, status| {
         let keep = keep_resident_chunk(
             *key,
@@ -381,14 +791,38 @@ pub(super) fn plan_lod_chunks(
             center64,
             &config.terrain_lod,
         );
-        if !keep {
-            if let Some(root) = status.root() {
-                commands.entity(root).try_despawn();
+        if keep {
+            // A chunk that comes back before the unload budget reaches it - or that was held
+            // across a visit to an interior - is revived as it is.
+            if revive_left_chunk(&mut commands, &chunk_visibility, &chunk_roots, status) {
+                revived += 1;
+                profiler.event(format!("{key:?}"), "revived", None);
             }
-            profiler.event(format!("{key:?}"), "unloaded", None);
+            return true;
         }
-        keep
+        match leave_keep_set(&mut commands, &chunk_visibility, status, false) {
+            ChunkLeave::Dropped => {
+                profiler.event(format!("{key:?}"), "unloaded", None);
+                false
+            }
+            ChunkLeave::Retiring => {
+                profiler.event(format!("{key:?}"), "retiring", None);
+                retired += 1;
+                true
+            }
+            ChunkLeave::Held | ChunkLeave::AlreadyLeaving => true,
+        }
     });
+    if revived > 0 {
+        metrics.revived_lod_chunks = metrics.revived_lod_chunks.saturating_add(revived);
+        profiler.increment("lod/chunks_revived", revived);
+    }
+    if retired > 0 {
+        profiler.increment("lod/chunks_retiring", retired);
+    }
+    if streaming.chunks.len() != previous_chunks {
+        streaming.visibility_dirty = true;
+    }
     let generation = streaming.generation;
     streaming
         .pending_chunks
@@ -398,20 +832,21 @@ pub(super) fn plan_lod_chunks(
         .queued_retry_chunks
         .retain(|key| resident_keys.contains(key));
     enqueue_due_lod_retries(&mut streaming, Instant::now());
-    budget.reserve_for_lod(
-        streaming.has_queued_chunks(),
-        runtime
-            .as_ref()
-            .and_then(|runtime| runtime.decision)
-            .map_or(config.max_cell_commits_per_frame, |decision| {
-                decision.budgets.max_cell_commits
-            }),
-    );
     update_counts(&streaming, &mut metrics, &mut profiler);
     profiler.record_elapsed("lod/plan", started);
 }
 
-/// Root and descendant layers for distant world geometry on both reflection routes.
+/// The layers a LOD ring chunk root carries, and the [`Propagate`] source the chunk's meshes pick
+/// up: the ring is distant *world* content, so the main camera draws it on the world layer and
+/// the water reflection draws it on either shadow route
+/// ([`crate::render::reflectable_world_layers`]). A ring left on the world layer alone would be
+/// the shadowless route's largest hole - everything past the streaming radius is all that is left
+/// of the world in a wide reflection (impl-1094). The propagation source carries the same set, so
+/// the chunk's glTF meshes, which appear frames later, pick it up exactly as a streamed cell's
+/// nodes do.
+///
+/// One function so the layer choice is testable without standing up [`collect_lod_chunks`]'s
+/// database, asset server and budget; see `the_lod_ring_is_on_both_reflection_routes`.
 pub(super) fn lod_ring_layers() -> (RenderLayers, Propagate<RenderLayers>) {
     let layers = crate::render::reflectable_world_layers();
     (layers.clone(), Propagate(layers))
@@ -505,10 +940,14 @@ pub(super) fn collect_lod_chunks(
                 )
             });
     }
-    while budget.remaining > 0 {
+    while budget.lod_slot_open(config.max_commit_micros_per_frame) {
+        if requests::enabled(&config) && budget.remaining == 0 {
+            break;
+        }
         if budget.elapsed_limit_reached(runtime.as_deref()) {
             break;
         }
+
         let Some((generation, metadata, retry_attempt)) = streaming.pending_chunks.pop_front()
         else {
             break;
@@ -671,8 +1110,10 @@ pub(super) fn collect_lod_chunks(
                 origin: chunk_origin,
             },
         );
-        budget.remaining -= 1;
-        budget.commits = budget.commits.saturating_add(1);
+        budget.spend_lod_slot();
+        if requests::enabled(&config) {
+            budget.remaining = budget.remaining.saturating_sub(1);
+        }
         metrics.lod_chunks_requested = metrics.lod_chunks_requested.saturating_add(1);
         profiler.increment("lod/chunks_requested", 1);
         profiler.event(format!("{key:?}"), "requested", None);
@@ -708,6 +1149,8 @@ pub(super) fn track_lod_readiness(
     names: Query<&Name>,
     mesh_handles: Query<&Mesh3d>,
     mut pending_chunks: Query<(Entity, &LodChunkRoot, &mut PendingLodChunk)>,
+    roots: Query<Option<&LodChunkRoot>>,
+    mut debug_previous: Local<HashMap<ChunkKey, String>>,
     mut streaming: ResMut<LodStreaming>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
@@ -799,24 +1242,44 @@ pub(super) fn track_lod_readiness(
                 .entity(*patch)
                 .insert((*coverage, TerrainSurfaceReady, Visibility::Hidden));
         }
-        commands.entity(entity).insert(Visibility::Inherited);
-        commands.entity(entity).remove::<PendingLodChunk>();
-        if let Some(LodChunkStatus::Loading {
-            root: expected_root,
-            generation,
-            origin,
-        }) = streaming.chunks.get(&root.key).cloned()
-            && expected_root == entity
-            && generation == root.generation
-        {
-            streaming.chunks.insert(
-                root.key,
-                LodChunkStatus::Ready {
-                    root: entity,
-                    origin,
-                },
-            );
+        if !patches.is_empty() {
+            streaming.visibility_dirty = true;
         }
+        // The chunk's content is committed; whether it starts drawing now depends on whether the
+        // plan still wants it. A chunk that left the keep-set while it was loading (or whose load
+        // outlived the space it was in - `--lod-keep-hidden-in-interiors`) stays hidden and
+        // marked, so the revive ([`revive_left_chunk`]) or the return to the exterior shows it;
+        // it may have been hidden since its spawn, so the mark is written here as well as by the
+        // leave - the visibility a *shown* chunk root carries is `Inherited`.
+        let status = streaming.chunks.get(&root.key).cloned();
+        match status {
+            Some(LodChunkStatus::Loading {
+                root: expected_root,
+                generation,
+                origin,
+            }) if expected_root == entity && generation == root.generation => {
+                streaming.chunks.insert(
+                    root.key,
+                    LodChunkStatus::Ready {
+                        root: entity,
+                        origin,
+                    },
+                );
+                commands.entity(entity).insert(Visibility::Inherited);
+            }
+            Some(LodChunkStatus::Retiring { .. } | LodChunkStatus::Held { .. }) => {
+                commands.entity(entity).try_insert((
+                    super::RetireHidden(Visibility::Inherited),
+                    Visibility::Hidden,
+                ));
+            }
+            // A chunk with no entry, or one whose entry is another root's: what the plan did
+            // before the retire states existed - show it and let the map catch up.
+            _ => {
+                commands.entity(entity).insert(Visibility::Inherited);
+            }
+        }
+        commands.entity(entity).remove::<PendingLodChunk>();
         metrics.lod_chunks_ready = metrics.lod_chunks_ready.saturating_add(1);
         metrics.ready_lod_terrain_patches = metrics
             .ready_lod_terrain_patches
@@ -832,16 +1295,174 @@ pub(super) fn track_lod_readiness(
                 patches,
             });
     }
+    if bevy::log::tracing::enabled!(bevy::log::Level::DEBUG) {
+        debug_pending_lod_chunks(
+            &streaming,
+            &asset_server,
+            &world_assets,
+            &pending_chunks,
+            &roots,
+            &mut debug_previous,
+        );
+    }
     update_counts(&streaming, &mut metrics, &mut profiler);
     profiler.record_elapsed("lod/readiness", started);
 }
 
-/// A merged terrain cell the render world has confirmed drawn.
-type DrawnMergedTerrain = (
-    With<super::TerrainPatch>,
-    With<TerrainSurfaceReady>,
-    Without<SwapWaiting>,
-);
+/// Debug-only snapshots of precisely the keys counted by pending_lod_chunks. Only changed
+/// states are logged, at most 32 per frame; unchanged age does not produce another event.
+/// The caller checks DEBUG before collecting or formatting anything.
+fn debug_pending_lod_chunks(
+    streaming: &LodStreaming,
+    asset_server: &AssetServer,
+    world_assets: &Assets<WorldAsset>,
+    pending: &Query<(Entity, &LodChunkRoot, &mut PendingLodChunk)>,
+    roots: &Query<Option<&LodChunkRoot>>,
+    previous: &mut HashMap<ChunkKey, String>,
+) {
+    let queued: HashMap<_, _> = streaming
+        .pending_chunks
+        .iter()
+        .filter(|(generation, _, _)| *generation == streaming.generation)
+        .map(|(generation, metadata, retry)| (metadata.key, (*generation, metadata, *retry)))
+        .collect();
+    let mut keys: Vec<_> = streaming
+        .chunks
+        .iter()
+        .filter_map(|(key, status)| {
+            matches!(
+                status,
+                LodChunkStatus::Loading { .. }
+                    | LodChunkStatus::Failed {
+                        retry_at: Some(_),
+                        ..
+                    }
+            )
+            .then_some(*key)
+        })
+        .chain(
+            queued
+                .keys()
+                .filter(|key| !streaming.chunks.contains_key(*key))
+                .copied(),
+        )
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let current: HashSet<_> = keys.iter().copied().collect();
+    let mut remaining = 32_usize;
+    for key in keys {
+        if remaining == 0 {
+            break;
+        }
+        let mut age_ms = None;
+        let detail = match streaming.chunks.get(&key) {
+            Some(LodChunkStatus::Loading {
+                root, generation, ..
+            }) => match pending.get(*root) {
+                Ok((_, source, load)) => {
+                    age_ms = Some(load.started.elapsed().as_millis());
+                    let states = load
+                        .asset
+                        .as_ref()
+                        .and_then(|asset| asset_server.get_load_states(asset.id()));
+                    let dependencies_ready = load
+                        .asset
+                        .as_ref()
+                        .is_some_and(|asset| asset_server.is_loaded_with_dependencies(asset.id()));
+                    let world_asset_present = load
+                        .asset
+                        .as_ref()
+                        .is_some_and(|asset| world_assets.get(asset).is_some());
+                    format!(
+                        "state=Loading root={root:?} map_generation={generation} root_generation={} root_key={:?} path={} hash_verified={} hash_task_finished={:?} scene_spawned={} dependencies_ready={dependencies_ready} world_asset_present={world_asset_present} asset_states={states:?} gates=[hash:{},scene_spawn:{},dependencies:{},world_asset:{}]",
+                        source.generation,
+                        source.key,
+                        load.metadata.payload_path,
+                        load.hash_verified,
+                        load.hash_task.as_ref().map(|task| task.is_finished()),
+                        load.scene_spawned,
+                        !load.hash_verified,
+                        !load.scene_spawned,
+                        !dependencies_ready,
+                        !world_asset_present,
+                    )
+                }
+                Err(_) => {
+                    let source = roots.get(*root);
+                    format!(
+                        "state=Loading root={root:?} map_generation={generation} root_query_match={} lod_root_present={} root_generation={:?} root_key={:?} path=unavailable_without_pending_component gate=missing_pending_lod_chunk",
+                        source.is_ok(),
+                        source.as_ref().is_ok_and(|root| root.is_some()),
+                        source
+                            .as_ref()
+                            .ok()
+                            .and_then(|root| root.as_ref().map(|root| root.generation)),
+                        source
+                            .as_ref()
+                            .ok()
+                            .and_then(|root| root.as_ref().map(|root| root.key)),
+                    )
+                }
+            },
+            Some(LodChunkStatus::Failed {
+                metadata,
+                retry_count,
+                retry_at: Some(retry_at),
+                ..
+            }) => {
+                format!(
+                    "state=RetryWaiting path={} retry_count={retry_count} retry_due={} queued={} gate=retry_deadline_or_commit_budget",
+                    metadata.payload_path,
+                    Instant::now() >= *retry_at,
+                    queued.contains_key(&key)
+                )
+            }
+            None => match queued.get(&key) {
+                Some((generation, metadata, retry)) => format!(
+                    "state=Queued queued_generation={generation} path={} retry={retry:?} gate=commit_budget",
+                    metadata.payload_path,
+                ),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let fingerprint = format!(
+            "generation={} world={:?} center={:?} {detail}",
+            streaming.generation, streaming.worldspace_id, streaming.center,
+        );
+        if previous.get(&key) == Some(&fingerprint) {
+            continue;
+        }
+        debug!(?key, pending_count = current.len(), ?age_ms, detail = %fingerprint,
+            "terrain LOD pending key state changed");
+        previous.insert(key, fingerprint);
+        remaining -= 1;
+    }
+    let mut finished: Vec<_> = previous
+        .keys()
+        .filter(|key| !current.contains(*key))
+        .copied()
+        .collect();
+    finished.sort_unstable();
+    for key in finished.into_iter().take(remaining) {
+        let state = match streaming.chunks.get(&key) {
+            Some(LodChunkStatus::Ready { .. }) => "Ready",
+            Some(LodChunkStatus::Retiring { .. }) => "Retiring",
+            Some(LodChunkStatus::Held { .. }) => "Held",
+            Some(LodChunkStatus::Failed { .. }) => "Failed",
+            Some(LodChunkStatus::Loading { .. }) => "Loading",
+            None => "Absent",
+        };
+        debug!(
+            ?key,
+            generation = streaming.generation,
+            state,
+            "terrain LOD key no longer counted pending"
+        );
+        previous.remove(&key);
+    }
+}
 
 /// Batching shares the streaming commit budget. Until its turn, a ready chunk keeps drawing its
 /// original quadrant meshes. One chunk is the smallest atomic conversion and can exceed the time
@@ -986,433 +1607,6 @@ fn terrain_batch_budget_available(budget: &StreamingCommitBudget, max_micros: u6
     budget.remaining != 0 && budget.frame_started.elapsed().as_micros() < u128::from(max_micros)
 }
 
-/// One terrain patch that is ready to draw, as the index remembers it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct IndexedPatch {
-    key: (IVec2, u8),
-    /// `None` for a full-detail patch, which hides the LOD tiers of its quadrant.
-    tier: Option<LodTier>,
-}
-
-/// The ready patches of one grid cell quadrant.
-#[derive(Default)]
-struct QuadrantPatches {
-    /// Ready full-detail patches; one is enough to hand the quadrant over to full detail.
-    full_detail_ready: usize,
-    /// Ready LOD patches of the quadrant, one per tier in practice.
-    lod: Vec<(LodTier, Entity)>,
-    /// The tier last applied to the `lod` patches' visibility.
-    selected: Option<LodTier>,
-    /// How many of the `lod` patches that selection draws.
-    visible: usize,
-}
-
-impl QuadrantPatches {
-    fn is_empty(&self) -> bool {
-        self.full_detail_ready == 0 && self.lod.is_empty()
-    }
-}
-
-/// Ready terrain patches grouped by grid cell quadrant, kept up to date from component additions
-/// and removals instead of being rebuilt from every patch entity.
-///
-/// A far terrain ring holds tens of thousands of LOD patch entities, and the camera crossing a
-/// cell used to scan all of them twice and rebuild two hash maps (about 12 ms, up to 40 ms, on the
-/// frame of the crossing). Here a crossing only recomputes the selected tier of each quadrant and
-/// writes the visibility of the quadrants whose selection changed, which is a ring of patches
-/// around the tier boundaries. Batched coverage is reselected from the full index map on each
-/// refresh, so a refresh visits every held quadrant even though it writes only the changed ones.
-///
-/// This system owns the `Visibility` of ready LOD patches: a patch that something else shows or
-/// hides is not corrected until its quadrant's selection changes or a patch in it comes or goes.
-/// A patch enters the index only through `Added<TerrainSurfaceReady>` (a patch is never given
-/// coverage after readiness), and leaves it through the removal messages, which Bevy keeps for
-/// about two updates, so the system must run every `Update`, not behind a run condition.
-#[derive(Default)]
-pub(super) struct TerrainLodIndex {
-    patches: HashMap<Entity, IndexedPatch>,
-    quadrants: HashMap<(IVec2, u8), QuadrantPatches>,
-    /// Quadrants whose patches changed since their visibility was last applied.
-    changed: HashSet<(IVec2, u8)>,
-    ready_lod_patches: usize,
-    visible_lod_patches: usize,
-}
-
-impl TerrainLodIndex {
-    /// Records a ready patch, moving it when the entity was already indexed under another key.
-    fn insert(&mut self, entity: Entity, patch: IndexedPatch) {
-        if let Some(known) = self.patches.get(&entity) {
-            if *known == patch {
-                return;
-            }
-            self.remove(entity, true);
-        }
-        let quadrant = self.quadrants.entry(patch.key).or_default();
-        match patch.tier {
-            None => quadrant.full_detail_ready += 1,
-            Some(tier) => {
-                quadrant.lod.push((tier, entity));
-                self.ready_lod_patches += 1;
-            }
-        }
-        self.patches.insert(entity, patch);
-        self.changed.insert(patch.key);
-    }
-
-    /// Forgets a patch that is no longer ready or no longer exists. `invalidate` stays false for
-    /// sources a batch just replaced: the transfer set vouches for those removals, so their
-    /// quadrant must not be treated as externally changed and the visibility revision must not
-    /// move. The ready and visible tallies still track the departure either way, because the
-    /// replacement pass may skip applying that quadrant for the rest of the frame. A quiet
-    /// removal that empties its quadrant drops the quadrant too: nothing would mark it changed,
-    /// and the batch-only selection answers the same key from the replacement's retained tiers.
-    fn remove(&mut self, entity: Entity, invalidate: bool) -> Option<IndexedPatch> {
-        let patch = self.patches.remove(&entity)?;
-        let mut drop_quadrant = false;
-        if let Some(quadrant) = self.quadrants.get_mut(&patch.key) {
-            match patch.tier {
-                None => quadrant.full_detail_ready = quadrant.full_detail_ready.saturating_sub(1),
-                Some(_) => {
-                    if let Some(position) = quadrant.lod.iter().position(|(_, e)| *e == entity) {
-                        quadrant.lod.swap_remove(position);
-                        self.ready_lod_patches = self.ready_lod_patches.saturating_sub(1);
-                        if quadrant.selected == patch.tier {
-                            quadrant.visible = quadrant.visible.saturating_sub(1);
-                            self.visible_lod_patches = self.visible_lod_patches.saturating_sub(1);
-                        }
-                    }
-                }
-            }
-            drop_quadrant = !invalidate && quadrant.is_empty();
-        }
-        if drop_quadrant {
-            self.quadrants.remove(&patch.key);
-        }
-        if invalidate {
-            self.changed.insert(patch.key);
-        }
-        Some(patch)
-    }
-}
-
-type LodPatchFilter = (With<TerrainCoverage>, Without<super::TerrainPatch>);
-
-/// Picks the tier a quadrant draws and, when that changed (or `apply` asks), writes the patches'
-/// visibility. Returns false once the quadrant holds no patches and can be dropped.
-#[allow(clippy::too_many_arguments)]
-fn apply_quadrant_selection(
-    key: (IVec2, u8),
-    quadrant: &mut QuadrantPatches,
-    camera_grid: IVec2,
-    apply: bool,
-    distances: &TerrainLodDistances,
-    batch_available: &HashMap<(IVec2, u8), u8, bevy::platform::hash::FixedHasher>,
-    merged_full: &HashSet<(IVec2, u8)>,
-    patch_visibility: &mut Query<&mut Visibility, LodPatchFilter>,
-    visible_total: &mut usize,
-) -> bool {
-    // The index's ready tiers and any retained batch's member tiers share one availability byte.
-    let available = quadrant
-        .lod
-        .iter()
-        .fold(0u8, |bits, (tier, _)| bits | *tier as u8)
-        | batch_available.get(&key).copied().unwrap_or(0);
-    let selected = select_terrain_lod_tier(
-        chebyshev_grid_distance(key.0, camera_grid),
-        quadrant.full_detail_ready > 0 || merged_full.contains(&key),
-        available,
-        distances,
-    );
-    if apply || selected != quadrant.selected {
-        for (tier, entity) in &quadrant.lod {
-            let next = if Some(*tier) == selected {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
-            if let Ok(mut visibility) = patch_visibility.get_mut(*entity)
-                && *visibility != next
-            {
-                *visibility = next;
-            }
-        }
-        quadrant.selected = selected;
-    }
-    let visible = quadrant
-        .lod
-        .iter()
-        .filter(|(tier, _)| Some(*tier) == selected)
-        .count();
-    *visible_total = (*visible_total + visible).saturating_sub(quadrant.visible);
-    quadrant.visible = visible;
-    !quadrant.is_empty()
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn update_terrain_lod_visibility(
-    config: Res<EngineConfig>,
-    origin: Res<RenderOrigin>,
-    camera: Query<&Transform, With<StreamingCamera>>,
-    mut removed_coverage: RemovedComponents<TerrainCoverage>,
-    mut removed_readiness: RemovedComponents<TerrainSurfaceReady>,
-    mut removed_merged: RemovedComponents<MergedTerrainCoverage>,
-    mut drawn_swaps: RemovedComponents<SwapWaiting>,
-    mut streaming: ParamSet<(Res<LodStreaming>, ResMut<LodStreaming>)>,
-    ready_patches: Query<
-        (Entity, &TerrainCoverage, Has<super::TerrainPatch>),
-        Added<TerrainSurfaceReady>,
-    >,
-    // A merged cell covers its grid once it is surface-ready *and* the render world has confirmed
-    // it drawn (the swap bridge removed its `SwapWaiting`): its arrays are validated
-    // before any cell commits, so it is surface-ready the frame it spawns, and hiding the tiles on
-    // that alone left the grid with neither drawn until the merged mesh reached the GPU.
-    merged_full_detail: Query<&MergedTerrainCoverage, DrawnMergedTerrain>,
-    mut patch_visibility: Query<&mut Visibility, LodPatchFilter>,
-    mut index: Local<TerrainLodIndex>,
-    mut batches: terrain_batching::LodBatchVisibility,
-    mut budget: Option<ResMut<StreamingCommitBudget>>,
-    mut metrics: ResMut<StreamingMetrics>,
-    mut profiler: ResMut<ProfilingState>,
-) {
-    let started = Instant::now();
-    let replaced_sources = std::mem::take(&mut streaming.p1().replaced_source_quadrants);
-    // Drain both readers completely before expiring the transfer set. Removals the transfer set
-    // vouches for leave the index quietly; any other coverage/readiness removal is a real
-    // semantic invalidation, and absent events cannot leak tracking.
-    let mut real_removals = false;
-    for entity in removed_coverage.read().chain(removed_readiness.read()) {
-        let expected = replaced_sources.contains(&entity);
-        if !expected {
-            real_removals = true;
-        }
-        // A patch that stays alive without readiness no longer draws. A replaced source is
-        // already being despawned by its batch, so only real departures hide it here.
-        if let Some(patch) = index.remove(entity, !expected)
-            && !expected
-            && patch.tier.is_some()
-            && let Ok(mut visibility) = patch_visibility.get_mut(entity)
-            && *visibility != Visibility::Hidden
-        {
-            *visibility = Visibility::Hidden;
-        }
-    }
-    for (entity, coverage, full_detail) in &ready_patches {
-        let tier = match (full_detail, coverage.tier) {
-            (true, _) => None,
-            (false, Some(tier)) => Some(tier),
-            // Not a LOD patch of any tier: nothing selects it.
-            (false, None) => continue,
-        };
-        index.insert(
-            entity,
-            IndexedPatch {
-                key: (coverage.grid, coverage.quadrant),
-                tier,
-            },
-        );
-    }
-    let batches_removed = batches.removed();
-    let Ok(camera) = camera.single() else {
-        if real_removals || batches_removed {
-            streaming.p1().visibility_dirty = true;
-        }
-        return;
-    };
-    let camera_grid = streaming_center(config.acceptance_screenshot.is_some(), origin.0, camera);
-    let upload_completed = batches.upload_completed();
-    let merged_removed = removed_merged.read().count() != 0;
-    // Every surface the bridge confirms drawn leaves the waiting set; only a merged cell's
-    // completion changes what this pass decides. Read in full, so no event is left for next frame.
-    let merged_drawn = drawn_swaps
-        .read()
-        .filter(|entity| merged_full_detail.contains(*entity))
-        .count()
-        != 0;
-    let merged_changed = merged_removed || merged_drawn;
-    let (force_apply, camera_moved, radius_changed) = {
-        let state = streaming.p0();
-        (
-            state.visibility_dirty,
-            state.visibility_camera_grid != Some(camera_grid),
-            state.visibility_stream_radius != Some(config.stream_radius),
-        )
-    };
-    // The index's own change set joins the semantic event flags: a patch that just became ready
-    // or departed is exactly what a refresh exists to apply.
-    let refresh = force_apply
-        || real_removals
-        || batches_removed
-        || camera_moved
-        || radius_changed
-        || merged_changed
-        || !index.changed.is_empty();
-    let submission_dirty = streaming.p0().submission_dirty;
-    {
-        let mut state = streaming.p1();
-        state.submission_dirty = false;
-        // A dirty flag can only exist when it forced this refresh, or it was set while no camera
-        // could run selection; either way it is consumed now that a pass is possible.
-        state.visibility_dirty = false;
-    }
-    if refresh {
-        let mut state = streaming.p1();
-        state.visibility_camera_grid = Some(camera_grid);
-        state.visibility_stream_radius = Some(config.stream_radius);
-        state.visibility_revision = state.visibility_revision.wrapping_add(1);
-    }
-    if refresh {
-        // Retained batches keep drawing their members' tiers until finalize; for quadrants the
-        // index no longer holds, their member masks are the only availability left.
-        let mut batch_available: HashMap<(IVec2, u8), u8, bevy::platform::hash::FixedHasher> =
-            HashMap::with_hasher(bevy::platform::hash::FixedHasher);
-        let mut batch_ready_patches = 0usize;
-        for coverage in batches.coverage() {
-            if let Some(tier) = coverage.tier {
-                *batch_available
-                    .entry((coverage.grid, coverage.quadrant))
-                    .or_default() |= tier as u8;
-                batch_ready_patches += 1;
-            }
-        }
-
-        // Every quadrant a drawn merged cell covers is full detail, whether or not it holds LOD
-        // patches of its own.
-        let merged_full: HashSet<(IVec2, u8)> = merged_full_detail
-            .iter()
-            .flat_map(|coverage| (0..4u8).map(move |quadrant| (coverage.grid, quadrant)))
-            .collect();
-        let index = &mut *index;
-        let changed = std::mem::take(&mut index.changed);
-        let mut visible_patches = index.visible_lod_patches;
-        // A crossing recomputes every quadrant's selection but writes only the quadrants whose
-        // selection changed, matching the index's external-mutation contract; an explicit
-        // refresh (visibility_dirty) or a radius change corrects every patch unconditionally. A
-        // batch removal also recomputes every quadrant (a held quadrant's tier bits may have
-        // come from the removed batch) but still writes only the ones whose selection moved. A
-        // merged cell's confirmed draw or removal can cover or uncover any quadrant, so it
-        // recomputes every quadrant too.
-        let apply_all = force_apply || radius_changed || merged_changed;
-        if camera_moved || radius_changed || force_apply || batches_removed || merged_changed {
-            index.quadrants.retain(|key, quadrant| {
-                apply_quadrant_selection(
-                    *key,
-                    quadrant,
-                    camera_grid,
-                    apply_all || changed.contains(key),
-                    &config.terrain_lod,
-                    &batch_available,
-                    &merged_full,
-                    &mut patch_visibility,
-                    &mut visible_patches,
-                )
-            });
-        } else {
-            for key in changed {
-                let Some(quadrant) = index.quadrants.get_mut(&key) else {
-                    continue;
-                };
-                if !apply_quadrant_selection(
-                    key,
-                    quadrant,
-                    camera_grid,
-                    true,
-                    &config.terrain_lod,
-                    &batch_available,
-                    &merged_full,
-                    &mut patch_visibility,
-                    &mut visible_patches,
-                ) {
-                    index.quadrants.remove(&key);
-                }
-            }
-        }
-        index.visible_lod_patches = visible_patches;
-
-        // The batch selector takes the index's answer for every quadrant it still holds, plus a
-        // fresh selection from retained member tiers alone for batch-only quadrants whose
-        // sources were already finalized away.
-        let mut selected: HashMap<(IVec2, u8), Option<LodTier>, bevy::platform::hash::FixedHasher> =
-            HashMap::with_hasher(bevy::platform::hash::FixedHasher);
-        selected.extend(
-            index
-                .quadrants
-                .iter()
-                .map(|(key, quadrant)| (*key, quadrant.selected)),
-        );
-        for (&key, &available) in &batch_available {
-            selected.entry(key).or_insert_with(|| {
-                // A drawn merged cell's mesh draws over any retained batch of its quadrant.
-                if merged_full.contains(&key) {
-                    return None;
-                }
-                select_terrain_lod_tier(
-                    chebyshev_grid_distance(key.0, camera_grid),
-                    false,
-                    available,
-                    &config.terrain_lod,
-                )
-            });
-        }
-
-        let (batched_quadrants, _, changed_batches) = batches.update(&selected);
-        let visible_total = visible_patches + batched_quadrants;
-        let ready_lod_patches = index.ready_lod_patches + batch_ready_patches;
-        profiler.increment("lod/terrain_batches_updated", changed_batches as u64);
-        profiler.increment("lod/selection_refreshes", 1);
-        metrics.visible_lod_terrain_patches = visible_total;
-        profiler.set_gauge("lod/ready_terrain_patches", ready_lod_patches as f64);
-        profiler.set_gauge("lod/visible_terrain_patches", visible_total as f64);
-        profiler.record_elapsed("lod/visibility", started);
-    } else if upload_completed {
-        let upload_started = Instant::now();
-        batches.finish_uploads();
-        profiler.record_elapsed("lod/terrain_batch_upload_activation", upload_started);
-    }
-
-    // Initial hierarchy transfer is a shared-budget commit AFTER current semantic masks have
-    // superseded any stale immutable IDs. CPU preparation and transfer share one slot per frame.
-    let mut activated = false;
-    if let Some(budget) = budget.as_deref_mut() {
-        let mut state = streaming.p1();
-        if !state.terrain_batch_commit_used
-            && terrain_batch_budget_available(budget, config.max_commit_micros_per_frame)
-        {
-            let activation_started = Instant::now();
-            if batches.finalize_one(&mut state.replaced_source_quadrants) {
-                state.terrain_batch_commit_used = true;
-                state.terrain_batch_activated_chunks += 1;
-                budget.remaining -= 1;
-                budget.commits = budget.commits.saturating_add(1);
-                profiler.increment("lod/terrain_batch_chunks_activated", 1);
-                profiler.record_elapsed("lod/terrain_batch_activation", activation_started);
-                activated = true;
-            } else {
-                profiler.record_elapsed("lod/terrain_batch_gpu_poll", activation_started);
-            }
-            let pending_gpu = batches.pending_count();
-            let pending_cpu = state.terrain_batch_pending_cpu_chunks;
-            record_terrain_batch_progress(&mut state, &mut profiler, pending_cpu, pending_gpu);
-        }
-    }
-    if refresh || submission_dirty || upload_completed || activated {
-        let inventory_started = Instant::now();
-        let (retained_quadrants, generated_batches, batched_quadrants, visible_batches) =
-            batches.counts();
-        profiler.set_gauge("lod/batched_terrain_quadrants", retained_quadrants as f64);
-        profiler.set_gauge("lod/resident_terrain_batches", generated_batches as f64);
-        profiler.set_gauge("lod/visible_terrain_batches", visible_batches as f64);
-        profiler.set_gauge(
-            "lod/pending_terrain_selection_uploads",
-            batches.pending_selection_uploads() as f64,
-        );
-        profiler.set_gauge(
-            "lod/batched_selected_triangles",
-            (batched_quadrants * TERRAIN_QUADRANT_INDEX_COUNT / 3) as f64,
-        );
-        profiler.record_elapsed("lod/terrain_batch_inventory", inventory_started);
-    }
-}
-
 fn fail_chunk(
     chunk: (Entity, &LodChunkRoot),
     metadata: &LodChunkMetadata,
@@ -1434,25 +1628,47 @@ fn fail_chunk(
     metrics.failed_lod_chunks = metrics.failed_lod_chunks.saturating_add(1);
     profiler.increment("lod/chunks_failed", 1);
     profiler.event(format!("{:?}", root.key), "failed", None);
-    if let Some(LodChunkStatus::Loading {
-        root: expected_root,
-        generation,
-        ..
-    }) = streaming.chunks.get(&root.key).cloned()
-        && expected_root == entity
-        && generation == root.generation
-    {
-        streaming.chunks.insert(
-            root.key,
-            LodChunkStatus::Failed {
-                origin: root.origin,
-                metadata: metadata.clone(),
-                retry_count: root.retry_count,
-                retry_at,
-            },
-        );
+    match streaming.chunks.get(&root.key).cloned() {
+        // The chunk the plan still wants: the failure is recorded - a transient one is retried on
+        // its own clock - and the root, which would never draw now, goes.
+        Some(LodChunkStatus::Loading {
+            root: expected_root,
+            generation,
+            ..
+        }) if expected_root == entity && generation == root.generation => {
+            streaming.chunks.insert(
+                root.key,
+                LodChunkStatus::Failed {
+                    origin: root.origin,
+                    metadata: metadata.clone(),
+                    retry_count: root.retry_count,
+                    retry_at,
+                },
+            );
+            commands.entity(entity).try_despawn();
+        }
+        // A chunk that is already leaving: its root is the unload pacer's, not this function's -
+        // despawning it here would put a single despawn back on the frame the retire exists to
+        // keep off it.
+        Some(LodChunkStatus::Retiring { .. }) => {}
+        // A held chunk whose content failed has nothing to hold: it starts retiring (already
+        // hidden, marker and all), and a return to that exterior streams the chunk in afresh.
+        Some(LodChunkStatus::Held {
+            root: held_root,
+            origin,
+        }) if held_root == entity => {
+            streaming.chunks.insert(
+                root.key,
+                LodChunkStatus::Retiring {
+                    root: entity,
+                    origin,
+                },
+            );
+        }
+        _ => {
+            commands.entity(entity).try_despawn();
+        }
     }
-    commands.entity(entity).try_despawn();
 }
 
 fn validate_lod_scene(
@@ -1630,18 +1846,50 @@ fn validate_lod_quadrant_mesh(mesh: &Mesh) -> Result<(), String> {
 
 /// The finest ready tier whose configured reach covers the cell, or `None` once
 /// full detail is drawable or the cell is beyond every reach.
-fn select_terrain_lod_tier(
+fn select_ready_terrain_lod_tier(
     grid_distance: i32,
     full_detail_ready: bool,
-    available: u8,
+    is_available: impl Fn(LodTier) -> bool,
     distances: &TerrainLodDistances,
 ) -> Option<LodTier> {
     if full_detail_ready {
         return None;
     }
-    LodTier::ALL.into_iter().find(|tier| {
-        grid_distance <= distances.reach_cells(*tier) && available & (*tier as u8) != 0
-    })
+    LodTier::ALL
+        .into_iter()
+        .find(|tier| grid_distance <= distances.reach_cells(*tier) && is_available(*tier))
+}
+
+/// [`select_ready_terrain_lod_tier`] over a set of ready tiers.
+#[cfg(test)]
+fn select_terrain_lod_tier(
+    grid_distance: i32,
+    full_detail_ready: bool,
+    available: impl TestTerrainAvailability,
+    distances: &TerrainLodDistances,
+) -> Option<LodTier> {
+    select_ready_terrain_lod_tier(
+        grid_distance,
+        full_detail_ready,
+        |tier| available.has(tier),
+        distances,
+    )
+}
+#[cfg(test)]
+trait TestTerrainAvailability {
+    fn has(&self, tier: LodTier) -> bool;
+}
+#[cfg(test)]
+impl TestTerrainAvailability for u8 {
+    fn has(&self, tier: LodTier) -> bool {
+        self & tier as u8 != 0
+    }
+}
+#[cfg(test)]
+impl TestTerrainAvailability for &HashSet<LodTier> {
+    fn has(&self, tier: LodTier) -> bool {
+        self.contains(&tier)
+    }
 }
 
 fn chebyshev_grid_distance(left: IVec2, right: IVec2) -> i32 {
@@ -1843,6 +2091,22 @@ fn update_counts(
         .values()
         .filter(|status| matches!(status, LodChunkStatus::Ready { .. }))
         .count();
+    // Chunks the plan has stopped wanting but the world still holds: retiring ones wait for the
+    // unload pacer's budget, held ones for the return to their exterior
+    // (`--lod-keep-hidden-in-interiors`). Neither draws.
+    metrics.retiring_lod_chunks = streaming
+        .chunks
+        .values()
+        .filter(|status| matches!(status, LodChunkStatus::Retiring { .. }))
+        .count();
+    metrics.peak_retiring_lod_chunks = metrics
+        .peak_retiring_lod_chunks
+        .max(metrics.retiring_lod_chunks);
+    metrics.held_lod_chunks = streaming
+        .chunks
+        .values()
+        .filter(|status| matches!(status, LodChunkStatus::Held { .. }))
+        .count();
     let mut pending_keys: HashSet<_> = streaming
         .chunks
         .iter()
@@ -1875,6 +2139,28 @@ fn update_counts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::LodHorizon;
+
+    fn fixture_chunk_owner(world: &mut World, tier: LodTier, grid: IVec2) -> Entity {
+        let worldspace_id = world.resource::<EngineConfig>().worldspace_id;
+        let origin = LodOrigin::new(0, 0);
+        world
+            .spawn((
+                LodChunkRoot {
+                    key: ChunkKey::new(
+                        worldspace_id,
+                        tier,
+                        origin.chunk_for_cell(tier, grid.x, grid.y),
+                    ),
+                    generation: 0,
+                    origin,
+                    retry_count: 0,
+                },
+                Visibility::Inherited,
+            ))
+            .id()
+    }
+
     use crate::world::database::LodChunkBounds;
     use bevy::ecs::system::RunSystemOnce;
 
@@ -1986,7 +2272,9 @@ mod tests {
                 let quadrant = (index % 4) as u8;
                 let full_ready = index % 2 == 0;
                 if full_ready {
+                    let worldspace_id = world.resource::<EngineConfig>().worldspace_id;
                     world.spawn((
+                        super::super::TerrainWorldspace(worldspace_id),
                         super::super::TerrainPatch,
                         TerrainCoverage {
                             grid,
@@ -2000,7 +2288,9 @@ mod tests {
                     reference_tier_selection(distance, full_ready, &reference, &distances);
                 expected_visible += usize::from(expected.is_some());
                 for tier in LodTier::ALL {
+                    let owner = fixture_chunk_owner(&mut world, tier, grid);
                     let mut entity = world.spawn((
+                        ChildOf(owner),
                         TerrainCoverage {
                             grid,
                             quadrant,
@@ -2012,13 +2302,12 @@ mod tests {
                     if ready {
                         entity.insert(TerrainSurfaceReady);
                     }
-                    // The index owns ready patches only. Coverage arrives together with
-                    // readiness in production and the chunk root hides everything until then,
-                    // so a never-ready patch keeps the visibility it spawned with.
-                    let expected_visibility = if ready && expected != Some(tier) {
-                        Visibility::Hidden
-                    } else {
+                    // Unready patches stay hidden; a ready patch draws only when
+                    // its tier wins the same independent reference selection.
+                    let expected_visibility = if ready && expected == Some(tier) {
                         Visibility::Inherited
+                    } else {
+                        Visibility::Hidden
                     };
                     patches.push((entity.id(), expected_visibility));
                 }
@@ -2422,6 +2711,7 @@ mod tests {
             ..default()
         })
         .init_resource::<StreamingWorld>()
+        .init_resource::<LodHorizon>()
         .init_resource::<StreamingMetrics>()
         .init_resource::<SceneAdmission>()
         .init_resource::<StreamingPreparationBridge>()
@@ -2632,6 +2922,41 @@ mod tests {
         assert_eq!(select_terrain_lod_tier(2, false, 0, &defaults), None);
     }
 
+    fn identify_visibility_fixtures(world: &mut World) {
+        let worldspace_id = world.resource::<EngineConfig>().worldspace_id;
+        let mut query = world.query::<(Entity, &TerrainCoverage)>();
+        let patches: Vec<_> = query
+            .iter(world)
+            .map(|(entity, coverage)| (entity, *coverage))
+            .collect();
+        let mut roots = HashMap::new();
+        for (entity, coverage) in patches {
+            if let Some(tier) = coverage.tier {
+                let origin = LodOrigin::new(0, 0);
+                let key = ChunkKey::new(
+                    worldspace_id,
+                    tier,
+                    origin.chunk_for_cell(tier, coverage.grid.x, coverage.grid.y),
+                );
+                let root = *roots.entry(key).or_insert_with(|| {
+                    world
+                        .spawn(LodChunkRoot {
+                            key,
+                            generation: 1,
+                            origin,
+                            retry_count: 0,
+                        })
+                        .id()
+                });
+                world.entity_mut(entity).insert(ChildOf(root));
+            } else {
+                world
+                    .entity_mut(entity)
+                    .insert(super::super::TerrainWorldspace(worldspace_id));
+            }
+        }
+    }
+
     #[test]
     fn terrain_lod_visibility_skips_unchanged_frames() {
         let mut app = App::new();
@@ -2663,6 +2988,7 @@ mod tests {
             .collect();
         let patch = patches[0];
 
+        identify_visibility_fixtures(app.world_mut());
         app.update();
         assert_eq!(
             *app.world().get::<Visibility>(patch).unwrap(),
@@ -2754,8 +3080,11 @@ mod tests {
         world.spawn((StreamingCamera, camera));
         // Both tiers are resident for the same quadrant, and neither the camera nor any readiness
         // or removal event changes after the first frame.
+        let fine_owner = fixture_chunk_owner(world, LodTier::Tier4, grid);
+        let coarse_owner = fixture_chunk_owner(world, LodTier::Tier8, grid);
         let fine = world
             .spawn((
+                ChildOf(fine_owner),
                 TerrainCoverage {
                     grid,
                     quadrant: 0,
@@ -2767,6 +3096,7 @@ mod tests {
             .id();
         let coarse = world
             .spawn((
+                ChildOf(coarse_owner),
                 TerrainCoverage {
                     grid,
                     quadrant: 0,
@@ -2809,6 +3139,7 @@ mod tests {
             .insert_resource(ProfilingState::default())
             .insert_resource(LodStreaming::default())
             .add_systems(Update, update_terrain_lod_visibility);
+        super::super::identity_changes::install_terrain(app.world_mut());
         let world = app.world_mut();
         let camera = world
             .spawn((
@@ -2820,8 +3151,10 @@ mod tests {
         // until the camera crosses one cell east.
         let patches: HashMap<i32, Entity> = (-3..=95)
             .map(|x| {
+                let owner = fixture_chunk_owner(world, LodTier::Tier16, IVec2::new(x, 0));
                 let patch = world
                     .spawn((
+                        ChildOf(owner),
                         TerrainCoverage {
                             grid: IVec2::new(x, 0),
                             quadrant: 0,
@@ -2844,11 +3177,32 @@ mod tests {
             .resource::<StreamingMetrics>()
             .visible_lod_terrain_patches;
 
-        // A quadrant whose tier does not change keeps whatever visibility it has: the crossing
-        // does not rescan or rewrite it.
-        app.world_mut()
-            .entity_mut(patches[&5])
-            .insert(Visibility::Hidden);
+        // Observe writes directly: an outside visibility override is a separate refresh input
+        // that the demo contract requires the selector to repair on a crossing.
+        let written_at = |app: &App| {
+            app.world()
+                .entity(patches[&5])
+                .get_ref::<Visibility>()
+                .unwrap()
+                .last_changed()
+        };
+        let work = |app: &App| {
+            [
+                "lod/visibility/rebuilds",
+                "lod/visibility/ancestry_walks",
+                "lod/visibility/patches_evaluated",
+                "lod/visibility/keys_applied",
+            ]
+            .map(|name| {
+                app.world()
+                    .resource::<ProfilingState>()
+                    .gauge(name)
+                    .unwrap()
+            })
+        };
+        assert_eq!(visibility(&app, 5), Visibility::Inherited);
+        let written_before = written_at(&app);
+        let work_before = work(&app);
         app.world_mut()
             .get_mut::<Transform>(camera)
             .unwrap()
@@ -2856,10 +3210,22 @@ mod tests {
             .x += CELL_SIZE;
         app.update();
         assert_eq!(visibility(&app, 92), Visibility::Inherited);
+        assert_eq!(visibility(&app, 5), Visibility::Inherited);
         assert_eq!(
-            visibility(&app, 5),
-            Visibility::Hidden,
+            written_at(&app),
+            written_before,
             "an unchanged selection is not rewritten on a crossing"
+        );
+        let work_after = work(&app);
+        assert_eq!(
+            &work_after[..3],
+            &work_before[..3],
+            "a crossing does not rebuild, walk ancestry or reread patches"
+        );
+        assert_eq!(
+            work_after[3] - work_before[3],
+            1.0,
+            "only cell 92 changes its selected tier"
         );
         assert_eq!(
             app.world()
@@ -2885,8 +3251,10 @@ mod tests {
             Transform::from_xyz(CELL_SIZE * 0.5, 0.0, -CELL_SIZE * 0.5),
         ));
         let spawn = |world: &mut World, tier| {
+            let owner = fixture_chunk_owner(world, tier, IVec2::new(3, 0));
             world
                 .spawn((
+                    ChildOf(owner),
                     TerrainCoverage {
                         grid: IVec2::new(3, 0),
                         quadrant: 0,
@@ -2951,7 +3319,7 @@ mod tests {
             StreamingCamera,
             Transform::from_xyz(CELL_SIZE * 0.5, 0.0, -CELL_SIZE * 0.5),
         ));
-        let root = world.spawn(Visibility::Inherited).id();
+        let root = fixture_chunk_owner(world, LodTier::Tier4, IVec2::new(3, 0));
         for quadrant in 0..4 {
             world.spawn((
                 ChildOf(root),
@@ -2984,66 +3352,7 @@ mod tests {
 
     #[test]
     fn terrain_lod_index_quiet_removal_drops_an_emptied_quadrant() {
-        let mut index = TerrainLodIndex::default();
-        let entity = Entity::from_raw_u32(1).unwrap();
-        let key = (IVec2::new(-2, 3), 2);
-        index.insert(
-            entity,
-            IndexedPatch {
-                key,
-                tier: Some(LodTier::Tier4),
-            },
-        );
-        assert_eq!(index.ready_lod_patches, 1);
-        {
-            let quadrant = index.quadrants.get_mut(&key).unwrap();
-            quadrant.selected = Some(LodTier::Tier4);
-            quadrant.visible = 1;
-        }
-        index.visible_lod_patches = 1;
-        index.changed.clear();
-
-        // A batch-replaced source leaves quietly: tallies drop, the revision's changed set
-        // stays empty, and the emptied quadrant is forgotten so a stationary camera cannot
-        // accumulate ghost quadrants across a long startup.
-        assert_eq!(
-            index.remove(entity, false).map(|patch| patch.key),
-            Some(key)
-        );
-        assert!(
-            index.quadrants.is_empty(),
-            "a quiet removal must not leave an empty quadrant behind"
-        );
-        assert!(index.patches.is_empty());
-        assert!(index.changed.is_empty());
-        assert_eq!(index.ready_lod_patches, 0);
-        assert_eq!(index.visible_lod_patches, 0);
-
-        // A quadrant that still holds a neighbour keeps its entry through a quiet removal.
-        let held = Entity::from_raw_u32(2).unwrap();
-        index.insert(
-            held,
-            IndexedPatch {
-                key,
-                tier: Some(LodTier::Tier8),
-            },
-        );
-        assert!(index.quadrants.contains_key(&key));
-        assert!(index.remove(held, false).is_some());
-        assert!(index.quadrants.is_empty());
-
-        // Real removals still mark the emptied quadrant changed for the rebuild pass.
-        let real = Entity::from_raw_u32(3).unwrap();
-        index.insert(
-            real,
-            IndexedPatch {
-                key,
-                tier: Some(LodTier::Tier4),
-            },
-        );
-        index.changed.clear();
-        assert!(index.remove(real, true).is_some());
-        assert!(index.changed.contains(&key));
+        visibility::assert_removed_sources_leave_no_ghost_keys();
     }
 
     #[test]
@@ -3084,6 +3393,7 @@ mod tests {
             ))
             .id();
 
+        identify_visibility_fixtures(app.world_mut());
         app.update();
         assert_eq!(
             *app.world().get::<Visibility>(lod_patch).unwrap(),
@@ -3182,6 +3492,7 @@ mod tests {
             }
         }
 
+        identify_visibility_fixtures(&mut world);
         world
             .run_system_once(update_terrain_lod_visibility)
             .unwrap();
@@ -3290,6 +3601,11 @@ mod tests {
             side_reach().max_reach_cells() + LOD_UNLOAD_MARGIN_CELLS,
         ));
     }
+
+    /// The LOD ring is on both reflection routes' layers. The water reflection's shadowless route
+    /// draws the replica layer only, so a ring left on the world layer alone would drop out of a
+    /// wide reflection - and the ring is everything past the streaming radius there (impl-1094;
+    /// this is its follow-up, impl-1141). `collect_lod_chunks` spawns the ring with a database,
     /// asset server and budget in hand, so the test holds the one layer choice it spawns with
     /// ([`lod_ring_layers`]) instead of standing the spawn up.
     #[test]
@@ -3311,6 +3627,319 @@ mod tests {
         assert_eq!(
             propagated.0, layers,
             "the ring's meshes must be stamped with the root's own layers"
+        );
+    }
+}
+
+// Append inside streaming/lod.rs, not streaming.rs: this child test module may
+// construct LodChunkRoot with its private fields, so no test-only constructor or
+// production-field exposure is needed. The identity helper lives in streaming.rs.
+// Uses real World relationships and actual SystemParam QueryState, without assets/GPU.
+
+#[cfg(test)]
+mod terrain_primitive_identity_tests {
+    use super::super::{TerrainIdentityAccess, TerrainPrimitiveIdentity, TerrainWorldspace};
+    use super::*;
+    use bevy::ecs::system::{RunSystemOnce, SystemState};
+
+    fn resolve(world: &mut World, mesh: Entity) -> Option<TerrainPrimitiveIdentity> {
+        let mut state = SystemState::<TerrainIdentityAccess>::new(world);
+        state
+            .get(world)
+            .expect("terrain identity queries are valid")
+            .identity(mesh)
+    }
+
+    fn mesh(world: &mut World) -> Entity {
+        world.spawn(Mesh3d(Handle::default())).id()
+    }
+
+    fn attach(world: &mut World, parent: Entity, child: Entity) {
+        world.entity_mut(parent).add_child(child);
+    }
+
+    fn chunk(world: &mut World, tier: LodTier, grid: IVec2, worldspace_id: u32) -> Entity {
+        let origin = LodOrigin::new(13, -7);
+        let key = ChunkKey::new(
+            worldspace_id,
+            tier,
+            origin.chunk_for_cell(tier, grid.x, grid.y),
+        );
+        world
+            .spawn(LodChunkRoot {
+                key,
+                generation: 1,
+                origin,
+                retry_count: 0,
+            })
+            .id()
+    }
+
+    #[test]
+    fn near_mesh_owns_its_exact_coverage_and_worldspace() {
+        let mut world = World::new();
+        let grid = IVec2::new(-19, 37);
+        let entity = world
+            .spawn((
+                Mesh3d(Handle::default()),
+                TerrainCoverage {
+                    grid,
+                    quadrant: 3,
+                    tier: None,
+                },
+                TerrainWorldspace(71),
+            ))
+            .id();
+        assert_eq!(
+            resolve(&mut world, entity),
+            Some(TerrainPrimitiveIdentity {
+                worldspace_id: 71,
+                grid,
+                quadrant: 3,
+                tier: None,
+            })
+        );
+        world
+            .entity_mut(entity)
+            .get_mut::<TerrainWorldspace>()
+            .unwrap()
+            .0 = 72;
+        assert_eq!(resolve(&mut world, entity).unwrap().worldspace_id, 72);
+    }
+
+    #[test]
+    fn lod_mesh_inherits_one_exact_quadrant_regardless_of_tier_or_chunk_anchor() {
+        let mut world = World::new();
+        for tier in LodTier::ALL {
+            for grid in [IVec2::new(-19, 37), IVec2::new(108, -209)] {
+                let root = chunk(&mut world, tier, grid, 91);
+                let wrapper = world.spawn_empty().id();
+                let quadrant = world
+                    .spawn(TerrainCoverage {
+                        grid,
+                        quadrant: 2,
+                        tier: Some(tier),
+                    })
+                    .id();
+                let primitive = mesh(&mut world);
+                attach(&mut world, root, wrapper);
+                attach(&mut world, wrapper, quadrant);
+                attach(&mut world, quadrant, primitive);
+                assert_eq!(
+                    resolve(&mut world, primitive),
+                    Some(TerrainPrimitiveIdentity {
+                        worldspace_id: 91,
+                        grid,
+                        quadrant: 2,
+                        tier: Some(tier),
+                    })
+                );
+                // A coverage node itself is not the draw primitive.
+                assert_eq!(resolve(&mut world, quadrant), None);
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_or_out_of_range_identity_never_guesses_from_active_world() {
+        let mut world = World::new();
+        let bare = mesh(&mut world);
+        assert_eq!(resolve(&mut world, bare), None);
+        world.entity_mut(bare).insert(TerrainCoverage {
+            grid: IVec2::ZERO,
+            quadrant: 0,
+            tier: None,
+        });
+        assert_eq!(resolve(&mut world, bare), None);
+        world.entity_mut(bare).insert(TerrainWorldspace(7));
+        assert!(resolve(&mut world, bare).is_some());
+        world
+            .entity_mut(bare)
+            .get_mut::<TerrainCoverage>()
+            .unwrap()
+            .quadrant = 4;
+        assert_eq!(resolve(&mut world, bare), None);
+
+        let orphan = world
+            .spawn(TerrainCoverage {
+                grid: IVec2::new(400, -500),
+                quadrant: 1,
+                tier: Some(LodTier::Tier16),
+            })
+            .id();
+        let primitive = mesh(&mut world);
+        attach(&mut world, orphan, primitive);
+        assert_eq!(resolve(&mut world, primitive), None);
+    }
+
+    #[test]
+    fn duplicate_coverage_along_one_ancestry_is_ambiguous_even_if_equal() {
+        let mut world = World::new();
+        let coverage = TerrainCoverage {
+            grid: IVec2::ONE,
+            quadrant: 0,
+            tier: None,
+        };
+        let parent = world.spawn((coverage, TerrainWorldspace(71))).id();
+        let primitive = world.spawn((Mesh3d(Handle::default()), coverage)).id();
+        attach(&mut world, parent, primitive);
+        assert_eq!(resolve(&mut world, primitive), None);
+    }
+
+    #[test]
+    fn conflicting_world_or_chunk_ownership_refuses_replacement() {
+        let mut world = World::new();
+        let grid = IVec2::new(25, 3);
+        let parent = world.spawn(TerrainWorldspace(72)).id();
+        let primitive = world
+            .spawn((
+                Mesh3d(Handle::default()),
+                TerrainWorldspace(71),
+                TerrainCoverage {
+                    grid,
+                    quadrant: 0,
+                    tier: None,
+                },
+            ))
+            .id();
+        attach(&mut world, parent, primitive);
+        assert_eq!(resolve(&mut world, primitive), None);
+
+        let outer = chunk(&mut world, LodTier::Tier8, grid, 71);
+        let inner = chunk(&mut world, LodTier::Tier8, grid, 72);
+        let quadrant = world
+            .spawn(TerrainCoverage {
+                grid,
+                quadrant: 0,
+                tier: Some(LodTier::Tier8),
+            })
+            .id();
+        let primitive = mesh(&mut world);
+        attach(&mut world, outer, inner);
+        attach(&mut world, inner, quadrant);
+        attach(&mut world, quadrant, primitive);
+        assert_eq!(resolve(&mut world, primitive), None);
+    }
+
+    #[test]
+    fn lod_tier_must_match_owner_and_near_world_marker_cannot_override_it() {
+        let mut world = World::new();
+        let grid = IVec2::new(20, 30);
+        let root = chunk(&mut world, LodTier::Tier8, grid, 71);
+        let quadrant = world
+            .spawn(TerrainCoverage {
+                grid,
+                quadrant: 0,
+                tier: Some(LodTier::Tier16),
+            })
+            .id();
+        let primitive = mesh(&mut world);
+        attach(&mut world, root, quadrant);
+        attach(&mut world, quadrant, primitive);
+        assert_eq!(resolve(&mut world, primitive), None);
+        world
+            .entity_mut(quadrant)
+            .get_mut::<TerrainCoverage>()
+            .unwrap()
+            .tier = Some(LodTier::Tier8);
+        assert!(resolve(&mut world, primitive).is_some());
+        world.entity_mut(primitive).insert(TerrainWorldspace(72));
+        assert_eq!(resolve(&mut world, primitive), None);
+    }
+    fn terrain_tiers_do_not_share_coverage_across_worlds_or_unknown_ancestry() {
+        let mut world = World::new();
+        world.insert_resource(EngineConfig {
+            worldspace_id: 77,
+            ..default()
+        });
+        world.insert_resource(RenderOrigin(IVec2::ZERO));
+        world.insert_resource(StreamingMetrics::default());
+        world.insert_resource(ProfilingState::default());
+        world.insert_resource(LodStreaming::default());
+        world.spawn((
+            StreamingCamera,
+            Transform::from_xyz(CELL_SIZE * 0.5, 0.0, -CELL_SIZE * 0.5),
+        ));
+        let coverage = TerrainCoverage {
+            grid: IVec2::ZERO,
+            quadrant: 0,
+            tier: Some(LodTier::Tier4),
+        };
+        let origin = LodOrigin::new(0, 0);
+        let root = |world: &mut World, worldspace_id| {
+            world
+                .spawn(LodChunkRoot {
+                    key: ChunkKey::new(
+                        worldspace_id,
+                        LodTier::Tier4,
+                        shared::lod::ChunkAnchor::new(0, 0),
+                    ),
+                    generation: 1,
+                    origin,
+                    retry_count: 0,
+                })
+                .id()
+        };
+        let current_root = root(&mut world, 77);
+        let wrong_root = root(&mut world, 88);
+        let current = world
+            .spawn((
+                coverage,
+                TerrainSurfaceReady,
+                Visibility::Hidden,
+                ChildOf(current_root),
+            ))
+            .id();
+        world.spawn((Mesh3d(Handle::default()), ChildOf(current)));
+        world.spawn((Mesh3d(Handle::default()), ChildOf(current)));
+        let other = world
+            .spawn((
+                coverage,
+                TerrainSurfaceReady,
+                Visibility::Inherited,
+                ChildOf(wrong_root),
+            ))
+            .id();
+        let unknown = world
+            .spawn((coverage, TerrainSurfaceReady, Visibility::Inherited))
+            .id();
+        let near = world
+            .spawn((
+                Mesh3d(Handle::default()),
+                super::super::TerrainPatch,
+                super::super::TerrainWorldspace(88),
+                TerrainCoverage {
+                    tier: None,
+                    ..coverage
+                },
+                TerrainSurfaceReady,
+                Visibility::Inherited,
+            ))
+            .id();
+        world
+            .run_system_once(update_terrain_lod_visibility)
+            .unwrap();
+        assert_eq!(
+            *world.get::<Visibility>(current).unwrap(),
+            Visibility::Inherited,
+            "a different world's near terrain cannot suppress this world's far tier"
+        );
+        assert_eq!(*world.get::<Visibility>(other).unwrap(), Visibility::Hidden);
+        assert_eq!(
+            *world.get::<Visibility>(unknown).unwrap(),
+            Visibility::Hidden
+        );
+        world
+            .entity_mut(near)
+            .insert(super::super::TerrainWorldspace(77));
+        world.resource_mut::<LodStreaming>().visibility_dirty = true;
+        world
+            .run_system_once(update_terrain_lod_visibility)
+            .unwrap();
+        assert_eq!(
+            *world.get::<Visibility>(current).unwrap(),
+            Visibility::Hidden,
+            "same-world near terrain still replaces its far tier"
         );
     }
 }

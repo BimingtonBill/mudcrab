@@ -134,6 +134,7 @@ fn with_enable_state(
 fn load_cell(database: &WorldDatabase, generation: u64, key: CellKey) -> CellPayload {
     database
         .request(DatabaseRequest::Load {
+            detail: engine::world::database::CellDetail::Full,
             generation,
             key,
             queued_at: Instant::now(),

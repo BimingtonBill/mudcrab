@@ -1339,7 +1339,13 @@ mod tests {
         app.world_mut()
             .resource_mut::<StreamingWorld>()
             .cells
-            .insert(cell, CellStatus::Retiring { root: entity });
+            .insert(
+                cell,
+                CellStatus::Retiring {
+                    root: entity,
+                    detail: crate::world::database::CellDetail::Full,
+                },
+            );
         app.update();
         assert!(
             app.world()
@@ -1352,7 +1358,13 @@ mod tests {
         app.world_mut()
             .resource_mut::<StreamingWorld>()
             .cells
-            .insert(cell, CellStatus::Resident { root: entity });
+            .insert(
+                cell,
+                CellStatus::Resident {
+                    root: entity,
+                    detail: crate::world::database::CellDetail::Full,
+                },
+            );
         app.update();
         assert!(
             app.world()

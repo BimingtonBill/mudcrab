@@ -4,9 +4,8 @@
     forward_io::{VertexOutput, FragmentOutput},
 }
 
-// One overlay's weight grid: 17x17 opacities, four to a vec4, padded to whole vec4s so every
-// overlay starts on a 16-byte boundary. `render.rs` declares the same numbers as
-// `QUADRANT_WEIGHT_SAMPLES` and `OVERLAY_WEIGHT_WORDS`.
+// Samples per overlay weight grid and how they are packed into `weights`: 17x17 samples, four to
+// a vec4, padded to `73` vec4s per overlay so every overlay starts on a 16-byte boundary.
 const WEIGHT_GRID_SIDE: u32 = 17u;
 const WEIGHT_GRID_WORDS: u32 = 73u;
 
@@ -21,9 +20,8 @@ struct TerrainSettings {
     quadrant_origin: vec4<f32>,
     fallback_weights_0: vec4<f32>,
     fallback_weights_1: vec4<f32>,
-    // x > 0.5 when `weights` holds this quadrant's overlay grids; otherwise the packed vertex
-    // attributes below are the only source - a material with no weight field at all, or a quadrant
-    // whose only layer is its base, which has no overlays for the field to hold.
+    // x > 0.5 when `weights` holds this quadrant's overlay grids (streamed cells); otherwise the
+    // packed vertex attributes above are the only source (the synthetic fixtures).
     weight_source: vec4<f32>,
     // 1.0 where a layer has a normal map bound: layers 0-3 in `normal_layers_0`, 4-5 in
     // `normal_layers_1.xy`. A layer without one keeps the geometric normal.
@@ -74,24 +72,24 @@ fn terrain_tbn(n: vec3<f32>) -> mat3x3<f32> {
     return mat3x3<f32>(t, cross(n, t), n);
 }
 
-// One sample of an overlay's weight grid, in the order LAND's `VTXT` entries use: `y * 17 + x` on
-// the quadrant's own 17x17 grid, 128 units apart.
+/// One sample of an overlay's weight grid. Sample order is the one LAND's `VTXT` entries use:
+/// `y * 17 + x` on the quadrant's own 17x17 grid, 128 units apart.
 fn packed_weight(overlay: u32, sample: u32) -> f32 {
     return terrain.weights[overlay * WEIGHT_GRID_WORDS + sample / 4u][sample % 4u];
 }
 
-// A quadrant-local coordinate clamped onto the sample square. Clamping before the blend fraction is
-// taken keeps a coordinate an ulp outside the quadrant on its edge sample instead of blending the
-// neighbouring one in, and keeps a coordinate past the far edge on the last sample rather than
-// reading the next quadrant's.
+/// A quadrant-local coordinate clamped onto the sample square. Clamping before the blend fraction is
+/// taken keeps a coordinate an ulp outside the quadrant on its edge sample instead of blending the
+/// neighbouring one in, and keeps a coordinate past the far edge on the last sample rather than
+/// reading the next quadrant's.
 fn grid_point(coordinate: vec2<f32>) -> vec2<f32> {
     return clamp(coordinate, vec2<f32>(0.0), vec2<f32>(f32(GRID_LAST_SAMPLE)));
 }
 
-// One overlay's opacity at a quadrant-local coordinate: bilinear across the sample grid, clamped at
-// the quadrant's edge. This is the interpolation Skyrim applies to `VTXT` opacities, and it is
-// linear between samples - the packed vertex attributes it replaces lost weight to Bevy's
-// normalization of the tangent, which sharpened every transition into a step.
+/// One overlay's opacity at a quadrant-local coordinate: bilinear across the sample grid, clamped
+/// at the quadrant's edge. This is the interpolation Skyrim applies to `VTXT` opacities, and it is
+/// linear between samples - the packed vertex attributes it replaces lost weight to Bevy's
+/// normalization of the tangent, which sharpened every transition into a step.
 fn grid_weight(overlay: u32, coordinate: vec2<f32>) -> f32 {
     let point = grid_point(coordinate);
     let corner = floor(point);
@@ -127,10 +125,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         terrain.fallback_weights_1.y,
     );
 #ifdef VERTEX_TANGENTS
-    // The packed-tangent carrier, for materials with no weight field to read.
-    // Weights 1-3 travel as a unit direction plus its magnitude, and Bevy re-normalizes the
-    // direction between the vertex and fragment stages, so the three weights shrink towards zero
-    // mid-edge - see `build_terrain_quadrant_mesh`.
+    // The packed-tangent fallback, for materials that carry no weight field (the synthetic
+    // fixtures). Weights 1-3 travel as a unit direction plus its magnitude, and Bevy re-normalizes
+    // the direction between the vertex and fragment stages, so the three weights shrink towards
+    // zero mid-edge - see `build_terrain_quadrant_mesh`.
     let packed_length = abs(in.world_tangent.w);
     weights[1] = max(0.0, in.world_tangent.x * packed_length);
     weights[2] = max(0.0, in.world_tangent.y * packed_length);
@@ -140,8 +138,6 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     weights[4] = in.uv_b.x;
     weights[5] = in.uv_b.y;
 #endif
-    // The material's own weight field, wherever the quadrant has overlays. A quadrant whose only
-    // layer is its base has none to read, so it keeps the packed attributes and skips the lookups.
     if terrain.weight_source.x > 0.5 {
         let coordinate = (in.uv * 2.0 - terrain.quadrant_origin.xy) * f32(GRID_LAST_SAMPLE);
         weights[1] = grid_weight(0u, coordinate);

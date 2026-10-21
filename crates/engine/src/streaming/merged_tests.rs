@@ -714,7 +714,15 @@ fn spawn_merged_cell(
         true,
     );
     let mut snapshot = cached_snapshot(&record);
-    snapshot.water_height = Some(12.0);
+    // A wet-cell fixture must put water above actual ground samples.
+    snapshot.water_height = Some(
+        snapshot
+            .heights
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max)
+            + 1.0,
+    );
     let classes = Arc::new(TerrainClasses::from_table(vanilla_table(9)).unwrap());
     spawn_cell(
         &mut commands,
@@ -756,6 +764,7 @@ fn a_merged_cell_spawns_one_terrain_entity_with_one_collider() {
         .init_asset::<TerrainMaterial>()
         .init_asset::<WaterMaterial>()
         .init_resource::<AssetCatalog>()
+        .init_resource::<EngineConfig>()
         .init_resource::<StreamingMetrics>()
         .init_resource::<lod::LodStreaming>()
         .init_resource::<ProfilingState>()
@@ -835,10 +844,21 @@ fn a_merged_cell_hides_its_lod_tiles_in_all_four_quadrants() {
         StreamingCamera,
         Transform::from_xyz(CELL_SIZE * 0.5, 0.0, -CELL_SIZE * 0.5),
     ));
+    let worldspace_id = world.resource::<EngineConfig>().worldspace_id;
+    let owner = lod::LodStreaming::spawn_ready_chunk_at_tier_for_test(
+        world,
+        shared::lod::ChunkKey::new(
+            worldspace_id,
+            LodTier::Tier4,
+            shared::lod::ChunkAnchor::new(0, 0),
+        ),
+        shared::lod::LodOrigin::new(0, 0),
+    );
     let tiles: Vec<Entity> = (0..4u8)
         .map(|quadrant| {
             world
                 .spawn((
+                    ChildOf(owner),
                     TerrainCoverage {
                         grid: IVec2::ZERO,
                         quadrant,
@@ -865,6 +885,7 @@ fn a_merged_cell_hides_its_lod_tiles_in_all_four_quadrants() {
     let merged = app
         .world_mut()
         .spawn((
+            TerrainWorldspace(worldspace_id),
             TerrainPatch,
             MergedTerrainCoverage { grid: IVec2::ZERO },
             TerrainSurfaceReady,

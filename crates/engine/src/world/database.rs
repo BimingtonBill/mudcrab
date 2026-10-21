@@ -1,5 +1,5 @@
 use super::enable_state::{EnableStateError, EnableStateResolver, InitialEnableInputs};
-use bevy::prelude::{Reflect, Resource};
+use bevy::prelude::{Reflect, Resource, warn};
 use color_eyre::{Result, eyre::WrapErr};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -29,6 +29,22 @@ pub enum CellKey {
         grid_y: i32,
     },
     Interior(u32),
+}
+
+/// How much of a cell a request asks for. The full-detail grid is loaded as [`CellDetail::Full`];
+/// the terrain-only ring beyond it is loaded as [`CellDetail::Terrain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellDetail {
+    /// The whole cell: the landscape, its water plane, and every reference with its light and its
+    /// load door.
+    Full,
+    /// The landscape and its water plane only. A terrain-only cell is drawn and never entered, so
+    /// nothing in it can be seen, lit, walked through or opened - and its references are never
+    /// queried, which is most of the cost of a request.
+    ///
+    /// Exteriors only: an interior has no terrain to fall back on, so [`load_cell`] loads a
+    /// terrain request for one in full.
+    Terrain,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +124,7 @@ pub enum DatabaseRequest {
     Load {
         generation: u64,
         key: CellKey,
+        detail: CellDetail,
         queued_at: Instant,
     },
     LoadLodChunks {
@@ -122,6 +139,9 @@ pub enum DatabaseRequest {
 pub struct DatabaseResponse {
     pub generation: u64,
     pub key: CellKey,
+    /// The detail the request asked for, echoed back so the commit knows what it is holding even
+    /// when the request that asked for it is no longer the one the plan wants.
+    pub detail: CellDetail,
     pub result: std::result::Result<CellPayload, String>,
     pub query_micros: u64,
     pub queue_wait_micros: u64,
@@ -225,6 +245,20 @@ pub struct WorldDatabase {
     lod_responses: Receiver<LodChunkResponse>,
     worker: Option<thread::JoinHandle<()>>,
     worker_stopped: Arc<AtomicBool>,
+    /// The worldspaces whose `lod_chunks` hold at least one chunk, read once in
+    /// [`WorldDatabase::open`]. Empty for a database without the table, or with no chunks compiled.
+    ///
+    /// [`WorldDatabase::has_lod_for`] answers from this, so the terrain ring's resolution
+    /// ([`EngineConfig::effective_terrain_radius`](crate::config::EngineConfig::effective_terrain_radius))
+    /// costs a set lookup rather than a query on every frame. The database is opened read-only and
+    /// the conversion never writes it while a run holds it (`--reuse-assets` builds elsewhere), so
+    /// the answer cannot go stale within a run.
+    lod_worldspaces: HashSet<u32>,
+    /// The receiving end [`WorldDatabase::saturated_queue`] keeps open so its one request slot
+    /// fills. `None` in every run: a real database's worker owns the receiving end. See
+    /// [`Drop`], which releases it before the shutdown request.
+    #[cfg(test)]
+    held_receiver: Option<Receiver<DatabaseRequest>>,
 }
 
 /// A water's Skyrim colours and reflectivity factors, decoded by the converter from its WATR
@@ -389,6 +423,9 @@ fn is_safe_relative_asset_path(path: &str) -> bool {
 }
 
 impl WorldDatabase {
+    /// A database with no worker whose request queue holds `capacity` requests, with the far ends of
+    /// both channels handed to the test: it reads what the engine asked for and answers as the
+    /// worker would. Tests only.
     #[cfg(test)]
     pub(crate) fn channel_fixture(
         capacity: usize,
@@ -403,6 +440,9 @@ impl WorldDatabase {
                 lod_responses,
                 worker: None,
                 worker_stopped: Arc::new(AtomicBool::new(true)),
+                // No database behind this one, so it holds no LOD data either.
+                lod_worldspaces: HashSet::new(),
+                held_receiver: None,
             },
             request_rx,
             response_tx,
@@ -422,6 +462,10 @@ impl WorldDatabase {
             require_table(path, "door_links", crate::extensions::Feature::DoorLinks)?;
         }
         let path = path.to_owned();
+        // Before the worker takes the file: which worldspaces draw their own terrain LOD. Read here
+        // rather than in the worker because a run resolves the ring on the frame the space changes
+        // and cannot wait for a query to come back (`EngineConfig::effective_terrain_radius`).
+        let lod_worldspaces = lod_worldspaces(&path);
         let (request_tx, request_rx) = bounded(128);
         // Responses must not block shutdown if the main world stops polling.
         let (response_tx, response_rx) = unbounded();
@@ -441,7 +485,30 @@ impl WorldDatabase {
             lod_responses: lod_response_rx,
             worker: Some(worker),
             worker_stopped,
+            lod_worldspaces,
+            #[cfg(test)]
+            held_receiver: None,
         })
+    }
+
+    /// Whether the database holds at least one terrain LOD chunk for `worldspace_id`, which is what
+    /// decides that the worldspace draws its own distant terrain (see
+    /// [`EngineConfig::effective_terrain_radius`](crate::config::EngineConfig::effective_terrain_radius)):
+    /// the terrain ring is left off where the LOD covers that distance and kept where it does not.
+    ///
+    /// A database without a `lod_chunks` table - one converted before LOD existed - answers false
+    /// for every worldspace, and so does a worldspace the conversion compiled no chunks for. Both
+    /// keep the ring, which is what they drew before LOD was a thing. The answer is read once in
+    /// [`Self::open`] and cached for the run.
+    ///
+    /// The answer is worldspace-granular and says nothing about coverage: *one* chunk turns the ring
+    /// off for the whole worldspace, so a mod worldspace or a partial conversion whose LOD covers
+    /// only part of its grid draws LOD where it has chunks and neither LOD nor ring past them, where
+    /// the ring would have drawn ground. Per-area coverage would need a query per frame and is not
+    /// what this asks; a conversion that compiles LOD for a worldspace is expected to compile it for
+    /// its whole reach (the converter walks the grid), so the assumption is the conversion's.
+    pub fn has_lod_for(&self, worldspace_id: u32) -> bool {
+        self.lod_worldspaces.contains(&worldspace_id)
     }
 
     pub fn request(&self, request: DatabaseRequest) -> Result<()> {
@@ -450,9 +517,41 @@ impl WorldDatabase {
             .wrap_err("world database worker stopped")
     }
 
-    /// Ordinary streaming intake must never wait for the worker on the main thread.
+    /// [`Self::request`] without blocking. Ordinary streaming intake must never wait for the worker
+    /// on the main thread.
+    ///
+    /// The planner asks for a whole ring of cells at once, hundreds of them, and the worker drains
+    /// its bounded queue at one query per answer: blocking on a full queue would stall the frame
+    /// for as long as that takes. A request that does not fit is refused as a full queue and left
+    /// for the next frame - the plan's wanted list is ordered nearest first, so the cells closest
+    /// to the camera are always the ones that do. A stopped worker is refused with its own error.
     pub(crate) fn try_request(&self, request: DatabaseRequest) -> Result<()> {
         enqueue_request(&self.requests, request)
+    }
+
+    /// A database with no worker running and a request queue of one slot that nothing drains: the
+    /// first request fills it and every later one is refused with `Full`, which is what the planner
+    /// sees on a frame where the worker is behind. Tests only - a run would never get a cell out of
+    /// this.
+    #[cfg(test)]
+    pub(crate) fn saturated_queue() -> Self {
+        let (requests, held_receiver) = bounded(1);
+        let (_responses, responses) = unbounded();
+        let (_lod_responses, lod_responses) = unbounded();
+        Self {
+            requests,
+            responses,
+            lod_responses,
+            worker: None,
+            worker_stopped: Arc::new(AtomicBool::new(true)),
+            // No database behind this one, so it holds no LOD data either; every worldspace gets
+            // the ring (`EngineConfig::effective_terrain_radius`).
+            lod_worldspaces: HashSet::new(),
+            // Held open and never read, so the one slot fills: dropping the receiver instead would
+            // refuse requests as `Disconnected`, which is the stopped-worker case rather than a
+            // full queue.
+            held_receiver: Some(held_receiver),
+        }
     }
 
     pub fn try_response(&self) -> Option<DatabaseResponse> {
@@ -502,6 +601,10 @@ fn enqueue_request(requests: &Sender<DatabaseRequest>, request: DatabaseRequest)
 
 impl Drop for WorldDatabase {
     fn drop(&mut self) {
+        // A test-only receiver goes first. Only a running worker is sent the shutdown, a blocking
+        // send that it drains; a database with no worker (a test fixture) has nothing to stop.
+        #[cfg(test)]
+        drop(self.held_receiver.take());
         if let Some(worker) = self.worker.take() {
             let _ = self.requests.send(DatabaseRequest::Shutdown);
             let _ = worker.join();
@@ -562,13 +665,16 @@ fn worker(
             DatabaseRequest::Load {
                 generation,
                 key,
+                detail,
                 queued_at,
             } => {
                 let queue_wait_micros = elapsed_micros(queued_at);
                 let started = Instant::now();
                 let result = match &mut setup {
-                    Ok((connection, query)) => load_cell(connection, query, generation, key)
-                        .map_err(|error| format!("{error:#}")),
+                    Ok((connection, query)) => {
+                        load_cell(connection, query, generation, key, detail)
+                            .map_err(|error| format!("{error:#}"))
+                    }
                     Err(error) => Err(error.clone()),
                 };
                 let query_micros = elapsed_micros(started);
@@ -579,6 +685,7 @@ fn worker(
                     .send(DatabaseResponse {
                         generation,
                         key,
+                        detail,
                         result,
                         query_micros,
                         queue_wait_micros,
@@ -719,12 +826,47 @@ fn load_lod_chunks(connection: &Connection, query: LodChunkQuery) -> Result<Vec<
     .collect()
 }
 
-fn has_lod_table(connection: &Connection) -> Result<bool> {
-    Ok(connection.query_row(
+fn has_lod_table(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='lod_chunks')",
         [],
         |row| row.get(0),
-    )?)
+    )
+}
+
+/// The worldspaces [`WorldDatabase::has_lod_for`] answers true for: the ones with at least one
+/// `lod_chunks` row, from the database at `path`.
+///
+/// The question is per worldspace and the answer is a property of the converted database, which a
+/// run cannot write, so it is read once - one `DISTINCT` over the whole table rather than an
+/// `EXISTS` per worldspace - and kept. A database without the table (converted before LOD existed)
+/// has none, silently: that is a database this engine renders, and every worldspace of it keeps the
+/// ring. A `lod_chunks` table that is there and cannot be read is a fault of its own and is
+/// reported, and every worldspace keeps the ring rather than the run refusing to open over a table
+/// it may never query; the LOD streamer fails loudly on the same table when it does query it
+/// (`load_lod_chunks`).
+fn lod_worldspaces(path: &Path) -> HashSet<u32> {
+    match read_lod_worldspaces(path) {
+        Ok(worldspaces) => worldspaces,
+        Err(error) => {
+            warn!(
+                %error,
+                "world database's LOD worldspace list is unreadable: every worldspace keeps its \
+                 terrain ring"
+            );
+            HashSet::new()
+        }
+    }
+}
+
+fn read_lod_worldspaces(path: &Path) -> rusqlite::Result<HashSet<u32>> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    if !has_lod_table(&connection)? {
+        return Ok(HashSet::new());
+    }
+    let mut statement = connection.prepare("SELECT DISTINCT worldspace_id FROM lod_chunks")?;
+    let rows = statement.query_map([], |row| row.get::<_, u32>(0))?;
+    rows.collect()
 }
 
 fn validate_lod_query(query: LodChunkQuery) -> Result<()> {
@@ -1083,6 +1225,7 @@ fn load_cell(
     query: &mut ReferenceQuery,
     generation: u64,
     key: CellKey,
+    detail: CellDetail,
 ) -> Result<CellPayload> {
     let cell_id: u32 = match key {
         CellKey::Exterior {
@@ -1096,6 +1239,17 @@ fn load_cell(
         )?,
         CellKey::Interior(cell_id) => cell_id,
     };
+    // A terrain-only cell is drawn and never entered, so the landscape the cell cache holds for
+    // `cell_id` is everything the request needs. Answering it here also skips the reference query
+    // below, which is the whole cost of a request at this distance.
+    if detail == CellDetail::Terrain && matches!(key, CellKey::Exterior { .. }) {
+        return Ok(CellPayload {
+            generation,
+            key,
+            cell_id,
+            references: Vec::new(),
+        });
+    }
     let columns = &query.columns;
     let joins = &query.joins;
     let rows = match key {
@@ -1269,15 +1423,31 @@ mod tests {
         assert!(!LodQueryFailure::from_error(rusqlite::Error::InvalidQuery.into()).transient);
     }
 
-    /// `load_cell` with the reference query built for `connection` as it is now, the way the
-    /// worker builds it when it opens a database.
+    /// The three-argument shape the tests below were written against: every one of them asks for a
+    /// whole cell. A test about the terrain ring calls [`super::load_cell`] with its own detail.
+    ///
+    /// The return-link cache is fresh on every call, so a test that changes `door_links` between
+    /// two loads sees the table as it is: one cache for a whole run is what [`ReturnLinks`] is for,
+    /// A full cell using the fixture's declared legacy/core door capability.
     fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<CellPayload> {
         super::load_cell(
             connection,
             &mut ReferenceQuery::for_connection(connection, fixture_features(connection))?,
             generation,
             key,
+            CellDetail::Full,
         )
+    }
+
+    /// [`super::load_cell`] for a whole cell with a query the test keeps across loads (the enable
+    /// state resolver lives on it).
+    fn load_cell_with(
+        connection: &Connection,
+        query: &mut ReferenceQuery,
+        generation: u64,
+        key: CellKey,
+    ) -> Result<CellPayload> {
+        super::load_cell(connection, query, generation, key, CellDetail::Full)
     }
 
     /// The features a fixture database stands for: it lists `mudcrab.door_links` exactly when it
@@ -1402,7 +1572,7 @@ mod tests {
                 grid_y: -3,
             },
         ] {
-            let payload = super::load_cell(&connection, &mut query, 1, key).unwrap();
+            let payload = load_cell_with(&connection, &mut query, 1, key).unwrap();
             let child = payload
                 .references
                 .iter()
@@ -1428,10 +1598,10 @@ mod tests {
             ReferenceQuery::for_connection(&connection, WorldDatabaseFeatures::default()).unwrap();
         for _ in 0..2 {
             let interior =
-                super::load_cell(&connection, &mut query, 1, CellKey::Interior(99)).unwrap();
+                load_cell_with(&connection, &mut query, 1, CellKey::Interior(99)).unwrap();
             assert_eq!(interior.references.len(), 1);
             assert!(!interior.references[0].initially_enabled);
-            let exterior = super::load_cell(
+            let exterior = load_cell_with(
                 &connection,
                 &mut query,
                 2,
@@ -1484,7 +1654,7 @@ mod tests {
                 ReferenceQuery::for_connection(&connection, WorldDatabaseFeatures::default())
                     .unwrap();
             for _ in 0..2 {
-                let payload = super::load_cell(
+                let payload = load_cell_with(
                     &connection,
                     &mut query,
                     1,
@@ -1798,6 +1968,7 @@ mod tests {
         let request = || DatabaseRequest::Load {
             generation: 1,
             key: CellKey::Interior(1),
+            detail: CellDetail::Full,
             queued_at: Instant::now(),
         };
         database.try_request(request()).unwrap();
@@ -2212,6 +2383,150 @@ mod tests {
         assert_eq!(catalog.landscape_normal(1), None);
     }
 
+    /// The terrain ring asks for the cell's landscape and nothing else: the cell id is what the
+    /// cell cache is keyed by, and the references - which are most of a cell's cost - are not
+    /// queried at all.
+    #[test]
+    fn loads_a_terrain_only_exterior_cell_without_its_references() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        add_door_links(&connection);
+        light_fixture(&connection);
+        let key = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 2,
+            grid_y: -3,
+        };
+
+        let terrain_only = super::load_cell(
+            &connection,
+            &mut ReferenceQuery::for_connection(&connection, fixture_features(&connection))
+                .unwrap(),
+            7,
+            key,
+            CellDetail::Terrain,
+        )
+        .unwrap();
+        assert_eq!(terrain_only.generation, 7);
+        assert_eq!(terrain_only.cell_id, 10);
+        assert_eq!(terrain_only.key, key);
+        assert!(
+            terrain_only.references.is_empty(),
+            "a terrain-only cell carries no references, lights or doors to spawn"
+        );
+
+        // The same cell at full detail is the one the ring is a cheaper version of.
+        let full = load_cell(&connection, 7, key).unwrap();
+        assert_eq!(full.cell_id, terrain_only.cell_id);
+        assert!(
+            !full.references.is_empty(),
+            "the fixture's cell has references, so an empty list above means they were skipped"
+        );
+    }
+
+    /// An interior has no landscape to fall back on, so a terrain request for one loads it whole:
+    /// the ring never asks for an interior, and a request that does must not return a cell with
+    /// nothing in it.
+    #[test]
+    fn loads_a_terrain_request_for_an_interior_in_full() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+
+        let payload = super::load_cell(
+            &connection,
+            &mut ReferenceQuery::for_connection(&connection, fixture_features(&connection))
+                .unwrap(),
+            1,
+            CellKey::Interior(99),
+            CellDetail::Terrain,
+        )
+        .unwrap();
+        assert_eq!(payload.cell_id, 99);
+        assert_eq!(payload.references.len(), 1);
+    }
+
+    /// The ring covers a square of grid cells, and a worldspace does not fill it: a grid with no
+    /// cell at all is an error at both details, so the plan marks it failed instead of spawning an
+    /// empty root for it.
+    #[test]
+    fn fails_a_terrain_request_for_a_grid_the_worldspace_does_not_cover() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        let absent = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 900,
+            grid_y: 900,
+        };
+        assert!(
+            super::load_cell(
+                &connection,
+                &mut ReferenceQuery::for_connection(&connection, fixture_features(&connection))
+                    .unwrap(),
+                1,
+                absent,
+                CellDetail::Terrain,
+            )
+            .is_err()
+        );
+        assert!(
+            super::load_cell(
+                &connection,
+                &mut ReferenceQuery::for_connection(&connection, fixture_features(&connection))
+                    .unwrap(),
+                1,
+                absent,
+                CellDetail::Full,
+            )
+            .is_err()
+        );
+    }
+
+    /// The ring's question, asked once per run: which worldspaces draw their own terrain LOD.
+    /// Read from `lod_chunks` when the database opens; false - so the ring stays - where the
+    /// table or the rows are missing.
+    #[test]
+    fn has_lod_for_answers_from_the_lod_chunks_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!(
+                r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
+                INSERT INTO schema_info VALUES({version});
+                CREATE TABLE lod_chunks(
+                    worldspace_id INTEGER NOT NULL,tier INTEGER NOT NULL,anchor_x INTEGER NOT NULL,anchor_y INTEGER NOT NULL,
+                    payload_path TEXT NOT NULL,content_hash TEXT NOT NULL,
+                    bounds_min_x REAL NOT NULL,bounds_min_y REAL NOT NULL,bounds_min_z REAL NOT NULL,
+                    bounds_max_x REAL NOT NULL,bounds_max_y REAL NOT NULL,bounds_max_z REAL NOT NULL,
+                    source_cells TEXT NOT NULL,PRIMARY KEY(worldspace_id,tier,anchor_x,anchor_y));
+                INSERT INTO lod_chunks VALUES(60,4,0,0,'lod/0000003c/4/cell_0_0.glb','hash',
+                 0.0,0.0,0.0,1.0,1.0,1.0,'');"#,
+                version = shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+        let database = WorldDatabase::open(&path).unwrap();
+        assert!(
+            database.has_lod_for(60),
+            "the worldspace the conversion compiled chunks for"
+        );
+        assert!(
+            !database.has_lod_for(614),
+            "a worldspace with no chunk of its own keeps the ring"
+        );
+
+        // A database converted before LOD existed has no table at all, and every worldspace of it
+        // keeps the ring rather than the run refusing to open.
+        let legacy_path = directory.path().join("legacy.db");
+        Connection::open(&legacy_path)
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES({});",
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+        assert!(!WorldDatabase::open(&legacy_path).unwrap().has_lod_for(60));
+    }
+
     #[test]
     fn rejects_previous_database_schema() {
         let directory = tempfile::tempdir().unwrap();
@@ -2220,45 +2535,6 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_info(version INTEGER); INSERT INTO schema_info VALUES(2);",
-            )
-            .unwrap();
-        drop(connection);
-        assert!(validate(&path).is_err());
-    }
-
-    /// Schema-4 and schema-5 databases validate and load; a schema newer than the current one does not.
-    #[test]
-    fn accepts_schema_four_and_five_databases_with_legacy_query_columns() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("world.db");
-        let connection = Connection::open(&path).unwrap();
-        fixture(&connection);
-        drop(connection);
-        for version in [4, 5] {
-            let connection = Connection::open(&path).unwrap();
-            connection
-                .execute("UPDATE schema_info SET version=?1", [version])
-                .unwrap();
-            drop(connection);
-            validate(&path).unwrap();
-            let connection = Connection::open(&path).unwrap();
-            let payload = load_cell(
-                &connection,
-                1,
-                CellKey::Exterior {
-                    worldspace_id: 60,
-                    grid_x: 2,
-                    grid_y: -3,
-                },
-            )
-            .unwrap();
-            assert_eq!(payload.references.len(), 2);
-        }
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute(
-                "UPDATE schema_info SET version=?1",
-                [shared::WORLD_DATABASE_SCHEMA_VERSION + 1],
             )
             .unwrap();
         drop(connection);
@@ -2309,6 +2585,7 @@ mod tests {
                 .send(DatabaseRequest::Load {
                     generation,
                     key,
+                    detail: CellDetail::Full,
                     queued_at: Instant::now(),
                 })
                 .unwrap();
@@ -2387,6 +2664,7 @@ mod tests {
                         grid_x: 2,
                         grid_y: -3,
                     },
+                    detail: CellDetail::Full,
                     queued_at: Instant::now(),
                 })
                 .unwrap();
@@ -2785,5 +3063,41 @@ mod tests {
                 .all(|reference| reference.door.is_none())
         );
     }
-
+    #[test]
+    fn accepts_schema_four_and_five_databases_with_legacy_query_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        fixture(&connection);
+        drop(connection);
+        for version in [4, 5] {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute("UPDATE schema_info SET version=?1", [version])
+                .unwrap();
+            drop(connection);
+            validate(&path).unwrap();
+            let connection = Connection::open(&path).unwrap();
+            let payload = load_cell(
+                &connection,
+                1,
+                CellKey::Exterior {
+                    worldspace_id: 60,
+                    grid_x: 2,
+                    grid_y: -3,
+                },
+            )
+            .unwrap();
+            assert_eq!(payload.references.len(), 2);
+        }
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE schema_info SET version=?1",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(validate(&path).is_err());
+    }
 }
