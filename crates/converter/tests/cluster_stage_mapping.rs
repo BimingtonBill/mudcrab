@@ -860,7 +860,7 @@ fn a_loose_item_is_refused_until_production_state_writers_exist() {
     let builder = run(&dataset, &settings);
     let authority = authority(&dataset, &settings, builder);
     let done = finalize(&dataset, &authority).unwrap();
-    assert_eq!(done.extension.stats["instance_map_rows"], 4);
+    assert_eq!(done.extension.stats["instance_map_rows"], 3);
     let connection = Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
     assert_eq!(
         coverage_state(&connection, 0x100).unwrap(),
@@ -874,7 +874,7 @@ fn a_loose_item_is_refused_until_production_state_writers_exist() {
 
 #[test]
 fn scripts_on_either_reference_or_base_prevent_cluster_replacement() {
-    for scripted_form in [0x100, 0x11] {
+    for (scripted_form, rows) in [(0x100, 4), (0x11, 3)] {
         let dataset = dataset();
         let connection =
             Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
@@ -886,7 +886,8 @@ fn scripts_on_either_reference_or_base_prevent_cluster_replacement() {
         let builder = run(&dataset, &settings);
         let authority = authority(&dataset, &settings, builder);
         let done = finalize(&dataset, &authority).unwrap();
-        assert_eq!(done.extension.stats["instance_map_rows"], 4);
+        // A scripted reference loses its own rows; a scripted base loses every reference to it.
+        assert_eq!(done.extension.stats["instance_map_rows"], rows);
         let connection =
             Connection::open(dataset.directory.path().join("skyrim_world.db")).unwrap();
         assert_eq!(
