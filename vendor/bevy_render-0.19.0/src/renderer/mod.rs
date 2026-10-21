@@ -5,7 +5,8 @@ mod render_device;
 mod wgpu_wrapper;
 
 pub use render_context::{
-    CurrentView, FlushCommands, PendingCommandBuffers, RenderContext, RenderContextState, ViewQuery,
+    finish_in_order, last_parallel_finish_count, parallel_finish, set_parallel_finish, CurrentView,
+    FlushCommands, Pending, PendingCommandBuffers, RenderContext, RenderContextState, ViewQuery,
 };
 pub use render_device::*;
 pub use wgpu_wrapper::WgpuWrapper;
@@ -82,10 +83,22 @@ pub fn render_system(
         let mut encoder =
             render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        crate::view::screenshot::submit_screenshot_commands(world, &mut encoder);
-        crate::gpu_readback::submit_readback_commands(world, &mut encoder);
-
-        render_queue.submit([encoder.finish()]);
+        {
+            #[cfg(feature = "trace")]
+            let _span = info_span!("render::readback_encode").entered();
+            crate::view::screenshot::submit_screenshot_commands(world, &mut encoder);
+            crate::gpu_readback::submit_readback_commands(world, &mut encoder);
+        }
+        let buffer = {
+            #[cfg(feature = "trace")]
+            let _span = info_span!("render::readback_finish").entered();
+            encoder.finish()
+        };
+        {
+            #[cfg(feature = "trace")]
+            let _span = info_span!("render::readback_submit").entered();
+            render_queue.submit([buffer]);
+        }
     }
 
     {

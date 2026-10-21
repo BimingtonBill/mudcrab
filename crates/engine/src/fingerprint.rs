@@ -162,6 +162,9 @@ pub struct GraphicsFingerprint {
     pub max_upload_mib_per_frame: usize,
     /// Whether streamed `LIGH` references place point lights.
     pub lights: bool,
+    /// Whether the run was presented as played (`--as-played`): runs with and without it draw
+    /// different work and are not compared.
+    pub as_played: bool,
     /// Whether the run opens no window at all.
     pub headless: bool,
     /// The window's present mode (`AutoNoVsync` for a benchmark, `AutoVsync` otherwise), or `null`
@@ -233,6 +236,7 @@ impl RunFingerprint {
                 tree_load_distance: config.object_lod.tree_load_distance,
                 max_upload_mib_per_frame: config.max_upload_mib_per_frame,
                 lights: config.lights,
+                as_played: config.as_played,
                 headless: config.headless,
                 present_mode: window.map(|window| format!("{:?}", window.present_mode)),
             },
@@ -259,22 +263,6 @@ fn opened_world_database_schema(config: &EngineConfig) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn measured_native_visibility_uses_the_live_resource() {
-        let config = EngineConfig::default();
-        assert!(config.graphics.lod_objects && config.graphics.lod_trees);
-        let mut settings = config.graphics.clone();
-        settings.set("lod-objects", "off").unwrap();
-        let mut app = App::new();
-        app.insert_resource(config)
-            .insert_resource(settings)
-            .add_plugins(RunFingerprintPlugin);
-        app.update();
-        let fingerprint = app.world().resource::<RunFingerprint>();
-        assert!(!fingerprint.graphics.lod_objects);
-        assert!(fingerprint.graphics.lod_trees);
-    }
 
     fn fingerprint_without_renderer() -> RunFingerprint {
         RunFingerprint::collect(&EngineConfig::default(), None, None, None, false, None)

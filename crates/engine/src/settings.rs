@@ -990,7 +990,7 @@ pub(crate) fn apply_render_settings(
             settings.sun_color[2],
         );
         light.shadow_maps_enabled = settings.sun && settings.shadows;
-        let base = crate::app::sun_shadow_cascades(&config);
+        let base = crate::app::world_sun_shadow_cascades(&config);
         let maximum =
             base.bounds.last().copied().unwrap_or(1000.0) * settings.shadow_distance_scale;
         *cascades = CascadeShadowConfigBuilder {

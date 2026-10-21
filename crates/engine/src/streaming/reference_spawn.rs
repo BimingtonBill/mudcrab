@@ -2,10 +2,11 @@
 
 use super::{
     PendingAssetProfile, PendingModel, converted_model_path, creation_rotation_to_bevy,
-    creation_to_bevy,
+    creation_to_bevy, door_anchor, load_door,
 };
 use crate::{
     profiling::ProfilingState,
+    snow::{DirectionalSnow, DirectionalSnowCatalog},
     world::{
         components::{
             CellRef, ExpectedModelBounds, FormId, InstanceBounds, MeshHandle, WorldPosition,
@@ -14,12 +15,14 @@ use crate::{
         database::{CellKey, ReferenceRow},
     },
 };
-use bevy::prelude::*;
+use bevy::{app::Inherited, camera::visibility::RenderLayers, prelude::*};
 use std::time::Instant;
 
 /// Inputs already selected by the caller. This helper does not establish residency or readiness.
 pub(crate) struct ReferenceSpawnContext<'a> {
     pub(crate) key: CellKey,
+    pub(crate) stamp: Option<&'a RenderLayers>,
+    pub(crate) snow: &'a DirectionalSnowCatalog,
     pub(crate) model_sequence: &'a mut u64,
     pub(crate) asset_server: &'a AssetServer,
     pub(crate) profiler: &'a mut ProfilingState,
@@ -57,6 +60,8 @@ pub(crate) fn spawn_reference(
     context: &mut ReferenceSpawnContext<'_>,
 ) -> Option<(Entity, bool)> {
     let key = context.key;
+    let stamp = context.stamp;
+    let snow = context.snow;
     let model_sequence = &mut *context.model_sequence;
     let asset_server = context.asset_server;
     let profiler = &mut *context.profiler;
@@ -92,14 +97,40 @@ pub(crate) fn spawn_reference(
     if let Some(rgb) = reference.emittance {
         entity.insert(crate::emittance::ReferenceEmittance::from_srgb(rgb));
     }
-    // Descendant scenes keep the ordinary placed-object layer source on both load paths.
-    entity.insert(bevy::app::Propagate(super::PLACED_OBJECT_RENDER_LAYERS));
-    if let Some(door) = crate::doors::load_door(reference.form_id, reference.door.as_ref()) {
+    // Born on the cell's layers: the model the loader hangs under this reference
+    // inherits them the frame it arrives.
+    if let Some(layers) = stamp.cloned() {
+        entity.insert((Inherited(layers.clone()), layers));
+    } else {
+        entity.insert(bevy::app::Propagate(super::PLACED_OBJECT_RENDER_LAYERS));
+    }
+    // A static whose `DNAM` names a `MATO` draws its model with a projected snow
+    // material. The reference carries the coverage from here; the swap itself waits for
+    // the scene to be validated (`apply_directional_snow`). An ordinary static - the
+    // overwhelming majority, and every one in a database without the tables - gets
+    // nothing, and its meshes stay exactly as the model published them.
+    if let Some(coverage) = snow.coverage_for(reference.base_form_id) {
+        entity.insert(DirectionalSnow {
+            static_form_id: reference.base_form_id,
+            coverage,
+        });
+    }
+    if let Some(door) = load_door(&reference) {
         entity.insert(door);
+    }
+    // The doorway anchor rides beside the door: a door the data supports is drawn,
+    // crossed and streamed through the two doorways rather than through the link's
+    // `XTEL` arrival point (`crate::doors::DoorAnchor`).
+    if let Some(anchor) = door_anchor(&reference) {
+        entity.insert(anchor);
+    }
+    // Actors, doors and loose objects are never culled by their stored room.
+    if crate::room_culling::exempt_record_type(reference.base_record_type.as_deref()) {
+        entity.insert(crate::room_culling::RoomCullExempt);
     }
     // A child of the reference, so the light sits where the reference is and follows it
     // through a render-origin rebase - and, because it is a descendant of the cell root,
-    // through the cell unload that removes the reference.
+    // through the portal isolation that walks a cell's hierarchy.
     if let Some(light) = reference
         .light
         .as_ref()

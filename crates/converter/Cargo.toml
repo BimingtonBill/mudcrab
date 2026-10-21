@@ -56,6 +56,7 @@ sha2 = { workspace = true, features = ["asm"] }
 insta = { version = "1.48", features = ["json", "redactions"] }
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 dummy-content = { path = "../dummy-content" }
+project-wormhole-shared = "0.1.0"
 
 [build-dependencies]
 cc = "1.2"

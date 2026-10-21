@@ -17,14 +17,23 @@ use std::{
 
 const NULL_BLOCK: u32 = u32::MAX;
 const SLSF1_SPECULAR: u32 = 1;
-const SLSF1_MODEL_SPACE_NORMALS: u32 = 1 << 12;
-const SLSF1_ENVIRONMENT_MAPPING: u32 = 1 << 7;
-#[cfg(test)]
+/// `SLSF1_Vertex_Alpha`, `SkyrimShaderPropertyFlags1` bit 3 (nif.xml): the shader reads the vertex
+/// colour's alpha.
 const SLSF1_VERTEX_ALPHA: u32 = 1 << 3;
+const SLSF1_ENVIRONMENT_MAPPING: u32 = 1 << 7;
+/// `SLSF1_MODEL_SPACE_NORMALS`, `SkyrimShaderPropertyFlags1` bit 12 (nif.xml). These
+/// meshes take their specular mask from slot 7's red channel rather than from the
+/// normal map's alpha (`docs/research/gloss-mask-semantics.md`), so the normal map
+/// must not also be published as the mask.
+const SLSF1_MODEL_SPACE_NORMALS: u32 = 1 << 12;
+/// `SLSF1_REFRACTION`, `SkyrimShaderPropertyFlags1` bit 15 (nif.xml).
+const SLSF1_REFRACTION: u32 = 1 << 15;
 const SLSF1_SCREENDOOR_ALPHA_FADE: u32 = 1 << 19;
 const SLSF2_DOUBLE_SIDED: u32 = 1 << 4;
 const SLSF2_GLOW_MAP: u32 = 1 << 6;
 const SLSF2_PREMULTIPLIED_ALPHA: u32 = 1 << 19;
+const SLSF2_VERTEX_COLORS: u32 = 1 << 5;
+const SLSF2_TREE_ANIM: u32 = 1 << 29;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,6 +135,139 @@ pub enum NifAlphaMode {
     Blend,
 }
 
+/// A source or destination blend factor of `NiAlphaProperty` (the `AlphaFunction`
+/// enumeration in nif.xml). glTF's `BLEND` is always straight alpha-over, so an
+/// additive (`SRC_ALPHA`/`ONE`) or multiplicative (`ZERO`/`SRC_COLOR`) Skyrim
+/// surface keeps its meaning only if both factors travel with the material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NifBlendFactor {
+    One,
+    Zero,
+    SourceColor,
+    InverseSourceColor,
+    DestinationColor,
+    InverseDestinationColor,
+    SourceAlpha,
+    InverseSourceAlpha,
+    DestinationAlpha,
+    InverseDestinationAlpha,
+    SourceAlphaSaturate,
+}
+
+impl NifBlendFactor {
+    /// Decodes one 4-bit `AlphaFunction` field of the `NiAlphaProperty` flag
+    /// word: the source factor starts at bit 1 and the destination factor at
+    /// bit 5 (nif.xml `AlphaFlags`, `vendor/project-wormhole-nif/src/nif_flags.rs`).
+    /// Codes above `SRC_ALPHA_SATURATE` are not defined by the format, so they
+    /// decode to `None` and the glTF default is kept instead of inventing one.
+    fn from_alpha_flags(flags: u16, bit: u32) -> Option<Self> {
+        Some(match (flags >> bit) & 0x0F {
+            0 => Self::One,
+            1 => Self::Zero,
+            2 => Self::SourceColor,
+            3 => Self::InverseSourceColor,
+            4 => Self::DestinationColor,
+            5 => Self::InverseDestinationColor,
+            6 => Self::SourceAlpha,
+            7 => Self::InverseSourceAlpha,
+            8 => Self::DestinationAlpha,
+            9 => Self::InverseDestinationAlpha,
+            10 => Self::SourceAlphaSaturate,
+            _ => return None,
+        })
+    }
+
+    /// The nif.xml spelling, which is what the `OPEN_SKYRIM_material`
+    /// extension publishes.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::One => "ONE",
+            Self::Zero => "ZERO",
+            Self::SourceColor => "SRC_COLOR",
+            Self::InverseSourceColor => "INV_SRC_COLOR",
+            Self::DestinationColor => "DEST_COLOR",
+            Self::InverseDestinationColor => "INV_DEST_COLOR",
+            Self::SourceAlpha => "SRC_ALPHA",
+            Self::InverseSourceAlpha => "INV_SRC_ALPHA",
+            Self::DestinationAlpha => "DEST_ALPHA",
+            Self::InverseDestinationAlpha => "INV_DEST_ALPHA",
+            Self::SourceAlphaSaturate => "SRC_ALPHA_SATURATE",
+        }
+    }
+}
+
+/// The blend factors of a shape's `NiAlphaProperty`, or `None` when the shape has
+/// no property or the property has the blend bit clear (in which case the shape
+/// is not blended at all and glTF `BLEND`'s straight alpha-over is what it gets).
+///
+/// An `AlphaFunction` code the format does not define falls back to the glTF
+/// default of that side (`SRC_ALPHA` / `INV_SRC_ALPHA`).
+fn blend_factors(
+    alpha: Option<(u32, &NiAlphaProperty)>,
+) -> Option<(NifBlendFactor, NifBlendFactor)> {
+    let (_, property) = alpha?;
+    if !property.flags.blend_enabled() {
+        return None;
+    }
+    let flags = property.flags.raw();
+    Some((
+        NifBlendFactor::from_alpha_flags(flags, 1).unwrap_or(NifBlendFactor::SourceAlpha),
+        NifBlendFactor::from_alpha_flags(flags, 5).unwrap_or(NifBlendFactor::InverseSourceAlpha),
+    ))
+}
+
+/// Editor-only marker shapes are authored inside models that are otherwise
+/// legitimate (a lever, a door, a trap, a wall), so they cannot be filtered by
+/// model path the way `markers/` and `effects/` models are. Bethesda's editor
+/// writes them as a shape named `EditorMarker`, and no shipping renderer draws
+/// them; publishing them paints flat untextured shapes over the world.
+pub fn is_editor_marker_shape(shape_name: Option<&str>) -> bool {
+    shape_name.is_some_and(|name| {
+        name.split(':')
+            .next()
+            .unwrap_or(name)
+            .trim()
+            .eq_ignore_ascii_case("EditorMarker")
+    })
+}
+
+/// Whether the NIF declares the editor-marker bit in its `BSXFlags`.
+///
+/// A minimal fixture carries no `BSXFlags` block at all; those NIFs count as declaring
+/// the marker, so a shape named `EditorMarker` is still excluded. A NIF that does carry
+/// `BSXFlags` decides it: only a set marker bit excludes the shape - a shape whose name
+/// merely reads `EditorMarker` while the flags clear the bit is kept
+/// (`v16_only_declared_markers_and_refraction_are_excluded`).
+///
+/// `mesh::drop_editor_marker_geometry` reads the same predicate, so a mesh is only
+/// deleted from the export when the material contract also excludes it.
+pub(crate) fn declares_editor_marker(nif: &NifFile) -> bool {
+    nif.blocks
+        .iter()
+        .find_map(|block| match block {
+            NifBlock::BSXFlags(flags) => Some(flags.integer_data & (1 << 5) != 0),
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
+/// A `BSEffectShaderProperty`'s view-angle fade and soft-edge depth, as the NIF stores them.
+///
+/// The two "angles" are stored as cosines: the shader compares them with `|N·V|` directly
+/// (Community Shaders' `Effect.hlsl`: `saturate((abs(WdotN) - start) / (stop - start))`,
+/// smoothstepped, then `lerp(startOpacity, stopOpacity, s)`; a hearth flame card stores 0.1736
+/// and 0.0872, cos 80° and cos 85°). The fade applies only with `SLSF1_Use_Falloff` (bit 6) and
+/// the soft edge only with `SLSF1_Soft_Effect` (bit 30), both published in `shaderFlags1`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EffectFalloff {
+    pub start_angle: f32,
+    pub stop_angle: f32,
+    pub start_opacity: f32,
+    pub stop_opacity: f32,
+    pub soft_depth: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidatedNifMaterial {
     pub shader_family: NifShaderFamily,
@@ -139,15 +281,29 @@ pub struct ValidatedNifMaterial {
     pub alpha: f32,
     pub alpha_mode: NifAlphaMode,
     pub alpha_threshold: Option<u8>,
+    /// Source and destination blend factors, present only when the shape's
+    /// `NiAlphaProperty` enables blending.
+    pub blend_factors: Option<(NifBlendFactor, NifBlendFactor)>,
     pub glossiness: f32,
     pub specular_color: [f32; 3],
     pub specular_strength: f32,
     pub emissive_color: [f32; 3],
     pub emissive_multiple: f32,
     pub double_sided: bool,
-    pub textures: Vec<NifTextureSlot>,
+    /// The shader property's static UV offset, in [u, v]. `[0.0, 0.0]` when the
+    /// property does not shift its texture coordinates.
     pub uv_offset: [f32; 2],
+    /// The shader property's static UV scale, in [u, v]. `[1.0, 1.0]` when the
+    /// property does not resize its texture coordinates.
     pub uv_scale: [f32; 2],
+    /// The effect shader's view-angle fade and soft-edge depth; `None` for the lighting family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_falloff: Option<EffectFalloff>,
+    pub textures: Vec<NifTextureSlot>,
+    /// The shader property's `NiTexturingProperty` clamp mode, packed as the NIF does
+    /// (bit 1 for S, bit 0 for T; 3 is wrap, wrap). Published as a glTF sampler and as
+    /// a wrap-suffixed texture alias, so a clamped decal and a wrapping tiling surface
+    /// can share one KTX2.
     pub texture_clamp_mode: u8,
     /// Shader-variable float controllers on this shape's shader property.
     ///
@@ -158,6 +314,64 @@ pub struct ValidatedNifMaterial {
     /// (`docs/specs/converters/nif-to-gltf.md`). Empty for a static material.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub animation: Vec<NifMaterialAnimationChannel>,
+}
+
+/// How Skyrim's shader reads a shape's vertex colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexColourUse {
+    /// No vertex-colour technique: the shader never reads the colour at all.
+    Ignored,
+    /// RGB tints the shape; the alpha is not opacity (the shader does not read it, or tree
+    /// animation's wind amplitude).
+    ColourOnly,
+    /// RGB tints the shape and the alpha multiplies its opacity, in the blend or the alpha test.
+    ColourAndOpacity,
+}
+
+impl ValidatedNifMaterial {
+    /// How Skyrim reads this shape's vertex colours.
+    ///
+    /// Both shader families read vertex colours only under their `VC` technique, which
+    /// `SLSF2_Vertex_Colors` selects (the vertex shader otherwise passes `1.0`;
+    /// Community Shaders' `Lighting.hlsl` and `Effect.hlsl`).
+    ///
+    /// On a lighting shape the alpha is opacity when `SLSF1_Vertex_Alpha` is set, and it then
+    /// enters the alpha test as well as the blend (`Lighting.hlsl` multiplies `input.Color.w` into
+    /// the alpha before the `DO_ALPHA_TEST` discard): the gravel skirts under rocks and the moss
+    /// and plaster decals on walls fade out at their rims. Without the flag the alpha is not
+    /// opacity: Whiterun's alpha-tested wall caps, fence bases and rugs carry vertex alpha far
+    /// below their cutoff (0 against 0.5) and draw solid. Tree-animated foliage never reads it as
+    /// opacity; there it is the wind amplitude (`GetTreeShiftVector` scales the sway by `color.w`).
+    /// TreeAnimation, LodObjects and LodObjectsHd also exclude vertex opacity independently of
+    /// the TREE_ANIM flag.
+    ///
+    /// On an effect shape the alpha is kept as opacity when the shape blends: an effect card's
+    /// faded edges, a glow.
+    pub fn vertex_colour_use(&self) -> VertexColourUse {
+        if self.shader_flags_2 & SLSF2_VERTEX_COLORS == 0 {
+            return VertexColourUse::Ignored;
+        }
+        let opacity = match self.shader_family {
+            NifShaderFamily::Lighting => {
+                self.shader_flags_2 & SLSF2_TREE_ANIM == 0
+                    && self.shader_flags_1 & SLSF1_VERTEX_ALPHA != 0
+                    && !matches!(
+                        self.lighting_shader_type,
+                        Some(
+                            LightingShaderType::TreeAnimation
+                                | LightingShaderType::LodObjects
+                                | LightingShaderType::LodObjectsHd
+                        )
+                    )
+            }
+            NifShaderFamily::Effect => self.alpha_mode == NifAlphaMode::Blend,
+        };
+        if opacity {
+            VertexColourUse::ColourAndOpacity
+        } else {
+            VertexColourUse::ColourOnly
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -485,8 +699,23 @@ fn publish_material(
     let normal = texture_with_semantic(material, NifTextureSemantic::Normal);
     let glow = texture_with_semantic(material, NifTextureSemantic::Glow);
     let specular = texture_with_semantic(material, NifTextureSemantic::Specular);
+    // A `BSEffectShaderProperty` is unlit: its `base_color` is a tint multiplied
+    // by the source texture and `base_color_scale` is that tint's brightness, so
+    // the source texture is what the surface actually shows. It has no `Glow` slot
+    // (that is a lighting-shader semantic), so the emissive takes the source
+    // texture, and the albedo below drops to black: with the texture and the tint
+    // both in the emissive term the base-colour pass would only add a second,
+    // ambient-lit copy of the same image. The base colour's alpha is kept - it is
+    // the blend coverage the published `SRC_ALPHA` factors multiply.
+    let unlit_effect = material.shader_family == NifShaderFamily::Effect;
+    let emissive_texture = if unlit_effect { diffuse } else { glow };
+    let base_color_factor = if unlit_effect && emissive_texture.is_some() {
+        [0.0, 0.0, 0.0, material.base_color[3]]
+    } else {
+        material.base_color
+    };
     let mut pbr = serde_json::json!({
-        "baseColorFactor": material.base_color,
+        "baseColorFactor": base_color_factor,
         "metallicFactor": 0.0,
         "roughnessFactor": perceptual_roughness(material.glossiness)
     });
@@ -497,6 +726,14 @@ fn publish_material(
         });
     }
     let alpha_mode = material.alpha_mode;
+    // The blend factors only mean something for a material that blends: a shape
+    // whose `NiAlphaProperty` has the alpha test bit as well is published as
+    // `MASK`, not `BLEND`.
+    let published_blend_factors = if alpha_mode == NifAlphaMode::Blend {
+        material.blend_factors
+    } else {
+        None
+    };
     let mut output = serde_json::json!({
         "alphaMode": match alpha_mode {
             NifAlphaMode::Opaque => "OPAQUE",
@@ -544,7 +781,7 @@ fn publish_material(
     publish_emissive(
         &mut output,
         material,
-        glow,
+        emissive_texture,
         glb_output_path,
         registry,
         used_extensions,
@@ -581,6 +818,12 @@ fn publish_material(
         registry,
         used_extensions,
     )?;
+    publish_mudcrab_extension(
+        &mut output,
+        material,
+        published_blend_factors,
+        used_extensions,
+    );
     publish_material_animation(&mut output, material, used_extensions);
     Ok(output)
 }
@@ -605,10 +848,18 @@ fn publish_material_animation(
     used_extensions.insert("OPEN_SKYRIM_material_animation".to_owned());
 }
 
+/// Publishes the emissive term.
+///
+/// `emissive_texture` is the slot that carries the surface's own light: a lighting
+/// shader's `Glow` map, or - because an effect shader's look *is* its tinted source
+/// texture - the source texture of an effect shader (`publish_material` picks it).
+/// `emissive_color` is the tint and `emissive_multiple` its brightness, which is
+/// what they mean for an effect shader and what the lighting family stores a real
+/// emission and emission multiple in.
 fn publish_emissive(
     output: &mut serde_json::Value,
     material: &ValidatedNifMaterial,
-    glow: Option<&NifTextureSlot>,
+    emissive_texture: Option<&NifTextureSlot>,
     glb_output_path: &Path,
     registry: &mut TextureRegistry,
     used_extensions: &mut BTreeSet<String>,
@@ -629,7 +880,7 @@ fn publish_emissive(
         });
     }
     let has_color = material.emissive_color.iter().any(|value| *value > 0.0);
-    if glow.is_none() && !has_color {
+    if emissive_texture.is_none() && !has_color {
         return Ok(());
     }
     // glTF bounds the tint to [0, 1], but the extension preserves its authored
@@ -637,7 +888,7 @@ fn publish_emissive(
     let peak = material.emissive_color.into_iter().fold(1.0_f32, f32::max);
     let color = material.emissive_color.map(|value| value.max(0.0) / peak);
     output["emissiveFactor"] = serde_json::json!(color);
-    if let Some(slot) = glow {
+    if let Some(slot) = emissive_texture {
         output["emissiveTexture"] = serde_json::json!({
             "index": registry.texture(&slot.path, glb_output_path, true, material.texture_clamp_mode)?,
             "texCoord": 0
@@ -652,6 +903,14 @@ fn publish_emissive(
     Ok(())
 }
 
+/// Publishes `KHR_materials_specular`, including Skyrim's specular mask.
+///
+/// Skyrim multiplies its specular term by a mask that lives in the alpha channel of the
+/// normal map (`docs/research/gloss-mask-semantics.md`), which glTF can carry without any
+/// new texture: `specularTexture` points at the normal map's own texture index, whose alpha
+/// glTF samples as the mask. Model-space-normal meshes take the mask from slot 7's red
+/// channel instead, and that slot is already published as `specularColorTexture`, so they
+/// stay as they were.
 fn publish_specular(
     output: &mut serde_json::Value,
     material: &ValidatedNifMaterial,
@@ -693,6 +952,14 @@ fn publish_specular(
     Ok(())
 }
 
+/// Publishes the `OPEN_SKYRIM_material` extension.
+///
+/// This is the core extension, byte-for-byte what `main` writes: the same keys, the
+/// same values and the same emission rule (skipped for a material with no auxiliary
+/// texture slots and neither alpha flag). Everything `dev` adds on top of it (UV
+/// transform, effect falloff, blend factors) lives in `MUDCRAB_material`
+/// (`publish_mudcrab_extension`), so a mesh from `main`'s converter and a mesh from
+/// this one differ only by that extra extension.
 fn publish_skyrim_extension(
     output: &mut serde_json::Value,
     material: &ValidatedNifMaterial,
@@ -711,17 +978,25 @@ fn publish_skyrim_extension(
         ) {
             continue;
         }
+        // Detail and environment-cube textures are encoded with the sRGB transfer function
+        // (`texture.rs` counts both in its colour set), so the label, the URI (the
+        // `.opensky-srgb.ktx2` alias) and the file have to agree on it.
+        // (`main` labels only `Detail` as sRGB here: a core difference tracked as OP13.)
+        let srgb = matches!(
+            slot.semantic,
+            NifTextureSemantic::Detail | NifTextureSemantic::EnvironmentCube
+        );
         slots.push(serde_json::json!({
             "slot": slot.slot,
             "semantic": slot.semantic,
             "texture": registry.texture(
                 &slot.path,
                 glb_output_path,
-                matches!(slot.semantic, NifTextureSemantic::Detail),
+                srgb,
                 material.texture_clamp_mode,
             )?,
             "required": slot.required,
-            "colorSpace": if matches!(slot.semantic, NifTextureSemantic::Detail) { "srgb" } else { "linear" }
+            "colorSpace": if srgb { "srgb" } else { "linear" }
         }));
     }
     let premultiplied_alpha = material.shader_flags_2 & SLSF2_PREMULTIPLIED_ALPHA != 0;
@@ -740,6 +1015,77 @@ fn publish_skyrim_extension(
     });
     used_extensions.insert("OPEN_SKYRIM_material".to_owned());
     Ok(())
+}
+
+/// Publishes the `MUDCRAB_material` extension (data-set extension `mudcrab.material`,
+/// version 1): the material data `main`'s `OPEN_SKYRIM_material` does not carry.
+///
+/// Keys: `uvOffset`/`uvScale` (the static UV transform), the five effect falloff keys
+/// and `blendSource`/`blendDestination`. A material with the identity UV transform,
+/// no falloff and no blend factors gets no extension, and a reader treats an absent
+/// extension or key as identity UVs, no falloff and the default blend.
+fn publish_mudcrab_extension(
+    output: &mut serde_json::Value,
+    material: &ValidatedNifMaterial,
+    blend_factors: Option<(NifBlendFactor, NifBlendFactor)>,
+    used_extensions: &mut BTreeSet<String>,
+) {
+    let mut extension = serde_json::Map::new();
+    if material.uv_offset != [0.0; 2] || material.uv_scale != [1.0; 2] {
+        extension.insert("uvOffset".into(), serde_json::json!(material.uv_offset));
+        extension.insert("uvScale".into(), serde_json::json!(material.uv_scale));
+    }
+    if let Some(falloff) = material.effect_falloff.filter(|falloff| {
+        [
+            falloff.start_angle,
+            falloff.stop_angle,
+            falloff.start_opacity,
+            falloff.stop_opacity,
+            falloff.soft_depth,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+    }) {
+        // Named after the shader variables their float controllers drive, so an animated
+        // channel and the static value it overrides share a name. A non-finite value (which
+        // `serde_json` would write as `null`) leaves the fields out: the card loses its fade,
+        // not its model.
+        extension.insert(
+            "falloffStartAngle".into(),
+            serde_json::json!(falloff.start_angle),
+        );
+        extension.insert(
+            "falloffStopAngle".into(),
+            serde_json::json!(falloff.stop_angle),
+        );
+        extension.insert(
+            "falloffStartOpacity".into(),
+            serde_json::json!(falloff.start_opacity),
+        );
+        extension.insert(
+            "falloffStopOpacity".into(),
+            serde_json::json!(falloff.stop_opacity),
+        );
+        extension.insert(
+            "softFalloffDepth".into(),
+            serde_json::json!(falloff.soft_depth),
+        );
+    }
+    if let Some((source, destination)) = blend_factors {
+        // glTF `BLEND` cannot express these: an additive (`SRC_ALPHA`/`ONE`) or
+        // multiplicative (`ZERO`/`SRC_COLOR`) surface would be drawn as ordinary
+        // transparency without them.
+        extension.insert("blendSource".into(), serde_json::json!(source.name()));
+        extension.insert(
+            "blendDestination".into(),
+            serde_json::json!(destination.name()),
+        );
+    }
+    if extension.is_empty() {
+        return;
+    }
+    output["extensions"]["MUDCRAB_material"] = serde_json::Value::Object(extension);
+    used_extensions.insert("MUDCRAB_material".to_owned());
 }
 
 fn texture_with_semantic(
@@ -793,10 +1139,10 @@ fn build_shape_material(
     alpha_reference: u32,
     animation_skips: &mut NifAnimationSkips,
 ) -> Result<NifMaterialDisposition> {
-    if shape_name == Some("EditorMarker") && nif.blocks.iter().any(|block| {
-        matches!(block, NifBlock::BSXFlags(flags) if flags.integer_data & (1 << 5) != 0)
-    }) {
-        return Ok(NifMaterialDisposition::Excluded { reason: "declared BSX EditorMarker".into() });
+    if is_editor_marker_shape(shape_name) && declares_editor_marker(nif) {
+        return Ok(NifMaterialDisposition::Excluded {
+            reason: "editor marker shape".to_owned(),
+        });
     }
     if shader_reference == NULL_BLOCK {
         return Ok(NifMaterialDisposition::Excluded {
@@ -861,7 +1207,29 @@ fn build_shape_material(
         }
     };
     validate_material(source, shape_block, shape_name, &material)?;
+    if is_refraction_only(&material) {
+        return Ok(NifMaterialDisposition::Excluded {
+            reason: "refraction surface: Skyrim draws it only as a distortion of the scene behind"
+                .to_owned(),
+        });
+    }
     Ok(NifMaterialDisposition::Validated { material })
+}
+
+/// Whether a lighting material only bends the view of what is behind it.
+///
+/// Skyrim renders a refraction shape into a separate refraction target, from
+/// which a full-screen pass re-samples the scene behind at an offset taken from
+/// the normal map; the lighting shader has no colour path for it, whatever its
+/// diffuse slot holds. Skyrim SE ships 362 such shapes: the heat haze over every
+/// torch, sconce and fire (`VaporTileNormal_n`), water ripples, aquarium glass,
+/// Nocturnal's swirls. None has an alpha property, so publishing one as an
+/// ordinary material paints an opaque card over the scene. A renderer without
+/// screen-space refraction draws nothing for them; where Skyrim shows colour
+/// there, it comes from a separate alpha-blended or effect shape.
+fn is_refraction_only(material: &ValidatedNifMaterial) -> bool {
+    material.shader_family == NifShaderFamily::Lighting
+        && material.shader_flags_1 & SLSF1_REFRACTION != 0
 }
 
 fn resolve_alpha<'a>(
@@ -949,6 +1317,7 @@ fn build_lighting_material(
         alpha: material_alpha,
         alpha_mode,
         alpha_threshold,
+        blend_factors: blend_factors(alpha),
         glossiness: property.glossiness,
         specular_color: property.specular_color.0.to_array(),
         specular_strength: property.specular_strength,
@@ -969,6 +1338,7 @@ fn build_lighting_material(
             project_wormhole_nif::nif_enum::TexClampMode::WrapSClampT => 2,
             project_wormhole_nif::nif_enum::TexClampMode::WrapSWrapT => 3,
         },
+        effect_falloff: None,
         textures: textures.map(|(_, slots)| slots).unwrap_or_default(),
         animation,
     })
@@ -1032,15 +1402,29 @@ fn build_effect_material(
         alpha: color[3],
         alpha_mode,
         alpha_threshold,
+        blend_factors: blend_factors(alpha),
         glossiness: 0.0,
         specular_color: [0.0; 3],
         specular_strength: 0.0,
+        // For an effect shader these hold the tint on the source texture and that
+        // tint's brightness, which is not an emission of its own - the texture is
+        // what glows. `publish_material` publishes `source_texture` as the emissive
+        // texture, this colour as `emissiveFactor` and this scale as
+        // `KHR_materials_emissive_strength`; the field names stay because the
+        // lighting family keeps a real emission in them.
         emissive_color: [color[0], color[1], color[2]],
         emissive_multiple: property.base_color_scale,
         double_sided: flags_2 & SLSF2_DOUBLE_SIDED != 0,
         uv_offset: property.uv_offset.0.to_array(),
         uv_scale: property.uv_scale.0.to_array(),
         texture_clamp_mode: property.texture_clamp_mode & 3,
+        effect_falloff: Some(EffectFalloff {
+            start_angle: property.falloff_start_angle,
+            stop_angle: property.falloff_stop_angle,
+            start_opacity: property.falloff_start_opacity,
+            stop_opacity: property.falloff_stop_opacity,
+            soft_depth: property.soft_falloff_depth,
+        }),
         textures,
         animation,
     };
@@ -1786,15 +2170,18 @@ mod tests {
             alpha: 1.0,
             alpha_mode: mode,
             alpha_threshold: (mode == NifAlphaMode::Cutout).then_some(128),
+            blend_factors: None,
             glossiness: 32.0,
             specular_color: [1.0; 3],
             specular_strength: 1.0,
             emissive_color: if emissive { [1.0, 0.5, 0.25] } else { [0.0; 3] },
             emissive_multiple: if emissive { 2.0 } else { 0.0 },
             double_sided,
-            uv_offset: [0.0; 2],
-            uv_scale: [1.0; 2],
+            // The NIF defaults: no offset, no rescale.
+            uv_offset: [0.0, 0.0],
+            uv_scale: [1.0, 1.0],
             texture_clamp_mode: 3,
+            effect_falloff: None,
             textures: Vec::new(),
             animation: Vec::new(),
         }
@@ -2070,6 +2457,27 @@ mod tests {
     }
 
     #[test]
+    fn maps_glossiness_to_roughness_as_a_blinn_phong_exponent() {
+        // Rows of `docs/research/specular-gloss-mapping.md` section 5.1, recomputed from
+        // `(2 / (n + 2))^(1/4)` in f32. 100 is the first value the old linear mapping flattened to
+        // a mirror.
+        for (glossiness, expected) in [
+            (0.0, 1.0),
+            (5.0, 0.731_110_5),
+            (30.0, 0.5),
+            (80.0, 0.395_188_28),
+            (100.0, 0.374_203_18),
+            (400.0, 0.265_583_43),
+        ] {
+            let roughness = perceptual_roughness(glossiness);
+            assert!(
+                (roughness - expected).abs() < 1e-3,
+                "glossiness {glossiness} gave roughness {roughness}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn v6_emission_contract_rejects_invalid_channels_and_negative_effect_strength() {
         for channel in 0..3 {
             for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
@@ -2082,6 +2490,81 @@ mod tests {
         material.emissive_multiple = -1.0;
         material.shader_family = NifShaderFamily::Effect;
         assert!(validate_material(Path::new("fixture.nif"), 3, None, &material).is_err());
+    }
+
+    #[test]
+    fn roughness_decreases_strictly_with_glossiness() {
+        let sweep = [
+            0.0,
+            0.25,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            30.0,
+            32.0,
+            50.0,
+            80.0,
+            100.0,
+            128.0,
+            200.0,
+            256.0,
+            400.0,
+            512.0,
+            1000.0,
+            4096.0,
+            65536.0,
+            f32::MAX,
+        ];
+        for pair in sweep.windows(2) {
+            let (coarser, finer) = (pair[0], pair[1]);
+            let coarser_roughness = perceptual_roughness(coarser);
+            let finer_roughness = perceptual_roughness(finer);
+            assert!(
+                finer_roughness < coarser_roughness,
+                "glossiness {finer} gave roughness {finer_roughness}, not below the \
+                 {coarser_roughness} of glossiness {coarser}"
+            );
+        }
+    }
+
+    #[test]
+    fn roughness_stays_finite_and_inside_the_unit_interval() {
+        // `validate_material` rejects the negative and non-finite entries; they are here so that a
+        // caller which skips validation still cannot publish a NaN or a zero roughness.
+        let sweep = [
+            0.0,
+            -0.0,
+            1e-6,
+            1.0,
+            5.0,
+            30.0,
+            80.0,
+            400.0,
+            4096.0,
+            1.0e30,
+            f32::MAX,
+            -1.0,
+            -1.0e30,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        for glossiness in sweep {
+            let roughness = perceptual_roughness(glossiness);
+            assert!(
+                roughness.is_finite() && roughness > 0.0 && roughness <= 1.0,
+                "glossiness {glossiness} gave roughness {roughness}"
+            );
+        }
+    }
+
+    #[test]
+    fn materials_without_a_glossiness_field_are_fully_rough() {
+        // A `BSEffectShaderProperty` has no glossiness field and `build_effect_material` publishes
+        // 0 for it, which the exponent mapping takes to the matte end exactly - the same roughness
+        // the old linear mapping gave it.
+        assert_eq!(perceptual_roughness(0.0), 1.0);
     }
 
     #[test]
@@ -2408,6 +2891,17 @@ mod tests {
             published["extensions"]["KHR_materials_specular"]["specularColorTexture"]["index"],
             3
         );
+        // The mask is the normal map's alpha, so the extension points at the normal map's own
+        // texture object; the factor stays bounded (main's #141 contract: the engine's native
+        // loader owns the Bevy-specific compensation).
+        assert_eq!(
+            published["extensions"]["KHR_materials_specular"]["specularTexture"]["index"],
+            published["normalTexture"]["index"]
+        );
+        assert_eq!(
+            published["extensions"]["KHR_materials_specular"]["specularFactor"],
+            1.0
+        );
         assert_eq!(document["meshes"][0]["primitives"][0]["material"], 0);
         assert_eq!(
             document["images"][0]["uri"],
@@ -2427,6 +2921,201 @@ mod tests {
         assert!(document.get("extensionsRequired").is_none());
     }
 
+    /// Compares a published factor array against `f32` expectations: the JSON
+    /// carries the widened `f32`, so the decimal literal is not the value
+    /// (`1.6` arrives as `1.600000023841858`).
+    fn assert_factors(published: &serde_json::Value, expected: &[f32]) {
+        let actual = published
+            .as_array()
+            .expect("published factors must be an array");
+        assert_eq!(actual.len(), expected.len(), "published {published}");
+        for (actual, expected) in actual.iter().zip(expected) {
+            let actual = actual.as_f64().unwrap();
+            assert!(
+                (actual - f64::from(*expected)).abs() < 1e-6,
+                "published {published}, expected {expected:?}"
+            );
+        }
+    }
+
+    fn publish_single(material: ValidatedNifMaterial) -> serde_json::Value {
+        let mut document = gltf(1);
+        publish_gltf_materials(
+            &mut document,
+            &[shape(10, material)],
+            &[10],
+            Path::new("assets/meshes/effects/fxambbeamdust01.glb"),
+        )
+        .unwrap();
+        document
+    }
+
+    /// An effect-shader material as `build_effect_material` produces one: the tint
+    /// and its brightness in the emissive fields, the source texture in a `Diffuse`
+    /// slot and no lighting slot at all.
+    fn effect_material(source_texture: Option<&str>, scale: f32) -> ValidatedNifMaterial {
+        let mut material = fixture(NifAlphaMode::Blend, true, false, false);
+        material.shader_family = NifShaderFamily::Effect;
+        material.lighting_shader_type = None;
+        material.texture_set_block = None;
+        material.glossiness = 0.0;
+        material.specular_color = [0.0; 3];
+        material.specular_strength = 0.0;
+        material.base_color = [1.0, 0.5, 0.25, 1.0];
+        material.alpha = 1.0;
+        material.emissive_color = [1.0, 0.5, 0.25];
+        material.emissive_multiple = scale;
+        material.blend_factors = Some((NifBlendFactor::SourceAlpha, NifBlendFactor::One));
+        material.textures = source_texture
+            .map(|path| NifTextureSlot {
+                slot: 0,
+                semantic: NifTextureSemantic::Diffuse,
+                path: path.to_owned(),
+                required: true,
+            })
+            .into_iter()
+            .collect();
+        material
+    }
+
+    #[test]
+    fn publishes_the_effect_source_texture_as_a_tinted_unlit_emissive() {
+        let document = publish_single(effect_material(
+            Some("textures/effects/fxfireatlas04.dds"),
+            1.6,
+        ));
+        let published = &document["materials"][0];
+        // The texture is the source image, the same registry entry the base colour
+        // texture takes, and it is the emissive that carries it.
+        let base_index = published["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+            .as_u64()
+            .unwrap();
+        let emissive_index = published["emissiveTexture"]["index"].as_u64().unwrap();
+        assert_eq!(emissive_index, base_index);
+        assert_eq!(
+            document["images"][emissive_index as usize]["uri"],
+            "../../textures/effects/fxfireatlas04.opensky-srgb.ktx2"
+        );
+        // The tint is the emissive colour and its brightness is the strength.
+        assert_factors(&published["emissiveFactor"], &[1.0, 0.5, 0.25]);
+        let strength =
+            published["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"]
+                .as_f64()
+                .unwrap();
+        assert!((strength - 1.6).abs() < 1e-6, "strength {strength}");
+        // The albedo RGB is zero with the coverage alpha kept, so the emissive term
+        // is the whole look.
+        assert_factors(
+            &published["pbrMetallicRoughness"]["baseColorFactor"],
+            &[0.0, 0.0, 0.0, 1.0],
+        );
+        // Alpha mode and blend factors are untouched. A source-texture-only effect has no
+        // auxiliary slots and neither alpha flag, so main's rule publishes no core extension;
+        // the blend factors live in `MUDCRAB_material`.
+        assert_eq!(published["alphaMode"], "BLEND");
+        assert!(
+            published["extensions"]
+                .get("OPEN_SKYRIM_material")
+                .is_none()
+        );
+        let mudcrab = &published["extensions"]["MUDCRAB_material"];
+        assert_eq!(mudcrab["blendSource"], "SRC_ALPHA");
+        assert_eq!(mudcrab["blendDestination"], "ONE");
+    }
+
+    #[test]
+    fn keeps_the_effect_albedo_alpha_which_is_the_blend_coverage() {
+        let mut material = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        material.base_color = [0.8, 0.8, 0.8, 0.9];
+        material.alpha = 0.9;
+        let document = publish_single(material);
+        assert_factors(
+            &document["materials"][0]["pbrMetallicRoughness"]["baseColorFactor"],
+            &[0.0, 0.0, 0.0, 0.9],
+        );
+    }
+
+    #[test]
+    fn publishes_a_lighting_glow_map_as_before() {
+        let mut material = fixture(NifAlphaMode::Opaque, true, false, false);
+        material.textures = vec![
+            NifTextureSlot {
+                slot: 0,
+                semantic: NifTextureSemantic::Diffuse,
+                path: "textures/clutter/candles/horncandles01.dds".to_owned(),
+                required: true,
+            },
+            NifTextureSlot {
+                slot: 2,
+                semantic: NifTextureSemantic::Glow,
+                path: "textures/clutter/candles/horncandles01_g.dds".to_owned(),
+                required: false,
+            },
+        ];
+        let document = publish_single(material);
+        let published = &document["materials"][0];
+        // The albedo is the shader's own base colour, not a zeroed effect one.
+        assert_factors(
+            &published["pbrMetallicRoughness"]["baseColorFactor"],
+            &[1.0, 1.0, 1.0, 1.0],
+        );
+        assert_factors(&published["emissiveFactor"], &[1.0, 0.5, 0.25]);
+        // The emissive still takes the `Glow` slot, not the diffuse texture.
+        let emissive_index = published["emissiveTexture"]["index"].as_u64().unwrap();
+        assert_ne!(
+            emissive_index,
+            published["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+                .as_u64()
+                .unwrap()
+        );
+        assert_eq!(
+            document["images"][emissive_index as usize]["uri"],
+            "../../textures/clutter/candles/horncandles01_g.opensky-srgb.ktx2"
+        );
+    }
+
+    #[test]
+    fn leaves_an_untextured_effect_material_as_it_was() {
+        // `Effects\TESTCandleFlame01.nif`: an effect shader with no source texture
+        // in the NIF. There is no texture to attach, so nothing changes.
+        let mut material = effect_material(None, 1.0);
+        material.alpha_mode = NifAlphaMode::Opaque;
+        material.blend_factors = None;
+        material.base_color = [1.0; 4];
+        material.emissive_color = [1.0; 3];
+        let document = publish_single(material);
+        let published = &document["materials"][0];
+        assert_eq!(published["alphaMode"], "OPAQUE");
+        assert_eq!(
+            published["pbrMetallicRoughness"]["baseColorFactor"],
+            serde_json::json!([1.0, 1.0, 1.0, 1.0])
+        );
+        assert!(
+            published["pbrMetallicRoughness"]
+                .get("baseColorTexture")
+                .is_none()
+        );
+        assert_eq!(
+            published["emissiveFactor"],
+            serde_json::json!([1.0, 1.0, 1.0])
+        );
+        assert!(published.get("emissiveTexture").is_none());
+        // Neither extension is published: main's rule skips `OPEN_SKYRIM_material` (no
+        // auxiliary slots, no alpha flag), and the material has an identity UV transform, no
+        // falloff and no blend factors, so it has no `MUDCRAB_material` either.
+        assert!(
+            published["extensions"]
+                .get("OPEN_SKYRIM_material")
+                .is_none()
+        );
+        assert!(published["extensions"].get("MUDCRAB_material").is_none());
+        assert!(
+            published["extensions"]
+                .get("OPEN_SKYRIM_material_animation")
+                .is_none()
+        );
+    }
+
     #[test]
     fn preserves_shape_association_and_skyrim_only_texture_semantics() {
         let first = fixture(NifAlphaMode::Opaque, false, false, false);
@@ -2443,6 +3132,12 @@ mod tests {
                 semantic: NifTextureSemantic::EnvironmentCube,
                 path: "textures/cubemaps/ore_e.dds".to_owned(),
                 required: true,
+            },
+            NifTextureSlot {
+                slot: 6,
+                semantic: NifTextureSemantic::InnerLayer,
+                path: "textures/cubemaps/ore_m.dds".to_owned(),
+                required: false,
             },
         ];
         let contract = vec![shape(10, first), shape(20, second)];
@@ -2462,16 +3157,61 @@ mod tests {
         let slots = document["materials"][1]["extensions"]["OPEN_SKYRIM_material"]["textureSlots"]
             .as_array()
             .unwrap();
+        // The label, the URI and the file have to agree on the colour space: `texture.rs`
+        // encodes detail and environment-cube textures with the sRGB transfer function, so
+        // both publish the `srgb` label and the `.opensky-srgb.ktx2` alias, and everything
+        // else stays linear.
         assert_eq!(slots[0]["colorSpace"], "srgb");
-        assert_eq!(slots[1]["colorSpace"], "linear");
+        assert_eq!(slots[1]["colorSpace"], "srgb");
+        assert_eq!(slots[2]["colorSpace"], "linear");
         assert_eq!(
             document["images"][0]["uri"],
             "../../../textures/detail.opensky-srgb.ktx2"
         );
         assert_eq!(
             document["images"][1]["uri"],
-            "../../../textures/cubemaps/ore_e.ktx2"
+            "../../../textures/cubemaps/ore_e.opensky-srgb.ktx2"
         );
+        assert_eq!(
+            document["images"][2]["uri"],
+            "../../../textures/cubemaps/ore_m.ktx2"
+        );
+    }
+
+    #[test]
+    fn a_refraction_surface_draws_nothing() {
+        let mut haze = fixture(NifAlphaMode::Opaque, false, false, false);
+        haze.shader_flags_1 = SLSF1_REFRACTION | (1 << 16);
+        haze.textures = vec![
+            texture_slot(
+                0,
+                NifTextureSemantic::Diffuse,
+                "textures/effects/VaporTileNormal_n.dds",
+                true,
+            )
+            .unwrap(),
+            texture_slot(
+                1,
+                NifTextureSemantic::Normal,
+                "textures/effects/VaporTileNormal_n.dds",
+                true,
+            )
+            .unwrap(),
+        ];
+        assert!(is_refraction_only(&haze));
+
+        // A refraction surface with a colour texture draws nothing either: the
+        // colour Skyrim shows there comes from a separate shape. A normal map in the
+        // diffuse slot means nothing without the flag.
+        let mut swirls = haze.clone();
+        swirls.textures[0].path = "textures/effects/DarkSwirls.dds".to_owned();
+        assert!(is_refraction_only(&swirls));
+        let mut plain = haze.clone();
+        plain.shader_flags_1 = 0;
+        assert!(!is_refraction_only(&plain));
+        let mut effect = haze;
+        effect.shader_family = NifShaderFamily::Effect;
+        assert!(!is_refraction_only(&effect));
     }
 
     #[test]
@@ -2556,8 +3296,33 @@ mod tests {
         );
     }
 
+    /// `SLSF1_VERTEX_ALPHA`, `SkyrimShaderPropertyFlags1` bit 3 (nif.xml). The
+    /// converter deliberately treats it as no blend state at all, so the test
+    /// names the bit instead of production code.
+    const VERTEX_ALPHA: u32 = 1 << 3;
+
+    /// Parses an `NiAlphaProperty` from the block bytes the NIF reader reads:
+    /// name string index, no extra data, no controller, flag word, threshold.
+    fn alpha_property(flags: u16, threshold: u8) -> NiAlphaProperty {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&flags.to_le_bytes());
+        bytes.push(threshold);
+        match NifBlock::parse(&bytes, "NiAlphaProperty".to_owned()) {
+            Ok((_, NifBlock::NiAlphaProperty(property))) => property,
+            other => panic!("alpha property fixture did not parse: {other:?}"),
+        }
+    }
+
     #[test]
     fn v14_shader_alpha_flags_do_not_enable_blending_without_an_alpha_property() {
+        // Skyrim's blend state comes from `NiAlphaProperty`, not from a shader flag:
+        // `SLSF1_VERTEX_ALPHA` only asks the shader to read per-vertex alpha
+        // (`docs/research/transparent-and-misplaced-meshes.md`), and screen-door
+        // fade and premultiplied alpha are published as material extras instead of
+        // switching the shape into the transparent pass.
         let mut material = fixture(NifAlphaMode::Opaque, false, false, false);
         material.alpha = 0.25;
         material.base_color[3] = 0.25;
@@ -2574,6 +3339,374 @@ mod tests {
             NifAlphaMode::Opaque
         );
     }
+
+    #[test]
+    fn alpha_property_alone_still_decides_blend_and_cutout() {
+        // A property with the blend bit is a blend whatever the shader flags say.
+        // `0x100D` is the torch's `GlowAddMesh`: SRC_ALPHA / ONE, no test.
+        let blend = alpha_property(0x100D, 128);
+        assert_eq!(
+            alpha_contract(Some((89, &blend)), VERTEX_ALPHA, 0).0,
+            NifAlphaMode::Blend
+        );
+        assert_eq!(
+            blend_factors(Some((89, &blend))),
+            Some((NifBlendFactor::SourceAlpha, NifBlendFactor::One))
+        );
+        // The test bit wins over the blend bit: this is the ice pile's
+        // `IcePileM02:6`, a cutout at its own threshold.
+        let cutout = alpha_property(0x12EC, 26);
+        assert_eq!(
+            alpha_contract(Some((13, &cutout)), VERTEX_ALPHA, 0),
+            (NifAlphaMode::Cutout, Some(26), Some(13))
+        );
+        assert_eq!(blend_factors(Some((13, &cutout))), None);
+        assert_eq!(blend_factors(None), None);
+        // An `AlphaFunction` code the format does not define keeps the glTF
+        // default of that side instead of inventing a factor.
+        let undefined = alpha_property(0x0001 | (15 << 1) | (15 << 5), 128);
+        assert_eq!(
+            blend_factors(Some((14, &undefined))),
+            Some((
+                NifBlendFactor::SourceAlpha,
+                NifBlendFactor::InverseSourceAlpha
+            ))
+        );
+    }
+
+    #[test]
+    fn publishes_blend_factors_only_for_blending_materials() {
+        let mut additive = fixture(NifAlphaMode::Blend, false, false, false);
+        additive.blend_factors = Some((NifBlendFactor::SourceAlpha, NifBlendFactor::One));
+        let mut straight = fixture(NifAlphaMode::Blend, false, false, false);
+        straight.blend_factors = Some((
+            NifBlendFactor::SourceAlpha,
+            NifBlendFactor::InverseSourceAlpha,
+        ));
+        let opaque = fixture(NifAlphaMode::Opaque, false, false, false);
+        let mut opaque_with_slots = fixture(NifAlphaMode::Opaque, false, false, false);
+        opaque_with_slots.textures = vec![NifTextureSlot {
+            slot: 3,
+            semantic: NifTextureSemantic::Detail,
+            path: "textures/architecture/detail.dds".to_owned(),
+            required: false,
+        }];
+        let contract = vec![
+            shape(10, additive),
+            shape(20, straight),
+            shape(30, opaque),
+            shape(40, opaque_with_slots),
+        ];
+        let mut document = gltf(4);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[10, 20, 30, 40],
+            Path::new("assets/meshes/weapons/torch/torch.glb"),
+        )
+        .unwrap();
+
+        let additive = &document["materials"][0]["extensions"]["MUDCRAB_material"];
+        assert_eq!(document["materials"][0]["alphaMode"], "BLEND");
+        assert_eq!(additive["blendSource"], "SRC_ALPHA");
+        assert_eq!(additive["blendDestination"], "ONE");
+        let straight = &document["materials"][1]["extensions"]["MUDCRAB_material"];
+        assert_eq!(straight["blendSource"], "SRC_ALPHA");
+        assert_eq!(straight["blendDestination"], "INV_SRC_ALPHA");
+        assert_eq!(document["materials"][2]["alphaMode"], "OPAQUE");
+        // An opaque material publishes no blend factors at all, so it has no
+        // `MUDCRAB_material`.
+        assert!(
+            document["materials"][2]["extensions"]
+                .get("MUDCRAB_material")
+                .is_none()
+        );
+        // An opaque material that publishes the core extension for its texture slots must
+        // still carry no blend factors.
+        let opaque_with_slots = &document["materials"][3]["extensions"];
+        assert!(opaque_with_slots.get("OPEN_SKYRIM_material").is_some());
+        assert!(opaque_with_slots.get("MUDCRAB_material").is_none());
+        let used = document["extensionsUsed"].as_array().unwrap();
+        assert!(used.iter().any(|value| value == "OPEN_SKYRIM_material"));
+        assert!(used.iter().any(|value| value == "MUDCRAB_material"));
+    }
+
+    #[test]
+    fn publishes_a_non_default_uv_transform_on_both_shader_families() {
+        let mut lighting = fixture(NifAlphaMode::Opaque, false, false, false);
+        lighting.uv_offset = [0.25, -0.5];
+        lighting.uv_scale = [2.0, 3.0];
+        let mut effect = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        effect.uv_offset = [-0.125, 0.0625];
+        effect.uv_scale = [0.5, 4.0];
+        let contract = vec![shape(10, lighting), shape(20, effect)];
+        let mut document = gltf(2);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[10, 20],
+            Path::new("assets/meshes/effects/fxuvtransform.glb"),
+        )
+        .unwrap();
+
+        let lighting_extension = &document["materials"][0]["extensions"]["MUDCRAB_material"];
+        assert_factors(&lighting_extension["uvOffset"], &[0.25, -0.5]);
+        assert_factors(&lighting_extension["uvScale"], &[2.0, 3.0]);
+        let effect_extension = &document["materials"][1]["extensions"]["MUDCRAB_material"];
+        assert_factors(&effect_extension["uvOffset"], &[-0.125, 0.0625]);
+        assert_factors(&effect_extension["uvScale"], &[0.5, 4.0]);
+    }
+
+    #[test]
+    fn publishes_no_uv_keys_when_the_property_has_the_default_transform() {
+        // `fixture()` and `effect_material()` both start from the NIF defaults:
+        // no offset, no rescale. The effect still has blend factors, so it has a
+        // `MUDCRAB_material`, but one without UV keys; the lighting material has none.
+        let lighting = fixture(NifAlphaMode::Opaque, false, false, false);
+        let effect = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        let contract = vec![shape(10, lighting), shape(20, effect)];
+        let mut document = gltf(2);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[10, 20],
+            Path::new("assets/meshes/effects/fxuvdefault.glb"),
+        )
+        .unwrap();
+
+        assert!(
+            document["materials"][0]["extensions"]
+                .get("MUDCRAB_material")
+                .is_none()
+        );
+        let extension = &document["materials"][1]["extensions"]["MUDCRAB_material"];
+        assert!(extension.get("uvOffset").is_none());
+        assert!(extension.get("uvScale").is_none());
+    }
+
+    #[test]
+    fn publishes_effect_falloff_as_stored_and_only_on_effect_materials() {
+        let lighting = fixture(NifAlphaMode::Opaque, false, false, false);
+        let mut effect = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        // The hearth flame card's own values (fireplacewood01burning.nif, Flames:0).
+        effect.effect_falloff = Some(EffectFalloff {
+            start_angle: 0.1736,
+            stop_angle: 0.0872,
+            start_opacity: 1.0,
+            stop_opacity: 0.0,
+            soft_depth: 100.0,
+        });
+        let mut broken = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        broken.effect_falloff = Some(EffectFalloff {
+            start_angle: f32::NAN,
+            stop_angle: 0.0872,
+            start_opacity: 1.0,
+            stop_opacity: 0.0,
+            soft_depth: 100.0,
+        });
+        let contract = vec![shape(10, lighting), shape(20, effect), shape(30, broken)];
+        let mut document = gltf(3);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[10, 20, 30],
+            Path::new("assets/meshes/effects/fxfalloff.glb"),
+        )
+        .unwrap();
+
+        let fields = [
+            "falloffStartAngle",
+            "falloffStopAngle",
+            "falloffStartOpacity",
+            "falloffStopOpacity",
+            "softFalloffDepth",
+        ];
+        let extension =
+            |index: usize| &document["materials"][index]["extensions"]["MUDCRAB_material"];
+        for field in fields {
+            assert!(
+                extension(0).get(field).is_none(),
+                "lighting material has {field}"
+            );
+            assert!(
+                extension(2).get(field).is_none(),
+                "non-finite falloff published {field}"
+            );
+        }
+        let published: Vec<f64> = fields
+            .iter()
+            .map(|field| extension(1)[field].as_f64().unwrap())
+            .collect();
+        let expected = [0.1736, 0.0872, 1.0, 0.0, 100.0];
+        for (value, expected) in published.iter().zip(expected) {
+            assert!((value - expected).abs() < 1e-6, "{published:?}");
+        }
+    }
+
+    /// Main's `OPEN_SKYRIM_material` for a material with a `Detail` slot (texture 0), written as
+    /// literals: the keys, the values and the `textureSlots` entry `main`'s converter publishes.
+    #[test]
+    fn a_default_material_writes_main_core_extension_and_no_mudcrab_extension() {
+        let mut material = fixture(NifAlphaMode::Opaque, false, false, false);
+        material.textures = vec![NifTextureSlot {
+            slot: 3,
+            semantic: NifTextureSemantic::Detail,
+            path: "textures/architecture/detail.dds".to_owned(),
+            required: false,
+        }];
+        let document = publish_single(material);
+        let extensions = &document["materials"][0]["extensions"];
+        assert_eq!(
+            extensions["OPEN_SKYRIM_material"],
+            serde_json::json!({
+                "shaderFamily": "lighting",
+                "lightingShaderType": "default",
+                "shaderFlags1": SLSF1_SPECULAR,
+                "shaderFlags2": 0,
+                "premultipliedAlpha": false,
+                "screenDoorAlphaFade": false,
+                "textureSlots": [{
+                    "slot": 3,
+                    "semantic": "detail",
+                    "texture": 0,
+                    "required": false,
+                    "colorSpace": "srgb"
+                }]
+            })
+        );
+        assert!(
+            extensions.get("MUDCRAB_material").is_none(),
+            "identity UVs, no falloff and no blend factors write no MUDCRAB_material"
+        );
+        let used = document["extensionsUsed"].as_array().unwrap();
+        assert!(!used.iter().any(|value| value == "MUDCRAB_material"));
+        assert!(
+            document
+                .get("extensionsRequired")
+                .and_then(|required| required.as_array())
+                .is_none_or(|required| !required.iter().any(|value| value == "MUDCRAB_material"))
+        );
+    }
+
+    /// Main skips `OPEN_SKYRIM_material` for a material with no auxiliary slots and neither alpha
+    /// flag; so does this converter, whatever the UV transform or effect data say.
+    #[test]
+    fn the_core_extension_keeps_main_emission_rule() {
+        let mut material = fixture(NifAlphaMode::Opaque, false, false, false);
+        material.uv_offset = [0.25, 0.5];
+        let document = publish_single(material);
+        let extensions = &document["materials"][0]["extensions"];
+        assert!(extensions.get("OPEN_SKYRIM_material").is_none());
+        assert!(extensions.get("MUDCRAB_material").is_some());
+
+        let mut premultiplied = fixture(NifAlphaMode::Opaque, false, false, false);
+        premultiplied.shader_flags_2 |= SLSF2_PREMULTIPLIED_ALPHA;
+        let document = publish_single(premultiplied);
+        let core = &document["materials"][0]["extensions"]["OPEN_SKYRIM_material"];
+        assert_eq!(core["premultipliedAlpha"], true);
+        assert_eq!(core["textureSlots"], serde_json::json!([]));
+        assert!(
+            document["materials"][0]["extensions"]
+                .get("MUDCRAB_material")
+                .is_none()
+        );
+    }
+
+    /// Everything `dev` adds to a material round-trips through `MUDCRAB_material`, and none of it
+    /// leaks into the core extension.
+    #[test]
+    fn mudcrab_material_round_trips_uv_falloff_and_blend() {
+        let mut material = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        material.shader_flags_2 |= SLSF2_PREMULTIPLIED_ALPHA;
+        material.uv_offset = [0.125, -0.25];
+        material.uv_scale = [2.0, 0.5];
+        material.effect_falloff = Some(EffectFalloff {
+            start_angle: 0.1736,
+            stop_angle: 0.0872,
+            start_opacity: 1.0,
+            stop_opacity: 0.0,
+            soft_depth: 16.0,
+        });
+        material.blend_factors = Some((NifBlendFactor::SourceAlpha, NifBlendFactor::One));
+        let document = publish_single(material);
+        let extensions = &document["materials"][0]["extensions"];
+        assert_eq!(
+            extensions["MUDCRAB_material"],
+            serde_json::json!({
+                "uvOffset": [0.125, -0.25],
+                "uvScale": [2.0, 0.5],
+                "falloffStartAngle": 0.1736f32,
+                "falloffStopAngle": 0.0872f32,
+                "falloffStartOpacity": 1.0,
+                "falloffStopOpacity": 0.0,
+                "softFalloffDepth": 16.0,
+                "blendSource": "SRC_ALPHA",
+                "blendDestination": "ONE"
+            })
+        );
+        let core = extensions["OPEN_SKYRIM_material"].as_object().unwrap();
+        let mut keys = core.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "lightingShaderType",
+                "premultipliedAlpha",
+                "screenDoorAlphaFade",
+                "shaderFamily",
+                "shaderFlags1",
+                "shaderFlags2",
+                "textureSlots"
+            ],
+            "the core extension carries main's keys only"
+        );
+        let used = document["extensionsUsed"].as_array().unwrap();
+        assert!(used.iter().any(|value| value == "MUDCRAB_material"));
+    }
+
+    #[test]
+    fn recognises_editor_marker_shape_names_only() {
+        // `EditorMarker` is the only editor marker shape name in the converted
+        // set. Models whose name merely contains "Marker" are real objects the
+        // engine filters by path, so a substring rule would delete geometry.
+        assert!(is_editor_marker_shape(Some("EditorMarker")));
+        assert!(is_editor_marker_shape(Some("editormarker")));
+        assert!(is_editor_marker_shape(Some("EditorMarker:0")));
+        assert!(!is_editor_marker_shape(None));
+        assert!(!is_editor_marker_shape(Some("EditorMarkerDecal")));
+        assert!(!is_editor_marker_shape(Some("DoorLeft:12")));
+        assert!(!is_editor_marker_shape(Some("MarkerTeleport:0")));
+        assert!(!is_editor_marker_shape(Some("MarkerCOCHeading:0")));
+        assert!(!is_editor_marker_shape(Some("WayShrinePourMarker")));
+    }
+
+    #[test]
+    fn excludes_editor_marker_shapes_from_the_material_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let nif_path = directory.path().join("marker.nif");
+        let shape = dummy_content::nif::StaticShape {
+            name: "EditorMarker",
+            positions: &[[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0]],
+            normals: &[[0.0, 0.0, 1.0]; 3],
+            uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+            indices: &[[0, 1, 2]],
+            diffuse: "textures/generated_color.dds",
+            normal_texture: "textures/generated_normal.dds",
+        };
+        std::fs::write(&nif_path, dummy_content::nif::static_shape(&shape).unwrap()).unwrap();
+
+        let contract = crate::mesh::MeshConverter::inspect_nif_materials(&nif_path).unwrap();
+        assert_eq!(contract.len(), 1);
+        assert!(matches!(
+            contract[0].disposition,
+            NifMaterialDisposition::Excluded { .. }
+        ));
+    }
+
     fn quad_shape() -> dummy_content::nif::StaticShape<'static> {
         dummy_content::nif::StaticShape {
             name: "GeneratedFlame",

@@ -24,13 +24,22 @@ use std::path::Path;
 
 use bevy::prelude::*;
 use color_eyre::eyre::{Result, WrapErr};
-use shared::extensions::{DOOR_LINKS, DataExtensions, ExtensionStatus, MATERIAL};
+use shared::extensions::{
+    DIRECTIONAL_SNOW, DOOR_LINKS, DataExtensions, ExtensionStatus, MATERIAL, SPACE_LIGHTING,
+};
 
+use crate::portal_graph::PortalGraph;
+use crate::snow::DirectionalSnowCatalog;
 use crate::world::database::{DoorLinksAccess, WorldDatabaseFeatures, has_door_links};
+use crate::world::lighting::SpaceLightingCatalog;
 
 /// An engine feature that needs a data set extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Feature {
+    /// Snow-covered statics (`matos`, `static_materials`): [`crate::snow`].
+    DirectionalSnow,
+    /// Per-space ambient, fog and sky (`space_lighting`): [`crate::world::lighting`].
+    SpaceLighting,
     /// The portal graph and every load door's destination (`door_links`): [`crate::portal_graph`],
     /// [`crate::world::database`].
     DoorLinks,
@@ -42,11 +51,18 @@ pub enum Feature {
 
 impl Feature {
     /// Every feature, in the order notices are listed.
-    pub const ALL: [Self; 2] = [Self::DoorLinks, Self::Material];
+    pub const ALL: [Self; 4] = [
+        Self::DirectionalSnow,
+        Self::SpaceLighting,
+        Self::DoorLinks,
+        Self::Material,
+    ];
 
     /// The extension id the feature reads.
     pub const fn extension(self) -> &'static str {
         match self {
+            Self::DirectionalSnow => DIRECTIONAL_SNOW,
+            Self::SpaceLighting => SPACE_LIGHTING,
             Self::DoorLinks => DOOR_LINKS,
             Self::Material => MATERIAL,
         }
@@ -55,6 +71,8 @@ impl Feature {
     /// What the settings menu and the log call the feature.
     pub const fn label(self) -> &'static str {
         match self {
+            Self::DirectionalSnow => "directional snow",
+            Self::SpaceLighting => "per-space lighting",
             Self::DoorLinks => "load-door links and portal graph",
             Self::Material => "extra material data (UV transform, falloff, blend, animation)",
         }
@@ -197,42 +215,71 @@ pub fn describe(data: &DataExtensions) -> Vec<ExtensionLine> {
     lines
 }
 
-/// The public capability state used by the database and mesh readers.
-/// Private extension catalogs are installed by their introducing adapters.
+/// What the loaded data set gives the features that read extensions: a reader result for each
+/// extension that is usable, nothing for each that is not, and the notices for those.
 pub struct RuntimeFeatures {
     pub extensions: DataSetExtensions,
     pub notices: ExtensionNotices,
-    door_links: DoorLinksAccess,
-    has_doors: bool,
+    pub snow: Option<DirectionalSnowCatalog>,
+    pub space_lighting: Option<SpaceLightingCatalog>,
+    pub portal_graph: Option<PortalGraph>,
 }
 
 impl RuntimeFeatures {
+    /// What the world database worker has to read beyond the core tables.
     pub fn world_database(&self) -> WorldDatabaseFeatures {
         WorldDatabaseFeatures {
-            door_links: self.door_links,
+            door_links: if self.extensions.data().get(DOOR_LINKS).is_none() {
+                DoorLinksAccess::Core
+            } else if self.portal_graph.is_some() {
+                DoorLinksAccess::LegacyExtension
+            } else {
+                DoorLinksAccess::Disabled
+            },
         }
     }
 
+    /// Whether `feature` is usable in this data set.
     pub fn enabled(&self, feature: Feature) -> bool {
         if feature == Feature::DoorLinks {
-            self.has_doors && self.door_links != DoorLinksAccess::Disabled
+            self.portal_graph.is_some()
         } else {
             self.extensions.status(feature).is_present()
         }
     }
 
+    /// Inserts the extension resources into the app. A feature that is off inserts nothing.
     pub fn install(self, app: &mut App) {
         app.insert_resource(self.extensions)
             .insert_resource(self.notices);
+        if let Some(snow) = self.snow {
+            app.insert_resource(snow);
+        }
+        if let Some(space_lighting) = self.space_lighting {
+            app.insert_resource(space_lighting);
+        }
+        if let Some(graph) = self.portal_graph {
+            graph.log_summary();
+            app.insert_resource(graph);
+        }
     }
 }
 
-/// Opens the public capability gates without importing private feature readers.
-/// An invalid legacy declaration cannot bypass the gate through core discovery.
+/// Opens the extension readers of the data set at `assets_dir`.
+///
+/// Each of the four [`Feature`]s is asked of the manifest. A usable extension's reader runs, and an
+/// unreadable table is an error naming it. An unusable extension gets one `warn!` line and one
+/// notice, and its reader does not run.
 pub fn open_features(assets_dir: &Path, data: DataExtensions) -> Result<RuntimeFeatures> {
     let extensions = DataSetExtensions::new(data);
     let database = assets_dir.join("skyrim_world.db");
-    let has_doors = if database.is_file() {
+    let mut notices = Vec::new();
+    let mut snow = None;
+    let mut space_lighting = None;
+    let mut portal_graph = None;
+    // A declaration identifies the legacy contract even when stale or unsupported.
+    // Only an undeclared table is eligible for upstream core discovery.
+    let core_doors = if extensions.data().get(DOOR_LINKS).is_none() && database.is_file() {
         let connection = rusqlite::Connection::open_with_flags(
             &database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -241,22 +288,11 @@ pub fn open_features(assets_dir: &Path, data: DataExtensions) -> Result<RuntimeF
     } else {
         false
     };
-    let declared = extensions.data().get(DOOR_LINKS).is_some();
-    let door_links = if !declared {
-        DoorLinksAccess::Core
-    } else if extensions.status(Feature::DoorLinks).is_present() {
-        color_eyre::eyre::ensure!(
-            has_doors,
-            "extension {} is listed but its door_links table lacks columns",
-            DOOR_LINKS
-        );
-        DoorLinksAccess::LegacyExtension
-    } else {
-        DoorLinksAccess::Disabled
-    };
-    let mut notices = Vec::new();
+    if core_doors {
+        portal_graph = Some(PortalGraph::open(&database)?);
+    }
     for feature in Feature::ALL {
-        if feature == Feature::DoorLinks && !declared && has_doors {
+        if feature == Feature::DoorLinks && core_doors {
             continue;
         }
         let status = extensions.status(feature);
@@ -274,13 +310,22 @@ pub fn open_features(assets_dir: &Path, data: DataExtensions) -> Result<RuntimeF
                 feature: feature.label(),
                 reason,
             });
+            continue;
+        }
+        match feature {
+            Feature::DirectionalSnow => snow = Some(DirectionalSnowCatalog::open(&database)?),
+            Feature::SpaceLighting => space_lighting = Some(SpaceLightingCatalog::open(&database)?),
+            Feature::DoorLinks => portal_graph = Some(PortalGraph::open(&database)?),
+            // Read by the mesh loader, which treats an absent glTF extension as identity values.
+            Feature::Material => {}
         }
     }
     Ok(RuntimeFeatures {
         extensions,
         notices: ExtensionNotices(notices),
-        door_links,
-        has_doors,
+        snow,
+        space_lighting,
+        portal_graph,
     })
 }
 
@@ -387,6 +432,14 @@ mod tests {
     use super::fixtures::{MAIN_MANIFEST, data_set, manifest};
     use super::*;
     use shared::extensions::LOD_INVENTORY;
+
+    const ALL_FOUR: [(&str, u32, &str); 4] = [
+        (DIRECTIONAL_SNOW, 1, "core"),
+        (SPACE_LIGHTING, 1, "core"),
+        (DOOR_LINKS, 1, "core"),
+        (MATERIAL, 1, "core"),
+    ];
+
     fn open(directory: &tempfile::TempDir) -> Result<RuntimeFeatures> {
         open_features(
             directory.path(),
@@ -399,9 +452,70 @@ mod tests {
     }
 
     #[test]
+    fn every_listed_extension_reads_its_table() {
+        let directory = data_set(&manifest(&ALL_FOUR), Some("core"), &[]);
+        let features = open(&directory).unwrap();
+        assert!(features.notices.is_empty(), "{:?}", features.notices);
+        assert_eq!(features.snow.as_ref().unwrap().snowed_static_count(), 1);
+        assert_eq!(features.space_lighting.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            features
+                .portal_graph
+                .as_ref()
+                .unwrap()
+                .door(1)
+                .unwrap()
+                .door_ref,
+            1
+        );
+        assert_eq!(
+            features.world_database().door_links,
+            DoorLinksAccess::LegacyExtension
+        );
+        for feature in Feature::ALL {
+            assert!(features.enabled(feature), "{feature:?}");
+        }
+    }
+
+    #[test]
+    fn a_main_data_set_without_extensions_reports_every_feature_missing() {
+        // Historical core packs may lack both the door table and all optional extension tables.
+        let directory = data_set(
+            MAIN_MANIFEST,
+            None,
+            &["door_links", "static_materials", "matos", "space_lighting"],
+        );
+        let features = open(&directory).unwrap();
+        assert!(features.snow.is_none());
+        assert!(features.space_lighting.is_none());
+        assert!(features.portal_graph.is_none());
+        assert_eq!(features.world_database().door_links, DoorLinksAccess::Core);
+        assert_eq!(features.notices.len(), 4);
+        for feature in Feature::ALL {
+            let notice = features
+                .notices
+                .for_feature(feature)
+                .unwrap_or_else(|| panic!("{feature:?} has no notice"));
+            assert_eq!(notice.extension, feature.extension());
+            assert_eq!(notice.feature, feature.label());
+            assert!(
+                notice.reason.contains("not in this converted data set")
+                    && notice.reason.contains("convert it again"),
+                "{}",
+                notice.reason
+            );
+            assert_eq!(
+                features.extensions.status(feature),
+                ExtensionStatus::Missing
+            );
+        }
+    }
+
+    #[test]
     fn core_door_links_need_no_legacy_extension_declaration() {
         let directory = data_set(MAIN_MANIFEST, None, &[]);
         let features = open(&directory).unwrap();
+        assert!(features.portal_graph.as_ref().unwrap().door(1).is_some());
         assert!(features.enabled(Feature::DoorLinks));
         assert!(features.notices.for_feature(Feature::DoorLinks).is_none());
     }
@@ -416,6 +530,7 @@ mod tests {
         std::fs::write(directory.path().join("conversion-manifest.json"),
             serde_json::json!({"schema_version": shared::LOD_CONVERTER_SCHEMA_VERSION, "complete": true}).to_string()).unwrap();
         let features = open(&directory).unwrap();
+        assert!(features.portal_graph.is_some());
         assert!(features.enabled(Feature::DoorLinks));
         assert_eq!(features.world_database().door_links, DoorLinksAccess::Core);
         assert!(features.extensions.data().get(DOOR_LINKS).is_none());
@@ -439,6 +554,48 @@ mod tests {
         assert!(read_data_extensions(directory.path()).is_err());
     }
 
+    /// Per feature: not listed (the others are) -> that feature alone is off, with a notice, and the
+    /// others still read.
+    #[test]
+    fn an_unlisted_extension_switches_off_only_its_feature() {
+        for off in [
+            Feature::DirectionalSnow,
+            Feature::SpaceLighting,
+            Feature::DoorLinks,
+            Feature::Material,
+        ] {
+            let listed: Vec<_> = ALL_FOUR
+                .iter()
+                .copied()
+                .filter(|(id, _, _)| *id != off.extension())
+                .collect();
+            let removed: &[&str] = if off == Feature::DoorLinks {
+                &["door_links"]
+            } else {
+                &[]
+            };
+            let directory = data_set(&manifest(&listed), Some("core"), removed);
+            let features = open(&directory).unwrap();
+            assert_eq!(features.notices.len(), 1, "{off:?}");
+            assert!(features.notices.for_feature(off).is_some(), "{off:?}");
+            assert_eq!(
+                features.snow.is_some(),
+                off != Feature::DirectionalSnow,
+                "{off:?}"
+            );
+            assert_eq!(
+                features.space_lighting.is_some(),
+                off != Feature::SpaceLighting,
+                "{off:?}"
+            );
+            assert_eq!(
+                features.portal_graph.is_some(),
+                off != Feature::DoorLinks,
+                "{off:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_stale_extension_is_off_with_the_reason() {
         for feature in Feature::ALL {
@@ -460,6 +617,12 @@ mod tests {
                     DoorLinksAccess::Disabled
                 );
             }
+            assert!(features.snow.is_none());
+            assert_eq!(
+                features.portal_graph.is_some(),
+                feature != Feature::DoorLinks
+            );
+            assert!(features.space_lighting.is_none());
         }
     }
 
@@ -484,6 +647,31 @@ mod tests {
                     DoorLinksAccess::Disabled
                 );
             }
+            assert!(features.snow.is_none());
+            assert_eq!(
+                features.portal_graph.is_some(),
+                feature != Feature::DoorLinks
+            );
+            assert!(features.space_lighting.is_none());
+        }
+    }
+
+    /// A listed extension whose table is gone is a corrupt data set: an error naming the table, not
+    /// a feature quietly off.
+    #[test]
+    fn a_listed_extension_without_its_table_is_an_error() {
+        for (feature, tables) in [
+            (Feature::DirectionalSnow, &["matos"][..]),
+            (Feature::DirectionalSnow, &["static_materials"][..]),
+            (Feature::SpaceLighting, &["space_lighting"][..]),
+            (Feature::DoorLinks, &["door_links"][..]),
+        ] {
+            let directory = data_set(&only(feature, 1, "core"), Some("core"), tables);
+            let error = match open(&directory) {
+                Ok(_) => panic!("{feature:?} without {tables:?} opened"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(tables[0]), "{feature:?}: {error}");
         }
     }
 
@@ -495,19 +683,48 @@ mod tests {
             &[],
         );
         let features = open(&directory).unwrap();
-        assert_eq!(features.notices.len(), 1);
+        assert_eq!(features.notices.len(), 3);
         assert!(features.enabled(Feature::DoorLinks));
     }
+
     #[test]
-    fn a_declared_door_extension_requires_its_complete_table() {
-        let directory = data_set(
-            &only(Feature::DoorLinks, 1, "core"),
-            Some("core"),
-            &["door_links"],
+    fn describe_lists_every_extension_with_its_status() {
+        let data = DataExtensions::from_manifest_json(
+            &manifest(&[
+                (DOOR_LINKS, 1, "core"),
+                (SPACE_LIGHTING, 3, "core"),
+                (LOD_INVENTORY, 1, "core"),
+            ]),
+            Some("core".into()),
+        )
+        .unwrap();
+        let lines = describe(&data);
+        let by_id = |id: &str| lines.iter().find(|line| line.id == id).unwrap();
+        assert!(by_id(DOOR_LINKS).status.starts_with("present"));
+        assert!(by_id(SPACE_LIGHTING).status.contains("version 3"));
+        assert_eq!(by_id(LOD_INVENTORY).status, "not read by this engine");
+        assert_eq!(by_id(LOD_INVENTORY).feature, None);
+        assert_eq!(by_id(DIRECTIONAL_SNOW).version, None);
+        assert!(
+            by_id(DIRECTIONAL_SNOW)
+                .status
+                .contains("not in this converted data set")
         );
-        let error = open(&directory)
-            .err()
-            .expect("missing declared table must fail");
-        assert!(format!("{error:#}").contains("door_links"));
+        // A main data set has nothing to print.
+        let main = DataExtensions::from_manifest_json(MAIN_MANIFEST, None).unwrap();
+        assert!(describe(&main).is_empty());
+    }
+
+    #[test]
+    fn install_inserts_only_what_is_on() {
+        let directory = data_set(&only(Feature::SpaceLighting, 1, "core"), Some("core"), &[]);
+        let features = open(&directory).unwrap();
+        let mut app = App::new();
+        features.install(&mut app);
+        assert!(app.world().contains_resource::<DataSetExtensions>());
+        assert!(app.world().contains_resource::<ExtensionNotices>());
+        assert!(app.world().contains_resource::<SpaceLightingCatalog>());
+        assert!(!app.world().contains_resource::<DirectionalSnowCatalog>());
+        assert!(app.world().contains_resource::<PortalGraph>());
     }
 }

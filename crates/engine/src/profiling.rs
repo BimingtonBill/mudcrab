@@ -212,7 +212,12 @@ fn graph_lap_value(sides: &CycleSides, column: &str) -> Option<String> {
 ///
 /// A name here that no system records yet — the portal's five, on a branch where portal.rs does not
 /// span them — still gets its column, and the column stays zero.
-const FRAME_SERIES_COLUMNS: [&str; 11] = [
+const FRAME_SERIES_COLUMNS: [&str; 16] = [
+    "portal/isolate",
+    "portal/colliders",
+    "portal/update",
+    "portal/floor_probe",
+    "portal/propagate",
     "streaming/plan_cells",
     "streaming/frame_commit",
     "lod/collect",

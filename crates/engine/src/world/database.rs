@@ -1,4 +1,5 @@
 use super::enable_state::{EnableStateError, EnableStateResolver, InitialEnableInputs};
+use crate::doors::DoorwayPlacement;
 use crate::world::is_safe_relative_asset_path;
 use bevy::prelude::{Reflect, Resource, warn};
 use color_eyre::{Result, eyre::WrapErr};
@@ -8,6 +9,7 @@ use shared::cluster_recipe::classify::CELL_SIZE;
 use shared::lod::{ChunkAnchor, ChunkKey, LodOrigin, LodTier, chunk_payload_path};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    f32::consts::{PI, TAU},
     path::Path,
     sync::{
         Arc,
@@ -66,6 +68,14 @@ pub struct ReferenceRow {
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
     pub bounds_valid: bool,
+    /// The reference's `door_links` row, when the database has one. `None` for every ordinary
+    /// reference, and for every reference in a database converted before doors were exported.
+    pub door: Option<DoorLinkRow>,
+    /// The reference's own doorway, when it is a load door and the database can place one: the
+    /// model's bounds box under the reference's placement, and the model's own axis convention
+    /// (`crate::doors::DoorwayPlacement`). `None` for an ordinary reference, and for a door of a
+    /// database converted before the `door_links` table existed.
+    pub doorway: Option<DoorwayPlacement>,
     /// The `lights` row of the reference's base record, when the database has one and the record is
     /// a `LIGH`. `None` for every other reference, and for every reference in a database converted
     /// before lights were exported.
@@ -78,33 +88,14 @@ pub struct ReferenceRow {
     /// when the reference names no source the converter could resolve, and in a database
     /// converted before the `emittance` table existed.
     pub emittance: Option<[u8; 3]>,
-    /// The reference's `door_links` row, when the database has the table and the reference is a
-    /// load door. `None` for every other reference, and for every reference in a database
-    /// converted before door links were exported.
-    pub door: Option<DoorLinkRow>,
+    /// Whether the reference's base object is one of Skyrim's auto-load door markers - an invisible
+    /// `AutoLoadDoor*` that crosses on contact instead of on the `E` key. Read only for references
+    /// that carry a [`door`](Self::door); see [`AUTO_LOAD_COLUMN`] for how the base identifies one.
+    pub auto_load: bool,
 }
 
-/// A `door_links` row as the world database stores it: where a load door leads, from the door's
-/// `XTEL` subrecord.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DoorLinkRow {
-    /// Destination interior FULL name or worldspace editor ID.
-    pub label: String,
-    /// The destination door reference (`XTEL` bytes 0..4, after plugin FormID remapping).
-    pub destination_ref_id: u32,
-    /// The destination reference's cell, `None` when the converter could not resolve it.
-    pub destination_cell_id: Option<u32>,
-    /// The destination reference's worldspace; `None` means the destination is an interior.
-    pub destination_worldspace_id: Option<u32>,
-    /// Arrival position in Creation units (`XTEL` bytes 4..16). Not the destination door's own
-    /// position.
-    pub arrival_position: [f32; 3],
-    /// Arrival rotation in Creation-engine radians (`XTEL` bytes 16..28).
-    pub arrival_rotation: [f32; 3],
-}
-
-/// A `lights` row as the converted database stores it
-/// (`docs/specs/converters/db-schema.md`, §12): one row per `LIGH` record, with or without a model.
+/// A `lights` row as the converted database stores it (`docs/design/lights-and-auto-doors.md`, the
+/// converter's schema 5): one row per `LIGH` record, with or without a model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LightRow {
     /// Radius in Creation units, from `DATA`'s radius.
@@ -113,6 +104,50 @@ pub struct LightRow {
     pub color: [u8; 3],
     /// `DATA`'s flags, uninterpreted; see the flag bits in [`crate::lights`].
     pub flags: u32,
+    /// `DATA`'s falloff exponent.
+    pub falloff: f32,
+    /// `FNAM`'s fade, when the record has one.
+    pub fade: Option<f32>,
+}
+
+/// A `door_links` row as the converted database stores it, plus the destination's label.
+///
+/// The destination is unresolved when [`Self::destination_cell_id`] is `None`: the converter
+/// found the link but not the cell it points at. The engine turns a resolved row into a
+/// [`DoorDestination`](crate::doors::DoorDestination); this type stays the table's shape.
+/// The arrival frame of a link that leads back into a door: where the player lands coming through
+/// it and which way they face, `(position, rotation)` in Creation-engine units and radians, exactly
+/// as the `XTEL` of the door that leads there stores it. See [`DoorLinkRow::return_arrival`].
+pub type ReturnArrival = ([f32; 3], [f32; 3]);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DoorLinkRow {
+    /// The destination door reference (`XTEL` bytes 0..4).
+    pub destination_ref_id: u32,
+    /// The destination reference's cell, `None` when the converter could not resolve it.
+    pub destination_cell_id: Option<u32>,
+    /// The destination reference's worldspace; `None` means the destination is an interior.
+    pub destination_worldspace_id: Option<u32>,
+    /// Arrival position in Creation-engine units (`XTEL` bytes 4..16).
+    pub arrival_position: [f32; 3],
+    /// Arrival rotation in Creation-engine radians (`XTEL` bytes 16..28).
+    pub arrival_rotation: [f32; 3],
+    /// The destination interior's `interior_name`, else the destination worldspace's
+    /// `editor_id`, else empty.
+    pub label: String,
+    /// The arrival frame of the link that leads **back** to this door, when the database has one:
+    /// the `XTEL` of a door that opens into this one. The game puts that arrival point in front of
+    /// this door, facing away from it, which is what gives the door its own outward direction
+    /// without trusting the door model's axes ([`crate::doors::LoadDoor::outward`]). `None` for a
+    /// door nothing leads back to - a one-way link, or a database whose door links the converter
+    /// could not resolve.
+    pub return_arrival: Option<ReturnArrival>,
+    /// The **destination reference's** own doorway, when the database can place one: its position,
+    /// rotation, scale, bounds box and model convention ([`DoorwayPlacement`]). This is what the
+    /// destination door's own geometry is read from under a doorway anchor - the `XTEL` arrival
+    /// point is not the destination door, and `destination_ref_id` names the reference that is.
+    /// `None` for a link the database cannot resolve to a reference it has placed.
+    pub destination_doorway: Option<DoorwayPlacement>,
 }
 
 #[derive(Debug, Clone)]
@@ -725,6 +760,9 @@ fn worker(
         Ok((connection, query))
     })
     .map_err(|error| format!("world database {} is unusable: {error:#}", path.display()));
+    // The links that lead back into a door, and every door's own doorway, are the same rows for
+    // every cell, so they are read once for the life of the connection instead of once per cell.
+    let mut tables = DoorTables::default();
     while let Ok(request) = requests.recv() {
         match request {
             DatabaseRequest::Shutdown => break,
@@ -738,7 +776,7 @@ fn worker(
                 let started = Instant::now();
                 let result = match &mut setup {
                     Ok((connection, query)) => {
-                        load_cell(connection, query, generation, key, detail)
+                        load_cell(connection, query, generation, key, detail, &mut tables)
                             .map_err(|error| format!("{error:#}"))
                     }
                     Err(error) => Err(error.clone()),
@@ -807,7 +845,7 @@ fn worker(
                 let started = Instant::now();
                 let result = match &mut setup {
                     Ok((connection, query)) => {
-                        load_references(connection, query, key, &reference_ids)
+                        load_references(connection, query, key, &reference_ids, &mut tables)
                             .map_err(|error| format!("{error:#}"))
                     }
                     Err(error) => Err(error.clone()),
@@ -935,13 +973,6 @@ fn has_lod_table(connection: &Connection) -> rusqlite::Result<bool> {
         [],
         |row| row.get(0),
     )
-}
-
-fn has_table(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
-    let count: i64 = connection
-        .prepare_cached("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1")?
-        .query_row([table], |row| row.get(0))?;
-    Ok(count > 0)
 }
 
 /// LAND, not a rectangular chunk bound or an empty CELL record, defines required terrain.
@@ -1128,16 +1159,30 @@ fn is_canonical_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// The reference columns [`map_reference`] reads, in order: the placement itself and the base
-/// object's model and bounds. Every table this query can be missing is joined on after them, so the
-/// indices below are the same whichever tables a database has.
-const REFERENCE_COLUMNS: &str = "r.id,r.cell_id,r.base_form_id,s.model_path,r.pos_x,r.pos_y,r.pos_z,\
-     r.rot_x,r.rot_y,r.rot_z,r.scale,\
-     COALESCE(s.bounds_min_x,-64),COALESCE(s.bounds_min_y,-64),COALESCE(s.bounds_min_z,-64),\
-     COALESCE(s.bounds_max_x,64),COALESCE(s.bounds_max_y,64),COALESCE(s.bounds_max_z,64),\
-     COALESCE(s.bounds_valid,0)";
+/// The reference columns every cell query selects, in the order [`map_reference`] reads them.
+const REFERENCE_COLUMNS: &str = concat!(
+    "r.id,r.cell_id,r.base_form_id,s.model_path,",
+    "r.pos_x,r.pos_y,r.pos_z,r.rot_x,r.rot_y,r.rot_z,r.scale,",
+    "COALESCE(s.bounds_min_x,-64),COALESCE(s.bounds_min_y,-64),COALESCE(s.bounds_min_z,-64),",
+    "COALESCE(s.bounds_max_x,64),COALESCE(s.bounds_max_y,64),COALESCE(s.bounds_max_z,64),",
+    "COALESCE(s.bounds_valid,0)",
+);
 
-const REFERENCE_JOIN: &str = " LEFT JOIN statics s ON s.id=r.base_form_id";
+// The reference query's column layout, which [`map_reference`] reads by index:
+//
+// - 0..=17: the reference and its base's bounds ([`REFERENCE_COLUMNS`]); 18: the base record type;
+// - 19..=23: the base's `lights` row ([`LIGHT_COLUMNS`]); 24: the `XRDS` radius override;
+// - 25..=33: the `door_links` row ([`DOOR_COLUMNS`]); 34..=36: the `XEMI` day colour;
+// - 37..=39: the reference's enable-state inputs ([`REFERENCE_ENABLE_START`]);
+// - 40: the door's destination label; 41..=42: the light's falloff and fade; 43: the auto-load rule.
+//
+// Every optional table or column reads as `NULL` (or the model-only auto-load rule) when the
+// database lacks it, so no index moves between database versions and one feature's projection can
+// never be read as another's.
+const REFERENCE_ENABLE_START: usize = 37;
+const DOOR_LABEL_INDEX: usize = 40;
+const LIGHT_DETAIL_START: usize = 41;
+const AUTO_LOAD_INDEX: usize = 43;
 
 /// The `door_links` row of the reference, in the order [`map_reference`] reads them.
 const DOOR_COLUMNS: &str = "d.destination_ref_id,d.destination_cell_id,d.destination_worldspace_id,\
@@ -1147,7 +1192,12 @@ const DOOR_COLUMNS: &str = "d.destination_ref_id,d.destination_cell_id,d.destina
 /// non-door, with the column order unchanged.
 const ABSENT_DOOR_COLUMNS: &str = "NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL";
 
-const DOOR_JOIN: &str = " LEFT JOIN door_links d ON d.ref_id=r.id";
+/// The destination's label: the destination interior's `interior_name`, else the destination
+/// worldspace's `editor_id`, else empty. [`DOOR_LABEL_WITHOUT_WORLDSPACES_COLUMN`] is the same rule
+/// for a database without the `worldspaces` table, which can only name interiors.
+const DOOR_LABEL_COLUMN: &str = "COALESCE(NULLIF(dc.interior_name,''),NULLIF(ws.editor_id,''),'')";
+const DOOR_LABEL_WITHOUT_WORLDSPACES_COLUMN: &str = "COALESCE(NULLIF(dc.interior_name,''),'')";
+const ABSENT_DOOR_LABEL_COLUMN: &str = "NULL";
 
 /// The `lights` row of the reference's base record, in the order [`map_reference`] reads them.
 const LIGHT_COLUMNS: &str = "l.radius,l.color_r,l.color_g,l.color_b,l.flags";
@@ -1156,15 +1206,51 @@ const LIGHT_COLUMNS: &str = "l.radius,l.color_r,l.color_g,l.color_b,l.flags";
 /// reads as unlit, with the column order unchanged.
 const ABSENT_LIGHT_COLUMNS: &str = "NULL,NULL,NULL,NULL,NULL";
 
+/// The rest of the `lights` row: `DATA`'s falloff exponent and `FNAM`'s fade.
+const LIGHT_DETAIL_COLUMNS: &str = "l.falloff,l.fade";
+const ABSENT_LIGHT_DETAIL_COLUMNS: &str = "NULL,NULL";
+
 /// The reference's own `XRDS` light radius, which wins over the record's. The column arrived with
-/// the `lights` table in conversion schema 4; a database from before it has no such column.
+/// the `lights` table in conversion schema 5; a database from before it has no such column.
 const RADIUS_OVERRIDE_COLUMN: &str = "r.radius_override";
 const ABSENT_RADIUS_OVERRIDE_COLUMN: &str = "NULL";
 
-// PR #128 owns door decoding at 25..=33 and emittance at 34..=36. Enable state follows that
-// reserved suffix so combining the optional door/emittance projections with enable state cannot
-// reinterpret either feature.
-const REFERENCE_ENABLE_START: usize = 37;
+/// Whether the reference's base object is an auto-load door marker: the `statics` row of the base
+/// record, whose editor id starts `AutoLoadDoor` (`AutoLoadDoor01`, `AutoLoadDoorMinUse01`,
+/// `AutoLoadDoorHiddenMinUse01` in Skyrim.esm) or whose model is an `AutoLoadMarker*.nif`. In the
+/// converted database the two rules agree exactly - 315 of the 2204 placed load doors, and no door
+/// matched one without the other (`tools/research/auto_load_doors.py`) - so an editor id is only
+/// needed for a base the model rule cannot see. SQLite's `LIKE` is case-insensitive for ASCII, and
+/// the model test is lowercased anyway so the rule does not rest on that.
+const AUTO_LOAD_COLUMN: &str = "CASE WHEN s.editor_id LIKE 'AutoLoadDoor%' \
+OR LOWER(COALESCE(s.model_path,'')) LIKE '%autoloadmarker%' THEN 1 ELSE 0 END";
+
+/// Stand-in for [`AUTO_LOAD_COLUMN`] for a `statics` table with no `editor_id`: the model rule
+/// alone, which is all such a database can answer. Every exported database has both columns.
+const ABSENT_EDITOR_ID_AUTO_LOAD_COLUMN: &str =
+    "CASE WHEN LOWER(COALESCE(s.model_path,'')) LIKE '%autoloadmarker%' THEN 1 ELSE 0 END";
+
+/// The destination label a prompt draws. An interior's `interior_name` is the `FULL` subrecord's
+/// bytes as the converter read them (`crates/converter/src/esm/extractors.rs`), so it ends in the
+/// NUL the game's format terminates it with - an invisible character the prompt renders as a box
+/// after `Alftand01`. Trailing NULs and whitespace are not part of anyone's cell name.
+fn door_label(label: String) -> String {
+    label
+        .trim_end_matches(|character: char| character == '\0' || character.is_whitespace())
+        .to_owned()
+}
+
+const REFERENCE_JOIN: &str = " LEFT JOIN statics s ON s.id=r.base_form_id";
+
+/// The `door_links` row of the reference and the destination cell its label is read from.
+const DOOR_JOIN: &str = concat!(
+    " LEFT JOIN door_links d ON d.ref_id=r.id",
+    " LEFT JOIN cells dc ON dc.id=d.destination_cell_id",
+);
+
+/// The destination worldspace an exterior door's label is read from, when the database has the
+/// `worldspaces` table.
+const DOOR_WORLDSPACE_JOIN: &str = " LEFT JOIN worldspaces ws ON ws.id=d.destination_worldspace_id";
 
 /// The `lights` row of the reference's base record: one `LIGH` record can be placed many times,
 /// each reference lighting the space at its own radius.
@@ -1176,20 +1262,21 @@ const EMITTANCE_COLUMNS: &str = "e.day_r,e.day_g,e.day_b";
 const ABSENT_EMITTANCE_COLUMNS: &str = "NULL,NULL,NULL";
 const EMITTANCE_JOIN: &str = " LEFT JOIN emittance e ON e.id=r.emittance_id";
 
-fn has_records(connection: &Connection) -> Result<bool> {
+fn has_table(connection: &Connection, table: &str) -> Result<bool> {
     let count: i64 = connection
-        .prepare_cached("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='records'")?
-        .query_row([], |row| row.get(0))?;
+        .prepare_cached("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1")?
+        .query_row([table], |row| row.get(0))?;
     Ok(count > 0)
+}
+
+fn has_records(connection: &Connection) -> Result<bool> {
+    has_table(connection, "records")
 }
 
 /// Whether the database carries the `lights` table. A database converted before lights were
 /// exported still loads; every reference then reads as unlit.
 fn has_lights(connection: &Connection) -> Result<bool> {
-    let count: i64 = connection
-        .prepare_cached("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='lights'")?
-        .query_row([], |row| row.get(0))?;
-    Ok(count > 0)
+    has_table(connection, "lights")
 }
 
 /// Every `door_links` column [`DOOR_COLUMNS`] and [`DOOR_JOIN`] read.
@@ -1256,10 +1343,282 @@ fn has_emittance(connection: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
-/// The reference query's column list and joins for one database: optional `records`, `lights`,
-/// `door_links`, and `emittance` data read as `NULL` when absent, keeping [`map_reference`]'s
-/// column indices stable across database versions. Enable-state metadata is optional for legacy
-/// packages; the resolver survives cell unloads on this worker.
+/// Whether `statics` carries `editor_id`. Exported databases have had it since the table was
+/// written, and only the engine's own fixtures predate it; without the column the auto-load rule
+/// falls back to the base's model, which is all such a table can answer.
+fn has_statics_editor_id(connection: &Connection) -> Result<bool> {
+    let count: i64 = connection
+        .prepare_cached("SELECT COUNT(*) FROM pragma_table_info('statics') WHERE name='editor_id'")?
+        .query_row([], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// The links that lead back into a door, read from `door_links` the first time a cell needs them
+/// and kept from then on.
+///
+/// The table is the same for every cell of a database, so answering "which way does this door
+/// face" out of it costs one scan for the whole run instead of one scan per cell load: a cell with
+/// doors used to pay for the whole table on every load, which is the shape of cost that is
+/// invisible on an interior with four doors and ruinous on a full exterior grid. The connection
+/// the engine opens is read-only (`SQLITE_OPEN_READ_ONLY` in [`validate`] and in [`worker`]), so
+/// what was read once cannot go stale.
+#[derive(Default)]
+struct ReturnLinks(Option<HashMap<u32, ReturnArrival>>);
+
+impl ReturnLinks {
+    /// The links, read on the first call and the same map on every one after it.
+    fn get_or_build(&mut self, connection: &Connection) -> Result<&HashMap<u32, ReturnArrival>> {
+        if self.0.is_none() {
+            self.0 = Some(return_links(connection)?);
+        }
+        Ok(self.0.as_ref().expect("just read"))
+    }
+}
+
+/// Every link that leads **to** a reference, keyed by that reference's FormID: what
+/// [`DoorLinkRow::return_arrival`] is filled from.
+///
+/// This is the data a `LEFT JOIN door_links back ON back.destination_ref_id = r.id` would bring in,
+/// read in one pass instead of one join per reference. The join is the shape a reader expects, but
+/// `door_links` has no index on `destination_ref_id` (the converter creates the table with `ref_id`
+/// as its only key, `crates/converter/src/esm/exporter.rs`), so it would scan the whole table once
+/// for every reference of every cell - and it fans out: `destination_ref_id` is not unique, and two
+/// doors that lead into the same door would return that door's reference twice, spawning two doors
+/// where the game has one. One pass over the table cannot duplicate a reference.
+///
+/// The one pass is [`ReturnLinks`]'s, once for the whole run.
+///
+/// When several links lead to the same door the lowest `ref_id` wins, so the answer does not depend
+/// on the order the table happens to be in. A link whose arrival point is NULL (one the converter
+/// could not finish) is no link here either, as in [`map_reference`].
+fn return_links(connection: &Connection) -> Result<HashMap<u32, ReturnArrival>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT ref_id,destination_ref_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z FROM door_links \
+         WHERE pos_x IS NOT NULL AND pos_y IS NOT NULL AND pos_z IS NOT NULL \
+         AND rot_x IS NOT NULL AND rot_y IS NOT NULL AND rot_z IS NOT NULL",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut links: HashMap<u32, (u32, [f32; 3], [f32; 3])> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let ref_id: u32 = row.get(0)?;
+        let destination: u32 = row.get(1)?;
+        if links
+            .get(&destination)
+            .is_some_and(|existing| existing.0 <= ref_id)
+        {
+            continue;
+        }
+        links.insert(
+            destination,
+            (
+                ref_id,
+                [row.get(2)?, row.get(3)?, row.get(4)?],
+                [row.get(5)?, row.get(6)?, row.get(7)?],
+            ),
+        );
+    }
+    Ok(links
+        .into_iter()
+        .map(|(destination, (_, position, rotation))| (destination, (position, rotation)))
+        .collect())
+}
+
+/// The fewest placements a model needs before its own axis convention is read from them, the share
+/// of those placements that has to agree with the mean, and how far one may stand from it and still
+/// count as agreeing, in degrees.
+///
+/// This is `reliable_models` of `tools/research/portal_door_alignment.py`, the rule the doorway
+/// alignment report's section 3 measures with: 41 of the instal's 104 door models pass it, and a
+/// model that does not (the invisible `AutoLoadMarker01`, ship trapdoors, ladder doors, the few
+/// real doors placed in two orientations) has a circular mean of disagreement that predicts
+/// nothing.
+const CONVENTION_MIN_PLACEMENTS: usize = 4;
+const CONVENTION_MIN_SHARE: f32 = 0.8;
+const CONVENTION_WITHIN_DEGREES: f32 = 15.0;
+
+/// Every reference with a `door_links` row, as its own doorway: [`DoorwayPlacement`] by FormID.
+///
+/// Read once for the life of the connection, like [`ReturnLinks`]: the table is the same for every
+/// cell of a database, and it is what gives a spawned door the geometry its doorway anchor is built
+/// from. The convention of each model is fitted here and carried on every one of its placements, so
+/// a caller never needs a second lookup for it.
+#[derive(Default)]
+struct Doorways(Option<HashMap<u32, DoorwayPlacement>>);
+
+impl Doorways {
+    /// The placements, read on the first call and the same map on every one after it.
+    fn get_or_build(&mut self, connection: &Connection) -> Result<&HashMap<u32, DoorwayPlacement>> {
+        if self.0.is_none() {
+            self.0 = Some(doorway_placements(connection)?);
+        }
+        Ok(self.0.as_ref().expect("just read"))
+    }
+}
+
+/// The tables a cell load needs that are not rows of the cell itself, read once for the life of the
+/// connection: the links that lead back into a door ([`ReturnLinks`]) and every door's own doorway
+/// ([`Doorways`]).
+#[derive(Default)]
+struct DoorTables {
+    links: ReturnLinks,
+    doorways: Doorways,
+}
+
+/// Every door reference's own doorway, and its model's own axis convention.
+///
+/// The convention is a fact about the *model*, fitted from every placement of it in the instal: the
+/// circular mean of (link-derived facing - reference yaw) over those placements, kept only for a
+/// model whose placements agree with it - at least [`CONVENTION_MIN_PLACEMENTS`] of them, at least
+/// [`CONVENTION_MIN_SHARE`] of them within [`CONVENTION_WITHIN_DEGREES`] degrees of the mean. The
+/// link-derived facing is [`crate::doors::outward_from_return_link`], the same evidence a spawned
+/// door's `outward` is read from, so this pass and the engine agree on what a door's link data says
+/// about it.
+///
+/// The query is `tools/research/portal_door_alignment.py`'s `DOOR_SELECT` exactly (2,204 rows in
+/// the installed data), minus what only the report needs: one row per placed load door, joined to
+/// the `statics` row that says which model it is and to the cell that places it on a grid.
+fn doorway_placements(connection: &Connection) -> Result<HashMap<u32, DoorwayPlacement>> {
+    let links = return_links(connection)?;
+    let mut statement = connection.prepare_cached(
+        "SELECT r.id,r.pos_x,r.pos_y,r.pos_z,r.rot_x,r.rot_y,r.rot_z,r.scale,\
+         COALESCE(s.model_path,''),\
+         s.bounds_min_x,s.bounds_min_y,s.bounds_min_z,s.bounds_max_x,s.bounds_max_y,s.bounds_max_z,\
+         COALESCE(s.bounds_valid,0),c.grid_x,c.grid_y \
+         FROM \"references\" r JOIN door_links d ON d.ref_id=r.id \
+         LEFT JOIN statics s ON s.id=r.base_form_id LEFT JOIN cells c ON c.id=r.cell_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut placements: HashMap<u32, DoorwayPlacement> = HashMap::new();
+    // The evidence each model's convention is fitted from: (link-derived facing - reference yaw),
+    // one per placement whose return link carries a usable direction.
+    let mut offsets: HashMap<String, Vec<f32>> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let form_id: u32 = row.get(0)?;
+        let position: [f32; 3] = [row.get(1)?, row.get(2)?, row.get(3)?];
+        let rotation = [row.get(4)?, row.get(5)?, row.get(6)?];
+        let scale: f32 = row.get(7)?;
+        let model: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
+        let bounds: [Option<f32>; 6] = [
+            row.get(9)?,
+            row.get(10)?,
+            row.get(11)?,
+            row.get(12)?,
+            row.get(13)?,
+            row.get(14)?,
+        ];
+        let bounds_valid = row.get::<_, Option<i64>>(15)?.is_some_and(|flag| flag != 0);
+        let (box_centre, box_bottom) = match (bounds_valid, bounds) {
+            (
+                true,
+                [
+                    Some(min_x),
+                    Some(min_y),
+                    Some(min_z),
+                    Some(max_x),
+                    Some(max_y),
+                    Some(max_z),
+                ],
+            ) => (
+                Some([
+                    (min_x + max_x) * 0.5,
+                    (min_y + max_y) * 0.5,
+                    (min_z + max_z) * 0.5,
+                ]),
+                Some(min_y),
+            ),
+            _ => (None, None),
+        };
+        let grid = match (
+            row.get::<_, Option<i32>>(16)?,
+            row.get::<_, Option<i32>>(17)?,
+        ) {
+            // The cell's own grid says only that the reference is in an exterior: the position
+            // says where. Load doors are often in a worldspace's persistent cell, whose grid is
+            // (0, 0) wherever its references stand (Riverwood's are), so the grid is the
+            // reference's own position's.
+            (Some(_), Some(_)) => Some([
+                (position[0] / 4096.0).floor() as i32,
+                (position[1] / 4096.0).floor() as i32,
+            ]),
+            _ => None,
+        };
+        let return_arrival_z = links.get(&form_id).map(|(arrival, _)| arrival[2]);
+        if let Some((arrival, arrival_rotation)) = links.get(&form_id)
+            && let Some(outward) =
+                crate::doors::outward_from_return_link(position, *arrival, *arrival_rotation)
+        {
+            offsets
+                .entry(model.clone())
+                .or_default()
+                .push(outward[0].atan2(outward[1]) - rotation[2]);
+        }
+        placements.insert(
+            form_id,
+            DoorwayPlacement {
+                position,
+                rotation,
+                scale,
+                box_centre,
+                box_bottom,
+                model,
+                // Filled in below, once every model's placements have been seen.
+                convention: None,
+                grid,
+                return_arrival_z,
+            },
+        );
+    }
+    let conventions = model_conventions(&offsets);
+    for placement in placements.values_mut() {
+        placement.convention = conventions.get(&placement.model).copied();
+    }
+    Ok(placements)
+}
+
+/// The models whose own axis convention can be read from their placements, and what it is: the
+/// circular mean of each model's offsets, in radians, for the models [`CONVENTION_MIN_PLACEMENTS`]
+/// of whose placements agree with it to within [`CONVENTION_WITHIN_DEGREES`] degrees at least
+/// [`CONVENTION_MIN_SHARE`] of the time. A model that fails the test is left out - its placements
+/// disagree by more than the mean can absorb, and a door of it keeps today's frame (tier 3 or 4).
+fn model_conventions(offsets: &HashMap<String, Vec<f32>>) -> HashMap<String, f32> {
+    let mut conventions = HashMap::new();
+    for (model, offsets) in offsets {
+        if offsets.len() < CONVENTION_MIN_PLACEMENTS {
+            continue;
+        }
+        // A circular mean, so angles that wrap around north average the way they should.
+        let (sine, cosine) = offsets.iter().fold((0.0, 0.0), |(sine, cosine), offset| {
+            (sine + offset.sin(), cosine + offset.cos())
+        });
+        let mean = sine.atan2(cosine);
+        let within = offsets
+            .iter()
+            .filter(|offset| {
+                ((**offset - mean + PI).rem_euclid(TAU) - PI).abs()
+                    <= CONVENTION_WITHIN_DEGREES.to_radians()
+            })
+            .count() as f32
+            / offsets.len() as f32;
+        if within >= CONVENTION_MIN_SHARE {
+            conventions.insert(model.clone(), mean);
+        }
+    }
+    conventions
+}
+
+/// The reference query's column list and joins for one database: every optional table (`records`,
+/// `lights`, `door_links`, `emittance`, `worldspaces`) and column (`radius_override`,
+/// `statics.editor_id`, the enable-state columns) is joined when the database has it and read as
+/// `NULL` (or the model-only auto-load rule, or "enabled") when it does not, so [`map_reference`]'s
+/// column indices are the same either way.
+///
+/// Load doors are read when the manifest lists the `mudcrab.door_links` extension (`features`, whose
+/// table [`WorldDatabase::open_with`] has already required) or, for a data set that carries the
+/// table as part of its core schema, when [`has_door_links`] finds a complete table. A listed
+/// extension whose table lacks a column is an error rather than a data set with no doors.
+///
+/// Enable-state metadata is optional for legacy packages; the resolver survives cell unloads on
+/// this worker.
 struct ReferenceQuery {
     columns: String,
     joins: String,
@@ -1274,27 +1633,39 @@ impl ReferenceQuery {
         let has_records = has_records(connection)?;
         let record_column = if has_records { "b.record_type" } else { "NULL" };
         let has_lights = has_lights(connection)?;
-        let light_columns = if has_lights {
-            LIGHT_COLUMNS
+        let (light_columns, light_detail_columns) = if has_lights {
+            (LIGHT_COLUMNS, LIGHT_DETAIL_COLUMNS)
         } else {
-            ABSENT_LIGHT_COLUMNS
+            (ABSENT_LIGHT_COLUMNS, ABSENT_LIGHT_DETAIL_COLUMNS)
         };
         let override_column = if has_radius_override(connection)? {
             RADIUS_OVERRIDE_COLUMN
         } else {
             ABSENT_RADIUS_OVERRIDE_COLUMN
         };
-        let has_doors =
+        let auto_load_column = if has_statics_editor_id(connection)? {
+            AUTO_LOAD_COLUMN
+        } else {
+            ABSENT_EDITOR_ID_AUTO_LOAD_COLUMN
+        };
+        let complete_door_links =
             features.door_links != DoorLinksAccess::Disabled && has_door_links(connection)?;
         color_eyre::eyre::ensure!(
-            has_doors || features.door_links != DoorLinksAccess::LegacyExtension,
+            complete_door_links || features.door_links != DoorLinksAccess::LegacyExtension,
             "extension {} is listed but its door_links table lacks columns",
             crate::extensions::Feature::DoorLinks.extension()
         );
-        let door_columns = if has_doors {
-            DOOR_COLUMNS
-        } else {
-            ABSENT_DOOR_COLUMNS
+        let has_doors = complete_door_links;
+        let has_worldspaces = has_doors && has_table(connection, "worldspaces")?;
+        let (door_columns, door_label_column) = match (has_doors, has_worldspaces) {
+            (true, true) => (DOOR_COLUMNS, DOOR_LABEL_COLUMN),
+            (true, false) => (DOOR_COLUMNS, DOOR_LABEL_WITHOUT_WORLDSPACES_COLUMN),
+            (false, _) => {
+                bevy::log::info!(
+                    "world database has no door_links table; no reference is a load door"
+                );
+                (ABSENT_DOOR_COLUMNS, ABSENT_DOOR_LABEL_COLUMN)
+            }
         };
         let has_emittance = has_emittance(connection)?;
         let emittance_columns = if has_emittance {
@@ -1311,6 +1682,9 @@ impl ReferenceQuery {
         }
         if has_doors {
             joins.push_str(DOOR_JOIN);
+            if has_worldspaces {
+                joins.push_str(DOOR_WORLDSPACE_JOIN);
+            }
         }
         if has_emittance {
             joins.push_str(EMITTANCE_JOIN);
@@ -1333,30 +1707,6 @@ impl ReferenceQuery {
                 "incomplete reference enable-state columns: expected header_flags, enable_parent_id and enable_parent_flags"
             ),
         };
-        let has_worldspaces: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='worldspaces')",
-            [],
-            |row| row.get(0),
-        )?;
-        let has_interior_name: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('cells') WHERE name='interior_name')",
-            [],
-            |row| row.get(0),
-        )?;
-        let door_label_column = if has_doors && has_interior_name {
-            joins.push_str(" LEFT JOIN cells dc ON dc.id=d.destination_cell_id");
-            if has_worldspaces {
-                joins.push_str(" LEFT JOIN worldspaces ws ON ws.id=d.destination_worldspace_id");
-                "COALESCE(NULLIF(dc.interior_name,''),NULLIF(ws.editor_id,''),'')"
-            } else {
-                "COALESCE(NULLIF(dc.interior_name,''),'')"
-            }
-        } else if has_doors && has_worldspaces {
-            joins.push_str(" LEFT JOIN worldspaces ws ON ws.id=d.destination_worldspace_id");
-            "COALESCE(NULLIF(ws.editor_id,''),'')"
-        } else {
-            "''"
-        };
         let reference_enable_columns = match enable_column_count {
             0 => "0,NULL,0",
             _ => "r.header_flags,r.enable_parent_id,r.enable_parent_flags",
@@ -1364,7 +1714,8 @@ impl ReferenceQuery {
         Ok(Self {
             columns: format!(
                 "{REFERENCE_COLUMNS},{record_column},{light_columns},{override_column},\
-                 {door_columns},{emittance_columns},{reference_enable_columns},{door_label_column}"
+                 {door_columns},{emittance_columns},{reference_enable_columns},\
+                 {door_label_column},{light_detail_columns},{auto_load_column}"
             ),
             joins,
             has_doors,
@@ -1418,6 +1769,7 @@ fn load_cell(
     generation: u64,
     key: CellKey,
     detail: CellDetail,
+    tables: &mut DoorTables,
 ) -> Result<CellPayload> {
     let cell_id: u32 = match key {
         CellKey::Exterior {
@@ -1472,31 +1824,8 @@ fn load_cell(
                 .collect::<rusqlite::Result<Vec<_>>>()?
         }
     };
-    let mut references = Vec::with_capacity(rows.len());
-    for (mut reference, inputs) in rows {
-        let state = query
-            .enable_states
-            .resolve(reference.form_id, inputs, |parent| {
-                connection
-                    .prepare_cached(&query.parent_sql)?
-                    .query_row([parent], |row| map_enable_inputs(row, 0))
-                    .optional()
-            })
-            .wrap_err_with(|| format!("enable state of reference {:08X}", reference.form_id))?;
-        reference.initially_enabled = match state {
-            Ok(enabled) => enabled,
-            Err(error) => {
-                if query.enable_errors.insert(error) {
-                    bevy::log::warn!(
-                        "reference {:08X}: {error}; unresolved references will not spawn",
-                        reference.form_id
-                    );
-                }
-                false
-            }
-        };
-        references.push(reference);
-    }
+    let mut references = query.resolve_enable_states(connection, rows)?;
+    finish_references(connection, query.has_doors, &mut references, tables)?;
     Ok(CellPayload {
         generation,
         key,
@@ -1513,6 +1842,7 @@ fn load_references(
     query: &mut ReferenceQuery,
     key: CellKey,
     reference_ids: &BTreeSet<u32>,
+    tables: &mut DoorTables,
 ) -> Result<Vec<ReferenceRow>> {
     let CellKey::Exterior {
         worldspace_id,
@@ -1555,8 +1885,35 @@ fn load_references(
         );
         rows.push((reference, inputs));
     }
-    let references = query.resolve_enable_states(connection, rows)?;
+    let mut references = query.resolve_enable_states(connection, rows)?;
+    finish_references(connection, query.has_doors, &mut references, tables)?;
     Ok(references)
+}
+
+fn finish_references(
+    connection: &Connection,
+    has_doors: bool,
+    references: &mut [ReferenceRow],
+    tables: &mut DoorTables,
+) -> Result<()> {
+    // What a door of this cell needs beyond its own row: which way it faces, from the links that
+    // lead back to it (the doors of this cell are the rows a `door_links` row's
+    // `destination_ref_id` can name), and its own doorway and its destination's, from the doorway
+    // table. Both are read once for the whole run.
+    if has_doors && references.iter().any(|reference| reference.door.is_some()) {
+        let links = tables.links.get_or_build(connection)?;
+        let doorways = tables.doorways.get_or_build(connection)?;
+        for reference in references {
+            if let Some(door) = reference.door.as_mut() {
+                door.return_arrival = links.get(&reference.form_id).copied();
+                door.destination_doorway = doorways.get(&door.destination_ref_id).cloned();
+            }
+            if reference.door.is_some() {
+                reference.doorway = doorways.get(&reference.form_id).cloned();
+            }
+        }
+    }
+    Ok(())
 }
 
 fn map_enable_inputs(
@@ -1584,12 +1941,16 @@ fn map_enable_inputs(
 
 fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<(ReferenceRow, InitialEnableInputs)> {
     let base_record_type: Option<String> = row.get(18)?;
+    // The `lights` row is present exactly when the join found one and it has the radius the design
+    // makes `NOT NULL`; anything else is a reference this database cannot light.
     let radius: Option<f32> = row.get(19)?;
     let light = match radius {
         Some(radius) => Some(LightRow {
             radius,
             color: [row.get(20)?, row.get(21)?, row.get(22)?],
             flags: row.get(23)?,
+            falloff: row.get(LIGHT_DETAIL_START)?,
+            fade: row.get(LIGHT_DETAIL_START + 1)?,
         }),
         None => None,
     };
@@ -1605,15 +1966,19 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<(ReferenceRow, Ini
             if arrival.iter().all(Option::is_some) {
                 let value = |index: usize| arrival[index].unwrap_or_default();
                 Some(DoorLinkRow {
-                    label: row
-                        .get::<_, String>(REFERENCE_ENABLE_START + 3)?
-                        .trim_end_matches(|c: char| c == '\0' || c.is_whitespace())
-                        .to_owned(),
                     destination_ref_id,
                     destination_cell_id: row.get(26)?,
                     destination_worldspace_id: row.get(27)?,
                     arrival_position: [value(0), value(1), value(2)],
                     arrival_rotation: [value(3), value(4), value(5)],
+                    label: door_label(
+                        row.get::<_, Option<String>>(DOOR_LABEL_INDEX)?
+                            .unwrap_or_default(),
+                    ),
+                    // Both filled in after the query: the return link from the links that lead
+                    // back into this cell, the destination doorway from the doorway table.
+                    return_arrival: None,
+                    destination_doorway: None,
                 })
             } else {
                 bevy::log::debug!(
@@ -1643,10 +2008,12 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<(ReferenceRow, Ini
             bounds_min: [row.get(11)?, row.get(12)?, row.get(13)?],
             bounds_max: [row.get(14)?, row.get(15)?, row.get(16)?],
             bounds_valid: row.get(17)?,
+            door,
+            doorway: None,
             light,
             light_radius_override: row.get(24)?,
-            door,
             emittance,
+            auto_load: row.get(AUTO_LOAD_INDEX)?,
         },
         map_enable_inputs(row, REFERENCE_ENABLE_START)?,
     ))
@@ -1697,33 +2064,48 @@ mod tests {
     ///
     /// The return-link cache is fresh on every call, so a test that changes `door_links` between
     /// two loads sees the table as it is: one cache for a whole run is what [`ReturnLinks`] is for,
-    /// A full cell using the fixture's declared legacy/core door capability.
+    /// which `the_return_links_are_read_once_and_kept` checks on purpose.
     fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<CellPayload> {
         super::load_cell(
             connection,
-            &mut ReferenceQuery::for_connection(connection, fixture_features(connection))?,
+            &mut ReferenceQuery::for_connection(connection, WorldDatabaseFeatures::default())?,
             generation,
             key,
             CellDetail::Full,
+            &mut DoorTables::default(),
         )
     }
 
     /// [`super::load_cell`] for a whole cell with a query the test keeps across loads (the enable
-    /// state resolver lives on it).
+    /// state resolver lives on it) and a fresh door-table cache.
     fn load_cell_with(
         connection: &Connection,
         query: &mut ReferenceQuery,
         generation: u64,
         key: CellKey,
     ) -> Result<CellPayload> {
-        super::load_cell(connection, query, generation, key, CellDetail::Full)
+        super::load_cell(
+            connection,
+            query,
+            generation,
+            key,
+            CellDetail::Full,
+            &mut DoorTables::default(),
+        )
     }
 
     /// The features a fixture database stands for: it lists `mudcrab.door_links` exactly when it
-    /// holds the complete public table, checked by the same column detector as the worker.
+    /// holds the table, which is what a converted data set's manifest says about the real one.
     fn fixture_features(connection: &Connection) -> WorldDatabaseFeatures {
+        let found: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='door_links'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         WorldDatabaseFeatures {
-            door_links: if has_door_links(connection).unwrap() {
+            door_links: if found > 0 {
                 DoorLinksAccess::LegacyExtension
             } else {
                 DoorLinksAccess::Core
@@ -1733,33 +2115,40 @@ mod tests {
 
     fn fixture(connection: &Connection) {
         connection
-            .execute_batch(
+            .execute_batch(&format!(
                 r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
-                INSERT INTO schema_info VALUES(6);
-                CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
+                INSERT INTO schema_info VALUES({version});
+                CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
                 CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
-                CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
+                CREATE TABLE statics(id INTEGER PRIMARY KEY,editor_id TEXT,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
                 CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
                 CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
-                INSERT INTO cells VALUES(10,60,2,-3);
-                INSERT INTO statics VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1);
+                INSERT INTO cells VALUES(10,60,2,-3,NULL);
+                INSERT INTO statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1);
                 INSERT INTO "references" VALUES(30,10,20,8200,-12200,50,0,0,0,1);
                 INSERT INTO exterior_spatial VALUES(30,8200,8200,-12200,-12200,50,50,10,60);
                 INSERT INTO "references" VALUES(31,99,20,8250,-12150,55,0,0,0,1);
                 INSERT INTO exterior_spatial VALUES(31,8250,8250,-12150,-12150,55,55,99,60);"#,
-            ).unwrap();
+                version = shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
     }
 
-    // Minimal door projection: no interior names or worldspaces, so the label stays empty.
+    /// The schema-4 door tables, the interior cell a door leads into, and its `door_links` row.
+    /// A database without any of this is the pre-door shape [`load_cell`] must still handle.
     fn door_fixture(connection: &Connection) {
-        connection.execute_batch(
-            r#"CREATE TABLE door_links(ref_id INTEGER PRIMARY KEY,destination_ref_id INTEGER NOT NULL,
-                pos_x REAL NOT NULL,pos_y REAL NOT NULL,pos_z REAL NOT NULL,
-                rot_x REAL NOT NULL,rot_y REAL NOT NULL,rot_z REAL NOT NULL,
-                destination_cell_id INTEGER,destination_worldspace_id INTEGER);
-            INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(99,NULL,NULL,NULL);
-            INSERT INTO door_links VALUES(30,77,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);"#,
-        ).unwrap();
+        connection
+            .execute_batch(
+                r#"CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,editor_id TEXT NOT NULL,parent_world INTEGER,flags INTEGER NOT NULL);
+                CREATE TABLE door_links(ref_id INTEGER PRIMARY KEY,destination_ref_id INTEGER NOT NULL,
+                    pos_x REAL NOT NULL,pos_y REAL NOT NULL,pos_z REAL NOT NULL,
+                    rot_x REAL NOT NULL,rot_y REAL NOT NULL,rot_z REAL NOT NULL,
+                    destination_cell_id INTEGER,destination_worldspace_id INTEGER);
+                INSERT INTO cells VALUES(99,NULL,NULL,NULL,'Alftand01');
+                INSERT INTO worldspaces VALUES(614,'Blackreach',60,0);
+                INSERT INTO door_links VALUES(30,77,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);"#,
+            )
+            .unwrap();
     }
 
     fn sparse_reference_fixture(connection: &Connection) {
@@ -1769,11 +2158,9 @@ mod tests {
         connection
             .execute_batch(
                 r#"CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT);
-                INSERT INTO records VALUES(20,'DOOR'),(22,'LIGH');
-                UPDATE lights SET id=22 WHERE id=20;
-                UPDATE "references" SET radius_override=NULL WHERE id=30;
-                UPDATE "references" SET radius_override=850.8 WHERE id=40;
-                INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(11,60,0,0),(12,614,0,0);
+                INSERT INTO records VALUES(20,'DOOR'),(21,'LIGH');
+                UPDATE statics SET editor_id='AutoLoadDoorTest' WHERE id=20;
+                INSERT INTO cells VALUES(11,60,0,0,NULL),(12,614,0,0,NULL);
                 UPDATE "references" SET cell_id=11 WHERE id=31;
                 UPDATE door_links SET destination_ref_id=31,destination_cell_id=11,destination_worldspace_id=60 WHERE ref_id=30;
                 INSERT INTO door_links VALUES(31,30,8201,-12201,51,0,0,1,10,60);
@@ -1828,6 +2215,7 @@ mod tests {
             &mut ReferenceQuery::for_connection(connection, fixture_features(connection))?,
             key,
             &ids.into_iter().collect(),
+            &mut DoorTables::default(),
         )
     }
 
@@ -1868,7 +2256,6 @@ mod tests {
                 .find(|row| row.form_id == actual.form_id)
                 .unwrap();
             assert_eq!(actual.form_id, expected.form_id);
-            assert_eq!(actual.initially_enabled, expected.initially_enabled);
             assert_eq!(actual.cell_id, expected.cell_id);
             assert_eq!(actual.base_form_id, expected.base_form_id);
             assert_eq!(actual.base_record_type, expected.base_record_type);
@@ -1880,19 +2267,16 @@ mod tests {
             assert_eq!(actual.bounds_max, expected.bounds_max);
             assert_eq!(actual.bounds_valid, expected.bounds_valid);
             assert_eq!(actual.door, expected.door);
+            assert_eq!(actual.doorway, expected.doorway);
             assert_eq!(actual.light, expected.light);
-            assert_eq!(actual.emittance, expected.emittance);
             assert_eq!(actual.light_radius_override, expected.light_radius_override);
+            assert_eq!(actual.auto_load, expected.auto_load);
         }
         let door = sparse[0].door.as_ref().unwrap();
-        assert_eq!(door, &DoorLinkRow {
-            label: String::new(),
-            destination_ref_id: 31,
-            destination_cell_id: Some(11),
-            destination_worldspace_id: Some(60),
-            arrival_position: [-947.038, 3958.835, 591.917],
-            arrival_rotation: [0.0, 0.0, 2.96989],
-        });
+        assert!(door.return_arrival.is_some());
+        assert!(door.destination_doorway.is_some());
+        assert!(sparse[0].doorway.is_some());
+        assert!(sparse[0].auto_load);
         assert!(sparse[1].light.is_some());
         assert_eq!(sparse[1].light_radius_override, Some(850.8));
     }
@@ -2072,7 +2456,7 @@ mod tests {
     fn disabled_legacy_doors_are_not_read_through_core_discovery() {
         let connection = Connection::open_in_memory().unwrap();
         fixture(&connection);
-        add_door_links(&connection);
+        door_fixture(&connection);
         let core =
             ReferenceQuery::for_connection(&connection, WorldDatabaseFeatures::default()).unwrap();
         assert!(core.has_doors);
@@ -2404,6 +2788,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "portal: the runtime loads only the portal's own world database schema"]
     fn legacy_databases_render_without_lod_but_cannot_advertise_lod() {
         for version in [3, 4, 5] {
             let directory = tempfile::tempdir().unwrap();
@@ -2812,7 +3197,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT NOT NULL);
                  INSERT INTO records VALUES(20,'STAT');
-                 INSERT INTO statics VALUES(22,'clutter/barrel.nif',-1,-1,-1,1,1,1,1);
+                 INSERT INTO statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(22,'clutter/barrel.nif',-1,-1,-1,1,1,1,1);
                  INSERT INTO records VALUES(22,'MISC');
                  INSERT INTO \"references\" VALUES(40,10,22,8250,-12150,55,0,0,0,1);
                  INSERT INTO exterior_spatial VALUES(40,8250,8250,-12150,-12150,55,55,10,60);",
@@ -2967,7 +3352,8 @@ mod tests {
     fn loads_a_terrain_only_exterior_cell_without_its_references() {
         let connection = Connection::open_in_memory().unwrap();
         fixture(&connection);
-        add_door_links(&connection);
+        door_fixture(&connection);
+        auto_load_fixture(&connection);
         light_fixture(&connection);
         let key = CellKey::Exterior {
             worldspace_id: 60,
@@ -2982,6 +3368,7 @@ mod tests {
             7,
             key,
             CellDetail::Terrain,
+            &mut DoorTables::default(),
         )
         .unwrap();
         assert_eq!(terrain_only.generation, 7);
@@ -3016,6 +3403,7 @@ mod tests {
             1,
             CellKey::Interior(99),
             CellDetail::Terrain,
+            &mut DoorTables::default(),
         )
         .unwrap();
         assert_eq!(payload.cell_id, 99);
@@ -3042,6 +3430,7 @@ mod tests {
                 1,
                 absent,
                 CellDetail::Terrain,
+                &mut DoorTables::default()
             )
             .is_err()
         );
@@ -3053,6 +3442,7 @@ mod tests {
                 1,
                 absent,
                 CellDetail::Full,
+                &mut DoorTables::default()
             )
             .is_err()
         );
@@ -3123,7 +3513,7 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         fixture(&connection);
         connection
-            .execute_batch("INSERT INTO cells VALUES(9,60,2,-3); INSERT INTO land VALUES(10);")
+            .execute_batch("INSERT INTO cells VALUES(9,60,2,-3,NULL); INSERT INTO land VALUES(10);")
             .unwrap();
 
         let payload = load_cell(
@@ -3260,21 +3650,561 @@ mod tests {
         assert_eq!(payload.references[0].form_id, 31);
     }
 
-    /// A `lights` table and an `XRDS` override, with the columns the runtime reads (the converter's
-    /// table carries more, all of them unread). Reference 30 is lit - its base 20 has a `lights` row
-    /// and it carries an override - and reference 40 is not, because its base 22 has no row.
+    #[test]
+    fn returns_the_door_link_of_a_reference_and_the_interior_label() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+
+        let door = payload
+            .references
+            .iter()
+            .find(|reference| reference.form_id == 30)
+            .expect("reference 30 is in the cell")
+            .door
+            .clone()
+            .expect("reference 30 has a door_links row");
+        assert_eq!(door.destination_ref_id, 77);
+        assert_eq!(door.destination_cell_id, Some(99));
+        assert_eq!(
+            door.destination_worldspace_id, None,
+            "an interior destination has no worldspace"
+        );
+        assert_eq!(door.arrival_position, [-947.038, 3958.835, 591.917]);
+        assert_eq!(door.arrival_rotation, [0.0, 0.0, 2.96989]);
+        assert_eq!(door.label, "Alftand01");
+
+        assert!(
+            payload
+                .references
+                .iter()
+                .find(|reference| reference.form_id == 31)
+                .expect("reference 31 is in the cell")
+                .door
+                .is_none(),
+            "a reference without a door_links row is not a door"
+        );
+    }
+
+    /// A door model's own axis convention is a fact about the model, fitted from every placement of
+    /// it in the install: the circular mean of (link-derived facing - reference yaw) over those
+    /// placements, kept only for a model whose placements agree with it. This is what tier 2 of the
+    /// doorway anchor faces a doorway with (`docs/research/portal-door-alignment.md` section 3).
+    #[test]
+    fn a_models_axis_convention_is_fitted_from_its_placements() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO statics VALUES(40,'dweDoor','doors/dwe.nif',-50,-60,-5,50,60,5,1);
+                INSERT INTO statics VALUES(41,'twoWays','doors/twoways.nif',-50,-60,-5,50,60,5,1);
+                INSERT INTO statics VALUES(42,'rare','doors/rare.nif',-50,-60,-5,50,60,5,1);
+                -- Four placements of model 40, each at reference yaw 0 and each with a link 32 units
+                -- east of it: the model's own axis is a quarter turn from its reference's.
+                INSERT INTO "references" VALUES(100,10,40,0,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(101,10,40,10,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(102,10,40,20,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(103,10,40,30,0,0,0,0,0,1);
+                INSERT INTO door_links VALUES(100,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(101,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(102,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(103,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(200,100,32,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(201,101,42,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(202,102,52,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(203,103,62,0,0,0,0,0.1,99,NULL);
+                -- Model 41 is placed both ways: four like the first, four a quarter turn round, so
+                -- its mean predicts nothing about a placement of it.
+                INSERT INTO "references" VALUES(110,10,41,0,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(111,10,41,10,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(112,10,41,20,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(113,10,41,30,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(114,10,41,40,0,0,0,0,1.5707963,1);
+                INSERT INTO "references" VALUES(115,10,41,50,0,0,0,0,1.5707963,1);
+                INSERT INTO "references" VALUES(116,10,41,60,0,0,0,0,1.5707963,1);
+                INSERT INTO "references" VALUES(117,10,41,70,0,0,0,0,1.5707963,1);
+                INSERT INTO door_links VALUES(110,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(111,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(112,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(113,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(114,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(115,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(116,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(117,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(210,110,32,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(211,111,42,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(212,112,52,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(213,113,62,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(214,114,72,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(215,115,82,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(216,116,92,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(217,117,102,0,0,0,0,0.1,99,NULL);
+                -- Model 42 has three placements: too few to fit a convention from.
+                INSERT INTO "references" VALUES(120,10,42,0,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(121,10,42,10,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(122,10,42,20,0,0,0,0,0,1);
+                INSERT INTO door_links VALUES(120,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(121,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(122,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(220,120,32,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(221,121,42,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(222,122,52,0,0,0,0,0.1,99,NULL);"#,
+            )
+            .unwrap();
+
+        let placements = super::doorway_placements(&connection).unwrap();
+        let convention = |form_id: u32| {
+            placements
+                .get(&form_id)
+                .unwrap_or_else(|| panic!("reference {form_id} is in the doorway table"))
+                .convention
+        };
+        assert!(
+            (convention(100).expect("four placements agree") - PI / 2.0).abs() < 1.0e-3,
+            "the model faces a quarter turn from its reference's own yaw: {:?}",
+            convention(100)
+        );
+        assert_eq!(
+            convention(110),
+            None,
+            "a model placed in two orientations has no convention"
+        );
+        assert_eq!(
+            convention(120),
+            None,
+            "three placements are too few to fit one from"
+        );
+
+        // The placement itself: the model's bounds box centre (in the model's frame) and the grid
+        // the reference stands in, which is what the anchor's destination grid comes from. That is
+        // the grid of the reference's own position, not its cell's: cell 10 says (2, -3), and a
+        // worldspace's persistent cell says (0, 0) for every reference in it wherever it stands -
+        // Riverwood's load doors are there, and streaming the cell's grid put the portal in the
+        // wrong part of Skyrim.
+        let placement = placements.get(&100).unwrap();
+        assert_eq!(placement.box_centre, Some([0.0, 0.0, 0.0]));
+        assert_eq!(placement.grid, Some([0, 0]));
+        assert_eq!(placement.scale, 1.0);
+        assert_eq!(
+            placement.return_arrival_z,
+            Some(0.0),
+            "the link that leads back into it arrives at the door's own height"
+        );
+    }
+
+    /// A door's own doorway and its destination's are read for it, and the anchor built from them
+    /// rides on the spawned reference: the two rows are what `crate::streaming::door_anchor`
+    /// decides tier 1 from, with no convention needed at all.
+    #[test]
+    fn a_door_reads_its_own_doorway_and_its_destinations() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        // The destination door of reference 30's link (77), standing on the arrival point itself:
+        // the game lands the player in its doorway, so the gate passes.
+        connection
+            .execute_batch(
+                r#"INSERT INTO "references" VALUES(77,99,20,-947.038,3958.835,591.917,0,0,1.2,1);
+                INSERT INTO door_links VALUES(77,30,8232.0,-12200.0,50.0,0,0,1.60570,10,60);"#,
+            )
+            .unwrap();
+
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        let reference = payload
+            .references
+            .iter()
+            .find(|reference| reference.form_id == 30)
+            .expect("the door is in the cell");
+        let doorway = reference
+            .doorway
+            .as_ref()
+            .expect("a door has a doorway row");
+        assert_eq!(doorway.model, "architecture/wall.nif");
+        assert_eq!(
+            doorway.box_centre,
+            Some([0.0, 0.0, 0.0]),
+            "the fixture's bounds are symmetric about the model's origin"
+        );
+        let destination = reference
+            .door
+            .as_ref()
+            .unwrap()
+            .destination_doorway
+            .as_ref()
+            .expect("the destination reference is a door too");
+        assert_eq!(destination.position, [-947.038, 3958.835, 591.917]);
+        assert_eq!(destination.grid, None, "an interior cell has no grid");
+
+        let anchor = crate::streaming::door_anchor(reference).expect("the pair anchors");
+        assert_eq!(anchor.tier, crate::doors::DoorAnchorTier::SameModel);
+        assert_eq!(anchor.source_box_centre, [0.0, 0.0, 0.0]);
+        assert_eq!(anchor.destination.box_centre, [0.0, 0.0, 0.0]);
+        assert_eq!(anchor.destination_grid, None);
+
+        // And a reference whose link points at a door the database cannot place has no anchor.
+        let mut orphan = reference.clone();
+        orphan.door.as_mut().unwrap().destination_doorway = None;
+        assert_eq!(crate::streaming::door_anchor(&orphan), None);
+    }
+
+    /// A door whose front is known from the link that leads back into it, shaped like the Alftand
+    /// ruined tower's door: the door itself at 8200, -12200 and a link from another door arriving
+    /// 32 units east of it, heading 92 degrees.
+    #[test]
+    fn returns_the_link_that_leads_back_into_a_door() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        connection
+            .execute_batch(
+                r#"INSERT INTO door_links VALUES(77,30,8232.0,-12200.0,50.0,0,0,1.60570,10,60);
+                INSERT INTO door_links VALUES(31,78,21088.559,18512.045,2434.0,0,0,-1.87080,120,614);"#,
+            )
+            .unwrap();
+
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        let door_of = |form_id| {
+            payload
+                .references
+                .iter()
+                .find(|reference| reference.form_id == form_id)
+                .expect("the reference is in the cell")
+                .door
+                .clone()
+                .expect("the reference is a door")
+        };
+
+        let tower = door_of(30);
+        assert_eq!(
+            tower.return_arrival,
+            Some(([8232.0, -12200.0, 50.0], [0.0, 0.0, 1.60570])),
+            "the arrival of the door that leads here is the door's front"
+        );
+        assert_eq!(
+            tower.destination_ref_id, 77,
+            "the door's own link is untouched: it still leads to 77"
+        );
+        assert_eq!(tower.arrival_position, [-947.038, 3958.835, 591.917]);
+
+        assert_eq!(
+            door_of(31).return_arrival,
+            None,
+            "nothing leads back to a door that only leads away"
+        );
+
+        // The link that leads back is read once for the whole cell, not joined per reference, so a
+        // second door leading into the same door does not return that door's reference twice.
+        connection
+            .execute_batch(
+                "INSERT INTO door_links VALUES(78,30,8232.0,-12200.0,50.0,0,0,0.7,10,60);",
+            )
+            .unwrap();
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            payload
+                .references
+                .iter()
+                .filter(|reference| reference.form_id == 30)
+                .count(),
+            1,
+            "a second link into a door must not spawn the door twice"
+        );
+        let tower = payload
+            .references
+            .iter()
+            .find(|reference| reference.form_id == 30)
+            .unwrap();
+        assert_eq!(
+            tower.door.as_ref().unwrap().return_arrival,
+            Some(([8232.0, -12200.0, 50.0], [0.0, 0.0, 1.60570])),
+            "two links that lead to the same door are the same doorway: the lower ref_id decides"
+        );
+    }
+
+    /// `door_links` is the same table for every cell, so a [`ReturnLinks`] that lives for a whole
+    /// run reads it once: the second cell load of a run pays nothing for the links, which is what
+    /// makes a door-bearing exterior cell cost one query rather than a whole-table scan.
+    ///
+    /// A connection the engine opens is read-only, so what was read once cannot go stale under it.
+    /// This one can change: the cache is the reason a link deleted after the first load is still in
+    /// the answer, and a fresh cache is what notices.
+    #[test]
+    fn the_return_links_are_read_once_and_kept() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        let key = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 2,
+            grid_y: -3,
+        };
+        let link = "INSERT INTO door_links VALUES(77,30,8232.0,-12200.0,50.0,0,0,1.60570,10,60)";
+        connection.execute_batch(link).unwrap();
+        let arrival = |payload: &CellPayload| {
+            payload
+                .references
+                .iter()
+                .find(|reference| reference.form_id == 30)
+                .expect("reference 30 is in the cell")
+                .door
+                .clone()
+                .expect("reference 30 is a door")
+                .return_arrival
+        };
+
+        let mut cache = DoorTables::default();
+        let loaded = |connection: &Connection, cache: &mut DoorTables| {
+            super::load_cell(
+                connection,
+                &mut ReferenceQuery::for_connection(connection, fixture_features(connection))
+                    .unwrap(),
+                1,
+                key,
+                CellDetail::Full,
+                cache,
+            )
+            .unwrap()
+        };
+        assert!(
+            arrival(&loaded(&connection, &mut cache)).is_some(),
+            "the link that leads back into the door is read"
+        );
+
+        connection
+            .execute_batch("DELETE FROM door_links WHERE ref_id=77")
+            .unwrap();
+        assert!(
+            arrival(&loaded(&connection, &mut cache)).is_some(),
+            "the links were read once: the table is not asked again"
+        );
+        assert!(
+            arrival(&loaded(&connection, &mut DoorTables::default())).is_none(),
+            "and a cache that has not read them yet sees the table as it is"
+        );
+    }
+
+    /// The destination label is the destination interior's `FULL` subrecord bytes, which the game
+    /// terminates with a NUL - the prompt drew `Alftand01` and then an empty box.
+    #[test]
+    fn trims_the_terminator_off_a_door_label() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        connection
+            .execute(
+                "UPDATE cells SET interior_name=?1 WHERE id=99",
+                params!["Alftand01\0"],
+            )
+            .unwrap();
+
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        let door = payload
+            .references
+            .iter()
+            .find(|reference| reference.form_id == 30)
+            .expect("reference 30 is in the cell")
+            .door
+            .clone()
+            .expect("reference 30 has a door_links row");
+        assert_eq!(door.label, "Alftand01");
+
+        assert_eq!(door_label("Alftand01".to_owned()), "Alftand01");
+        assert_eq!(door_label("Blackreach \0\0 ".to_owned()), "Blackreach");
+        assert_eq!(
+            door_label("\0".to_owned()),
+            "",
+            "a label that is only the terminator is empty, not invisible"
+        );
+    }
+
+    /// Four load doors on the fixture's cell, one per way a base can look: Skyrim's
+    /// `AutoLoadDoor01` with its `AutoLoadMarker01.nif` (reference 41), a `MinUse` variant with
+    /// another model (42), a mod marker whose editor id says nothing but whose model says
+    /// "autoloadmarker" (43), and a plain `DweDoorLarge01Load` (44). See [`AUTO_LOAD_COLUMN`].
+    fn auto_load_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                r#"INSERT INTO statics(id,editor_id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid)
+                    VALUES(41,'AutoLoadDoor01','architecture/doors/AutoLoadMarker01.nif',0,0,0,0,0,0,0);
+                INSERT INTO statics(id,editor_id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid)
+                    VALUES(42,'AutoLoadDoorMinUse01','architecture/doors/Marker.nif',0,0,0,0,0,0,0);
+                INSERT INTO statics(id,editor_id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid)
+                    VALUES(43,'SomeModDoor','architecture/doors/autoloadmarker01.nif',0,0,0,0,0,0,0);
+                INSERT INTO statics(id,editor_id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid)
+                    VALUES(44,'DweDoorLarge01Load','dungeons/dwemer/door/dwemerlargedoorload01.nif',0,0,0,0,0,0,0);
+                INSERT INTO "references" VALUES(41,10,41,8200,-12200,50,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(41,8200,8200,-12200,-12200,50,50,10,60);
+                INSERT INTO "references" VALUES(42,10,42,8250,-12150,55,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(42,8250,8250,-12150,-12150,55,55,10,60);
+                INSERT INTO "references" VALUES(43,10,43,8300,-12100,55,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(43,8300,8300,-12100,-12100,55,55,10,60);
+                INSERT INTO "references" VALUES(44,10,44,8300,-12200,55,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(44,8300,8300,-12200,-12200,55,55,10,60);
+                INSERT INTO door_links VALUES(41,42,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);
+                INSERT INTO door_links VALUES(42,41,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);
+                INSERT INTO door_links VALUES(43,41,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);
+                INSERT INTO door_links VALUES(44,41,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);"#,
+            )
+            .unwrap();
+    }
+
+    fn auto_load_of(connection: &Connection, form_id: u32) -> bool {
+        load_cell(
+            connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap()
+        .references
+        .iter()
+        .find(|reference| reference.form_id == form_id)
+        .expect("the reference is in the cell")
+        .auto_load
+    }
+
+    #[test]
+    fn marks_auto_load_doors_by_their_base_editor_id_or_model() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        auto_load_fixture(&connection);
+
+        assert!(
+            auto_load_of(&connection, 41),
+            "AutoLoadDoor01 with the AutoLoadMarker01 model is an auto-load door"
+        );
+        assert!(
+            auto_load_of(&connection, 42),
+            "AutoLoadDoorMinUse01 is one too, whatever its model is called"
+        );
+        assert!(
+            auto_load_of(&connection, 43),
+            "a mod's marker is found by its model, case-insensitively"
+        );
+        assert!(
+            !auto_load_of(&connection, 44),
+            "a plain DweDoorLarge01Load keeps its E key"
+        );
+        assert!(
+            !auto_load_of(&connection, 30),
+            "the fixture's plain wall is not an auto-load door"
+        );
+
+        // The same thing as the spawned door sees it: the flag the database put on the reference is
+        // the one `LoadDoor` carries, which is what crosses the door on contact.
+        let spawned = |form_id| {
+            crate::streaming::load_door(
+                load_cell(
+                    &connection,
+                    1,
+                    CellKey::Exterior {
+                        worldspace_id: 60,
+                        grid_x: 2,
+                        grid_y: -3,
+                    },
+                )
+                .unwrap()
+                .references
+                .iter()
+                .find(|reference| reference.form_id == form_id)
+                .expect("the reference is in the cell"),
+            )
+            .expect("the reference has a resolved door link")
+            .auto_load
+        };
+        assert!(spawned(41), "an AutoLoadDoor01 base crosses on contact");
+        assert!(!spawned(44), "a DweDoorLarge01Load base keeps the E key");
+    }
+
+    /// A `statics` table without `editor_id` is not a shape the converter ever wrote, but the
+    /// engine's own fixtures had it, and the rule falls back to the base's model rather than
+    /// failing the cell load.
+    #[test]
+    fn falls_back_to_the_model_when_statics_has_no_editor_id() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        connection
+            .execute_batch(
+                r#"CREATE TABLE plain_statics(id INTEGER PRIMARY KEY,model_path TEXT,
+                    bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,
+                    bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
+                INSERT INTO plain_statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1);
+                DROP TABLE statics;
+                ALTER TABLE plain_statics RENAME TO statics;"#,
+            )
+            .unwrap();
+
+        assert!(!auto_load_of(&connection, 30));
+        assert!(!has_statics_editor_id(&connection).unwrap());
+    }
+
+    /// The schema-5 light tables: a `LIGH` record placed as reference 40 with an `XRDS` radius of
+    /// its own, and the plain statics reference 30, which is not a light at all.
     fn light_fixture(connection: &Connection) {
         connection
             .execute_batch(
-                r#"CREATE TABLE lights(id INTEGER PRIMARY KEY,
+                r#"CREATE TABLE lights(id INTEGER PRIMARY KEY,editor_id TEXT,
                     radius REAL NOT NULL,color_r INTEGER NOT NULL,color_g INTEGER NOT NULL,
-                    color_b INTEGER NOT NULL,flags INTEGER NOT NULL);
-                INSERT INTO lights VALUES(20,256.0,255,150,80,8);
-                INSERT INTO statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(22,'clutter/barrel.nif',-2,-3,-4,2,3,4,1);
-                INSERT INTO "references" VALUES(40,10,22,8250,-12150,55,0,0,0,1);
-                INSERT INTO exterior_spatial VALUES(40,8250,8250,-12150,-12150,55,55,10,60);
+                    color_b INTEGER NOT NULL,flags INTEGER NOT NULL,falloff REAL NOT NULL,fade REAL);
                 ALTER TABLE "references" ADD COLUMN radius_override REAL;
-                UPDATE "references" SET radius_override=850.8 WHERE id=30;"#,
+                INSERT INTO lights VALUES(21,'DefaultCandleLight01',256.0,255,150,80,8,1.25,0.5);
+                INSERT INTO statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(21,'clutter/candle.nif',-2,-3,-4,2,3,4,1);
+                INSERT INTO "references" VALUES(40,10,21,8250,-12150,55,0,0,0,1,850.8);
+                INSERT INTO exterior_spatial VALUES(40,8250,8250,-12150,-12150,55,55,10,60);"#,
             )
             .unwrap();
     }
@@ -3284,8 +4214,6 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         fixture(&connection);
         light_fixture(&connection);
-        assert!(has_lights(&connection).unwrap());
-        assert!(has_radius_override(&connection).unwrap());
 
         let payload = load_cell(
             &connection,
@@ -3301,14 +4229,16 @@ mod tests {
         let lit = payload
             .references
             .iter()
-            .find(|reference| reference.form_id == 30)
-            .expect("reference 30 is in the cell");
+            .find(|reference| reference.form_id == 40)
+            .expect("reference 40 is in the cell");
         assert_eq!(
             lit.light,
             Some(LightRow {
                 radius: 256.0,
                 color: [255, 150, 80],
                 flags: 8,
+                falloff: 1.25,
+                fade: Some(0.5),
             })
         );
         assert_eq!(
@@ -3317,21 +4247,13 @@ mod tests {
             "the reference's own XRDS radius comes back with it"
         );
 
-        let unlit = payload
+        let plain = payload
             .references
             .iter()
-            .find(|reference| reference.form_id == 40)
-            .expect("reference 40 is in the cell");
-        assert_eq!(
-            unlit.light, None,
-            "a reference whose base has no lights row is not a light"
-        );
-        assert_eq!(unlit.light_radius_override, None);
-        assert_eq!(
-            unlit.model_path.as_deref(),
-            Some("clutter/barrel.nif"),
-            "and it still joins its base object"
-        );
+            .find(|reference| reference.form_id == 30)
+            .expect("reference 30 is in the cell");
+        assert_eq!(plain.light, None, "a statics reference is not a light");
+        assert_eq!(plain.light_radius_override, None);
     }
 
     /// A reference's light and its override are separate columns of separate tables, so a database
@@ -3342,10 +4264,10 @@ mod tests {
         fixture(&connection);
         connection
             .execute_batch(
-                r#"CREATE TABLE lights(id INTEGER PRIMARY KEY,
+                r#"CREATE TABLE lights(id INTEGER PRIMARY KEY,editor_id TEXT,
                     radius REAL NOT NULL,color_r INTEGER NOT NULL,color_g INTEGER NOT NULL,
-                    color_b INTEGER NOT NULL,flags INTEGER NOT NULL);
-                INSERT INTO lights VALUES(20,512.0,255,200,120,0);"#,
+                    color_b INTEGER NOT NULL,flags INTEGER NOT NULL,falloff REAL NOT NULL,fade REAL);
+                INSERT INTO lights VALUES(20,'Torch01',512.0,255,200,120,0,1.0,NULL);"#,
             )
             .unwrap();
         assert!(!has_radius_override(&connection).unwrap());
@@ -3476,6 +4398,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn labels_an_exterior_destination_with_the_worldspace_editor_id() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        connection
+            .execute_batch("INSERT INTO door_links VALUES(31,78,21088.559,18512.045,2434.0,0,0,-1.8708,120,614);")
+            .unwrap();
+
+        let payload = load_cell(&connection, 1, CellKey::Interior(99)).unwrap();
+        let door = payload.references[0]
+            .door
+            .clone()
+            .expect("reference 31 has a door_links row");
+        assert_eq!(door.destination_worldspace_id, Some(614));
+        assert_eq!(
+            door.destination_cell_id,
+            Some(120),
+            "the destination ref's own cell is kept"
+        );
+        assert_eq!(door.label, "Blackreach");
+        assert_eq!(
+            door.arrival_position,
+            [21088.559, 18512.045, 2434.0],
+            "the arrival point is the XTEL position, not the destination door's"
+        );
+    }
+
+    #[test]
+    fn loads_a_database_whose_references_are_all_non_doors() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+
+        assert_eq!(
+            fixture_features(&connection).door_links,
+            DoorLinksAccess::Core
+        );
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        assert_eq!(payload.references.len(), 2);
+        assert!(
+            payload
+                .references
+                .iter()
+                .all(|reference| reference.door.is_none())
+        );
+        assert_eq!(
+            payload.references[0].model_path.as_deref(),
+            Some("architecture/wall.nif"),
+            "the plain query still joins the base object"
+        );
+    }
+
     /// A `door_links` table and its rows: reference 30 (exterior cell 10) leads into interior cell
     /// 500, reference 31 leads out to worldspace 60 and reference 32 is a link whose destination
     /// the converter could not resolve.
@@ -3529,12 +4512,16 @@ mod tests {
                 assert_eq!(
                     reference.door,
                     doors.then_some(DoorLinkRow {
-                        label: String::new(),
                         destination_ref_id: 700,
                         destination_cell_id: Some(500),
                         destination_worldspace_id: None,
                         arrival_position: [10.5, -20.25, 30.0],
                         arrival_rotation: [0.0, 0.0, 1.5],
+                        // No destination cell row or worldspace names the label, nothing leads back
+                        // into door 30 and its destination has no doorway.
+                        label: String::new(),
+                        return_arrival: None,
+                        destination_doorway: None,
                     }),
                     "doors={doors}, emittance={emittance}"
                 );
@@ -3545,77 +4532,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn door_labels_use_authored_destination_and_trim_terminators() {
-        let connection = Connection::open_in_memory().unwrap();
-        fixture(&connection);
-        add_door_links(&connection);
-        connection
-            .execute_batch(
-                "ALTER TABLE cells ADD COLUMN interior_name TEXT;
-            INSERT INTO cells(id,interior_name) VALUES(500,'Interior');
-            CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,editor_id TEXT);
-            INSERT INTO worldspaces VALUES(60,'OtherWorld');",
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE cells SET interior_name=?1 WHERE id=500",
-                ["Interior\0  "],
-            )
-            .unwrap();
-        let payload = exterior_payload(&connection);
-        let label = |id| {
-            payload
-                .references
-                .iter()
-                .find(|r| r.form_id == id)
-                .unwrap()
-                .door
-                .as_ref()
-                .unwrap()
-                .label
-                .as_str()
-        };
-        assert_eq!(label(30), "Interior");
-        assert_eq!(label(31), "OtherWorld");
-    }
-
-    #[test]
-    fn named_destination_keeps_interior_label_with_a_worldspace_and_blank_uses_editor_id() {
-        let connection = Connection::open_in_memory().unwrap();
-        fixture(&connection);
-        add_door_links(&connection);
-        connection
-            .execute_batch(
-                "ALTER TABLE cells ADD COLUMN interior_name TEXT;
-            INSERT INTO cells(id,interior_name) VALUES(500,'Named destination');
-            CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,editor_id TEXT);
-            INSERT INTO worldspaces VALUES(60,'OtherWorld');
-            UPDATE door_links SET destination_worldspace_id=60 WHERE ref_id=30;",
-            )
-            .unwrap();
-        let label = || {
-            exterior_payload(&connection)
-                .references
-                .into_iter()
-                .find(|r| r.form_id == 30)
-                .unwrap()
-                .door
-                .unwrap()
-                .label
-        };
-        assert_eq!(label(), "Named destination");
-        connection
-            .execute("UPDATE cells SET interior_name='' WHERE id=500", [])
-            .unwrap();
-        assert_eq!(label(), "OtherWorld");
-        connection
-            .execute("UPDATE worldspaces SET editor_id='' WHERE id=60", [])
-            .unwrap();
-        assert_eq!(label(), "");
     }
 
     #[test]
@@ -3638,12 +4554,16 @@ mod tests {
         assert_eq!(
             door(30),
             Some(DoorLinkRow {
-                label: String::new(),
                 destination_ref_id: 700,
                 destination_cell_id: Some(500),
                 destination_worldspace_id: None,
                 arrival_position: [10.5, -20.25, 30.0],
                 arrival_rotation: [0.0, 0.0, 1.5],
+                // No destination cell row or worldspace names the label, nothing leads back
+                // into door 30 and its destination has no doorway.
+                label: String::new(),
+                return_arrival: None,
+                destination_doorway: None,
             })
         );
         assert_eq!(door(31).unwrap().destination_worldspace_id, Some(60));

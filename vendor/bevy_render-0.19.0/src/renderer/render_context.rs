@@ -15,12 +15,166 @@ use bevy_ecs::world::unsafe_world_cell::UnsafeWorldCell;
 use bevy_ecs::world::DeferredWorld;
 #[cfg(feature = "trace")]
 use bevy_log::info_span;
+use bevy_tasks::ComputeTaskPool;
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use wgpu::CommandBuffer;
+
+// MUDCRAB PATCH (impl-1132, analysis-1131; see MUDCRAB-README.md at the crate root). Everything in this file
+// that mentions `Pending`, `PARALLEL_FINISH`, `LAST_PARALLEL_FINISH_COUNT`, `finish_or_defer`, `finish_pending` or
+// `finish_in_order` is Mudcrab's; the rest is stock bevy_render 0.19.0.
+
+/// Whether render systems hand their command encoders over unfinished, so that
+/// [`PendingCommandBuffers::take`] can finish them in parallel. Off (the default) is stock Bevy.
+static PARALLEL_FINISH: AtomicBool = AtomicBool::new(false);
+
+/// Turns parallel finishing of render command encoders on or off (Mudcrab patch).
+///
+/// With it off, every encoder is finished where Bevy always finished it: when its render system's deferred
+/// buffer is applied. With it on, the encoder is queued unfinished, in the same position of the same ordered
+/// list, and all unfinished encoders are finished together on the compute task pool when the pending command
+/// buffers are taken for submission. The buffers come back in exactly the order they would have had.
+///
+/// Set it once at startup, before the first frame; changing it mid-run is safe but only affects later frames.
+pub fn set_parallel_finish(enabled: bool) {
+    PARALLEL_FINISH.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether parallel finishing of render command encoders is on (see [`set_parallel_finish`]).
+pub fn parallel_finish() -> bool {
+    PARALLEL_FINISH.load(Ordering::Relaxed)
+}
+
+/// How many encoders the most recent [`PendingCommandBuffers::take`] (or [`RenderContextState::finish`])
+/// finished through the task pool. 0 when it finished serially: the switch off, fewer than two encoders, or
+/// no compute task pool. A cheap proof that the parallel path ran; it is not a metric.
+static LAST_PARALLEL_FINISH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// The number of encoders the last submission list finished in parallel (see [`set_parallel_finish`]).
+pub fn last_parallel_finish_count() -> usize {
+    LAST_PARALLEL_FINISH_COUNT.load(Ordering::Relaxed)
+}
+
+/// One entry of the ordered submission list: an already finished command buffer, or an encoder whose
+/// `finish()` is still to be done (only queued unfinished while [`parallel_finish`] is on).
+///
+/// Generic only so the ordering logic ([`finish_in_order`]) can be tested without a GPU device.
+#[doc(hidden)]
+pub enum Pending<B = CommandBuffer, E = NamedEncoder> {
+    Buffer(B),
+    Encoder(E),
+}
+
+/// An encoder waiting to be finished, with the system that recorded it when tracing is on, so the
+/// `render::encoder_finish` span says whose commands took the time.
+#[doc(hidden)]
+pub struct NamedEncoder {
+    encoder: CommandEncoder,
+    #[cfg(feature = "trace")]
+    owner: Option<alloc::sync::Arc<str>>,
+}
+
+impl NamedEncoder {
+    fn new(encoder: CommandEncoder) -> Self {
+        Self {
+            encoder,
+            #[cfg(feature = "trace")]
+            owner: None,
+        }
+    }
+
+    fn finish(self) -> CommandBuffer {
+        #[cfg(feature = "trace")]
+        let _span = info_span!(
+            "render::encoder_finish",
+            owner = self.owner.as_deref().unwrap_or("unnamed")
+        )
+        .entered();
+        self.encoder.finish()
+    }
+}
+
+/// Queues `encoder` unfinished when parallel finishing is on, finished (the stock behaviour) otherwise.
+fn finish_or_defer(encoder: CommandEncoder) -> Pending {
+    if parallel_finish() {
+        Pending::Encoder(NamedEncoder::new(encoder))
+    } else {
+        Pending::Buffer(NamedEncoder::new(encoder).finish())
+    }
+}
+
+/// Turns an ordered list into finished command buffers in the same order. Encoders are finished in parallel
+/// on the compute task pool when parallel finishing is on, there are at least two, and the pool exists;
+/// otherwise one after another, in order.
+fn finish_pending(pending: Vec<Pending>) -> Vec<CommandBuffer> {
+    finish_in_order(pending, parallel_finish(), NamedEncoder::finish)
+}
+
+/// The ordering logic of [`finish_pending`], over any buffer and encoder types: returns one buffer per
+/// entry, in the order of `pending`. With `use_pool` true, at least two encoders and a compute task pool,
+/// the encoders are finished concurrently on the pool; the results go back into their own places.
+#[doc(hidden)]
+pub fn finish_in_order<B, E, F>(pending: Vec<Pending<B, E>>, use_pool: bool, finish: F) -> Vec<B>
+where
+    B: Send + 'static,
+    E: Send,
+    F: Fn(E) -> B + Sync,
+{
+    let encoder_count = pending
+        .iter()
+        .filter(|entry| matches!(entry, Pending::Encoder(_)))
+        .count();
+    let pool = if use_pool && encoder_count >= 2 {
+        ComputeTaskPool::try_get()
+    } else {
+        None
+    };
+    let Some(pool) = pool else {
+        LAST_PARALLEL_FINISH_COUNT.store(0, Ordering::Relaxed);
+        return pending
+            .into_iter()
+            .map(|entry| match entry {
+                Pending::Buffer(buffer) => buffer,
+                Pending::Encoder(encoder) => finish(encoder),
+            })
+            .collect();
+    };
+
+    #[cfg(feature = "trace")]
+    let _span = info_span!("finish_pending_parallel", encoders = encoder_count).entered();
+
+    // `None` marks the place of an encoder; each task returns its place with its buffer.
+    let mut slots: Vec<Option<B>> = Vec::with_capacity(pending.len());
+    let mut encoders = Vec::with_capacity(encoder_count);
+    for (index, entry) in pending.into_iter().enumerate() {
+        match entry {
+            Pending::Buffer(buffer) => slots.push(Some(buffer)),
+            Pending::Encoder(encoder) => {
+                slots.push(None);
+                encoders.push((index, encoder));
+            }
+        }
+    }
+    let finish = &finish;
+    let finished = pool.scope(|scope| {
+        for (index, encoder) in encoders {
+            scope.spawn(async move { (index, finish(encoder)) });
+        }
+    });
+    for (index, buffer) in finished {
+        slots[index] = Some(buffer);
+    }
+    debug_assert!(
+        slots.iter().all(Option::is_some),
+        "every queued encoder must come back finished"
+    );
+    LAST_PARALLEL_FINISH_COUNT.store(encoder_count, Ordering::Relaxed);
+    slots.into_iter().flatten().collect()
+}
 
 #[derive(Default)]
 struct PendingCommandBuffersInner {
-    buffers: Vec<CommandBuffer>,
+    buffers: Vec<Pending>,
     encoders: Vec<CommandEncoder>,
 }
 
@@ -36,7 +190,13 @@ impl Default for PendingCommandBuffers {
 
 impl PendingCommandBuffers {
     pub fn push(&mut self, buffers: impl IntoIterator<Item = CommandBuffer>) {
-        self.0.buffers.extend(buffers);
+        self.0
+            .buffers
+            .extend(buffers.into_iter().map(Pending::Buffer));
+    }
+
+    fn push_pending(&mut self, pending: impl IntoIterator<Item = Pending>) {
+        self.0.buffers.extend(pending);
     }
 
     pub fn push_encoder(&mut self, encoder: CommandEncoder) {
@@ -44,11 +204,15 @@ impl PendingCommandBuffers {
     }
 
     pub fn take(&mut self) -> Vec<CommandBuffer> {
-        let encoders: Vec<_> = self.0.encoders.drain(..).collect();
-        for encoder in encoders {
-            self.0.buffers.push(encoder.finish());
-        }
-        core::mem::take(&mut self.0.buffers)
+        // Same order as stock: the pushed buffers, then the encoders handed over with `push_encoder`.
+        let mut pending = core::mem::take(&mut self.0.buffers);
+        pending.extend(
+            self.0
+                .encoders
+                .drain(..)
+                .map(|encoder| Pending::Encoder(NamedEncoder::new(encoder))),
+        );
+        finish_pending(pending)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -63,7 +227,7 @@ impl PendingCommandBuffers {
 #[derive(Default)]
 struct RenderContextStateInner {
     command_encoder: Option<CommandEncoder>,
-    command_buffers: Vec<CommandBuffer>,
+    command_buffers: Vec<Pending>,
     render_device: Option<RenderDevice>,
 }
 
@@ -81,7 +245,7 @@ impl Default for RenderContextState {
 impl RenderContextState {
     fn flush_encoder(&mut self) {
         if let Some(encoder) = self.0.command_encoder.take() {
-            self.0.command_buffers.push(encoder.finish());
+            self.0.command_buffers.push(finish_or_defer(encoder));
         }
     }
 
@@ -99,7 +263,7 @@ impl RenderContextState {
 
     pub fn finish(&mut self) -> Vec<CommandBuffer> {
         self.flush_encoder();
-        core::mem::take(&mut self.0.command_buffers)
+        finish_pending(core::mem::take(&mut self.0.command_buffers))
     }
 }
 
@@ -113,12 +277,26 @@ impl SystemBuffer for RenderContextState {
 
         // flush to ensure correct submission order
         if let Some(encoder) = inner.command_encoder.take() {
-            inner.command_buffers.push(encoder.finish());
+            inner.command_buffers.push(finish_or_defer(encoder));
+        }
+
+        #[cfg(feature = "trace")]
+        if inner
+            .command_buffers
+            .iter()
+            .any(|entry| matches!(entry, Pending::Encoder(_)))
+        {
+            let owner: alloc::sync::Arc<str> = _system_meta.name().to_string().into();
+            for entry in &mut inner.command_buffers {
+                if let Pending::Encoder(named) = entry {
+                    named.owner = Some(owner.clone());
+                }
+            }
         }
 
         if !inner.command_buffers.is_empty() {
             let mut pending = world.resource_mut::<PendingCommandBuffers>();
-            pending.push(core::mem::take(&mut inner.command_buffers));
+            pending.push_pending(core::mem::take(&mut inner.command_buffers));
         }
 
         inner.render_device = None;
@@ -177,7 +355,10 @@ impl<'w, 's> RenderContext<'w, 's> {
     /// Adds a finished command buffer to be submitted later.
     pub fn add_command_buffer(&mut self, command_buffer: CommandBuffer) {
         self.state.flush_encoder();
-        self.state.0.command_buffers.push(command_buffer);
+        self.state
+            .0
+            .command_buffers
+            .push(Pending::Buffer(command_buffer));
     }
 }
 
@@ -193,8 +374,14 @@ pub struct FlushCommands<'w> {
 impl<'w> FlushCommands<'w> {
     /// Flushes all pending command buffers to the render queue.
     pub fn flush(&mut self) {
-        let buffers = self.pending.take();
+        let buffers = {
+            #[cfg(feature = "trace")]
+            let _span = info_span!("render::pending_finish", pending = self.pending.len()).entered();
+            self.pending.take()
+        };
         if !buffers.is_empty() {
+            #[cfg(feature = "trace")]
+            let _span = info_span!("render::queue_submit", buffers = buffers.len()).entered();
             self.queue.submit(buffers);
         }
     }

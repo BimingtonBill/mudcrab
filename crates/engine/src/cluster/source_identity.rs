@@ -728,11 +728,6 @@ pub(crate) mod actual_loader_tests {
         configure: impl FnOnce(&mut App),
     ) -> App {
         let mut app = App::new();
-        app.insert_resource(crate::config::EngineConfig {
-            assets_dir: directory.to_path_buf(),
-            ..default()
-        })
-        .init_resource::<crate::graphics_settings::GraphicsSettings>();
         app.add_plugins((
             MinimalPlugins,
             AssetPlugin {

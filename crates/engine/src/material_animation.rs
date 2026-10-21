@@ -41,6 +41,8 @@ use std::{
 
 use bevy::prelude::*;
 
+use crate::effect_palette::EffectPaletteMaterial;
+
 /// A shader value a channel drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variable {
@@ -370,6 +372,11 @@ impl MaterialAnimationRegistry {
     }
 }
 
+/// Palette effect materials whose source texture is animated, with their animation. Filled by the
+/// palette swap in `crate::streaming` as it builds each one.
+#[derive(Resource, Default)]
+pub struct AnimatedPaletteMaterials(pub Vec<(Handle<EffectPaletteMaterial>, MaterialAnimation)>);
+
 /// Standard materials found to carry an animation, and every one already looked at.
 #[derive(Resource, Default)]
 struct AnimatedStandardMaterials {
@@ -382,7 +389,8 @@ pub struct MaterialAnimationPlugin;
 
 impl Plugin for MaterialAnimationPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<AnimatedStandardMaterials>()
+        app.init_resource::<AnimatedPaletteMaterials>()
+            .init_resource::<AnimatedStandardMaterials>()
             // After visibility, so a material is played on the frame whatever draws it is seen.
             .add_systems(
                 PostUpdate,
@@ -451,6 +459,8 @@ fn animate_materials(
     time: Res<Time>,
     mut standard: ResMut<Assets<StandardMaterial>>,
     animated_standard: Res<AnimatedStandardMaterials>,
+    palettes: Option<ResMut<Assets<EffectPaletteMaterial>>>,
+    animated_palettes: Res<AnimatedPaletteMaterials>,
     users: Query<(&MeshMaterial3d<StandardMaterial>, &ViewVisibility)>,
     cluster: Option<Res<crate::cluster::render::ClusterBatchHandles>>,
     mut state: Local<PlayState>,
@@ -503,6 +513,25 @@ fn animate_materials(
         if let Some(mut material) = standard.get_mut(*id) {
             let (offset, scale) = animation.uv_offset_scale(seconds);
             material.uv_transform = uv_transform(offset, scale);
+        }
+    }
+    let Some(mut palettes) = palettes else {
+        return;
+    };
+    for (handle, animation) in &animated_palettes.0 {
+        if let Some(mut material) = palettes.get_mut(handle) {
+            if animation.moves_texture() {
+                let (offset, scale) = animation.uv_offset_scale(seconds);
+                material.extension.set_uv(offset, scale);
+                material.base.uv_transform = uv_transform(offset, scale);
+            }
+            let colour = animation.emissive_color(seconds);
+            let multiple = animation.emissive_multiple(seconds);
+            if colour.is_some() || multiple.is_some() {
+                material
+                    .extension
+                    .set_emissive(colour.map(|colour| colour.x), multiple);
+            }
         }
     }
 }

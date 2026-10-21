@@ -7,7 +7,15 @@ param(
     # out because it is a soak window (30 minutes by default), not a baseline; `all` selects it too.
     # `check` is the held-out route (scripts/routes/check.json): reported, but never in the defaults
     # and never tuned against; `all` selects it too.
-    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability", "travel", "check")]
+    #
+    # The portal branch adds five scenes, none of them in the default set: `portal-door-tour` (the
+    # Riverwood door tour, two crossings), `portal-heavy` (standing at Sven's House door with the
+    # portal view open), `lod-far` (a high vantage where terrain LOD reaches the horizon),
+    # `lod-far-ring-off` (the same view with the terrain ring off, for comparison) and
+    # `lod-flythrough` (a fly-through from LOD into full detail). `portal` selects the five. They
+    # load the portal's converted assets, so -Assets must name those. Their poses and arguments are in
+    # phase2-profile.ps1 (Get-PortalSceneArguments).
+    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability", "travel", "check", "portal", "portal-door-tour", "portal-heavy", "lod-far", "lod-far-ring-off", "lod-flythrough")]
     [string[]]$Scenarios = @(),
     # The converted legal Skyrim asset set every world scenario loads. Not needed for `synthetic`.
     [string]$Assets,
@@ -17,6 +25,9 @@ param(
     # allowance (see `Get-WindowDuration`), so a route cannot be cut short by the world loading.
     [int]$DurationSeconds = 120,
     [int]$StabilitySeconds = 1800,
+    # The portal-door-tour window, in seconds: the scripted tour of Sven's House (in and out) takes
+    # about this long; see phase2-profile.ps1.
+    [int]$PortalTourSeconds = 40,
     [string]$Out,
     [switch]$NoBuild,
     # A previous baseline.json to compare against. Without it, an existing `baseline.json` in -Out
@@ -53,7 +64,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 # names here (-Assets, the window lengths, -Worldspace and the grids). The values this command was
 # called with are put back afterwards, or a caller's -Assets and -DurationSeconds would be lost.
 $sharedNames = @(
-    "Assets", "DurationSeconds", "StabilitySeconds", "Worldspace",
+    "Assets", "DurationSeconds", "StabilitySeconds", "PortalTourSeconds", "Worldspace",
     "RuralGridX", "RuralGridY", "DenseGridX", "DenseGridY", "DenseLegacyGridX", "DenseLegacyGridY", "WaterGridX", "WaterGridY"
 )
 $requestedValues = @{}
@@ -62,6 +73,10 @@ foreach ($name in $sharedNames) { $requestedValues[$name] = Get-Variable -Name $
 foreach ($name in $sharedNames) { Set-Variable -Name $name -Value $requestedValues[$name] }
 
 $defaultScenarios = @("synthetic", "rural", "dense", "water", "stress", "travel")
+$portalScenarios = @("portal-door-tour", "portal-heavy", "lod-far", "lod-far-ring-off", "lod-flythrough")
+if ($Scenarios -contains "portal") {
+    $Scenarios = @($Scenarios | Where-Object { $_ -ne "portal" }) + $portalScenarios | Select-Object -Unique
+}
 $requested = if ($Scenarios.Count -eq 0) {
     # Like the profiling campaign, the default without -Assets is the one scene that needs no
     # converted data instead of a request that immediately fails.
@@ -156,6 +171,7 @@ function Get-WindowInvocationParameters([string]$Name, [string]$Kind, [hashtable
     $parameters = @{
         StandingStill = ($Kind -eq "standing_still")
         DurationSeconds = (Get-WindowDuration $Name); StabilitySeconds = $StabilitySeconds
+        PortalTourSeconds = $PortalTourSeconds
         ResolvedAssets = $resolvedAssets; Worldspace = $Worldspace
         RuralGridX = $RuralGridX; RuralGridY = $RuralGridY; DenseGridX = $DenseGridX; DenseGridY = $DenseGridY
         DenseLegacyGridX = $DenseLegacyGridX; DenseLegacyGridY = $DenseLegacyGridY
@@ -181,6 +197,9 @@ function Get-PlannedWorkloads($Names, $WindowCounts) {
 }
 
 function Get-WindowDuration([string]$Name) {
+    if ($portalScenarios -contains $Name) {
+        return Get-SceneDuration -Name $Name -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds -PortalTourSeconds $PortalTourSeconds
+    }
     if ($Name -eq "stability") { return $StabilitySeconds }
     if ($routeScenarios.ContainsKey($Name)) {
         return [Math]::Max($DurationSeconds, (Get-RouteTravelSeconds $Name) + $RouteReadinessSeconds)
@@ -420,6 +439,12 @@ function Get-KnownScenarioInputs($Arguments, [int]$DurationSeconds) {
             sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $routeArgument).Hash
         }
     }
+    # The portal scenes' own inputs (null for every other scene): the terrain ring, the demo, the
+    # pose file or start position, and the tour's length. A window of one of them is only
+    # comparable with another that was started the same way.
+    $terrainRadius = Get-ArgumentValue $Arguments "--terrain-radius"
+    $shotsFile = Get-ArgumentValue $Arguments "--shots"
+    $startIndex = [Array]::IndexOf($Arguments, "--start-position")
     $assetsIdentity = Get-AssetsIdentity (Get-ArgumentValue $Arguments "--assets")
     return [ordered]@{
         worldspace = $worldspace
@@ -428,6 +453,12 @@ function Get-KnownScenarioInputs($Arguments, [int]$DurationSeconds) {
         synthetic_instances = if ($null -eq $syntheticInstances) { $null } else { [int]$syntheticInstances }
         route = $route
         assets = Get-ArgumentValue $Arguments "--assets"
+        terrain_radius = if ($null -eq $terrainRadius) { $null } else { [int]$terrainRadius }
+        demo = Get-ArgumentValue $Arguments "--demo"
+        tour_doors = Get-ArgumentValue $Arguments "--tour-doors"
+        shots_file = if ($null -eq $shotsFile) { $null } else { Split-Path -Leaf $shotsFile }
+        start_position = if ($startIndex -lt 0) { $null } else { ($Arguments[($startIndex + 1)..($startIndex + 3)] -join ",") }
+        stream_radius = Get-ArgumentValue $Arguments "--stream-radius"
         assets_identity = [ordered]@{
             world_database_bytes = $assetsIdentity.world_database_bytes
             world_database_modified_utc = $assetsIdentity.world_database_modified_utc
@@ -1231,6 +1262,7 @@ $baselineReport = [ordered]@{
     repeats = $Repeats
     duration_seconds = $DurationSeconds
     stability_seconds = $StabilitySeconds
+    portal_tour_seconds = $PortalTourSeconds
     frame_budget_ms = $FrameBudgetMs
     # Where this campaign's own report bundles are, so a window's raw evidence can be found again
     # after a later campaign has written to the same -Out.

@@ -10,7 +10,7 @@ use crate::{
         SkyrimCinematicPost,
     },
     shots::shot_camera_translation,
-    streaming::{ActiveSpace, RenderOrigin, StreamingWorld},
+    streaming::{ActiveCell, RenderOrigin, StreamingWorld},
     swap_bridge::{SwapInCameraView, SwapWaiting, pending_drawn},
     tone_mapping::SceneToneMapSource,
     world::components::StreamingCamera,
@@ -253,7 +253,7 @@ fn extract_capture_frames(
     )>,
     view_inputs: Extract<(
         Res<crate::config::EngineConfig>,
-        Option<Res<ActiveSpace>>,
+        Option<Res<ActiveCell>>,
         Option<Res<StreamingWorld>>,
         Query<Has<SwapInCameraView>, With<SwapWaiting>>,
     )>,
@@ -317,7 +317,7 @@ fn extract_capture_frames(
         } else {
             let (grid_x, grid_y) = crate::config::grid_of(pose[0], pose[1]);
             crate::world::database::CellKey::Exterior {
-                worldspace_id: active.worldspace_id.unwrap_or(config.worldspace_id),
+                worldspace_id: active.worldspace_id,
                 grid_x,
                 grid_y,
             }
@@ -441,57 +441,9 @@ pub(crate) fn validate_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extraction_keeps_fresh_cluster_and_exact_stock_blockers() {
-        for blocker in [
-            "cluster",
-            "failed_cluster",
-            "queued_stock",
-            "stock",
-            "qualification",
-            "failed_stock",
-            "native_draw",
-        ] {
-            let (mut render, ticket) = extraction_world(
-                ActiveSpace {
-                    worldspace_id: Some(17),
-                    interior: Some(83),
-                },
-                IVec2::ZERO,
-                Vec3::ZERO,
-                Failures::default(),
-            );
-            {
-                let mut main = render.resource_mut::<MainWorld>();
-                main.resource_mut::<StreamingWorld>()
-                    .set_resident_for_test(CellKey::Interior(83), Entity::PLACEHOLDER);
-                let mut metrics = main.resource_mut::<StreamingMetrics>();
-                match blocker {
-                    "cluster" => metrics.pending_cluster_batches = 1,
-                    "failed_cluster" => metrics.failed_cluster_batches = 1,
-                    "queued_stock" => metrics.queued_far_stock_queries = 1,
-                    "stock" => metrics.pending_far_stock_queries = 1,
-                    "qualification" => metrics.pending_far_stock_qualification = 1,
-                    "failed_stock" => metrics.failed_far_stock_sources = 1,
-                    "native_draw" => metrics.pending_native_lod_draws = 1,
-                    _ => unreachable!(),
-                }
-            }
-
-            let frame = extracted_receipt(&mut render, &ticket);
-            assert!(frame.work.space_resident);
-            assert_eq!(frame.work.scope, SettleScope::ViewAndCapture);
-            assert!(
-                !frame.work.is_quiet(),
-                "{blocker}: {}",
-                frame.work.describe()
-            );
-        }
-    }
     use crate::{
         shots::{Failures, SettleScope},
-        streaming::{ActiveSpace, StreamingMetrics, StreamingWorld},
+        streaming::{ActiveCell, StreamingMetrics, StreamingWorld},
         swap_bridge::{SwapInCameraView, SwapWaiting},
         world::database::CellKey,
     };
@@ -499,7 +451,7 @@ mod tests {
 
     /// Run the production extraction against an actual MainWorld, without a GPU or readback.
     fn extraction_world(
-        active: ActiveSpace,
+        active: ActiveCell,
         origin: IVec2,
         translation: Vec3,
         baseline: Failures,
@@ -563,8 +515,8 @@ mod tests {
             "benchmark",
         ] {
             let (mut render, ticket) = extraction_world(
-                ActiveSpace {
-                    worldspace_id: Some(17),
+                ActiveCell {
+                    worldspace_id: 17,
                     interior: None,
                 },
                 IVec2::new(4, -10),
@@ -583,7 +535,7 @@ mod tests {
                     benchmark_only: fixture == "benchmark",
                     ..default()
                 });
-                main.remove_resource::<ActiveSpace>();
+                main.remove_resource::<ActiveCell>();
                 main.remove_resource::<StreamingWorld>();
             }
 
@@ -605,8 +557,8 @@ mod tests {
         for mode in ["world", "streaming_benchmark", "streaming_fixture"] {
             for missing in ["cell", "world", "both"] {
                 let (mut render, ticket) = extraction_world(
-                    ActiveSpace {
-                        worldspace_id: Some(17),
+                    ActiveCell {
+                        worldspace_id: 17,
                         interior: Some(83),
                     },
                     IVec2::new(4, -10),
@@ -624,7 +576,7 @@ mod tests {
                         ..default()
                     });
                     if missing != "world" {
-                        main.remove_resource::<ActiveSpace>();
+                        main.remove_resource::<ActiveCell>();
                     }
                     if missing != "cell" {
                         main.remove_resource::<StreamingWorld>();
@@ -651,8 +603,8 @@ mod tests {
     fn interior_extraction_ignores_the_previous_exterior_origin() {
         let pose = [21750.0, -44530.0, 140.0];
         let (mut render, ticket) = extraction_world(
-            ActiveSpace {
-                worldspace_id: Some(17),
+            ActiveCell {
+                worldspace_id: 17,
                 interior: Some(83),
             },
             IVec2::new(4, -10),
@@ -677,8 +629,8 @@ mod tests {
         let pose = [21750.0, -44530.0, 140.0];
         let origin = IVec2::new(4, -10);
         let (mut render, ticket) = extraction_world(
-            ActiveSpace {
-                worldspace_id: Some(17),
+            ActiveCell {
+                worldspace_id: 17,
                 interior: None,
             },
             origin,
@@ -707,8 +659,8 @@ mod tests {
     #[test]
     fn extraction_reads_the_new_active_cells_failure_after_the_request() {
         let (mut render, ticket) = extraction_world(
-            ActiveSpace {
-                worldspace_id: Some(17),
+            ActiveCell {
+                worldspace_id: 17,
                 interior: None,
             },
             IVec2::ZERO,
@@ -726,7 +678,7 @@ mod tests {
                 Entity::PLACEHOLDER,
             );
             // A space switch after the request invalidates the old resident-cell observation.
-            main.resource_mut::<ActiveSpace>().interior = Some(83);
+            main.resource_mut::<ActiveCell>().interior = Some(83);
             main.resource_mut::<StreamingWorld>()
                 .set_failed_for_test(CellKey::Interior(83));
             main.resource_mut::<FrameCount>().0 = 9;
@@ -742,8 +694,8 @@ mod tests {
     #[test]
     fn extraction_reads_camera_visible_swap_waiters_at_capture_time() {
         let (mut render, ticket) = extraction_world(
-            ActiveSpace {
-                worldspace_id: Some(17),
+            ActiveCell {
+                worldspace_id: 17,
                 interior: Some(83),
             },
             IVec2::ZERO,
@@ -767,6 +719,54 @@ mod tests {
     }
 
     #[test]
+    fn extraction_keeps_fresh_cluster_and_exact_stock_blockers() {
+        for blocker in [
+            "cluster",
+            "failed_cluster",
+            "queued_stock",
+            "stock",
+            "qualification",
+            "failed_stock",
+            "native_draw",
+        ] {
+            let (mut render, ticket) = extraction_world(
+                ActiveCell {
+                    worldspace_id: 17,
+                    interior: Some(83),
+                },
+                IVec2::ZERO,
+                Vec3::ZERO,
+                Failures::default(),
+            );
+            {
+                let mut main = render.resource_mut::<MainWorld>();
+                main.resource_mut::<StreamingWorld>()
+                    .set_resident_for_test(CellKey::Interior(83), Entity::PLACEHOLDER);
+                let mut metrics = main.resource_mut::<StreamingMetrics>();
+                match blocker {
+                    "cluster" => metrics.pending_cluster_batches = 1,
+                    "failed_cluster" => metrics.failed_cluster_batches = 1,
+                    "queued_stock" => metrics.queued_far_stock_queries = 1,
+                    "stock" => metrics.pending_far_stock_queries = 1,
+                    "qualification" => metrics.pending_far_stock_qualification = 1,
+                    "failed_stock" => metrics.failed_far_stock_sources = 1,
+                    "native_draw" => metrics.pending_native_lod_draws = 1,
+                    _ => unreachable!(),
+                }
+            }
+
+            let frame = extracted_receipt(&mut render, &ticket);
+            assert!(frame.work.space_resident);
+            assert_eq!(frame.work.scope, SettleScope::ViewAndCapture);
+            assert!(
+                !frame.work.is_quiet(),
+                "{blocker}: {}",
+                frame.work.describe()
+            );
+        }
+    }
+
+    #[test]
     fn extraction_combines_view_evidence_with_the_frozen_failure_baseline() {
         let earlier = StreamingMetrics {
             failed_cells: 1,
@@ -776,8 +776,8 @@ mod tests {
         };
         let baseline = Failures::read(&earlier, &crate::render::RendererMetrics::default());
         let (mut render, ticket) = extraction_world(
-            ActiveSpace {
-                worldspace_id: Some(17),
+            ActiveCell {
+                worldspace_id: 17,
                 interior: Some(83),
             },
             IVec2::ZERO,

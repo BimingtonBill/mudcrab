@@ -49,11 +49,15 @@ impl RemoteSettings {
 #[cfg(feature = "remote")]
 pub fn add_remote_plugins(app: &mut App, settings: Option<RemoteSettings>) {
     use crate::{
-        streaming::{AssetFailure, RenderOrigin, StreamingMetrics},
+        doors::{DoorLeaf, DoorState, LoadDoor},
+        player::{Player, PlayerMode},
+        portal::StreamedCellKey,
+        streaming::{ActiveCell, AssetFailure, RenderOrigin, StreamingMetrics},
+        transition::CrossingHeld,
         world::components::{
-            CellRef, ExpectedModelBounds, ExteriorCellGrid, FormId, InstanceBounds, MaterialHandle,
-            MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch, WaterSurface,
-            WorldPosition, WorldTransform,
+            CellRef, DistantTerrainRoot, ExpectedModelBounds, ExteriorCellGrid, FormId,
+            InstanceBounds, MaterialHandle, MeshHandle, StreamedCellRoot, StreamingCamera,
+            TerrainPatch, WaterSurface, WorldPosition, WorldTransform,
         },
     };
     use bevy::remote::{RemotePlugin, http::RemoteHttpPlugin};
@@ -70,8 +74,6 @@ pub fn add_remote_plugins(app: &mut App, settings: Option<RemoteSettings>) {
     ))
     // Only reflected types are visible to `world.query` and friends. Automatic registration covers
     // these on most platforms; registering them here keeps the list explicit.
-    .register_type::<crate::graphics_settings::GraphicsSettings>()
-    .register_type::<crate::world::components::StreamedCellKey>()
     .register_type::<FormId>()
     .register_type::<CellRef>()
     .register_type::<WorldPosition>()
@@ -87,7 +89,18 @@ pub fn add_remote_plugins(app: &mut App, settings: Option<RemoteSettings>) {
     .register_type::<WaterSurface>()
     .register_type::<RenderOrigin>()
     .register_type::<StreamingMetrics>()
-    .register_type::<AssetFailure>();
+    .register_type::<AssetFailure>()
+    // The portal's own state: the space the camera is in, the load doors and their leaves, the
+    // player controller and a crossing in progress.
+    .register_type::<DistantTerrainRoot>()
+    .register_type::<ActiveCell>()
+    .register_type::<StreamedCellKey>()
+    .register_type::<LoadDoor>()
+    .register_type::<DoorState>()
+    .register_type::<DoorLeaf>()
+    .register_type::<Player>()
+    .register_type::<PlayerMode>()
+    .register_type::<CrossingHeld>();
     info!(
         "Bevy Remote Protocol listening on http://{}:{} (render world on port {REMOTE_RENDER_PORT}); \
          no authentication, local development only",

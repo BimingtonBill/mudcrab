@@ -50,6 +50,17 @@ pub fn supports_runtime_world_database_schema(version: u32) -> bool {
     (MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION..=WORLD_DATABASE_SCHEMA_VERSION).contains(&version)
 }
 
+/// Schema numbers from this number up were written by an older Mudcrab dev build, which numbered its
+/// schemas privately (`100_000 + main's number`, e.g. converter 102_401, world database 100_701).
+/// The dev tree now writes `main`'s numbers; a data set at a retired number is read by no build and
+/// must be converted again.
+pub const RETIRED_DEV_SCHEMA_FLOOR: u32 = 100_000;
+
+/// Whether a converter or world database schema number is one of the retired private dev numbers.
+pub fn is_retired_dev_schema(version: u32) -> bool {
+    version >= RETIRED_DEV_SCHEMA_FLOOR
+}
+
 pub const CELL_CACHE_VERSION: u32 = 3;
 pub const LAND_SIDE: u16 = 33;
 

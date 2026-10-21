@@ -109,6 +109,7 @@ impl MatchedRoute {
                 hfov: self.hfov_degrees,
                 reference: None,
                 note: None,
+                open_door: None,
             })
             .collect();
         let file = ShotsFile {

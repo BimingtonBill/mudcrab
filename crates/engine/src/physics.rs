@@ -540,7 +540,7 @@ fn report_movement_tuning(tuning: Res<MovementTuning>) {
         .record_speeds
         .as_ref()
         .map_or("legacy provisional constants", |s| s.source.as_str());
-    info!(
+    debug!(
         "WALK speeds: forward walk={} run={} Creation units/s (first-pass factor 1); provisional sprint={} ({}x directional run); source={source}; jump_launch={} and gravity={} provisional",
         tuning.walk_speed,
         tuning.run_speed,
@@ -593,8 +593,13 @@ pub(crate) struct PlayerControlsSystems;
 impl Plugin for PlayerControlsPlugin {
     fn build(&self, app: &mut App) {
         register_move_mode_effect(app.world_mut());
-        app.add_plugins(PhysicsCorePlugin)
-            .init_resource::<MoveMode>()
+        // A walked world run adds the physics core itself (`crate::app`, for the streamed world
+        // colliders) before main's player comes in through `WorldPlayerPlugin`; adding it twice
+        // panics at startup, so the player brings it only when nothing else has.
+        if !app.is_plugin_added::<PhysicsCorePlugin>() {
+            app.add_plugins(PhysicsCorePlugin);
+        }
+        app.init_resource::<MoveMode>()
             .init_resource::<WalkIntent>()
             .init_resource::<SprintLatch>()
             .init_resource::<LookIntent>()
@@ -745,6 +750,7 @@ fn fixture_material(base_color: Color) -> StandardMaterial {
 
 fn setup_physics_fixture(
     mut commands: Commands,
+    config: Option<Res<crate::config::EngineConfig>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -818,7 +824,7 @@ fn setup_physics_fixture(
     commands.spawn((
         DirectionalLight {
             illuminance: 12_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: crate::app::sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),

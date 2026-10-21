@@ -276,8 +276,6 @@ fn source_pose(
 
 #[cfg(test)]
 mod tests {
-    // An unrelated content layer outside both public reflection routes.
-    const UNROUTED_TEST_LAYER: usize = 31;
     use super::*;
     use crate::render::{
         LIGHT_LAYERS, MAIN_VIEW_LAYERS, PLACED_OBJECT_LAYER, REFLECTION_VIEW_LAYERS, WATER_LAYER,
@@ -481,7 +479,7 @@ mod tests {
     /// the water surface, or the portal's destination space.
     #[test]
     fn water_and_the_portal_destination_stay_out_of_both_routes() {
-        let destination = RenderLayers::layer(UNROUTED_TEST_LAYER);
+        let destination = RenderLayers::layer(crate::portal::DESTINATION_LAYER);
         for layers in [shadowed_layers(), unshadowed_layers()] {
             assert!(!layers.intersects(&destination));
             assert!(!layers.intersects(&RenderLayers::layer(WATER_LAYER)));
@@ -622,7 +620,7 @@ mod tests {
             .world_mut()
             .entity_mut(sun)
             // The doorway's sun is such a source: it lights the portal's destination layer only.
-            .insert(RenderLayers::layer(UNROUTED_TEST_LAYER));
+            .insert(RenderLayers::layer(crate::portal::DESTINATION_LAYER));
         harness.app.update();
         harness.app.update();
         assert!(harness.copies().is_empty());

@@ -1,0 +1,25 @@
+From d6e121210717d0da56f0588968e9fc38903d6dee Mon Sep 17 00:00:00 2001
+From: BimingtonBill <90541801+BimingtonBill@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 12:54:16 +0930
+Subject: [PATCH] [claude] experimental: drop duplicated #[test] from the #121
+ merge
+
+---
+ crates/engine/src/app.rs | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/crates/engine/src/app.rs b/crates/engine/src/app.rs
+index 0f17079b..38cf0e60 100644
+--- a/crates/engine/src/app.rs
++++ b/crates/engine/src/app.rs
+@@ -2353,7 +2353,6 @@ mod tests {
+         assert!(message.contains("exit code"), "{message}");
+     }
+ 
+-    #[test]
+     #[test]
+     fn io_pool_is_a_quarter_of_the_hardware_threads_unless_requested() {
+         assert_eq!(io_pool_threads(0, 16), 4);
+-- 
+2.50.0.windows.1
+

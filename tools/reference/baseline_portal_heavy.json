@@ -1,0 +1,18 @@
+{
+  "width": 1600,
+  "height": 900,
+  "shots": [
+    {
+      "name": "sven-door-square",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [20558.4, -46062.6, -2.1],
+      "yaw": 161.5,
+      "pitch": 5.2,
+      "hfov": 75.0,
+      "open_door": "0x0001CBB0",
+      "reference": null,
+      "note": "The phase 2 baseline's portal-heavy scene: the first shot of tools/reference/doorway_shots.json (Sven's House doorway from the street, square to the door, 350 units), at the baseline's 1600x900 window so every scene of a campaign shares one resolution. Only this first shot is used: in a benchmark run the shots run opens the door, waits for the portal to draw the room beyond it, and then holds this view for the benchmark window instead of photographing it."
+    }
+  ]
+}

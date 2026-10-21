@@ -278,6 +278,10 @@ fn inspect_world(options: &Options) -> Result<InspectionReport> {
         })
         .wrap_err("world database has no schema version")?;
     color_eyre::eyre::ensure!(
+        !shared::is_retired_dev_schema(database_schema),
+        "this data set was converted by an older Mudcrab dev build (world database schema          {database_schema}); convert it again with this build"
+    );
+    color_eyre::eyre::ensure!(
         shared::supports_runtime_world_database_schema(database_schema),
         "world database schema {database_schema} is unsupported; reconvert assets for a schema \
          from {} through {}",

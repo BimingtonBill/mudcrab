@@ -1,4 +1,3 @@
-use crate::streaming::lod::LodStreaming;
 use super::*;
 use crate::{
     cluster::reader::{
@@ -97,7 +96,6 @@ fn complete_plan_app(fixture: &Fixture, key: CellKey) -> App {
         })
         .insert_resource(RenderOrigin(grid(key)))
         .insert_resource(ValidatedPackage(fixture.package.clone()))
-        .init_resource::<ActiveSpace>()
         .init_resource::<LodStreaming>()
         .init_resource::<FarStock>()
         .init_resource::<SourceFallbackDemand>()
@@ -137,16 +135,11 @@ fn world() -> World {
     world.insert_resource(config);
     world.insert_resource(RenderOrigin(IVec2::new(310_000, -270_000)));
     world.init_resource::<Messages<AppExit>>();
-    world.init_resource::<ActiveSpace>();
     world.init_resource::<FarStock>();
     world
 }
 
 fn root(world: &mut World, key: CellKey, far: bool) -> Entity {
-    world.init_resource::<ActiveSpace>();
-    if world.resource::<ActiveSpace>().worldspace_id.is_none() {
-        world.resource_mut::<ActiveSpace>().worldspace_id = cell_world(key);
-    }
     let translation = grid_translation(grid(key), world.resource::<RenderOrigin>().0);
     let mut entity = world.spawn((
         ExteriorCellGrid(grid(key)),
@@ -154,13 +147,16 @@ fn root(world: &mut World, key: CellKey, far: bool) -> Entity {
         Visibility::Inherited,
     ));
     if far {
-        entity.insert(DistantSourceRoot);
+        entity.insert(DistantRoleRoot);
     } else {
         entity.insert(StreamedCellRoot);
     }
     // As in a real cell bundle, the role-owner marker must exist when the key observer runs.
     entity.insert(StreamedCellKey(key));
     let entity = entity.id();
+    if far {
+        sync_holder_role(world, entity, CellRole::Active).unwrap();
+    }
     entity
 }
 
@@ -230,6 +226,9 @@ fn state(fixture: &Fixture, key: CellKey, owner: Owner) -> FarStock {
         demand: Some(LodDemand {
             world: placing_world,
             center: grid(key),
+            role: LodDemandRole::Main,
+            camera: Entity::PLACEHOLDER,
+            main_camera: None,
         }),
         desired: HashMap::from([(identity, key)]),
         near_roots: owner.near_key.zip(owner.near_root).into_iter().collect(),
@@ -248,12 +247,17 @@ fn assert_no_exit(world: &World) {
 
 // Exercise the real sparse collector and shared spawner with an already delivered database row.
 // Scene admission retains the request, so these tests need neither a glTF loader nor a renderer.
-fn layer_app(fixture: &Fixture, key: CellKey, row: &ReferenceRow) -> App {
+fn layer_app(fixture: &Fixture, key: CellKey, row: &ReferenceRow, seamless: bool) -> App {
     let mut app = App::new();
-    let config = EngineConfig {
+    let mut config = EngineConfig {
         max_scene_loads: 1,
         lights: true,
         ..default()
+    };
+    config.portal.load_doors = if seamless {
+        crate::config::LoadDoors::Seamless
+    } else {
+        crate::config::LoadDoors::LoadScreen
     };
     let (_sender, receiver) = crossbeam_channel::bounded(1);
     let far = FarStock {
@@ -261,6 +265,9 @@ fn layer_app(fixture: &Fixture, key: CellKey, row: &ReferenceRow) -> App {
         demand: Some(LodDemand {
             world: cell_world(key).unwrap(),
             center: grid(key),
+            role: LodDemandRole::Main,
+            camera: Entity::PLACEHOLDER,
+            main_camera: None,
         }),
         desired: HashMap::from([((cell_world(key).unwrap(), row.form_id), key)]),
         pending: HashMap::from([(
@@ -291,12 +298,18 @@ fn layer_app(fixture: &Fixture, key: CellKey, row: &ReferenceRow) -> App {
             remaining: 1,
             ..default()
         })
-        .init_resource::<ActiveSpace>()
+        .init_resource::<DirectionalSnowCatalog>()
         .init_resource::<StreamingWorld>()
         .init_resource::<ProfilingState>()
         .init_resource::<Messages<AppExit>>()
         .add_systems(Update, collect);
-    crate::render::add_placed_object_layer_propagation(&mut app);
+    if seamless {
+        app.init_resource::<PortalState>()
+            .init_resource::<crate::portal::StreamedCellLayerStamps>();
+        crate::portal::add_cell_layer_isolation(&mut app);
+    } else {
+        crate::render::add_placed_object_layer_propagation(&mut app);
+    }
     app
 }
 
@@ -324,17 +337,22 @@ fn nonseamless_exact_sources_keep_stock_layers_for_both_producer_orders_and_late
         radius: 128.0,
         color: [255, 200, 150],
         flags: 0,
+        falloff: 1.0,
+        fade: None,
     });
     let identity = (cell_world(key).unwrap(), row.form_id);
     for near_first in [false, true] {
-        let mut app = layer_app(&fixture, key, &row);
+        let mut app = layer_app(&fixture, key, &row, false);
         let near = root(app.world_mut(), key, false);
         let ordinary = if near_first {
             let asset_server = app.world().resource::<AssetServer>().clone();
+            let snow = DirectionalSnowCatalog::default();
             let mut profiler = ProfilingState::default();
             let mut sequence = 0;
             let mut context = ReferenceSpawnContext {
                 key,
+                stamp: None,
+                snow: &snow,
                 model_sequence: &mut sequence,
                 asset_server: &asset_server,
                 profiler: &mut profiler,
@@ -387,14 +405,8 @@ fn nonseamless_exact_sources_keep_stock_layers_for_both_producer_orders_and_late
             .unwrap();
         let model = app.world_mut().spawn(ChildOf(entity)).id();
         let mesh = app.world_mut().spawn(ChildOf(model)).id();
-        let own_layers = RenderLayers::layer(7);
-        let own = app
-            .world_mut()
-            .spawn((own_layers.clone(), ChildOf(entity)))
-            .id();
         app.update();
         assert_stock_layers(app.world(), &[entity, model, mesh]);
-        assert_eq!(app.world().get::<RenderLayers>(own), Some(&own_layers));
 
         let mut payload = vec![row.clone()];
         let mut adoptions = Vec::new();
@@ -412,27 +424,30 @@ fn nonseamless_exact_sources_keep_stock_layers_for_both_producer_orders_and_late
         app.update();
         assert_eq!(app.world().get::<ChildOf>(entity).unwrap().parent(), near);
         assert_stock_layers(app.world(), &[entity, model, mesh]);
-        assert_eq!(app.world().get::<RenderLayers>(own), Some(&own_layers));
 
         release(app.world_mut(), near);
         app.world_mut().entity_mut(near).insert(Visibility::Hidden);
         with_far(app.world_mut(), reconcile_near);
         let holder = app.world().resource::<FarStock>().holders[&key];
         assert_eq!(app.world().get::<ChildOf>(entity).unwrap().parent(), holder);
-        // Public demand controls holder visibility; source layers survive every refresh.
-        let demand = app.world().resource::<FarStock>().demand;
-        for active in [false, true] {
+        // Refresh must not put a retained ordinary source on portal layers, even as roles flip.
+        for demand_role in [
+            LodDemandRole::Portal,
+            LodDemandRole::Pinned,
+            LodDemandRole::Main,
+        ] {
             with_far(app.world_mut(), |world, far| {
-                far.demand = if active { demand } else { None };
+                far.demand.as_mut().unwrap().role = demand_role;
                 refresh_holders(world, far);
             });
             let late = app.world_mut().spawn(ChildOf(model)).id();
             app.update();
-            assert_stock_layers(app.world(), &[entity, model, mesh, late]);
-            assert_eq!(app.world().get::<RenderLayers>(own), Some(&own_layers));
+            assert_stock_layers(app.world(), &[holder, entity, model, mesh, late]);
             assert_eq!(
                 app.world().get::<Visibility>(holder),
-                Some(&holder_visibility(active))
+                Some(&holder_visibility(role(
+                    app.world().resource::<FarStock>().demand
+                )))
             );
         }
         app.world_mut()
@@ -443,7 +458,6 @@ fn nonseamless_exact_sources_keep_stock_layers_for_both_producer_orders_and_late
         app.update();
         assert_eq!(app.world().get::<ChildOf>(entity).unwrap().parent(), near);
         assert_stock_layers(app.world(), &[entity, model, mesh]);
-        assert_eq!(app.world().get::<RenderLayers>(own), Some(&own_layers));
         assert_eq!(
             app.world()
                 .get::<super::super::requests::SceneRequest>(entity)
@@ -473,6 +487,88 @@ fn nonseamless_exact_sources_keep_stock_layers_for_both_producer_orders_and_late
         );
         assert_no_exit(app.world());
     }
+}
+
+#[test]
+fn seamless_exact_sources_keep_active_destination_and_hidden_roles_for_late_scenes() {
+    let fixture = Fixture::new();
+    let (key, row, _) = fixture.selected();
+    let identity = (cell_world(key).unwrap(), row.form_id);
+    let mut app = layer_app(&fixture, key, &row, true);
+    app.update();
+    let entity = app.world().resource::<FarStock>().owners[&identity].entity;
+    let holder = app.world().resource::<FarStock>().holders[&key];
+    let model = app.world_mut().spawn(ChildOf(entity)).id();
+    for (demand_role, expected) in [
+        (
+            LodDemandRole::Main,
+            crate::render::reflectable_world_layers(),
+        ),
+        (
+            LodDemandRole::Portal,
+            RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+        ),
+        (LodDemandRole::Pinned, RenderLayers::none()),
+        (
+            LodDemandRole::Main,
+            crate::render::reflectable_world_layers(),
+        ),
+    ] {
+        with_far(app.world_mut(), |world, far| {
+            far.demand.as_mut().unwrap().role = demand_role;
+            refresh_holders(world, far);
+        });
+        let late = app.world_mut().spawn(ChildOf(model)).id();
+        app.update();
+        for node in [holder, entity, model, late] {
+            assert_eq!(app.world().get::<RenderLayers>(node), Some(&expected));
+        }
+    }
+    // An actual own-layer source uses the portal registry on adoption and release, rather than
+    // acquiring the ordinary stock override. Its original layers return when the holder is active.
+    let own_layers = RenderLayers::layer(7);
+    let own = app
+        .world_mut()
+        .spawn((own_layers.clone(), ChildOf(entity)))
+        .id();
+    app.update();
+    assert_eq!(app.world().get::<RenderLayers>(own), Some(&own_layers));
+    app.insert_resource(crate::streaming::ActiveCell {
+        worldspace_id: cell_world(key).unwrap(),
+        interior: None,
+    });
+    app.world_mut().spawn((
+        crate::world::components::StreamingCamera,
+        Transform::default(),
+    ));
+    let near = root(app.world_mut(), key, false);
+    queue_adopt(
+        &mut app.world_mut().commands(),
+        near,
+        key,
+        vec![row.form_id],
+    );
+    app.world_mut().flush();
+    app.update();
+    assert_eq!(app.world().get::<ChildOf>(entity).unwrap().parent(), near);
+    assert_eq!(app.world().get::<RenderLayers>(own), Some(&own_layers));
+    release(app.world_mut(), near);
+    app.world_mut().flush();
+    for (demand_role, expected) in [
+        (
+            LodDemandRole::Portal,
+            RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+        ),
+        (LodDemandRole::Main, own_layers),
+    ] {
+        with_far(app.world_mut(), |world, far| {
+            far.demand.as_mut().unwrap().role = demand_role;
+            refresh_holders(world, far);
+        });
+        app.update();
+        assert_eq!(app.world().get::<RenderLayers>(own), Some(&expected));
+    }
+    assert_no_exit(app.world());
 }
 
 fn assert_bookkeeping(far: &FarStock) {
@@ -1064,7 +1160,6 @@ fn headless_destination_readiness_uses_exact_far_cell_coverage_and_hidden_holder
     // and makes no claim about drawable geometry, queued passes or renderer acceptance.
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, AssetPlugin::default()))
-        .init_resource::<ActiveSpace>()
         .init_resource::<StreamingWorld>()
         .init_resource::<FarStock>()
         .add_plugins(DestinationReadinessPlugin);
@@ -1072,12 +1167,7 @@ fn headless_destination_readiness_uses_exact_far_cell_coverage_and_hidden_holder
     let other_world = exterior(18, grid(cell));
     let near = app
         .world_mut()
-        .spawn((
-            StreamedCellRoot,
-            StreamedCellKey(cell),
-            ExteriorCellGrid(grid(cell)),
-            Visibility::Inherited,
-        ))
+        .spawn((StreamedCellRoot, Visibility::Inherited))
         .id();
     app.world_mut()
         .resource_mut::<StreamingWorld>()
@@ -1130,12 +1220,7 @@ fn headless_destination_readiness_uses_exact_far_cell_coverage_and_hidden_holder
     );
     let holder = app
         .world_mut()
-        .spawn((
-            DistantSourceRoot,
-            StreamedCellKey(cell),
-            ExteriorCellGrid(grid(cell)),
-            Visibility::Hidden,
-        ))
+        .spawn((DistantRoleRoot, Visibility::Hidden))
         .id();
     app.world_mut().spawn((
         crate::streaming::AssetFailed,
@@ -1518,6 +1603,9 @@ fn queued_membership_tracks_replan_pop_retry_clear_and_qualification() {
         demand: Some(LodDemand {
             world: 17,
             center: grid(key),
+            role: LodDemandRole::Main,
+            camera: Entity::PLACEHOLDER,
+            main_camera: None,
         }),
         qualification_pending: true,
         ..Default::default()
@@ -1668,17 +1756,26 @@ fn full_model_demand_is_bounded_by_the_loaded_grid_and_leaves_interiors_empty() 
 }
 
 #[test]
-fn loaded_grid_bounds_are_world_exact_and_inclusive() {
+fn loaded_grid_bounds_are_world_exact_inclusive_and_role_independent() {
     let mut demand = LodDemand {
         world: 17,
         center: IVec2::new(-3, 4),
+        role: LodDemandRole::Main,
+        camera: Entity::PLACEHOLDER,
+        main_camera: None,
     };
-    assert!(demand_contains(demand, 17, IVec2::new(-5, 6), 2));
-    assert!(!demand_contains(demand, 17, IVec2::new(-6, 6), 2));
-    assert!(!demand_contains(demand, 18, IVec2::new(-3, 4), 2));
-    assert!(demand_contains(demand, 17, demand.center, -1));
-    assert!(!demand_contains(demand, 17, demand.center + IVec2::X, -1));
+    for role in [
+        LodDemandRole::Main,
+        LodDemandRole::Portal,
+        LodDemandRole::Pinned,
+    ] {
+        demand.role = role;
+        assert!(demand.contains_cell(17, IVec2::new(-5, 6), 2));
+        assert!(!demand.contains_cell(17, IVec2::new(-6, 6), 2));
+        assert!(!demand.contains_cell(18, IVec2::new(-3, 4), 2));
+        assert!(!demand.contains_cell(17, demand.center, -1));
+    }
     demand.world = 18;
-    assert!(!demand_contains(demand, 17, demand.center, 2));
-    assert!(demand_contains(demand, 18, demand.center, 0));
+    assert!(!demand.contains_cell(17, demand.center, 2));
+    assert!(demand.contains_cell(18, demand.center, 0));
 }

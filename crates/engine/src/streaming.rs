@@ -1,12 +1,15 @@
-use crate::physics::{DebugTankard, PlayerBody, PlayerControlsSystems};
+use crate::physics::PlayerControlsSystems;
 use crate::{
     config::EngineConfig,
+    doors::LoadDoor,
+    effect_palette::{EffectPaletteExtension, EffectPaletteMaterial, EffectPaletteRegistry},
     nif_depth::NifDepthMaterialSource,
     profiling::ProfilingState,
     render::{
         PLACED_OBJECT_RENDER_LAYERS, QUADRANT_WEIGHT_SAMPLES, TerrainExtension, TerrainMaterial,
         WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
+    snow::{DirectionalSnow, DirectionalSnowCatalog, SnowMaterial, SnowMaterialCache},
     swap_bridge::{SwapDrawn, SwapInCameraView, SwapStandIn, SwapSurface, SwapWaiting},
     terrain_merge::{
         CellLookup, TerrainMerge, classes::TerrainClasses, material::MergedTerrainMaterial,
@@ -14,9 +17,9 @@ use crate::{
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
-            CELL_SIZE, CellRef, DistantTerrainRoot, ExpectedModelBounds, ExteriorCellGrid, FormId,
-            InstanceBounds, MeshHandle, StreamedCellKey, StreamedCellRoot, StreamingCamera,
-            TerrainPatch, WaterSurface, WorldPosition, WorldTransform,
+            CELL_SIZE, CellRef, DistantTerrainRoot, ExpectedModelBounds, ExteriorCellGrid,
+            InstanceBounds, StreamedCellRoot, StreamingCamera, TerrainPatch, WaterSurface,
+            WorldTransform,
         },
         database::{
             AssetCatalog, CellDetail, CellKey, CellPayload, DatabaseRequest, DatabaseResponse,
@@ -26,7 +29,8 @@ use crate::{
     },
 };
 use bevy::{
-    app::{Propagate, SceneSpawnerSystems},
+    animation::AnimationTargetId,
+    app::{Inherited, Propagate, SceneSpawnerSystems},
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::{primitives::MeshAabb, visibility::RenderLayers},
     ecs::system::SystemParam,
@@ -51,19 +55,19 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub(crate) mod far_stock;
+pub(crate) mod lod;
 mod reference_spawn;
 pub(crate) use reference_spawn::{ReferenceSpawnContext, reference_placement, spawn_reference};
 pub(crate) mod identity_changes;
-pub(crate) mod lod;
+pub(crate) mod terrain_audit;
+mod terrain_identity;
+pub(crate) use terrain_identity::{TerrainIdentityAccess, TerrainPrimitiveIdentity};
 mod lod_objects;
 mod lod_trees;
 pub(crate) mod native_lod;
-pub(crate) mod terrain_audit;
 pub(crate) mod terrain_handoff;
-mod terrain_identity;
 use shared::terrain_mesh::TerrainCellMesh;
 use std::sync::Arc;
-pub(crate) use terrain_identity::{TerrainIdentityAccess, TerrainPrimitiveIdentity};
 
 pub(crate) mod admission;
 pub(crate) mod control;
@@ -236,8 +240,13 @@ pub struct StreamingPlugin;
 
 impl Plugin for StreamingPlugin {
     fn build(&self, app: &mut App) {
-        identity_changes::install(app.world_mut());
+        identity_changes::install_terrain(app.world_mut());
         app.add_systems(Last, terrain_identity::validate_relationships);
+        terrain_audit::install(app);
+        // The snow catalogue is inserted by `crate::extensions` before this plugin, and only when the
+        // data set lists `mudcrab.directional_snow` at a version the engine reads. Without it the
+        // snow system is not registered at all.
+        let snow_extension = app.world().contains_resource::<DirectionalSnowCatalog>();
         if app
             .world()
             .get_resource::<EngineConfig>()
@@ -260,6 +269,13 @@ impl Plugin for StreamingPlugin {
             .init_resource::<runtime::StreamingRuntime>()
             .add_plugins(crate::streaming_preparation::StreamingPreparationPlugin)
             .init_resource::<crate::pacing::PacingTracker>()
+            .init_resource::<ActiveCell>()
+            .init_resource::<PrestreamCells>()
+            // Filled by `crate::extensions` when the data set lists `mudcrab.directional_snow`;
+            // otherwise empty, and `spawn_cell` gives no reference a `DirectionalSnow`. The snow
+            // system below is registered only in the first case.
+            .init_resource::<DirectionalSnowCatalog>()
+            .init_resource::<SnowMaterialCache>()
             .add_observer(mark_world_instance_ready)
             .add_observer(lod::mark_lod_world_instance_ready)
             .add_systems(
@@ -267,6 +283,7 @@ impl Plugin for StreamingPlugin {
                 (
                     (
                         // First, so the LOD planner two systems down reads this frame's space.
+                        sync_active_space,
                         runtime::update_streaming_control,
                         plan_cells,
                         despawn_cells,
@@ -275,12 +292,14 @@ impl Plugin for StreamingPlugin {
                         lod::collect_lod_chunks,
                         // Include this frame's deferred LOD roots before the next
                         // player update can encounter their visible mesh geometry.
+                        lod::sync_lod_roles,
                         requests::dispatch_scene_requests,
                         arm_pending_models,
                         track_asset_readiness,
                     )
                         .chain(),
                     (
+                        apply_effect_palettes,
                         track_surface_readiness,
                         track_merged_surface_readiness,
                         lod::track_lod_readiness,
@@ -294,6 +313,19 @@ impl Plugin for StreamingPlugin {
                         .chain(),
                 )
                     .chain()
+                    // The transition systems move the camera into its new cell and decide what a
+                    // nearby door pre-streams, both of which the plan below has to see this frame.
+                    // They are added by `crate::portal::PortalPlugin`, which this plugin is always
+                    // added with; an ordering edge onto a set with no members is not an error.
+                    .after(crate::transition::DoorTransition)
+                    // The portal isolation hides every cell outside the active space in the same
+                    // frame's `PortalFrame` ([`crate::portal::isolate_cells`]); a cell a distance
+                    // unload retires is outside that space too, so the plan must read the
+                    // isolation's hide before writing its own ([`hide_retiring_root`]). Ordered
+                    // after, the isolation always gets there first and the plan never hides a root
+                    // the isolation owns. An edge onto a set with no members is not an error, so a
+                    // run without the portal is unaffected.
+                    .after(crate::portal::PortalFrame)
                     .after(PlayerControlsSystems),
             )
             // Bevy instantiates every ready converted model in one unbudgeted pass inside
@@ -306,6 +338,16 @@ impl Plugin for StreamingPlugin {
                     end_scene_spawn_batch.after(SceneSpawnerSystems::WorldInstanceSpawn),
                 ),
             );
+        if snow_extension {
+            // Where it sat in the chain above: after the asset readiness pass, before the effect
+            // palettes. The chain orders everything around it, so these two edges keep its place.
+            app.add_systems(
+                Update,
+                apply_directional_snow
+                    .after(track_asset_readiness)
+                    .before(apply_effect_palettes),
+            );
+        }
         // Distant object LOD and tree billboards from the package's Skyrim LOD inventory. Inert
         // for a package without it, and for a run that turns both off.
         app.add_plugins((
@@ -326,8 +368,8 @@ impl Plugin for StreamingPlugin {
         // `collect_cells` -> `lod::collect_lod_chunks` edge. A commit queues a cell's root, its
         // references and their scene spawns as deferred commands, so the frame's spawning cost is
         // paid at that sync point rather than inside the system - the same shape as the unload
-        // apply, and the other deferred half of a crossing frame's `Update` (analysis-1103 Â§4
-        // leaves the 140 ms `Update` unattributed; analysis-1074 Â§2's open item is which part of
+        // apply, and the other deferred half of a crossing frame's `Update` (analysis-1103 §4
+        // leaves the 140 ms `Update` unattributed; analysis-1074 §2's open item is which part of
         // it is the apply). Both brackets sit exactly where Bevy's own pass inserts its sync
         // point, so a profiled run's schedule is the unmeasured one's; only the measurement is
         // added.
@@ -560,21 +602,20 @@ fn wanted_in_space(
     center: IVec2,
     radius: i32,
 ) -> HashSet<CellKey> {
-    if let Some(cell_id) = space.interior {
-        return HashSet::from([CellKey::Interior(cell_id)]);
-    }
-    let worldspace_id = space.exterior_worldspace(configured_worldspace);
-    let mut wanted = HashSet::new();
-    for y in -radius..=radius {
-        for x in -radius..=radius {
-            wanted.insert(CellKey::Exterior {
-                worldspace_id,
-                grid_x: center.x + x,
-                grid_y: center.y + y,
-            });
-        }
-    }
-    wanted
+    let active = ActiveCell {
+        worldspace_id: space.exterior_worldspace(configured_worldspace),
+        interior: space.interior,
+    };
+    wanted_cells(
+        &active,
+        radius.max(0),
+        radius.max(0),
+        center,
+        &PrestreamCells::default(),
+    )
+    .into_iter()
+    .map(|(key, _)| key)
+    .collect()
 }
 
 /// Whether this run builds world colliders (main's `interactive_world_physics`, narrowed to a run
@@ -675,6 +716,84 @@ impl StreamingWorld {
             Some(CellStatus::Loading { generation: current, detail: wanted, .. })
                 if *current == generation && *wanted == detail
         )
+    }
+}
+
+/// The cell the camera streams from: the exterior worldspace around it, or the interior it is
+/// inside. While `interior` is `Some`, `worldspace_id` still names the worldspace the camera came
+/// from and no exterior is streamed.
+///
+/// Started from [`EngineConfig::worldspace_id`], so a run that never crosses a load door behaves
+/// exactly as it did before doors existed.
+#[derive(Resource, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
+#[reflect(Resource)]
+pub struct ActiveCell {
+    pub worldspace_id: u32,
+    pub interior: Option<u32>,
+}
+
+impl FromWorld for ActiveCell {
+    fn from_world(world: &mut World) -> Self {
+        Self {
+            worldspace_id: world.get_resource::<EngineConfig>().map_or_else(
+                || EngineConfig::default().worldspace_id,
+                |config| config.worldspace_id,
+            ),
+            interior: None,
+        }
+    }
+}
+
+/// Cells the transition layer wants streamed before the camera gets there: the destination behind
+/// every load door the camera is close to. Rebuilt every frame and merged into the planner's
+/// wanted set, so a crossing finds its destination already resident.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct PrestreamCells {
+    interiors: HashSet<u32>,
+    exteriors: HashSet<(u32, i32, i32)>,
+}
+
+impl PrestreamCells {
+    pub fn clear(&mut self) {
+        self.interiors.clear();
+        self.exteriors.clear();
+    }
+
+    pub fn request_interior(&mut self, cell_id: u32) {
+        self.interiors.insert(cell_id);
+    }
+
+    pub fn request_exterior(&mut self, worldspace_id: u32, grid: IVec2) {
+        self.exteriors.insert((worldspace_id, grid.x, grid.y));
+    }
+
+    pub fn contains(&self, key: &CellKey) -> bool {
+        match *key {
+            CellKey::Interior(cell_id) => self.interiors.contains(&cell_id),
+            CellKey::Exterior {
+                worldspace_id,
+                grid_x,
+                grid_y,
+            } => self.exteriors.contains(&(worldspace_id, grid_x, grid_y)),
+        }
+    }
+
+    /// Every pre-streamed cell, interiors and exteriors. A pre-streamed cell is always streamed in
+    /// full: it is the space behind a door, which the camera may cross into at any moment.
+    pub fn keys(&self) -> impl Iterator<Item = CellKey> + '_ {
+        let interiors = self
+            .interiors
+            .iter()
+            .map(|cell_id| CellKey::Interior(*cell_id));
+        let exteriors = self
+            .exteriors
+            .iter()
+            .map(|&(worldspace_id, grid_x, grid_y)| CellKey::Exterior {
+                worldspace_id,
+                grid_x,
+                grid_y,
+            });
+        interiors.chain(exteriors)
     }
 }
 
@@ -1260,7 +1379,7 @@ pub(crate) struct RetiredCellAccess<'w, 's> {
         'w,
         's,
         (&'static Visibility, &'static RetireHidden),
-        With<crate::world::components::StreamedCellKey>,
+        With<crate::portal::StreamedCellKey>,
     >,
 }
 
@@ -1301,27 +1420,6 @@ pub(crate) fn set_distance_retired_for_cluster_test(
             .remove::<RetireHidden>();
     }
 }
-
-/// The space the player is in. The planner streams only this space: the active interior when
-/// there is one, otherwise the exterior cells around the camera in the active worldspace. A load
-/// door crossing (`crate::door_crossing`) changes it; nothing else does, so the default (no
-/// interior, the configured worldspace) is the behaviour before doors existed.
-#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ActiveSpace {
-    /// `None` means the worldspace the engine was configured with.
-    pub worldspace_id: Option<u32>,
-    /// `Some(cell_id)` while the player is inside that interior cell.
-    pub interior: Option<u32>,
-}
-
-impl ActiveSpace {
-    pub fn exterior_worldspace(&self, configured: u32) -> u32 {
-        self.worldspace_id.unwrap_or(configured)
-    }
-}
-
-/// The cells the planner wants resident: the active interior alone, or the exterior window of
-/// `radius` cells around `center` in the active worldspace.
 
 #[derive(Resource, Reflect, Debug, Clone, Copy)]
 #[reflect(Resource)]
@@ -1381,6 +1479,42 @@ impl StreamingWorld {
     #[cfg(test)]
     pub(crate) fn cell_count_for_test(&self) -> usize {
         self.cells.len()
+    }
+}
+
+/// The active interior or exterior worldspace used by readiness and LOD.
+/// Door transitions update ActiveCell; sync_active_space mirrors that selection before planning.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActiveSpace {
+    /// `None` means the worldspace the engine was configured with.
+    pub worldspace_id: Option<u32>,
+    /// `Some(cell_id)` while the player is inside that interior cell.
+    pub interior: Option<u32>,
+}
+
+impl ActiveSpace {
+    pub fn exterior_worldspace(&self, configured: u32) -> u32 {
+        self.worldspace_id.unwrap_or(configured)
+    }
+}
+
+impl From<&ActiveCell> for ActiveSpace {
+    fn from(active: &ActiveCell) -> Self {
+        Self {
+            worldspace_id: Some(active.worldspace_id),
+            interior: active.interior,
+        }
+    }
+}
+
+/// Mirrors portal's [`ActiveCell`] into [`ActiveSpace`], the one place the two meet: the space
+/// switch a portal door makes is what turns terrain LOD off in an interior and back on at an
+/// exterior arrival. Written only on a change, so what reads the space through change detection
+/// is not woken every frame.
+pub(crate) fn sync_active_space(active: Res<ActiveCell>, mut space: ResMut<ActiveSpace>) {
+    let wanted = ActiveSpace::from(&*active);
+    if *space != wanted {
+        *space = wanted;
     }
 }
 
@@ -1462,7 +1596,8 @@ pub(crate) fn unload_all_cells_now(world: &mut World) -> usize {
 /// Grouped to stay within Bevy's sixteen-parameter system function limit.
 #[derive(SystemParam)]
 struct CellPlanningContext<'w, 's> {
-    space: Res<'w, ActiveSpace>,
+    active: Res<'w, ActiveCell>,
+    prestream: Res<'w, PrestreamCells>,
     origin: Res<'w, RenderOrigin>,
     camera: Query<'w, 's, &'static Transform, With<StreamingCamera>>,
 }
@@ -1488,7 +1623,8 @@ fn plan_cells(
     mut runtime: Option<ResMut<runtime::StreamingRuntime>>,
 ) {
     let CellPlanningContext {
-        space,
+        active,
+        prestream,
         origin,
         camera,
     } = context;
@@ -1501,7 +1637,7 @@ fn plan_cells(
     let mut space_unload_entities = 0u64;
     // Recorded before anything else, so `has_failed` reads the interior the camera is in even on
     // a frame the plan stops early.
-    streaming.active_interior = space.interior;
+    streaming.active_interior = active.interior;
     commit_budget.remaining = runtime
         .as_ref()
         .and_then(|runtime| runtime.decision)
@@ -1518,16 +1654,16 @@ fn plan_cells(
     let Ok(camera) = camera.single() else {
         return;
     };
-    let center = window_center(&config, camera.translation, origin.0);
+    let center = camera_grid(camera.translation, origin.0);
     // Keep LAND stand-ins resident through drawable coverage withdrawal. Inventory does not
     // authorize retirement; the existing LOD index arbitrates each surface's visibility below.
     let terrain_radius = config.effective_terrain_radius(false);
     let mut wanted = wanted_cells(
-        &space,
-        config.worldspace_id,
+        &active,
         config.stream_radius,
         terrain_radius,
         center,
+        &prestream,
     );
     wanted.retain(|(key, detail)| terrain_request_required(&database, *key, *detail));
     let controlled = config.streaming_controls_enabled();
@@ -1544,6 +1680,7 @@ fn plan_cells(
                 CellKey::Interior(_) => 0,
             };
             (
+                !prestream.contains(key),
                 *detail == CellDetail::Terrain,
                 distance,
                 cell_order_key(*key),
@@ -1589,7 +1726,7 @@ fn plan_cells(
         // Whether this is a retry of a failure at exactly the tier the plan is asking for again:
         // only the interior the camera stands in is ever asked for again at the tier it failed at
         // ([`retry_failed_interior`]), and only while its retry budget lasts.
-        let retrying = retry_failed_interior(&key, space.interior, &streaming);
+        let retrying = retry_failed_interior(&key, active.interior, &streaming);
         // What the cell is streamed as now, and the root that draws it.
         let (held, root) = match streaming.cells.get(&key) {
             None => (None, None),
@@ -1725,11 +1862,11 @@ fn plan_cells(
         let keep = pinned.contains(key)
             || cell_within_unload_radius(
                 *key,
-                &space,
-                config.worldspace_id,
+                &active,
                 center,
                 config.unload_radius,
                 terrain_radius,
+                &prestream,
             );
         if keep {
             // A cell that comes back before the unload budget reaches it is revived as it is: the
@@ -1755,7 +1892,7 @@ fn plan_cells(
         // the root stay until the budget in `despawn_cells` reaches it. Everything else is a space
         // change - an interior left behind, a worldspace just left on a door crossing - and
         // unloads in this frame, exactly as it did before the pacer existed.
-        if paces_its_unload(*key, &space, config.worldspace_id) {
+        if paces_its_unload(*key, &active) {
             match status {
                 CellStatus::Resident { root, detail } => {
                     if config.clusters.is_some() {
@@ -2002,11 +2139,10 @@ fn record_cell_commit_flush(
 /// exterior of a worldspace the camera just left, on this frame or on the door crossing before it:
 /// those are the cells of a space the camera is no longer in, and holding them drawn is not an
 /// option. Both unload in [`plan_cells`] itself, as they did before the pacer existed.
-fn paces_its_unload(key: CellKey, active: &ActiveSpace, configured_worldspace: u32) -> bool {
+fn paces_its_unload(key: CellKey, active: &ActiveCell) -> bool {
     match key {
         CellKey::Exterior { worldspace_id, .. } => {
-            active.interior.is_none()
-                && worldspace_id == active.exterior_worldspace(configured_worldspace)
+            active.interior.is_none() && worldspace_id == active.worldspace_id
         }
         CellKey::Interior(_) => false,
     }
@@ -2212,7 +2348,7 @@ fn despawn_cells(world: &mut World) {
             let budget = if overflow {
                 cell_backlog
             } else {
-                count_budget.min(cell_backlog + chunk_backlog)
+                count_budget.min(cell_backlog + chunk_backlog + block_backlog)
             };
             cells = budget.min(cell_backlog);
             chunks = (budget - cells).min(chunk_backlog);
@@ -2621,20 +2757,98 @@ fn probe_retire_visibility(
     });
 }
 
+// -----------------------------------------------------------------------------------------
+// The test bridge: `StreamingWorld`'s cell table and the drain are private to this module,
+// and another module's tests have to hold roots against a running drain (the portal's: a
+// retiring cell must be invisible while it drains, and the pre-warm's wait must not be held
+// by a drain). Compiled only under `cfg(test)`.
+// -----------------------------------------------------------------------------------------
+
+/// Plants a retiring full-detail cell with `root` holding it in the world table, the way
+/// [`plan_cells`]' distance fall-out leaves one, for a test outside this module that cannot fill
+/// the private map.
+#[cfg(test)]
+pub(crate) fn test_plant_retiring_cell(world: &mut World, key: CellKey, root: Entity) {
+    world.resource_mut::<StreamingWorld>().cells.insert(
+        key,
+        CellStatus::Retiring {
+            root,
+            detail: CellDetail::Full,
+        },
+    );
+}
+
+/// Plants a resident full-detail cell with `root` in the world table, the way a finished load
+/// commits it, for the same tests.
+#[cfg(test)]
+pub(crate) fn test_plant_resident_cell(world: &mut World, key: CellKey, root: Entity) {
+    world.resource_mut::<StreamingWorld>().cells.insert(
+        key,
+        CellStatus::Resident {
+            root,
+            detail: CellDetail::Full,
+        },
+    );
+}
+
+/// How many cells the table holds as retiring: what a test reads to prove a drain is mid-flight.
+#[cfg(test)]
+pub(crate) fn test_retiring_cells(world: &World) -> usize {
+    world
+        .resource::<StreamingWorld>()
+        .cells
+        .values()
+        .filter(|status| matches!(status, CellStatus::Retiring { .. }))
+        .count()
+}
+
+/// Runs [`despawn_cells`] for a test outside this module, which cannot schedule the private
+/// system by name: the same exclusive system, on the same resources.
+#[cfg(test)]
+pub(crate) fn test_despawn_cells(world: &mut World) {
+    despawn_cells(world);
+}
+
+/// The resources [`despawn_cells`] touches that a foreign test app does not otherwise carry.
+#[cfg(test)]
+pub(crate) fn test_init_despawn_resources(world: &mut World) {
+    world.init_resource::<StreamingMetrics>();
+    world.init_resource::<TerrainContinuity>();
+    world.init_resource::<lod::LodStreaming>();
+}
+
+/// The two read-only catalogues a cell commit reads: the landscape and water texture paths
+/// ([`AssetCatalog`]) and the projected snow materials ([`DirectionalSnowCatalog`]).
 ///
 /// They travel as one - together with the frame's shared commit budget, which main's commit
 /// pacing spends from - because a system function takes at most sixteen parameters, and
 /// [`collect_cells`] - the commit path - is at that limit.
 #[derive(SystemParam)]
-struct CommitCatalogs<'w, 's> {
+struct CommitCatalogs<'w> {
     assets: Res<'w, AssetCatalog>,
+    snow: Res<'w, DirectionalSnowCatalog>,
     budget: ResMut<'w, StreamingCommitBudget>,
     far: Option<ResMut<'w, far_stock::FarStock>>,
-    reference_entities: Query<'w, 's, (), With<FormId>>,
-    cluster_terrain: Option<Res<'w, crate::cluster::terrain::ClusterTerrain>>,
 }
 
-/// Hands the root a detail change replaces over to the stand-in hold (design-1091 Â§3): the cell
+/// What a commit reads to stamp a cell's nodes at birth (`crate::portal`'s spawn stamp,
+/// impl-1058): the classification inputs of the moment - the run's configuration, render origin,
+/// active cell, the portal-installed marker that says a run stamps at all, the portal's
+/// destination cells and the streaming camera. One parameter, for the same reason
+/// [`CommitCatalogs`] is: [`collect_cells`] is at the system-function parameter limit.
+#[derive(SystemParam)]
+struct SpawnStampContext<'w, 's> {
+    config: Res<'w, EngineConfig>,
+    origin: Res<'w, RenderOrigin>,
+    active: Res<'w, ActiveCell>,
+    stamps: Option<Res<'w, crate::portal::StreamedCellLayerStamps>>,
+    cluster_terrain: Option<Res<'w, crate::cluster::terrain::ClusterTerrain>>,
+    state: Option<Res<'w, crate::portal::PortalState>>,
+    camera: Query<'w, 's, &'static Transform, With<StreamingCamera>>,
+    reference_entities: Query<'w, 's, (), With<crate::world::components::FormId>>,
+}
+
+/// Hands the root a detail change replaces over to the stand-in hold (design-1091 §3): the cell
 /// changed detail on the same grid, and until the root that replaced it can be drawn this one keeps
 /// covering the ground, so no frame shows neither.
 ///
@@ -2661,8 +2875,7 @@ fn hold_replaced_root(commands: &mut Commands, replaced: Entity) {
 #[allow(clippy::too_many_arguments)]
 fn collect_cells(
     mut commands: Commands,
-    config: Res<EngineConfig>,
-    origin: Res<RenderOrigin>,
+    context: SpawnStampContext,
     database: Res<WorldDatabase>,
     cache: Res<CellCache>,
     asset_server: Res<AssetServer>,
@@ -2685,7 +2898,7 @@ fn collect_cells(
         .merge
         .as_deref()
         .is_some_and(TerrainMerge::holds_cells);
-    let config = &*config;
+    let config = &context.config;
     let catalog = &catalogs.assets;
     let world_physics = builds_world_colliders(config);
     let frame_commit_started = Instant::now();
@@ -2829,7 +3042,7 @@ fn collect_cells(
                     terrain: terrain_commits,
                     elapsed_micros: elapsed_micros(frame_commit_started),
                 },
-                config,
+                &context.config,
             )
         {
             // Rotate deferred full responses so terrain and unrelated reservations can progress.
@@ -2876,7 +3089,7 @@ fn collect_cells(
             Ok(mut payload) => {
                 let mut terrain = cache.terrain(payload.cell_id);
                 if let (Some(terrain), Some(cluster)) =
-                    (terrain.as_mut(), catalogs.cluster_terrain.as_deref())
+                    (terrain.as_mut(), context.cluster_terrain.as_deref())
                     && let CellKey::Exterior {
                         worldspace_id,
                         grid_x,
@@ -2909,7 +3122,7 @@ fn collect_cells(
                 });
                 if let Some(terrain) = terrain.as_mut() {
                     let canonical =
-                        catalogs
+                        context
                             .cluster_terrain
                             .as_deref()
                             .and_then(|cluster| match payload.key {
@@ -2948,7 +3161,7 @@ fn collect_cells(
                             );
                             metrics.ring_cells_empty = metrics.ring_cells_empty.saturating_add(1);
                             profiler.increment("streaming/ring_cells_invalid_terrain", 1);
-                            if config.clusters.is_some()
+                            if context.config.clusters.is_some()
                                 && let Some(root) = replaced
                             {
                                 far_stock::queue_release(&mut commands, root);
@@ -3013,7 +3226,7 @@ fn collect_cells(
                     );
                     metrics.ring_cells_empty = metrics.ring_cells_empty.saturating_add(1);
                     profiler.increment("streaming/ring_cells_without_terrain", 1);
-                    if config.clusters.is_some()
+                    if context.config.clusters.is_some()
                         && let Some(root) = replaced
                     {
                         far_stock::queue_release(&mut commands, root);
@@ -3035,6 +3248,30 @@ fn collect_cells(
                 // becomes the new root's stand-in (at the end of this arm) and stays drawn until
                 // the new root's terrain is confirmed drawn, so no frame shows neither. See
                 // [`hold_replaced_root`].
+                // The layers the cell is born on (`crate::portal`'s resolver, impl-1058): the commit
+                // classifies the cell from the space of the moment, and the nodes the tree is built
+                // from carry that value in their own bundles - the propagation's first pass over
+                // them is then a comparison, and the crossing's role flips later are value writes.
+                // A terrain-only cell is never isolated and keeps the layers it was spawned with,
+                // as before; a run without the portal has no resolver and stamps nothing.
+                let stamp = match detail {
+                    CellDetail::Full => context.stamps.as_ref().and_then(|_| {
+                        let camera = context.camera.single().ok()?.translation;
+                        let destination = context
+                            .state
+                            .as_deref()
+                            .map_or(&[][..], crate::portal::PortalState::destination);
+                        Some(crate::portal::spawn_layer_stamp(
+                            &response.key,
+                            &context.active,
+                            context.config.unload_radius,
+                            camera,
+                            context.origin.0,
+                            destination,
+                        ))
+                    }),
+                    CellDetail::Terrain => None,
+                };
                 // A full exterior cell answered without terrain is committed as before - no
                 // quadrants, no water - but no longer silently: counted, logged, and marked so the
                 // lifecycle check can tell it from a cell that lost its landscape.
@@ -3052,7 +3289,7 @@ fn collect_cells(
                 let adoptions = if detail == CellDetail::Full {
                     catalogs.far.as_deref_mut().map(|far| {
                         far.take_adoptions(payload.key, &mut payload.references, |entity| {
-                            catalogs.reference_entities.contains(entity)
+                            context.reference_entities.contains(entity)
                         })
                     })
                 } else {
@@ -3065,11 +3302,12 @@ fn collect_cells(
                     &mut commands,
                     &asset_server,
                     &catalogs.assets,
+                    &catalogs.snow,
                     &reflection,
                     &mut assets.meshes,
                     &mut assets.terrain_materials,
                     &mut assets.water_materials,
-                    origin.0,
+                    context.origin.0,
                     config.lights,
                     requests::enabled(config),
                     payload,
@@ -3077,7 +3315,7 @@ fn collect_cells(
                     merged,
                     detail,
                     world_physics,
-                    None,
+                    stamp,
                     replaced,
                     &mut streaming.next_model_sequence,
                     &mut profiler,
@@ -3127,7 +3365,7 @@ fn collect_cells(
                 // is confirmed drawn - in the same frame the two are drawn together, never in
                 // neither - or, loudly and counted, when the hold bound passes.
                 if let Some(replaced) = replaced {
-                    if config.clusters.is_some() {
+                    if context.config.clusters.is_some() {
                         far_stock::queue_release(&mut commands, replaced);
                     }
                     hold_replaced_root(&mut commands, replaced);
@@ -3151,7 +3389,7 @@ fn collect_cells(
                     debug!(?response.key, %error, "the ring holds nothing at this grid");
                     metrics.ring_cells_empty = metrics.ring_cells_empty.saturating_add(1);
                     profiler.increment("streaming/ring_cells_without_a_cell", 1);
-                    if config.clusters.is_some()
+                    if context.config.clusters.is_some()
                         && let Some(root) = replaced
                     {
                         far_stock::queue_release(&mut commands, root);
@@ -3442,7 +3680,7 @@ fn terrain_request_required(database: &WorldDatabase, key: CellKey, detail: Cell
 
 /// The cells the active cell wants resident, and what it wants of each: the interior the camera is
 /// in, or the exterior grid of `stream_radius` around it in full and the terrain-only ring out to
-/// `terrain_radius` beyond â€” plus everything the transition layer pre-streamed for a nearby load
+/// `terrain_radius` beyond — plus everything the transition layer pre-streamed for a nearby load
 /// door, which is what makes a crossing seamless.
 ///
 /// Ordered for the worker's queue, which takes them in the order they are asked for:
@@ -3453,13 +3691,19 @@ fn terrain_request_required(database: &WorldDatabase, key: CellKey, detail: Cell
 /// 3. the exterior grid, nearest first and full before terrain-only, so the world appears from the
 ///    camera outwards.
 fn wanted_cells(
-    active: &ActiveSpace,
-    configured_worldspace: u32,
+    active: &ActiveCell,
     stream_radius: i32,
     terrain_radius: i32,
     center: IVec2,
+    prestream: &PrestreamCells,
 ) -> Vec<(CellKey, CellDetail)> {
     let mut wanted = Vec::new();
+    // Everything a nearby door pre-streamed, wherever it is: a destination in another worldspace,
+    // an interior, or a cell the grid below reaches only as terrain. Always in full: it is the
+    // space behind a door, which the camera may cross into at any moment.
+    for key in prestream.keys() {
+        wanted.push((key, CellDetail::Full));
+    }
     if let Some(cell_id) = active.interior {
         // An interior is the whole plan: it is one cell, and no exterior is streamed while the
         // camera is inside one.
@@ -3475,17 +3719,22 @@ fn wanted_cells(
                     continue;
                 };
                 let key = CellKey::Exterior {
-                    worldspace_id: active.exterior_worldspace(configured_worldspace),
+                    worldspace_id: active.worldspace_id,
                     grid_x,
                     grid_y,
                 };
+                // A cell a door pre-streamed is already in the list, in full: it is not the grid's
+                // to decide the tier of.
+                if prestream.contains(&key) {
+                    continue;
+                }
                 if let Some(detail) = wanted_detail(
                     active,
-                    configured_worldspace,
                     stream_radius,
                     terrain_radius,
                     center,
                     key,
+                    prestream,
                 ) {
                     grid.push((x.abs().max(y.abs()), key, detail));
                 }
@@ -3502,16 +3751,19 @@ fn wanted_cells(
 /// What the plan wants done with one cell: nothing, its terrain, or the whole cell.
 ///
 /// A cell is full inside the inner grid, terrain-only in the ring around it, and not wanted beyond
-/// the ring â€” except that a pre-streamed cell is always full, however far away it is: it is the
+/// the ring — except that a pre-streamed cell is always full, however far away it is: it is the
 /// space behind a door the camera is about to cross into, and an interior is never terrain-only.
 fn wanted_detail(
-    active: &ActiveSpace,
-    configured_worldspace: u32,
+    active: &ActiveCell,
     stream_radius: i32,
     terrain_radius: i32,
     center: IVec2,
     key: CellKey,
+    prestream: &PrestreamCells,
 ) -> Option<CellDetail> {
+    if prestream.contains(&key) {
+        return Some(CellDetail::Full);
+    }
     match (key, active.interior) {
         (CellKey::Interior(cell_id), Some(interior)) if cell_id == interior => {
             Some(CellDetail::Full)
@@ -3526,7 +3778,7 @@ fn wanted_detail(
             },
             None,
         ) => {
-            if worldspace_id != active.exterior_worldspace(configured_worldspace) {
+            if worldspace_id != active.worldspace_id {
                 return None;
             }
             let distance = (i64::from(grid_x) - i64::from(center.x))
@@ -3557,12 +3809,15 @@ fn wanted_detail(
 /// instead of holding its cells at whatever grid the destination happens to share.
 fn cell_within_unload_radius(
     key: CellKey,
-    active: &ActiveSpace,
-    configured_worldspace: u32,
+    active: &ActiveCell,
     center: IVec2,
     radius: i32,
     terrain_radius: i32,
+    prestream: &PrestreamCells,
 ) -> bool {
+    if prestream.contains(&key) {
+        return true;
+    }
     match (key, active.interior) {
         (CellKey::Interior(cell_id), Some(active_interior)) => cell_id == active_interior,
         (CellKey::Interior(_), None) => false,
@@ -3576,7 +3831,7 @@ fn cell_within_unload_radius(
             None,
         ) => {
             let limit = radius.max(terrain_radius.saturating_add(1));
-            worldspace_id == active.exterior_worldspace(configured_worldspace)
+            worldspace_id == active.worldspace_id
                 && (grid_x - center.x).abs() <= limit
                 && (grid_y - center.y).abs() <= limit
         }
@@ -3637,6 +3892,7 @@ fn spawn_cell(
         commands,
         asset_server,
         catalog,
+        &DirectionalSnowCatalog::default(),
         reflection,
         meshes,
         terrain_materials,
@@ -3662,6 +3918,7 @@ fn spawn_demo_cell(
     commands: &mut Commands,
     asset_server: &AssetServer,
     catalog: &AssetCatalog,
+    snow: &DirectionalSnowCatalog,
     reflection: &WaterReflectionTexture,
     meshes: &mut Assets<Mesh>,
     terrain_materials: &mut Assets<TerrainMaterial>,
@@ -3692,6 +3949,7 @@ fn spawn_demo_cell(
         commands,
         asset_server,
         catalog,
+        snow,
         reflection,
         meshes,
         terrain_materials,
@@ -3717,6 +3975,7 @@ fn spawn_cell_with_options(
     commands: &mut Commands,
     asset_server: &AssetServer,
     catalog: &AssetCatalog,
+    snow: &DirectionalSnowCatalog,
     reflection: &WaterReflectionTexture,
     meshes: &mut Assets<Mesh>,
     terrain_materials: &mut Assets<TerrainMaterial>,
@@ -3794,7 +4053,6 @@ fn spawn_cell_with_options(
     let mut root_commands = commands.spawn((
         Name::new(format!("Cell {:08X}", payload.cell_id)),
         CellRef(payload.cell_id),
-        StreamedCellKey(payload.key),
         Transform::from_translation(root_translation),
         Visibility::default(),
     ));
@@ -3808,6 +4066,14 @@ fn spawn_cell_with_options(
     }
     if let CellKey::Exterior { grid_x, grid_y, .. } = payload.key {
         root_commands.insert(ExteriorCellGrid(IVec2::new(grid_x, grid_y)));
+    }
+    // The exact key, so portal isolation can tell two worldspaces apart at the same grid.
+    root_commands.insert(crate::portal::StreamedCellKey(payload.key));
+    // The role's source and its `Inherited` from the same moment: `stamp_streamed_cell` re-classifies
+    // the root from the same resources this stamp came from, and the isolation re-classifies every
+    // frame, so the stamp can only be confirmed or corrected, never half-applied.
+    if let Some(layers) = stamp.clone() {
+        root_commands.insert((Propagate(layers.clone()), Inherited(layers.clone()), layers));
     }
     let root = root_commands.id();
     commands.entity(root).with_children(|parent| {
@@ -3849,6 +4115,7 @@ fn spawn_cell_with_options(
                         TerrainCollider,
                         RigidBody::Fixed,
                         collider,
+                        ColliderDisabled,
                         crate::physics::world_collision_groups(),
                     ));
                 }
@@ -3867,7 +4134,7 @@ fn spawn_cell_with_options(
                     },
                     extension,
                 });
-                // The quadrant declares what its draw needs, for the renderâ†’main swap bridge
+                // The quadrant declares what its draw needs, for the render→main swap bridge
                 // (`crate::swap_bridge`): the material it draws with and every image that material
                 // binds. The images are the ones the readiness pass validates below, and the
                 // declaration includes every authored diffuse and normal dependency.
@@ -3918,10 +4185,15 @@ fn spawn_cell_with_options(
                     }
                 }
                 if let Some(collider) = collider {
+                    // Born disabled: only `crate::portal`'s space gate enables a collider, and only
+                    // for a cell whose role is Active (decision 4 of the collision brief). Surface
+                    // readiness must not enable one - a pre-streamed destination becomes ready while
+                    // it is not active.
                     patch.insert((
                         TerrainCollider,
                         RigidBody::Fixed,
                         collider,
+                        ColliderDisabled,
                         crate::physics::world_collision_groups(),
                     ));
                 }
@@ -3930,7 +4202,11 @@ fn spawn_cell_with_options(
                 // water reflection draws the terrain on either shadow route (`crate::shadow_route`).
                 // Not both: layers of the patch's own would make it a layer source of its own under
                 // the portal's cell isolation (`crate::portal`'s `adopt_own_layer_node`).
-                patch.insert(crate::render::reflectable_world_layers());
+                if let Some(layers) = stamp.clone() {
+                    patch.insert((Inherited(layers.clone()), layers));
+                } else {
+                    patch.insert(crate::render::reflectable_world_layers());
+                }
                 if detail == CellDetail::Terrain {
                     // A ring cell casts no shadow: its own shadows fall on the ring, tens of
                     // thousands of units away and past the last shadow cascade, so nobody can see
@@ -4029,18 +4305,25 @@ fn spawn_cell_with_options(
         if detail == CellDetail::Full {
             let references_started = Instant::now();
             let mut model_loads = 0u64;
-            let mut context = ReferenceSpawnContext {
+            let mut reference_context = ReferenceSpawnContext {
                 key: payload.key,
-                model_sequence,
+                stamp: stamp.as_ref(),
+                snow,
+                model_sequence: &mut *model_sequence,
                 asset_server,
-                profiler,
-                world_physics: terrain_physics,
+                profiler: &mut *profiler,
+                world_physics,
                 lights,
                 schedule_scenes,
             };
             for reference in payload.references {
-                if let Some((_, requested)) = spawn_reference(parent, reference, &mut context) {
-                    model_loads += u64::from(requested);
+                if !reference.initially_enabled {
+                    continue;
+                }
+                if let Some((_, model_requested)) =
+                    spawn_reference(parent, reference, &mut reference_context)
+                {
+                    model_loads += u64::from(model_requested);
                 }
             }
             profiler.record_elapsed("streaming/spawn_references", references_started);
@@ -4057,6 +4340,44 @@ fn spawn_cell_with_options(
     profiler.increment("streaming/references_suppressed", suppressed_count as u64);
     profiler.record_elapsed("streaming/spawn_cell", spawn_started);
     Ok(root)
+}
+
+/// The [`LoadDoor`] a reference spawns with, or `None` for an ordinary reference and for a door
+/// link the converter could not resolve to a cell.
+///
+/// The destination's cell decides which kind of destination this is: a `worldspace_id` names an
+/// exterior, and its absence makes the cell an interior. `auto_load` comes from the base record
+/// ([`ReferenceRow::auto_load`]), which is how an invisible `AutoLoadDoor01` marker is told from a
+/// door the player has to open. `outward` comes from the link that leads back into this door
+/// ([`DoorLinkRow::return_arrival`]), which is what says which side of the door the player arrives
+/// on, whatever the door model's own axes are.
+pub(crate) fn load_door(reference: &ReferenceRow) -> Option<LoadDoor> {
+    crate::doors::load_door(
+        reference.form_id,
+        reference.position,
+        reference.auto_load,
+        reference.door.as_ref(),
+    )
+}
+
+/// The doorway anchor the reference's door is drawn, crossed and streamed with, or `None` when the
+/// data does not support one - tier 4 of `docs/research/portal-door-alignment.md` section 9.2, and
+/// every door of a run without a world database. Such a door keeps today's map exactly.
+///
+/// The source doorway is the reference's own row; the destination's is the row the database read
+/// for the link's destination reference (`DoorLinkRow::destination_doorway`), which is the door's
+/// own geometry and not the `XTEL` arrival point. A link the database could not resolve to a
+/// reference it has placed has no destination doorway, and no anchor.
+pub(crate) fn door_anchor(reference: &ReferenceRow) -> Option<crate::doors::DoorAnchor> {
+    let door = reference.door.as_ref()?;
+    let source = reference.doorway.as_ref()?;
+    let destination = door.destination_doorway.as_ref()?;
+    crate::doors::doorway_anchor(
+        source,
+        destination,
+        door.arrival_position,
+        door.destination_worldspace_id.is_some(),
+    )
 }
 
 /// A converted model [`spawn_cell`] found for a reference but has not handed to Bevy yet.
@@ -4196,7 +4517,9 @@ type RenderPrimitiveQuery<'world, 'state> = Query<
 >;
 
 /// A spawned model's hierarchy nodes as the strict bounds check reads them. `Billboard` marks the
-/// camera-facing nodes, whose authored rotation stands in for their camera-dependent one.
+/// camera-facing nodes, whose authored rotation stands in for their camera-dependent one;
+/// [`AuthoredPose`] marks the nodes a clip can move, whose spawn-time transform stands in for
+/// wherever the clip has put them.
 type SpawnedNodeQuery<'world, 'state> = Query<
     'world,
     'state,
@@ -4204,8 +4527,39 @@ type SpawnedNodeQuery<'world, 'state> = Query<
         &'static Transform,
         &'static GlobalTransform,
         Option<&'static crate::billboard::Billboard>,
+        Option<&'static AuthoredPose>,
     ),
 >;
+
+/// A node's local transform as its model authored it, recorded when the model's scene spawns, on
+/// the nodes an animation clip can move.
+///
+/// The strict bounds check compares a spawned model with the bounds the converter computed from the
+/// authored NIF, at rest. A model's clips move its nodes - the mill wheel turns
+/// (`model_animation.rs`, started at a per-reference phase), a door swings (`door_animation.rs`) -
+/// and the check runs a frame or more after the scene spawns, by which time a clip may already have
+/// posed them: the Riverwood wheel then measured 92 units lower than converted, and a Whiterun
+/// shack door a few degrees open, and both were rejected and never drawn. The glTF loader tags
+/// every node under an animation root with an [`AnimationTargetId`], and nothing can animate a node
+/// before the scene is ready, so the transform read at [`WorldInstanceReady`] is the authored one.
+/// A model with no clips carries no target ids, gets no `AuthoredPose`, and is measured exactly as
+/// it spawned: the check on static models is unchanged.
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct AuthoredPose(pub Transform);
+
+/// Records an [`AuthoredPose`] on every node under `root` that an animation clip can target.
+fn record_authored_poses(
+    commands: &mut Commands,
+    root: Entity,
+    children: &Query<&Children>,
+    animated: &Query<&Transform, With<AnimationTargetId>>,
+) {
+    for node in children.iter_descendants(root) {
+        if let Ok(transform) = animated.get(node) {
+            commands.entity(node).try_insert(AuthoredPose(*transform));
+        }
+    }
+}
 
 /// Every streamed cell root, in either tier: a full cell ([`StreamedCellRoot`]) or one of the
 /// ring's terrain-only cells ([`DistantTerrainRoot`]). Both carry the cell they draw, so the
@@ -4284,6 +4638,15 @@ fn end_scene_spawn_batch(
     profiler.set_gauge("scene/instances_armed_this_frame", armed as f64);
 }
 
+/// Hands loaded converted models to Bevy's scene spawner, at most `max_model_spawns_per_frame` of
+/// them per frame.
+///
+/// Bevy instantiates every model whose converted scene is ready in the frame it is handed over, in
+/// `SceneSpawnerSystems::WorldInstanceSpawn`, so the batch a frame pays to instantiate is the batch
+/// this system lets through. The budget is spent on the models that are ready and skipped over the
+/// ones that are still loading, so a slow load cannot hold the models behind it back; among the
+/// ready ones the oldest reference is armed first in fixed mode. Optional priority scheduling
+/// rechecks camera and cell demand and shares this quota with LOD scenes. `0` arms every ready model.
 #[allow(clippy::too_many_arguments)]
 fn arm_pending_models(
     config: Res<EngineConfig>,
@@ -4355,6 +4718,7 @@ fn arm_pending_models(
             (model.sequence, entity, model.handle.clone(), rank)
         })
         .collect();
+    ownership.finish_frame();
     ready.sort_by_key(|(sequence, entity, _, _)| (*sequence, entity.to_bits()));
     let decision = runtime.as_ref().and_then(|runtime| runtime.decision);
     let budget = decision.map_or(config.max_model_spawns_per_frame, |decision| {
@@ -4469,15 +4833,6 @@ const ARMING_BURST_FACTOR: usize = 8;
 /// world-serialization plugin, and such an app has no spawner either. There the asset server's own
 /// answer decides, which is what keeps a reference from being pending forever in a world that
 /// cannot load the model at all.
-fn mark_world_instance_ready(
-    ready: On<WorldInstanceReady>,
-    mut pending: Query<&mut PendingAssetProfile>,
-) {
-    if let Ok(mut pending) = pending.get_mut(ready.entity) {
-        pending.scene_spawned = true;
-    }
-}
-
 fn model_can_spawn(
     world_assets: Option<&Assets<WorldAsset>>,
     asset_server: &AssetServer,
@@ -4494,6 +4849,48 @@ fn model_can_spawn(
     )
 }
 
+fn mark_world_instance_ready(
+    ready: On<WorldInstanceReady>,
+    mut commands: Commands,
+    mut pending: Query<&mut PendingAssetProfile>,
+    children: Query<&Children>,
+    animated: Query<&Transform, With<AnimationTargetId>>,
+) {
+    if let Ok(mut pending) = pending.get_mut(ready.entity) {
+        pending.scene_spawned = true;
+        // Before any clip has run: the strict check measures animated nodes here.
+        record_authored_poses(&mut commands, ready.entity, &children, &animated);
+    }
+}
+
+/// Whole-model exclusion keeps baked ACTI shapes independent of mutable node poses.
+/// Direct loader tags and raw extras matter before deferred pose/billboard markers arrive.
+type ActiMotionFilter = Or<(
+    With<AnimationTargetId>,
+    With<AuthoredPose>,
+    With<crate::billboard::Billboard>,
+    With<bevy::animation::AnimationPlayer>,
+)>;
+
+#[derive(SystemParam)]
+struct ActiMotionQueries<'w, 's> {
+    moving: Query<'w, 's, (), ActiMotionFilter>,
+    extras: Query<'w, 's, &'static GltfExtras>,
+}
+
+impl ActiMotionQueries<'_, '_> {
+    fn present(&self, root: Entity, children: &Query<&Children>) -> bool {
+        std::iter::once(root)
+            .chain(children.iter_descendants(root))
+            .any(|entity| {
+                self.moving.contains(entity)
+                    || self.extras.get(entity).is_ok_and(|extras| {
+                        crate::billboard::BillboardMode::from_extras(&extras.value).is_some()
+                    })
+            })
+    }
+}
+
 /// Validate spawned model instances, account for failures and record completed readiness latency.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn track_asset_readiness(
@@ -4506,6 +4903,7 @@ fn track_asset_readiness(
     primitives: RenderPrimitiveQuery,
     transforms: SpawnedNodeQuery,
     scene_extras: Query<&GltfSceneExtras>,
+    acti_motion: ActiMotionQueries,
     images: Res<Assets<Image>>,
     mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
     mut static_cache: ResMut<StaticCollisionCache>,
@@ -4545,7 +4943,8 @@ fn track_asset_readiness(
             break;
         }
         let static_candidate = pending.static_physics
-            && fixed_collision_record_eligible(pending.base_record_type.as_deref());
+            && (fixed_collision_record_eligible(pending.base_record_type.as_deref())
+                || pending.base_record_type.as_deref() == Some("ACTI"));
         let load_failure =
             asset_server
                 .get_load_states(root.0.id())
@@ -4745,19 +5144,32 @@ fn track_asset_readiness(
                 // logs once and is skipped; it never fails the cell.
                 let key = (pending.base_record_type.clone(), pending.path.clone());
                 let first_placement = !static_cache.0.contains_key(&key);
-                let decision = static_cache.0.entry(key).or_insert_with(|| {
-                    static_collision_from_hierarchy(
-                        pending.base_record_type.as_deref(),
-                        &pending.path,
-                        entity,
-                        &children,
-                        &scene_extras,
-                        &transforms,
-                        &primitives,
-                        &meshes,
-                        &materials,
-                    )
-                });
+                // Motion is a placement fact: never reuse an otherwise valid model decision
+                // for an instance an animation or billboard system can move.
+                let mut motion_decision;
+                let decision = if pending.base_record_type.as_deref() == Some("ACTI")
+                    && acti_motion.present(entity, &children)
+                {
+                    motion_decision = StaticCollisionDecision::Skipped(
+                        "ACTI authored fixed collision excluded: model can animate or billboard"
+                            .to_owned(),
+                    );
+                    &mut motion_decision
+                } else {
+                    static_cache.0.entry(key).or_insert_with(|| {
+                        static_collision_from_hierarchy(
+                            pending.base_record_type.as_deref(),
+                            &pending.path,
+                            entity,
+                            &children,
+                            &scene_extras,
+                            &transforms,
+                            &primitives,
+                            &meshes,
+                            &materials,
+                        )
+                    })
+                };
                 match decision {
                     StaticCollisionDecision::Authored(parts, skipped) => {
                         attach_authored_collision(&mut commands, entity, parts);
@@ -4774,10 +5186,14 @@ fn track_asset_readiness(
                         }
                     }
                     StaticCollisionDecision::RenderProxy(collider) => {
+                        // Born disabled: the space gate in `crate::portal` enables it only while its
+                        // cell's role is Active. Asset readiness must not enable it - a pre-streamed
+                        // destination becomes ready while it is not active.
                         commands.entity(entity).insert((
                             StaticColliderSource::RenderProxy,
                             RigidBody::Fixed,
                             collider.clone(),
+                            ColliderDisabled,
                             crate::physics::world_collision_groups(),
                         ));
                         metrics.static_colliders_proxy =
@@ -4802,6 +5218,19 @@ fn track_asset_readiness(
                         note_static_proxy_skip(&mut metrics, &mut profiler);
                     }
                 }
+            }
+            if static_candidate && !config.seamless_doors() {
+                commands.queue(move |world: &mut World| {
+                    let mut pending = vec![entity];
+                    while let Some(at) = pending.pop() {
+                        if let Some(children) = world.get::<Children>(at) {
+                            pending.extend(children.iter());
+                        }
+                        if let Ok(mut node) = world.get_entity_mut(at) {
+                            node.remove::<ColliderDisabled>();
+                        }
+                    }
+                });
             }
             let micros = pending
                 .started
@@ -4858,9 +5287,135 @@ fn track_asset_readiness(
     }
 }
 
-fn note_static_proxy_skip(metrics: &mut StreamingMetrics, profiler: &mut ProfilingState) {
-    metrics.static_colliders_skipped = metrics.static_colliders_skipped.saturating_add(1);
-    profiler.increment("physics/static_proxy_skipped", 1);
+/// Gives every mesh of a reference whose static carries a `MATO` the projected snow material of
+/// [`crate::snow`].
+///
+/// It runs directly after [`track_asset_readiness`], and only for a reference whose
+/// `PendingAssetProfile` has gone, because that pass is what validates a loaded material - its alpha
+/// mode, its culling, its emissive, the colour space of each of its textures - through
+/// `MeshMaterial3d<StandardMaterial>`. A mesh already moved to the snow material would reach the
+/// validation as one with no material at all, and a scene swapped before it is validated would fail
+/// its own gate. Swapping after it also means the snow base is the material the glTF handler in
+/// `render.rs` published - blend pair and engine-scale emissive included - rather than the raw glTF
+/// one, which is the same thing every other mesh in the cell is drawn with.
+///
+/// The reference carries its coverage from spawn time ([`DirectionalSnow`]); this system only moves
+/// meshes onto it. A reference whose scene holds no mesh - an editor marker's empty one, or a model
+/// that failed to load - is left with what it has and simply stops being asked about.
+#[allow(clippy::too_many_arguments)]
+fn apply_directional_snow(
+    mut commands: Commands,
+    materials: Res<Assets<StandardMaterial>>,
+    // `None` in an app that never registered the snow material's asset collection - the streaming
+    // and transition tests build their worlds without the renderer's plugins. There is nothing to
+    // swap a mesh onto there, and the reference keeps the material its scene was validated with.
+    snow_materials: Option<ResMut<Assets<SnowMaterial>>>,
+    mut cache: ResMut<SnowMaterialCache>,
+    references: Query<(Entity, &DirectionalSnow), Without<PendingAssetProfile>>,
+    children: Query<&Children>,
+    primitives: Query<&MeshMaterial3d<StandardMaterial>>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let Some(mut snow_materials) = snow_materials else {
+        return;
+    };
+    if references.is_empty() {
+        return;
+    }
+    let started = Instant::now();
+    let mut swapped = 0u64;
+    for (entity, snow) in &references {
+        for descendant in children.iter_descendants(entity) {
+            let Ok(material) = primitives.get(descendant) else {
+                continue;
+            };
+            // `None` when the standard material asset is gone, which is a scene that failed its
+            // load: there is nothing to extend, and the mesh keeps what it has.
+            let Some(handle) =
+                cache.material_for(material.0.id(), snow, &materials, &mut snow_materials)
+            else {
+                continue;
+            };
+            commands
+                .entity(descendant)
+                .try_remove::<MeshMaterial3d<StandardMaterial>>()
+                .try_insert(MeshMaterial3d(handle));
+            swapped += 1;
+        }
+        commands.entity(entity).try_remove::<DirectionalSnow>();
+    }
+    profiler.increment("streaming/snow_meshes", swapped);
+    profiler.record_elapsed("streaming/directional_snow", started);
+}
+
+/// Moves the meshes of a just-validated reference whose material is a greyscale-to-palette effect
+/// onto [`EffectPaletteMaterial`] ([`crate::effect_palette`]): the hearth fires, candle flames and
+/// light shafts, which draw white without their palette.
+///
+/// Like [`apply_directional_snow`] it runs after [`track_asset_readiness`], for the same reason: the
+/// readiness pass validates `MeshMaterial3d<StandardMaterial>`, and a mesh moved before it would
+/// fail as one with no material. A reference is looked at once, the frame its
+/// `PendingAssetProfile` goes. Which materials are palette effects is known from the glTF load:
+/// the material handler in `crate::render` records each one in the [`EffectPaletteRegistry`]
+/// under its material's asset path, and one palette material is built per standard material and
+/// cached. The registry keeps every palette it records (a few small images for the whole run).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn apply_effect_palettes(
+    mut commands: Commands,
+    mut validated: RemovedComponents<PendingAssetProfile>,
+    asset_server: Option<Res<AssetServer>>,
+    materials: Res<Assets<StandardMaterial>>,
+    // `None` in an app without the renderer's plugins, as for the snow material.
+    palettes: Option<Res<EffectPaletteRegistry>>,
+    palette_materials: Option<ResMut<Assets<EffectPaletteMaterial>>>,
+    animations: Option<Res<crate::material_animation::MaterialAnimationRegistry>>,
+    mut animated: Option<ResMut<crate::material_animation::AnimatedPaletteMaterials>>,
+    mut cache: Local<HashMap<AssetId<StandardMaterial>, Option<Handle<EffectPaletteMaterial>>>>,
+    children: Query<&Children>,
+    primitives: Query<&MeshMaterial3d<StandardMaterial>>,
+) {
+    let (Some(asset_server), Some(palettes), Some(mut palette_materials)) =
+        (asset_server, palettes, palette_materials)
+    else {
+        validated.clear();
+        return;
+    };
+    for entity in validated.read() {
+        for descendant in children.iter_descendants(entity) {
+            let Ok(material) = primitives.get(descendant) else {
+                continue;
+            };
+            let id = material.0.id();
+            let handle = cache
+                .entry(id)
+                .or_insert_with(|| {
+                    let handle = palette_material_for(
+                        id,
+                        &asset_server,
+                        &materials,
+                        &palettes,
+                        &mut palette_materials,
+                    )?;
+                    // An animated flame keeps moving on its palette material.
+                    let animation = animations
+                        .as_ref()
+                        .zip(asset_server.get_path(id))
+                        .and_then(|(animations, path)| animations.get(&path.to_string()));
+                    if let (Some(animation), Some(animated)) = (animation, animated.as_mut()) {
+                        animated.0.push((handle.clone(), animation));
+                    }
+                    Some(handle)
+                })
+                .clone();
+            let Some(handle) = handle else {
+                continue;
+            };
+            commands
+                .entity(descendant)
+                .try_remove::<MeshMaterial3d<StandardMaterial>>()
+                .try_insert(MeshMaterial3d(handle));
+        }
+    }
 }
 
 /// Opens the merged data of an exterior cell for drawing, or counts why the cell takes the
@@ -4940,6 +5495,27 @@ fn count_merged_fallback(
             );
         }
     }
+}
+
+/// The palette material for a standard material the glTF handler recorded a palette for, or `None`
+/// for every other material.
+fn palette_material_for(
+    id: AssetId<StandardMaterial>,
+    asset_server: &AssetServer,
+    materials: &Assets<StandardMaterial>,
+    palettes: &EffectPaletteRegistry,
+    palette_materials: &mut Assets<EffectPaletteMaterial>,
+) -> Option<Handle<EffectPaletteMaterial>> {
+    let palette = palettes.get(&asset_server.get_path(id)?.to_string())?;
+    let mut base = materials.get(id)?.clone();
+    // An effect shader is unlit in Skyrim: its colour is the palette's emission alone. Left at
+    // Bevy's default reflectance, the card caught the room lights' specular as a grey sheet.
+    base.reflectance = 0.0;
+    base.perceptual_roughness = 1.0;
+    base.metallic = 0.0;
+    let mut extension = EffectPaletteExtension::new(&palette);
+    extension.set_additive(base.alpha_mode == AlphaMode::Add);
+    Some(palette_materials.add(EffectPaletteMaterial { base, extension }))
 }
 
 /// What the merged path needs beyond [`TerrainCellMesh::validate`]: seam duplicates that agree,
@@ -5137,6 +5713,9 @@ fn track_merged_surface_readiness(
             .entity(entity)
             .insert((Visibility::Inherited, TerrainSurfaceReady))
             .remove::<PendingMergedTerrain>();
+        if !config.seamless_doors() {
+            commands.entity(entity).try_remove::<ColliderDisabled>();
+        }
         lod_streaming.visibility_dirty = true;
     }
 }
@@ -5190,6 +5769,9 @@ fn track_surface_readiness(
                 commands
                     .entity(entity)
                     .try_remove::<PendingTerrainProfile>();
+                if !config.seamless_doors() {
+                    commands.entity(entity).try_remove::<ColliderDisabled>();
+                }
                 completed += 1;
             }
             SurfaceDependencyState::Failed(reason) => {
@@ -5547,12 +6129,15 @@ fn accumulate_relative_bounds(
     // stack. Children are pushed in reverse so they are visited in order, as before.
     let mut stack = vec![(entity, relative_to_root)];
     while let Some((entity, parent_to_root)) = stack.pop() {
-        let (local, global, billboard) = transforms
+        let (local, global, billboard, authored) = transforms
             .get(entity)
             .map_err(|_| format!("hierarchy node {entity:?} has no local/global transform"))?;
         validate_transform(&format!("hierarchy node {entity:?}"), local, global)?;
         *nodes += 1;
-        let local = crate::billboard::authored_transform(local, billboard);
+        let local = match authored {
+            Some(AuthoredPose(pose)) => *pose,
+            None => crate::billboard::authored_transform(local, billboard),
+        };
         let relative_to_root = parent_to_root * local.compute_affine();
         if let Ok((mesh_handle, _, _, _, _)) = primitives.get(entity) {
             let mesh = meshes.get(mesh_handle).ok_or_else(|| {
@@ -5689,6 +6274,10 @@ pub(crate) fn validate_standard_material(
     images: &Assets<Image>,
 ) -> Result<usize, String> {
     match material.alpha_mode {
+        // `Add` and `Multiply` are what a shape whose `NiAlphaProperty` blends additively
+        // (`SRC_ALPHA`/`ONE`) or multiplicatively (`ZERO`/`SRC_COLOR`) is given by the glTF
+        // material handler in `render.rs`, so they are as expected here as `Blend`.
+        AlphaMode::Opaque | AlphaMode::Blend | AlphaMode::Add | AlphaMode::Multiply => {}
         AlphaMode::Mask(cutoff) if cutoff.is_finite() && (0.0..=1.0).contains(&cutoff) => {}
         AlphaMode::Mask(cutoff) => return Err(format!("invalid alpha cutoff {cutoff}")),
         mode => return Err(format!("unsupported Skyrim material alpha mode {mode:?}")),
@@ -5915,12 +6504,8 @@ pub(crate) fn absolute_render_position(render_position: Vec3, origin: IVec2) -> 
 
 /// The centre of the stream window: the exterior grid the camera is over, which is what
 /// [`plan_cells`] streams around. The pacing report's world-ready scan reads the same square.
-pub(crate) fn window_center(config: &EngineConfig, translation: Vec3, origin: IVec2) -> IVec2 {
-    if config.acceptance_screenshot.is_some() {
-        origin
-    } else {
-        streaming_center(translation, origin)
-    }
+pub(crate) fn window_center(_config: &EngineConfig, translation: Vec3, origin: IVec2) -> IVec2 {
+    streaming_center(translation, origin)
 }
 
 /// The exterior grid a render-space point stands in while `origin` is the render origin: the cell
@@ -5969,6 +6554,7 @@ pub fn converted_model_path(path: String) -> Option<String> {
     Some(converted.to_string_lossy().replace('\\', "/"))
 }
 
+/// Rapier consumes the exact vertex and triangle buffers rendered by this quadrant.
 fn terrain_collider_from_mesh(mesh: &Mesh) -> Result<Collider, String> {
     let Some(VertexAttributeValues::Float32x3(positions)) =
         mesh.attribute(Mesh::ATTRIBUTE_POSITION)
@@ -5978,7 +6564,7 @@ fn terrain_collider_from_mesh(mesh: &Mesh) -> Result<Collider, String> {
     let Some(Indices::U32(indices)) = mesh.indices() else {
         return Err("terrain mesh lacks U32 triangle indices".to_owned());
     };
-    if indices.len() % 3 != 0 {
+    if !indices.len().is_multiple_of(3) {
         return Err("terrain mesh triangle indices are incomplete".to_owned());
     }
     let vertices = positions.iter().copied().map(Vec3::from_array).collect();
@@ -5987,6 +6573,11 @@ fn terrain_collider_from_mesh(mesh: &Mesh) -> Result<Collider, String> {
         .map_err(|error| format!("invalid terrain trimesh: {error}"))
 }
 
+/// Fixed Riverwood solids with a declared render-triangle proxy policy. Record type remains
+/// authoritative: plant TREE records outside the pine family and movable clutter stay excluded.
+///
+/// The path is compared in the lowercase canonical form the converter publishes and
+/// [`converted_model_path`] returns.
 fn static_proxy_eligible(record_type: Option<&str>, path: &str) -> bool {
     let pine = path.starts_with("meshes/landscape/trees/treepineforest");
     match record_type {
@@ -5998,21 +6589,16 @@ fn static_proxy_eligible(record_type: Option<&str>, path: &str) -> bool {
                 || path.starts_with("meshes/clutter/firewood/firewoodpile")
                 || (path.starts_with("meshes/landscape/roads/road") && path.contains("ramp"))
         }
+        // FURN is eligible for its *authored* shapes, but never for a render proxy: a chair the
+        // player can sit in is fixed clutter whose rendered triangles would be a phantom block.
         _ => false,
     }
 }
 
+/// Placed furniture is fixed in the world, but may use only its authored NIF shape.
+/// Render proxies remain restricted to the verified STAT/TREE families above.
 fn fixed_collision_record_eligible(record_type: Option<&str>) -> bool {
     matches!(record_type, Some("STAT" | "TREE" | "FURN"))
-}
-
-fn dynamic_clutter_record_eligible(record_type: Option<&str>) -> bool {
-    matches!(
-        record_type,
-        Some(
-            "MISC" | "WEAP" | "ARMO" | "BOOK" | "AMMO" | "ALCH" | "INGR" | "SLGM" | "KEYM" | "SCRL"
-        )
-    )
 }
 
 fn static_proxy_material_allowed(
@@ -6032,6 +6618,13 @@ fn static_proxy_material_allowed(
             && matches!(material.alpha_mode, AlphaMode::Mask(_)))
 }
 
+/// Build one model-local proxy from the validated spawned scene. Bevy/Rapier apply the reference
+/// instance translation, rotation, and scale when this collider is attached to its reference root.
+/// Node transforms are baked into vertices, preserving mesh holes such as doorways.
+///
+/// This is what a load-door frame in a cell gets: the proxy is the model's own rendered triangles,
+/// not a box around them, so a doorway arch keeps its opening. That is the property the port's door
+/// frames depend on (see `docs/handoff/impl-279-portal-colliders.md`).
 fn static_proxy_from_hierarchy(
     path: &str,
     root: Entity,
@@ -6048,18 +6641,14 @@ fn static_proxy_from_hierarchy(
         stack.extend(kids.iter().map(|child| (child, Affine3A::IDENTITY)));
     }
     while let Some((entity, parent_to_root)) = stack.pop() {
-        let (local, _, _) = transforms
+        let (local, _, _, _) = transforms
             .get(entity)
             .map_err(|_| format!("static proxy node {entity:?} has no transform"))?;
         let node_to_root = parent_to_root * local.compute_affine();
-        if let Ok((mesh_handle, material_handle, material_name, extras, native_source)) =
-            primitives.get(entity)
+        if let Ok((mesh_handle, material_handle, material_name, extras, _)) = primitives.get(entity)
             && !extras.is_some_and(has_explicit_material_exclusion)
         {
-            let material = material_handle
-                .map(|handle| &handle.0)
-                .or_else(|| native_source.map(|source| &source.0))
-                .and_then(|handle| materials.get(handle));
+            let material = material_handle.and_then(|handle| materials.get(handle));
             if material.is_some_and(|material| {
                 static_proxy_material_allowed(
                     path,
@@ -6117,41 +6706,8 @@ fn static_proxy_from_hierarchy(
         .map_err(|error| format!("invalid static proxy trimesh: {error}"))
 }
 
-fn drop_malformed_bodies(collision: &mut serde_json::Value) {
-    let Some(object) = collision.as_object_mut() else {
-        return;
-    };
-    // Only an array is filtered; anything else is left for the parse to report as it did before.
-    if !object
-        .get("bodies")
-        .is_some_and(serde_json::Value::is_array)
-    {
-        return;
-    }
-    let Some(serde_json::Value::Array(entries)) = object.remove("bodies") else {
-        return;
-    };
-    let mut kept = Vec::with_capacity(entries.len());
-    let mut notes = Vec::new();
-    for (index, entry) in entries.into_iter().enumerate() {
-        match serde_json::from_value::<CollisionBody>(entry.clone()) {
-            Ok(_) => kept.push(entry),
-            Err(error) => notes.push(serde_json::Value::String(format!(
-                "rigid body {index} is malformed: {error}"
-            ))),
-        }
-    }
-    object.insert("bodies".to_owned(), serde_json::Value::Array(kept));
-    if !notes.is_empty() {
-        let skipped = object
-            .entry("skipped")
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        if let Some(skipped) = skipped.as_array_mut() {
-            skipped.extend(notes);
-        }
-    }
-}
-
+/// The authored `mudcrabCollision` a converted model publishes in its GLB scene extras, if it
+/// has one.
 fn authored_collision_from_hierarchy(
     root: Entity,
     children: &Query<&Children>,
@@ -6190,7 +6746,237 @@ fn authored_collision_from_hierarchy(
 fn collider_parts_from_authored(
     asset: &CollisionAsset,
 ) -> Result<Vec<AuthoredColliderPart>, String> {
-    asset.shapes.iter().map(collider_part_from_shape).collect()
+    collider_parts_from_shapes(&asset.shapes)
+}
+
+fn collider_parts_from_shapes<'a>(
+    source: impl IntoIterator<Item = &'a CollisionShape>,
+) -> Result<Vec<AuthoredColliderPart>, String> {
+    let mut shapes = Vec::new();
+    for shape in source {
+        let (translation, collider) = match shape {
+            CollisionShape::Mesh {
+                vertices,
+                triangles,
+            } => {
+                if vertices.len() > 1_000_000 || triangles.len() > 2_000_000 {
+                    return Err("authored mesh exceeds safety limit".to_owned());
+                }
+                if vertices.iter().flatten().any(|value| !value.is_finite())
+                    || triangles
+                        .iter()
+                        .flatten()
+                        .any(|index| *index as usize >= vertices.len())
+                {
+                    return Err("authored mesh contains invalid vertices or indices".to_owned());
+                }
+                let collider = Collider::trimesh(
+                    vertices.iter().copied().map(Vec3::from_array).collect(),
+                    triangles.clone(),
+                )
+                .map_err(|error| format!("invalid authored trimesh: {error}"))?;
+                (Vec3::ZERO, collider)
+            }
+            CollisionShape::Capsule { a, b, radius } => {
+                if !a.iter().chain(b).all(|value| value.is_finite())
+                    || !radius.is_finite()
+                    || *radius <= 0.0
+                {
+                    return Err("invalid authored capsule".to_owned());
+                }
+                (
+                    Vec3::ZERO,
+                    Collider::capsule(Vec3::from_array(*a), Vec3::from_array(*b), *radius),
+                )
+            }
+            CollisionShape::Box {
+                center,
+                half_extents,
+            } => {
+                if !center
+                    .iter()
+                    .chain(half_extents)
+                    .all(|value| value.is_finite())
+                    || half_extents.iter().any(|value| *value <= 0.0)
+                {
+                    return Err("invalid authored box".to_owned());
+                }
+                (
+                    Vec3::from_array(*center),
+                    Collider::cuboid(half_extents[0], half_extents[1], half_extents[2]),
+                )
+            }
+            CollisionShape::Hull { points } => {
+                if points.len() > 1_000_000
+                    || points.iter().flatten().any(|value| !value.is_finite())
+                {
+                    return Err("invalid authored hull".to_owned());
+                }
+                let collider = Collider::convex_hull(
+                    &points
+                        .iter()
+                        .copied()
+                        .map(Vec3::from_array)
+                        .collect::<Vec<_>>(),
+                )
+                .ok_or_else(|| "invalid authored convex hull".to_owned())?;
+                (Vec3::ZERO, collider)
+            }
+        };
+        shapes.push(AuthoredColliderPart {
+            translation,
+            collider,
+        });
+    }
+    Ok(shapes)
+}
+
+/// ACTI is new support, so it requires explicit v2 ownership and a conservative static
+/// subset. `Fixed` alone is the converter's fallback, not evidence that a body cannot move.
+fn acti_authored_collision(asset: &CollisionAsset) -> StaticCollisionDecision {
+    use shared::collision::BodyKind;
+    if asset.version != 2 || !asset.authored || asset.bodies.is_empty() {
+        return StaticCollisionDecision::Skipped(
+            "ACTI requires authored v2 rigid-body ownership".to_owned(),
+        );
+    }
+    let mut owners = vec![false; asset.shapes.len()];
+    for body in &asset.bodies {
+        for &index in &body.shapes {
+            let Some(owned) = owners.get_mut(index as usize) else {
+                return StaticCollisionDecision::Skipped(
+                    "ACTI body shape index is out of range".to_owned(),
+                );
+            };
+            if std::mem::replace(owned, true) {
+                return StaticCollisionDecision::Skipped(
+                    "ACTI shape has duplicate rigid-body ownership".to_owned(),
+                );
+            }
+        }
+    }
+    let mut skipped = asset.skipped.clone();
+    let mut selected = Vec::new();
+    for body in &asset.bodies {
+        // Motion 7 is FIXED. The existing Havok census identifies motion 5 / zero
+        // mass as vanilla fixed statics. Quality 0 is uninformative; it is accepted
+        // only with all of these other static-purpose guards. Motion 4 is excluded
+        // even when the converter's fallback called it Fixed and quality is 1.
+        if body.kind == BodyKind::Fixed
+            && body.mass.is_finite()
+            && body.mass == 0.0
+            && body.havok.collision_layer == 1
+            && matches!(body.havok.motion_system, 5 | 7)
+            && matches!(body.havok.quality_type, 0 | 1)
+        {
+            selected.extend(
+                body.shapes
+                    .iter()
+                    .map(|&index| &asset.shapes[index as usize]),
+            );
+        } else {
+            skipped.push(format!(
+                "ACTI body node {} unsupported for fixed collision: kind={:?} motion={} quality={} layer={} mass={}",
+                body.node, body.kind, body.havok.motion_system,
+                body.havok.quality_type, body.havok.collision_layer, body.mass,
+            ));
+        }
+    }
+    let orphans = owners.iter().filter(|owned| !**owned).count();
+    if orphans != 0 {
+        skipped.push(format!(
+            "ACTI omits {orphans} shapes without rigid-body ownership"
+        ));
+    }
+    match collider_parts_from_shapes(selected) {
+        Ok(parts) if !parts.is_empty() => StaticCollisionDecision::Authored(parts, skipped),
+        Ok(_) => StaticCollisionDecision::Skipped(if skipped.is_empty() {
+            "ACTI has no supported authored fixed shapes".to_owned()
+        } else {
+            skipped.join("; ")
+        }),
+        Err(reason) => StaticCollisionDecision::Skipped(reason),
+    }
+}
+
+/// Attaches an authored collision to the reference root: one part at the origin becomes the body's
+/// own collider, several become children of the fixed body so Rapier keeps one body per placement
+/// instead of a nested compound. Every collider is born `ColliderDisabled`; the space gate in
+/// `crate::portal` is the only thing that enables one (decision 4 of the collision brief).
+fn attach_authored_collision(
+    commands: &mut Commands,
+    entity: Entity,
+    parts: &[AuthoredColliderPart],
+) {
+    if let [
+        AuthoredColliderPart {
+            translation,
+            collider,
+        },
+    ] = parts
+        && *translation == Vec3::ZERO
+    {
+        commands.entity(entity).insert((
+            StaticColliderSource::NifAuthored,
+            RigidBody::Fixed,
+            collider.clone(),
+            ColliderDisabled,
+            crate::physics::world_collision_groups(),
+        ));
+        return;
+    }
+    commands.entity(entity).insert((
+        StaticColliderSource::NifAuthored,
+        RigidBody::Fixed,
+        ColliderDisabled,
+    ));
+    for part in parts {
+        commands.spawn((
+            part.collider.clone(),
+            Transform::from_translation(part.translation),
+            ColliderDisabled,
+            crate::physics::world_collision_groups(),
+            ChildOf(entity),
+        ));
+    }
+}
+
+/// The collision decision for one placement: authored shapes when the model has them, otherwise a
+/// render-triangle proxy when the record and path are eligible, otherwise nothing.
+#[allow(clippy::too_many_arguments)] // Scene queries and assets belong to this extraction pass.
+fn drop_malformed_bodies(collision: &mut serde_json::Value) {
+    let Some(object) = collision.as_object_mut() else {
+        return;
+    };
+    // Only an array is filtered; anything else is left for the parse to report as it did before.
+    if !object
+        .get("bodies")
+        .is_some_and(serde_json::Value::is_array)
+    {
+        return;
+    }
+    let Some(serde_json::Value::Array(entries)) = object.remove("bodies") else {
+        return;
+    };
+    let mut kept = Vec::with_capacity(entries.len());
+    let mut notes = Vec::new();
+    for (index, entry) in entries.into_iter().enumerate() {
+        match serde_json::from_value::<CollisionBody>(entry.clone()) {
+            Ok(_) => kept.push(entry),
+            Err(error) => notes.push(serde_json::Value::String(format!(
+                "rigid body {index} is malformed: {error}"
+            ))),
+        }
+    }
+    object.insert("bodies".to_owned(), serde_json::Value::Array(kept));
+    if !notes.is_empty() {
+        let skipped = object
+            .entry("skipped")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(skipped) = skipped.as_array_mut() {
+            skipped.extend(notes);
+        }
+    }
 }
 
 fn collider_part_from_shape(shape: &CollisionShape) -> Result<AuthoredColliderPart, String> {
@@ -6271,38 +7057,13 @@ fn collider_part_from_shape(shape: &CollisionShape) -> Result<AuthoredColliderPa
     })
 }
 
-fn attach_authored_collision(
-    commands: &mut Commands,
-    entity: Entity,
-    parts: &[AuthoredColliderPart],
-) {
-    if let [
-        AuthoredColliderPart {
-            translation,
-            collider,
-        },
-    ] = parts
-        && *translation == Vec3::ZERO
-    {
-        commands.entity(entity).insert((
-            StaticColliderSource::NifAuthored,
-            RigidBody::Fixed,
-            collider.clone(),
-            crate::physics::world_collision_groups(),
-        ));
-        return;
-    }
-    commands
-        .entity(entity)
-        .insert((StaticColliderSource::NifAuthored, RigidBody::Fixed));
-    for part in parts {
-        commands.spawn((
-            part.collider.clone(),
-            Transform::from_translation(part.translation),
-            crate::physics::world_collision_groups(),
-            ChildOf(entity),
-        ));
-    }
+fn dynamic_clutter_record_eligible(record_type: Option<&str>) -> bool {
+    matches!(
+        record_type,
+        Some(
+            "MISC" | "WEAP" | "ARMO" | "BOOK" | "AMMO" | "ALCH" | "INGR" | "SLGM" | "KEYM" | "SCRL"
+        )
+    )
 }
 
 fn for_each_shape_hull_point(shape: &CollisionShape, mut emit: impl FnMut(Vec3)) {
@@ -6363,12 +7124,6 @@ fn for_each_shape_hull_point(shape: &CollisionShape, mut emit: impl FnMut(Vec3))
     }
 }
 
-/// Most points one dynamic body may contribute after duplicate shape indices are removed.
-const MAX_CLUTTER_HULL_POINTS: usize = 1_000_000;
-/// Most collider parts one dynamic body may spawn. The point budget alone would permit
-/// 125,000 distinct boxes; this cap bounds collider entities independently of geometry size.
-const MAX_CLUTTER_COLLIDER_PARTS: usize = 256;
-
 fn shape_hull_points(shape: &CollisionShape, points: &mut Vec<Vec3>) {
     for_each_shape_hull_point(shape, |point| points.push(point));
 }
@@ -6389,6 +7144,9 @@ fn clutter_hull_point_total(shapes: &[&CollisionShape], budget: usize) -> Option
     }
     Some(total)
 }
+
+const MAX_CLUTTER_HULL_POINTS: usize = 1_000_000;
+const MAX_CLUTTER_COLLIDER_PARTS: usize = 256;
 
 fn clutter_decision_from_asset(asset: &CollisionAsset) -> StaticCollisionDecision {
     clutter_decision_from_asset_within(asset, MAX_CLUTTER_HULL_POINTS)
@@ -6494,6 +7252,10 @@ fn clutter_collision_from_hierarchy(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Collision extraction shares the caller's hierarchy queries and asset stores."
+)]
 fn static_collision_from_hierarchy(
     record_type: Option<&str>,
     path: &str,
@@ -6506,6 +7268,7 @@ fn static_collision_from_hierarchy(
     materials: &Assets<StandardMaterial>,
 ) -> StaticCollisionDecision {
     match authored_collision_from_hierarchy(root, children, scene_extras) {
+        Ok(Some(asset)) if record_type == Some("ACTI") => acti_authored_collision(&asset),
         Ok(Some(asset)) => match collider_parts_from_authored(&asset) {
             Ok(parts) if !parts.is_empty() => {
                 StaticCollisionDecision::Authored(parts, asset.skipped)
@@ -6514,6 +7277,9 @@ fn static_collision_from_hierarchy(
             Ok(_) => StaticCollisionDecision::Skipped(asset.skipped.join("; ")),
             Err(reason) => StaticCollisionDecision::Skipped(reason),
         },
+        Ok(None) if record_type == Some("ACTI") => StaticCollisionDecision::Skipped(
+            "ACTI requires authored v2 collision metadata".to_owned(),
+        ),
         Ok(None) if static_proxy_eligible(record_type, path) => {
             match static_proxy_from_hierarchy(
                 path, root, children, transforms, primitives, meshes, materials,
@@ -6528,6 +7294,12 @@ fn static_collision_from_hierarchy(
         Ok(None) => StaticCollisionDecision::LegacyExcluded,
         Err(reason) => StaticCollisionDecision::Skipped(reason),
     }
+}
+
+/// Counts a placement the eligibility rules wanted collision for but could not get one.
+fn note_static_proxy_skip(metrics: &mut StreamingMetrics, profiler: &mut ProfilingState) {
+    metrics.static_colliders_skipped = metrics.static_colliders_skipped.saturating_add(1);
+    profiler.increment("physics/static_proxy_skipped", 1);
 }
 
 pub(crate) fn quadrant_layers(
@@ -7065,46 +7837,24 @@ type OriginParticipantFilter = (
 
 #[allow(clippy::too_many_arguments)] // The collider queries belong to this pass, not the caller.
 fn update_render_origin(
-    config: Res<EngineConfig>,
-    space: Res<ActiveSpace>,
+    active: Res<ActiveCell>,
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
-    mut roots: Query<
-        (
-            Option<&ExteriorCellGrid>,
-            Option<&lod::LodChunkGridOrigin>,
-            &mut Transform,
-        ),
-        (
-            Or<(With<ExteriorCellGrid>, With<lod::LodChunkGridOrigin>)>,
-            Without<StreamingCamera>,
-            Without<PlayerBody>,
-            Without<DebugTankard>,
-        ),
-    >,
-    mut participants: Query<
-        (Entity, &mut Transform),
-        (
-            Or<(With<PlayerBody>, With<DebugTankard>)>,
-            Without<StreamingCamera>,
-        ),
-    >,
-    terrain: Query<Entity, With<TerrainCollider>>,
+    mut roots: crate::streaming::CellRootTransforms,
+    mut participants: Query<(Entity, &mut Transform), OriginParticipantFilter>,
+    terrain_colliders: Query<Entity, With<TerrainCollider>>,
     static_colliders: Query<Entity, With<StaticColliderSource>>,
+    parents: Query<&ChildOf>,
+    exterior_roots: Query<(), With<ExteriorCellGrid>>,
     clutter: Query<Entity, With<crate::physics::DynamicClutter>>,
     mut physics: WriteRapierContext,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
-    // Screenshot runs keep the start-cell origin fixed: rebasing toward an
-    // artistically offset camera would drag the streamed window (and the
-    // screenshot target's cells) away from the framed view.
-    if config.acceptance_screenshot.is_some() {
-        return;
-    }
-    // An interior is placed in absolute coordinates around the origin it was entered with, so the
-    // origin stays put while the player is inside one; leaving it sets the origin afresh.
-    if space.interior.is_some() {
+    // An interior is placed at its absolute creation coordinates and carries no cell grid, so
+    // rebasing would slide the interior sideways relative to the camera. A crossing out of one
+    // sets the origin for the destination itself.
+    if active.interior.is_some() {
         return;
     }
     let started = Instant::now();
@@ -7119,23 +7869,30 @@ fn update_render_origin(
         return;
     }
     origin.0 += shift;
-    let displacement = Vec3::new(
-        shift.x as f32 * CELL_SIZE,
-        0.0,
-        -(shift.y as f32) * CELL_SIZE,
-    );
+    let displacement = grid_translation(shift, IVec2::ZERO);
     camera.translation -= displacement;
-    let mut bodies = Vec::new();
+    // A fixed rapier body does not follow its Bevy transform through a rebase teleport, so every
+    // collider body under a root that moves is shifted by hand - destination and hidden exterior
+    // cells as much as the active one. Only exterior roots move ([`reposition_cell_roots`]): a
+    // pre-streamed interior keeps its absolute place, so its colliders must keep theirs, or a door
+    // crossing into it lands a cell away from its own floor (the Alftand walk, impl-281). Nothing
+    // to do, and nothing to panic on, in a run without the rapier plugin: the context query simply
+    // finds no context.
+    let under_exterior_root = |entity: Entity| {
+        std::iter::once(entity)
+            .chain(parents.iter_ancestors(entity))
+            .any(|ancestor| exterior_roots.contains(ancestor))
+    };
+    let mut bodies: Vec<Entity> = terrain_colliders
+        .iter()
+        .chain(static_colliders.iter())
+        .chain(clutter.iter())
+        .filter(|entity| under_exterior_root(*entity))
+        .collect();
     for (entity, mut transform) in &mut participants {
         transform.translation -= displacement;
         bodies.push(entity);
     }
-    bodies.extend(terrain.iter());
-    bodies.extend(static_colliders.iter());
-    // Dynamic clutter is a cell-root descendant, so the root's move already shifts its Transform;
-    // only its Rapier body is teleported here. Adding it to `participants` instead would shift the
-    // Transform a second time and double the displacement. The teleport keeps its velocity.
-    bodies.extend(clutter.iter());
     if let Ok(mut context) = physics.single_mut() {
         for entity in bodies {
             if let Some(handle) = context.entity2body().get(&entity).copied()
@@ -7146,19 +7903,7 @@ fn update_render_origin(
         }
         context.propagate_modified_body_positions_to_colliders();
     }
-    for (cell_grid, lod_grid, mut transform) in &mut roots {
-        let Some(grid) = cell_grid
-            .map(|grid| (i64::from(grid.0.x), i64::from(grid.0.y)))
-            .or_else(|| lod_grid.map(|grid| (grid.grid_x, grid.grid_y)))
-        else {
-            continue;
-        };
-        transform.translation = Vec3::new(
-            (grid.0 - i64::from(origin.0.x)) as f32 * CELL_SIZE,
-            0.0,
-            -((grid.1 - i64::from(origin.0.y)) as f32) * CELL_SIZE,
-        );
-    }
+    reposition_cell_roots(origin.0, &mut roots);
     profiler.increment("streaming/origin_rebases", 1);
     metrics.origin_rebases = metrics.origin_rebases.saturating_add(1);
     profiler.event(
@@ -7170,7 +7915,7 @@ fn update_render_origin(
 }
 
 /// Frames a visible full-detail terrain quadrant may wait on the render world before the run-level
-/// invariant counts it as a hole that came back (design-1091 Â§4).
+/// invariant counts it as a hole that came back (design-1091 §4).
 ///
 /// Derived from what a legitimate wait is made of: the bridge's own latency is two render frames (a
 /// surface is prepared in the extract after the frame that established its assets, and the hand-over
@@ -7204,7 +7949,8 @@ struct LifecycleQueries<'w, 's> {
 fn validate_streaming_lifecycle(
     config: Res<EngineConfig>,
     _database: Option<Res<WorldDatabase>>,
-    active: Res<ActiveSpace>,
+    active: Res<ActiveCell>,
+    prestream: Res<PrestreamCells>,
     origin: Res<RenderOrigin>,
     streaming: Res<StreamingWorld>,
     camera: Query<&Transform, With<StreamingCamera>>,
@@ -7272,7 +8018,7 @@ fn validate_streaming_lifecycle(
         // read the configured ring where the plan drew none would accept a cell the plan has
         // stopped wanting (`EngineConfig::effective_terrain_radius`).
         camera.single().map_or(0, |camera| {
-            let center = window_center(&config, camera.translation, origin.0);
+            let center = camera_grid(camera.translation, origin.0);
             let terrain_radius = config.effective_terrain_radius(false);
             let limit = config.unload_radius.max(terrain_radius.saturating_add(1));
             streaming
@@ -7281,8 +8027,9 @@ fn validate_streaming_lifecycle(
                 .filter(|(key, status)| {
                     let key = **key;
                     matches!(status, CellStatus::Resident { .. })
+                        && !prestream.contains(&key)
                         && matches!(key, CellKey::Exterior { worldspace_id, grid_x, grid_y }
-                            if worldspace_id == active.exterior_worldspace(config.worldspace_id)
+                            if worldspace_id == active.worldspace_id
                                 && ((grid_x - center.x).abs() > limit
                                     || (grid_y - center.y).abs() > limit))
                 })
@@ -7337,7 +8084,7 @@ fn validate_streaming_lifecycle(
         let full_window_roots: HashSet<Entity> = camera.single().map_or_else(
             |_| HashSet::new(),
             |camera| {
-                let center = window_center(&config, camera.translation, origin.0);
+                let center = camera_grid(camera.translation, origin.0);
                 streaming
                     .cells
                     .iter()
@@ -7352,7 +8099,7 @@ fn validate_streaming_lifecycle(
                                 root,
                                 detail: CellDetail::Full,
                             },
-                        ) if *worldspace_id == active.exterior_worldspace(config.worldspace_id)
+                        ) if *worldspace_id == active.worldspace_id
                             && (grid_x - center.x).abs() <= config.stream_radius
                             && (grid_y - center.y).abs() <= config.stream_radius =>
                         {
@@ -7428,17 +8175,6 @@ impl TerrainCoverage {
 }
 
 #[cfg(test)]
-pub(crate) fn test_plant_retiring_cell(world: &mut World, key: CellKey, root: Entity) {
-    world.resource_mut::<StreamingWorld>().cells.insert(
-        key,
-        CellStatus::Retiring {
-            root,
-            detail: CellDetail::Full,
-        },
-    );
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -7480,7 +8216,10 @@ mod tests {
     }
 
     use crate::world::components::FormId;
-    use crate::world::database::LightRow;
+    use crate::{
+        snow::{SnowCoverage, snow_material_object_1p},
+        world::database::DoorLinkRow,
+    };
     use bevy::asset::{AssetApp, AssetPlugin};
     use bevy::ecs::system::SystemState;
 
@@ -7951,6 +8690,7 @@ mod tests {
                 &mut commands,
                 &asset_server,
                 &catalog,
+                &DirectionalSnowCatalog::default(),
                 &reflection,
                 &mut meshes,
                 &mut terrain_materials,
@@ -8000,16 +8740,18 @@ mod tests {
             .init_asset::<WaterMaterial>()
             .insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .insert_resource(AssetCatalog::open(&path).unwrap())
+            .init_resource::<DirectionalSnowCatalog>()
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(QueuedCells(cells))
             .insert_resource(QueuedCellsPhysics(world_physics))
             .insert_resource(metrics)
             .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<ProfilingState>()
             .add_systems(
@@ -8101,14 +8843,15 @@ mod tests {
     #[test]
     fn unload_radius_drops_distant_exteriors_and_inactive_interiors() {
         let center = IVec2::new(4, -2);
-        let outside = ActiveSpace {
-            worldspace_id: Some(60),
+        let outside = ActiveCell {
+            worldspace_id: 60,
             interior: None,
         };
-        let inside = ActiveSpace {
-            worldspace_id: Some(60),
+        let inside = ActiveCell {
+            worldspace_id: 60,
             interior: Some(99),
         };
+        let none = PrestreamCells::default();
         let exterior = |worldspace_id, grid_x, grid_y| CellKey::Exterior {
             worldspace_id,
             grid_x,
@@ -8118,46 +8861,46 @@ mod tests {
         assert!(cell_within_unload_radius(
             exterior(60, 7, -5),
             &outside,
-            60,
             center,
             3,
-            0
+            0,
+            &none
         ));
         assert!(!cell_within_unload_radius(
             exterior(60, 8, -2),
             &outside,
-            60,
             center,
             3,
-            0
+            0,
+            &none
         ));
         assert!(
-            !cell_within_unload_radius(exterior(614, 4, -2), &outside, 60, center, 3, 0),
+            !cell_within_unload_radius(exterior(614, 4, -2), &outside, center, 3, 0, &none),
             "the same grid in another worldspace belongs to the worldspace just left"
         );
         assert!(
-            !cell_within_unload_radius(exterior(60, 4, -2), &inside, 60, center, 3, 0),
+            !cell_within_unload_radius(exterior(60, 4, -2), &inside, center, 3, 0, &none),
             "no exterior is streamed while an interior is active"
         );
         assert!(cell_within_unload_radius(
             CellKey::Interior(99),
             &inside,
-            60,
             center,
             0,
-            0
+            0,
+            &none
         ));
         assert!(
-            !cell_within_unload_radius(CellKey::Interior(98), &inside, 60, center, 0, 0),
+            !cell_within_unload_radius(CellKey::Interior(98), &inside, center, 0, 0, &none),
             "an interior that is neither active nor pre-streamed unloads"
         );
         assert!(!cell_within_unload_radius(
             CellKey::Interior(99),
             &outside,
-            60,
             center,
             0,
-            0
+            0,
+            &none
         ));
 
         // The ring's own band: a cell one past the ring's edge survives, the next one does not, so
@@ -8166,51 +8909,81 @@ mod tests {
         assert!(cell_within_unload_radius(
             exterior(60, 4 + terrain_radius + 1, -2),
             &outside,
-            60,
             center,
             3,
-            terrain_radius
+            terrain_radius,
+            &none
         ));
         assert!(!cell_within_unload_radius(
             exterior(60, 4 + terrain_radius + 2, -2),
             &outside,
-            60,
             center,
             3,
-            terrain_radius
+            terrain_radius,
+            &none
         ));
         assert!(
             cell_within_unload_radius(
                 exterior(60, 4 + 7, -2),
                 &outside,
-                60,
                 center,
                 3,
-                terrain_radius
+                terrain_radius,
+                &none
             ),
             "a ring cell seven cells out is nobody's unload radius but the ring's"
         );
+
+        // A pre-streamed destination survives anywhere until the request stops.
+        let mut prestream = PrestreamCells::default();
+        prestream.request_interior(98);
+        prestream.request_exterior(614, IVec2::new(5, 4));
+        assert!(cell_within_unload_radius(
+            CellKey::Interior(98),
+            &inside,
+            center,
+            0,
+            0,
+            &prestream
+        ));
+        assert!(cell_within_unload_radius(
+            exterior(614, 5, 4),
+            &inside,
+            center,
+            3,
+            0,
+            &prestream
+        ));
+        assert!(!cell_within_unload_radius(
+            CellKey::Interior(97),
+            &inside,
+            center,
+            0,
+            0,
+            &prestream
+        ));
     }
 
     #[test]
     fn wanted_cells_are_the_active_interior_or_the_active_worldspace_grid() {
         let center = IVec2::new(4, -2);
-        let inside = ActiveSpace {
-            worldspace_id: Some(60),
+        let none = PrestreamCells::default();
+        let inside = ActiveCell {
+            worldspace_id: 60,
             interior: Some(99),
         };
         assert_eq!(
-            wanted_cells(&inside, 60, 1, 1, center),
+            wanted_cells(&inside, 1, 1, center, &none),
             vec![(CellKey::Interior(99), CellDetail::Full)],
             "an interior is the whole plan, and there is no exterior grid while it is active"
         );
 
-        let blackreach = ActiveSpace {
-            worldspace_id: Some(614),
+        let blackreach = ActiveCell {
+            worldspace_id: 614,
             interior: None,
         };
         // With no ring, the plan is exactly the grid `stream_radius` always asked for.
-        let wanted = wanted_cells(&blackreach, 60, 1, 1, center);
+        let wanted = wanted_cells(&blackreach, 1, 1, center, &none);
         assert_eq!(wanted.len(), 9);
         assert!(wanted.iter().all(|(key, detail)| matches!(
             key,
@@ -8227,16 +9000,35 @@ mod tests {
             },
             CellDetail::Full
         )));
+
+        // Pre-streamed destinations are wanted on top of the active cell's own plan, and an
+        // exterior destination too far from the camera for the grid is still wanted in full.
+        let mut prestream = PrestreamCells::default();
+        prestream.request_interior(98);
+        prestream.request_exterior(60, IVec2::new(19, 18));
+        let wanted = wanted_cells(&inside, 1, 1, center, &prestream);
+        assert!(wanted.contains(&(CellKey::Interior(99), CellDetail::Full)));
+        assert!(wanted.contains(&(CellKey::Interior(98), CellDetail::Full)));
+        assert!(wanted.contains(&(
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 19,
+                grid_y: 18,
+            },
+            CellDetail::Full
+        )));
     }
 
     /// The ring classification, as a pure function of the camera cell and the two radii: the inner
     /// grid in full, the ring around it terrain-only, and nothing beyond. Its own cell is the
-    /// nearest full one, and the cell diagonally inside the grid corner counts as inside it.
+    /// nearest full one, the cell diagonally inside the grid corner counts as inside it, and a
+    /// pre-streamed cell outside the inner grid is still wanted in full - it is the space behind a
+    /// door, which has to be complete before the camera crosses.
     #[test]
     fn classifies_cells_into_the_inner_grid_the_ring_and_nothing() {
         let center = IVec2::new(4, -2);
-        let outside = ActiveSpace {
-            worldspace_id: Some(60),
+        let outside = ActiveCell {
+            worldspace_id: 60,
             interior: None,
         };
         let exterior = |grid_x, grid_y| CellKey::Exterior {
@@ -8244,7 +9036,8 @@ mod tests {
             grid_x,
             grid_y,
         };
-        let detail = |key| wanted_detail(&outside, 60, 2, 5, center, key);
+        let none = PrestreamCells::default();
+        let detail = |key| wanted_detail(&outside, 2, 5, center, key, &none);
 
         assert_eq!(detail(exterior(4, -2)), Some(CellDetail::Full));
         assert_eq!(detail(exterior(2, -4)), Some(CellDetail::Full));
@@ -8271,7 +9064,6 @@ mod tests {
         assert_eq!(
             wanted_detail(
                 &outside,
-                60,
                 2,
                 5,
                 center,
@@ -8279,23 +9071,42 @@ mod tests {
                     worldspace_id: 614,
                     grid_x: 4,
                     grid_y: -2,
-                }
+                },
+                &none
             ),
             None,
             "an exterior of the worldspace the camera came from is not wanted at any detail"
         );
 
+        // A cell a nearby door pre-streamed is full even outside the inner grid: an interior with
+        // no grid position at all, and an exterior at the far edge of the ring.
+        let mut prestream = PrestreamCells::default();
+        prestream.request_interior(99);
+        prestream.request_exterior(60, IVec2::new(4, 3));
+        let with_prestream = |key| wanted_detail(&outside, 2, 5, center, key, &prestream);
+        assert_eq!(
+            with_prestream(CellKey::Interior(99)),
+            Some(CellDetail::Full),
+            "a pre-streamed interior is always full"
+        );
+        assert_eq!(
+            with_prestream(exterior(4, 3)),
+            Some(CellDetail::Full),
+            "a pre-streamed cell outside the inner grid stays full"
+        );
+        assert_eq!(with_prestream(exterior(4, 2)), Some(CellDetail::Terrain));
+
         // A ring at or inside the inner grid is no ring at all: the same cells, one tier.
         assert_eq!(
-            wanted_detail(&outside, 60, 3, 3, center, exterior(7, -2)),
+            wanted_detail(&outside, 3, 3, center, exterior(7, -2), &none),
             Some(CellDetail::Full)
         );
         assert_eq!(
-            wanted_detail(&outside, 60, 3, 3, center, exterior(8, -2)),
+            wanted_detail(&outside, 3, 3, center, exterior(8, -2), &none),
             None
         );
         assert_eq!(
-            wanted_detail(&outside, 60, 0, 0, center, exterior(1, -2)),
+            wanted_detail(&outside, 0, 0, center, exterior(1, -2), &none),
             None,
             "the plan is the one cell the camera is in"
         );
@@ -8303,6 +9114,67 @@ mod tests {
 
     /// The order the plan asks for its cells in is the order the worker's queue gets them in, and
     /// it decides what appears on screen first: the space behind a nearby door, then the cell the
+    /// camera is in, then the world around it, nearest first and full before terrain-only. A
+    /// pre-streamed cell is asked for once, at the head of the list.
+    #[test]
+    fn pre_streamed_destinations_come_before_the_ring() {
+        let center = IVec2::new(4, -2);
+        let outside = ActiveCell {
+            worldspace_id: 60,
+            interior: None,
+        };
+        let mut prestream = PrestreamCells::default();
+        // An interior destination, and an exterior one at the far edge of the ring.
+        prestream.request_interior(99);
+        prestream.request_exterior(60, IVec2::new(4, 3));
+        let wanted = wanted_cells(&outside, 2, 5, center, &prestream);
+
+        let keys: Vec<CellKey> = wanted.iter().map(|(key, _)| *key).collect();
+        let unique: HashSet<CellKey> = keys.iter().copied().collect();
+        assert_eq!(unique.len(), keys.len(), "no cell is asked for twice");
+        assert_eq!(
+            &keys[..2],
+            [
+                CellKey::Interior(99),
+                CellKey::Exterior {
+                    worldspace_id: 60,
+                    grid_x: 4,
+                    grid_y: 3,
+                }
+            ],
+            "the cells a nearby door pre-streamed lead the queue"
+        );
+        assert!(
+            wanted[..2]
+                .iter()
+                .all(|(_, detail)| *detail == CellDetail::Full),
+            "a pre-streamed cell is always asked for in full"
+        );
+        assert_eq!(
+            keys[2],
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 4,
+                grid_y: -2,
+            },
+            "then the cell the camera is in"
+        );
+        // The ring's own cells follow, and the pre-streamed exterior appears once, at the head.
+        assert!(keys[3..].iter().all(|key| key != &CellKey::Interior(99)));
+        assert_eq!(
+            keys.iter()
+                .filter(|key| **key
+                    == CellKey::Exterior {
+                        worldspace_id: 60,
+                        grid_x: 4,
+                        grid_y: 3,
+                    })
+                .count(),
+            1
+        );
+    }
+
+    /// The columns [`plan_cells`] and the worker's queries read, without any cell of the
     /// destination worldspace: this test only checks which keys the planner asks for.
     fn write_plan_database(path: &std::path::Path) {
         let connection = rusqlite::Connection::open(path).unwrap();
@@ -8504,11 +9376,13 @@ mod tests {
         );
     }
 
-    /// A full cell of a walked run carries one enabled terrain collider per quadrant.
-    /// A run that does not walk builds none. Private role gating extends this behavior later.
+    /// A full cell of a walked run carries one terrain collider per quadrant, and every one of them
+    /// is born disabled: only the space gate in `crate::portal` enables a collider, and only for a
+    /// cell that is part of the active space. A run that does not walk builds none, which is what
+    /// leaves every shot, tour and benchmark run exactly as it was.
     #[test]
     fn a_full_cell_builds_terrain_colliders_only_in_a_walked_run() {
-        for &(walk, expected) in &[(true, (4, 0)), (false, (0, 0))] {
+        for &(walk, expected) in &[(true, (4, 4)), (false, (0, 0))] {
             let directory = tempfile::tempdir().unwrap();
             let database_path = directory.path().join("world.db");
             write_terrain_database(&database_path);
@@ -8532,7 +9406,7 @@ mod tests {
             assert_eq!(
                 terrain_collider_state(&mut app),
                 expected,
-                "a walked run ({walk}) builds one enabled collider per quadrant"
+                "a walked run ({walk}) builds one collider per quadrant, disabled until the gate"
             );
         }
     }
@@ -8602,6 +9476,7 @@ mod tests {
                 TerrainCollider,
                 Collider::cuboid(1.0, 1.0, 1.0),
                 RigidBody::Fixed,
+                ColliderDisabled,
                 ChildOf(root),
             ))
             .id();
@@ -8639,9 +9514,8 @@ mod tests {
     fn a_rebase_moves_the_camera_and_the_roots_with_colliders_present() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
-            .insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .init_resource::<ActiveSpace>()
+            .init_resource::<ActiveCell>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, update_render_origin);
@@ -8662,6 +9536,7 @@ mod tests {
                 TerrainCollider,
                 Collider::cuboid(1.0, 1.0, 1.0),
                 RigidBody::Fixed,
+                ColliderDisabled,
                 Transform::default(),
                 GlobalTransform::default(),
                 ChildOf(root),
@@ -8713,9 +9588,8 @@ mod tests {
             .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
                 std::time::Duration::from_secs_f32(1.0 / 60.0),
             ))
-            .insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .init_resource::<ActiveSpace>()
+            .init_resource::<ActiveCell>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, update_render_origin);
@@ -8788,6 +9662,96 @@ mod tests {
     }
 
     /// A pre-streamed interior's root keeps its absolute place through an exterior rebase, so its
+    /// static colliders must too; an exterior static beside it still moves with its root. Before
+    /// the fix the interior's floor slid a cell away and a door crossing into it found no ground
+    /// (the Alftand walked tour, impl-281).
+    #[test]
+    fn a_rebase_leaves_a_prestreamed_interiors_colliders_where_its_root_is() {
+        use bevy::ecs::system::RunSystemOnce;
+        use bevy_rapier3d::prelude::{RapierRigidBodyHandle, ReadRapierContext};
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, TransformPlugin))
+            .add_plugins(crate::physics::PhysicsCorePlugin)
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_secs_f32(1.0 / 60.0),
+            ))
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<ActiveCell>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, update_render_origin);
+        app.finish();
+        let camera = app
+            .world_mut()
+            .spawn((Transform::default(), StreamingCamera))
+            .id();
+        let static_body = |app: &mut App, root: Entity, x: f32| {
+            app.world_mut()
+                .spawn((
+                    StaticColliderSource::NifAuthored,
+                    Collider::cuboid(10.0, 10.0, 10.0),
+                    RigidBody::Fixed,
+                    Transform::from_xyz(x, 0.0, 0.0),
+                    ChildOf(root),
+                ))
+                .id()
+        };
+        // An interior root: no cell grid, placed at its absolute coordinates.
+        let interior = app.world_mut().spawn(Transform::default()).id();
+        let interior_floor = static_body(&mut app, interior, 4000.0);
+        let exterior = app
+            .world_mut()
+            .spawn((
+                ExteriorCellGrid(IVec2::new(1, 0)),
+                Transform::from_xyz(CELL_SIZE, 0.0, 0.0),
+            ))
+            .id();
+        let exterior_static = static_body(&mut app, exterior, 5.0);
+        let body_x = |app: &mut App, entity: Entity| {
+            let handle = app
+                .world()
+                .entity(entity)
+                .get::<RapierRigidBodyHandle>()
+                .expect("rapier has the body")
+                .0;
+            app.world_mut()
+                .run_system_once(move |context: ReadRapierContext| {
+                    context.single().unwrap().rigidbody_set.bodies[handle]
+                        .translation()
+                        .x
+                })
+                .unwrap()
+        };
+        for _ in 0..5 {
+            app.update();
+        }
+        assert!((body_x(&mut app, interior_floor) - 4000.0).abs() < 1.0e-2);
+
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation
+            .x = CELL_SIZE;
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(app.world().resource::<StreamingMetrics>().origin_rebases, 1);
+        let floor = body_x(&mut app, interior_floor);
+        assert!(
+            (floor - 4000.0).abs() < 1.0e-2,
+            "the interior's floor stays under its unmoved root: {floor}"
+        );
+        let moved = body_x(&mut app, exterior_static);
+        assert!(
+            (moved - 5.0).abs() < 1.0e-2,
+            "the exterior static moves back a cell with its root: {moved}"
+        );
+    }
+
+    /// An app that streams through the real plan and the real commit, with the assets and the
+    /// database a terrain-only and a full cell both need, and a camera that does not move itself.
     fn terrain_streaming_app(database_path: &std::path::Path, cache_path: &std::path::Path) -> App {
         terrain_streaming_app_with(database_path, cache_path, false)
     }
@@ -8811,6 +9775,7 @@ mod tests {
             terrain_radius: 2,
             ..EngineConfig::default()
         };
+        config.portal.walk = walk;
         config.headless = !walk;
         app.add_plugins(MinimalPlugins)
             .add_plugins(AssetPlugin::default())
@@ -8821,15 +9786,17 @@ mod tests {
             .init_asset::<WaterMaterial>()
             .insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::new(2, -3)))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .insert_resource(CellCache::open(cache_path).unwrap())
             .insert_resource(AssetCatalog::open(&catalogue_path).unwrap())
+            .init_resource::<DirectionalSnowCatalog>()
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(WorldDatabase::open(database_path).unwrap())
             .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
@@ -8929,6 +9896,64 @@ mod tests {
     }
 
     #[test]
+    fn the_active_space_mirrors_the_active_cell() {
+        let mut app = App::new();
+        app.init_resource::<ActiveSpace>()
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .add_systems(Update, sync_active_space);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<ActiveSpace>(),
+            ActiveSpace {
+                worldspace_id: Some(60),
+                interior: None
+            }
+        );
+
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(99);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<ActiveSpace>(),
+            ActiveSpace {
+                worldspace_id: Some(60),
+                interior: Some(99)
+            }
+        );
+
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 61,
+            interior: None,
+        };
+        app.update();
+        assert_eq!(
+            *app.world().resource::<ActiveSpace>(),
+            ActiveSpace {
+                worldspace_id: Some(61),
+                interior: None
+            }
+        );
+    }
+
+    /// The write is on a change only: a frame that changes nothing leaves the resource unflagged.
+    #[test]
+    fn the_active_space_is_not_rewritten_when_the_cell_did_not_change() {
+        let mut app = App::new();
+        app.init_resource::<ActiveSpace>()
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .add_systems(Update, sync_active_space);
+        app.update();
+        app.world_mut().clear_trackers();
+        app.update();
+        assert!(!app.world().resource_ref::<ActiveSpace>().is_changed());
+    }
+
+    #[test]
     fn the_lod_horizon_is_known_per_worldspace() {
         let mut horizon = LodHorizon::default();
         assert_eq!(horizon.reach_in(60), None, "nothing known before an answer");
@@ -8941,6 +9966,128 @@ mod tests {
         );
     }
 
+    /// The connection end to end: a portal door that switches `ActiveCell` into an interior takes
+    /// distant terrain with it - its chunks stop being drawn and nothing streams - and an exterior
+    /// arrival brings it back. Nothing but `ActiveCell` is written in the test.
+    ///
+    /// A chunk leaving that way is the *paced* retire, not a despawn: hidden the frame it leaves
+    /// ([`RetireHidden`] and all), kept until the unload budget reaches it, and drained by the
+    /// pacer ([`despawn_cells`]) - which the test drives by hand, at the two budgets at `0` that
+    /// are exactly the old one-flush path (`pacing::startup` lifts them the same way).
+    #[test]
+    fn distant_terrain_follows_the_portal_active_cell_into_and_out_of_an_interior() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let config = EngineConfig {
+            max_cell_unloads_per_frame: 0,
+            max_unload_ms_per_frame: 0.0,
+            ..EngineConfig::default()
+        };
+        let worldspace = config.worldspace_id;
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: worldspace,
+                interior: None,
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<ActiveSpace>()
+            .init_resource::<lod::LodStreaming>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingWorld>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, (sync_active_space, lod::plan_lod_chunks).chain());
+        app.world_mut().spawn((
+            Transform::from_translation(Vec3::new(100.0, 40.0, -200.0)),
+            StreamingCamera,
+        ));
+        let chunk_root = lod::LodStreaming::spawn_ready_chunk_for_test(
+            app.world_mut(),
+            worldspace,
+            shared::lod::ChunkAnchor::new(0, 0),
+            shared::lod::LodOrigin::new(0, 0),
+        );
+
+        app.update();
+        let lod = |app: &App| {
+            let lod = app.world().resource::<lod::LodStreaming>();
+            (
+                lod.streamed_worldspace_for_test(),
+                lod.resident_chunks_for_test(),
+                lod.retiring_chunks_for_test(),
+            )
+        };
+        assert_eq!(
+            lod(&app),
+            (Some(worldspace), 1, 0),
+            "outside, distant terrain streams for the active worldspace and keeps its chunk"
+        );
+        assert!(app.world().get_entity(chunk_root).is_ok());
+        assert_ne!(
+            app.world().get::<Visibility>(chunk_root),
+            Some(&Visibility::Hidden),
+            "a chunk the plan wants draws"
+        );
+
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(99);
+        app.update();
+        assert_eq!(
+            lod(&app),
+            (None, 1, 1),
+            "inside an interior nothing is streamed: the chunk stops drawing and waits for the \
+             unload budget instead of being despawned on the crossing's frame"
+        );
+        assert!(
+            app.world().get_entity(chunk_root).is_ok(),
+            "a retiring chunk keeps its root until the budget reaches it"
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(chunk_root),
+            Some(&Visibility::Hidden),
+            "and it is hidden the frame it retires, so nothing of it can show through the interior"
+        );
+        assert!(
+            app.world().get::<RetireHidden>(chunk_root).is_some(),
+            "the hide is marked, so a revive gives back exactly it"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .resident_lod_chunks,
+            0
+        );
+
+        // The unpaced drain: both budgets at `0` unloads every retiring root at once, the path
+        // the pacer replaced.
+        despawn_cells(app.world_mut());
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.unloaded_lod_chunks, 1);
+        assert_eq!(metrics.lod_despawns_this_frame, 1);
+        assert_eq!(metrics.retiring_lod_chunks, 0);
+        assert_eq!(metrics.despawned_lod_entities, 1);
+        assert!(
+            app.world().get_entity(chunk_root).is_err(),
+            "the drained chunk's entities are despawned"
+        );
+
+        app.world_mut().resource_mut::<ActiveCell>().interior = None;
+        app.update();
+        assert_eq!(
+            lod(&app).0,
+            Some(worldspace),
+            "an exterior arrival streams distant terrain again"
+        );
+    }
+
+    /// `--lod-keep-hidden-in-interiors` (Option B, off by default): the exterior's chunks stay
+    /// resident and hidden through the interior visit instead of retiring, the unload pacer has
+    /// nothing of them to take, and the return shows the same roots - nothing is streamed in
+    /// again. A return that lands in another worldspace is not a return: the held chunks start
+    /// retiring then.
     #[test]
     fn the_held_lod_flag_keeps_chunks_through_an_interior_visit() {
         let directory = tempfile::tempdir().unwrap();
@@ -8954,8 +10101,8 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(worldspace),
+            .insert_resource(ActiveCell {
+                worldspace_id: worldspace,
                 interior: None,
             })
             .insert_resource(WorldDatabase::open(&path).unwrap())
@@ -8966,7 +10113,7 @@ mod tests {
             .init_resource::<StreamingWorld>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<ProfilingState>()
-            .add_systems(Update, lod::plan_lod_chunks);
+            .add_systems(Update, (sync_active_space, lod::plan_lod_chunks).chain());
         app.world_mut().spawn((
             Transform::from_translation(Vec3::new(100.0, 40.0, -200.0)),
             StreamingCamera,
@@ -8979,7 +10126,7 @@ mod tests {
         );
         app.update();
 
-        app.world_mut().resource_mut::<ActiveSpace>().interior = Some(99);
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(99);
         app.update();
         let lod = app.world().resource::<lod::LodStreaming>();
         assert_eq!(lod.held_chunks_for_test(), 1, "kept for the return");
@@ -9010,7 +10157,7 @@ mod tests {
         assert!(app.world().get_entity(chunk_root).is_ok());
 
         // Back out the same door: the chunk is shown in the frame the exterior is entered.
-        app.world_mut().resource_mut::<ActiveSpace>().interior = None;
+        app.world_mut().resource_mut::<ActiveCell>().interior = None;
         app.update();
         let lod = app.world().resource::<lod::LodStreaming>();
         assert_eq!(lod.held_chunks_for_test(), 0);
@@ -9042,7 +10189,7 @@ mod tests {
 
         // Held again, then a door into another worldspace: not its exterior any more, so the
         // chunk starts retiring and the budget takes it.
-        app.world_mut().resource_mut::<ActiveSpace>().interior = Some(99);
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(99);
         app.update();
         assert_eq!(
             app.world()
@@ -9050,8 +10197,8 @@ mod tests {
                 .held_chunks_for_test(),
             1
         );
-        app.world_mut().resource_mut::<ActiveSpace>().worldspace_id = Some(61);
-        app.world_mut().resource_mut::<ActiveSpace>().interior = None;
+        app.world_mut().resource_mut::<ActiveCell>().worldspace_id = 61;
+        app.world_mut().resource_mut::<ActiveCell>().interior = None;
         app.update();
         assert_eq!(
             app.world()
@@ -9083,8 +10230,8 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(worldspace),
+            .insert_resource(ActiveCell {
+                worldspace_id: worldspace,
                 interior: None,
             })
             .insert_resource(WorldDatabase::open(&path).unwrap())
@@ -9093,7 +10240,7 @@ mod tests {
             .init_resource::<StreamingCommitBudget>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
-            .add_systems(Update, lod::plan_lod_chunks);
+            .add_systems(Update, (sync_active_space, lod::plan_lod_chunks).chain());
         app.world_mut().spawn((
             Transform::from_translation(Vec3::new(100.0, 40.0, -200.0)),
             StreamingCamera,
@@ -9106,7 +10253,7 @@ mod tests {
         );
         app.update();
 
-        app.world_mut().resource_mut::<ActiveSpace>().interior = Some(99);
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(99);
         app.update();
         assert_eq!(
             app.world()
@@ -9116,7 +10263,7 @@ mod tests {
         );
 
         // Turn around before the budget has reached the chunk.
-        app.world_mut().resource_mut::<ActiveSpace>().interior = None;
+        app.world_mut().resource_mut::<ActiveCell>().interior = None;
         app.update();
         let lod = app.world().resource::<lod::LodStreaming>();
         assert_eq!(lod.retiring_chunks_for_test(), 0);
@@ -9148,6 +10295,72 @@ mod tests {
     }
 
     #[test]
+    fn plan_cells_follows_the_active_cell_across_a_worldspace_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let config = EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 1,
+            ..EngineConfig::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: Some(99),
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, plan_cells);
+        app.world_mut().spawn((
+            Transform::from_translation(Vec3::new(100.0, 40.0, -200.0)),
+            StreamingCamera,
+        ));
+        app.update();
+
+        assert_eq!(
+            planned_keys(&app),
+            HashSet::from([CellKey::Interior(99)]),
+            "an interior plans exactly itself, not a grid of exteriors"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .requests_submitted,
+            1
+        );
+
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 614,
+            interior: None,
+        };
+        app.update();
+
+        let wanted = planned_keys(&app);
+        assert_eq!(wanted.len(), 9);
+        assert!(
+            !wanted.contains(&CellKey::Interior(99)),
+            "the interior that stopped being active is unloaded"
+        );
+        assert!(wanted.iter().all(|key| matches!(
+            key,
+            CellKey::Exterior {
+                worldspace_id: 614,
+                ..
+            }
+        )));
+    }
+
+    /// Both worlds retain actual LAND stand-ins despite sparse authored LOD inventory.
+    /// A crossing changes exact world identity; inventory alone never retires a ring.
+    #[test]
     fn sparse_lod_in_another_worldspace_does_not_remove_the_terrain_ring() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("world.db");
@@ -9178,12 +10391,13 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .insert_resource(WorldDatabase::open(&path).unwrap())
             .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
@@ -9224,8 +10438,8 @@ mod tests {
         // Worldspace 614 has one, so it draws its own distant terrain and the plan wants nothing
         // beyond the full-detail grid - the same crossing the review found the far plane did not
         // follow, planned from the other side.
-        *app.world_mut().resource_mut::<ActiveSpace>() = ActiveSpace {
-            worldspace_id: Some(614),
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 614,
             interior: None,
         };
         app.update();
@@ -9275,12 +10489,13 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .insert_resource(WorldDatabase::open(&path).unwrap())
             .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
@@ -9320,8 +10535,8 @@ mod tests {
                 .is_empty()
         );
 
-        *app.world_mut().resource_mut::<ActiveSpace>() = ActiveSpace {
-            worldspace_id: Some(614),
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 614,
             interior: None,
         };
         app.update();
@@ -9358,7 +10573,7 @@ mod tests {
 
         // The run report keeps a gauge's value at the end of the run, and a crossing's counts are
         // zero on every frame after it: a plain last-value gauge would read 0 for the whole run
-        // (what the A1 window saw, analysis-1103 Â§0). Quiet frames after the crossing must not
+        // (what the A1 window saw, analysis-1103 §0). Quiet frames after the crossing must not
         // erase it.
         for _ in 0..3 {
             app.update();
@@ -9392,12 +10607,13 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .insert_resource(WorldDatabase::open(&path).unwrap())
             .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
@@ -9412,8 +10628,8 @@ mod tests {
             .collect();
         app.update();
 
-        *app.world_mut().resource_mut::<ActiveSpace>() = ActiveSpace {
-            worldspace_id: Some(614),
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 614,
             interior: None,
         };
         app.update();
@@ -9523,8 +10739,8 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .insert_resource(WorldDatabase::open(&path).unwrap())
@@ -9532,6 +10748,7 @@ mod tests {
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
             .init_resource::<lod::LodStreaming>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<ActiveSpace>()
             .init_resource::<ProfilingState>()
@@ -10429,8 +11646,8 @@ mod tests {
         app.update();
         assert_eq!(resident_root_count(&mut app), 3);
 
-        *app.world_mut().resource_mut::<ActiveSpace>() = ActiveSpace {
-            worldspace_id: Some(60),
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 60,
             interior: Some(99),
         };
         let interior = spawn_mock_interior(&mut app, 99);
@@ -10481,8 +11698,8 @@ mod tests {
         assert!(app.world().get_entity(waiting).is_ok());
 
         // The camera crosses into an interior: the waiting cell's space is gone.
-        *app.world_mut().resource_mut::<ActiveSpace>() = ActiveSpace {
-            worldspace_id: Some(60),
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 60,
             interior: Some(99),
         };
         spawn_mock_interior(&mut app, 99);
@@ -10522,6 +11739,12 @@ mod tests {
         app.update();
 
         let streaming = app.world().resource::<StreamingWorld>();
+        assert!(
+            !app.world()
+                .resource::<PrestreamCells>()
+                .contains(&waiting_key),
+            "the cell is not a destination pre-streamed behind a door"
+        );
         assert!(
             matches!(
                 streaming.cells.get(&waiting_key),
@@ -10575,12 +11798,13 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .insert_resource(WorldDatabase::open(&path).unwrap())
             .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
@@ -10753,12 +11977,13 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .insert_resource(WorldDatabase::open(&path).unwrap())
             .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
@@ -10846,12 +12071,13 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: Some(INTERIOR_CELL),
             })
             .insert_resource(WorldDatabase::open(&path).unwrap())
             .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
@@ -10925,12 +12151,13 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: Some(INTERIOR_CELL),
             })
             .insert_resource(WorldDatabase::open(&path).unwrap())
             .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
@@ -10983,10 +12210,13 @@ mod tests {
             .resource_mut::<StreamingWorld>()
             .failed_retries
             .clear();
-        *app.world_mut().resource_mut::<ActiveSpace>() = ActiveSpace {
-            worldspace_id: Some(60),
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 60,
             interior: None,
         };
+        app.world_mut()
+            .resource_mut::<PrestreamCells>()
+            .request_interior(INTERIOR_CELL);
         app.update();
         answer_failed(&mut app);
         assert!(
@@ -11080,12 +12310,13 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .insert_resource(database)
             .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
@@ -12052,12 +13283,13 @@ mod tests {
             .init_asset::<WaterMaterial>()
             .insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .insert_resource(CellCache::open(&cache_path).unwrap())
             .insert_resource(AssetCatalog::open(&catalogue_path).unwrap())
+            .init_resource::<DirectionalSnowCatalog>()
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(WorldDatabase::open(&database_path).unwrap())
             .init_resource::<StreamingWorld>()
@@ -12143,7 +13375,7 @@ mod tests {
         );
     }
 
-    /// The detail-change hand-over end to end through the commit (design-1091 Â§3, slice C3): the
+    /// The detail-change hand-over end to end through the commit (design-1091 §3, slice C3): the
     /// ring cell is asked for in full, and the root the cell was drawn by is not despawned - it is
     /// handed over as the stand-in every patch of the new root names, and stops being a streamed
     /// cell root, so the cell has one root and the stand-in is never counted as a second.
@@ -12172,12 +13404,13 @@ mod tests {
             .init_asset::<WaterMaterial>()
             .insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .insert_resource(CellCache::open(&cache_path).unwrap())
             .insert_resource(AssetCatalog::open(&catalogue_path).unwrap())
+            .init_resource::<DirectionalSnowCatalog>()
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(WorldDatabase::open(&database_path).unwrap())
             .init_resource::<StreamingWorld>()
@@ -12310,6 +13543,252 @@ mod tests {
         assert_eq!(named, vec![Some(ring_root); 4]);
     }
 
+    #[test]
+    fn an_interior_reference_keeps_its_camera_relative_position() {
+        let mut app = App::new();
+        app.insert_resource(RenderOrigin(IVec2::new(3, -2)))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: Some(0x56C1B),
+            })
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, update_render_origin);
+        // Alftand02's door: -9223.65, -2592.04, -9223.65 in Creation units, i.e. more than two
+        // cell widths from the render origin, which is what makes an exterior camera rebase.
+        let reference = Vec3::new(-9223.65, -500.0, 2592.04);
+        let camera_position = reference + Vec3::new(100.0, 0.0, 0.0);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(camera_position),
+                StreamingCamera,
+            ))
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((StreamedCellRoot, Transform::default()))
+            .id();
+        let reference_entity = app
+            .world_mut()
+            .spawn((Transform::from_translation(reference), ChildOf(root)))
+            .id();
+
+        for _ in 0..3 {
+            app.update();
+        }
+
+        assert_eq!(
+            app.world().resource::<StreamingMetrics>().origin_rebases,
+            0,
+            "an interior never rebases"
+        );
+        assert_eq!(app.world().resource::<RenderOrigin>().0, IVec2::new(3, -2));
+        let camera_transform = app.world().entity(camera).get::<Transform>().unwrap();
+        assert!(
+            camera_transform
+                .translation
+                .abs_diff_eq(camera_position, 1.0e-4)
+        );
+        let relative = app
+            .world()
+            .entity(reference_entity)
+            .get::<Transform>()
+            .unwrap()
+            .translation
+            - camera_transform.translation;
+        assert!(relative.abs_diff_eq(Vec3::new(-100.0, 0.0, 0.0), 1.0e-4));
+    }
+
+    #[test]
+    fn builds_a_load_door_from_every_shape_of_door_link() {
+        let reference = |door, auto_load| ReferenceRow {
+            form_id: 0x30,
+            cell_id: 10,
+            base_form_id: 20,
+            model_path: None,
+            position: [0.0; 3],
+            rotation: [0.0; 3],
+            scale: 1.0,
+            bounds_min: [0.0; 3],
+            bounds_max: [0.0; 3],
+            bounds_valid: false,
+            door,
+            doorway: None,
+            light: None,
+            base_record_type: None,
+            light_radius_override: None,
+            auto_load,
+
+            initially_enabled: true,
+            emittance: None,
+        };
+        let link = |cell, worldspace| DoorLinkRow {
+            destination_ref_id: 0x31,
+            destination_cell_id: cell,
+            destination_worldspace_id: worldspace,
+            arrival_position: [1.0, 2.0, 3.0],
+            arrival_rotation: [0.0, 0.0, 0.5],
+            label: "Alftand01".into(),
+            return_arrival: None,
+            destination_doorway: None,
+        };
+
+        let interior = load_door(&reference(Some(link(Some(99), None)), false)).unwrap();
+        assert_eq!(interior.ref_id, 0x30);
+        assert_eq!(interior.destination.interior_cell_id, Some(99));
+        assert_eq!(interior.destination.worldspace_id, None);
+        assert_eq!(interior.destination.arrival_position, [1.0, 2.0, 3.0]);
+        assert_eq!(interior.label, "Alftand01");
+
+        let exterior = load_door(&reference(Some(link(Some(120), Some(614))), false)).unwrap();
+        assert_eq!(exterior.destination.interior_cell_id, None);
+        assert_eq!(exterior.destination.worldspace_id, Some(614));
+
+        assert!(
+            load_door(&reference(None, false)).is_none(),
+            "not a door at all"
+        );
+        assert!(
+            load_door(&reference(Some(link(None, None)), false)).is_none(),
+            "a link the converter could not resolve leads nowhere"
+        );
+        assert!(
+            load_door(&reference(Some(link(Some(0), None)), false)).is_none(),
+            "cell 0 is not a cell the converter resolved"
+        );
+    }
+
+    /// The spawned door's outward direction, from the link that leads back into it: the Alftand
+    /// ruined tower's door at 73550, 78431 with a link arriving 32 units east of it.
+    #[test]
+    fn a_door_faces_the_way_the_link_that_leads_back_into_it_arrives() {
+        let door_of = |position: [f32; 3], return_arrival| {
+            load_door(&ReferenceRow {
+                form_id: 0x5BDF1,
+                cell_id: 10,
+                base_form_id: 0x5BDF0,
+                model_path: Some("dungeons\\dwemer\\doors\\dwemerloaddoor.nif".into()),
+                position,
+                rotation: [0.0, 0.0, 0.0],
+                scale: 1.0,
+                bounds_min: [0.0; 3],
+                bounds_max: [0.0; 3],
+                bounds_valid: false,
+                door: Some(DoorLinkRow {
+                    destination_ref_id: 0x5BDC3,
+                    destination_cell_id: Some(0x699B3),
+                    destination_worldspace_id: None,
+                    arrival_position: [75998.0, 78971.0, -8106.0],
+                    arrival_rotation: [0.0, 0.0, -1.87080],
+                    label: "AlftandZCell".into(),
+                    return_arrival,
+                    destination_doorway: None,
+                }),
+                doorway: None,
+                light: None,
+                base_record_type: None,
+                light_radius_override: None,
+                auto_load: false,
+
+                initially_enabled: true,
+                emittance: None,
+            })
+            .unwrap()
+        };
+        let tower = [73550.0, 78431.0, -5609.0];
+        let east =
+            |outward: [f32; 3]| outward[0] > 0.99 && outward[1].abs() < 0.05 && outward[2] == 0.0;
+
+        // From the arrival point of the return link, 32 units east, and from its heading alone when
+        // the point is inside the doorway: both say the door faces east.
+        let from_point = door_of(
+            tower,
+            Some(([73582.0, 78430.0, -5609.0], [0.0, 0.0, 1.60570])),
+        );
+        assert!(
+            east(from_point.outward.expect("a return link is a direction")),
+            "{:?}",
+            from_point.outward
+        );
+        let from_heading = door_of(tower, Some((tower, [0.0, 0.0, 1.60570])));
+        assert!(
+            east(from_heading.outward.expect("a return link is a direction")),
+            "{:?}",
+            from_heading.outward
+        );
+
+        // No link leads back: nothing in the database says which side the door faces, and the
+        // portal and the trigger fall back to the door model's own axes.
+        assert_eq!(door_of(tower, None).outward, None);
+        assert_eq!(
+            door_of(tower, Some(([f32::NAN; 3], [f32::NAN; 3]))).outward,
+            None,
+            "a return link that is not a direction either"
+        );
+    }
+
+    /// What the base record said about auto-loading reaches the spawned door unchanged: the
+    /// database marks an `AutoLoadDoor01` base ([`AUTO_LOAD_COLUMN`]) and nothing about the
+    /// reference or the link may drop that.
+    #[test]
+    fn a_door_keeps_the_auto_load_flag_of_its_base() {
+        let door = |auto_load| {
+            load_door(&ReferenceRow {
+                form_id: 0x15D48,
+                cell_id: 10,
+                base_form_id: 0x1A4A2,
+                model_path: Some("architecture\\doors\\AutoLoadMarker01.nif".into()),
+                position: [0.0; 3],
+                rotation: [0.0; 3],
+                scale: 1.0,
+                bounds_min: [0.0; 3],
+                bounds_max: [0.0; 3],
+                bounds_valid: false,
+                door: Some(DoorLinkRow {
+                    destination_ref_id: 0x152CF,
+                    destination_cell_id: Some(0x152C3),
+                    destination_worldspace_id: None,
+                    arrival_position: [-947.038, 3958.835, 591.917],
+                    arrival_rotation: [0.0, 0.0, 2.96989],
+                    label: "Alftand01".into(),
+                    return_arrival: None,
+                    destination_doorway: None,
+                }),
+                doorway: None,
+                light: None,
+                base_record_type: None,
+                light_radius_override: None,
+                auto_load,
+
+                initially_enabled: true,
+                emittance: None,
+            })
+            .unwrap()
+        };
+        assert!(
+            door(true).auto_load,
+            "an AutoLoadDoor01 base crosses on contact"
+        );
+        assert!(
+            !door(false).auto_load,
+            "a DweDoorLarge01Load keeps the E key"
+        );
+    }
+
+    use crate::world::database::LightRow;
+
+    fn light_row(radius: f32, color: [u8; 3], flags: u32) -> LightRow {
+        LightRow {
+            radius,
+            color,
+            flags,
+            falloff: 1.0,
+            fade: None,
+        }
+    }
+
+    /// A reference in interior cell 99 with a light row and, optionally, an `XRDS` radius of its
     /// own, as the database hands one to `spawn_cell`.
     fn lit_reference(
         form_id: u32,
@@ -12328,9 +13807,11 @@ mod tests {
             bounds_max: [0.0; 3],
             bounds_valid: false,
             door: None,
+            doorway: None,
             light,
             base_record_type: None,
             light_radius_override: radius_override,
+            auto_load: false,
 
             initially_enabled: true,
             emittance: None,
@@ -12344,81 +13825,729 @@ mod tests {
     #[derive(Resource, Default)]
     struct SpawnedCellRoot(Option<Entity>);
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_queued_references(
         mut commands: Commands,
-        config: Res<EngineConfig>,
         queued: Res<QueuedReferences>,
         mut root: ResMut<SpawnedCellRoot>,
+        context: SpawnStampContext,
         asset_server: Res<AssetServer>,
         catalog: Res<AssetCatalog>,
+        snow: Res<DirectionalSnowCatalog>,
         reflection: Res<WaterReflectionTexture>,
         mut meshes: ResMut<Assets<Mesh>>,
         mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
         mut water_materials: ResMut<Assets<WaterMaterial>>,
         mut profiler: ResMut<ProfilingState>,
     ) {
-        root.0 = Some(
-            spawn_cell(
-                &mut commands,
-                &asset_server,
-                &catalog,
-                &reflection,
-                &mut meshes,
-                &mut terrain_materials,
-                &mut water_materials,
-                IVec2::ZERO,
-                config.lights,
-                false,
-                false,
-                CellPayload {
-                    generation: 1,
-                    key: CellKey::Interior(99),
-                    cell_id: 99,
-                    references: queued.0.clone(),
-                },
-                None,
-                None,
-                &mut 0,
-                &mut profiler,
-            )
-            .expect("spawn cell"),
-        );
+        // The stamp the commit would compute, from the same classification: a test that installs
+        // the portal's marker and a destination gets a stamped cell; every other test gets `None`
+        // and a cell spawned exactly as a run without the portal spawns one.
+        let stamp = context.stamps.as_ref().and_then(|_| {
+            let camera = context.camera.single().ok()?.translation;
+            let destination = context
+                .state
+                .as_deref()
+                .map_or(&[][..], crate::portal::PortalState::destination);
+            Some(crate::portal::spawn_layer_stamp(
+                &CellKey::Interior(99),
+                &context.active,
+                context.config.unload_radius,
+                camera,
+                context.origin.0,
+                destination,
+            ))
+        });
+        root.0 = Some(spawn_demo_cell(
+            &mut commands,
+            &asset_server,
+            &catalog,
+            &snow,
+            &reflection,
+            &mut meshes,
+            &mut terrain_materials,
+            &mut water_materials,
+            IVec2::ZERO,
+            CellPayload {
+                generation: 1,
+                key: CellKey::Interior(99),
+                cell_id: 99,
+                references: queued.0.clone(),
+            },
+            None,
+            CellDetail::Full,
+            false,
+            stamp,
+            None,
+            &mut 0,
+            &mut profiler,
+        ));
     }
 
+    /// An app that spawns one interior cell holding `references` through the real [`spawn_cell`].
     fn spawn_reference_cell_app(references: Vec<ReferenceRow>) -> App {
+        spawn_reference_cell_app_with(references, DirectionalSnowCatalog::default())
+    }
+
+    /// The same, with the snow catalogue the references are spawned against.
+    fn spawn_reference_cell_app_with(
+        references: Vec<ReferenceRow>,
+        snow: DirectionalSnowCatalog,
+    ) -> App {
+        let mut app = reference_cell_app(references, snow);
+        app.update();
+        app
+    }
+
+    /// The app [`spawn_reference_cell_app_with`] builds, before its first update: a test installs
+    /// the spawn stamp and the camera the classification reads, then lets the cell commit.
+    fn reference_cell_app(references: Vec<ReferenceRow>, snow: DirectionalSnowCatalog) -> App {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("catalogue.db");
         write_empty_catalogue(&path);
-        let config = EngineConfig {
-            lights: true,
-            ..default()
-        };
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .add_plugins(AssetPlugin::default())
             .init_asset::<Mesh>()
             .init_asset::<Image>()
+            .init_asset::<StandardMaterial>()
             .init_asset::<TerrainMaterial>()
             .init_asset::<WaterMaterial>()
-            .insert_resource(config)
+            .insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .init_resource::<ActiveSpace>()
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: Some(99),
+            })
             .insert_resource(AssetCatalog::open(&path).unwrap())
+            .insert_resource(snow)
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(QueuedReferences(references))
             .init_resource::<SpawnedCellRoot>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, spawn_queued_references);
+        app
+    }
+
+    /// The reference-cell app with the portal's spawn stamp installed and the interior held as the
+    /// portal's destination: the cell commits on `crate::portal::DESTINATION_LAYER`-class layers in its first
+    /// frame, stamped where the tree is built and never walked to get there. `active` decides what
+    /// the stamp classifies the cell into; the destination set always contains cell 99.
+    fn stamped_reference_cell_app(references: Vec<ReferenceRow>, active: ActiveCell) -> App {
+        let mut app = reference_cell_app(references, DirectionalSnowCatalog::default());
+        app.insert_resource(crate::portal::StreamedCellLayerStamps)
+            .insert_resource(active)
+            .init_resource::<crate::portal::PortalState>()
+            // The classification reads the streaming camera; without one the stamp is skipped.
+            .world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        let door = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<crate::portal::PortalState>()
+            .draw_destination(door, vec![CellKey::Interior(99)]);
         app.update();
         app
+    }
+
+    /// The nodes of a cell tree, in traversal order, with the layers each carries: what the stamp
+    /// and the propagation must agree on.
+    fn layer_snapshot(
+        app: &App,
+        root: Entity,
+    ) -> Vec<(Option<RenderLayers>, Option<RenderLayers>)> {
+        let mut out = Vec::new();
+        let mut queue = VecDeque::from([root]);
+        while let Some(entity) = queue.pop_front() {
+            let entity_ref = app.world().entity(entity);
+            out.push((
+                entity_ref
+                    .get::<Inherited<RenderLayers>>()
+                    .map(|inherited| inherited.0.clone()),
+                entity_ref.get::<RenderLayers>().cloned(),
+            ));
+            if let Some(children) = entity_ref.get::<Children>() {
+                for child in children.iter() {
+                    queue.push_back(child);
+                }
+            }
+        }
+        out
+    }
+
+    /// A cell the commit stamps is born on its role's layers, on every node, in its first frame -
+    /// asserted on the stamp itself and not on timing: this app runs no propagation, so the
+    /// `Inherited` and `RenderLayers` on the tree can only have come from the spawn stamp
+    /// (impl-1058). The reference's light child is the one node left to the propagation: a real
+    /// run layers it in the same frame's PostUpdate, and there is one per light to save.
+    #[test]
+    fn a_committed_cell_is_born_on_the_layers_its_role_asks() {
+        let app = stamped_reference_cell_app(
+            vec![lit_reference(
+                0x100,
+                Some(light_row(256.0, [255, 200, 120], 0)),
+                None,
+            )],
+            ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            },
+        );
+        let root = app.world().resource::<SpawnedCellRoot>().0.unwrap();
+        let destination = RenderLayers::layer(crate::portal::DESTINATION_LAYER);
+        // The root carries the role's source - and its `Inherited`, so the propagation that reads
+        // it in a real run has nothing to write on the tree below.
+        let entity = app.world().entity(root);
+        assert_eq!(
+            entity
+                .get::<Propagate<RenderLayers>>()
+                .map(|propagate| propagate.0.clone()),
+            Some(destination.clone()),
+        );
+        assert_eq!(
+            entity
+                .get::<Inherited<RenderLayers>>()
+                .map(|inherited| inherited.0.clone()),
+            Some(destination.clone()),
+        );
+        let mut nodes = VecDeque::from([root]);
+        let mut plain = 0;
+        while let Some(entity) = nodes.pop_front() {
+            let entity_ref = app.world().entity(entity);
+            if entity_ref.get::<crate::lights::SkyrimLight>().is_some() {
+                continue;
+            }
+            // The root is a source, not a plain node: its value lives in its `Propagate` (asserted
+            // above), and the propagation gives a source's own `Inherited` but never its concrete
+            // `RenderLayers` - the bare path leaves the root exactly the same, which is the parity
+            // the other stamp test pins. Everything below it is born carrying both components.
+            if entity != root {
+                plain += 1;
+                assert_eq!(
+                    entity_ref
+                        .get::<Inherited<RenderLayers>>()
+                        .map(|inherited| inherited.0.clone()),
+                    Some(destination.clone()),
+                    "every plain node of the tree is born inherited onto the role's layers"
+                );
+                assert_eq!(
+                    entity_ref.get::<RenderLayers>().cloned(),
+                    Some(destination.clone()),
+                    "and born carrying them, in the frame the cell exists"
+                );
+            }
+            if let Some(children) = entity_ref.get::<Children>() {
+                for child in children.iter() {
+                    nodes.push_back(child);
+                }
+            }
+        }
+        assert!(
+            plain >= 1,
+            "the cell has at least one reference under the root"
+        );
+    }
+
+    /// The stamp and the propagation agree: a cell spawned stamped and a cell spawned bare settle
+    /// onto the same layers on every node. What differs is only the work - the stamped tree costs
+    /// the values where the tree is built, the bare one pays the propagation's per-node archetype
+    /// moves (impl-1058).
+    #[test]
+    fn a_spawn_stamp_matches_what_the_propagation_would_write() {
+        let references = vec![lit_reference(
+            0x100,
+            Some(light_row(256.0, [255, 200, 120], 0)),
+            None,
+        )];
+        // Stamping off: the propagation writes the tree, the frame after the commit.
+        let mut app = reference_cell_app(references.clone(), DirectionalSnowCatalog::default());
+        app.insert_resource(ActiveCell {
+            worldspace_id: 60,
+            interior: None,
+        })
+        .init_resource::<crate::portal::PortalState>();
+        let door = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<crate::portal::PortalState>()
+            .draw_destination(door, vec![CellKey::Interior(99)]);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        crate::portal::add_cell_layer_isolation(&mut app);
+        app.update();
+        app.update();
+        let root = app.world().resource::<SpawnedCellRoot>().0.unwrap();
+        let bare = layer_snapshot(&app, root);
+
+        // Stamping on: born stamped, confirmed by the propagation in the same frame.
+        let mut app = stamped_reference_cell_app(
+            references,
+            ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            },
+        );
+        crate::portal::add_cell_layer_isolation(&mut app);
+        app.update();
+        let root = app.world().resource::<SpawnedCellRoot>().0.unwrap();
+        let stamped = layer_snapshot(&app, root);
+
+        assert_eq!(stamped, bare, "same tree, same layers, different work");
+        assert!(
+            stamped.iter().all(|(inherited, _)| inherited.is_some()),
+            "the propagation had settled every node onto the cell's layers"
+        );
+    }
+
+    /// A run without the portal has no destination stamp. Stock references still own their placed
+    /// layer, and their lights retain independent lighting layers when model children arrive.
+    #[test]
+    fn a_run_without_the_portal_stamps_nothing() {
+        let mut app = spawn_reference_cell_app(vec![lit_reference(
+            0x100,
+            Some(light_row(256.0, [255, 200, 120], 0)),
+            None,
+        )]);
+        let root = app.world().resource::<SpawnedCellRoot>().0.unwrap();
+        let references = app.world().get::<Children>(root).unwrap();
+        assert_eq!(references.len(), 1);
+        let reference = references[0];
+        let lights = app.world().get::<Children>(reference).unwrap();
+        assert_eq!(lights.len(), 1);
+        let light = lights[0];
+        assert!(
+            app.world()
+                .get::<crate::lights::SkyrimLight>(light)
+                .is_some()
+        );
+        assert!(app.world().get::<Propagate<RenderLayers>>(root).is_none());
+        assert_eq!(
+            app.world()
+                .get::<Propagate<RenderLayers>>(reference)
+                .map(|value| &value.0),
+            Some(&PLACED_OBJECT_RENDER_LAYERS)
+        );
+        crate::render::add_placed_object_layer_propagation(&mut app);
+        app.update();
+        let late_model = app.world_mut().spawn(ChildOf(reference)).id();
+        app.update();
+        assert_eq!(
+            app.world().get::<RenderLayers>(late_model),
+            Some(&PLACED_OBJECT_RENDER_LAYERS)
+        );
+        assert_eq!(
+            app.world().get::<RenderLayers>(light),
+            Some(&RenderLayers::from_layers(
+                &crate::render::POINT_LIGHT_LAYERS
+            ))
+        );
+        assert!(
+            app.world()
+                .entity(light)
+                .contains::<bevy::app::PropagateOver<RenderLayers>>()
+        );
+        let destination = RenderLayers::layer(crate::portal::DESTINATION_LAYER);
+        for (inherited, layers) in layer_snapshot(&app, root) {
+            for value in inherited.iter().chain(layers.iter()) {
+                assert!(
+                    !value.intersects(&destination),
+                    "no node gains an unowned destination layer"
+                );
+            }
+        }
+    }
+
+    /// One lit reference, one negative light, one flagged off by default and one plain reference:
+    /// exactly one `PointLight` comes out, carrying the reference's own radius and colour.
+    #[test]
+    fn spawns_one_point_light_for_a_lit_reference() {
+        let mut app = spawn_reference_cell_app(vec![
+            lit_reference(
+                0x100,
+                Some(light_row(256.0, [255, 200, 120], 0)),
+                Some(850.8),
+            ),
+            lit_reference(0x101, Some(light_row(512.0, [80, 80, 90], 0x4)), None),
+            lit_reference(0x102, Some(light_row(512.0, [80, 80, 90], 0x20)), None),
+            lit_reference(0x103, None, None),
+        ]);
+
+        let lights: Vec<(Entity, PointLight, crate::lights::SkyrimLight)> = {
+            let mut query = app
+                .world_mut()
+                .query::<(Entity, &PointLight, &crate::lights::SkyrimLight)>();
+            query
+                .iter(app.world())
+                .map(|(entity, light, marker)| (entity, *light, *marker))
+                .collect()
+        };
+        assert_eq!(
+            lights.len(),
+            1,
+            "the negative and off-by-default lights spawn none"
+        );
+        let (light_entity, light, marker) = lights[0];
+        assert_eq!(marker.form_id, 0x100);
+        assert_eq!(marker.cell_id, 99);
+        assert_eq!(
+            light.range, 850.8,
+            "the reference's XRDS radius wins over the record's 256"
+        );
+        assert_eq!(light.color, Color::srgb_u8(255, 200, 120));
+        assert!(
+            (light.intensity - crate::lights::intensity_for_radius(850.8)).abs() < 1.0e3,
+            "{}",
+            light.intensity
+        );
+        assert!(!light.shadow_maps_enabled);
+
+        // The light has to be inside the cell root: that hierarchy is what the portal isolation
+        // walks to hide a pre-streamed cell, and what a render-origin rebase moves.
+        let root = app
+            .world()
+            .resource::<SpawnedCellRoot>()
+            .0
+            .expect("the cell spawned");
+        assert!(app.world().entity(root).get::<StreamedCellRoot>().is_some());
+        let reference = app
+            .world()
+            .entity(light_entity)
+            .get::<ChildOf>()
+            .expect("the light is a child of its reference")
+            .parent();
+        assert_eq!(
+            app.world().entity(reference).get::<FormId>(),
+            Some(&FormId(0x100))
+        );
+        assert_eq!(
+            app.world()
+                .entity(reference)
+                .get::<ChildOf>()
+                .expect("the reference is a child of the cell root")
+                .parent(),
+            root
+        );
+    }
+
+    /// The static the snow tests place: `DweFacadeTowerRoof01SnowHeavy`, 120 degrees.
+    const SNOW_STATIC: u32 = 0x000D_C850;
+    /// An ordinary static: a `STAT` with no `DNAM`, which must stay exactly as the model published
+    /// it.
+    const PLAIN_STATIC: u32 = 0x0001_0000;
+
+    /// The heavy roof's catalogue: the real `MATO` (0x25129) at the roof's 120 degrees, and the
+    /// same material at the arch's 90.
+    fn snow_catalogue() -> DirectionalSnowCatalog {
+        DirectionalSnowCatalog::from_parts(
+            &[
+                (SNOW_STATIC, 0x0002_5129, 120.0),
+                (0x0006_DD66, 0x0002_5129, 90.0),
+            ],
+            &[(0x0002_5129, snow_material_object_1p())],
+        )
+    }
+
+    /// A reference like [`lit_reference`] but placed from a static of our choosing. It carries no
+    /// model: the snow marker is attached at spawn, before any scene exists, and a model path here
+    /// would only try to load a real glb through an asset server this test app does not have.
+    fn snow_reference(form_id: u32, base_form_id: u32) -> ReferenceRow {
+        ReferenceRow {
+            base_form_id,
+            ..lit_reference(form_id, None, None)
+        }
+    }
+
+    /// Every reference the last [`spawn_cell`] produced, by the form id it was placed with.
+    fn reference_entity(app: &App, form_id: u32) -> Entity {
+        let root = app
+            .world()
+            .resource::<SpawnedCellRoot>()
+            .0
+            .expect("the cell spawned");
+        app.world()
+            .entity(root)
+            .get::<Children>()
+            .expect("the cell root has the references as children")
+            .iter()
+            .find(|child| {
+                app.world()
+                    .entity(*child)
+                    .get::<FormId>()
+                    .is_some_and(|id| id.0 == form_id)
+            })
+            .expect("the reference spawned")
+    }
+
+    /// A reference whose static carries a `MATO` is spawned with its coverage; one whose static has
+    /// none - and every reference at all, in a database without the tables - is spawned with
+    /// nothing, which is the behaviour this feature has to leave alone.
+    #[test]
+    fn a_snow_static_spawns_with_its_coverage_and_a_plain_static_does_not() {
+        let app = spawn_reference_cell_app_with(
+            vec![
+                snow_reference(0x100, SNOW_STATIC),
+                snow_reference(0x101, PLAIN_STATIC),
+            ],
+            snow_catalogue(),
+        );
+
+        let snowed = app.world().entity(reference_entity(&app, 0x100));
+        let snow = snowed
+            .get::<DirectionalSnow>()
+            .expect("the heavy roof's reference carries its coverage");
+        assert_eq!(snow.static_form_id, SNOW_STATIC);
+        // The record's `dir_proj` is (0, 0, -1) in Creation space, so the axis snow falls along is
+        // Bevy's +Y and the cone is the roof's 120 degrees.
+        assert_eq!(snow.coverage.up, Vec3::Y);
+        assert!(
+            (snow.coverage.cos_max_angle - (-0.5)).abs() < 1.0e-6,
+            "{}",
+            snow.coverage.cos_max_angle
+        );
+        assert_eq!(snow.coverage.color, [107, 116, 126]);
+        // The material is the same one for both snow statics, so a catalogue keyed on the material
+        // alone would lose the angle.
+        assert!(
+            snow_catalogue()
+                .coverage_for(0x0006_DD66)
+                .unwrap()
+                .cos_max_angle
+                .abs()
+                < 1.0e-6
+        );
+
+        assert!(
+            app.world()
+                .entity(reference_entity(&app, 0x101))
+                .get::<DirectionalSnow>()
+                .is_none(),
+            "a static with no `DNAM` is left alone"
+        );
+
+        // And with no catalogue at all - the schema-15 database this ships against today - nothing
+        // in the cell carries the component.
+        let app = spawn_reference_cell_app(vec![snow_reference(0x100, SNOW_STATIC)]);
+        assert!(
+            app.world()
+                .entity(reference_entity(&app, 0x100))
+                .get::<DirectionalSnow>()
+                .is_none()
+        );
+    }
+
+    /// The coverage the roof's material draws with, off the real catalogue.
+    fn roof_coverage() -> SnowCoverage {
+        snow_catalogue().coverage_for(SNOW_STATIC).unwrap()
+    }
+
+    /// The swap happens once the readiness pass has had its say, and it moves the mesh onto a snow
+    /// material that keeps the base the handler published - alpha mode and all - instead of
+    /// replacing the material with one of its own.
+    #[test]
+    fn a_validated_scene_is_swapped_onto_the_snow_material() {
+        let mut app = App::new();
+        // The entities need to exist before the app's systems are added, so build them first.
+        let root = app
+            .world_mut()
+            .spawn((Name::new("snow reference"), Transform::default()))
+            .id();
+        let mesh = app.world_mut().spawn(Transform::default()).id();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<StandardMaterial>()
+            .init_asset::<SnowMaterial>()
+            .init_resource::<SnowMaterialCache>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, apply_directional_snow);
+        let base = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                base_color: Color::srgb(0.4, 0.3, 0.2),
+                // The blend pair the glTF handler in `render.rs` publishes: the snow material has
+                // to keep it, or every additive snow card turns into a grey veil.
+                alpha_mode: AlphaMode::Add,
+                emissive: LinearRgba::new(500.0, 400.0, 300.0, 1.0),
+                ..default()
+            });
+        app.world_mut().entity_mut(root).insert(DirectionalSnow {
+            static_form_id: SNOW_STATIC,
+            coverage: roof_coverage(),
+        });
+        app.world_mut()
+            .entity_mut(mesh)
+            .insert((ChildOf(root), MeshMaterial3d(base)));
+        app.update();
+
+        let material = app
+            .world()
+            .entity(mesh)
+            .get::<MeshMaterial3d<SnowMaterial>>()
+            .expect("the mesh is drawn with the snow material");
+        assert!(
+            app.world()
+                .entity(mesh)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .is_none(),
+            "the standard material is replaced, not added beside"
+        );
+        let snow = app
+            .world()
+            .resource::<Assets<SnowMaterial>>()
+            .get(&material.0)
+            .expect("the material is in the asset collection");
+        assert_eq!(snow.base.alpha_mode, AlphaMode::Add);
+        assert_eq!(snow.base.base_color, Color::srgb(0.4, 0.3, 0.2));
+        assert_eq!(
+            snow.base.emissive,
+            LinearRgba::new(500.0, 400.0, 300.0, 1.0)
+        );
+        assert!(
+            (snow.extension.axis_and_cos_max().w - (-0.5)).abs() < 1.0e-6,
+            "the roof's 120-degree cone reaches the uniform: {}",
+            snow.extension.axis_and_cos_max().w
+        );
+        // Applied once: the reference stops being asked about, so the swap cannot run again on a
+        // material of its own making.
+        assert!(
+            app.world().entity(root).get::<DirectionalSnow>().is_none(),
+            "the marker goes with the swap"
+        );
+        app.update();
+        assert_eq!(
+            app.world().resource::<Assets<SnowMaterial>>().len(),
+            1,
+            "a second frame must not add a second material"
+        );
+    }
+
+    /// The swap must not reach a reference the readiness pass is still holding: that pass validates
+    /// `MeshMaterial3d<StandardMaterial>`, so a mesh moved early would reach it as a mesh with no
+    /// material at all.
+    #[test]
+    fn a_reference_still_loading_is_left_alone() {
+        let coverage = roof_coverage();
+        let mut app = App::new();
+        let root = app.world_mut().spawn(Transform::default()).id();
+        let mesh = app.world_mut().spawn(Transform::default()).id();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<StandardMaterial>()
+            .init_asset::<SnowMaterial>()
+            .init_resource::<SnowMaterialCache>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, apply_directional_snow);
+        let base = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        app.world_mut().entity_mut(root).insert((
+            DirectionalSnow {
+                static_form_id: SNOW_STATIC,
+                coverage,
+            },
+            PendingAssetProfile {
+                started: Instant::now(),
+                scene_spawned: false,
+                path: "meshes/dwefacadetowerroof01.glb".into(),
+                form_id: 0x100,
+                base_form_id: SNOW_STATIC,
+                base_record_type: Some("STAT".into()),
+                static_physics: false,
+                cell_id: 99,
+            },
+        ));
+        app.world_mut()
+            .entity_mut(mesh)
+            .insert((ChildOf(root), MeshMaterial3d(base)));
+        app.update();
+
+        assert!(
+            app.world()
+                .entity(mesh)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .is_some(),
+            "the validating pass has to see the loaded material"
+        );
+        assert!(app.world().entity(root).get::<DirectionalSnow>().is_some());
+
+        // Once the profile is gone the swap runs on the next frame.
+        app.world_mut()
+            .entity_mut(root)
+            .remove::<PendingAssetProfile>();
+        app.update();
+        assert!(
+            app.world()
+                .entity(mesh)
+                .get::<MeshMaterial3d<SnowMaterial>>()
+                .is_some()
+        );
+    }
+
+    /// Two references of one snow static share the model's materials, and the two of them must end
+    /// up on one material asset, not one each.
+    #[test]
+    fn references_sharing_a_model_and_a_static_share_one_material() {
+        let coverage = roof_coverage();
+        let mut app = App::new();
+        let mut roots = Vec::new();
+        for _ in 0..2 {
+            roots.push(app.world_mut().spawn(Transform::default()).id());
+        }
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<StandardMaterial>()
+            .init_asset::<SnowMaterial>()
+            .init_resource::<SnowMaterialCache>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, apply_directional_snow);
+        let base = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        for root in &roots {
+            let mesh = app.world_mut().spawn(Transform::default()).id();
+            app.world_mut()
+                .entity_mut(mesh)
+                .insert((ChildOf(*root), MeshMaterial3d(base.clone())));
+            app.world_mut().entity_mut(*root).insert(DirectionalSnow {
+                static_form_id: SNOW_STATIC,
+                coverage,
+            });
+        }
+        app.update();
+        assert_eq!(
+            app.world().resource::<SnowMaterialCache>().len(),
+            1,
+            "the cache is keyed on the material and the static, not the reference"
+        );
+        assert_eq!(app.world().resource::<Assets<SnowMaterial>>().len(), 1);
+
+        // A second snow static that happens to share the model's material is a different material:
+        // its coverage is the only thing telling the two apart, and 120 degrees is not 90.
+        let other = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                DirectionalSnow {
+                    static_form_id: 0x0006_DD66,
+                    coverage: snow_catalogue().coverage_for(0x0006_DD66).unwrap(),
+                },
+            ))
+            .id();
+        let mesh = app.world_mut().spawn(Transform::default()).id();
+        app.world_mut()
+            .entity_mut(mesh)
+            .insert((ChildOf(other), MeshMaterial3d(base)));
+        app.update();
+        assert_eq!(app.world().resource::<SnowMaterialCache>().len(), 2);
+        assert_eq!(app.world().resource::<Assets<SnowMaterial>>().len(), 2);
     }
 
     #[test]
     fn repeated_rebasing_preserves_camera_and_cell_root_locality() {
         let mut app = App::new();
         app.insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
             .init_resource::<StreamingMetrics>()
@@ -12460,16 +14589,17 @@ mod tests {
     /// A visible full-detail terrain quadrant the render world has not confirmed drawn past
     /// [`MAX_SWAP_WAIT_FRAMES`] is the hole coming back, and the run-level invariant says so; one
     /// within the bound is a quadrant on its way and is not; and a quadrant no view can see is never
-    /// counted, however long it waits (design-1091 Â§4).
+    /// counted, however long it waits (design-1091 §4).
     #[test]
     fn lifecycle_validator_flags_a_visible_patch_stuck_past_the_swap_bound() {
         let mut app = App::new();
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
+            .init_resource::<PrestreamCells>()
             .init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
@@ -12578,10 +14708,11 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
-            .insert_resource(ActiveSpace {
-                worldspace_id: Some(60),
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
                 interior: None,
             })
+            .init_resource::<PrestreamCells>()
             .init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
@@ -12624,10 +14755,11 @@ mod tests {
             ..EngineConfig::default()
         })
         .insert_resource(RenderOrigin(IVec2::ZERO))
-        .insert_resource(ActiveSpace {
-            worldspace_id: Some(60),
+        .insert_resource(ActiveCell {
+            worldspace_id: 60,
             interior: None,
         })
+        .init_resource::<PrestreamCells>()
         .init_resource::<StreamingWorld>()
         .init_resource::<StreamingMetrics>()
         .init_resource::<ProfilingState>()
@@ -13143,7 +15275,32 @@ mod tests {
         );
     }
 
-    /// A far reference exercises model-space bounds without world-space precision loss.
+    /// The additive and multiplicative modes the glTF material handler gives a Skyrim glow are
+    /// valid streamed materials, not the "unsupported alpha mode" the validator used to report.
+    #[test]
+    fn accepts_the_additive_and_multiplicative_alpha_modes() {
+        let images = Assets::<Image>::default();
+        for alpha_mode in [AlphaMode::Add, AlphaMode::Multiply] {
+            assert_eq!(
+                validate_standard_material(
+                    &StandardMaterial {
+                        base_color: Color::srgba(1.0, 0.8, 0.4, 0.6),
+                        alpha_mode,
+                        ..default()
+                    },
+                    &images
+                ),
+                Ok(0)
+            );
+        }
+    }
+
+    /// A `Transform` of a reference the acceptance run's stability scenario flew to far
+    /// across Tamriel: at this distance one f32 step is ~0.008 units, which is larger than
+    /// the bounds tolerance (at least 1e-3) of a typical model. A streamed instance is
+    /// placed with a yaw and a position that is not exactly representable at that
+    /// magnitude, both of which are what makes the world-space subtraction of the old
+    /// measurement lose precision.
     fn far_reference() -> Transform {
         Transform::from_rotation(Quat::from_rotation_z(0.41)).with_translation(
             Vec3::new(120_000.0, -95_000.0, 8_000.0) + Vec3::new(1.37, -2.19, 0.43),
@@ -13409,6 +15566,85 @@ mod tests {
     /// The bounds check on a model whose mesh node a clip has moved after its scene spawned, as
     /// `model_animation.rs` turns the mill wheel. `animated` tags the node as a clip target
     /// ([`AnimationTargetId`], as the glTF loader does under an animation root); `authored_shift`
+    /// displaces the node before its pose is recorded, which is a model whose authored hierarchy
+    /// genuinely disagrees with the converted bounds.
+    fn animated_node_case(
+        animated: bool,
+        authored_shift: Vec3,
+    ) -> Result<TransformValidationSummary, String> {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut app = App::new();
+        let mut meshes = Assets::<Mesh>::default();
+        let mesh = meshes.add(Cuboid::new(2.0, 4.0, 6.0));
+        app.insert_resource(meshes);
+        let (root, _) = spawn_bounds_fixture(
+            app.world_mut(),
+            Transform::default(),
+            scene_node(),
+            rotated_mesh_node(),
+            authored_shift,
+            mesh,
+        );
+        let world = app.world_mut();
+        let node = world
+            .query_filtered::<Entity, With<Mesh3d>>()
+            .single(world)
+            .expect("the fixture has one mesh node");
+        if animated {
+            world
+                .entity_mut(node)
+                .insert(AnimationTargetId::from_name(&Name::new(
+                    "L1_SawWaterWheelHub",
+                )));
+        }
+        // What the scene-ready observer does, before any clip has run.
+        world
+            .run_system_once(
+                move |mut commands: Commands,
+                      children: Query<&Children>,
+                      animated: Query<&Transform, With<AnimationTargetId>>| {
+                    record_authored_poses(&mut commands, root, &children, &animated);
+                },
+            )
+            .expect("recording the authored poses runs");
+        // The clip turns the node about its hub, as the wheel's Idle clip does.
+        let mut transform = world.get_mut::<Transform>(node).unwrap();
+        transform.rotation = Quat::from_rotation_x(1.9) * transform.rotation;
+        app.init_resource::<BoundsOutcome>()
+            .add_systems(Update, run_bounds_check);
+        app.update();
+        app.world_mut()
+            .remove_resource::<BoundsOutcome>()
+            .expect("the bounds check system ran")
+            .check
+            .expect("the bounds check ran")
+    }
+
+    #[test]
+    fn bounds_check_measures_an_animated_node_at_its_authored_pose() {
+        let turned_by_its_clip = animated_node_case(true, Vec3::ZERO);
+        assert!(
+            turned_by_its_clip.is_ok(),
+            "a clip target turned after spawn must pass: {turned_by_its_clip:?}"
+        );
+    }
+
+    #[test]
+    fn bounds_check_still_rejects_a_moved_static_node_and_a_wrong_authored_pose() {
+        let static_turned = animated_node_case(false, Vec3::ZERO)
+            .expect_err("the same turn on a node no clip targets is a real divergence");
+        assert!(
+            static_turned.contains("spawned hierarchy bounds diverge from conversion"),
+            "{static_turned}"
+        );
+        let wrong_at_rest = animated_node_case(true, Vec3::new(0.0, 0.5, 0.0))
+            .expect_err("an animated model whose authored pose disagrees with conversion fails");
+        assert!(
+            wrong_at_rest.contains("spawned hierarchy bounds diverge from conversion"),
+            "{wrong_at_rest}"
+        );
+    }
+
     use bevy::world_serialization::WorldSerializationPlugin;
 
     /// The app the empty-model tests run in: the real readiness scan
@@ -13535,6 +15771,19 @@ mod tests {
         assert!(app.world().get::<WorldAssetRoot>(root).is_some());
     }
 
+    /// The app the model-pacing tests run in: the unload pacer, the arming pacer and the real
+    /// readiness scan ([`track_asset_readiness`]) over an asset server and the world serialization
+    /// spawner the engine uses, so a converted model is spawned and its reference becomes ready by
+    /// the same route a converted glb takes. The three run chained, in the order `StreamingPlugin`
+    /// runs them, so a test can tell which frame of that chain a model answered on.
+    /// A fixed placement the proxy rules cover gets a collider once its model is ready, and a load
+    /// door never does, whatever it is made of: main gives DOOR records no collision at all, and a
+    /// collider on a door reference would seal the doorway its leaf swings in.
+    ///
+    /// The reference is left with `ColliderDisabled`: asset readiness is not a reason to enable a
+    /// collider, because a pre-streamed destination becomes ready while its cell is not active
+    /// (port-prep-collision, point 2). `crate::portal`'s space gate is the only thing that removes
+    /// it, and its own test covers the role half.
     #[test]
     fn a_fixed_static_gets_a_proxy_collider_and_a_door_gets_none() {
         let mut app = model_app();
@@ -13588,8 +15837,8 @@ mod tests {
         assert!(stat_entity.contains::<Collider>());
         assert!(stat_entity.contains::<RigidBody>());
         assert!(
-            !stat_entity.contains::<ColliderDisabled>(),
-            "a vanilla static proxy is enabled without a private space gate"
+            stat_entity.contains::<ColliderDisabled>(),
+            "readiness must not enable a collider; only the space gate does"
         );
         let door_entity = world.entity(door);
         assert!(
@@ -13609,7 +15858,13 @@ mod tests {
         .init_asset::<Mesh>()
         .init_asset::<Image>()
         .init_asset::<StandardMaterial>()
-        .insert_resource(EngineConfig::default())
+        .insert_resource(EngineConfig {
+            portal: crate::config::PortalOptions {
+                load_doors: crate::config::LoadDoors::Seamless,
+                ..default()
+            },
+            ..default()
+        })
         .init_resource::<StreamingMetrics>()
         .init_resource::<StreamingWorld>()
         .init_resource::<lod::LodStreaming>()
@@ -14299,11 +16554,269 @@ mod tests {
         assert_eq!(budget.commits, 2);
     }
 
-    fn bare_probe_app() -> App {
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins).add_message::<AppExit>();
-        app
+    fn acti_body(
+        node: u32,
+        shape: u32,
+        motion: u8,
+        quality: u8,
+        layer: u8,
+    ) -> shared::collision::CollisionBody {
+        serde_json::from_value(serde_json::json!({
+            "node":node,"target":"synthetic","shapes":[shape],"kind":"fixed",
+            "havok":{"motion_system":motion,"quality_type":quality,
+                "deactivator_type":0,"collision_layer":layer},
+            "mass":0.0,"inertia":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0],"center_of_mass":[0.0,0.0,0.0],
+            "linear_damping":0.0,"angular_damping":0.0,"friction":0.5,
+            "restitution":0.0,"max_linear_velocity":0.0,"max_angular_velocity":0.0,
+            "convex":true
+        })).unwrap()
     }
+
+    fn acti_asset() -> CollisionAsset {
+        CollisionAsset {
+            version: 2,
+            authored: true,
+            skipped: vec![],
+            shapes: (0..6)
+                .map(|i| CollisionShape::Box {
+                    center: [i as f32 * 20.0, 5.0, 0.0],
+                    half_extents: [2.0, 1.0, 2.0],
+                })
+                .collect(),
+            bodies: vec![
+                acti_body(0, 0, 5, 0, 1),
+                acti_body(1, 1, 4, 1, 2),
+                shared::collision::CollisionBody {
+                    kind: shared::collision::BodyKind::Dynamic,
+                    ..acti_body(2, 2, 5, 1, 1)
+                },
+                shared::collision::CollisionBody {
+                    kind: shared::collision::BodyKind::Keyframed,
+                    ..acti_body(3, 3, 6, 2, 1)
+                },
+                acti_body(4, 4, 7, 1, 1),
+            ], // shape5 is deliberately orphaned.
+        }
+    }
+
+    /// Actual WorldAsset instantiation and the real readiness scan, without a renderer.
+    fn acti_readiness_case(
+        asset: Option<CollisionAsset>,
+        marker: Option<&str>,
+    ) -> (App, Entity, StreamingMetrics) {
+        let mut app = model_app();
+        app.register_type::<GltfSceneExtras>()
+            .register_type::<GltfExtras>();
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::new(2.0, 4.0, 6.0));
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let mut scene = converted_scene_with_material(mesh, material);
+        // World also holds resource-bookkeeping entities; select the actual named model root.
+        let mut query = scene.query_filtered::<Entity, (With<Name>, Without<ChildOf>)>();
+        let scene_root = query.single(&scene).unwrap();
+        if let Some(asset) = asset {
+            scene.entity_mut(scene_root).insert(GltfSceneExtras {
+                value: serde_json::json!({"mudcrabCollision":asset}).to_string(),
+            });
+        }
+        if marker == Some("raw_billboard") {
+            scene.entity_mut(scene_root).insert(GltfExtras {
+                value: r#"{"openSkyrim":{"billboard":"rotateAboutUp"}}"#.to_owned(),
+            });
+        }
+        let handle = add_converted_model(&mut app, scene);
+        let entity = spawn_pending_reference_with(
+            &mut app,
+            handle,
+            0,
+            "meshes/synthetic/support.glb",
+            "ACTI",
+            true,
+        );
+        app.world_mut().entity_mut(entity).insert(cuboid_bounds());
+        if marker == Some("animation") {
+            app.world_mut()
+                .entity_mut(entity)
+                .insert(AnimationTargetId::from_name(&Name::new("synthetic")));
+        }
+        let metrics = settle_armed_readiness(&mut app);
+        assert_eq!(
+            metrics.transform_bounds_validation_failures, 0,
+            "{:?}",
+            metrics.asset_failures
+        );
+        (app, entity, metrics)
+    }
+
+    #[test]
+    fn acti_readiness_attaches_only_owned_supported_fixed_shapes_in_baked_frame() {
+        let (mut app, root, metrics) = acti_readiness_case(Some(acti_asset()), None);
+        assert_eq!(metrics.static_colliders_authored, 1);
+        assert_eq!(metrics.static_colliders_partial, 1);
+        let world = app.world_mut();
+        assert_eq!(world.get::<RigidBody>(root), Some(&RigidBody::Fixed));
+        assert!(world.get::<ColliderDisabled>(root).is_some());
+        assert_eq!(
+            world.get::<Transform>(root).unwrap().translation,
+            Vec3::new(3.0, -4.0, 5.0)
+        );
+        let mut query =
+            world.query::<(&Collider, &Transform, &ChildOf, Option<&ColliderDisabled>)>();
+        let mut centers: Vec<_> = query
+            .iter(world)
+            .filter(|(_, _, parent, _)| parent.parent() == root)
+            .map(|(_, transform, _, disabled)| {
+                assert!(disabled.is_some());
+                transform.translation
+            })
+            .collect();
+        centers.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert_eq!(
+            centers,
+            vec![Vec3::new(0.0, 5.0, 0.0), Vec3::new(80.0, 5.0, 0.0)]
+        );
+    }
+
+    #[test]
+    fn an_acti_motion_marker_cannot_reuse_another_placements_cached_fixed_shapes() {
+        let (mut app, first, _) = acti_readiness_case(Some(acti_asset()), None);
+        let handle = app.world().get::<WorldAssetRoot>(first).unwrap().0.clone();
+        let second = spawn_pending_reference_with(
+            &mut app,
+            handle,
+            1,
+            "meshes/synthetic/support.glb",
+            "ACTI",
+            true,
+        );
+        app.world_mut().entity_mut(second).insert((
+            cuboid_bounds(),
+            AnimationTargetId::from_name(&Name::new("moving-second-placement")),
+        ));
+        let metrics = settle_armed_readiness(&mut app);
+        assert_eq!(metrics.static_colliders_authored, 1);
+        assert!(app.world().get::<RigidBody>(first).is_some());
+        assert!(app.world().get::<RigidBody>(second).is_none());
+    }
+
+    #[test]
+    fn acti_body_raw_motion_quality_and_mass_are_conservative_even_when_kind_is_fixed() {
+        for (motion, quality, layer, mass) in [
+            (0, 1, 1, 0.0),
+            (4, 1, 1, 0.0),
+            (6, 1, 1, 0.0),
+            (9, 1, 1, 0.0),
+            (5, 2, 1, 0.0),
+            (5, 4, 1, 0.0),
+            (5, 255, 1, 0.0),
+            (5, 1, 2, 0.0),
+            (5, 1, 1, 1.0),
+            (5, 1, 1, f32::NAN),
+            (5, 1, 1, f32::INFINITY),
+        ] {
+            let mut asset = acti_asset();
+            let mut body = acti_body(0, 0, motion, quality, layer);
+            body.mass = mass;
+            asset.bodies = vec![body];
+            assert!(matches!(
+                acti_authored_collision(&asset),
+                StaticCollisionDecision::Skipped(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn acti_readiness_refuses_legacy_missing_or_ambiguous_ownership_and_motion() {
+        let mut duplicate = acti_asset();
+        duplicate.bodies[1].shapes.push(0);
+        let mut invalid = acti_asset();
+        invalid.bodies[1].shapes.push(100);
+        let mut missing = acti_asset();
+        missing.bodies.clear();
+        let mut legacy = acti_asset();
+        legacy.version = 1;
+        for asset in [
+            Some(duplicate),
+            Some(invalid),
+            Some(missing),
+            Some(legacy),
+            None,
+        ] {
+            let (app, root, metrics) = acti_readiness_case(asset, None);
+            assert_eq!(metrics.static_colliders_authored, 0);
+            assert_eq!(metrics.static_colliders_proxy, 0);
+            assert!(app.world().get::<RigidBody>(root).is_none());
+        }
+        for marker in ["animation", "raw_billboard"] {
+            let (app, root, metrics) = acti_readiness_case(Some(acti_asset()), Some(marker));
+            assert_eq!(metrics.static_colliders_authored, 0);
+            assert!(app.world().get::<RigidBody>(root).is_none());
+        }
+    }
+
+    #[test]
+    fn collision_authored_under_the_pre_rename_key_still_loads() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        let root = app.world_mut().spawn_empty().id();
+        // Built from JSON rather than a struct literal, so a field added to `CollisionAsset`
+        // with a serde default does not break this test.
+        let mut asset: CollisionAsset = serde_json::from_value(serde_json::json!({
+            "version": COLLISION_ASSET_VERSION,
+            "authored": true,
+            "shapes": [],
+            "skipped": [],
+        }))
+        .unwrap();
+        asset.shapes.push(CollisionShape::Box {
+            center: [0.0, 5.0, 0.0],
+            half_extents: [10.0, 5.0, 10.0],
+        });
+        // The key is built in two halves so scripts/rename-to-mudcrab.py leaves it alone.
+        let old_key = ["openSkyrim", "Collision"].concat();
+        app.world_mut().spawn((
+            GltfSceneExtras {
+                value: serde_json::json!({ old_key: asset }).to_string(),
+            },
+            ChildOf(root),
+        ));
+        let decision = app
+            .world_mut()
+            .run_system_once(
+                move |children: Query<&Children>,
+                      scene_extras: Query<&GltfSceneExtras>,
+                      transforms: SpawnedNodeQuery,
+                      primitives: RenderPrimitiveQuery,
+                      meshes: Res<Assets<Mesh>>,
+                      materials: Res<Assets<StandardMaterial>>| {
+                    static_collision_from_hierarchy(
+                        Some("STAT"),
+                        "meshes/architecture/farmhouse/inn01.glb",
+                        root,
+                        &children,
+                        &scene_extras,
+                        &transforms,
+                        &primitives,
+                        &meshes,
+                        &materials,
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(decision, StaticCollisionDecision::Authored(_, _)));
+    }
+
+    /// A minimal app the retire-visibility probe's own tests drive: the resources the probe reads,
+    /// the probe installed against `dir`, and nothing else - no streaming pipeline, so the test
+    /// controls exactly which cells are retiring.
     fn probe_app(dir: PathBuf) -> App {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
@@ -14314,11 +16827,24 @@ mod tests {
         install_retire_visibility_probe(&mut app, Some(dir));
         app
     }
+
+    /// How many systems the `PostUpdate` schedule carries: the way a test tells whether the probe's
+    /// one system was installed, since a system's own name is only present with the debug feature.
     fn post_update_systems_len(app: &App) -> usize {
         app.get_schedule(PostUpdate)
             .map(|schedule| schedule.systems_len())
             .unwrap_or(0)
     }
+
+    /// A bare app with the plugins the probe tests use and no probe installed.
+    fn bare_probe_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins).add_message::<AppExit>();
+        app
+    }
+
+    /// The probe installs nothing at all - no resource, no system - unless the flag names a
+    /// directory, so an ordinary run is exactly as before.
     #[test]
     fn the_retire_visibility_probe_installs_only_when_asked() {
         let mut control = bare_probe_app();
@@ -14352,6 +16878,9 @@ mod tests {
             "and its resource"
         );
     }
+
+    /// The probe counts a retiring root that still shows in a view - the failure it hunts - and
+    /// counts nothing for one that is hidden, the state the drain leaves a cell in.
     #[test]
     fn the_probe_counts_only_a_retiring_cell_that_shows() {
         let directory = tempfile::tempdir().unwrap();
@@ -14536,7 +17065,10 @@ mod upstream_tests {
             .collect();
         assert_eq!(parts.len(), 2);
         for entity in std::iter::once(root).chain(parts) {
-            assert!(!app.world().entity(entity).contains::<ColliderDisabled>());
+            assert!(app.world().entity(entity).contains::<ColliderDisabled>());
+            app.world_mut()
+                .entity_mut(entity)
+                .remove::<ColliderDisabled>();
         }
         for _ in 0..3 {
             app.update();
@@ -15190,16 +17722,23 @@ mod upstream_tests {
     }
     fn upstream_unload_contract(key: CellKey, center: IVec2, radius: i32) -> bool {
         let active = match key {
-            CellKey::Interior(cell) => ActiveSpace {
-                worldspace_id: Some(60),
+            CellKey::Interior(cell) => ActiveCell {
+                worldspace_id: 60,
                 interior: Some(cell),
             },
-            CellKey::Exterior { worldspace_id, .. } => ActiveSpace {
-                worldspace_id: Some(worldspace_id),
+            CellKey::Exterior { worldspace_id, .. } => ActiveCell {
+                worldspace_id,
                 interior: None,
             },
         };
-        super::cell_within_unload_radius(key, &active, 60, center, radius, radius.saturating_sub(1))
+        super::cell_within_unload_radius(
+            key,
+            &active,
+            center,
+            radius,
+            radius.saturating_sub(1),
+            &PrestreamCells::default(),
+        )
     }
 
     /// An app with the cell plan, the unload pacer and the lifecycle validator chained as they run
@@ -15234,6 +17773,8 @@ mod upstream_tests {
             .init_resource::<lod::LodStreaming>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<ActiveSpace>()
+            .init_resource::<ActiveCell>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<ProfilingState>()
             .add_systems(
                 Update,
@@ -15545,6 +18086,8 @@ mod upstream_tests {
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
             .init_resource::<ActiveSpace>()
+            .init_resource::<ActiveCell>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, update_render_origin);
@@ -15587,6 +18130,8 @@ mod upstream_tests {
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
             .init_resource::<ActiveSpace>()
+            .init_resource::<ActiveCell>()
+            .init_resource::<PrestreamCells>()
             .add_systems(Update, update_render_origin);
         let cell = app
             .world_mut()
@@ -15673,6 +18218,8 @@ mod upstream_tests {
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
             .init_resource::<ActiveSpace>()
+            .init_resource::<ActiveCell>()
+            .init_resource::<PrestreamCells>()
             .init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
@@ -16250,6 +18797,8 @@ mod upstream_tests {
         .init_resource::<lod::LodStreaming>()
         .init_resource::<TerrainContinuity>()
         .init_resource::<ActiveSpace>()
+        .init_resource::<ActiveCell>()
+        .init_resource::<PrestreamCells>()
         .init_resource::<ProfilingState>()
         .init_resource::<DiagnosticFallbackAssets>()
         .init_resource::<SceneSpawnBatch>()
@@ -16491,6 +19040,8 @@ mod upstream_tests {
             .init_asset::<WaterMaterial>()
             .insert_resource(RenderOrigin(IVec2::ZERO))
             .init_resource::<ActiveSpace>()
+            .init_resource::<ActiveCell>()
+            .init_resource::<PrestreamCells>()
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .add_systems(Update, spawn_test_cell);
         app.update();
@@ -16653,6 +19204,9 @@ mod upstream_tests {
                     light_radius_override: None,
                     door: None,
                     emittance: None,
+
+                    doorway: None,
+                    auto_load: false,
                 }],
             },
             Some(terrain),
@@ -17477,7 +20031,7 @@ mod upstream_tests {
             let aabb = mesh.compute_aabb().unwrap();
             let center = Vec3::from(aabb.center);
             let half_extents = Vec3::from(aabb.half_extents);
-            let (_, global, _) = transforms.get(descendant).unwrap();
+            let (_, global, _, _) = transforms.get(descendant).unwrap();
             let relative = Mat4::from(root_inverse * global.affine());
             let transformed =
                 InstanceBounds::transformed(center - half_extents, center + half_extents, relative);
@@ -17634,6 +20188,8 @@ mod upstream_tests {
             radius,
             color,
             flags,
+            falloff: 1.0,
+            fade: None,
         }
     }
 
@@ -17662,6 +20218,9 @@ mod upstream_tests {
             light_radius_override: radius_override,
             door: None,
             emittance: None,
+
+            doorway: None,
+            auto_load: false,
         }
     }
 
@@ -17746,6 +20305,8 @@ mod upstream_tests {
             .insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
             .init_resource::<ActiveSpace>()
+            .init_resource::<ActiveCell>()
+            .init_resource::<PrestreamCells>()
             .insert_resource(AssetCatalog::open(&path).unwrap())
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(QueuedReferences(references))
@@ -18338,6 +20899,8 @@ mod upstream_tests {
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
             .init_resource::<ActiveSpace>()
+            .init_resource::<ActiveCell>()
+            .init_resource::<PrestreamCells>()
             .add_systems(Update, update_render_origin);
         let cell = app
             .world_mut()
@@ -18544,12 +21107,15 @@ mod upstream_tests {
     #[test]
     fn a_spawned_door_reference_carries_load_door() {
         let link = |cell| crate::world::database::DoorLinkRow {
-            label: String::new(),
             destination_ref_id: 0x700,
             destination_cell_id: cell,
             destination_worldspace_id: None,
             arrival_position: [10.0, 20.0, 30.0],
             arrival_rotation: [0.0, 0.0, 1.0],
+
+            label: String::new(),
+            return_arrival: None,
+            destination_doorway: None,
         };
         let mut door = lit_reference(0x110, None, None);
         door.door = Some(link(Some(500)));
@@ -18714,162 +21280,6 @@ mod upstream_tests {
                 .get::<FormId>(),
             Some(&FormId(0x100)),
             "and the reference is still spawned"
-        );
-    }
-
-    #[derive(Resource, Default)]
-    struct BoundsOutcome {
-        expected: Option<ExpectedModelBounds>,
-        bounds: Option<Result<SpawnedBounds, String>>,
-        check: Option<Result<TransformValidationSummary, String>>,
-    }
-
-    fn run_bounds_check(
-        mut outcome: ResMut<BoundsOutcome>,
-        roots: Query<(
-            Entity,
-            &Transform,
-            &GlobalTransform,
-            &WorldTransform,
-            Option<&ExpectedModelBounds>,
-        )>,
-        transforms: SpawnedNodeQuery,
-        children: Query<&Children>,
-        primitives: RenderPrimitiveQuery,
-        meshes: Res<Assets<Mesh>>,
-    ) {
-        let Ok((root, local, global, world_transform, expected)) = roots.single() else {
-            panic!("the fixture must spawn exactly one model root");
-        };
-        outcome.expected = expected.copied();
-        outcome.bounds = Some(spawned_relative_bounds(
-            root,
-            &children,
-            &transforms,
-            &primitives,
-            &meshes,
-        ));
-        outcome.check = Some(super::validate_spawned_transforms_and_bounds(
-            root,
-            local,
-            global,
-            world_transform,
-            expected,
-            None,
-            &children,
-            &transforms,
-            &primitives,
-            &meshes,
-        ));
-    }
-
-    fn spawn_bounds_fixture(
-        world: &mut World,
-        root_local: Transform,
-        node_local: Transform,
-        mesh_local: Transform,
-        mesh_shift: Vec3,
-        mesh: Handle<Mesh>,
-    ) -> (Entity, ExpectedModelBounds) {
-        let (min, max) = {
-            let aabb = world
-                .resource::<Assets<Mesh>>()
-                .get(&mesh)
-                .and_then(|mesh| mesh.compute_aabb())
-                .expect("the fixture mesh has finite POSITION bounds");
-            let center = Vec3::from(aabb.center);
-            let half_extents = Vec3::from(aabb.half_extents);
-            let converted = InstanceBounds::transformed(
-                center - half_extents,
-                center + half_extents,
-                node_local.to_matrix() * mesh_local.to_matrix(),
-            );
-            (converted.min, converted.max)
-        };
-        let root_global = GlobalTransform::from(root_local.to_matrix());
-        let root = world
-            .spawn((
-                root_local,
-                root_global,
-                WorldTransform(root_local.to_matrix()),
-                ExpectedModelBounds { min, max },
-            ))
-            .id();
-        let node_global = root_global.mul_transform(node_local);
-        let node = world.spawn((node_local, node_global, ChildOf(root))).id();
-        let mut mesh_local = mesh_local;
-        mesh_local.translation += mesh_shift;
-        world.spawn((
-            mesh_local,
-            node_global.mul_transform(mesh_local),
-            Mesh3d(mesh),
-            ChildOf(node),
-        ));
-        (root, ExpectedModelBounds { min, max })
-    }
-
-    fn scene_node() -> Transform {
-        Transform::from_rotation(Quat::from_rotation_x(-0.55) * Quat::from_rotation_z(0.3))
-            .with_translation(Vec3::new(-1.23, 4.07, 0.61))
-    }
-
-    fn rotated_mesh_node() -> Transform {
-        Transform::from_rotation(
-            Quat::from_rotation_y(0.7) * Quat::from_rotation_x(0.35) * Quat::from_rotation_z(-0.2),
-        )
-        .with_translation(Vec3::new(3.37, 0.51, -2.19))
-        .with_scale(Vec3::new(1.5, 0.75, 2.0))
-    }
-
-    fn turned_node_case(billboard: bool) -> Result<TransformValidationSummary, String> {
-        let mut app = App::new();
-        let mut meshes = Assets::<Mesh>::default();
-        let mesh = meshes.add(Cuboid::new(2.0, 4.0, 6.0));
-        app.insert_resource(meshes);
-        spawn_bounds_fixture(
-            app.world_mut(),
-            Transform::default(),
-            scene_node(),
-            rotated_mesh_node(),
-            Vec3::ZERO,
-            mesh,
-        );
-        let world = app.world_mut();
-        let node = world
-            .query_filtered::<Entity, With<Mesh3d>>()
-            .single(world)
-            .expect("the fixture has one mesh node");
-        let authored = rotated_mesh_node().rotation;
-        let mut entity = world.entity_mut(node);
-        entity.get_mut::<Transform>().unwrap().rotation = Quat::from_rotation_y(1.1) * authored;
-        if billboard {
-            entity.insert(crate::billboard::Billboard {
-                mode: crate::billboard::BillboardMode::TurnAboutUp,
-                authored,
-            });
-        }
-        app.init_resource::<BoundsOutcome>()
-            .add_systems(Update, run_bounds_check);
-        app.update();
-        app.world_mut()
-            .remove_resource::<BoundsOutcome>()
-            .expect("the bounds check system ran")
-            .check
-            .expect("the bounds check ran")
-    }
-
-    #[test]
-    fn bounds_check_measures_a_billboard_at_its_authored_rotation() {
-        let turned_billboard = turned_node_case(true);
-        assert!(
-            turned_billboard.is_ok(),
-            "a billboard turned toward the camera must pass: {turned_billboard:?}"
-        );
-        let reason = turned_node_case(false)
-            .expect_err("the same turn on an ordinary node is a real divergence");
-        assert!(
-            reason.contains("spawned hierarchy bounds diverge from conversion"),
-            "{reason}"
         );
     }
 }

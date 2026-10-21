@@ -121,10 +121,6 @@ pub const DEFAULT_REMOTE_PORT: u16 = 15702;
 
 #[derive(Debug, Clone, Resource)]
 pub struct EngineConfig {
-    /// Live native LOD and cluster quality controls, initialized by their graphics flags.
-    pub graphics: crate::graphics_settings::GraphicsSettings,
-    /// Keep an automated capture window on screen instead of parking it off screen.
-    pub show_window: bool,
     /// Explicit launch options. Saved interactive settings defer to these and to `--ini`.
     pub settings_overrides: Vec<String>,
     pub assets_dir: PathBuf,
@@ -132,10 +128,6 @@ pub struct EngineConfig {
     pub bug_report_dir: Option<PathBuf>,
     pub worldspace_id: u32,
     pub start_grid: (i32, i32),
-    /// Authored feet in Creation units; shot camera framing takes precedence.
-    pub start_position: Option<[f32; 3]>,
-    /// Authored heading in Creation radians about Z.
-    pub start_yaw: f32,
     pub stream_radius: i32,
     pub unload_radius: i32,
     /// Optional upper bound for sun-shadow cascades from `[Display] fShadowDistance`.
@@ -174,6 +166,8 @@ pub struct EngineConfig {
     /// load, nearest first, instead of as each comes into view. The startup cover then waits for
     /// all of them, and nothing a view or a crossing proof depends on changes during play.
     pub cluster_preload_batches: bool,
+    /// Extend the selected sun beyond CSM using certified canonical terrain.
+    pub cluster_far_terrain_shadows: bool,
     /// `--cluster-min-instance-pixels`: instances whose bounding sphere spans fewer pixels than
     /// this across are not drawn (default 0: every instance).
     pub cluster_min_instance_pixels: Option<f32>,
@@ -383,20 +377,148 @@ pub struct EngineConfig {
     pub transform_bounds_fixture: bool,
     pub renderer_fixture: bool,
     pub streaming_fixture: bool,
+    /// Exact start in Creation-engine units, overriding the default camera placement.
+    pub start_position: Option<[f32; 3]>,
+    /// Start heading in Creation-engine radians (rotation about Z), used with start_position.
+    pub start_yaw: f32,
+    /// The portal's own options: the walk, the demo starts, the scripted tour and the shots run.
+    /// One struct, parsed by one block at the end of this file ([`PortalOptions`]).
+    pub portal: PortalOptions,
     /// Serve the Bevy Remote Protocol on 127.0.0.1 (`--remote`). Needs the `remote` feature.
     pub remote: bool,
     pub remote_port: u16,
     /// Whether a streamed `LIGH` reference places a point light (`--lights`). Off by default, so
     /// every run that does not ask for lights renders exactly as it did before.
     pub lights: bool,
+    /// Whether a measured run is presented as a played one (`--as-played`): the sky, fog and
+    /// per-space lighting, the door and model animations and the portals an interactive run has
+    /// ([`Self::interactive`]), so a route or benchmark measures what a player sees. Never the
+    /// walking player: the run's camera stays scripted. Off by default, so a measured run keeps
+    /// the flat lighting its gates were set for.
+    pub as_played: bool,
+    /// Whether the main camera culls interior objects by room and portal (`--room-culling`). Off
+    /// by default; it needs the converter's room tables (`db-schema.md` section 15) and does
+    /// nothing without them.
+    pub room_culling: bool,
     pub physics_fixture: bool,
     /// `--water-reflection-preset <baseline|water>`: which [`crate::view_policy::ViewPolicy`] the
     /// water reflection camera is given. `baseline` is the full-size, every-frame reflection the
     /// engine has always drawn.
     pub water_reflection_preset: WaterReflectionPreset,
-    /// `--water-reflection <on|off>`: whether the water reflection view is drawn.
-    /// Defaults to on; off is an explicit measurement switch. See [`HELP_TEXT`].
+    /// `--water-reflection <on|off|planar|ssr>`: whether the water reflection view is drawn at
+    /// all (`off` is the measurement switch; `on` and `planar` draw it, and `ssr` is the Water Plus
+    /// reflection of [`Self::water_reflection_mode`]). See [`HELP_TEXT`].
     pub water_reflection: bool,
+    /// `--water-reflection <planar|ssr>`: how the water reflects. `ssr` (the Plus default, the
+    /// user's call 2026-10-10) marches the screen in the water shader, and the reflection camera is
+    /// never demanded ([`crate::water_ssr`]); `planar` is the mirrored reflection view the engine
+    /// drew before.
+    pub water_reflection_mode: WaterReflectionMode,
+    /// `--water-ssr-steps <linear>[,<bisection>]`: how many steps the `ssr` march takes per water
+    /// pixel. Only read with `--water-reflection ssr`.
+    pub water_ssr_steps: WaterSsrSteps,
+    /// `--shadows <on|off>`: whether the sun casts shadows. A measurement switch; see
+    /// [`HELP_TEXT`].
+    pub shadows: bool,
+    /// `--render-parallel-finish`: finish the render command encoders in parallel (the Mudcrab
+    /// patch to the vendored `bevy_render`, impl-1132). On by default in Plus (the user's call
+    /// 2026-10-10); `--no-render-parallel-finish` is stock Bevy.
+    pub render_parallel_finish: bool,
+    /// `--render-backends <all|vulkan>`: which graphics backends wgpu may pick from. `all` is
+    /// Bevy's own choice and the default; `vulkan` is optional (its window gained 0.56 ms alone and
+    /// nothing on top of the parallel finish, so it stayed off, impl-1132).
+    pub render_backends: RenderBackends,
+}
+
+/// The graphics backends the renderer may use (`--render-backends`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderBackends {
+    /// Bevy's default: every backend wgpu has for the platform (`WGPU_BACKEND` still applies).
+    #[default]
+    All,
+    /// Vulkan only. wgpu then never needs the DX12 indirect-call validation pass, so the engine
+    /// also drops `VALIDATION_INDIRECT_CALL` in release builds (see `render::wgpu_settings`).
+    Vulkan,
+}
+
+impl RenderBackends {
+    /// Every choice, in the order the help lists them.
+    pub const ALL: [Self; 2] = [Self::All, Self::Vulkan];
+
+    /// The spelling the command line and run records use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Vulkan => "vulkan",
+        }
+    }
+}
+
+/// How the water reflects (`--water-reflection`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaterReflectionMode {
+    /// The mirrored reflection camera the engine has always drawn.
+    #[default]
+    Planar,
+    /// Water Plus: a screen-space ray march in the water shader ([`crate::water_ssr`]). The
+    /// reflection camera is never demanded.
+    Ssr,
+}
+
+impl WaterReflectionMode {
+    /// The spelling the command line and run records use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Planar => "planar",
+            Self::Ssr => "ssr",
+        }
+    }
+}
+
+/// The step counts of the screen-space water reflection's ray march (`--water-ssr-steps`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaterSsrSteps {
+    /// Equal steps along the ray to find the first place it passes behind the depth buffer.
+    pub linear: u32,
+    /// Halvings of the last linear step that refine that place.
+    pub bisection: u32,
+}
+
+impl WaterSsrSteps {
+    /// 16 linear and 6 bisection steps.
+    pub const DEFAULT: Self = Self {
+        linear: 16,
+        bisection: 6,
+    };
+    /// The most linear steps `--water-ssr-steps` accepts. The counts are shader definitions, so
+    /// the loops have constant bounds and this bounds the variants a run can ask for.
+    pub const MAX_LINEAR: u32 = 128;
+    /// The most bisection steps it accepts: each halves the last linear step, and 32 halvings are
+    /// past what an `f32` can tell apart.
+    pub const MAX_BISECTION: u32 = 32;
+
+    /// Parses `<linear>` or `<linear>,<bisection>`; an omitted bisection count keeps the default.
+    /// `None` for a count that is not a number, 0 or more than [`Self::MAX_LINEAR`] linear steps,
+    /// or more than [`Self::MAX_BISECTION`] bisection steps.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (linear, bisection) = match raw.split_once(',') {
+            Some((linear, bisection)) => (linear, Some(bisection)),
+            None => (raw, None),
+        };
+        let linear: u32 = linear.parse().ok()?;
+        let bisection: u32 = match bisection {
+            Some(bisection) => bisection.parse().ok()?,
+            None => Self::DEFAULT.bisection,
+        };
+        ((1..=Self::MAX_LINEAR).contains(&linear) && bisection <= Self::MAX_BISECTION)
+            .then_some(Self { linear, bisection })
+    }
+}
+
+impl Default for WaterSsrSteps {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 /// The view policy the water reflection camera is given (`--water-reflection-preset`).
@@ -444,7 +566,7 @@ impl WaterReflectionPreset {
 /// | 16 | 1,064 | 20 | 54.2 ms |
 ///
 /// Each ring cell is four landscape draws of its own - one per quadrant, each with its own
-/// material - and costs the frame about 20 Âµs, so a ring's price is its cell count. Eight is the
+/// material - and costs the frame about 20 µs, so a ring's price is its cell count. Eight is the
 /// largest that stays clearly above the sixty-frame acceptance gate with the whole Pale in view;
 /// ten and twelve sit on the gate and sixteen falls through it. Frames were measured while other
 /// work ran on this machine and single runs differ by a quarter either way, so read the table as
@@ -459,15 +581,11 @@ impl Default for EngineConfig {
     /// Start with the standard engine settings and optional profiling diagnostics disabled.
     fn default() -> Self {
         Self {
-            graphics: crate::graphics_settings::GraphicsSettings::default(),
             settings_overrides: Vec::new(),
-            show_window: false,
             assets_dir: PathBuf::from("modern_assets"),
             bug_report_dir: None,
             worldspace_id: 0x3c,
             start_grid: (0, 0),
-            start_position: None,
-            start_yaw: 0.0,
             // Skyrim's default `uGridsToLoad=5`.
             stream_radius: 2,
             unload_radius: 3,
@@ -480,6 +598,7 @@ impl Default for EngineConfig {
             cluster_own_statics: false,
             cluster_terrain: false,
             cluster_preload_batches: false,
+            cluster_far_terrain_shadows: false,
             cluster_min_instance_pixels: None,
             cluster_prepass: true,
             terrain_radius_given: false,
@@ -590,12 +709,22 @@ impl Default for EngineConfig {
             transform_bounds_fixture: false,
             renderer_fixture: false,
             streaming_fixture: false,
+            start_position: None,
+            start_yaw: 0.0,
+            portal: PortalOptions::default(),
             remote: false,
             remote_port: DEFAULT_REMOTE_PORT,
             lights: false,
+            as_played: false,
+            room_culling: false,
             physics_fixture: false,
             water_reflection_preset: WaterReflectionPreset::Baseline,
             water_reflection: true,
+            water_reflection_mode: WaterReflectionMode::Ssr,
+            water_ssr_steps: WaterSsrSteps::DEFAULT,
+            shadows: true,
+            render_parallel_finish: true,
+            render_backends: RenderBackends::All,
         }
     }
 }
@@ -618,15 +747,15 @@ Assets and start position:
   --worldspace <id>                     worldspace form id, decimal or 0x-hex (default: 0x3c)
   --grid-x <cell>                       starting cell x (default: 0)
   --grid-y <cell>                       starting cell y (default: 0)
-  --start-position <x> <y> <z>         authored feet in Creation units
-  --start-yaw <radians>                authored start heading
-  --start-shot <file>                  start the live camera at one exterior shot pose
+  --start-shot <file> [name]           start at the sole exterior pose, or a named pose in its space
   --stdin-console                     accept developer console commands on stdin
   --no-render-diagnostics             disable GPU timing and pipeline-statistics queries
   --allow-incomplete-assets             run despite a failed manifest or integration-report gate
   --headless                            run without opening a window
   --hidden-window                       render screenshots without showing a window
   --lights                              place a point light for each streamed LIGH reference
+  --as-played                           present a measured run as a played one (sky, fog, animations, portals)
+  --room-culling                        cull interior objects by room and portal (needs the room tables)
 
 Streaming:
   --ini <file>                        layer Skyrim INI settings; CLI options override files
@@ -709,10 +838,6 @@ Benchmark and profiling:
   --image-space-slot <slot>            sunrise|day|sunset|night; requires --image-space-weather
   --visual-preset <vivid|cool-gray>      select sky and grading look (default: cool-gray)
   --sun-position <azimuth,elevation>     sun bearing clockwise from north and elevation above horizon, degrees
-  --cluster-error-pixels <px>          object cluster error threshold (default: 1; above 0, at most 16)
-  --cluster-terrain-error-pixels <px>  terrain cluster error threshold (default: 1; above 0, at most 16)
-  --lod-objects <on|off>                draw native distant object blocks (default: on)
-  --lod-trees <on|off>                  draw native distant tree billboards (default: on)
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
   --shots-settle-timeout <seconds>      maximum settling time per shot (default: 30, maximum: 600)
   --shots-out <dir>                     where the shots' PNGs and shots.log go (default: beside the shots file)
@@ -726,14 +851,23 @@ Benchmark and profiling:
   --profile-commit <hash>               commit recorded in the profile (default: unknown)
   --profile-dirty-worktree              record uncommitted worktree changes in the profile
   --profile-hardware <text>             hardware recorded in the profile (default: unspecified)
-  --water-reflection <on|off>           draw the water reflection view (default: on); measurement switch
   --water-reflection-preset <name>      water reflection cost: baseline (full size, every frame, shadowed)
                                         or water (quarter size, every other frame, shadowless) (default: baseline);
+                                        ignored with --water-reflection ssr
   --probe-retire-visibility <dir>       record whether a draining retiring cell ever shows, write retire-visibility.json and PNGs here, then exit
 
 Diagnostics:
   --bug-report-dir <dir>                local bug-report directory (default: per-user application data)
   --diagnostic-asset-fallbacks          log every fallback asset substitution
+  --water-reflection <planar|ssr|on|off>  measurement switch and Water Plus: ssr (default) marches the screen in the
+                                        water shader, never renders the reflection view and copies the opaque colour
+                                        once per view that draws water; planar (the same as on) renders the mirrored
+                                        reflection view; off never renders the reflection view, and the water gets
+                                        darker (a black reflection is blended in), not unreflective
+  --water-ssr-steps <n>[,<m>]           ssr only: n linear (1-128) and m bisection (0-32) march steps per water
+                                        pixel (default: 16,6); ignored with planar
+  --cluster-far-terrain-shadows         optional canonical distant sun shadows (requires --cluster-terrain)
+  --shadows <on|off>                    measurement switch: off turns off the sun's shadow maps (default: on)
   --material-fixture                    run the material fixture (no world database)
   --terrain-water-fixture               run the terrain-water fixture (no world database)
   --transform-bounds-fixture            run the transform-bounds fixture (no world database)
@@ -746,7 +880,39 @@ Remote:
   --remote                              serve the Bevy Remote Protocol on 127.0.0.1 (needs the remote feature)
   --remote-port <port>                  port for --remote (default: 15702); implies --remote
 
+Portal (this branch's doors, demos and tools):
+  --load-doors <load-screen|seamless>   how load doors cross: the vanilla load screen (default) or the seamless portal
+  --walk                                walk as a first-person player; E opens load doors
   --show-window                         keep an automated run's window on screen
+  --portal-depth-composite              composite the portal by depth (the default)
+  --portal-depth-composite=on           the same as --portal-depth-composite
+  --portal-depth-composite=off          draw the portal without depth compositing
+  --demo <alftand|blackreach|riverwood> start at a named demo position
+  --start-position <x> <y> <z>          start at a Creation-unit position
+  --start-yaw <radians>                 start heading, with --start-position
+  --demo-tour <dir>                     walk the scripted door tour, writing frames and a log here
+  --tour-doors <count>                  walk only the first doors of the tour
+  --tour-repeat <count>                 walk the tour's doors this many times
+  --tour-dwell <seconds>                wait only this long after a crossing
+  --tour-clip                           keep a clip's worth of frames around each crossing
+  --tour-bench <file>                   time the tour and write the report here
+  --portal-bench <file>                 time the portal at the doors in this file
+  --bench-out <file>                    where --portal-bench writes its report
+  --bench-seconds <seconds>             timing window per door for --portal-bench
+  --captures-dir <dir>                  where pose and field-note captures go
+  --field-notes-test                    field notes test mode
+  --portal-light-spill                  spill light through the doorway the portal draws
+  --dark-sun-shadows                    sun shadows in the dark spaces too
+  --tonemapper <name>                   tonemapper to start with
+  --graphics <preset>                   graphics preset
+  --graphics-file <file>                graphics settings file
+  --graphics-cycle <seconds>            step the anti-aliasing through every setting
+  --render-parallel-finish              finish the render command encoders in parallel on the compute pool
+                                        (the vendored bevy_render patch; same image and submission order) (default: on)
+  --no-render-parallel-finish           finish them one by one on the render thread, as stock Bevy does
+  --render-backends <all|vulkan>        graphics backends the renderer may use: all (Bevy's default) or vulkan
+                                        only, which also drops the indirect-draw validation pass; with no Vulkan
+                                        adapter the run logs an error and falls back to all (default: all)
 
 Help:
   -h, --help                            print this message and exit
@@ -784,7 +950,7 @@ pub enum ConfigError {
         /// What the option needs, phrased for the message.
         expected: &'static str,
     },
-    /// A value a reflection flag refused, already phrased as a message.
+    /// A value one of the portal's or the reflection's flags refused, already phrased as a message.
     Message(String),
     /// An option that only works together with another option that was not given.
     MissingRequirement {
@@ -882,47 +1048,6 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl EngineConfig {
-    /// Whether the window opens off-screen: in the runs nobody watches - a scripted tour and a shots
-    /// run - so they do not cover the user's screen or take focus while they work (the user asked
-    /// for it, 2026-09-24). The window is still a real, rendered window of its full size, so frames
-    /// and screenshots are as before; `--show-window` keeps it on screen.
-    pub fn window_offscreen(&self) -> bool {
-        // A timing run is not parked: it opens on screen, in the middle (`app::run`).
-        !self.show_window && !self.is_benchmark_run() && self.shots.is_some()
-    }
-
-    /// Describes the automated run and its owner in the window title.
-    pub fn window_title(&self) -> String {
-        let kind = if self.is_benchmark_run() {
-            Some("benchmark")
-        } else if self.matched_route.is_some() {
-            Some("matched-route")
-        } else if self.shots.is_some() {
-            Some("shots")
-        } else if self.route.is_some() {
-            Some("route")
-        } else if self.streaming_fixture {
-            Some("streaming fixture")
-        } else {
-            None
-        };
-        let class = if self.is_benchmark_run() {
-            "TIMING"
-        } else {
-            "TEST"
-        };
-        let mut title = match (kind, self.run_label.as_deref()) {
-            (Some(kind), Some(label)) => format!("Mudcrab [{class}] {kind}: {label}"),
-            (Some(kind), None) => format!("Mudcrab [{class}] {kind}"),
-            (None, Some(label)) => format!("Mudcrab - {label}"),
-            (None, None) => "Mudcrab".to_string(),
-        };
-        if let (Some(_), Some(owner)) = (kind, self.run_owner.as_deref()) {
-            title.push_str(&format!(" | {owner}"));
-        }
-        title
-    }
-
     pub fn streaming_controls_enabled(&self) -> bool {
         self.adaptive_streaming || self.max_streaming_backlog != 0 || self.streaming_memory_mib != 0
     }
@@ -1029,6 +1154,14 @@ impl EngineConfig {
             && !self.physics_fixture
     }
 
+    /// The unscripted load-screen capsule controller, in WALK or NOCLIP.
+    pub(crate) fn has_capsule_player(&self) -> bool {
+        !self.seamless_doors()
+            && self.interactive_world_physics()
+            && self.portal.demo_tour.is_none()
+            && self.portal.start_shot.is_none()
+    }
+
     pub fn from_env() -> Result<ConfigAction, ConfigError> {
         Self::from_args(std::env::args().skip(1))
     }
@@ -1059,10 +1192,13 @@ impl EngineConfig {
     }
 
     /// Whether the unpaced first load is also hidden behind the black cover: only with
-    /// `--startup-cover`, and never in a capture run (`--shots`), whose own settle
+    /// `--startup-cover`, and never in a capture run (`--shots`, `--demo-tour`), whose own settle
     /// gate already holds it past the load and whose photographs a cover still up would black out.
     pub fn covers_startup_load(&self) -> bool {
-        self.unpaced_startup() && self.startup_cover && self.shots.is_none()
+        self.unpaced_startup()
+            && self.startup_cover
+            && self.portal.shots.is_none()
+            && self.portal.demo_tour.is_none()
     }
 
     /// Whether the run moves the camera on its own: `--auto-fly-speed` or `--route`.
@@ -1117,6 +1253,10 @@ impl EngineConfig {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(error) => return Err(ConfigError::Message(error)),
+            }
+            // The portal's own flags, parsed by one block at the end of this file.
+            if PortalOptions::parse_flag(&mut config, &argument, &mut args) {
+                continue;
             }
             match argument.as_str() {
                 // The pre-scan above answers both spellings; these arms keep the
@@ -1196,9 +1336,10 @@ impl EngineConfig {
                         config.terrain_radius_given = true;
                     }
                 }
-                "--cluster-own-statics" => config.cluster_own_statics = true,
                 "--cluster-terrain" => config.cluster_terrain = true,
+                "--cluster-own-statics" => config.cluster_own_statics = true,
                 "--cluster-preload-batches" => config.cluster_preload_batches = true,
+                "--cluster-far-terrain-shadows" => config.cluster_far_terrain_shadows = true,
                 "--clusters" => {
                     // The selector is optional: bare `--clusters` means the only overlay.
                     let named = args.peek().is_some_and(|next| !next.starts_with("--"));
@@ -1658,34 +1799,6 @@ impl EngineConfig {
                         )
                     })?);
                 }
-                "--show-window" => config.show_window = true,
-                "--cluster-error-pixels" | "--cluster-terrain-error-pixels" => {
-                    let value = take_raw(
-                        if argument == "--cluster-error-pixels" {
-                            "--cluster-error-pixels"
-                        } else {
-                            "--cluster-terrain-error-pixels"
-                        },
-                        "a pixel count above 0, at most 16",
-                        args.next(),
-                    )?;
-                    config
-                        .graphics
-                        .set(argument.trim_start_matches("--"), &value)
-                        .map_err(ConfigError::Message)?;
-                }
-                "--lod-objects" | "--lod-trees" => {
-                    let option = if argument == "--lod-objects" {
-                        "--lod-objects"
-                    } else {
-                        "--lod-trees"
-                    };
-                    let value = take_raw(option, "on or off", args.next())?;
-                    config
-                        .graphics
-                        .set(argument.trim_start_matches("--"), &value)
-                        .map_err(ConfigError::Message)?;
-                }
                 "--shots" => {
                     config.shots = Some(take_value("--shots", "a shots file path", args.next())?);
                 }
@@ -1727,11 +1840,20 @@ impl EngineConfig {
                         })?;
                 }
                 "--start-shot" => {
-                    config.start_shot = Some(take_value(
-                        "--start-shot",
-                        "a one-pose shots file",
-                        args.next(),
-                    )?);
+                    let file: PathBuf =
+                        take_value("--start-shot", "a shots file path", args.next())?;
+                    // The shared flag retains main's single-pose form and the demo's named pose.
+                    // Peek before taking a name so a following option remains an option.
+                    if let Some(name) = args.next_if(|value| !value.starts_with('-')) {
+                        config.start_shot = None;
+                        config.portal.start_shot = Some(StartShot {
+                            file: Some(file),
+                            name: Some(name),
+                        });
+                    } else {
+                        config.portal.start_shot = None;
+                        config.start_shot = Some(file);
+                    }
                 }
                 "--stdin-console" => config.stdin_console = true,
                 "--no-render-diagnostics" => config.no_render_diagnostics = true,
@@ -1772,10 +1894,41 @@ impl EngineConfig {
                     }
                 }
                 "--lights" => config.lights = true,
+                "--as-played" => config.as_played = true,
+                "--room-culling" => config.room_culling = true,
                 "--physics-fixture" => config.physics_fixture = true,
                 "--water-reflection" => {
-                    config.water_reflection = take_on_off("--water-reflection", args.next())?;
+                    const EXPECTED: &str = "on, off, planar or ssr";
+                    let raw = take_raw("--water-reflection", EXPECTED, args.next())?;
+                    // Not a `match` on string literals: the help-drift tests read every
+                    // `"..." =>` line of this file as an option arm. `on` is `planar` under its
+                    // older name, so the measurement switch keeps working as it was written.
+                    if raw == "on" || raw == "planar" {
+                        config.water_reflection = true;
+                        config.water_reflection_mode = WaterReflectionMode::Planar;
+                    } else if raw == "off" {
+                        config.water_reflection = false;
+                        config.water_reflection_mode = WaterReflectionMode::Planar;
+                    } else if raw == "ssr" {
+                        config.water_reflection = true;
+                        config.water_reflection_mode = WaterReflectionMode::Ssr;
+                    } else {
+                        return Err(ConfigError::invalid_value(
+                            "--water-reflection",
+                            Some(raw),
+                            EXPECTED,
+                        ));
+                    }
                 }
+                "--water-ssr-steps" => {
+                    const EXPECTED: &str =
+                        "<linear>[,<bisection>], 1 to 128 linear and 0 to 32 bisection steps";
+                    let raw = take_raw("--water-ssr-steps", EXPECTED, args.next())?;
+                    config.water_ssr_steps = WaterSsrSteps::parse(&raw).ok_or_else(|| {
+                        ConfigError::invalid_value("--water-ssr-steps", Some(raw), EXPECTED)
+                    })?;
+                }
+                "--shadows" => config.shadows = take_on_off("--shadows", args.next())?,
                 "--water-reflection-preset" => {
                     const EXPECTED: &str = "baseline or water";
                     let raw = take_raw("--water-reflection-preset", EXPECTED, args.next())?;
@@ -1790,9 +1943,35 @@ impl EngineConfig {
                             )
                         })?;
                 }
+                // A value that is not one stops the run rather than leaving the vanilla crossing
+                // in place of the one asked for.
+                "--load-doors" => {
+                    let raw = take_raw("--load-doors", LoadDoors::EXPECTED, args.next())?;
+                    config.portal.load_doors = LoadDoors::parse(&raw).ok_or_else(|| {
+                        ConfigError::invalid_value("--load-doors", Some(raw), LoadDoors::EXPECTED)
+                    })?;
+                }
+                "--render-parallel-finish" => config.render_parallel_finish = true,
+                "--no-render-parallel-finish" => config.render_parallel_finish = false,
+                "--render-backends" => {
+                    const EXPECTED: &str = "all or vulkan";
+                    let raw = take_raw("--render-backends", EXPECTED, args.next())?;
+                    config.render_backends = RenderBackends::ALL
+                        .into_iter()
+                        .find(|backends| backends.name() == raw)
+                        .ok_or_else(|| {
+                            ConfigError::invalid_value("--render-backends", Some(raw), EXPECTED)
+                        })?;
+                }
                 unknown => return Err(ConfigError::unrecognized(unknown)),
             }
         }
+        // Benchmark and acceptance runs measure the full-detail grid the Phase 2 gates were set
+        // for, so the terrain ring is off there unless a run asks for it by name.
+        // `--shots` and `--shots-out` are main's options (parsed above, with main's checks); the
+        // portal's shots run reads them from its own options.
+        config.portal.shots = config.shots.clone();
+        config.portal.shots_out = config.shots_out.clone();
         if !config.terrain_radius_given
             && (config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some())
         {
@@ -1855,15 +2034,6 @@ impl EngineConfig {
                 "the cluster prepass enabled",
             ));
         }
-
-        if config.cluster_terrain && config.clusters.is_none() {
-            return Err(ConfigError::invalid_value(
-                "--cluster-terrain",
-                None,
-                "--clusters naming an overlay with terrain",
-            ));
-        }
-
         if config.cluster_own_statics && config.clusters.is_none() {
             return Err(ConfigError::invalid_value(
                 "--cluster-own-statics",
@@ -1878,6 +2048,21 @@ impl EngineConfig {
                 "--clusters",
             ));
         }
+        if config.cluster_terrain && config.clusters.is_none() {
+            return Err(ConfigError::invalid_value(
+                "--cluster-terrain",
+                None,
+                "--clusters naming an overlay with terrain",
+            ));
+        }
+        if config.cluster_far_terrain_shadows && !config.cluster_terrain {
+            return Err(ConfigError::invalid_value(
+                "--cluster-far-terrain-shadows",
+                None,
+                "--cluster-terrain",
+            ));
+        }
+        config.check_seamless_only_flags()?;
         Ok(ConfigAction::Run(Box::new(config)))
     }
 
@@ -1955,6 +2140,500 @@ const STREAM_RADIUS_EXPECTED: &str = "a cell count from 0 to 1073741822";
 /// What `--sun-position` takes: azimuth clockwise from north, then elevation above the horizon.
 const SUN_POSITION_EXPECTED: &str =
     "two finite angles in degrees: azimuth,elevation (elevation 0 to 90)";
+
+/// Test shorthand for a command line that must ask for a run.
+#[cfg(test)]
+impl EngineConfig {
+    pub(crate) fn run_from_args(args: impl IntoIterator<Item = String>) -> Self {
+        match Self::from_args(args) {
+            Ok(ConfigAction::Run(config)) => *config,
+            other => panic!("expected a run configuration, got {other:?}"),
+        }
+    }
+}
+
+/// How a load door takes the player to the space behind it (the "Load doors" option, group
+/// "Doors"; restart to change).
+///
+/// The vanilla value is [`LoadDoors::LoadScreen`]: Skyrim fades to a load screen and puts the
+/// player on the door's `XTEL` arrival point, which is `crate::door_crossing` (PR #128) with main's
+/// walking player. [`LoadDoors::Seamless`] is Mudcrab's own: the room behind an open door drawn
+/// live through the doorway and the walk carried across it (`crate::transition`, `crate::portal`,
+/// `crate::door_layer`). A run gets the systems of one of the two, never both: two `E` handlers
+/// would cross twice, and the off path must cost nothing.
+///
+/// Shaped like an entry of upstream's settings inventory (PR 229 `SettingSpec`, a `Choice`):
+/// label "Load doors", group "Doors", vanilla default "load screen", differs from vanilla when
+/// seamless, applies on restart (it decides which plugins a run is built with).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LoadDoors {
+    /// Vanilla: fade out, teleport to the arrival point, fade in once the landing cell is ready.
+    #[default]
+    LoadScreen,
+    /// The seamless portal: the destination drawn through the open doorway, crossed on foot.
+    Seamless,
+}
+
+impl LoadDoors {
+    /// The values `--load-doors` takes, in the order the help lists them.
+    pub const EXPECTED: &'static str = "load-screen (vanilla) or seamless";
+
+    /// The flag value for this setting.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::LoadScreen => "load-screen",
+            Self::Seamless => "seamless",
+        }
+    }
+
+    /// Reads a `--load-doors` value, any case.
+    pub fn parse(value: &str) -> Option<Self> {
+        [Self::LoadScreen, Self::Seamless]
+            .into_iter()
+            .find(|doors| doors.name().eq_ignore_ascii_case(value.trim()))
+    }
+}
+
+/// The portal's own options, and everything that reads them: the walk, the demo starts, the
+/// scripted tour, the shots run, the start shot, and the run modes the wiring asks about.
+///
+/// One struct and one parser, so that a merge from `main` finds the whole of the portal's
+/// configuration in one contiguous region - plus [`EngineConfig::portal`], its default, and the two
+/// lines in [`EngineConfig::from_args`] that call [`PortalOptions::parse_flag`]
+/// (docs/design/portal-plugin.md).
+#[derive(Debug, Clone)]
+pub struct PortalOptions {
+    /// Interactive first-person player (mouse look, walking, E opens load doors) instead of the
+    /// free-flight camera. Never used by acceptance or benchmark runs.
+    pub walk: bool,
+    /// Scripted walk through the Alftand -> Blackreach doors, writing screenshots and a log here.
+    pub demo_tour: Option<PathBuf>,
+    /// `--tour-doors N`: walk only the first `N` doors of the `--demo-tour` route and stop. A
+    /// smoke tour for iterating on the engine - it never prints the full tour's verdict word, so
+    /// it cannot be mistaken for a sign-off - and inert unless `--demo-tour` names an output
+    /// folder for it.
+    pub tour_doors: Option<usize>,
+    /// `--tour-repeat N`: walk the doors `--tour-doors` names - or, without that flag, the whole
+    /// route - `N` times over instead of once.
+    ///
+    /// The sequence is the one the tour already walks, repeated: a route whose first doors are a
+    /// house entered and left again ([`crate::demo_tour`]'s Riverwood route) is walked in and out
+    /// `N` times, which is what a check that a run of crossings leaves the engine as it found it
+    /// needs. Inert unless `--demo-tour` names an output folder for it, and never more than
+    /// [`EngineConfig::portal`]'s own door count per repeat.
+    pub tour_repeat: Option<usize>,
+    /// `--tour-dwell <seconds>`: after a crossing, wait only this long before walking to the next
+    /// door, instead of the four-way [`Phase::Survey`](crate::demo_tour) of the place. Reproduces a
+    /// user's quick round trip through a door and back (`tasks/deepseek/impl-185-...md`): the
+    /// ordinary tour's settle-then-survey pause between crossings is several seconds, long enough
+    /// to hide a defect that only shows up when the player does not linger. Inert unless
+    /// `--demo-tour` names an output folder for it.
+    pub tour_dwell: Option<f32>,
+    /// `--tour-clip`: the walk-through keeps a clip's worth of frames around each crossing instead
+    /// of the twenty a check needs - the whole walk in from the standoff and a second and a half
+    /// after the swap - for making a video of the crossing. Inert unless `--demo-tour` is given.
+    pub tour_clip: bool,
+    /// `--tour-bench <file.csv>`: at each outside door of the `--demo-tour` route, before the walk
+    /// presses `E`, hold the view still and time the frames with the door closed, open in view and
+    /// open behind the camera, then write one CSV row per door and state here
+    /// (`crate::demo_tour`'s doorway bench). Not a timing run unless the engine runs alone. Inert
+    /// unless `--demo-tour` names an output folder for it.
+    pub tour_bench: Option<PathBuf>,
+    /// `--portal-bench <doors.json>`: time the portal at each door of this file - closed, open in
+    /// view, open behind and open behind a wall - in GPU, CPU and frame time, write the CSV and
+    /// exit (`crate::portal_bench`). A run of its own: it teleports, it does not walk a demo route.
+    pub portal_bench: Option<PathBuf>,
+    /// `--bench-out <file.csv>`: where a `--portal-bench` run writes its CSV (and
+    /// `<file.csv>.summary.txt`); [`DEFAULT_PORTAL_BENCH_OUT`] without it.
+    pub bench_out: Option<PathBuf>,
+    /// `--bench-seconds <s>`: how long a `--portal-bench` run times each state
+    /// (`crate::portal_bench::DEFAULT_TIMING_SECONDS` without it).
+    pub bench_seconds: Option<f32>,
+    /// The --demo start that was chosen, if any (drives the on-screen objective).
+    pub demo: Option<String>,
+    /// Render each camera pose in this file to a PNG, then exit (see
+    /// docs/design/reference-shots.md).
+    pub shots: Option<PathBuf>,
+    /// Where a shots run writes its images and `shots.log`. Defaults to a folder named after the
+    /// shots file, next to it.
+    pub shots_out: Option<PathBuf>,
+    /// `--start-shot <shots.json> <name>`: start the run at a shot's pose, in its space
+    /// (`crate::pose_capture`).
+    pub start_shot: Option<StartShot>,
+    /// `--show-window`: keep the window on screen in an automated run (`--demo-tour`, `--shots`),
+    /// which otherwise opens it off-screen ([`EngineConfig::window_offscreen`]).
+    pub show_window: bool,
+    /// `--captures-dir <dir>`: where `F12` writes a run's field notes (`crate::field_notes`),
+    /// instead of the default [`DEFAULT_CAPTURES_DIR`].
+    pub captures_dir: PathBuf,
+    /// `--field-notes-test`: a hidden acceptance flag for `crate::field_notes` - after the first
+    /// door crossing and a few seconds more, takes a capture with the note "test" and exits, so a
+    /// script can check a real capture without a person at the keyboard.
+    pub field_notes_test: bool,
+    /// `--load-doors <load-screen|seamless>`: how load doors cross ([`LoadDoors`]). The vanilla
+    /// load screen by default; the depth composite, light spill, portal scale, portal cadence and
+    /// eye focus are sub-options of [`LoadDoors::Seamless`] and build nothing without it.
+    pub load_doors: LoadDoors,
+    /// The doorway depth composite (impl-211's spike, the default since impl-227): the doorway quad
+    /// writes the destination's own depth, read from the portal camera's depth buffer, instead of
+    /// its own plane's, so the source geometry just behind the doorway plane (a jamb, a lintel)
+    /// occludes the destination by depth rather than being painted over by the quad's rectangle
+    /// (`crate::portal`'s depth composite). On by default; `--portal-depth-composite=off` turns it
+    /// off, for comparison with the plain quad, and `--portal-depth-composite[=on]` back on.
+    pub depth_composite: bool,
+    /// `--portal-light-spill`: light spills through an open doorway both ways
+    /// (`crate::portal_spill`). Off by default until it holds on held-out doorways.
+    pub light_spill: bool,
+    /// `--dark-sun-shadows`: keep a sun's shadow maps on while it gives no light (an interior's
+    /// sun, or a doorway into one), as before research-228. Only for timing the saving
+    /// (`atmosphere::sun_casts_shadows`); off by default.
+    pub dark_sun_shadows: bool,
+    /// `--tonemapper <name>`: the main camera's tonemapper, any case (`crate::tonemapper`). Kept
+    /// as written; a name that is not one is refused before the window exists. `None` is Bevy's
+    /// default, TonyMcMapface.
+    pub tonemapper: Option<String>,
+    /// `--graphics <preset>`: `vanilla-high` (the default), `vanilla-low`,
+    /// `vanilla-medium`, `vanilla-ultra`, `showcase` (also `current`: the demo's older look), `bevy`
+    /// or `custom`
+    /// (`crate::graphics_settings`). Kept as written; checked before the window exists.
+    pub graphics: Option<String>,
+    /// `--graphics-file <path.toml|path.json>`: a settings file, read instead of the default
+    /// `local/graphics.toml`.
+    pub graphics_file: Option<PathBuf>,
+    /// The per-knob graphics flags in command-line order, as `(name without --, value)`, e.g.
+    /// `("aa", "smaa")` (`crate::graphics_settings::KNOBS`). A flag at the end of the line with no
+    /// value keeps an empty one, which is refused with the valid values.
+    pub graphics_knobs: Vec<(String, String)>,
+    /// `--graphics-cycle <seconds>`: a debug tool that steps the anti-aliasing through every
+    /// transition between its four modes, one step every this many seconds, without a keyboard
+    /// (`crate::graphics_settings::GraphicsCycle`). A value that is not a positive number is
+    /// ignored.
+    pub graphics_cycle: Option<f32>,
+}
+
+/// Where a capture's run folder is made when `--captures-dir` is not given
+/// (`local/captures/<run start>/`, `crate::field_notes`).
+pub const DEFAULT_CAPTURES_DIR: &str = "local/captures";
+
+/// Where a `--portal-bench` run writes its CSV when `--bench-out` is not given.
+pub const DEFAULT_PORTAL_BENCH_OUT: &str = "local/bench/portal-bench.csv";
+
+impl Default for PortalOptions {
+    fn default() -> Self {
+        Self {
+            walk: false,
+            demo_tour: None,
+            tour_doors: None,
+            tour_repeat: None,
+            tour_dwell: None,
+            tour_clip: false,
+            tour_bench: None,
+            portal_bench: None,
+            bench_out: None,
+            bench_seconds: None,
+            demo: None,
+            shots: None,
+            shots_out: None,
+            start_shot: None,
+            show_window: false,
+            captures_dir: PathBuf::from(DEFAULT_CAPTURES_DIR),
+            field_notes_test: false,
+            load_doors: LoadDoors::LoadScreen,
+            depth_composite: true,
+            light_spill: false,
+            dark_sun_shadows: false,
+            tonemapper: None,
+            graphics: None,
+            graphics_file: None,
+            graphics_knobs: Vec::new(),
+            graphics_cycle: None,
+        }
+    }
+}
+
+/// A `--start-shot` request as the command line wrote it: a shots file, and the name of the shot in
+/// it to start the run at.
+///
+/// The shared command-line parser creates this request only when a name follows the file.
+/// A file alone uses main's single-exterior-pose mode; a missing file is a parser error. Optional
+/// fields still allow manually supplied requests to be validated before the window exists, in
+/// [`pose_capture::start_shot_run`](crate::pose_capture::start_shot_run), which is also where the
+/// shot is read and where the flags that pose the camera beside this one are refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartShot {
+    /// The shots file the shot is in.
+    pub file: Option<PathBuf>,
+    /// The shot's name, as the file writes it.
+    pub name: Option<String>,
+}
+
+impl PortalOptions {
+    /// Parses one portal flag, taking the arguments it needs from `args`, and says whether
+    /// `argument` was one of them.
+    ///
+    /// It takes the whole configuration because two of these flags are not the portal's alone:
+    /// `--demo` and `--start-position` write the worldspace, the start grid and the start pose a
+    /// run streams and starts in, which the streaming plan reads directly (and which a nested
+    /// struct must not swallow).
+    pub fn parse_flag(
+        config: &mut EngineConfig,
+        argument: &str,
+        args: &mut impl Iterator<Item = String>,
+    ) -> bool {
+        match argument {
+            "--walk" => config.portal.walk = true,
+            "--show-window" => config.portal.show_window = true,
+            "--portal-depth-composite" => config.portal.depth_composite = true,
+            "--portal-depth-composite=on" => config.portal.depth_composite = true,
+            "--portal-depth-composite=off" => config.portal.depth_composite = false,
+            "--demo-tour" => config.portal.demo_tour = args.next().map(PathBuf::from),
+            "--tour-doors" => {
+                config.portal.tour_doors = args.next().and_then(|value| value.parse().ok());
+            }
+            "--tour-repeat" => {
+                config.portal.tour_repeat = args.next().and_then(|value| value.parse().ok());
+            }
+            "--tour-dwell" => {
+                config.portal.tour_dwell = args.next().and_then(|value| value.parse().ok());
+            }
+            "--tour-clip" => config.portal.tour_clip = true,
+            "--tour-bench" => config.portal.tour_bench = args.next().map(PathBuf::from),
+            "--portal-bench" => config.portal.portal_bench = args.next().map(PathBuf::from),
+            "--bench-out" => config.portal.bench_out = args.next().map(PathBuf::from),
+            "--bench-seconds" => {
+                config.portal.bench_seconds = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|seconds: &f32| *seconds > 0.0);
+            }
+            "--demo" => {
+                if let Some(name) = args.next()
+                    && let Some(demo) = DemoStart::named(&name)
+                {
+                    demo.apply(config);
+                    config.portal.demo = Some(name);
+                }
+            }
+            "--captures-dir" => {
+                if let Some(value) = args.next() {
+                    config.portal.captures_dir = PathBuf::from(value);
+                }
+            }
+            "--field-notes-test" => config.portal.field_notes_test = true,
+            "--portal-light-spill" => config.portal.light_spill = true,
+            "--dark-sun-shadows" => config.portal.dark_sun_shadows = true,
+            "--tonemapper" => config.portal.tonemapper = args.next(),
+            "--graphics" => config.portal.graphics = args.next(),
+            "--graphics-file" => config.portal.graphics_file = args.next().map(PathBuf::from),
+            "--graphics-cycle" => {
+                config.portal.graphics_cycle = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|seconds: &f32| seconds.is_finite() && *seconds > 0.0);
+            }
+            knob if knob
+                .strip_prefix("--")
+                .is_some_and(crate::graphics_settings::is_knob) =>
+            {
+                let name = knob.trim_start_matches("--").to_owned();
+                let value = args.next().unwrap_or_default();
+                config.portal.graphics_knobs.push((name, value));
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Where a `--shots` run writes its images and `shots.log`: the folder `--shots-out` names, or
+    /// the file's stem followed by `-shots`, next to it. `None` when there is no shots run.
+    pub fn shots_output_dir(&self) -> Option<PathBuf> {
+        let path = self.shots.as_ref()?;
+        Some(
+            self.shots_out
+                .clone()
+                .unwrap_or_else(|| crate::shots::default_output_dir(path)),
+        )
+    }
+}
+
+impl EngineConfig {
+    /// Whether the window opens off-screen: in the runs nobody watches - a scripted tour and a shots
+    /// run - so they do not cover the user's screen or take focus while they work (the user asked
+    /// for it, 2026-09-24). The window is still a real, rendered window of its full size, so frames
+    /// and screenshots are as before; `--show-window` keeps it on screen.
+    pub fn window_offscreen(&self) -> bool {
+        // A timing run is not parked: it opens on screen, in the middle (`app::run`).
+        !self.portal.show_window
+            && !self.times_frames()
+            && (self.portal.demo_tour.is_some() || self.portal.shots.is_some())
+    }
+
+    /// The window's title: the run's class, what kind of automated run it is, its `--run-label`
+    /// and its `--run-owner`, so a run on the taskbar says what it is and whose it is (the user
+    /// asked, 2026-09-26 and 2026-10-14). An interactive run is plain "Mudcrab".
+    ///
+    /// The class comes from the run's own flags, never from the caller: `[TIMING]` for a run whose
+    /// numbers are read ([`EngineConfig::times_frames`]; one at a time on the machine, under a
+    /// build-gate timing hold), `[TEST]` for any other automated run (bug repro, visual check,
+    /// shots; several at once, `docs/process/run-classes.md`).
+    pub fn window_title(&self) -> String {
+        let kind = if self.portal.portal_bench.is_some() {
+            Some("portal bench")
+        } else if self.portal.tour_bench.is_some() {
+            Some("tour bench")
+        } else if self.benchmark_frames.is_some() || self.benchmark_duration_secs.is_some() {
+            Some("benchmark")
+        } else if self.portal.demo_tour.is_some() {
+            Some("demo tour")
+        } else if self.matched_route.is_some() {
+            Some("matched-route")
+        } else if self.portal.shots.is_some() || self.shots.is_some() {
+            Some("shots")
+        } else if self.route.is_some() {
+            Some("route")
+        } else if self.portal.start_shot.is_some() {
+            Some("start shot")
+        } else if self.streaming_fixture {
+            Some("streaming fixture")
+        } else {
+            None
+        };
+        let class = if self.times_frames() {
+            "TIMING"
+        } else {
+            "TEST"
+        };
+        let mut title = match (kind, self.run_label.as_deref()) {
+            (Some(kind), Some(label)) => format!("Mudcrab [{class}] {kind}: {label}"),
+            (Some(kind), None) => format!("Mudcrab [{class}] {kind}"),
+            (None, Some(label)) => format!("Mudcrab - {label}"),
+            (None, None) => "Mudcrab".to_string(),
+        };
+        if let (Some(_), Some(owner)) = (kind, self.run_owner.as_deref()) {
+            title.push_str(&format!(" | {owner}"));
+        }
+        title
+    }
+
+    /// Whether load doors cross seamlessly ([`LoadDoors::Seamless`]): the run is built with the
+    /// portal, the door layer, the doorway image and the carried crossing instead of the vanilla
+    /// load screen.
+    pub fn seamless_doors(&self) -> bool {
+        self.portal.load_doors == LoadDoors::Seamless
+    }
+
+    /// Refuses a flag that only means something with seamless doors on a load-screen run, rather
+    /// than running without what it asked for: the portal bench and the tour bench time the
+    /// doorway image, and the light spill is light through it.
+    fn check_seamless_only_flags(&self) -> Result<(), ConfigError> {
+        if self.seamless_doors() {
+            return Ok(());
+        }
+        let asked = [
+            ("--portal-bench", self.portal.portal_bench.is_some()),
+            ("--tour-bench", self.portal.tour_bench.is_some()),
+            ("--portal-light-spill", self.portal.light_spill),
+        ];
+        match asked.into_iter().find(|(_, given)| *given) {
+            Some((flag, _)) => Err(ConfigError::Message(format!(
+                "{flag} needs --load-doors seamless (load doors default to the vanilla load screen)"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// A run that walks: `--walk` with the camera left to the player's own controller. A
+    /// benchmark, an auto-flight run, a `--route` run, a `--shots` run and a `--start-shot` run keep the scripted
+    /// camera whatever `--walk` was given, which is the rule `app::run` has always applied.
+    pub fn walks(&self) -> bool {
+        // A `--start-shot` run is driven by the player's own controller too - it starts in free
+        // flight at the shot's pose (`crate::pose_capture`) - because the scripted fly camera has
+        // no mouse look, and the person lining up a shot has to turn as well as move.
+        (self.portal.walk || self.portal.start_shot.is_some())
+            && self.benchmark_frames.is_none()
+            && self.benchmark_duration_secs.is_none()
+            && self.auto_fly_speed <= 0.0
+            && self.route.is_none()
+            && self.portal.shots.is_none()
+            && self.portal.portal_bench.is_none()
+    }
+
+    /// A run that is looked at rather than measured: sky and underground lighting, portals and
+    /// lights, and no acceptance capture. A measured run with `--as-played` is presented this way
+    /// too, so it measures what a player sees.
+    ///
+    /// A `--start-shot` run is one of these: it flies a camera of its own to a pose, which is what
+    /// a measured run does not do.
+    ///
+    /// Both this and [`walks`](Self::walks) are pure functions of the configuration
+    /// (`docs/design/portal-plugin.md`, H7), so the wiring that asks them - `app::run`'s lighting
+    /// gate, `crate::portal::PortalPlugin`, `crate::demo_tour::DemoTourPlugin` - agrees whatever it
+    /// is asked from.
+    pub fn interactive(&self) -> bool {
+        self.walks()
+            || self.as_played
+            || self.portal.demo_tour.is_some()
+            || self.portal.shots.is_some()
+            || self.portal.start_shot.is_some()
+            || self.portal.portal_bench.is_some()
+    }
+
+    /// A run that times frames against the renderer rather than the display: a benchmark, a
+    /// `--tour-bench` or a `--portal-bench`. It presents unsynced and runs its event loop
+    /// continuously, so neither V-Sync nor an unfocused window's throttle sets its frame time.
+    pub fn times_frames(&self) -> bool {
+        self.benchmark_frames.is_some()
+            || self.benchmark_duration_secs.is_some()
+            || self.portal.tour_bench.is_some()
+            || self.portal.portal_bench.is_some()
+    }
+}
+
+/// Named starting points for interactive demos (--demo <name>). Positions are Creation-engine
+/// units taken from Skyrim.esm (see docs/research/worldspace-transition-demo.md, section 2.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DemoStart {
+    pub worldspace_id: u32,
+    pub position: [f32; 3],
+    pub yaw: f32,
+}
+
+impl DemoStart {
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            // Outside the Alftand entrance in the Pale, exactly where the game puts a player who walks
+            // out of Alftand01: door 000152CF's XTEL arrival point and facing (out over the tundra;
+            // the entrance, auto-load door 00015D48, is behind).
+            "alftand" => Some(Self {
+                worldspace_id: 0x3c,
+                position: [77583.23, 77411.89, -5817.21],
+                yaw: -0.603_385_3,
+            }),
+            // Straight into Blackreach: the arrival point of Alftand's lower door (0006998D).
+            "blackreach" => Some(Self {
+                worldspace_id: 0x0001_EE62,
+                position: [21088.559, 18512.045, 2434.0],
+                yaw: -1.870_80,
+            }),
+            // On the Helgen road south-west of Riverwood, looking up the street at Sven's house
+            // and the village (docs/design/riverwood-demo.md, section 3). The position is the
+            // Creation foot point on the road chunk 0002C699; the engine adds the eye height.
+            "riverwood" => Some(Self {
+                worldspace_id: 0x3c,
+                position: [19600.0, -46650.0, -153.0],
+                yaw: 1.336_0,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn apply(self, config: &mut EngineConfig) {
+        config.worldspace_id = self.worldspace_id;
+        config.start_position = Some(self.position);
+        config.start_yaw = self.yaw;
+        config.start_grid = grid_of(self.position[0], self.position[1]);
+    }
+}
 
 /// The water reflection camera's cost options: each drops one piece of the reflection's per-view
 /// work, so the portal bench can measure them one at a time (`crate::render`'s
@@ -2140,10 +2819,7 @@ fn reflection_value(
 
 /// The exterior cell grid containing a Creation-engine position (cells are 4096 units).
 pub fn grid_of(x: f32, y: f32) -> (i32, i32) {
-    (
-        (x / CELL_SIZE).floor() as i32,
-        (y / CELL_SIZE).floor() as i32,
-    )
+    ((x / 4096.0).floor() as i32, (y / 4096.0).floor() as i32)
 }
 
 fn parse_offset(value: &str) -> Option<(f32, f32, f32)> {
@@ -2229,17 +2905,6 @@ fn take_on_off(option: &'static str, value: Option<String>) -> Result<bool, Conf
         Ok(false)
     } else {
         Err(ConfigError::invalid_value(option, Some(raw), EXPECTED))
-    }
-}
-
-/// Test shorthand for a command line that must ask for a run.
-#[cfg(test)]
-impl EngineConfig {
-    pub(crate) fn run_from_args(args: impl IntoIterator<Item = String>) -> Self {
-        match Self::from_args(args) {
-            Ok(ConfigAction::Run(config)) => *config,
-            other => panic!("expected a run configuration, got {other:?}"),
-        }
     }
 }
 
@@ -2406,20 +3071,6 @@ mod tests {
     /// audit tools and launch wrappers. Wrappers also contain engine invocations,
     /// so every other scanned `--flag` must be accepted by the engine parser.
     const NON_ENGINE_FLAGS: &[&str] = &[
-        "--bench-baked",                // cluster_bench.py
-        "--cluster-triangle-threshold", // cluster_bench.py
-        "--converted",                  // cluster_bench.py
-        "--keep-work",                  // cluster_bench.py
-        "--lod-mode",                   // cluster_bench.py
-        "--package-seconds",            // cluster_bench.py
-        "--plugin",                     // cluster_bench.py
-        "--previous",                   // cluster_bench.py
-        "--simulate-plugin-change",     // cluster_bench.py
-        "--terrain-lod-seconds",        // cluster_bench.py
-        "--threshold",                  // cluster_bench.py
-        "--work",                       // cluster_bench.py
-        "--work-root",                  // cluster_bench.py
-        "--overlay",                    // cluster_repro_check.py, extension_hash.py
         "--all",                        // cargo fmt
         "--all-targets",                // cargo test, cargo clippy
         "--bin",                        // cargo test
@@ -2430,133 +3081,104 @@ mod tests {
         "--ignore-submodules",          // git diff
         "--quiet",                      // git diff
         "--short",                      // git rev-parse
-        "--output", // world-inspect, profiling, startup runner, repeat-terrain-startup.py
-        "--pairs-output", // correlate_drawables.py
-        "--radius", // world-inspect
-        "--library-path", // ld-linux
-        "--meshes", // audit-collision.py
-        "--min-x",  // audit-collision.py
-        "--max-x",  // audit-collision.py
-        "--min-y",  // audit-collision.py
-        "--max-y",  // audit-collision.py
-        "--out",    // audit-collision.py
-        "--expect-solid", // audit-collision.py
-        "--expect-passable", // audit-collision.py
-        "--original", // audit_asset_sizes.py
-        "--json",   // audit_asset_sizes.py
-        "--candidate-inventory", // audit-riverwood-reuse.py
-        "--reference-inventory", // audit-riverwood-reuse.py
-        "--manifest", // audit-riverwood-reuse.py
-        "--include", // audit-z-fighting.py
-        "--materials-only", // audit-z-fighting.py
-        "--no-placements", // audit-z-fighting.py
-        "--plane-tolerance", // audit-z-fighting.py
-        "--min-overlap-area", // audit-z-fighting.py
-        "--max-triangles", // audit-z-fighting.py
-        "--max-comparisons", // audit-z-fighting.py
-        "--max-examples", // audit-z-fighting.py
-        "--progress", // audit-z-fighting.py
-        "--jobs",   // audit-z-fighting.py
-        "--locked", // cargo run
-        "--manifest-path", // cargo run
-        "--cpu-jobs", // converter
-        "--io-jobs", // converter
-        "--binary", // git diff
-        "--porcelain", // git status
-        "--engine", // repeat-terrain-startup.py
-        "--repeats", // repeat-terrain-startup.py
-        "--upload-budgets", // repeat-terrain-startup.py
-        "--warmup", // repeat-terrain-startup.py
-        "--duration", // repeat-terrain-startup.py
-        "--timeout", // repeat-terrain-startup.py
-        "--launch-prefix", // repeat-terrain-startup.py
-        "--commit", // repeat-terrain-startup.py
-        "--costs",  // compare-streaming-modes.py
-        "--thermal-probe", // compare-streaming-modes.py
-        "--ablation-repeats", // compare-streaming-modes.py
-        "--resume", // compare-streaming-modes.py
-        "--seed",   // streaming comparison scripts
-        "--smoke",  // compare-streaming-modes.py
-        "--experiment", // analyze-streaming-comparison.py
-        "--output-dir", // analyze-streaming-comparison.py
-        "--bootstrap-samples", // analyze-streaming-comparison.py
-        "--comparison", // analyze-streaming-comparison.py
-        "--output", // world inspection, profiling, startup runner
-        "--pairs-output", // correlate_drawables.py
-        "--native-preset", // prepare_skyrim_comparison.py
-        "--calibration", // prepare_skyrim_comparison.py
-        "--timeout", // run_skyrim_comparison.py
-        "--user",   // systemctl
-        "--property", // systemctl
-        "--value",  // systemctl
-        "--onlyvisible", // xdotool
-        "--name",   // xdotool
-        "--sync",   // xdotool
-        "--psm",    // tesseract
-        "--radius", // world-inspect
-        "--library-path", // ld-linux
-        "--meshes", // audit-collision.py
-        "--min-x",  // audit-collision.py
-        "--max-x",  // audit-collision.py
-        "--min-y",  // audit-collision.py
-        "--max-y",  // audit-collision.py
-        "--out",    // audit-collision.py
-        "--expect-solid", // audit-collision.py
-        "--expect-passable", // audit-collision.py
-        "--original", // audit_asset_sizes.py
-        "--json",   // audit_asset_sizes.py
-        "--candidate-inventory", // audit-riverwood-reuse.py
-        "--reference-inventory", // audit-riverwood-reuse.py
-        "--manifest", // audit-riverwood-reuse.py
-        "--include", // audit-z-fighting.py
-        "--materials-only", // audit-z-fighting.py
-        "--no-placements", // audit-z-fighting.py
-        "--plane-tolerance", // audit-z-fighting.py
-        "--min-overlap-area", // audit-z-fighting.py
-        "--max-triangles", // audit-z-fighting.py
-        "--max-comparisons", // audit-z-fighting.py
-        "--max-examples", // audit-z-fighting.py
-        "--progress", // audit-z-fighting.py
-        "--jobs",   // audit-z-fighting.py
-        "--locked", // cargo run
-        "--manifest-path", // cargo run
-        "--cpu-jobs", // converter
-        "--io-jobs", // converter
-        "--binary", // git diff
-        "--porcelain", // git status
-        "--engine", // repeat-terrain-startup.py
-        "--repeats", // repeat-terrain-startup.py
-        "--upload-budgets", // repeat-terrain-startup.py
-        "--warmup", // repeat-terrain-startup.py
-        "--duration", // repeat-terrain-startup.py
-        "--timeout", // repeat-terrain-startup.py
-        "--launch-prefix", // repeat-terrain-startup.py
-        "--commit", // repeat-terrain-startup.py
-        "--config", // capture_tonemap_tuning.py
-        "--validate-only", // capture_tonemap_tuning.py
-        "--clearmodifiers", // xdotool
-        "--delay",  // xdotool
-        "--console-open", // capture_skyrim_tonemap_state.py
-        "--event",  // inspect_skyrim_gpu_capture.py, sample_skyrim_tonemap_gpu.py
-        "--max-actions", // inspect_skyrim_gpu_capture.py
-        "--pairs-output", // correlate_drawables.py
+        "--output",                     // world-inspect, repeat-terrain-startup.py
+        "--radius",                     // world-inspect
+        "--library-path",               // ld-linux
+        "--meshes",                     // audit-collision.py
+        "--min-x",                      // audit-collision.py
+        "--max-x",                      // audit-collision.py
+        "--min-y",                      // audit-collision.py
+        "--max-y",                      // audit-collision.py
+        "--out",                        // audit-collision.py
+        "--expect-solid",               // audit-collision.py
+        "--expect-passable",            // audit-collision.py
+        "--original",                   // audit_asset_sizes.py
+        "--json",                       // audit_asset_sizes.py
+        "--candidate-inventory",        // audit-riverwood-reuse.py
+        "--reference-inventory",        // audit-riverwood-reuse.py
+        "--manifest",                   // audit-riverwood-reuse.py
+        "--locked",                     // cargo run
+        "--manifest-path",              // cargo run
+        "--cpu-jobs",                   // converter
+        "--io-jobs",                    // converter
+        "--binary",                     // git diff
+        "--porcelain",                  // git status
+        "--engine",                     // repeat-terrain-startup.py
+        "--repeats",                    // repeat-terrain-startup.py
+        "--upload-budgets",             // repeat-terrain-startup.py
+        "--warmup",                     // repeat-terrain-startup.py
+        "--duration",                   // repeat-terrain-startup.py
+        "--timeout",                    // repeat-terrain-startup.py
+        "--launch-prefix",              // repeat-terrain-startup.py
+        "--commit",                     // repeat-terrain-startup.py
+        "--bench-baked",                // cluster_bench.py
+        "--cluster-triangle-threshold", // cluster_bench.py
+        "--converted",                  // cluster_bench.py
+        "--exe",                        // cluster_bench.py
+        "--keep-work",                  // cluster_bench.py
+        "--lod-mode",                   // cluster_bench.py
+        "--package-seconds",            // cluster_bench.py
+        "--plugin",                     // cluster_bench.py
+        "--previous",                   // cluster_bench.py
+        "--simulate-plugin-change",     // cluster_bench.py
+        "--terrain-lod-seconds",        // cluster_bench.py
+        "--threshold",                  // cluster_bench.py
+        "--work",                       // cluster_bench.py
+        "--work-root",                  // cluster_bench.py
+        "--jobs",                       // cluster_bench.py
+        "--overlay",                    // cluster_repro_check.py, extension_hash.py
+        "--pairs-output",               // correlate_drawables.py
+        "--include",                    // audit-z-fighting.py
+        "--materials-only",             // audit-z-fighting.py
+        "--no-placements",              // audit-z-fighting.py
+        "--plane-tolerance",            // audit-z-fighting.py
+        "--min-overlap-area",           // audit-z-fighting.py
+        "--max-triangles",              // audit-z-fighting.py
+        "--max-comparisons",            // audit-z-fighting.py
+        "--max-examples",               // audit-z-fighting.py
+        "--progress",                   // audit-z-fighting.py
+        "--costs",                      // compare-streaming-modes.py
+        "--thermal-probe",              // compare-streaming-modes.py
+        "--ablation-repeats",           // compare-streaming-modes.py
+        "--resume",                     // compare-streaming-modes.py
+        "--seed",                       // streaming comparison scripts
+        "--smoke",                      // compare-streaming-modes.py
+        "--experiment",                 // analyze-streaming-comparison.py
+        "--output-dir",                 // analyze-streaming-comparison.py
+        "--bootstrap-samples",          // analyze-streaming-comparison.py
+        "--comparison",                 // analyze-streaming-comparison.py
+        "--native-preset",              // prepare_skyrim_comparison.py
+        "--calibration",                // prepare_skyrim_comparison.py
+        "--user",                       // systemctl
+        "--property",                   // systemctl
+        "--value",                      // systemctl
+        "--onlyvisible",                // xdotool
+        "--name",                       // xdotool
+        "--sync",                       // xdotool
+        "--psm",                        // tesseract
+        "--config",                     // capture_tonemap_tuning.py
+        "--validate-only",              // capture_tonemap_tuning.py
+        "--clearmodifiers",             // xdotool
+        "--delay",                      // xdotool
+        "--console-open",               // capture_skyrim_tonemap_state.py
+        "--event",            // inspect_skyrim_gpu_capture.py, sample_skyrim_tonemap_gpu.py
+        "--max-actions",      // inspect_skyrim_gpu_capture.py
         "--max-resource-mib", // inspect_skyrim_gpu_capture.py
-        "--max-resources", // inspect_skyrim_gpu_capture.py
-        "--max-total-mib", // inspect_skyrim_gpu_capture.py
-        "--previews", // inspect_skyrim_gpu_capture.py
-        "--tail",   // inspect_skyrim_gpu_capture.py
-        "--exe",    // inspect_skyrim_tonemap_memory.py
-        "--pid",    // inspect_skyrim_tonemap_memory.py
-        "--atol",   // replay_skyrim_tonemap.py
-        "--dot-mode", // replay_skyrim_tonemap.py
-        "--input",  // replay_skyrim_tonemap.py
-        "--mad-mode", // replay_skyrim_tonemap.py
-        "--rtol",   // replay_skyrim_tonemap.py
-        "--capture-sha256", // sample_skyrim_tonemap_gpu.py
-        "--output-id", // sample_skyrim_tonemap_gpu.py
-        "--pixel",  // sample_skyrim_tonemap_gpu.py
-        "--shader-id", // sample_skyrim_tonemap_gpu.py
-        "--source-shader", // sample_skyrim_tonemap_gpu.py
+        "--max-resources",    // inspect_skyrim_gpu_capture.py
+        "--max-total-mib",    // inspect_skyrim_gpu_capture.py
+        "--previews",         // inspect_skyrim_gpu_capture.py
+        "--tail",             // inspect_skyrim_gpu_capture.py
+        "--pid",              // inspect_skyrim_tonemap_memory.py
+        "--atol",             // replay_skyrim_tonemap.py
+        "--dot-mode",         // replay_skyrim_tonemap.py
+        "--input",            // replay_skyrim_tonemap.py
+        "--mad-mode",         // replay_skyrim_tonemap.py
+        "--rtol",             // replay_skyrim_tonemap.py
+        "--capture-sha256",   // sample_skyrim_tonemap_gpu.py
+        "--output-id",        // sample_skyrim_tonemap_gpu.py
+        "--pixel",            // sample_skyrim_tonemap_gpu.py
+        "--shader-id",        // sample_skyrim_tonemap_gpu.py
+        "--source-shader",    // sample_skyrim_tonemap_gpu.py
     ];
 
     fn run_config(arguments: &[&str]) -> EngineConfig {
@@ -2596,26 +3218,6 @@ mod tests {
     }
 
     #[test]
-    fn clustered_terrain_requires_an_explicit_package_and_prepass() {
-        assert!(!EngineConfig::default().cluster_terrain);
-        assert!(EngineConfig::from_args(["--cluster-terrain".to_owned()]).is_err());
-        let config = run_config(&["--clusters", "fixture", "--cluster-terrain"]);
-        assert!(config.cluster_terrain && config.cluster_prepass);
-        assert!(
-            EngineConfig::from_args(
-                [
-                    "--clusters",
-                    "fixture",
-                    "--cluster-terrain",
-                    "--no-cluster-prepass",
-                ]
-                .map(str::to_owned)
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn cluster_ownership_requires_a_package_and_is_accepted_with_one() {
         assert!(!EngineConfig::default().cluster_own_statics);
         assert!(EngineConfig::from_args(["--cluster-own-statics".to_owned()]).is_err());
@@ -2649,63 +3251,23 @@ mod tests {
     }
 
     #[test]
-    fn cluster_instance_size_and_prepass_flags_preserve_their_defaults_and_ranges() {
-        let defaults = EngineConfig::default();
-        assert_eq!(defaults.cluster_min_instance_pixels, None);
-        assert!(defaults.cluster_prepass);
-        assert!(!run_config(&["--no-cluster-prepass"]).cluster_prepass);
-        for (raw, expected) in [("0", 0.0), ("0.5", 0.5), ("128", 128.0)] {
-            assert_eq!(
-                run_config(&["--cluster-min-instance-pixels", raw]).cluster_min_instance_pixels,
-                Some(expected)
-            );
-        }
-        for raw in ["-1", "NaN", "inf", "-inf", "1e99", "invalid"] {
-            assert!(
-                EngineConfig::from_args(["--cluster-min-instance-pixels", raw].map(str::to_owned))
-                    .is_err(),
-                "accepted {raw}"
-            );
-        }
-        assert!(EngineConfig::from_args(["--cluster-min-instance-pixels".to_owned()]).is_err());
-    }
-
-    #[test]
-    fn cluster_quality_flags_validate_before_startup_and_update_the_public_resource() {
-        let defaults = EngineConfig::default();
-        assert_eq!(defaults.graphics.cluster_error_pixels, 1.0);
-        assert_eq!(defaults.graphics.cluster_terrain_error_pixels, 1.0);
-        let config = run_config(&[
-            "--cluster-error-pixels",
-            "2",
-            "--cluster-terrain-error-pixels",
-            "4",
-            "--lod-objects",
-            "off",
-            "--lod-trees",
-            "off",
-        ]);
-        assert_eq!(config.graphics.cluster_error_pixels, 2.0);
-        assert_eq!(config.graphics.cluster_terrain_error_pixels, 4.0);
-        assert!(!config.graphics.lod_objects && !config.graphics.lod_trees);
-        for flag in ["--cluster-error-pixels", "--cluster-terrain-error-pixels"] {
-            let settings = run_config(&[flag, "16"]).graphics;
-            let actual = if flag == "--cluster-error-pixels" {
-                settings.cluster_error_pixels
-            } else {
-                settings.cluster_terrain_error_pixels
-            };
-            assert_eq!(actual, crate::graphics_settings::MAX_CLUSTER_ERROR_PIXELS);
-            assert!(parser_options().contains(&flag));
-            assert!(help_names(flag));
-            assert!(EngineConfig::from_args([flag.to_owned()]).is_err());
-            for raw in ["0", "-1", "NaN", "inf", "-inf", "16.01", "1e99", "bad"] {
-                assert!(
-                    EngineConfig::from_args([flag, raw].map(str::to_owned)).is_err(),
-                    "{flag} accepted {raw}"
-                );
-            }
-        }
+    fn clustered_terrain_requires_an_explicit_package_and_prepass() {
+        assert!(!EngineConfig::default().cluster_terrain);
+        assert!(EngineConfig::from_args(["--cluster-terrain".to_owned()]).is_err());
+        let config = run_config(&["--clusters", "fixture", "--cluster-terrain"]);
+        assert!(config.cluster_terrain && config.cluster_prepass);
+        assert!(
+            EngineConfig::from_args(
+                [
+                    "--clusters",
+                    "fixture",
+                    "--cluster-terrain",
+                    "--no-cluster-prepass",
+                ]
+                .map(str::to_owned)
+            )
+            .is_err()
+        );
     }
 
     fn parse_error(arguments: &[&str]) -> ConfigError {
@@ -2722,7 +3284,9 @@ mod tests {
             .filter_map(|line| {
                 let (option, rest) = leading_quoted(line)?;
                 // The bare `--` arm is a no-op marker, not an option to document.
-                (rest.trim_start().starts_with("=>") && option != "--").then_some(option)
+                // Only option literals: the portal's demo-name arms (`"alftand" =>`) are values.
+                (rest.trim_start().starts_with("=>") && option.starts_with('-') && option != "--")
+                    .then_some(option)
             })
             .collect()
     }
@@ -3269,7 +3833,7 @@ mod tests {
         let shots = run_config(&["--shots", "poses.json"]);
         assert!(shots.unpaced_startup());
         assert!(!shots.covers_startup_load());
-        assert!(!run_config(&["--shots", "poses.json", "--startup-cover"]).covers_startup_load());
+        assert!(!run_config(&["--demo-tour", "out", "--startup-cover"]).covers_startup_load());
         // The cover is opt-in.
         assert!(!EngineConfig::default().covers_startup_load());
         assert!(run_config(&["--startup-cover"]).covers_startup_load());
@@ -3375,6 +3939,26 @@ mod tests {
     }
 
     #[test]
+    fn the_water_reflection_preset_defaults_to_baseline_and_parses_both_names() {
+        assert_eq!(
+            EngineConfig::default().water_reflection_preset,
+            WaterReflectionPreset::Baseline
+        );
+        assert_eq!(
+            run_config(&[]).water_reflection_preset,
+            WaterReflectionPreset::Baseline
+        );
+        for (name, preset) in [
+            ("baseline", WaterReflectionPreset::Baseline),
+            ("water", WaterReflectionPreset::Water),
+        ] {
+            let config = run_config(&["--water-reflection-preset", name]);
+            assert_eq!(config.water_reflection_preset, preset);
+            assert_eq!(preset.name(), name);
+        }
+    }
+
+    #[test]
     fn parses_the_unload_time_budget_and_lets_zero_mean_the_count_budget() {
         assert_eq!(
             run_config(&["--max-unload-ms-per-frame", "2.5"]).max_unload_ms_per_frame,
@@ -3392,6 +3976,251 @@ mod tests {
     fn the_lod_keep_hidden_flag_is_off_by_default_and_parses_as_a_switch() {
         assert!(!EngineConfig::default().lod_keep_hidden_in_interiors);
         assert!(run_config(&["--lod-keep-hidden-in-interiors"]).lod_keep_hidden_in_interiors);
+    }
+
+    #[test]
+    fn an_unknown_water_reflection_preset_or_a_missing_value_is_refused() {
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset", "fast"]),
+            ConfigError::InvalidValue { option: "--water-reflection-preset", value: Some(ref value), .. }
+                if value == "fast"
+        ));
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset"]),
+            ConfigError::InvalidValue {
+                option: "--water-reflection-preset",
+                value: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_error(&["--water-reflection-preset", "--headless"]),
+            ConfigError::InvalidValue {
+                option: "--water-reflection-preset",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_measurement_switches_default_on_and_take_on_or_off() {
+        let config = run_config(&[]);
+        assert!(config.water_reflection);
+        assert!(config.shadows);
+
+        let config = run_config(&["--water-reflection", "off", "--shadows", "off"]);
+        assert!(!config.water_reflection);
+        assert!(!config.shadows);
+
+        let config = run_config(&["--water-reflection", "off", "--water-reflection", "on"]);
+        assert!(config.water_reflection, "the last value wins");
+        assert!(run_config(&["--shadows", "on"]).shadows);
+    }
+
+    #[test]
+    fn a_measurement_switch_refuses_any_other_value() {
+        for option in ["--water-reflection", "--shadows"] {
+            for value in ["no", "true", "0", "OFF"] {
+                assert!(
+                    matches!(
+                        parse_error(&[option, value]),
+                        ConfigError::InvalidValue { value: Some(ref given), .. } if given == value
+                    ),
+                    "{option} accepted {value}"
+                );
+            }
+            assert!(matches!(
+                parse_error(&[option, "--headless"]),
+                ConfigError::InvalidValue { value: Some(ref given), .. } if given == "--headless"
+            ));
+            assert!(matches!(
+                parse_error(&[option]),
+                ConfigError::InvalidValue { value: None, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn help_documents_the_measurement_switches_as_such() {
+        assert!(help_names("--water-reflection"));
+        assert!(help_names("--shadows"));
+        let rows: Vec<_> = HELP_TEXT
+            .lines()
+            .filter(|line| {
+                line.trim_start().starts_with("--water-reflection <")
+                    || line.trim_start().starts_with("--shadows <")
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|row| row.contains("measurement switch")),
+            "the A/B switches are for measurement and the help says so"
+        );
+    }
+
+    #[test]
+    fn help_documents_the_water_reflection_preset() {
+        assert!(help_names("--water-reflection-preset"));
+    }
+
+    #[test]
+    fn the_water_reflection_is_ssr_unless_asked_otherwise() {
+        let config = run_config(&[]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Ssr);
+        assert!(config.water_reflection);
+        assert_eq!(config.water_ssr_steps, WaterSsrSteps::DEFAULT);
+        assert_eq!(
+            (
+                config.water_ssr_steps.linear,
+                config.water_ssr_steps.bisection
+            ),
+            (16, 6)
+        );
+
+        let config = run_config(&["--water-reflection", "planar"]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Planar);
+        assert!(config.water_reflection);
+
+        let config = run_config(&["--water-reflection", "ssr"]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Ssr);
+        assert!(config.water_reflection);
+    }
+
+    #[test]
+    fn the_last_water_reflection_value_wins_across_the_spellings() {
+        let config = run_config(&["--water-reflection", "ssr", "--water-reflection", "planar"]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Planar);
+        let config = run_config(&["--water-reflection", "ssr", "--water-reflection", "off"]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Planar);
+        assert!(!config.water_reflection);
+        let config = run_config(&["--water-reflection", "off", "--water-reflection", "ssr"]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Ssr);
+        assert!(config.water_reflection);
+    }
+
+    #[test]
+    fn a_bad_water_reflection_value_is_an_error() {
+        for value in ["screen", "SSR", "Planar", "true", ""] {
+            assert!(
+                matches!(
+                    parse_error(&["--water-reflection", value]),
+                    ConfigError::InvalidValue {
+                        option: "--water-reflection",
+                        value: Some(ref given),
+                        ..
+                    } if given == value
+                ),
+                "--water-reflection accepted {value:?}"
+            );
+        }
+        assert!(matches!(
+            parse_error(&["--water-reflection"]),
+            ConfigError::InvalidValue {
+                option: "--water-reflection",
+                value: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_preset_flag_still_parses_beside_ssr() {
+        let config = run_config(&[
+            "--water-reflection",
+            "ssr",
+            "--water-reflection-preset",
+            "water",
+        ]);
+        assert_eq!(config.water_reflection_mode, WaterReflectionMode::Ssr);
+        assert_eq!(config.water_reflection_preset, WaterReflectionPreset::Water);
+    }
+
+    #[test]
+    fn water_ssr_steps_take_a_linear_count_and_an_optional_bisection_count() {
+        let steps = |raw: &str| run_config(&["--water-ssr-steps", raw]).water_ssr_steps;
+        assert_eq!(steps("16,6"), WaterSsrSteps::DEFAULT);
+        assert_eq!(
+            steps("32"),
+            WaterSsrSteps {
+                linear: 32,
+                bisection: 6
+            },
+            "an omitted bisection count keeps the default"
+        );
+        assert_eq!(
+            steps("1,0"),
+            WaterSsrSteps {
+                linear: 1,
+                bisection: 0
+            }
+        );
+        assert_eq!(
+            steps("128,32"),
+            WaterSsrSteps {
+                linear: 128,
+                bisection: 32
+            }
+        );
+    }
+
+    #[test]
+    fn water_ssr_steps_refuse_zero_too_many_and_nonsense() {
+        for value in [
+            "0", "129", "0,6", "129,6", "16,33", "-1", "16,-1", "1.5", "16,", ",6", "16,6,2", "x",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    parse_error(&["--water-ssr-steps", value]),
+                    ConfigError::InvalidValue {
+                        option: "--water-ssr-steps",
+                        value: Some(ref given),
+                        ..
+                    } if given == value
+                ),
+                "--water-ssr-steps accepted {value:?}"
+            );
+        }
+        assert!(matches!(
+            parse_error(&["--water-ssr-steps"]),
+            ConfigError::InvalidValue {
+                option: "--water-ssr-steps",
+                value: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_error(&["--water-ssr-steps", "--shadows"]),
+            ConfigError::InvalidValue {
+                option: "--water-ssr-steps",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn help_says_the_ssr_flags_only_apply_with_ssr() {
+        assert!(help_names("--water-ssr-steps"));
+        let steps: Vec<_> = HELP_TEXT
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("--water-ssr-steps"))
+            .take(2)
+            .collect();
+        assert!(
+            steps.iter().any(|line| line.contains("ssr only")),
+            "the steps row says it only applies with ssr: {steps:?}"
+        );
+        let preset: Vec<_> = HELP_TEXT
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("--water-reflection-preset"))
+            .take(3)
+            .collect();
+        assert!(
+            preset
+                .iter()
+                .any(|line| line.contains("ignored with --water-reflection ssr")),
+            "the preset row says ssr ignores it: {preset:?}"
+        );
     }
 
     #[test]
@@ -3755,6 +4584,7 @@ mod tests {
             "Mudcrab"
         );
     }
+
     /// A file route cannot share the camera with the streaming benchmark route. Refused while the
     /// arguments are parsed, before any asset or device work starts.
     #[test]
@@ -3869,6 +4699,7 @@ mod tests {
             "--renderer-fixture",
             "--streaming-fixture",
             "--lights",
+            "--room-culling",
             "--physics-fixture",
         ]);
         assert_eq!(config.assets_dir, PathBuf::from("converted"));
@@ -3914,6 +4745,7 @@ mod tests {
         assert!(config.renderer_fixture);
         assert!(config.streaming_fixture);
         assert!(config.lights);
+        assert!(config.room_culling);
         assert!(config.physics_fixture);
     }
 
@@ -3958,6 +4790,80 @@ mod tests {
             "another flag does not turn lights on"
         );
         assert!(run_config(&["--lights"]).lights);
+    }
+
+    /// Room culling is opt-in like lights: nothing changes unless the flag is given.
+    #[test]
+    fn room_culling_is_off_until_the_flag_is_given() {
+        assert!(!EngineConfig::default().room_culling);
+        assert!(!run_config(&["--headless"]).room_culling);
+        assert!(run_config(&["--room-culling"]).room_culling);
+    }
+
+    /// The parallel encoder finish (impl-1132) is the Plus default; `--no-render-parallel-finish`
+    /// is stock Bevy, and the last of the two spellings wins.
+    #[test]
+    fn parallel_finish_is_on_until_turned_off() {
+        assert!(EngineConfig::default().render_parallel_finish);
+        assert!(run_config(&["--headless"]).render_parallel_finish);
+        assert!(!run_config(&["--no-render-parallel-finish"]).render_parallel_finish);
+        assert!(
+            run_config(&["--no-render-parallel-finish", "--render-parallel-finish"])
+                .render_parallel_finish
+        );
+        assert!(help_names("--render-parallel-finish"));
+        assert!(help_names("--no-render-parallel-finish"));
+    }
+
+    /// The backends default to every backend (today's behaviour) until a run names one.
+    #[test]
+    fn render_backends_default_to_all_and_parse_both_names() {
+        assert_eq!(EngineConfig::default().render_backends, RenderBackends::All);
+        assert_eq!(run_config(&[]).render_backends, RenderBackends::All);
+        for (name, backends) in [
+            ("all", RenderBackends::All),
+            ("vulkan", RenderBackends::Vulkan),
+        ] {
+            let config = run_config(&["--render-backends", name]);
+            assert_eq!(config.render_backends, backends);
+            assert_eq!(backends.name(), name);
+        }
+        assert_eq!(
+            run_config(&["--render-backends", "vulkan", "--render-backends", "all"])
+                .render_backends,
+            RenderBackends::All,
+            "the last value wins"
+        );
+        assert!(help_names("--render-backends"));
+    }
+
+    #[test]
+    fn an_unknown_render_backend_or_a_missing_value_is_refused() {
+        for value in ["dx12", "Vulkan", "VULKAN", "gl", ""] {
+            assert!(
+                matches!(
+                    parse_error(&["--render-backends", value]),
+                    ConfigError::InvalidValue { option: "--render-backends", value: Some(ref given), .. }
+                        if given == value
+                ),
+                "--render-backends accepted {value:?}"
+            );
+        }
+        assert!(matches!(
+            parse_error(&["--render-backends"]),
+            ConfigError::InvalidValue {
+                option: "--render-backends",
+                value: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_error(&["--render-backends", "--headless"]),
+            ConfigError::InvalidValue {
+                option: "--render-backends",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -4452,7 +5358,10 @@ mod tests {
                 continue;
             }
             assert!(
-                options.contains(&flag),
+                options.contains(&flag)
+                    || flag
+                        .strip_prefix("--")
+                        .is_some_and(crate::graphics_settings::is_knob),
                 "{} passes {flag}, which the parser refuses",
                 path.display()
             );
@@ -4716,6 +5625,23 @@ mod tests {
     }
 
     #[test]
+    fn the_doorway_depth_composite_is_on_unless_turned_off() {
+        let parse = |args: &[&str]| {
+            EngineConfig::run_from_args(args.iter().map(|arg| (*arg).to_owned()))
+                .portal
+                .depth_composite
+        };
+        assert!(parse(&[]), "the default doorway is the composite");
+        assert!(!parse(&["--portal-depth-composite=off"]));
+        assert!(parse(&["--portal-depth-composite"]));
+        assert!(parse(&["--portal-depth-composite=on"]));
+        assert!(
+            parse(&["--portal-depth-composite=off", "--portal-depth-composite"]),
+            "the last flag wins"
+        );
+    }
+
+    #[test]
     fn defaults_to_a_terrain_ring_beyond_the_full_detail_grid() {
         let config = EngineConfig::default();
         assert_eq!(config.stream_radius, 2);
@@ -4818,17 +5744,473 @@ mod tests {
     }
 
     #[test]
+    fn demo_starts_set_worldspace_grid_and_position() {
+        let config = EngineConfig::run_from_args(["--demo", "alftand", "--walk"].map(String::from));
+        assert!(config.portal.walk);
+        assert_eq!(config.worldspace_id, 0x3c);
+        assert_eq!(config.start_grid, (18, 18));
+        assert_eq!(config.start_position, Some([77583.23, 77411.89, -5817.21]));
+        // Bethesda's own exit facing for Alftand01 -> Tamriel (door 000152CF's XTEL).
+        assert_eq!(config.start_yaw, -0.603_385_3);
+        assert_eq!(config.portal.demo.as_deref(), Some("alftand"));
+
+        let config = EngineConfig::run_from_args(["--demo", "blackreach"].map(String::from));
+        assert!(!config.portal.walk);
+        assert_eq!(config.worldspace_id, 0x0001_EE62);
+        assert_eq!(config.start_grid, (5, 4));
+
+        let config = EngineConfig::run_from_args(["--demo", "nowhere"].map(String::from));
+        assert_eq!(config.start_position, None);
+        assert_eq!(config.worldspace_id, 0x3c);
+
+        let config = EngineConfig::run_from_args(
+            [
+                "--start-position",
+                "-100",
+                "8200",
+                "5",
+                "--start-yaw",
+                "1.5",
+            ]
+            .map(String::from),
+        );
+        assert_eq!(config.start_position, Some([-100.0, 8200.0, 5.0]));
+        assert_eq!(config.start_grid, (-1, 2));
+        assert_eq!(config.start_yaw, 1.5);
+    }
+
+    #[test]
+    fn shots_options_parse_and_default_the_output_folder() {
+        let config = EngineConfig::run_from_args(
+            ["--assets", "converted", "--shots", "shots/tamriel.json"].map(str::to_owned),
+        );
+        assert_eq!(
+            config.portal.shots,
+            Some(PathBuf::from("shots/tamriel.json"))
+        );
+        assert_eq!(config.portal.shots_out, None);
+        assert_eq!(
+            config.portal.shots_output_dir(),
+            Some(PathBuf::from("shots/tamriel-shots")),
+            "the default output folder is named after the shots file, next to it"
+        );
+
+        let config = EngineConfig::run_from_args(
+            ["--shots", "a.json", "--shots-out", "shots/out"].map(str::to_owned),
+        );
+        assert_eq!(
+            config.portal.shots_output_dir(),
+            Some(PathBuf::from("shots/out"))
+        );
+
+        // Nothing writes anywhere unless there is a shots file to render.
+        assert_eq!(EngineConfig::default().portal.shots, None);
+        assert_eq!(EngineConfig::default().portal.shots_output_dir(), None);
+    }
+
+    #[test]
+    fn start_shot_options_parse_a_file_and_a_shot_name() {
+        let config = EngineConfig::run_from_args(
+            [
+                "--assets",
+                "converted",
+                "--start-shot",
+                "tools/reference/riverwood_shots.json",
+                "RW-04-inn-front",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            config.portal.start_shot,
+            Some(StartShot {
+                file: Some(PathBuf::from("tools/reference/riverwood_shots.json")),
+                name: Some("RW-04-inn-front".to_owned()),
+            })
+        );
+        // The flag is a start pose and nothing else: it starts no shots run, no tour and no walk.
+        assert_eq!(config.portal.shots, None);
+        assert_eq!(config.portal.demo_tour, None);
+        assert!(!config.portal.walk);
+        assert_eq!(config.start_position, None);
+
+        // A file alone keeps main's single-pose form. A following option must not become a name,
+        // and a missing file is rejected before any window or asset loading starts.
+        let single = run_config(&["--start-shot", "a.json", "--stdin-console"]);
+        assert_eq!(single.start_shot, Some(PathBuf::from("a.json")));
+        assert_eq!(single.portal.start_shot, None);
+        assert!(single.stdin_console);
+        assert!(
+            parse_error(&["--start-shot"])
+                .to_string()
+                .contains("--start-shot")
+        );
+        assert_eq!(EngineConfig::default().portal.start_shot, None);
+    }
+
+    #[test]
+    fn repeated_start_shot_forms_keep_only_the_last_camera_request() {
+        let named = run_config(&[
+            "--start-shot",
+            "earlier-missing.json",
+            "--start-shot",
+            "named.json",
+            "selected",
+        ]);
+        assert_eq!(named.start_shot, None);
+        assert_eq!(
+            named.portal.start_shot,
+            Some(StartShot {
+                file: Some(PathBuf::from("named.json")),
+                name: Some("selected".to_owned()),
+            })
+        );
+
+        let single = run_config(&[
+            "--start-shot",
+            "earlier-missing.json",
+            "selected",
+            "--start-shot",
+            "single.json",
+            "--stdin-console",
+        ]);
+        assert_eq!(single.start_shot, Some(PathBuf::from("single.json")));
+        assert_eq!(single.portal.start_shot, None);
+        assert!(single.stdin_console);
+    }
+
+    #[test]
+    fn a_start_shot_run_is_looked_at_and_driven_by_the_player() {
+        let config =
+            EngineConfig::run_from_args(["--start-shot", "a.json", "shot"].map(str::to_owned));
+        assert!(
+            config.interactive(),
+            "a start-shot run gets the lighting and the portal"
+        );
+        assert!(
+            config.walks(),
+            "the player's controller drives it (in free flight), so the person can look around"
+        );
+
+        // `--walk` beside it changes nothing: the controller is the player's either way.
+        let walked = EngineConfig::run_from_args(
+            ["--walk", "--start-shot", "a.json", "shot"].map(str::to_owned),
+        );
+        assert!(walked.interactive());
+        assert!(walked.walks());
+
+        // A measured run is a measured run: nothing about this flag makes a benchmark a walk.
+        let measured = EngineConfig::run_from_args(
+            ["--start-shot", "a.json", "shot", "--benchmark-frames", "10"].map(str::to_owned),
+        );
+        assert!(!measured.walks());
+        assert!(measured.interactive());
+    }
+
+    #[test]
+    fn an_as_played_measured_run_is_presented_like_a_played_one_but_never_walks() {
+        let measured = |extra: &[&str]| {
+            let mut args = vec!["--benchmark-duration", "10"];
+            args.extend_from_slice(extra);
+            EngineConfig::run_from_args(args.into_iter().map(str::to_owned))
+        };
+        assert!(
+            !measured(&[]).interactive(),
+            "a measured run stays flat by default"
+        );
+        let played = measured(&["--as-played"]);
+        assert!(played.as_played);
+        assert!(
+            played.interactive(),
+            "the sky, fog, animations and portals a player sees"
+        );
+        assert!(!played.walks(), "the run's camera stays scripted");
+        assert!(!measured(&["--walk", "--as-played"]).walks());
+    }
+
+    #[test]
     fn automated_runs_open_their_window_off_screen_unless_asked_not_to() {
         let args = |list: &[&str]| {
             EngineConfig::run_from_args(list.iter().map(|value| (*value).to_owned()))
         };
+        assert!(args(&["--demo-tour", "local/tour"]).window_offscreen());
         assert!(args(&["--shots", "shots.json"]).window_offscreen());
-        assert!(!args(&["--shots", "shots.json", "--show-window"]).window_offscreen());
+        assert!(!args(&["--demo-tour", "local/tour", "--show-window"]).window_offscreen());
         assert!(
             !args(&["--walk"]).window_offscreen(),
             "a run someone plays is on screen"
         );
+        assert!(
+            !args(&["--start-shot", "shots.json", "a"]).window_offscreen(),
+            "the fitting tool is looked at"
+        );
     }
+
+    #[test]
+    fn a_timing_run_opens_on_screen_and_its_title_says_what_it_is() {
+        let args = |list: &[&str]| {
+            EngineConfig::run_from_args(list.iter().map(|value| (*value).to_owned()))
+        };
+        let bench = args(&[
+            "--load-doors",
+            "seamless",
+            "--portal-bench",
+            "doors.json",
+            "--run-label",
+            "default r1",
+            "--bench-seconds",
+            "2",
+        ]);
+        assert!(!bench.window_offscreen(), "a bench is watched");
+        assert_eq!(
+            bench.window_title(),
+            "Mudcrab [TIMING] portal bench: default r1"
+        );
+        assert_eq!(bench.portal.bench_seconds, Some(2.0));
+        assert!(
+            !args(&[
+                "--load-doors",
+                "seamless",
+                "--demo-tour",
+                "t",
+                "--tour-bench",
+                "b"
+            ])
+            .window_offscreen()
+        );
+        assert_eq!(
+            args(&["--demo-tour", "t"]).window_title(),
+            "Mudcrab [TEST] demo tour"
+        );
+        assert_eq!(
+            args(&["--shots", "s.json"]).window_title(),
+            "Mudcrab [TEST] shots"
+        );
+        assert_eq!(args(&["--walk"]).window_title(), "Mudcrab");
+        assert_eq!(
+            args(&[
+                "--load-doors",
+                "seamless",
+                "--portal-bench",
+                "d",
+                "--bench-seconds",
+                "-1"
+            ])
+            .portal
+            .bench_seconds,
+            None
+        );
+    }
+
+    #[test]
+    fn a_smoke_tour_flag_names_how_many_doors_to_walk() {
+        let config = EngineConfig::run_from_args(
+            [
+                "--demo",
+                "riverwood",
+                "--walk",
+                "--demo-tour",
+                "out",
+                "--tour-doors",
+                "1",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(config.portal.tour_doors, Some(1));
+        assert_eq!(
+            config.portal.demo_tour,
+            Some(PathBuf::from("out")),
+            "a smoke tour still needs the folder the full tour writes its log and shots to"
+        );
+
+        // Without the flag there is no smoke tour, and the route is walked whole.
+        assert_eq!(EngineConfig::default().portal.tour_doors, None);
+        assert_eq!(
+            EngineConfig::run_from_args(["--demo-tour", "out"].map(str::to_owned))
+                .portal
+                .tour_doors,
+            None
+        );
+    }
+
+    #[test]
+    fn a_tour_repeat_flag_names_how_many_times_to_walk_them() {
+        let config = EngineConfig::run_from_args(
+            [
+                "--demo",
+                "riverwood",
+                "--walk",
+                "--demo-tour",
+                "out",
+                "--tour-doors",
+                "2",
+                "--tour-repeat",
+                "5",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(config.portal.tour_repeat, Some(5));
+        assert_eq!(
+            config.portal.tour_doors,
+            Some(2),
+            "the repeat does not stand in for the doors it repeats"
+        );
+
+        // Without the flag a tour walks what it always did: its doors once.
+        assert_eq!(EngineConfig::default().portal.tour_repeat, None);
+        assert_eq!(
+            EngineConfig::run_from_args(["--demo-tour", "out"].map(str::to_owned))
+                .portal
+                .tour_repeat,
+            None
+        );
+    }
+
+    #[test]
+    fn a_tour_clip_flag_asks_for_a_clip_of_each_crossing() {
+        let config =
+            EngineConfig::run_from_args(["--demo-tour", "out", "--tour-clip"].map(str::to_owned));
+        assert!(config.portal.tour_clip);
+        assert!(!EngineConfig::default().portal.tour_clip);
+    }
+
+    #[test]
+    fn a_tour_dwell_flag_names_how_long_to_wait_before_the_next_door() {
+        let config = EngineConfig::run_from_args(
+            [
+                "--demo",
+                "riverwood",
+                "--walk",
+                "--demo-tour",
+                "out",
+                "--tour-doors",
+                "2",
+                "--tour-dwell",
+                "2",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(config.portal.tour_dwell, Some(2.0));
+        assert_eq!(
+            config.portal.tour_doors,
+            Some(2),
+            "the dwell does not stand in for the doors to walk"
+        );
+
+        // Without the flag a tour surveys the place between crossings, as it always did.
+        assert_eq!(EngineConfig::default().portal.tour_dwell, None);
+        assert_eq!(
+            EngineConfig::run_from_args(["--demo-tour", "out"].map(str::to_owned))
+                .portal
+                .tour_dwell,
+            None
+        );
+    }
+
+    /// The load doors are the vanilla load screen unless asked; a value that is not one, or a flag
+    /// that only means something with seamless doors, stops the run.
+    #[test]
+    fn load_doors_default_to_the_load_screen_and_refuse_seamless_only_flags() {
+        let run = |list: &[&str]| EngineConfig::from_args(list.iter().map(|a| a.to_string()));
+        assert_eq!(
+            EngineConfig::default().portal.load_doors,
+            LoadDoors::LoadScreen
+        );
+        assert!(!EngineConfig::default().seamless_doors());
+        assert!(matches!(
+            run(&["--load-doors", "SEAMLESS"]),
+            Ok(ConfigAction::Run(config)) if config.seamless_doors()
+        ));
+        assert_eq!(
+            run(&["--load-doors", "portal"])
+                .expect_err("not a value")
+                .to_string(),
+            ConfigError::invalid_value(
+                "--load-doors",
+                Some("portal".to_owned()),
+                LoadDoors::EXPECTED
+            )
+            .to_string()
+        );
+        for flag in [
+            &["--portal-bench", "doors.json"][..],
+            &["--demo-tour", "out", "--tour-bench", "b.csv"][..],
+            &["--portal-light-spill"][..],
+        ] {
+            let error = run(flag).expect_err("needs seamless doors").to_string();
+            assert!(error.contains("needs --load-doors seamless"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_tour_bench_flag_names_the_csv_to_write() {
+        let config = EngineConfig::run_from_args(
+            [
+                "--load-doors",
+                "seamless",
+                "--demo-tour",
+                "out",
+                "--tour-doors",
+                "2",
+                "--tour-bench",
+                "out/bench.csv",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            config.portal.tour_bench,
+            Some(PathBuf::from("out/bench.csv"))
+        );
+        assert_eq!(config.portal.tour_doors, Some(2));
+        assert_eq!(EngineConfig::default().portal.tour_bench, None);
+    }
+
+    #[test]
+    fn a_portal_bench_flag_names_the_doors_and_makes_an_unsynced_looked_at_run() {
+        let config = EngineConfig::run_from_args(
+            [
+                "--load-doors",
+                "seamless",
+                "--portal-bench",
+                "tools/bench/portal_bench_doors.json",
+                "--bench-out",
+                "local/bench/run.csv",
+                "--walk",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            config.portal.portal_bench,
+            Some(PathBuf::from("tools/bench/portal_bench_doors.json"))
+        );
+        assert_eq!(
+            config.portal.bench_out,
+            Some(PathBuf::from("local/bench/run.csv"))
+        );
+        // It draws the portal and the lights, it opens on screen to be watched (the user,
+        // 2026-09-26), it poses the camera itself rather than walking, and it is timed unsynced.
+        assert!(config.interactive());
+        assert!(!config.window_offscreen());
+        assert!(!config.walks());
+        assert!(config.times_frames());
+        let plain = EngineConfig::default();
+        assert_eq!(plain.portal.portal_bench, None);
+        assert!(!plain.times_frames());
+    }
+
+    #[test]
+    fn graphics_cycle_takes_a_positive_period_only() {
+        let period = |args: &[&str]| {
+            EngineConfig::run_from_args(args.iter().map(|arg| (*arg).to_owned()))
+                .portal
+                .graphics_cycle
+        };
+        assert_eq!(period(&[]), None);
+        assert_eq!(period(&["--graphics-cycle", "0.5"]), Some(0.5));
+        assert_eq!(period(&["--graphics-cycle", "0"]), None);
+        assert_eq!(period(&["--graphics-cycle", "-1"]), None);
+        assert_eq!(period(&["--graphics-cycle", "soon"]), None);
+    }
+
     #[test]
     fn parses_remote_options() {
         let config = EngineConfig::run_from_args(["--remote"].map(str::to_owned));
@@ -4844,104 +6226,6 @@ mod tests {
         let config = EngineConfig::run_from_args(["--remote-port", "16001"].map(str::to_owned));
         assert!(config.remote);
         assert_eq!(config.remote_port, 16_001);
-    }
-
-    #[test]
-    fn the_water_reflection_preset_defaults_to_baseline_and_parses_both_names() {
-        assert_eq!(
-            EngineConfig::default().water_reflection_preset,
-            WaterReflectionPreset::Baseline
-        );
-        assert_eq!(
-            run_config(&[]).water_reflection_preset,
-            WaterReflectionPreset::Baseline
-        );
-        for (name, preset) in [
-            ("baseline", WaterReflectionPreset::Baseline),
-            ("water", WaterReflectionPreset::Water),
-        ] {
-            let config = run_config(&["--water-reflection-preset", name]);
-            assert_eq!(config.water_reflection_preset, preset);
-            assert_eq!(preset.name(), name);
-        }
-    }
-
-    #[test]
-    fn an_unknown_water_reflection_preset_or_a_missing_value_is_refused() {
-        assert!(matches!(
-            parse_error(&["--water-reflection-preset", "fast"]),
-            ConfigError::InvalidValue { option: "--water-reflection-preset", value: Some(ref value), .. }
-                if value == "fast"
-        ));
-        assert!(matches!(
-            parse_error(&["--water-reflection-preset"]),
-            ConfigError::InvalidValue {
-                option: "--water-reflection-preset",
-                value: None,
-                ..
-            }
-        ));
-        assert!(matches!(
-            parse_error(&["--water-reflection-preset", "--headless"]),
-            ConfigError::InvalidValue {
-                option: "--water-reflection-preset",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn the_measurement_switches_default_on_and_take_on_or_off() {
-        let config = run_config(&[]);
-        assert!(config.water_reflection);
-
-        let config = run_config(&["--water-reflection", "off"]);
-        assert!(!config.water_reflection);
-
-        let config = run_config(&["--water-reflection", "off", "--water-reflection", "on"]);
-        assert!(config.water_reflection, "the last value wins");
-    }
-
-    #[test]
-    fn a_measurement_switch_refuses_any_other_value() {
-        for option in ["--water-reflection"] {
-            for value in ["no", "true", "0", "OFF", "planar", "ssr"] {
-                assert!(
-                    matches!(
-                        parse_error(&[option, value]),
-                        ConfigError::InvalidValue { value: Some(ref given), .. } if given == value
-                    ),
-                    "{option} accepted {value}"
-                );
-            }
-            assert!(matches!(
-                parse_error(&[option, "--headless"]),
-                ConfigError::InvalidValue { value: Some(ref given), .. } if given == "--headless"
-            ));
-            assert!(matches!(
-                parse_error(&[option]),
-                ConfigError::InvalidValue { value: None, .. }
-            ));
-        }
-    }
-
-    #[test]
-    fn help_documents_the_measurement_switches_as_such() {
-        assert!(help_names("--water-reflection"));
-        let rows: Vec<_> = HELP_TEXT
-            .lines()
-            .filter(|line| line.trim_start().starts_with("--water-reflection <"))
-            .collect();
-        assert_eq!(rows.len(), 1);
-        assert!(
-            rows.iter().all(|row| row.contains("measurement switch")),
-            "the A/B switches are for measurement and the help says so"
-        );
-    }
-
-    #[test]
-    fn help_documents_the_water_reflection_preset() {
-        assert!(help_names("--water-reflection-preset"));
     }
 
     #[test]
@@ -5000,6 +6284,9 @@ mod tests {
         );
     }
 
+    /// Every reflection flag with a value that is not one stops the run with a message naming the
+    /// flag, the value and what is accepted, instead of leaving the option at its default
+    /// (review-258 item 2; `parses_the_reflection_cost_flags` used to assert the swallowing).
     #[test]
     fn a_reflection_flag_value_that_is_not_one_is_refused() {
         let refused = |args: &[&str]| {
@@ -5068,6 +6355,8 @@ mod tests {
         );
     }
 
+    /// `from_args` is the parse the run uses (`from_env`, `main`): a bad value has to stop it with
+    /// the message, not hand back a configuration that quietly differs from the one asked for.
     #[test]
     fn from_args_stops_the_run_on_a_bad_reflection_value() {
         let error = EngineConfig::from_args(["--reflection-cascades", "5"].map(str::to_owned))

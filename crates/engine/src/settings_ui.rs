@@ -75,6 +75,10 @@ impl SettingsMenuState {
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SettingsUiSet;
 
+/// Input and menu actions precede both private graphics controls and persisted preference writes.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SettingsUiActions;
+
 pub struct SettingsPlugin;
 
 impl Plugin for SettingsPlugin {
@@ -100,7 +104,7 @@ impl Plugin for SettingsPlugin {
             .add_systems(
                 Update,
                 (
-                    menu_actions,
+                    menu_actions.in_set(SettingsUiActions),
                     apply_render_settings,
                     refresh_menu,
                     style_rows,

@@ -8,6 +8,7 @@ use crate::{
         stock_drawable::{StockDrawable, StockPassFamily},
         stock_visibility::ClassFilter,
     },
+    portal::CellRole,
     world::database::CellKey,
 };
 use bevy::{
@@ -292,6 +293,7 @@ fn extract(
     config: Extract<Res<crate::config::EngineConfig>>,
     origin: Extract<Res<RenderOrigin>>,
     views: Extract<super::lod::LodDemandViews>,
+    portal: Extract<Option<Res<crate::portal::PortalState>>>,
     mut timing: Local<crate::profiling::PeriodicTiming>,
     root_visibility: Extract<
         Query<(
@@ -308,7 +310,7 @@ fn extract(
 ) {
     let started = std::time::Instant::now();
     let window = views
-        .current(&config, origin.0)
+        .current(&config, origin.0, portal.as_deref())
         .map(|d| (d.world, d.center, config.stream_radius));
     if policy.window != window || policy.owned != config.cluster_own_statics {
         policy.window = window;
@@ -471,10 +473,9 @@ fn filter(
             continue;
         };
         let layers = layers.cloned().unwrap_or_default();
-        let objects = inputs
-            .objects
-            .as_ref()
-            .filter(|_| super::lod::lod_ring_layers().0.intersects(&layers));
+        let objects = inputs.objects.as_ref().filter(|objects| {
+            super::lod::lod_role_layers(demand_role(Some(objects.demand))).intersects(&layers)
+        });
         // Near readiness only decides which native draws (object blocks, tree cells) give way.
         // A view with neither has nothing to hide or select, and nothing to audit.
         if objects.is_none() && inputs.native.is_empty() {
@@ -696,6 +697,33 @@ fn restore(mut filters: ResMut<Filters>, mut views: Query<&mut RenderVisibleEnti
     }
 }
 
+pub(super) fn publish_roles(
+    commands: &mut Commands,
+    roots: impl Iterator<Item = (Entity, CellRole)>,
+    layers: &Query<&bevy::camera::visibility::RenderLayers>,
+) -> Vec<(Entity, CellRole)> {
+    roots
+        .map(|(root, role)| {
+            let next = super::lod::lod_role_layers(role);
+            if layers.get(root).is_ok_and(|old| *old == next) {
+                return (root, role);
+            }
+            commands
+                .entity(root)
+                .try_insert((next.clone(), bevy::app::Propagate(next)));
+            (root, role)
+        })
+        .collect()
+}
+
+pub(super) fn demand_role(demand: Option<super::lod::LodDemand>) -> CellRole {
+    match demand.map(|d| d.role) {
+        Some(super::lod::LodDemandRole::Main) => CellRole::Active,
+        Some(super::lod::LodDemandRole::Portal) => CellRole::Destination,
+        _ => CellRole::Hidden,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,6 +801,9 @@ mod tests {
         assert!(!loaded_root_visible(Visibility::Hidden, true));
         assert!(!loaded_root_visible(Visibility::Inherited, false));
         assert!(loaded_root_visible(Visibility::Inherited, true));
+        let world = super::super::lod::lod_role_layers(CellRole::Active);
+        let destination = super::super::lod::lod_role_layers(CellRole::Destination);
+        assert!(!world.intersects(&destination));
     }
 
     #[test]

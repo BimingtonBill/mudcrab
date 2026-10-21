@@ -1,6 +1,7 @@
 use crate::{
     color_pipeline::{DEFAULT_SCENE_EV100, SceneColorPipeline},
     config::WaterReflectionPreset,
+    lights::EMISSIVE_EXPOSURE,
     profiling::ProfilingState,
     view_policy::{
         SecondaryViewTarget, ViewDemand, ViewPolicy, ViewPolicySystems, ViewRequest, ViewShadows,
@@ -43,13 +44,21 @@ use bevy::{
 };
 use serde::Serialize;
 use shared::LAND_TEXTURE_REPEATS_PER_CELL;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
 pub type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
+/// The snow material of a `MATO`-covered static. Its type, its shader and its formula live in
+/// [`crate::snow`], which is also where the tables behind it are read; this alias keeps the three
+/// materials of the renderer side by side.
+pub type SnowMaterial = crate::snow::SnowMaterial;
+use crate::effect_palette::{EffectPalette, EffectPaletteMaterial, EffectPaletteRegistry};
 
 /// How far the procedural waves tilt the water's normal. Skyrim's water is close to flat at a
 /// distance; a stronger tilt striped lakes with bright and dark bands.
@@ -76,6 +85,7 @@ impl Plugin for VercidiumRendererPlugin {
         add_placed_object_layer_propagation(app);
         embedded_asset!(app, "shaders/terrain.wgsl");
         embedded_asset!(app, "shaders/water.wgsl");
+        embedded_asset!(app, "shaders/effect_palette.wgsl");
         // The policy owns every secondary camera's activity, and this plugin is what spawns the
         // first of them, so the two are registered together: without it the reflection camera would
         // be spawned with a demand and never switched on. The shared render-schedule skip
@@ -86,12 +96,22 @@ impl Plugin for VercidiumRendererPlugin {
             crate::view_policy::SecondaryViewPolicyPlugin,
             crate::shadow_route::ShadowRoutePlugin,
             crate::render_skip::RenderSkipPlugin,
+            // `--water-reflection ssr`: the screen-space reflection of the water, a module that
+            // knows nothing of this branch (see [`portal_water_ssr_hook`] for what joins it to
+            // the portal's views). Under `planar` (the default) it registers nothing at all.
+            crate::water_ssr::WaterSsrPlugin,
         ));
+        // The one place this branch's planar reflection and the screen-space one meet.
+        let planar_replaced = portal_water_ssr_hook(app);
         install_material_animation(app);
         app.add_plugins((
+            crate::light_falloff::SkyrimLightFalloffPlugin,
             crate::billboard::BillboardPlugin,
+            crate::shadow_layers::ShadowViewLayersPlugin,
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
+            crate::snow::SnowMaterialPlugin,
+            MaterialPlugin::<EffectPaletteMaterial>::default(),
             crate::prepass_vertex_alpha::PrepassVertexAlphaPlugin,
         ))
         .init_resource::<RendererMetrics>()
@@ -105,7 +125,9 @@ impl Plugin for VercidiumRendererPlugin {
         // the pose written just before propagation is the one the frame renders with.
         .add_systems(
             PostUpdate,
-            prepare_water_reflection.in_set(ViewPolicySystems::Prepare),
+            prepare_water_reflection
+                .in_set(ViewPolicySystems::Prepare)
+                .run_if(move || !planar_replaced),
         );
 
         // `--reflection-cascades N` installs a limit only when explicitly requested.
@@ -356,12 +378,10 @@ pub type Layer = usize;
 /// The layer of the world: terrain, and (here) the placed objects too.
 pub const WORLD_LAYER: Layer = 0;
 
-/// The full-detail object layer, separate from reflected world geometry.
-pub const PLACED_OBJECT_LAYER: Layer = 5;
-
 /// Full-detail stock objects stay separate from the reflected LOD world. Layers 2 through 4
 /// belong to the portal destination, animated door layer, and unshadowed reflection replica.
 /// Seamless cells instead receive their explicit role stamp from the portal's layer resolver.
+pub const PLACED_OBJECT_LAYER: Layer = 5;
 
 /// What every scene light belongs to, as a layer list (see [`LIGHT_LAYERS`]).
 pub const REFLECTION_VIEW_LAYERS: &[Layer] = &[WORLD_LAYER];
@@ -769,6 +789,7 @@ impl TerrainExtension {
     /// Whether the shader reads this material's overlay weights from its uniform weight field rather
     /// than from the weights the mesh packs into its vertex attributes. False only for a material
     /// with no overlays to read: a quadrant whose sole layer is its base, or a stand-in terrain.
+    #[cfg(test)]
     pub(crate) fn reads_weight_field(&self) -> bool {
         self.settings.weight_source.x > 0.5
     }
@@ -923,7 +944,25 @@ impl MaterialExtension for WaterExtension {
     fn fragment_shader() -> ShaderRef {
         "embedded://engine/shaders/water.wgsl".into()
     }
+
+    /// Under `--water-reflection ssr` the shader is compiled with the march and its step counts
+    /// ([`crate::water_ssr::push_shader_defs`]); under `planar` it gets no definition at all and
+    /// is the shader it has always been.
+    fn specialize(
+        _pipeline: &bevy::pbr::MaterialExtensionPipeline,
+        descriptor: &mut bevy::render::render_resource::RenderPipelineDescriptor,
+        _layout: &bevy::mesh::MeshVertexBufferLayoutRef,
+        _key: bevy::pbr::MaterialExtensionKey<Self>,
+    ) -> Result<(), bevy::render::render_resource::SpecializedMeshPipelineError> {
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            crate::water_ssr::push_shader_defs(&mut fragment.shader_defs);
+        }
+        Ok(())
+    }
 }
+
+#[derive(Resource, Clone)]
+pub struct WaterReflectionTexture(pub Handle<Image>);
 
 /// Apply live water controls without rewriting materials merely to advance their clock.
 fn apply_water_settings(
@@ -968,9 +1007,6 @@ fn apply_water_settings(
         }
     }
 }
-
-#[derive(Resource, Clone)]
-pub struct WaterReflectionTexture(pub Handle<Image>);
 
 #[derive(Component)]
 pub(crate) struct WaterReflectionCamera;
@@ -1064,6 +1100,9 @@ fn setup_water_reflection(
             allocated: policy.target_size,
         },
         WaterReflectionCamera,
+        // The exposure and shadow filter of the graphics settings; no AA, no SSAO
+        // (`crate::graphics_settings`).
+        crate::graphics_settings::GraphicsCamera::WaterReflection,
     ));
     // The prepass is on by default; `--reflection-prepass=off` disables it and occlusion culling.
     // Without the prepass the view has no prepass phase to queue, sort,
@@ -1193,6 +1232,59 @@ fn limit_water_reflection_cascades(
     }
 }
 
+/// PORTAL-SIDE HOOK of the screen-space water reflection (`--water-reflection ssr`,
+/// [`crate::water_ssr`]). Everything that joins that module to this branch is here; the module
+/// itself, and the `ssr_reflect` function of `shaders/water.wgsl`, know nothing of the portal, the
+/// view policy or the planar camera and port to another branch unchanged.
+///
+/// Under `ssr` it does two things, and returns `true` so the caller leaves
+/// [`prepare_water_reflection`] out of the schedule:
+///
+/// * **The planar camera is never demanded.** Without that system nothing fills the reflection
+///   camera's [`ViewDemand`], so the policy never admits it: it is not active, renders nothing and
+///   builds no shadow cascades, and its preparation costs nothing either.
+///   `--water-reflection-preset` is not consulted.
+/// * **The sky is the camera's own.** The water's misses fall back to the sky the camera's dome
+///   draws, and the dome's colours are this branch's per-camera [`CameraSky`]
+///   ([`crate::sky_dome`]): [`feed_water_ssr_sky`] hands each camera's palette to the module.
+///
+/// Under `planar` it does nothing and returns `false`.
+fn portal_water_ssr_hook(app: &mut App) -> bool {
+    let ssr = app
+        .world()
+        .get_resource::<crate::config::EngineConfig>()
+        .is_some_and(|config| {
+            config.water_reflection_mode == crate::config::WaterReflectionMode::Ssr
+        });
+    if ssr {
+        app.add_systems(
+            PostUpdate,
+            feed_water_ssr_sky.before(crate::water_ssr::WaterSsrSystems::Mark),
+        );
+    }
+    ssr
+}
+
+/// Part of [`portal_water_ssr_hook`]: copies each camera's sky palette to the component the
+/// screen-space reflection reads, writing only when it changed.
+fn feed_water_ssr_sky(
+    mut commands: Commands,
+    cameras: Query<(
+        Entity,
+        &crate::sky_dome::CameraSky,
+        Option<&crate::water_ssr::WaterSsrSky>,
+    )>,
+) {
+    for (camera, sky, current) in &cameras {
+        let wanted = crate::water_ssr::WaterSsrSky {
+            palette: sky.palette,
+        };
+        if current != Some(&wanted) {
+            commands.entity(camera).insert(wanted);
+        }
+    }
+}
+
 /// The streamed world camera, never the reflection camera.
 type WaterReflectionObserver = (
     With<crate::world::components::StreamingCamera>,
@@ -1221,6 +1313,12 @@ type WaterSurfaceView = (
     Option<&'static InheritedVisibility>,
 );
 
+/// The portal's camera, read for whether it draws this frame.
+type PortalCameraFilter = (
+    With<crate::portal::PortalCamera>,
+    Without<WaterReflectionCamera>,
+);
+
 /// Fills the reflection camera's [`ViewDemand`] for this frame.
 ///
 /// It picks the water surface nearest the observer for the mirror plane, tests the surfaces against
@@ -1237,6 +1335,7 @@ fn prepare_water_reflection(
     mut commands: Commands,
     main_camera: Query<WaterReflectionObserverView, WaterReflectionObserver>,
     water: Query<WaterSurfaceView, With<crate::world::components::WaterSurface>>,
+    portal_cameras: Query<&Camera, PortalCameraFilter>,
     mut reflection_camera: Query<
         (Entity, &mut ViewDemand, Option<&mut Exposure>),
         With<WaterReflectionCamera>,
@@ -1272,6 +1371,7 @@ fn prepare_water_reflection(
     // Keep both views in the same domain, including explicit diagnostic exposure changes.
     let ev100 = exposure.map_or(DEFAULT_SCENE_EV100, |value| value.ev100);
     let main_layers = main_layers.cloned().unwrap_or_default();
+    let portal_drawn = portal_cameras.iter().any(|camera| camera.is_active);
     // The frustum is built from the pose the observer stands in *now*, not from the one Bevy kept
     // in step with it at the end of the previous frame: a fast turn or a teleport otherwise leaves
     // the gate deciding against a view the camera has already left.
@@ -1284,7 +1384,7 @@ fn prepare_water_reflection(
     let mut mirror_distance = f32::INFINITY;
     let mut surface_in_view = false;
     for (entity, surface, bounds, layers, visibility) in &water {
-        let Some(seen_by) = water_drawn_by(layers, visibility, &main_layers) else {
+        let Some(seen_by) = water_drawn_by(layers, visibility, &main_layers, portal_drawn) else {
             // Water no camera draws - a pre-streamed exterior's river behind a shut house door -
             // neither fixes the mirror plane nor keeps the reflection rendering.
             continue;
@@ -1299,6 +1399,9 @@ fn prepare_water_reflection(
             WaterSeenBy::Main => {
                 water_plane_in_view(&observer_pose, frustum.as_ref(), far, &surface, bounds)
             }
+            // The destination is laid out behind the portal's window, not in the main camera's
+            // view, so the main frustum says nothing about it: drawn by the portal is enough.
+            WaterSeenBy::Portal => true,
         };
     }
 
@@ -1341,6 +1444,8 @@ fn prepare_water_reflection(
 enum WaterSeenBy {
     /// The main camera: the plane is on one of its layers.
     Main,
+    /// The portal camera, which draws the destination's cells while a doorway is open.
+    Portal,
 }
 
 /// Whether any camera that samples the water reflection draws this plane, and which one.
@@ -1358,6 +1463,7 @@ fn water_drawn_by(
     layers: Option<&RenderLayers>,
     visibility: Option<&InheritedVisibility>,
     main_layers: &RenderLayers,
+    portal_drawn: bool,
 ) -> Option<WaterSeenBy> {
     if visibility.is_some_and(|visibility| !visibility.get()) {
         return None;
@@ -1365,6 +1471,10 @@ fn water_drawn_by(
     let layers = layers.cloned().unwrap_or_default();
     if layers.intersects(main_layers) {
         Some(WaterSeenBy::Main)
+    } else if portal_drawn
+        && layers.intersects(&RenderLayers::layer(crate::portal::DESTINATION_LAYER))
+    {
+        Some(WaterSeenBy::Portal)
     } else {
         None
     }
@@ -1457,18 +1567,295 @@ fn reflected_camera_transform(main: &GlobalTransform, water_y: f32) -> Transform
     Transform::from_translation(position).looking_to(forward, Vec3::Y)
 }
 
+/// The core material extension (the one `main`'s converter writes): shader family, flags and the
+/// auxiliary texture slots.
+const OPEN_SKYRIM_MATERIAL_EXTENSION: &str = "OPEN_SKYRIM_material";
+/// The data-set extension `mudcrab.material` (`crates/converter/src/material.rs`): the static UV
+/// transform (`uvOffset`, `uvScale`), the effect falloff keys and the two `NiAlphaProperty` blend
+/// factors under `blendSource` and `blendDestination` that glTF's own `BLEND` cannot express,
+/// spelled as nif.xml's `AlphaFunction`. A mesh without it has identity UVs, no falloff and the
+/// default blend.
 const MUDCRAB_MATERIAL_EXTENSION: &str = "MUDCRAB_material";
+/// A material's animated shader values (`crate::material_animation`).
 const MATERIAL_ANIMATION_EXTENSION: &str = "OPEN_SKYRIM_material_animation";
 
+/// A source or destination blend factor of `NiAlphaProperty` (nif.xml's `AlphaFunction`), which is
+/// what the extension publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlendFactor {
+    One,
+    Zero,
+    SourceColor,
+    InverseSourceColor,
+    DestinationColor,
+    InverseDestinationColor,
+    SourceAlpha,
+    InverseSourceAlpha,
+    DestinationAlpha,
+    InverseDestinationAlpha,
+    SourceAlphaSaturate,
+}
+
+impl BlendFactor {
+    /// The factor a published name stands for, or `None` for a name this engine does not know.
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "ONE" => Self::One,
+            "ZERO" => Self::Zero,
+            "SRC_COLOR" => Self::SourceColor,
+            "INV_SRC_COLOR" => Self::InverseSourceColor,
+            "DEST_COLOR" => Self::DestinationColor,
+            "INV_DEST_COLOR" => Self::InverseDestinationColor,
+            "SRC_ALPHA" => Self::SourceAlpha,
+            "INV_SRC_ALPHA" => Self::InverseSourceAlpha,
+            "DEST_ALPHA" => Self::DestinationAlpha,
+            "INV_DEST_ALPHA" => Self::InverseDestinationAlpha,
+            "SRC_ALPHA_SATURATE" => Self::SourceAlphaSaturate,
+            _ => return None,
+        })
+    }
+}
+
+/// What a pair of blend factors renders as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlendInterpretation {
+    /// `SRC_ALPHA`/`ONE` and `ONE`/`ONE`: the surface's colour adds to the frame - the glow cards
+    /// of torches, braziers and Dwemer lanterns.
+    Additive,
+    /// `DEST_COLOR`/`ZERO` and `ZERO`/`SRC_COLOR`: the surface multiplies the frame behind it.
+    Multiplicative,
+    /// `SRC_ALPHA`/`INV_SRC_ALPHA`, which is exactly what glTF `BLEND` already renders.
+    StraightAlpha,
+    /// A pair neither glTF nor Bevy's material has a mode for: the material stays alpha-over, and
+    /// the pair is reported once.
+    Unsupported,
+}
+
+impl BlendInterpretation {
+    fn of(source: BlendFactor, destination: BlendFactor) -> Self {
+        match (source, destination) {
+            (BlendFactor::SourceAlpha, BlendFactor::One) | (BlendFactor::One, BlendFactor::One) => {
+                Self::Additive
+            }
+            (BlendFactor::DestinationColor, BlendFactor::Zero)
+            | (BlendFactor::Zero, BlendFactor::SourceColor) => Self::Multiplicative,
+            (BlendFactor::SourceAlpha, BlendFactor::InverseSourceAlpha) => Self::StraightAlpha,
+            _ => Self::Unsupported,
+        }
+    }
+
+    fn alpha_mode(self) -> AlphaMode {
+        match self {
+            Self::Additive => AlphaMode::Add,
+            Self::Multiplicative => AlphaMode::Multiply,
+            Self::StraightAlpha | Self::Unsupported => AlphaMode::Blend,
+        }
+    }
+}
+
+/// The blend pairs already reported, so a model whose shapes share one unmatched pair reports it
+/// once instead of once per material.
+static UNMATCHED_BLEND_PAIRS: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
+
+fn report_unmatched_blend_pair(source: &str, destination: &str) {
+    let mut reported = UNMATCHED_BLEND_PAIRS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if reported.insert((source.to_owned(), destination.to_owned())) {
+        warn!(
+            blend_source = %source,
+            blend_destination = %destination,
+            "the published `NiAlphaProperty` blend factors are not one this engine knows; the material keeps straight alpha-over"
+        );
+    }
+}
+
+/// The two blend factors a material's `MUDCRAB_material` extension publishes, as the converter
+/// spelled them. The converter writes both together, and only for a material it published as glTF
+/// `BLEND`, so a pair here always means a surface glTF's `BLEND` would draw wrong.
+fn published_blend_pair(extension: Option<&serde_json::Value>) -> Option<(&str, &str)> {
+    let extension = extension?;
+    let source = extension.get("blendSource")?.as_str()?;
+    let destination = extension.get("blendDestination")?.as_str()?;
+    Some((source, destination))
+}
+
+/// The alpha mode a loaded material's blend pair asks for, or `None` for a material that publishes
+/// no pair the engine acts on - no pair at all, a pair with a name it does not know, or a pair it
+/// cannot express, both of which are reported once and left as alpha-over.
+fn skyrim_alpha_mode(
+    material: &bevy::gltf::gltf::Material,
+    material_extensions: bool,
+) -> Option<AlphaMode> {
+    if !material_extensions {
+        return None;
+    }
+    let (source, destination) =
+        published_blend_pair(material.extension_value(MUDCRAB_MATERIAL_EXTENSION))?;
+    let factors = BlendFactor::from_name(source).zip(BlendFactor::from_name(destination));
+    let Some((source_factor, destination_factor)) = factors else {
+        report_unmatched_blend_pair(source, destination);
+        return None;
+    };
+    match BlendInterpretation::of(source_factor, destination_factor) {
+        BlendInterpretation::Unsupported => {
+            report_unmatched_blend_pair(source, destination);
+            None
+        }
+        interpretation => Some(interpretation.alpha_mode()),
+    }
+}
+
+/// The emissive a streamed material is published with: its colour channels at the engine's scale,
+/// its alpha kept.
+///
+/// The alpha is not the glow's to scale. A `StandardMaterial`'s emissive carries an alpha that a
+/// `Blend` surface uses as coverage, and `LinearRgba * f32` would scale it with the rest: an alpha
+/// of `1.0` would come out at `EMISSIVE_EXPOSURE`, and one of `0.0` would stay black however bright
+/// the scale is.
+///
+/// `app.rs` builds the canonical emissive fixture with this function too, so the fixture is what a
+/// converted glow looks like rather than a magnitude of its own.
+pub(crate) fn exposed_emissive(emissive: LinearRgba) -> LinearRgba {
+    LinearRgba::new(
+        emissive.red * EMISSIVE_EXPOSURE,
+        emissive.green * EMISSIVE_EXPOSURE,
+        emissive.blue * EMISSIVE_EXPOSURE,
+        emissive.alpha,
+    )
+}
+
+/// Whether a streamed material carries a *deliberate glow* - one this engine has to bring up to its
+/// own lighting scale - or an emissive that is a surface's own brightness and must stay where the
+/// converter put it.
+///
+/// The line is `KHR_materials_emissive_strength`, which the converter publishes only for a NIF whose
+/// emissive multiple is above 1 (`crates/converter/src/material.rs`, `publish_emissive`), and the two
+/// classes it separates behave completely differently in this engine:
+///
+/// * **Above 1: an emitter.** `blackreachgiantmushroom01`'s caps (2.0 to 3.6), the `BlackreachSun01`
+///   orb (3.0), a torch's flame card (3.0). These read as small lights, and against an ambient of
+///   650 to 800 - and light pools 10 times *that* (`crate::lights::LIGHT_EXPOSURE`) - a published emissive of 2 to
+///   3.6 is invisible: nothing renders it (`docs/research/visual-gaps-spec.md`, gap 1).
+/// * **Exactly 1: a self-lit surface.** `emissiveFactor [1, 1, 1]` with the glow slot holding the
+///   model's own diffuse texture - Skyrim's `SLSF1_Own_Emit`, which the snow-covered trees, the ice
+///   of the Alftand ravine and the landscape ice all carry. Skyrim uses it to keep a surface from
+///   going dark where the light leaves it, it is already the brightness the game gives it, and it is
+///   not this handler's to change.
+///
+/// Scaling the second class as well is not a smaller or larger version of the same fix: the first
+/// attempt at this scaled both, and at 1000 the ice of the Alftand ravine rendered white and a
+/// daylight reference pose went from 0.01 % to 45 % of its pixels clipped, while the value that
+/// holds that guard leaves the emitters of Tamriel untouched.
+/// The brightest a deliberate glow's channel is drawn at, after [`EMISSIVE_EXPOSURE`].
+///
+/// Past about 93 the tonemapper's lookup table has one cell for everything, so a glow whose channels
+/// all exceed it is drawn the same white whatever its colour: Blackreach's cyan mushroom caps
+/// (published `[0.42, 1.98, 2.0]`, x100) and hanging strands (`[2.26, 3.59, 3.6]`) burnt out
+/// (research-172, look-gaps item 8). 45 keeps the brightest channel a cell below, the others in
+/// proportion. Measured 2026-09-24: Blackreach's three shots 1.33 -> 1.14 (flat white 11.5 % ->
+/// 6.4 % on the worst), the exterior holdout 0.740 -> 0.724, interiors unchanged (0.658 -> 0.662).
+pub const GLOW_PEAK_CEILING: f32 = 45.0;
+
+/// A glow scaled down, colour kept, so its brightest channel is at most [`GLOW_PEAK_CEILING`].
+pub(crate) fn capped_glow(emissive: LinearRgba) -> LinearRgba {
+    let peak = emissive.red.max(emissive.green).max(emissive.blue);
+    if peak <= GLOW_PEAK_CEILING {
+        return emissive;
+    }
+    let scale = GLOW_PEAK_CEILING / peak;
+    LinearRgba::new(
+        emissive.red * scale,
+        emissive.green * scale,
+        emissive.blue * scale,
+        emissive.alpha,
+    )
+}
+
+fn is_deliberate_glow(gltf_material: &bevy::gltf::gltf::Material) -> bool {
+    gltf_material
+        .emissive_strength()
+        .is_some_and(|strength| strength > 1.0)
+}
+
+/// The material a streamed Skyrim material is published as: its blend pair's `AlphaMode` (when it
+/// publishes one the engine can act on) and, for the deliberate glows, its emissive at the engine's
+/// scale. `None` when the material is already what it should be, so nothing is republished for
+/// nothing.
+fn skyrim_material(
+    gltf_material: &bevy::gltf::gltf::Material,
+    material: &StandardMaterial,
+    material_extensions: bool,
+) -> Option<StandardMaterial> {
+    // A material with no pair this engine acts on - no extension at all, or one it cannot express -
+    // keeps the `AlphaMode` glTF's own `alphaMode` gave it: an additive glow card is the point of
+    // the pair, and the wrong guess in the other direction would veil the world.
+    let alpha_mode =
+        skyrim_alpha_mode(gltf_material, material_extensions).unwrap_or(material.alpha_mode);
+    let emissive = if is_deliberate_glow(gltf_material) {
+        capped_glow(exposed_emissive(material.emissive))
+    } else {
+        material.emissive
+    };
+    if alpha_mode == material.alpha_mode && emissive == material.emissive {
+        return None;
+    }
+    Some(StandardMaterial {
+        alpha_mode,
+        emissive,
+        ..material.clone()
+    })
+}
+
+/// Gives a streamed Skyrim material the `AlphaMode` its blend factors ask for and, for the
+/// deliberate glows, the emissive scale the engine lights its world in.
+///
+/// Bevy's own PBR material handler publishes the loaded material at `"{material_label}/std"`, the
+/// label the scene's meshes are then handed, so this handler - registered after that one - replaces
+/// the value under that label and changes nothing else about it. Without the blend half, an
+/// additive glow card (`SRC_ALPHA`/`ONE`: torch and Dwemer lantern glows) or a multiplicative
+/// surface (`ZERO`/`SRC_COLOR`) draws as ordinary alpha-over, a grey veil over the world instead of
+/// light.
+///
+/// It is registered for *every* streamed material, not only the ones with a blend pair: the
+/// materials that carry most of the game's glow publish no pair at all (the Blackreach mushroom
+/// caps are `OPAQUE` and `MASK`), so an early return on a missing pair would leave exactly those
+/// invisible - which is what it did before this handler covered every material.
+/// [`is_deliberate_glow`] is what decides which emitted values are that glow and which are a
+/// surface's own brightness.
+///
+/// It also remembers the file's textures by glTF index, because an effect material's palette is a
+/// texture no glTF material slot names: only the `OPEN_SKYRIM_material` extension points at it
+/// ([`crate::effect_palette`]).
 #[derive(Default, Clone)]
 struct SkyrimMaterialHandler {
     material_extensions: bool,
+    textures: Vec<Option<Handle<Image>>>,
+    palettes: EffectPaletteRegistry,
     animations: Option<crate::material_animation::MaterialAnimationRegistry>,
 }
 
 impl GltfExtensionHandler for SkyrimMaterialHandler {
     fn dyn_clone(&self) -> Box<dyn ErasedGltfExtensionHandler> {
         Box::new(self.clone())
+    }
+
+    fn on_root(
+        &mut self,
+        _load_context: &mut LoadContext<'_>,
+        _gltf: &bevy::gltf::gltf::Gltf,
+        _settings: &bevy::gltf::GltfLoaderSettings,
+    ) {
+        // A new file: the texture indices of the last one mean nothing here.
+        self.textures.clear();
+    }
+
+    fn on_texture(&mut self, gltf_texture: &bevy::gltf::gltf::Texture, texture: Handle<Image>) {
+        let index = gltf_texture.index();
+        if self.textures.len() <= index {
+            self.textures.resize(index + 1, None);
+        }
+        self.textures[index] = Some(texture);
     }
 
     fn on_material(
@@ -1479,18 +1866,77 @@ impl GltfExtensionHandler for SkyrimMaterialHandler {
         _material_asset: &GltfMaterial,
         material_label: &str,
     ) {
+        let label = format!("{material_label}/std");
+        // Reading the material Bevy built back out of the load context keeps every field it
+        // filled in (textures, culling, alpha cutoff, unlit flag) and lets the mode and the
+        // emissive be the only differences, which is what makes this safe to run over every
+        // streamed material.
+        let Some(material) = load_context
+            .get_labeled(&label)
+            .and_then(|asset| asset.get::<StandardMaterial>())
+            .cloned()
+        else {
+            // Once per process: this only happens if Bevy's own material handler stops publishing
+            // at this label, and then it happens for every streamed material.
+            warn_once!(
+                label = %label,
+                "a streamed material has no loaded `StandardMaterial` published for it"
+            );
+            return;
+        };
+        if let Some(palette) = effect_palette_of(
+            gltf_material,
+            &material,
+            &self.textures,
+            self.material_extensions,
+        ) {
+            self.palettes
+                .insert(format!("{}#{label}", load_context.path()), palette);
+        }
         if let Some(registry) = &self.animations
             && let Some(animation) = material_animation_of(gltf_material, self.material_extensions)
         {
-            registry.insert(
-                format!("{}#{material_label}/std", load_context.path()),
-                animation,
-            );
+            registry.insert(format!("{}#{label}", load_context.path()), animation);
         }
+        let Some(material) = skyrim_material(gltf_material, &material, self.material_extensions)
+        else {
+            return;
+        };
+        load_context.add_labeled_asset(label, material);
     }
 }
 
-/// Loader tasks may consume extension payloads only after validating the manifest capability.
+/// The [`EffectPalette`] of a greyscale-to-palette effect material, or `None` for every other
+/// material, and for one whose palette or source texture the file does not carry.
+fn effect_palette_of(
+    gltf_material: &bevy::gltf::gltf::Material,
+    material: &StandardMaterial,
+    textures: &[Option<Handle<Image>>],
+    material_extensions: bool,
+) -> Option<EffectPalette> {
+    let extension = gltf_material.extension_value(OPEN_SKYRIM_MATERIAL_EXTENSION)?;
+    let (palette_index, settings) = crate::effect_palette::palette_settings(
+        extension,
+        material_extensions
+            .then(|| gltf_material.extension_value(MUDCRAB_MATERIAL_EXTENSION))
+            .flatten(),
+        gltf_material.emissive_factor(),
+        gltf_material.emissive_strength().unwrap_or(1.0),
+        gltf_material.pbr_metallic_roughness().base_color_factor()[3],
+    )?;
+    Some(EffectPalette {
+        palette: textures.get(palette_index)?.clone()?,
+        // The emissive texture is the source; Bevy leaves it out of a material whose emissive it
+        // does not draw, and the converter publishes the same texture as the base colour's.
+        source: material
+            .emissive_texture
+            .clone()
+            .or_else(|| material.base_color_texture.clone())?,
+        settings,
+    })
+}
+
+/// Only a validated manifest capability allows the loader to consume material extension fields.
 fn material_extensions_enabled(app: &App) -> bool {
     app.world()
         .get_resource::<crate::extensions::DataSetExtensions>()
@@ -1525,8 +1971,12 @@ fn material_animation_of(
         .filter(crate::material_animation::MaterialAnimation::plays_anything)
 }
 
+/// Registers the handler after Bevy's PBR handler, capturing the data-set capability for loader
+/// tasks. Core material fields remain readable even when extension payloads are unusable.
 fn register_skyrim_material_handler(app: &mut App) {
     let material_extensions = material_extensions_enabled(app);
+    let palettes = EffectPaletteRegistry::default();
+    app.insert_resource(palettes.clone());
     let animations = material_extensions.then(|| {
         let registry = crate::material_animation::MaterialAnimationRegistry::default();
         app.insert_resource(registry.clone());
@@ -1534,7 +1984,7 @@ fn register_skyrim_material_handler(app: &mut App) {
     });
     let Some(handlers) = app.world().get_resource::<GltfExtensionHandlers>() else {
         warn!(
-            "the glTF extension handlers are unavailable; published material animations cannot be registered"
+            "the glTF extension handlers are unavailable; additive and multiplicative Skyrim materials will render as alpha-over, and no streamed emissive will reach the engine's scale"
         );
         return;
     };
@@ -1543,6 +1993,8 @@ fn register_skyrim_material_handler(app: &mut App) {
         .write_blocking()
         .push(Box::new(SkyrimMaterialHandler {
             material_extensions,
+            textures: Vec::new(),
+            palettes,
             animations,
         }));
 }
@@ -1550,9 +2002,7 @@ fn register_skyrim_material_handler(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::view_policy::ViewUpdateRate;
-
     use crate::world::cache::TerrainLayerSnapshot;
 
     #[test]
@@ -1690,22 +2140,42 @@ mod tests {
         assert!(!harness.frame().active);
     }
 
+    #[test]
+    fn terrain_reservation_observes_all_six_diffuse_and_normal_layers() {
+        let mut images = Assets::<Image>::default();
+        let handles: [Handle<Image>; 12] = std::array::from_fn(|_| images.add(Image::default()));
+        let extension = TerrainExtension {
+            layer_0: Some(handles[0].clone()),
+            layer_1: Some(handles[1].clone()),
+            layer_2: Some(handles[2].clone()),
+            layer_3: Some(handles[3].clone()),
+            layer_4: Some(handles[4].clone()),
+            layer_5: Some(handles[5].clone()),
+            normal_0: Some(handles[6].clone()),
+            normal_1: Some(handles[7].clone()),
+            normal_2: Some(handles[8].clone()),
+            normal_3: Some(handles[9].clone()),
+            normal_4: Some(handles[10].clone()),
+            normal_5: Some(handles[11].clone()),
+            ..default()
+        };
+        assert_eq!(
+            extension.image_ids().collect::<Vec<_>>(),
+            handles.iter().map(Handle::id).collect::<Vec<_>>()
+        );
+    }
     use crate::world::components::{StreamingCamera, WaterSurface};
-
     use bevy::app::Propagate;
-
     use bevy::camera::{primitives::CascadesFrusta, visibility::ViewVisibility};
-
     use bevy::image::ImageFilterMode;
-
     use bevy::light::update_directional_light_frusta;
-
     use bevy::mesh::VertexAttributeValues;
-
     use bevy::reflect::{PartialReflect, ReflectRef};
 
     const MAIN_CAMERA_FAR: f32 = 1000.0;
 
+    /// Runs `setup_water_reflection` under the given command line and returns the app and the
+    /// reflection camera it spawned.
     fn spawned_reflection_camera(args: &[&str]) -> (App, Entity) {
         let mut app = App::new();
         app.init_resource::<Assets<Image>>()
@@ -1778,6 +2248,17 @@ mod tests {
         }
     }
 
+    /// The app the cascade-limit tests drive: the limiter registered from an `EngineConfig` the way
+    /// `VercidiumRendererPlugin` registers it, Bevy's own `update_directional_light_frusta` in the
+    /// set the limiter is ordered after (`bevy_light-0.19.0/src/lib.rs:187-188`), and a sun and a
+    /// doorway sun (layer 2, out of the reflection's sight) over a main and a reflection view.
+    ///
+    /// Bevy's system is registered *after* the limiter, the way `VercidiumRendererPlugin` has it,
+    /// so the frusta the tests read are the ones the ordering edge produces. Bevy's own update
+    /// writes each light's whole frustum map from the cascade lists as they stand when it runs
+    /// (`bevy_light-0.19.0/src/directional_light.rs:239-251`), so a limiter that ran before it
+    /// would leave the reflection view with only the cascades it kept - which is what the frustum
+    /// assertions below would see.
     struct CascadeLimitApp {
         app: App,
         main: Entity,
@@ -1904,8 +2385,14 @@ mod tests {
         assert_eq!(run.frusta(run.sun, run.reflection), 4);
     }
 
+    /// The mesh bounds of the water plane streaming.rs spawns: a `Plane3d` quad a cell wide with no
+    /// thickness at all.
     const CELL_WATER_HALF_EXTENTS: Vec3 = Vec3::new(2048.0, 0.0, 2048.0);
 
+    /// The observer and the reflection camera the adapter and the policy drive, with no renderer.
+    /// The observer's pose, projection and the water surfaces are the whole input, so a headless
+    /// `App` is enough to run its frames; the reflection camera's `is_active`, pose and image are
+    /// the whole output.
     struct ReflectionHarness {
         app: App,
         main_camera: Entity,
@@ -2032,6 +2519,16 @@ mod tests {
         }
 
         /// The portal's camera, drawing this frame or not.
+        fn spawn_portal_camera(&mut self, drawing: bool) {
+            self.app.world_mut().spawn((
+                Camera {
+                    order: -2,
+                    is_active: drawing,
+                    ..default()
+                },
+                crate::portal::PortalCamera,
+            ));
+        }
 
         fn frame(&mut self) -> ReflectionFrame {
             self.app.update();
@@ -2072,6 +2569,7 @@ mod tests {
         })
     }
 
+    /// The `Frustum` `update_frusta` derives from a camera's projection and pose.
     fn main_camera_frustum(main: &Transform) -> Frustum {
         let projection = main_camera_projection();
         let global = GlobalTransform::from(*main);
@@ -2079,6 +2577,7 @@ mod tests {
         Frustum(ViewFrustum::from_clip_from_world(&clip_from_world))
     }
 
+    /// A water plane's bounds in its own space, as `calculate_bounds` leaves them on the entity.
     fn water_bounds(half_extents: Vec3) -> Aabb {
         Aabb::from_min_max(-half_extents, half_extents)
     }
@@ -2256,6 +2755,35 @@ mod tests {
         assert!(harness.frame().active);
     }
 
+    /// Inside a house with its door shut: the exterior behind the door is streamed in on the
+    /// destination layer, but the portal camera is off, so nothing draws its river.
+    #[test]
+    fn reflection_camera_stays_off_for_destination_water_while_the_portal_is_off() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        let destination = RenderLayers::layer(crate::portal::DESTINATION_LAYER);
+        harness.spawn_water_on(Vec3::new(0.0, 40.0, -800.0), destination.clone(), true);
+        assert!(!harness.frame().active, "no portal camera at all");
+        harness.spawn_portal_camera(false);
+        assert!(
+            !harness.frame().active,
+            "a portal camera that is not drawing"
+        );
+    }
+
+    /// The door opens: the portal draws the destination, and its water samples the reflection.
+    #[test]
+    fn reflection_camera_renders_destination_water_while_the_portal_draws() {
+        // Behind the main camera on purpose: the destination is laid out for the portal's window,
+        // so the main frustum must not decide it.
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        let destination = RenderLayers::layer(crate::portal::DESTINATION_LAYER);
+        harness.spawn_water_on(Vec3::new(0.0, 40.0, 5_000.0), destination, true);
+        harness.spawn_portal_camera(true);
+        assert!(harness.frame().active);
+    }
+
+    /// A cell the portal hides (no layers, hidden) keeps neither the reflection on nor the mirror
+    /// plane: the nearer hidden plane must not set the height the visible one is reflected at.
     #[test]
     fn hidden_water_neither_keeps_the_reflection_on_nor_fixes_the_mirror() {
         let main = Transform::from_xyz(0.0, 120.0, 0.0);
@@ -2392,6 +2920,58 @@ mod tests {
         );
     }
 
+    /// The spawned reflection camera switches between the shadowed and the unshadowed route as its
+    /// policy says, and on neither route reaches the source sun and the copy at once, nor the
+    /// water. (On this branch the placed objects share the world layer and are reflected, see
+    /// [`PLACED_OBJECT_LAYER`].)
+    #[test]
+    fn the_spawned_reflection_camera_follows_its_policys_shadow_route() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .add_plugins(crate::shadow_route::ShadowRoutePlugin)
+            .add_systems(Startup, setup_water_reflection);
+        app.update();
+        let camera = app
+            .world_mut()
+            .query_filtered::<Entity, With<WaterReflectionCamera>>()
+            .single(app.world())
+            .unwrap();
+        let layers = |app: &App| {
+            app.world()
+                .entity(camera)
+                .get::<RenderLayers>()
+                .cloned()
+                .unwrap()
+        };
+        let source_sun = RenderLayers::from_layers(&LIGHT_LAYERS);
+        let replica = RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER);
+
+        assert_eq!(
+            layers(&app),
+            RenderLayers::from_layers(REFLECTION_VIEW_LAYERS),
+            "the baseline policy keeps shadows on"
+        );
+        for shadows in [
+            crate::view_policy::ViewShadows::Off,
+            crate::view_policy::ViewShadows::On,
+        ] {
+            app.world_mut().entity_mut(camera).insert(ViewPolicy {
+                shadows,
+                ..ViewPolicy::baseline()
+            });
+            app.update();
+            let layers = layers(&app);
+            assert_ne!(
+                layers.intersects(&source_sun),
+                layers.intersects(&replica),
+                "{shadows:?}: the camera is on exactly one sun's route"
+            );
+            assert!(!layers.intersects(&RenderLayers::layer(WATER_LAYER)));
+            assert!(!layers.intersects(&RenderLayers::layer(crate::portal::DESTINATION_LAYER)));
+            assert!(layers.intersects(&reflectable_world_layers()));
+        }
+    }
+
     fn spawned_preset_reflection_camera(preset: WaterReflectionPreset) -> (App, Entity) {
         spawned_reflection_camera(&["--water-reflection-preset", preset.name()])
     }
@@ -2419,6 +2999,9 @@ mod tests {
         );
     }
 
+    /// The reflection cost flags still shape the camera under a preset: the prepass brings
+    /// occlusion culling back on the baseline camera, never on the throttled water one, and the
+    /// scale applies to whichever size the preset starts from.
     #[test]
     fn the_reflection_flags_apply_on_top_of_the_preset() {
         let (app, camera) = spawned_reflection_camera(&[
@@ -2448,6 +3031,114 @@ mod tests {
         assert_eq!(camera.get::<ViewPolicy>().unwrap().target_size, half);
     }
 
+    /// The replica layer is a layer of its own on this branch too: not the water's, not the
+    /// portal destination's and not the door layer's. Content carries it *beside* the world layer,
+    /// not instead of it, so no view gains or loses a thing from either route's membership.
+    #[test]
+    fn the_replica_layer_is_no_other_layer() {
+        for layer in [
+            WORLD_LAYER,
+            WATER_LAYER,
+            crate::portal::DESTINATION_LAYER,
+            crate::door_layer::DOOR_LAYER,
+        ] {
+            assert_ne!(UNSHADOWED_REFLECTION_LAYER, layer);
+        }
+        assert!(
+            !RenderLayers::from_layers(&MAIN_VIEW_LAYERS)
+                .intersects(&RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER)),
+            "the main camera is never on the replica layer"
+        );
+        let world = reflectable_world_layers();
+        assert!(world.intersects(&RenderLayers::layer(WORLD_LAYER)));
+        assert!(world.intersects(&RenderLayers::layer(UNSHADOWED_REFLECTION_LAYER)));
+        // Widening is a union: what a node was already on stays on it.
+        for own in [
+            RenderLayers::layer(WORLD_LAYER),
+            RenderLayers::from_layers(&MAIN_VIEW_LAYERS),
+            crate::door_layer::door_layers(),
+            RenderLayers::none(),
+            RenderLayers::layer(WATER_LAYER),
+            RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+        ] {
+            let widened = reflectable_layers(&own);
+            for layer in own.iter() {
+                assert!(
+                    widened.intersects(&RenderLayers::layer(layer)),
+                    "widening dropped layer {layer} of {own:?}"
+                );
+            }
+        }
+    }
+
+    /// The shadowless route draws the same content the shadowed one does - only without the sun's
+    /// cascades. Every kind of content the world layer holds is here with whether a reflection draws
+    /// it at all, and both routes have to agree: a route whose membership is smaller is a cheaper
+    /// reflection bought by dropping content (impl-1094: the portal stamped its cells with the world
+    /// layer alone, so the shadowless route drew terrain only).
+    #[test]
+    fn both_reflection_routes_draw_the_same_content() {
+        let shadowed = RenderLayers::from_layers(REFLECTION_VIEW_LAYERS);
+        let shadowless = RenderLayers::from_layers(UNSHADOWED_REFLECTION_VIEW_LAYERS);
+        let producers: [(&str, RenderLayers, bool); 8] = [
+            (
+                "terrain and the plain nodes of a cell",
+                reflectable_world_layers(),
+                true,
+            ),
+            (
+                "a reference's model on the placed-object layer",
+                reflectable_layers(&RenderLayers::layer(PLACED_OBJECT_LAYER)),
+                false,
+            ),
+            (
+                "a node a mod put on the world layer",
+                reflectable_layers(&RenderLayers::layer(WORLD_LAYER)),
+                true,
+            ),
+            (
+                "a light's own layers",
+                RenderLayers::from_layers(&POINT_LIGHT_LAYERS),
+                true,
+            ),
+            (
+                "a sky dome on the main camera's layers",
+                reflectable_layers(&RenderLayers::from_layers(&MAIN_VIEW_LAYERS)),
+                true,
+            ),
+            (
+                "the door layer's doors",
+                crate::door_layer::door_layers(),
+                true,
+            ),
+            ("a water surface", RenderLayers::layer(WATER_LAYER), false),
+            (
+                "the portal's destination space",
+                RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+                false,
+            ),
+        ];
+        for (what, layers, drawn) in producers {
+            assert_eq!(
+                layers.intersects(&shadowed),
+                drawn,
+                "the shadowed route and {what}: {layers:?}"
+            );
+            assert_eq!(
+                layers.intersects(&shadowless),
+                drawn,
+                "the shadowless route and {what}: {layers:?} - the two routes must draw the same \
+                 content"
+            );
+        }
+        // Non-vacuous: the content a reflection is supposed to show is drawn by both, so the
+        // agreement above is not two routes agreeing on nothing.
+        assert!(reflection_draws_a_whole_world());
+    }
+
+    /// Whether the shadowed reflection view draws the world layer at all - the fixture check the
+    /// parity test above needs, kept in one place so a change to [`REFLECTION_VIEW_LAYERS`] that
+    /// emptied it would fail the test that leans on it rather than making it vacuous.
     fn reflection_draws_a_whole_world() -> bool {
         RenderLayers::from_layers(REFLECTION_VIEW_LAYERS).intersects(&reflectable_world_layers())
     }
@@ -2524,6 +3215,141 @@ mod tests {
         }
     }
 
+    /// A spawned reflection camera, a main camera and a plane in front of it, run for a few frames
+    /// under this configuration; every frame's `is_active` of the reflection camera.
+    fn reflection_activity_under(config: crate::config::EngineConfig) -> Vec<bool> {
+        let mut app = App::new();
+        app.init_resource::<ProfilingState>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Time>()
+            .insert_resource(config)
+            .insert_resource(crate::streaming::RenderOrigin(IVec2::ZERO))
+            .insert_resource(crate::sky::CameraSpace::Exterior)
+            .add_plugins(crate::view_policy::SecondaryViewPolicyPlugin)
+            .add_systems(Startup, setup_water_reflection);
+        // As `VercidiumRendererPlugin` registers it: the hook decides whether the planar
+        // preparation is in the schedule at all.
+        let planar_replaced = portal_water_ssr_hook(&mut app);
+        app.add_systems(
+            PostUpdate,
+            prepare_water_reflection
+                .in_set(ViewPolicySystems::Prepare)
+                .run_if(move || !planar_replaced),
+        );
+        let observer = Transform::from_xyz(0.0, 120.0, 0.0);
+        app.world_mut().spawn((
+            observer,
+            GlobalTransform::from(observer),
+            main_camera_projection(),
+            StreamingCamera,
+        ));
+        let water = Vec3::new(0.0, 40.0, -800.0);
+        app.world_mut().spawn((
+            Transform::from_translation(water),
+            GlobalTransform::from_translation(water),
+            water_bounds(CELL_WATER_HALF_EXTENTS),
+            WaterSurface,
+        ));
+        (0..5)
+            .map(|_| {
+                app.update();
+                let world = app.world_mut();
+                let mut cameras = world.query_filtered::<&Camera, With<WaterReflectionCamera>>();
+                cameras.single(world).unwrap().is_active
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ssr_never_demands_or_activates_the_reflection_camera() {
+        use crate::config::{EngineConfig, WaterReflectionMode};
+        for preset in [
+            WaterReflectionPreset::Baseline,
+            WaterReflectionPreset::Water,
+        ] {
+            let activity = reflection_activity_under(EngineConfig {
+                water_reflection_mode: WaterReflectionMode::Ssr,
+                water_reflection_preset: preset,
+                ..default()
+            });
+            assert_eq!(
+                activity, [false; 5],
+                "water is in view, but --water-reflection ssr marches the screen instead ({preset:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn planar_still_demands_the_reflection_camera_when_water_is_in_view() {
+        use crate::config::{EngineConfig, WaterReflectionMode};
+        let planar = reflection_activity_under(EngineConfig {
+            water_reflection_mode: WaterReflectionMode::Planar,
+            ..default()
+        });
+        assert!(planar.iter().all(|active| *active), "{planar:?}");
+        // The Plus default is ssr, so a run with no flag never demands the reflection camera.
+        let default_run = reflection_activity_under(EngineConfig::default());
+        assert_eq!(default_run, [false; 5], "{default_run:?}");
+    }
+
+    #[test]
+    fn the_portal_hook_hands_each_cameras_sky_to_the_water_module_only_under_ssr() {
+        use crate::{
+            config::{EngineConfig, WaterReflectionMode},
+            sky::SkyPalette,
+            sky_dome::CameraSky,
+            water_ssr::WaterSsrSky,
+        };
+        for mode in [WaterReflectionMode::Ssr, WaterReflectionMode::Planar] {
+            let mut app = App::new();
+            app.insert_resource(EngineConfig {
+                water_reflection_mode: mode,
+                ..default()
+            });
+            let replaced = portal_water_ssr_hook(&mut app);
+            assert_eq!(replaced, mode == WaterReflectionMode::Ssr);
+            let palette = SkyPalette::SKYRIM_CLEAR_DAY;
+            let sky = app
+                .world_mut()
+                .spawn(CameraSky {
+                    palette: Some(palette),
+                })
+                .id();
+            let none = app.world_mut().spawn(CameraSky { palette: None }).id();
+            app.update();
+            let fed = |entity| app.world().get::<WaterSsrSky>(entity).copied();
+            if replaced {
+                assert_eq!(
+                    fed(sky),
+                    Some(WaterSsrSky {
+                        palette: Some(palette)
+                    })
+                );
+                assert_eq!(fed(none), Some(WaterSsrSky { palette: None }));
+            } else {
+                assert_eq!(fed(sky), None, "planar hands the water module nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn ssr_leaves_the_reflection_camera_spawned_but_off() {
+        // The camera, its image and its policy exist exactly as under planar (the material still
+        // binds the image), so `--water-reflection-preset` is simply not consulted for a demand.
+        let mut app = App::new();
+        app.init_resource::<Assets<Image>>()
+            .insert_resource(crate::config::EngineConfig {
+                water_reflection_mode: crate::config::WaterReflectionMode::Ssr,
+                ..default()
+            });
+        app.add_systems(Startup, setup_water_reflection);
+        app.update();
+        let world = app.world_mut();
+        let mut cameras = world.query_filtered::<&Camera, With<WaterReflectionCamera>>();
+        assert!(!cameras.single(world).unwrap().is_active);
+        assert!(world.get_resource::<WaterReflectionTexture>().is_some());
+    }
+
     #[test]
     fn reflection_renders_with_the_observer_projection() {
         let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
@@ -2598,6 +3424,58 @@ mod tests {
         assert!(!harness.frame().active, "nothing is left to mirror");
     }
 
+    /// A cell whose four quadrants each carry a base layer and one overlay with the same `VTXT`
+    /// list, so a weight measured in one quadrant can be compared with its neighbour's.
+    fn overlay_fixture(cell_id: u32, overlay: Vec<(u16, f32)>) -> TerrainSnapshot {
+        let layers = (0..4)
+            .flat_map(|quadrant| {
+                [
+                    TerrainLayerSnapshot {
+                        texture_form_id: 1,
+                        quadrant,
+                        layer: 0,
+                        is_base: true,
+                        weights: Vec::new(),
+                    },
+                    TerrainLayerSnapshot {
+                        texture_form_id: 7,
+                        quadrant,
+                        layer: 1,
+                        is_base: false,
+                        weights: overlay.clone(),
+                    },
+                ]
+            })
+            .collect();
+        TerrainSnapshot {
+            cell_id,
+            width: 33,
+            height: 33,
+            heights: vec![0.0; 33 * 33],
+            normals: [0, 0, 127].repeat(33 * 33),
+            vertex_colors: vec![255; 33 * 33 * 3],
+            layers,
+            water_height: None,
+            water_type_form_id: None,
+        }
+    }
+
+    /// The VTXT list of an overlay that has full weight on both of a quadrant's x edge columns and
+    /// none in between, so the samples one column inside an edge differ from the edge itself.
+    fn edge_columns_overlay() -> Vec<(u16, f32)> {
+        (0..QUADRANT_WEIGHT_SAMPLES as u16)
+            .flat_map(|y| [0u16, 16].map(move |x| (y * 17 + x, 1.0)))
+            .collect()
+    }
+
+    /// `terrain.wgsl`'s cell uv to quadrant-local uv, for the quadrant at `origin`.
+    fn quadrant_uv(cell_uv: [f32; 2], origin: [f32; 2]) -> [f32; 2] {
+        [cell_uv[0] * 2.0 - origin[0], cell_uv[1] * 2.0 - origin[1]]
+    }
+
+    /// The weight a fragment receives, mirroring `grid_point` and `grid_weight` in `terrain.wgsl`:
+    /// the quadrant-local coordinate clamped onto the 17x17 sample square, then read bilinearly,
+    /// clamped at the quadrant's edge.
     fn shader_weight(settings: &TerrainSettings, overlay: usize, local_uv: [f32; 2]) -> f32 {
         let last = (QUADRANT_WEIGHT_SAMPLES - 1) as f32;
         let sample = |x: usize, y: usize| -> f32 {
@@ -2622,6 +3500,7 @@ mod tests {
         top * (1.0 - blend[1]) + bottom * blend[1]
     }
 
+    /// The value of a `const NAME: u32 = <n>u;` declaration in `terrain.wgsl`.
     fn shader_constant(source: &str, name: &str) -> usize {
         let declaration = format!("const {name}: u32 = ");
         let rest = source
@@ -2634,6 +3513,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("`{declaration}` is not followed by a number: {rest}"))
     }
 
+    /// The element count of a `field: array<vec4<f32>, <n>>` declaration in `terrain.wgsl`.
     fn shader_array_length(source: &str, field: &str) -> usize {
         let declaration = format!("{field}: array<vec4<f32>, ");
         let rest = source
@@ -2646,6 +3526,8 @@ mod tests {
             .unwrap_or_else(|_| panic!("`{declaration}` is not followed by a number: {rest}"))
     }
 
+    /// The field names of `struct NAME { .. }` in `terrain.wgsl`, in declaration order, so the
+    /// uniform's layout can be compared with the Rust struct that is written into it.
     fn shader_struct_fields(source: &str, name: &str) -> Vec<String> {
         let body = source
             .split_once(&format!("struct {name} {{"))
@@ -2666,6 +3548,8 @@ mod tests {
             .collect()
     }
 
+    /// The expression a `const NAME: u32 = <expression>;` declaration in `terrain.wgsl` holds, so a
+    /// constant derived from another is read as the shader writes it.
     fn shader_constant_expression<'a>(source: &'a str, name: &str) -> &'a str {
         let declaration = format!("const {name}: u32 = ");
         source
@@ -2678,6 +3562,8 @@ mod tests {
             .trim()
     }
 
+    /// The body of `fn NAME(..) { <body> }` in `terrain.wgsl`, for the helpers whose whole body is
+    /// the arithmetic under test.
     fn shader_function_body<'a>(source: &'a str, name: &str) -> &'a str {
         source
             .split_once(&format!("fn {name}("))
@@ -2691,6 +3577,7 @@ mod tests {
             .0
     }
 
+    /// `source` without its whitespace, so a pinned expression survives a reformat of the file.
     fn without_whitespace(source: &str) -> String {
         source
             .chars()
@@ -2698,6 +3585,10 @@ mod tests {
             .collect()
     }
 
+    /// The value of one of `terrain.wgsl`'s `u32` expressions over the named `terms`: `+`, `-`, `*`,
+    /// `/`, `%`, parentheses, literals with their `u` suffix, and identifiers. This runs the
+    /// shader's own arithmetic rather than a copy of it, which is the only way a test can notice a
+    /// transposed index - a copy of the expression transposes with it.
     fn evaluate_u32(expression: &str, terms: &[(&str, u32)]) -> u32 {
         /// The expression left to read, and what the shader's identifiers stand for.
         struct Parser<'a> {
@@ -2832,6 +3723,8 @@ mod tests {
         assert!(reflected.forward().y < 0.0);
     }
 
+    /// Whether a world point is inside the reflection camera's clipped view (reverse-z, so a point
+    /// in front of the near or oblique clip plane has `z > w`).
     fn in_reflection_view(lens: &PerspectiveProjection, camera: &Transform, point: Vec3) -> bool {
         use bevy::camera::CameraProjection;
         let view = camera.compute_affine().inverse().transform_point3(point);
@@ -2926,6 +3819,11 @@ mod tests {
         assert_eq!(lens.far, main_lens.far);
     }
 
+    /// The reflection pass is what costs 1.72 ms of a 4.41 ms frame at the rural cell, because it
+    /// redraws every placed object; the camera must be spawned on the world layer alone. Asserting
+    /// on the spawned camera rather than on the constant keeps the two from drifting apart.
+    /// Stock full-detail objects and water stay outside the reflected LOD world. Seamless cells
+    /// use their explicit role layers; they do not change the stock placed-object contract.
     #[test]
     fn the_reflection_camera_renders_the_world_layer_only() {
         let mut app = App::new();
@@ -2945,6 +3843,9 @@ mod tests {
         assert!(!layers.intersects(&PLACED_OBJECT_RENDER_LAYERS));
     }
 
+    /// The other half of the contract: the main camera is what still draws the placed objects and
+    /// the water, so a new layer has to be added to its list and not only taken out of the
+    /// reflection camera's.
     #[test]
     fn the_main_view_renders_every_layer() {
         let main_view = RenderLayers::from_layers(&MAIN_VIEW_LAYERS);
@@ -2953,6 +3854,9 @@ mod tests {
         assert!(main_view.intersects(&PLACED_OBJECT_RENDER_LAYERS));
     }
 
+    /// A light needs the world layer for both cameras and the placed-object layer for its shadow
+    /// cascades: `check_dir_light_mesh_visibility` only collects casters that share a layer with
+    /// the light.
     #[test]
     fn lights_cover_both_cameras_and_the_placed_objects() {
         let light = RenderLayers::from_layers(&POINT_LIGHT_LAYERS);
@@ -2982,6 +3886,9 @@ mod tests {
         )));
     }
 
+    /// A point light is a child of its placed-object reference, whose layer propagates down the
+    /// hierarchy; the light must keep [`POINT_LIGHT_LAYERS`] anyway, or it stops lighting the terrain
+    /// and the reflection view.
     #[test]
     fn a_light_below_a_reference_keeps_the_light_layers() {
         let mut app = App::new();
@@ -3007,6 +3914,9 @@ mod tests {
         );
     }
 
+    /// The propagation has to be in place before visibility compares layers, and the meshes it
+    /// carries arrive from the glb spawner in `SpawnScene` - between `Update` and `PostUpdate`. A
+    /// descendant spawned after its reference must still inherit the layer in that same frame.
     #[test]
     fn a_descendant_spawned_after_its_reference_inherits_the_placed_object_layer() {
         let mut app = App::new();
@@ -3035,6 +3945,9 @@ mod tests {
         }
     }
 
+    /// The waves read the shared `globals.time_unwrapped`, so a frame in which only time advanced must not
+    /// touch a water material: any write marks the asset modified, and Bevy then re-extracts and
+    /// re-prepares its bind group, once per streamed water cell, every frame.
     #[test]
     fn advancing_time_leaves_water_materials_unmodified() {
         use bevy::time::TimeUpdateStrategy;
@@ -3095,6 +4008,8 @@ mod tests {
         );
     }
 
+    /// An unchanged pose and active flag are not written, so the reflection camera is not marked
+    /// changed on every still frame.
     #[test]
     fn a_still_view_does_not_rewrite_the_reflection_camera() {
         let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 50.0, 0.0));
@@ -3114,6 +4029,10 @@ mod tests {
         assert_eq!(ticks(&harness), settled);
     }
 
+    /// The water uniform is written in the Rust struct's declaration order and read in the WGSL
+    /// struct's, so the two lists of fields must be the same, name for name. A reorder on one side
+    /// only makes every water read another field's values (the clock arriving in the fresnel
+    /// slot froze the waves and lost the reflection).
     #[test]
     fn water_settings_fields_match_the_shader_struct() {
         use bevy::reflect::structs::Struct;
@@ -3137,6 +4056,43 @@ mod tests {
         assert_eq!(rust_fields, shader_fields);
     }
 
+    /// Bevy declares the view's fog binding only for a view that has `DistanceFog`, and a measured
+    /// run installs no atmosphere, so its main camera has none. The screen-space reflection water
+    /// must compile both ways: a water pipeline that fails never draws, so the world never counts
+    /// as ready (the fly-fast route waited 400 s at its first waypoint, 2026-10-20).
+    #[test]
+    fn the_ssr_water_shader_compiles_with_and_without_fog() {
+        use crate::far_terrain_shadows::{bindings_audit::add, lighting_tests};
+        use naga_oil::compose::{
+            Composer, NagaModuleDescriptor, ShaderDefValue, get_preprocessor_data,
+        };
+
+        let source = include_str!("shaders/water.wgsl");
+        let sources = lighting_tests::sources();
+        for fog in [true, false] {
+            let mut defs = lighting_tests::defs(false, 4, &["WATER_SSR", "DEPTH_PREPASS"]);
+            defs.insert("WATER_SSR_LINEAR_STEPS".into(), ShaderDefValue::UInt(24));
+            defs.insert("WATER_SSR_BISECTION_STEPS".into(), ShaderDefValue::UInt(4));
+            if !fog {
+                defs.remove("DISTANCE_FOG");
+            }
+            let mut composer =
+                Composer::default().with_capabilities(wgpu::naga::valid::Capabilities::all());
+            for import in get_preprocessor_data(source).1 {
+                add(&import.import, &sources, &mut composer, &defs);
+            }
+            composer
+                .make_naga_module(NagaModuleDescriptor {
+                    source,
+                    file_path: "engine/shaders/water.wgsl",
+                    shader_defs: defs,
+                    ..Default::default()
+                })
+                .unwrap_or_else(|error| panic!("fog {fog}: {}", error.emit_to_string(&composer)));
+        }
+    }
+
+    /// A pinned clock gives a reproducible still, and the shared clock is the default.
     #[test]
     fn only_a_pinned_water_clock_reads_the_material_time() {
         let shared = WaterExtension::default();
@@ -3217,6 +4173,9 @@ mod tests {
         );
     }
 
+    /// The shader tiles every layer by the shared LAND repeats per cell, so the layer textures
+    /// must be sampled with a repeating address mode. Bevy's default clamps to the edge, which
+    /// stretched the textures in the frames: everything past the first tile read the edge texels.
     #[test]
     fn authored_terrain_normal_bindings_and_flags_are_preserved() {
         let mut extension = TerrainExtension::default();
@@ -3273,6 +4232,8 @@ mod tests {
         );
     }
 
+    /// Zero overlays keep material slots and weights without image requests; a nonzero LTEX
+    /// with no diffuse image still fails without preventing a subsequent placeholder build.
     #[test]
     fn terrain_zero_texture_overlay_material_preserves_slots_without_image_requests() {
         let directory = tempfile::tempdir().unwrap();
@@ -3339,6 +4300,9 @@ mod tests {
         assert!(TerrainExtension::from_quadrant(&terrain, 0, &catalog, asset_server).is_ok());
     }
 
+    /// The weight field is the quadrant's own `17x17` grids, one per overlay, in the order
+    /// `quadrant_layers` returns them: an overlay's `VTXT` list reaches the fragment stage at the
+    /// samples it names, and every sample it does not name reads as opacity 0.
     #[test]
     fn weight_field_carries_every_overlay_grid_from_the_layer_list() {
         let terrain = terrain_fixture_with_overlays(
@@ -3394,6 +4358,8 @@ mod tests {
         );
     }
 
+    /// Each quadrant reads its own origin out of the cell, so the same cell uv addresses the same
+    /// ground in every quadrant.
     #[test]
     fn quadrant_origin_places_each_quadrant_inside_the_cell() {
         let origins: Vec<[f32; 2]> = (0..4)
@@ -3413,6 +4379,9 @@ mod tests {
         );
     }
 
+    /// The weight field is only worth reading where there are overlays to read. A quadrant whose only
+    /// layer is its base has none, and the packed vertex attributes carry none either, so the shader
+    /// is told to skip the field's five lookups altogether.
     #[test]
     fn weight_source_is_set_only_for_quadrants_with_overlays() {
         let grid = vec![1.0; QUADRANT_WEIGHT_SAMPLES * QUADRANT_WEIGHT_SAMPLES];
@@ -3432,6 +4401,8 @@ mod tests {
         );
     }
 
+    /// A fixture material carries the quadrant's own weight field, so the no-game-data scene draws
+    /// its overlays through the interpolation the streamed path uses instead of the packed tangent.
     #[test]
     fn fixture_materials_carry_the_quadrants_weight_field() {
         let sample = QUADRANT_WEIGHT_SAMPLES * 8 + 8;
@@ -3462,6 +4433,10 @@ mod tests {
         }
     }
 
+    /// Defect A. The overlay weight field is the quadrant's own 17x17 sample grid. A layer that is
+    /// full strength on one sample and absent on the next must reach the fragment as the linear
+    /// interpolation of the two - `0.5` halfway between them, `0.25`/`0.75` at the quarter points -
+    /// not as the sharpened `t^2` ramp the packed vertex attributes produce.
     #[test]
     fn weight_field_interpolates_linearly_between_samples() {
         let terrain = overlay_fixture(0x0001_2345, vec![(0, 1.0)]);
@@ -3510,6 +4485,10 @@ mod tests {
         }
     }
 
+    /// A coordinate outside the sample square reads the sample it is clamped onto. `grid_point`
+    /// clamps before `grid_weight` takes its blend fraction, so a coordinate an ulp below the
+    /// quadrant's west or south edge reads that edge sample rather than blending its neighbour in,
+    /// and one past the far edge reads the last sample instead of the next quadrant's.
     #[test]
     fn weight_field_clamps_coordinates_onto_the_sample_square() {
         let last = (QUADRANT_WEIGHT_SAMPLES - 1) as f32;
@@ -3528,6 +4507,9 @@ mod tests {
         assert_eq!(shader_weight(&settings, 0, [1.0, past]), 0.25);
     }
 
+    /// The uniform's Rust layout and the shader's must say the same numbers, and list the same
+    /// fields in the same order - an insertion on one side alone shifts every field after it, and
+    /// the shader then reads its neighbour's bytes.
     #[test]
     fn terrain_uniform_layout_matches_the_shader_source() {
         let source = include_str!("shaders/terrain.wgsl");
@@ -3565,6 +4547,10 @@ mod tests {
         assert_eq!(rust_fields, shader_struct_fields(source, "TerrainSettings"));
     }
 
+    /// The parts of `terrain.wgsl`'s weight arithmetic the evaluator cannot run, pinned as the
+    /// shader writes them: the two places that bound the sample grid, where a bound of
+    /// `WEIGHT_GRID_SIDE` instead of the last sample would read the next quadrant's edge texels
+    /// along this one, and the fragment's quadrant-local coordinate.
     #[test]
     fn shader_weight_field_bounds_its_grid_at_the_last_sample() {
         let source = include_str!("shaders/terrain.wgsl");
@@ -3598,6 +4584,11 @@ mod tests {
         );
     }
 
+    /// Defect A, the mechanism this replaced. `build_terrain_quadrant_mesh` still packs overlays
+    /// 1-3 into `ATTRIBUTE_TANGENT` for materials without a weight field, and Bevy re-normalizes
+    /// `world_tangent.xyz` in the vertex shader. Interpolating that carrier halfway across the
+    /// same 1.0 -> 0.0 edge yields 0.25: the sharpened ramp the user sees as hard, stair-stepped
+    /// transitions. Streamed quadrants carry the weight field above instead.
     #[test]
     fn packed_vertex_weights_sharpen_the_midpoint_to_a_quarter() {
         let terrain = overlay_fixture(0x0001_2345, vec![(0, 1.0)]);
@@ -3619,194 +4610,6 @@ mod tests {
             (reconstructed - 0.25).abs() < 0.01,
             "the packed path reads {reconstructed} where the linear weight is 0.5"
         );
-    }
-
-    #[test]
-    fn terrain_sampler_repeats_with_linear_mips_and_16x_anisotropy() {
-        let sampler = terrain_layer_sampler();
-        assert_eq!(sampler.address_mode_u, ImageAddressMode::Repeat);
-        assert_eq!(sampler.address_mode_v, ImageAddressMode::Repeat);
-        assert_eq!(sampler.mag_filter, bevy::image::ImageFilterMode::Linear);
-        assert_eq!(sampler.min_filter, bevy::image::ImageFilterMode::Linear);
-        assert_eq!(sampler.mipmap_filter, bevy::image::ImageFilterMode::Linear);
-        assert_eq!(sampler.anisotropy_clamp, 16);
-    }
-
-    #[test]
-    fn landscape_uvs_repeat_twelve_times_per_quadrant_without_scaling_weights() {
-        let terrain = terrain_fixture_with_overlays(0x12345, &[vec![(0, 1.0)]]);
-        for quadrant in 0..4 {
-            let mesh = crate::streaming::build_terrain_quadrant_mesh(&terrain, quadrant).unwrap();
-            let VertexAttributeValues::Float32x2(uvs) =
-                mesh.attribute(Mesh::ATTRIBUTE_UV_0).unwrap()
-            else {
-                panic!("UVs missing")
-            };
-            let grids = crate::streaming::quadrant_overlay_weights(&terrain, quadrant).unwrap();
-            let settings = TerrainSettings::for_quadrant(quadrant, 2, &grids);
-            let tiling = settings.tiling_and_layer_count.xy();
-            let origin = Vec2::from(uvs[0]);
-            assert_eq!(
-                (Vec2::from(uvs[16]) - origin) * tiling,
-                Vec2::new(12.0, 0.0)
-            );
-            assert_eq!(
-                (Vec2::from(uvs[272]) - origin) * tiling,
-                Vec2::new(0.0, 12.0)
-            );
-            // Blend coordinates still address the original 17x17 LAND samples.
-            let last = (Vec2::from(uvs[288]) * 2.0 - settings.quadrant_origin.xy()) * 16.0;
-            assert_eq!(last, Vec2::splat(16.0));
-        }
-    }
-
-    fn terrain_fixture_with_overlays(
-        cell_id: u32,
-        overlays: &[Vec<(u16, f32)>],
-    ) -> TerrainSnapshot {
-        let mut layers = Vec::new();
-        for quadrant in 0..4u8 {
-            layers.push(TerrainLayerSnapshot {
-                texture_form_id: 1,
-                quadrant,
-                layer: 0,
-                is_base: true,
-                weights: Vec::new(),
-            });
-            for (slot, weights) in overlays.iter().enumerate() {
-                let layer = u16::try_from(slot + 1).expect("fixture overlay count fits a u16");
-                layers.push(TerrainLayerSnapshot {
-                    texture_form_id: u32::from(layer) + 6,
-                    quadrant,
-                    layer,
-                    is_base: false,
-                    weights: weights.clone(),
-                });
-            }
-        }
-        TerrainSnapshot {
-            cell_id,
-            width: 33,
-            height: 33,
-            heights: vec![0.0; 33 * 33],
-            normals: [0, 0, 127].repeat(33 * 33),
-            vertex_colors: vec![255; 33 * 33 * 3],
-            layers,
-            water_height: None,
-            water_type_form_id: None,
-        }
-    }
-
-    #[test]
-    fn material_manifest_validity_controls_animation_installation() {
-        use crate::extensions::{
-            DataSetExtensions,
-            fixtures::{data_set, manifest},
-            read_data_extensions,
-        };
-        use crate::material_animation::{MaterialAnimationPlugin, MaterialAnimationRegistry};
-        use shared::extensions::MATERIAL;
-        for (entries, expected) in [
-            (vec![], false),
-            (vec![(MATERIAL, 1, "core")], true),
-            (vec![(MATERIAL, 1, "older")], false),
-            (vec![(MATERIAL, 2, "core")], false),
-        ] {
-            let directory = data_set(&manifest(&entries), Some("core"), &[]);
-            let data = read_data_extensions(directory.path()).unwrap();
-            let mut app = App::new();
-            app.init_resource::<GltfExtensionHandlers>();
-            app.insert_resource(DataSetExtensions::new(data));
-            install_material_animation(&mut app);
-            register_skyrim_material_handler(&mut app);
-            assert_eq!(app.is_plugin_added::<MaterialAnimationPlugin>(), expected);
-            assert_eq!(
-                app.world().contains_resource::<MaterialAnimationRegistry>(),
-                expected
-            );
-            assert_eq!(
-                app.world()
-                    .resource::<GltfExtensionHandlers>()
-                    .0
-                    .read_blocking()
-                    .len(),
-                1
-            );
-        }
-    }
-
-    #[test]
-    fn terrain_reservation_observes_all_six_diffuse_and_normal_layers() {
-        let mut images = Assets::<Image>::default();
-        let handles: [Handle<Image>; 12] = std::array::from_fn(|_| images.add(Image::default()));
-        let extension = TerrainExtension {
-            layer_0: Some(handles[0].clone()),
-            layer_1: Some(handles[1].clone()),
-            layer_2: Some(handles[2].clone()),
-            layer_3: Some(handles[3].clone()),
-            layer_4: Some(handles[4].clone()),
-            layer_5: Some(handles[5].clone()),
-            normal_0: Some(handles[6].clone()),
-            normal_1: Some(handles[7].clone()),
-            normal_2: Some(handles[8].clone()),
-            normal_3: Some(handles[9].clone()),
-            normal_4: Some(handles[10].clone()),
-            normal_5: Some(handles[11].clone()),
-            ..default()
-        };
-        assert_eq!(
-            extension.image_ids().collect::<Vec<_>>(),
-            handles.iter().map(Handle::id).collect::<Vec<_>>()
-        );
-    }
-
-    /// A cell whose four quadrants each carry a base layer and one overlay with the same `VTXT`
-    /// list, so a weight measured in one quadrant can be compared with its neighbour's.
-    fn overlay_fixture(cell_id: u32, overlay: Vec<(u16, f32)>) -> TerrainSnapshot {
-        let layers = (0..4)
-            .flat_map(|quadrant| {
-                [
-                    TerrainLayerSnapshot {
-                        texture_form_id: 1,
-                        quadrant,
-                        layer: 0,
-                        is_base: true,
-                        weights: Vec::new(),
-                    },
-                    TerrainLayerSnapshot {
-                        texture_form_id: 7,
-                        quadrant,
-                        layer: 1,
-                        is_base: false,
-                        weights: overlay.clone(),
-                    },
-                ]
-            })
-            .collect();
-        TerrainSnapshot {
-            cell_id,
-            width: 33,
-            height: 33,
-            heights: vec![0.0; 33 * 33],
-            normals: [0, 0, 127].repeat(33 * 33),
-            vertex_colors: vec![255; 33 * 33 * 3],
-            layers,
-            water_height: None,
-            water_type_form_id: None,
-        }
-    }
-
-    /// The VTXT list of an overlay that has full weight on both of a quadrant's x edge columns and
-    /// none in between, so the samples one column inside an edge differ from the edge itself.
-    fn edge_columns_overlay() -> Vec<(u16, f32)> {
-        (0..QUADRANT_WEIGHT_SAMPLES as u16)
-            .flat_map(|y| [0u16, 16].map(move |x| (y * 17 + x, 1.0)))
-            .collect()
-    }
-
-    /// `terrain.wgsl`'s cell uv to quadrant-local uv, for the quadrant at `origin`.
-    fn quadrant_uv(cell_uv: [f32; 2], origin: [f32; 2]) -> [f32; 2] {
-        [cell_uv[0] * 2.0 - origin[0], cell_uv[1] * 2.0 - origin[1]]
     }
 
     /// Defect A, at a quadrant and at a cell boundary. Each quadrant's weight field holds that
@@ -3911,6 +4714,448 @@ mod tests {
     /// Each blend pair the engine knows renders the way `NiAlphaProperty` asks; the pair glTF's
     /// `BLEND` already expresses keeps it, and a pair neither can express does not silently become
     /// an additive or multiplicative surface.
+    #[test]
+    fn blend_pairs_map_to_the_alpha_mode_that_renders_them() {
+        let mode = |source, destination| BlendInterpretation::of(source, destination).alpha_mode();
+        assert_eq!(
+            mode(BlendFactor::SourceAlpha, BlendFactor::One),
+            AlphaMode::Add,
+            "the additive glow card of a torch"
+        );
+        assert_eq!(mode(BlendFactor::One, BlendFactor::One), AlphaMode::Add);
+        assert_eq!(
+            mode(BlendFactor::DestinationColor, BlendFactor::Zero),
+            AlphaMode::Multiply
+        );
+        assert_eq!(
+            mode(BlendFactor::Zero, BlendFactor::SourceColor),
+            AlphaMode::Multiply
+        );
+        assert_eq!(
+            mode(BlendFactor::SourceAlpha, BlendFactor::InverseSourceAlpha),
+            AlphaMode::Blend,
+            "straight alpha-over is what glTF `BLEND` already renders"
+        );
+
+        // A pair with no mode of its own stays alpha-over instead of being rendered as something
+        // stronger: the direction is wrong for additive and multiplicative alike.
+        for (source, destination) in [
+            (BlendFactor::InverseSourceAlpha, BlendFactor::One),
+            (BlendFactor::One, BlendFactor::SourceAlpha),
+            (BlendFactor::SourceColor, BlendFactor::InverseSourceColor),
+            (BlendFactor::DestinationAlpha, BlendFactor::Zero),
+            (BlendFactor::SourceAlphaSaturate, BlendFactor::One),
+        ] {
+            assert_eq!(
+                BlendInterpretation::of(source, destination),
+                BlendInterpretation::Unsupported,
+                "{source:?}/{destination:?} is not expressible"
+            );
+            assert_eq!(
+                BlendInterpretation::of(source, destination).alpha_mode(),
+                AlphaMode::Blend
+            );
+        }
+    }
+
+    /// The pair the converter publishes for an additive glow card, read exactly as the loader hands
+    /// it to the material handler: both factors are named, and the pair is additive.
+    #[test]
+    fn a_published_additive_pair_is_an_additive_material() {
+        let extension: serde_json::Value = serde_json::from_str(
+            r#"{"shaderFamily":"Glow","shaderFlags1":0,"shaderFlags2":0,"premultipliedAlpha":false,
+                "screenDoorAlphaFade":false,"textureSlots":[],
+                "blendSource":"SRC_ALPHA","blendDestination":"ONE"}"#,
+        )
+        .unwrap();
+        let (source, destination) =
+            published_blend_pair(Some(&extension)).expect("the converter publishes both factors");
+        assert_eq!((source, destination), ("SRC_ALPHA", "ONE"));
+        let pair = BlendFactor::from_name(source)
+            .zip(BlendFactor::from_name(destination))
+            .expect("both names are ones this engine knows");
+        assert_eq!(
+            BlendInterpretation::of(pair.0, pair.1).alpha_mode(),
+            AlphaMode::Add
+        );
+
+        // `ONE`/`ONE` is the other additive spelling, and a zero/second factor is multiplicative.
+        let one_one: serde_json::Value =
+            serde_json::from_str(r#"{"blendSource":"ONE","blendDestination":"ONE"}"#).unwrap();
+        let multiply: serde_json::Value =
+            serde_json::from_str(r#"{"blendSource":"DEST_COLOR","blendDestination":"ZERO"}"#)
+                .unwrap();
+        let mode = |value: &serde_json::Value| {
+            let (source, destination) = published_blend_pair(Some(value)).unwrap();
+            let pair = BlendFactor::from_name(source)
+                .zip(BlendFactor::from_name(destination))
+                .unwrap();
+            BlendInterpretation::of(pair.0, pair.1).alpha_mode()
+        };
+        assert_eq!(mode(&one_one), AlphaMode::Add);
+        assert_eq!(mode(&multiply), AlphaMode::Multiply);
+
+        // A material with no extension, one with a single field, and one whose factor name this
+        // engine does not know all publish no pair this engine acts on.
+        assert_eq!(published_blend_pair(None), None);
+        assert_eq!(
+            published_blend_pair(Some(
+                &serde_json::from_str(r#"{"blendSource":"SRC_ALPHA"}"#).unwrap()
+            )),
+            None
+        );
+        let unknown =
+            serde_json::from_str(r#"{"blendSource":"SRC_ALPHA","blendDestination":"ONE_HALF"}"#)
+                .unwrap();
+        let (source, destination) = published_blend_pair(Some(&unknown)).unwrap();
+        assert_eq!(destination, "ONE_HALF");
+        assert_eq!(
+            BlendFactor::from_name(destination),
+            None,
+            "an unknown name is reported, not guessed at"
+        );
+        assert!(BlendFactor::from_name(source).is_some());
+    }
+
+    /// A minimal binary glTF - a header and one JSON chunk, no binary payload - that the parser the
+    /// glTF loader itself uses can read: the material JSON goes in the document's `materials`.
+    fn glb(materials: &str) -> Vec<u8> {
+        let json = format!(r#"{{"asset":{{"version":"2.0"}},"materials":[{materials}]}}"#);
+        let mut chunk = json.into_bytes();
+        while chunk.len() % 4 != 0 {
+            chunk.push(b' ');
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"glTF");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&(20 + chunk.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"JSON");
+        bytes.extend_from_slice(&chunk);
+        bytes
+    }
+
+    #[test]
+    fn material_manifest_validity_controls_payload_readers_and_animation_installation() {
+        use crate::extensions::DataSetExtensions;
+        use crate::material_animation::{
+            AnimatedPaletteMaterials, MaterialAnimationPlugin, MaterialAnimationRegistry,
+        };
+        use shared::extensions::DataExtensions;
+
+        let bytes = glb(r#"{"alphaMode":"BLEND","extensions":{
+            "OPEN_SKYRIM_material":{"shaderFamily":"effect","shaderFlags1":3221225592,
+                "textureSlots":[{"semantic":"greyscale","texture":0}]},
+            "MUDCRAB_material":{"blendSource":"SRC_ALPHA","blendDestination":"ONE",
+                "falloffStartAngle":0.2,"falloffStopAngle":0.1,
+                "falloffStartOpacity":1.0,"falloffStopOpacity":0.0,"softFalloffDepth":64.0},
+            "OPEN_SKYRIM_material_animation":{"channels":[{
+                "variable":"vOffset","interpolation":"LINEAR","times":[0.0,1.0],
+                "values":[0.0,1.0],"loop":"cycle","start":0.0,"stop":1.0}]}
+        }}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&bytes).unwrap();
+        let material = document.document.materials().next().unwrap();
+        let loaded = StandardMaterial {
+            alpha_mode: AlphaMode::Blend,
+            base_color_texture: Some(Handle::<Image>::default()),
+            ..default()
+        };
+        let textures = [Some(Handle::<Image>::default())];
+        for (entry, expected) in [
+            (None, false),
+            (Some((1, "old-core")), false),
+            (Some((2, "core")), false),
+            (Some((1, "core")), true),
+        ] {
+            let entries: Vec<_> = entry
+                .into_iter()
+                .map(|(version, built_from)| {
+                    serde_json::json!({"id":"mudcrab.material","version":version,
+                    "sha256":"unused","built_from":built_from})
+                })
+                .collect();
+            let data = DataExtensions::from_manifest_json(
+                &serde_json::json!({"extensions":entries}).to_string(),
+                Some("core".into()),
+            )
+            .unwrap();
+            let mut app = App::new();
+            app.init_resource::<GltfExtensionHandlers>();
+            app.insert_resource(DataSetExtensions::new(data));
+            let enabled = material_extensions_enabled(&app);
+            assert_eq!(enabled, expected);
+            assert_eq!(
+                skyrim_alpha_mode(&material, enabled),
+                expected.then_some(AlphaMode::Add)
+            );
+            assert_eq!(
+                material_animation_of(&material, enabled).is_some(),
+                expected
+            );
+            let palette = effect_palette_of(&material, &loaded, &textures, enabled)
+                .expect("core palette still loads without the material extension");
+            assert_eq!(palette.settings.falloff.is_some(), expected);
+            assert_eq!(palette.settings.soft_falloff_depth.is_some(), expected);
+            assert_eq!(
+                skyrim_material(&material, &loaded, enabled).is_some(),
+                expected
+            );
+
+            install_material_animation(&mut app);
+            register_skyrim_material_handler(&mut app);
+            assert_eq!(
+                app.world()
+                    .resource::<GltfExtensionHandlers>()
+                    .0
+                    .read_blocking()
+                    .len(),
+                1,
+                "the core material handler remains installed"
+            );
+            assert_eq!(app.is_plugin_added::<MaterialAnimationPlugin>(), expected);
+            assert_eq!(
+                app.world().contains_resource::<AnimatedPaletteMaterials>(),
+                expected
+            );
+            assert_eq!(
+                app.world().contains_resource::<MaterialAnimationRegistry>(),
+                expected
+            );
+        }
+        assert!(
+            !material_extensions_enabled(&App::new()),
+            "no dataset cannot authorize payloads"
+        );
+    }
+
+    /// The whole reading path, not a hand-built `Value`: the extension as it sits in a `.glb` the
+    /// converter wrote, parsed by the same glTF parser the loader uses. This is what proves the
+    /// unknown extension survives parsing at all - `gltf::Material::extension_value` reads it out of
+    /// the parser's flattened `others` map - and that a glow card comes out additive.
+    #[test]
+    fn a_glb_material_publishing_an_additive_pair_reads_as_additive() {
+        let additive = glb(r#"{"name":"GlowAddMesh","alphaMode":"BLEND",
+                "extensions":{"OPEN_SKYRIM_material":{"shaderFamily":"Glow","shaderFlags1":0,
+                "shaderFlags2":0,"premultipliedAlpha":false,"screenDoorAlphaFade":false,
+                "textureSlots":[]},
+                "MUDCRAB_material":{"blendSource":"SRC_ALPHA","blendDestination":"ONE"}}}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&additive).expect("a valid .glb");
+        let material = document.document.materials().next().expect("one material");
+        assert_eq!(
+            format!("{:?}", material.alpha_mode()),
+            "Blend",
+            "the converter publishes these materials as glTF `BLEND`, which Bevy loads as `Blend`"
+        );
+        assert_eq!(skyrim_alpha_mode(&material, true), Some(AlphaMode::Add));
+
+        // The pair glTF already renders stays `Blend`, and a material with no extension at all is
+        // left alone.
+        let straight = glb(r#"{"name":"Glass","alphaMode":"BLEND",
+                "extensions":{"MUDCRAB_material":{"blendSource":"SRC_ALPHA",
+                "blendDestination":"INV_SRC_ALPHA"}}}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&straight).unwrap();
+        let material = document.document.materials().next().unwrap();
+        assert_eq!(skyrim_alpha_mode(&material, true), Some(AlphaMode::Blend));
+
+        let plain = glb(r#"{"name":"Wall","alphaMode":"OPAQUE"}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&plain).unwrap();
+        let material = document.document.materials().next().unwrap();
+        assert_eq!(skyrim_alpha_mode(&material, true), None);
+
+        // The blend keys are read from `MUDCRAB_material` only: a mesh from main's converter has
+        // none, and a pair in the core extension is not looked at.
+        let core_only = glb(r#"{"name":"CoreOnly","alphaMode":"BLEND",
+                "extensions":{"OPEN_SKYRIM_material":{"blendSource":"SRC_ALPHA",
+                "blendDestination":"ONE"}}}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&core_only).unwrap();
+        let material = document.document.materials().next().unwrap();
+        assert_eq!(skyrim_alpha_mode(&material, true), None);
+    }
+
+    /// A converted glow has to leave this handler at the engine's scale. The caps of Blackreach's
+    /// glowing mushrooms are the case the fix is for: `emissiveFactor` `[0.212, 0.992, 1.0]` with an
+    /// emissive strength of `2.0` and a `MASK` mode, so they publish no blend pair at all - and the
+    /// handler used to return early on exactly those materials, leaving the glow at a magnitude of
+    /// 2.0 against an ambient of 650 (`docs/research/visual-gaps-spec.md`, gap 1).
+    #[test]
+    fn a_masked_glow_is_scaled_even_without_a_blend_pair() {
+        let cap = glb(r#"{"name":"BlackreachGiantMushroom01:3","alphaMode":"MASK",
+                "emissiveFactor":[0.212,0.992,1.0],
+                "extensions":{"KHR_materials_emissive_strength":{"emissiveStrength":2.0}}}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&cap).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        assert_eq!(
+            skyrim_alpha_mode(&gltf_material, true),
+            None,
+            "the cap publishes no pair, which is why it used to be skipped"
+        );
+        // What Bevy's own handler published for it: `emissiveFactor` times the emissive strength.
+        let loaded = StandardMaterial {
+            alpha_mode: AlphaMode::Mask(0.5),
+            emissive: LinearRgba::new(0.424, 1.984, 2.0, 1.0),
+            ..default()
+        };
+        let published =
+            skyrim_material(&gltf_material, &loaded, true).expect("the emissive is rescaled");
+        assert_eq!(
+            published.alpha_mode,
+            AlphaMode::Mask(0.5),
+            "and its mode is left exactly as glTF's `alphaMode` made it"
+        );
+        // At the engine's scale, then capped so its brightest channel stays below the tonemapper's
+        // white: the cap's cyan keeps its proportions instead of burning out.
+        let expected = capped_glow(exposed_emissive(loaded.emissive));
+        assert_eq!(
+            skyrim_material(&gltf_material, &loaded, false)
+                .unwrap()
+                .emissive,
+            expected,
+            "unusable extension payloads must not disable core emissive handling"
+        );
+        assert_eq!(
+            published.emissive, expected,
+            "the glow is published at the engine's scale, capped"
+        );
+        assert!((published.emissive.blue - GLOW_PEAK_CEILING).abs() < 1e-3);
+        assert!(
+            (published.emissive.red / published.emissive.blue - 0.424 / 2.0).abs() < 1e-4,
+            "and the colour is kept"
+        );
+        assert_eq!(
+            published.emissive.alpha, loaded.emissive.alpha,
+            "and the alpha is the surface's coverage, not the glow's brightness: `LinearRgba * f32` \
+             would have scaled it too"
+        );
+        assert!(
+            crate::app::emissive_is_visible(published.emissive),
+            "which is the point: a converted glow has to come out of this handler at the magnitude \
+             the engine's lighting works in, got {:?}",
+            published.emissive
+        );
+
+        // A torch's additive glow card keeps its pair *and* takes the scale: both changes come out
+        // of the one handler.
+        let card = glb(
+            r#"{"name":"GlowAddMesh","alphaMode":"BLEND","emissiveFactor":[1.0,1.0,1.0],
+                "extensions":{"MUDCRAB_material":{"blendSource":"SRC_ALPHA",
+                "blendDestination":"ONE"},
+                "KHR_materials_emissive_strength":{"emissiveStrength":3.0}}}"#,
+        );
+        let document = bevy::gltf::gltf::Gltf::from_slice(&card).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        let loaded = StandardMaterial {
+            alpha_mode: AlphaMode::Blend,
+            emissive: LinearRgba::new(3.0, 3.0, 3.0, 1.0),
+            ..default()
+        };
+        let published = skyrim_material(&gltf_material, &loaded, true).unwrap();
+        assert_eq!(published.alpha_mode, AlphaMode::Add);
+        assert_eq!(
+            published.emissive,
+            capped_glow(exposed_emissive(loaded.emissive))
+        );
+    }
+
+    /// The other class of emissive, which this handler must leave alone: Skyrim's own-emit *surface*
+    /// materials. `landscape/ice/icepilel03.glb`'s `IcePileL03` and every snow-covered tree publish
+    /// `emissiveFactor [1, 1, 1]` with the glow slot holding the model's own diffuse texture and
+    /// **no emissive strength**; scaling those by [`EMISSIVE_EXPOSURE`] is what turned the Alftand
+    /// ravine's ice white and clipped 45 % of a daylight frame, which is why the gate exists. The
+    /// values here are the real ones, read out of the material JSON of the converted
+    /// `landscape/ice/icepilel03.glb`.
+    #[test]
+    fn an_own_emit_surface_material_keeps_the_emissive_skyrim_gave_it() {
+        let own_emit = glb(r#"{"name":"IcePileL03:0","alphaMode":"OPAQUE",
+                "emissiveFactor":[1.0,1.0,1.0],
+                "extensions":{"OPEN_SKYRIM_material":{"shaderFamily":"lighting",
+                "shaderFlags1":2185233153,"shaderFlags2":50331681,"textureSlots":[]}}}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&own_emit).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        assert!(
+            gltf_material.emissive_strength().is_none(),
+            "the ice publishes no emissive strength: its multiple is 1"
+        );
+        // What Bevy published for it: `emissiveFactor` alone.
+        let loaded = StandardMaterial {
+            emissive: LinearRgba::new(1.0, 1.0, 1.0, 1.0),
+            ..default()
+        };
+        assert!(
+            skyrim_material(&gltf_material, &loaded, true).is_none(),
+            "an own-emit surface material is not this handler's to change"
+        );
+
+        // The strength is the whole difference: the same emissive with a multiple of 2 is a glow.
+        let glow = glb(
+            r#"{"name":"IcePileL03:0","alphaMode":"OPAQUE","emissiveFactor":[1.0,1.0,1.0],
+                "extensions":{"KHR_materials_emissive_strength":{"emissiveStrength":2.0}}}"#,
+        );
+        let document = bevy::gltf::gltf::Gltf::from_slice(&glow).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        assert!(is_deliberate_glow(&gltf_material));
+        // Bevy's own handler has already folded the strength into the emissive it published.
+        let loaded = StandardMaterial {
+            emissive: LinearRgba::new(2.0, 2.0, 2.0, 1.0),
+            ..default()
+        };
+        let published = skyrim_material(&gltf_material, &loaded, true).unwrap();
+        assert_eq!(
+            published.emissive,
+            capped_glow(exposed_emissive(loaded.emissive))
+        );
+        assert!(published.emissive.green > loaded.emissive.green);
+    }
+
+    /// A strength of exactly 1 is not a glow either: the converter writes the extension only above
+    /// 1 (`crates/converter/src/material.rs`, `publish_emissive`), and a record whose multiple is 1
+    /// emits its own texture at 1:1 like the own-emit class does.
+    #[test]
+    fn an_emissive_strength_of_one_is_not_a_deliberate_glow() {
+        for strength in ["1.0", "0.5"] {
+            let material_json = format!(
+                r#"{{"name":"Faint","alphaMode":"OPAQUE","emissiveFactor":[1.0,1.0,1.0],
+                    "extensions":{{"KHR_materials_emissive_strength":{{"emissiveStrength":{strength}}}}}}}"#
+            );
+            let document = bevy::gltf::gltf::Gltf::from_slice(&glb(&material_json)).unwrap();
+            let gltf_material = document.document.materials().next().unwrap();
+            assert!(
+                !is_deliberate_glow(&gltf_material),
+                "a strength of {strength} does not emit more than the texture it comes from"
+            );
+        }
+    }
+
+    /// The handler runs for every streamed material, so it must not republish the ones it has
+    /// nothing to say about: an ordinary surface with no pair and no emissive, and a material whose
+    /// pair asks for the alpha mode glTF already gave it.
+    #[test]
+    fn a_material_with_nothing_to_change_is_not_republished() {
+        let plain = glb(r#"{"name":"StoneWall","alphaMode":"OPAQUE"}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&plain).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        assert!(
+            skyrim_material(&gltf_material, &StandardMaterial::default(), true).is_none(),
+            "an ordinary surface is left alone"
+        );
+
+        let straight = glb(r#"{"name":"Glass","alphaMode":"BLEND",
+                "extensions":{"MUDCRAB_material":{"blendSource":"SRC_ALPHA",
+                "blendDestination":"INV_SRC_ALPHA"}}}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&straight).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        assert!(
+            skyrim_material(
+                &gltf_material,
+                &StandardMaterial {
+                    alpha_mode: AlphaMode::Blend,
+                    ..default()
+                },
+                true
+            )
+            .is_none(),
+            "straight alpha-over is what glTF's `BLEND` already renders"
+        );
+    }
 
     /// A cell whose four quadrants carry exactly the layers given, in quadrant order.
     fn layer_fixture(cell_id: u32, quadrants: [Vec<TerrainLayerSnapshot>; 4]) -> TerrainSnapshot {
@@ -4202,5 +5447,84 @@ mod tests {
         assert_eq!(extension.settings.normal_layers_0, Vec4::ZERO);
         assert_eq!(extension.settings.normal_layers_1, Vec4::ZERO);
         assert_eq!(extension.normal_0, None);
+    }
+
+    #[test]
+    fn terrain_sampler_repeats_with_linear_mips_and_16x_anisotropy() {
+        let sampler = terrain_layer_sampler();
+        assert_eq!(sampler.address_mode_u, ImageAddressMode::Repeat);
+        assert_eq!(sampler.address_mode_v, ImageAddressMode::Repeat);
+        assert_eq!(sampler.mag_filter, bevy::image::ImageFilterMode::Linear);
+        assert_eq!(sampler.min_filter, bevy::image::ImageFilterMode::Linear);
+        assert_eq!(sampler.mipmap_filter, bevy::image::ImageFilterMode::Linear);
+        assert_eq!(sampler.anisotropy_clamp, 16);
+    }
+
+    #[test]
+    fn landscape_uvs_repeat_twelve_times_per_quadrant_without_scaling_weights() {
+        let terrain = terrain_fixture_with_overlays(0x12345, &[vec![(0, 1.0)]]);
+        for quadrant in 0..4 {
+            let mesh = crate::streaming::build_terrain_quadrant_mesh(&terrain, quadrant).unwrap();
+            let VertexAttributeValues::Float32x2(uvs) =
+                mesh.attribute(Mesh::ATTRIBUTE_UV_0).unwrap()
+            else {
+                panic!("UVs missing")
+            };
+            let grids = crate::streaming::quadrant_overlay_weights(&terrain, quadrant).unwrap();
+            let settings = TerrainSettings::for_quadrant(quadrant, 2, &grids);
+            let tiling = settings.tiling_and_layer_count.xy();
+            let origin = Vec2::from(uvs[0]);
+            assert_eq!(
+                (Vec2::from(uvs[16]) - origin) * tiling,
+                Vec2::new(12.0, 0.0)
+            );
+            assert_eq!(
+                (Vec2::from(uvs[272]) - origin) * tiling,
+                Vec2::new(0.0, 12.0)
+            );
+            // Blend coordinates still address the original 17x17 LAND samples.
+            let last = (Vec2::from(uvs[288]) * 2.0 - settings.quadrant_origin.xy()) * 16.0;
+            assert_eq!(last, Vec2::splat(16.0));
+        }
+    }
+
+    /// A cell whose four quadrants each carry a base layer plus the given overlays, in the order the
+    /// `VTXT` lists are given, so a weight field built from it can be read back against the lists
+    /// that produced it.
+    fn terrain_fixture_with_overlays(
+        cell_id: u32,
+        overlays: &[Vec<(u16, f32)>],
+    ) -> TerrainSnapshot {
+        let mut layers = Vec::new();
+        for quadrant in 0..4u8 {
+            layers.push(TerrainLayerSnapshot {
+                texture_form_id: 1,
+                quadrant,
+                layer: 0,
+                is_base: true,
+                weights: Vec::new(),
+            });
+            for (slot, weights) in overlays.iter().enumerate() {
+                let layer = u16::try_from(slot + 1).expect("fixture overlay count fits a u16");
+                layers.push(TerrainLayerSnapshot {
+                    texture_form_id: u32::from(layer) + 6,
+                    quadrant,
+                    layer,
+                    is_base: false,
+                    weights: weights.clone(),
+                });
+            }
+        }
+        TerrainSnapshot {
+            cell_id,
+            width: 33,
+            height: 33,
+            heights: vec![0.0; 33 * 33],
+            normals: [0, 0, 127].repeat(33 * 33),
+            vertex_colors: vec![255; 33 * 33 * 3],
+            layers,
+            water_height: None,
+            water_type_form_id: None,
+        }
     }
 }

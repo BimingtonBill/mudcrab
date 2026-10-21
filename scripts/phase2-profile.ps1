@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability")]
+    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability", "portal-door-tour", "portal-heavy", "lod-far", "lod-far-ring-off", "lod-flythrough")]
     [string]$Scenario = "all",
     [string]$Assets,
     [string]$Worldspace = "0x3c",
@@ -17,6 +17,12 @@ param(
     [int]$Repetitions = 3,
     [int]$DurationSeconds = 120,
     [int]$StabilitySeconds = 1800,
+    # The portal-door-tour window: long enough for the scripted Riverwood tour (Sven's House in and out,
+    # `--tour-doors 2`) to finish its two crossings: it settles the world for about 10 s, crosses into the
+    # house at about 20 s and back out at about 30 s (quick build, 2026-10-06 dry run), so 40 s ends a few
+    # seconds after the second crossing. The tour repeats so the app is still running when the window ends
+    # and writes its report.
+    [int]$PortalTourSeconds = 40,
     [string]$Baseline = "profiling-baseline.json",
     [switch]$UpdateBaseline,
     [switch]$Quick,
@@ -130,6 +136,98 @@ function Resolve-ConvertedAssetSet {
     return $resolved
 }
 
+# How long one window of a scene runs: `stability` is the soak, the door tour is as long as its
+# tour, and every other scene takes the common window.
+function Get-SceneDuration {
+    param([string]$Name, [int]$DurationSeconds, [int]$StabilitySeconds, [int]$PortalTourSeconds)
+    if ($Name -eq "stability") { return $StabilitySeconds }
+    if ($Name -eq "portal-door-tour") { return $PortalTourSeconds }
+    return $DurationSeconds
+}
+
+# The portal scenes (this branch only): they run the portal's engine against the portal's converted
+# assets (-Assets, the same parameter as every world scene) and are defined here, in the one place
+# every scene is, so the baseline and the profile campaign time them the same way. Each scene's
+# pose is written in its comment below.
+#
+# The terrain ring: a benchmark run turns the ring off unless `--terrain-radius` names it
+# (config.rs), so every portal scene says which it wants. Every portal scene keeps portal's
+# default ring (since 28ce63dc the exterior fog ends at the LOD horizon, so the ring no longer hides
+# the native terrain LOD), except `lod-far-ring-off`, the comparison: the same pose with the ring
+# off, so the two windows show what the ring costs at the LOD vantage.
+$script:portalTerrainRadius = 8
+
+# The engine arguments that make up one portal scene beyond the benchmark and profile arguments
+# every scene shares. `$RunDirectory` is where the run writes (the tour's frames go under it).
+function Get-PortalSceneArguments {
+    param([string]$Name, [string]$RunDirectory, [switch]$StandingStill)
+    switch ($Name) {
+        # The demo door tour: Riverwood's route, the first two doors - Sven's House in, then the door
+        # inside it back out (`--tour-doors 2`; the demo starts on the Helgen road at 19600,-46650,
+        # facing the village). The tour walks to each door, waits for its destination to stream in,
+        # crosses it and photographs both sides, so the window holds the approach, the doorway with
+        # the portal drawing the room beyond it, the swap and the way back out. `--tour-repeat 3`
+        # makes the tour outlast the window: the benchmark writes its report at the window's end,
+        # which the tour finishing first would pre-empt. The tour's own screenshots are part of the
+        # load it measures. A benchmark run keeps the scripted camera (it does not walk), so the
+        # crossings are the scripted ones.
+        "portal-door-tour" {
+            return @(
+                "--demo", "riverwood",
+                "--terrain-radius", "$($script:portalTerrainRadius)",
+                "--demo-tour", (Join-Path $RunDirectory "tour"),
+                "--tour-doors", "2", "--tour-repeat", "3",
+                # Every frame's time, to place the crossing frame's spike against the timeline's
+                # `door_crossed` and `commit_budget_exceeded` events.
+                "--benchmark-frame-times", (Join-Path $RunDirectory "frame-times.csv")
+            )
+        }
+        # A standing view with one open portal view on screen: the camera 350 units in front of Sven's
+        # House door (0001CBB0, Tamriel; eye 20558.4,-46062.6,-2.1, yaw 161.5, pitch 5.2, hfov 75),
+        # the first shot of tools/reference/doorway_shots.json at the baseline's 1600x900. A shots
+        # run that is also a benchmark opens the door, waits for the portal to draw the room beyond
+        # it and then holds the view for the window instead of photographing it.
+        "portal-heavy" {
+            return @(
+                "--terrain-radius", "$($script:portalTerrainRadius)",
+                "--shots", (Join-Path (Get-ProfilingRepository) "tools\reference\baseline_portal_heavy.json"),
+                "--shots-out", (Join-Path $RunDirectory "shots")
+            )
+        }
+        # A high vantage above Riverwood looking north up the valley, where native terrain LOD (#105)
+        # reaches the horizon: eye 20500,-45500,6000 in Tamriel, yaw 0, pitch 8, hfov 90 (the a-north
+        # shot of local/reference/lod-check/lod-check.json, held for the window).
+        "lod-far" {
+            return @(
+                "--terrain-radius", "$($script:portalTerrainRadius)",
+                "--shots", (Join-Path (Get-ProfilingRepository) "tools\reference\baseline_lod_far.json"),
+                "--shots-out", (Join-Path $RunDirectory "shots")
+            )
+        }
+        # The ring-off comparison: lod-far's pose and shot with no `--terrain-radius`, so the
+        # benchmark's default turns the terrain ring off (terrain only within the streamed cells).
+        "lod-far-ring-off" {
+            return @(
+                "--shots", (Join-Path (Get-ProfilingRepository) "tools\reference\baseline_lod_far.json"),
+                "--shots-out", (Join-Path $RunDirectory "shots")
+            )
+        }
+        # A scripted fly-through from LOD into full detail: from the same vantage (20500,-45500,6000,
+        # yaw 0: north, level), the camera flies north at 1500 units a second over the full-detail
+        # grid and the LOD terrain beyond it; the auto-flight turns back after four cells, so the
+        # window crosses between the two again and again. The standing-still window of the same
+        # scene is the start pose with no flight.
+        "lod-flythrough" {
+            $arguments = @(
+                "--terrain-radius", "$($script:portalTerrainRadius)",
+                "--start-position", "20500", "-45500", "6000", "--start-yaw", "0"
+            )
+            if (-not $StandingStill) { $arguments += @("--auto-fly-speed", "1500") }
+            return $arguments
+        }
+    }
+}
+
 # The engine's arguments for one window of one scenario: the scenario's own definition (fixture
 # or world, its grid, its camera movement) and the output paths this run writes.
 #
@@ -148,6 +246,7 @@ function Get-ScenarioArguments {
         [switch]$StandingStill,
         [int]$DurationSeconds = 120,
         [int]$StabilitySeconds = 1800,
+        [int]$PortalTourSeconds = 40,
         [string]$ResolvedAssets,
         [string]$Worldspace = "0x3c",
         [int]$RuralGridX = 0,
@@ -160,7 +259,7 @@ function Get-ScenarioArguments {
         [int]$WaterGridY = 0
     )
     $arguments = @(
-        "--benchmark-duration", $(if ($Name -eq "stability") { "$StabilitySeconds" } else { "$DurationSeconds" }),
+        "--benchmark-duration", "$(Get-SceneDuration -Name $Name -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds -PortalTourSeconds $PortalTourSeconds)",
         "--benchmark-output", (Join-Path $RunDirectory "acceptance.json"),
         "--profile-output", $RunDirectory,
         "--profile-scenario", $Name,
@@ -179,7 +278,9 @@ function Get-ScenarioArguments {
         $arguments += @("--benchmark-only", "--synthetic-instances", "250000")
     } else {
         $arguments += @("--assets", $ResolvedAssets, "--worldspace", $Worldspace)
-        if ($Name -eq "water") {
+        if ($Name -in @("portal-door-tour", "portal-heavy", "lod-far", "lod-far-ring-off", "lod-flythrough")) {
+            $arguments += Get-PortalSceneArguments -Name $Name -RunDirectory $RunDirectory -StandingStill:$StandingStill
+        } elseif ($Name -eq "water") {
             $arguments += @("--grid-x", "$WaterGridX", "--grid-y", "$WaterGridY")
         } elseif ($Name -eq "dense-legacy") {
             # The old dense place (18,-5), kept for one release; compare older `dense` medians with it by hand.
@@ -404,7 +505,7 @@ foreach ($name in $requested) {
     for ($run = 1; $run -le $Repetitions; $run++) {
         $runDirectory = Join-Path $campaign "$name\run-$run"
         $arguments = Get-ScenarioArguments -Name $name -RunDirectory $runDirectory -Commit $commit -Hardware $hardware `
-            -RunId "run-$run" -DirtyWorktree:$dirty -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds `
+            -RunId "run-$run" -DirtyWorktree:$dirty -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds -PortalTourSeconds $PortalTourSeconds `
             -ResolvedAssets $resolvedAssets -Worldspace $Worldspace `
             -RuralGridX $RuralGridX -RuralGridY $RuralGridY -DenseGridX $DenseGridX -DenseGridY $DenseGridY `
             -DenseLegacyGridX $DenseLegacyGridX -DenseLegacyGridY $DenseLegacyGridY `

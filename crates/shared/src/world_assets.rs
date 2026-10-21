@@ -13,6 +13,11 @@ pub fn validate_world_database(path: &Path) -> Result<u32> {
         })
         .wrap_err("world database has no schema version")?;
     color_eyre::eyre::ensure!(
+        !crate::is_retired_dev_schema(version),
+        "this data set was converted by an older Mudcrab dev build (world database schema \
+         {version}); convert it again with this build"
+    );
+    color_eyre::eyre::ensure!(
         crate::supports_runtime_world_database_schema(version),
         "world database schema {version} is unsupported; supported versions are {} through {}",
         crate::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION,

@@ -101,7 +101,7 @@ class AuditRiverwoodReuseTests(unittest.TestCase):
     def test_renamed_collision_key_preserves_verified_collision_payload(self):
         reference_document = base_document()
         collision = {"version": 2, "shapes": [], "bodies": [{"mass": 2.5}]}
-        reference_document["scenes"][0]["extras"] = {"openSkyrimCollision": collision}
+        reference_document["scenes"][0]["extras"] = {"mudcrabCollision": collision}
         candidate_document = base_document()
         candidate_document["scenes"][0]["extras"] = {"mudcrabCollision": collision}
         self.write_pair("meshes/marker.glb", make_glb(reference_document), make_glb(candidate_document))
@@ -112,7 +112,7 @@ class AuditRiverwoodReuseTests(unittest.TestCase):
         reference = make_glb(base_document())
         candidate_document = base_document()
         candidate_document["scenes"][0]["extras"] = {
-            "openSkyrimCollision": {"version": 1, "shapes": [{"kind": "box"}]}
+            "mudcrabCollision": {"version": 1, "shapes": [{"kind": "box"}]}
         }
         self.write_pair("meshes/marker.glb", reference, make_glb(candidate_document))
         result = self.compare()
@@ -176,7 +176,7 @@ class AuditRiverwoodReuseTests(unittest.TestCase):
 
     def test_existing_collision_annotation_cannot_be_removed(self):
         reference_document = base_document()
-        reference_document["scenes"][0]["extras"] = {"openSkyrimCollision": {"version": 1}}
+        reference_document["scenes"][0]["extras"] = {"mudcrabCollision": {"version": 1}}
         self.write_pair(
             "meshes/model.glb",
             make_glb(reference_document),
@@ -188,9 +188,9 @@ class AuditRiverwoodReuseTests(unittest.TestCase):
 
     def test_existing_collision_annotation_cannot_be_changed(self):
         reference_document = base_document()
-        reference_document["scenes"][0]["extras"] = {"openSkyrimCollision": {"version": 1}}
+        reference_document["scenes"][0]["extras"] = {"mudcrabCollision": {"version": 1}}
         candidate_document = base_document()
-        candidate_document["scenes"][0]["extras"] = {"openSkyrimCollision": {"version": 2}}
+        candidate_document["scenes"][0]["extras"] = {"mudcrabCollision": {"version": 2}}
         self.write_pair(
             "meshes/model.glb",
             make_glb(reference_document),

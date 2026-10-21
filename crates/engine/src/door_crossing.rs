@@ -35,7 +35,7 @@ use crate::{
     },
     sky::CameraSpace,
     streaming::{
-        ActiveSpace, PendingUnder, RenderOrigin, StreamingWorld, camera_grid,
+        ActiveCell, ActiveSpace, PendingUnder, RenderOrigin, StreamingWorld, camera_grid,
         creation_rotation_to_bevy, creation_to_bevy, unload_all_cells_now,
     },
     swap_bridge::{
@@ -114,6 +114,14 @@ impl Plugin for DoorCrossingPlugin {
             );
         crate::hud::add_door_prompt(app);
     }
+}
+
+/// The type of the load-screen crossing's system, for the tests that check a seamless run builds
+/// none of it (`crate::portal`'s `load_doors_tests`).
+#[cfg(test)]
+pub(crate) fn crossing_system_type() -> std::any::TypeId {
+    use bevy::ecs::system::System;
+    IntoSystem::into_system(drive_door_crossing).system_type()
 }
 
 /// The full-screen black node the crossing fades.
@@ -275,6 +283,8 @@ impl DoorCrossing {
                 arrival_rotation: [0.0; 3],
             },
             label: String::new(),
+            auto_load: false,
+            outward: None,
         };
         let space = ActiveSpace::default();
         let target = landing_for(&door, &space, 0);
@@ -460,6 +470,18 @@ fn switch_space(world: &mut World, landing: Landing) {
     unload_all_cells_now(world);
     let left = *world.resource::<ActiveSpace>();
     *world.resource_mut::<ActiveSpace>() = landing.space;
+    // The streaming plan follows `ActiveCell`, and `streaming::sync_active_space` copies it over
+    // `ActiveSpace` whenever the two differ: written together, or the next frame puts the player
+    // back in the space just left.
+    let configured = world
+        .get_resource::<crate::config::EngineConfig>()
+        .map_or(0, |config| config.worldspace_id);
+    if let Some(mut active) = world.get_resource_mut::<ActiveCell>() {
+        *active = ActiveCell {
+            worldspace_id: landing.space.exterior_worldspace(configured),
+            interior: landing.space.interior,
+        };
+    }
     if let Some(grid) = landing.origin {
         world.resource_mut::<RenderOrigin>().0 = grid;
     }
@@ -1030,6 +1052,8 @@ mod tests {
             ref_id: 0x10,
             destination,
             label: String::new(),
+            auto_load: false,
+            outward: None,
         }
     }
 

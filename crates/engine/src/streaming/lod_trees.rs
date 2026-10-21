@@ -23,8 +23,8 @@
 use super::{
     RenderOrigin, StreamingCommitBudget, StreamingMetrics,
     lod::{
-        LodChunkFailureClass, LodChunkGridOrigin, LodDemand, LodDemandViews, lod_retry_deadline,
-        lod_ring_layers,
+        LodChunkFailureClass, LodChunkGridOrigin, LodDemand, LodDemandRole, LodDemandViews,
+        LodStreaming, lod_retry_deadline, lod_ring_layers,
     },
     lod_objects::rect_distance,
 };
@@ -301,6 +301,22 @@ pub(super) struct TreeLodStreaming {
     held: bool,
 }
 
+impl TreeLodStreaming {
+    pub(super) fn roles(&self) -> impl Iterator<Item = (Entity, crate::portal::CellRole)> + '_ {
+        self.blocks.values().filter_map(|status| match status {
+            TreeBlockStatus::Ready { root } => Some((
+                *root,
+                if self.worldspace_id.is_some() {
+                    super::native_lod::demand_role(self.demand)
+                } else {
+                    crate::portal::CellRole::Hidden
+                },
+            )),
+            _ => None,
+        })
+    }
+}
+
 #[derive(Component)]
 struct TreeLodBlockRoot;
 
@@ -316,6 +332,7 @@ impl Plugin for TreeLodPlugin {
                     .before(super::collect_cells),
                 collect_tree_lod
                     .after(super::lod::collect_lod_chunks)
+                    .before(super::lod::sync_lod_roles)
                     .before(super::arm_pending_models),
             ),
         );
@@ -327,6 +344,8 @@ fn plan_tree_lod(
     mut commands: Commands,
     config: Res<EngineConfig>,
     views: LodDemandViews,
+    portal: Option<Res<crate::portal::PortalState>>,
+    mut lod: ResMut<LodStreaming>,
     asset_server: Res<AssetServer>,
     meshes: Res<Assets<Mesh>>,
     materials: Res<Assets<StandardMaterial>>,
@@ -346,8 +365,10 @@ fn plan_tree_lod(
         IndexState::Ready(index) => index.clone(),
         _ => return,
     };
-    let actual = views.current(&config, origin.0);
-    let demand = actual;
+    let actual = views.current(&config, origin.0, portal.as_deref());
+    let demand = views.residency_demand(&config, actual, portal.as_deref(), &mut lod);
+    // With owned statics (`--cluster-own-statics`) the cluster package draws its trees at every
+    // distance; billboards would draw the same placements a second time.
     let world = (settings.as_ref().is_none_or(|s| s.lod_trees) && !config.cluster_own_statics)
         .then_some(demand)
         .flatten()
@@ -360,11 +381,13 @@ fn plan_tree_lod(
     streaming.demand = demand;
     for status in streaming.blocks.values() {
         if let TreeBlockStatus::Ready { root } = status {
-            commands.entity(*root).try_insert(if demand.is_some() {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            });
+            commands.entity(*root).try_insert(
+                if demand.is_some_and(|d| d.role != LodDemandRole::Pinned) {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                },
+            );
         }
     }
     let Some((worldspace_id, world)) = world else {
@@ -373,9 +396,9 @@ fn plan_tree_lod(
             info!("distant tree LOD stopped: nothing to draw in the active space");
         }
         let holding = config.lod_keep_hidden_in_interiors
-            && !config.cluster_own_statics
             && actual.is_none()
             && settings.as_ref().is_none_or(|settings| settings.lod_trees)
+            && !config.cluster_own_statics
             && streaming.catalog.worldspace_id.is_some();
         if holding {
             for status in streaming.blocks.values() {
@@ -762,7 +785,10 @@ fn spawn_block(
             Name::new(format!("LOD trees block {},{}", block.x, block.y)),
             TreeLodBlockRoot,
             Transform::IDENTITY,
-            if streaming.demand.is_some() {
+            if streaming
+                .demand
+                .is_some_and(|d| d.role != LodDemandRole::Pinned)
+            {
                 Visibility::Inherited
             } else {
                 Visibility::Hidden

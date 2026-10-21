@@ -39,5 +39,13 @@ transformed_data/
 mod_cache/
 /extracted/
 
+# AI worker harness: state, isolated checkouts, advisor notes
+/local/
+__pycache__/
+*.pyc
+# DeepSeek workers' throwaway inspection scripts
+tools/_dev_*.py
+tools/tmp_*.py
+
 # Remove once an official .agents is introduced
 .agents

@@ -15,7 +15,7 @@ use gltf::json::mesh::Primitive;
 use gltf::json::scene::UnitQuaternion;
 use gltf::json::texture::Info;
 use gltf::json::validation::{Checked, USize64};
-use gltf::{Semantic, json::*};
+use gltf::{json::*, Semantic};
 use project_wormhole_ba2::dev::ensure_texture_parent;
 use project_wormhole_ba2::dev::normalize_esm_path;
 use project_wormhole_esm::structs::geometry::Quaternion;
@@ -460,17 +460,22 @@ pub fn tri_shape_to_mesh(tri_shape: &BSTriShape, name: Option<String>) -> Static
     mesh.triangles.extend(triangles);
     mesh.normals.extend(normals);
     mesh.uvs.extend(uvs);
-    mesh.colors
-        .extend(tri_shape.vertex_data.iter().filter_map(|vertex| {
-            vertex.vertex_colors.map(|color| {
+    // Every vertex of a shape shares one vertex descriptor, so either every vertex carries a
+    // colour or none does. Scaled to 0..1 the way the skin-partition path below does.
+    mesh.colors.extend(
+        tri_shape
+            .vertex_data
+            .iter()
+            .filter_map(|vertex| vertex.vertex_colors)
+            .map(|color| {
                 BSVec4(glam::Vec4::new(
                     f32::from(color.x) / 255.0,
                     f32::from(color.y) / 255.0,
                     f32::from(color.z) / 255.0,
                     f32::from(color.w) / 255.0,
                 ))
-            })
-        }));
+            }),
+    );
 
     mesh
 }
@@ -895,8 +900,8 @@ fn static_node_from_av(
             .get_string(av.object.name as usize)
             .ok()
             .map(str::to_owned),
-        translation: av.translation.0.0,
-        rotation: av.rotation.0.0,
+        translation: av.translation.0 .0,
+        rotation: av.rotation.0 .0,
         scale: av.scale.0,
         children,
         mesh,
@@ -1597,16 +1602,7 @@ impl Parse<&[u8]> for NifFileV3 {
 
 impl std::fmt::Debug for NifFileV3 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "NifFileV3\nHeader: {:#?}\nNodes: {}\nSkins: {}\nMaterials: {}\nShapes: {}\nSegShapes: {}",
-            self.header,
-            self.nodes.len(),
-            self.skins.len(),
-            self.materials.len(),
-            self.shapes.len(),
-            self.seg_shapes.len()
-        )
+        write!(f, "NifFileV3\nHeader: {:#?}\nNodes: {}\nSkins: {}\nMaterials: {}\nShapes: {}\nSegShapes: {}", self.header, self.nodes.len(), self.skins.len(), self.materials.len(), self.shapes.len(), self.seg_shapes.len())
     }
 }
 
@@ -1649,16 +1645,16 @@ pub fn push_nodes_to_root(root: &mut Root, nif: &NifFileV3) -> Result<(), String
             None
         } else {
             Some([
-                node.av.translation.0.0.x,
-                node.av.translation.0.0.y,
-                node.av.translation.0.0.z,
+                node.av.translation.0 .0.x,
+                node.av.translation.0 .0.y,
+                node.av.translation.0 .0.z,
             ])
         };
 
         let rotation = if node.av.rotation == NifRotation::default() {
             None
         } else {
-            let q = glam::Quat::from_mat3(&node.av.rotation.0.0);
+            let q = glam::Quat::from_mat3(&node.av.rotation.0 .0);
 
             Some(UnitQuaternion([q.x, q.y, q.z, q.w]))
 

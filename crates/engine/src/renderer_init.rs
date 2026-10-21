@@ -424,3 +424,8 @@ mod tests {
         }
     }
 }
+
+// An explicitly ignored headless GPU test reuses this private production device initializer.
+#[cfg(test)]
+#[path = "far_terrain_shadows/gpu_numeric_tests.rs"]
+mod far_terrain_gpu_numeric;

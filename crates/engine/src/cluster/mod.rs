@@ -107,28 +107,28 @@ mod tests {
 
 pub mod assets;
 pub mod envelope;
-mod material_geometry;
+mod instance_identity;
+mod instance_mask;
 mod mesh_payload;
 #[cfg(test)]
 pub(crate) mod overlay_fixture;
-pub mod reader;
-pub(crate) mod stock_drawable;
-pub(crate) mod stock_visibility;
-
-mod instance_identity;
+pub(crate) mod ownership;
 pub mod package;
+pub mod reader;
 pub mod render;
 pub mod runtime_state;
-/// GPU-free cluster residency bookkeeping.
-pub mod residency;
-/// Stable shadow-view draw buckets.
+/// The plan for drawing a shadow view's clusters in buckets of equal triangle count.
 pub mod shadow_buckets;
+pub(crate) mod source_fallback;
 pub mod source_identity;
-/// Shared terrain material and validated package consumer.
+pub mod stock_visibility;
+
+/// GPU-free residency bookkeeping for block streaming: range allocator, mesh ledger, protocol states, planner.
+pub mod residency;
+
+/// Optional clustered terrain material, metadata and near-coverage clipping.
 pub mod terrain;
 
-pub(crate) mod ownership;
+mod material_geometry;
 
-pub(crate) mod instance_mask;
-
-pub(crate) mod source_fallback;
+pub(crate) mod stock_drawable;

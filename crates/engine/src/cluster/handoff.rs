@@ -11,9 +11,10 @@ use crate::{
         },
         stock_visibility::ClassFilter,
     },
-    streaming::{ActiveSpace, RenderOrigin},
+    portal::{PortalCamera, PortalPrewarm, PortalState, StreamedCellKey},
+    streaming::{ActiveCell, RenderOrigin},
     world::{
-        components::{CellRef, FormId, MeshHandle, StreamedCellKey},
+        components::{CellRef, FormId, MeshHandle},
         database::CellKey,
     },
 };
@@ -292,6 +293,7 @@ struct TemplateCaches<'a> {
 /// Borrowed qualification inputs; no additional per-frame source traversal.
 struct TemplateAssets<'a> {
     standards: &'a Assets<StandardMaterial>,
+    snow: Option<&'a Assets<SnowMaterial>>,
     lazy: Option<&'a LazyBatches>,
     scenes: Option<&'a Assets<WorldAsset>>,
     meshes: &'a Assets<Mesh>,
@@ -306,6 +308,7 @@ fn template_row(
 ) -> TemplateRow {
     let TemplateAssets {
         standards,
+        snow,
         lazy,
         scenes: assets,
         ..
@@ -315,6 +318,9 @@ fn template_row(
     let geometry = caches.geometry.get(&id).copied().or_else(|| {
         let material = if id.type_id() == std::any::TypeId::of::<StandardMaterial>() {
             standards.get(id.typed::<StandardMaterial>())
+        } else if id.type_id() == std::any::TypeId::of::<SnowMaterial>() {
+            snow.and_then(|assets| assets.get(id.typed::<SnowMaterial>()))
+                .map(|material| &material.base)
         } else {
             None
         }?;
@@ -610,8 +616,9 @@ type RootState = (
 type CameraState = (
     Entity,
     &'static Camera,
-    Has<crate::render::WaterReflectionCamera>,
+    Option<&'static crate::graphics_settings::GraphicsCamera>,
     Has<crate::world::components::StreamingCamera>,
+    Has<PortalCamera>,
     Option<&'static bevy::light::cluster::Clusters>,
     Option<&'static bevy::camera::visibility::VisibleEntities>,
 );
@@ -620,6 +627,7 @@ type LocalLightQuery<'w, 's> =
 
 type SourceMaterialState = (
     Option<&'static MeshMaterial3d<StandardMaterial>>,
+    Option<&'static MeshMaterial3d<SnowMaterial>>,
     Option<&'static RenderLayers>,
     Has<bevy::light::NotShadowCaster>,
 );
@@ -651,7 +659,10 @@ struct HotFacts {
     visible: Option<Visibility>,
     inherited: Option<bool>,
     layers: Option<RenderLayers>,
-    materials: Option<AssetId<StandardMaterial>>,
+    materials: (
+        Option<AssetId<StandardMaterial>>,
+        Option<AssetId<SnowMaterial>>,
+    ),
 }
 
 type HotFactState<'a> = (
@@ -661,10 +672,11 @@ type HotFactState<'a> = (
     Option<&'a InheritedVisibility>,
     Option<&'a RenderLayers>,
     Option<&'a MeshMaterial3d<StandardMaterial>>,
+    Option<&'a MeshMaterial3d<SnowMaterial>>,
 );
 
 fn hot_facts(state: HotFactState<'_>, literal_pose: bool) -> HotFacts {
-    let (pose, baseline, visible, inherited, layers, standard) = state;
+    let (pose, baseline, visible, inherited, layers, standard, snow) = state;
     // model_matrix rejects a node unless it equals its authored baseline.
     // All other poses have the same refused proof; returning to the baseline
     // still changes this snapshot and forces fresh qualification.
@@ -677,7 +689,10 @@ fn hot_facts(state: HotFactState<'_>, literal_pose: bool) -> HotFacts {
         visible: visible.copied(),
         inherited: inherited.map(|visible| visible.get()),
         layers: layers.cloned(),
-        materials: standard.map(|material| material.id()),
+        materials: (
+            standard.map(|material| material.id()),
+            snow.map(|material| material.id()),
+        ),
     }
 }
 
@@ -717,6 +732,7 @@ type HotFactChanges = Or<(
     Changed<InheritedVisibility>,
     Changed<RenderLayers>,
     Changed<MeshMaterial3d<StandardMaterial>>,
+    Changed<MeshMaterial3d<SnowMaterial>>,
 )>;
 
 // Invalidation is a superset of the actual proof-role domains. Required reads,
@@ -756,6 +772,7 @@ type SourceObservationDomain = (
         bevy::ecs::query::Allow<bevy::gltf::GltfExtras>,
         bevy::ecs::query::Allow<RenderLayers>,
         bevy::ecs::query::Allow<MeshMaterial3d<StandardMaterial>>,
+        bevy::ecs::query::Allow<MeshMaterial3d<SnowMaterial>>,
     ),
 );
 
@@ -775,6 +792,7 @@ struct SourceQueries<'w, 's> {
     cache: Local<'s, QualificationCache>,
 
     roots: Query<'w, 's, RootState>,
+    doors: Query<'w, 's, &'static crate::doors::LoadDoor>,
     // Entity allocation metadata is unfiltered; it is never a role/dependency oracle.
     entities: &'w bevy::ecs::entity::Entities,
     retired_cells: crate::streaming::RetiredCellAccess<'w, 's>,
@@ -1052,6 +1070,7 @@ struct SourceEvents<'w, 's> {
     meshes: MessageReader<'w, 's, AssetEvent<Mesh>>,
     scenes: Option<MessageReader<'w, 's, AssetEvent<WorldAsset>>>,
     standards: MessageReader<'w, 's, AssetEvent<StandardMaterial>>,
+    snow: Option<MessageReader<'w, 's, AssetEvent<SnowMaterial>>>,
 }
 
 #[derive(Default)]
@@ -1083,9 +1102,11 @@ fn extract_sources(
     geometry_assets: Extract<SourceGeometryAssets>,
     handles: Extract<Res<ClusterBatchHandles>>,
     standards: Extract<Res<Assets<StandardMaterial>>>,
+    snow: Extract<Option<Res<Assets<SnowMaterial>>>>,
     mut queries: Extract<SourceQueries>,
-    active: Extract<Option<Res<ActiveSpace>>>,
-    config: Extract<Option<Res<crate::config::EngineConfig>>>,
+    active: Extract<Option<Res<ActiveCell>>>,
+    portal: Extract<Option<Res<PortalState>>>,
+    prewarm: Extract<Option<Res<PortalPrewarm>>>,
     origin: Extract<Option<Res<RenderOrigin>>>,
     mut events: Extract<SourceEvents>,
     asset_server: Extract<Option<Res<AssetServer>>>,
@@ -1156,6 +1177,13 @@ fn extract_sources(
         work.material_events += 1;
         out.geometry_cache.remove(&event_asset_id(event).untyped());
         dropped_materials.push(event_asset_id(event).untyped());
+    }
+    if let Some(events) = events.snow.as_mut() {
+        for event in events.read() {
+            work.material_events += 1;
+            out.geometry_cache.remove(&event_asset_id(event).untyped());
+            dropped_materials.push(event_asset_id(event).untyped());
+        }
     }
     let certificate = package.as_ref().map(|package| package.0.clone());
     let same = match (&certificate, &out.certificate) {
@@ -1613,7 +1641,7 @@ fn extract_sources(
                         retired_refs.insert(reference);
                         for mesh in meshes {
                             let material = queries.source_materials.get(*mesh).ok().and_then(
-                                |(standard, layers, not_caster)| {
+                                |(standard, snow, layers, not_caster)| {
                                     retired_eligibility.insert(
                                         MainEntity::from(*mesh),
                                         RetiredEligibility {
@@ -1621,7 +1649,11 @@ fn extract_sources(
                                             casts_shadows: !not_caster,
                                         },
                                     );
-                                    standard.map(|material| material.id().untyped())
+                                    match (standard, snow) {
+                                        (Some(material), None) => Some(material.id().untyped()),
+                                        (None, Some(material)) => Some(material.id().untyped()),
+                                        _ => None,
+                                    }
                                 },
                             );
                             retired_materials.insert(MainEntity::from(*mesh), material);
@@ -1770,6 +1802,7 @@ fn extract_sources(
     stock_tangents.resize(batches, None);
     let inputs = TemplateAssets {
         standards: &standards,
+        snow: snow.as_deref(),
         lazy: lazy.as_deref(),
         scenes: assets.as_deref(),
         meshes: stock_meshes,
@@ -1864,15 +1897,30 @@ fn extract_sources(
     let mut worlds = HashMap::new();
     let active_world = active
         .as_ref()
-        .filter(|active| active.interior.is_none())
-        .and_then(|active| {
-            active
-                .worldspace_id
-                .or_else(|| config.as_ref().map(|config| config.worldspace_id))
+        .and_then(|active| active.interior.is_none().then_some(active.worldspace_id));
+    // Held streaming cells may include multiple doors. View ownership follows
+    // the one door the portal camera actually renders, never that aggregate.
+    let rendered_door = prewarm
+        .as_ref()
+        .and_then(|prewarm| prewarm.rendering_door())
+        .or_else(|| {
+            portal
+                .as_ref()
+                .and_then(|portal| portal.open_doorway())
+                .map(|doorway| doorway.door)
+        });
+    let portal_world = rendered_door
+        .and_then(|door| queries.doors.get(door).ok())
+        .and_then(|door| {
+            door.destination
+                .interior_cell_id
+                .is_none()
+                .then_some(door.destination.worldspace_id)
+                .flatten()
         });
     let lights_span = ::bevy::log::info_span!("cluster::sources::lights_worlds").entered();
     let mut light_dependencies = HashMap::new();
-    for (entity, camera, reflection, streaming, clusters, visible) in &queries.cameras {
+    for (entity, camera, graphics, streaming, is_portal, clusters, visible) in &queries.cameras {
         if !camera.is_active {
             continue;
         }
@@ -1882,7 +1930,11 @@ fn extract_sources(
                 queries.light_parents.contains(light)
             }),
         );
-        if streaming || reflection {
+        if is_portal {
+            worlds.insert(entity.into(), portal_world);
+        } else if streaming
+            || graphics == Some(&crate::graphics_settings::GraphicsCamera::WaterReflection)
+        {
             worlds.insert(entity.into(), active_world);
         }
     }
@@ -2200,6 +2252,7 @@ pub(super) struct TerrainClipInputs {
     forward_covered: HashSet<(IVec2, u8)>,
     depth_covered: HashSet<(IVec2, u8)>,
     ready_blocks: HashSet<u32>,
+    far_revision: Option<(u64, u64)>,
     target_offset: [u32; 3],
 }
 
@@ -2260,6 +2313,7 @@ pub(super) fn install(app: &mut App) {
 #[allow(clippy::too_many_arguments)]
 fn finalize_terrain_clips(
     frame: Res<ClusterFrame>,
+    far_state: Option<Res<crate::far_terrain_shadows::render::State>>,
     gpu: Option<ResMut<ClusterGpu>>,
     sources: Res<Sources>,
     queue: Res<RenderQueue>,
@@ -2361,12 +2415,17 @@ fn finalize_terrain_clips(
         }
         #[cfg(feature = "tracy")]
         drop(coverage_span);
+        let far_revision = (!shadow
+            && super::far::current(&gpu, &gpu.views[&key], far_state.as_deref()))
+        .then(|| gpu.views[&key].far.as_ref().unwrap().prepared.nonce);
+        let far_revision = super::far::record_revision(far_revision, gpu.layout_epoch);
         if gpu.views[&key]
             .terrain_clip_inputs
             .as_ref()
             .is_some_and(|inputs| {
                 inputs.world == world
                     && inputs.target_offset_matches(frame.origin_offset)
+                    && inputs.far_revision == far_revision
                     && inputs.origin == sources.origin
                     && inputs.forward_covered == forward_covered
                     && inputs.depth_covered == depth_covered
@@ -2380,6 +2439,7 @@ fn finalize_terrain_clips(
         // sets move into the cache; neither counts nor hashes stand in for them.
         let inputs = TerrainClipInputs {
             target_offset: frame.origin_offset.to_array().map(f32::to_bits),
+            far_revision,
             world,
             origin: sources.origin,
             forward_covered,
@@ -2439,7 +2499,10 @@ fn finalize_terrain_clips(
                 projection=?view.clip_from_view, ?selected, ?forward, ?depth,
                 hidden_stock_count=hidden_stock.len(), hidden_stock_hash=hash.finish(),
                 clip_hash={let mut h=std::hash::DefaultHasher::new(); bytes.hash(&mut h); h.finish()},
-                "cluster terrain representation inputs changed");
+                ?far_revision, "cluster terrain representation inputs changed");
+        }
+        if far_revision.is_some() {
+            super::far::stamp_records(&gpu, sources.origin, frame.origin_offset, &mut bytes);
         }
         let view = gpu.views.get_mut(&key).unwrap();
         if bytes != view.terrain_clip_bytes {
@@ -2499,9 +2562,10 @@ fn cached_batch_readiness(
         &PipelineCache,
         &ErasedRenderAssets<PreparedMaterial>,
         &MaterialBindGroupAllocators,
+        Option<&crate::far_terrain_shadows::render::State>,
     ),
 ) -> Vec<bool> {
-    // Revalidate successful predicates too. Material slabs, pipeline state and material
+    // Revalidate successful predicates too. Material slabs, pipeline state and far
     // bindings are current render facts, not a monotonic historical receipt.
     let _ = materials_version;
     views_batch_readiness(gpu, &gpu.views[&key], shadow, prepass, dependencies)
@@ -2516,6 +2580,7 @@ fn views_batch_readiness(
         &PipelineCache,
         &ErasedRenderAssets<PreparedMaterial>,
         &MaterialBindGroupAllocators,
+        Option<&crate::far_terrain_shadows::render::State>,
     ),
 ) -> Vec<bool> {
     /// Below this many batches a chunk costs more to hand out than it saves.
@@ -2551,9 +2616,10 @@ fn batch_ready(
         &PipelineCache,
         &ErasedRenderAssets<PreparedMaterial>,
         &MaterialBindGroupAllocators,
+        Option<&crate::far_terrain_shadows::render::State>,
     ),
 ) -> bool {
-    let (cache, materials, allocators) = dependencies;
+    let (cache, materials, allocators, far_state) = dependencies;
     let Some(group) = table_group(view, batch) else {
         return false;
     };
@@ -2575,6 +2641,17 @@ fn batch_ready(
     }
     // A slot/group rewrite or a hot-reloaded specialization cannot inherit an old plan.
     if gpu.batches[batch].material_slot != Some(u32::from(material.binding.slot)) {
+        return false;
+    }
+    if !shadow
+        && view
+            .memo
+            .get(batch)
+            .copied()
+            .flatten()
+            .is_some_and(|memo| memo.resolved.far)
+        && !super::far::current(gpu, view, far_state)
+    {
         return false;
     }
     if shadow {
@@ -3215,6 +3292,7 @@ mod incremental_selection_tests {
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn select_instances(
+    far_state: Option<Res<crate::far_terrain_shadows::render::State>>,
     gpu: Option<ResMut<ClusterGpu>>,
     sources: Res<Sources>,
     frame: Res<ClusterFrame>,
@@ -3322,7 +3400,7 @@ fn select_instances(
                 batch_materials.as_ref().map(|materials| materials.version),
                 shadow,
                 prepass,
-                (&cache, &materials, &allocators),
+                (&cache, &materials, &allocators, far_state.as_deref()),
             );
             drop(readiness_span);
             let stock_span = ::bevy::log::info_span!("cluster::select::stock_ids").entered();
@@ -7302,6 +7380,7 @@ mod actual_stock_layout_regressions {
                 },
                 &TemplateAssets {
                     standards: &self.standards,
+                    snow: None,
                     lazy: Some(&self.lazy),
                     scenes: Some(&self.scenes),
                     meshes: &self.meshes,

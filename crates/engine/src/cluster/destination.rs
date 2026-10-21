@@ -169,6 +169,7 @@ struct ViewMembers {
 /// keeps publish within the system-function parameter limit.
 #[derive(bevy::ecs::system::SystemParam)]
 struct CullProofResources<'w> {
+    far: Option<Res<'w, crate::far_terrain_shadows::render::State>>,
     frame: Res<'w, ClusterFrame>,
     pipelines: Res<'w, ClusterPipelines>,
     opaque: Res<'w, ViewBinnedRenderPhases<Opaque3d>>,
@@ -224,13 +225,21 @@ impl DrawProof<'_, '_> {
         {
             return false;
         }
+        // Optional shadow preparation is not geometry readiness. `batch_ready`
+        // checks the exact queued variant: ordinary terrain remains drawable
+        // while optional canonical shadows are waiting or unavailable.
         if !batch_ready(
             self.gpu,
             view,
             batch,
             shadow,
             prepass,
-            (self.cache, self.materials, self.allocators),
+            (
+                self.cache,
+                self.materials,
+                self.allocators,
+                self.cull.far.as_deref(),
+            ),
         ) {
             return false;
         }
@@ -792,19 +801,24 @@ mod tests {
             forward_covered: HashSet::new(),
             depth_covered: HashSet::new(),
             ready_blocks: [0].into_iter().collect(),
+            far_revision: Some((7, 0)),
             target_offset: offset.to_array().map(f32::to_bits),
         };
         assert!(inputs.target_offset_matches(offset));
         assert!(!inputs.target_offset_matches(offset + Vec3::X));
         assert!(!inputs.target_offset_matches(Vec3::new(offset.x, -0.0, offset.z)));
         assert!(!inputs.target_offset_matches(Vec3::new(offset.x, f32::NAN, offset.z)));
+        // Same grid and F1 nonce deliberately remain unchanged: only the actual
+        // render target offset distinguishes these cache inputs.
         assert_eq!(inputs.origin, grid_origin);
+        assert_eq!(inputs.far_revision, Some((7, 0)));
     }
 
     #[test]
     fn terrain_selection_does_not_prove_a_missing_shadow_or_depth_draw() {
         let grid = IVec2::new(7, -9);
         let mut inputs = TerrainClipInputs {
+            far_revision: None,
             target_offset: [0; 3],
             world: Some(12),
             origin: IVec2::ZERO,
@@ -898,6 +912,7 @@ mod terrain_candidate_regressions {
         }
         fn ready_on_stock_with_map(terrain: HashMap<MainEntity, TerrainPrimitiveIdentity>) -> Self {
             let inputs = TerrainClipInputs {
+                far_revision: None,
                 target_offset: [0; 3],
                 world: Some(WORLD),
                 origin: IVec2::ZERO,
@@ -1192,6 +1207,7 @@ mod terrain_candidate_regressions {
             TerrainMapChange::FarAdditionsOnly
         );
         let not_prepared = TerrainClipInputs {
+            far_revision: None,
             target_offset: [0; 3],
             world: Some(WORLD),
             origin: IVec2::ZERO,

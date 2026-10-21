@@ -1892,8 +1892,8 @@ fn parse_counted_av_object(i: &[u8]) -> IResult<&[u8], NiAVObject, nom::error::E
 }
 
 fn valid_av_transform(av: &NiAVObject) -> bool {
-    let rotation = av.rotation.0.0;
-    av.translation.0.0.is_finite()
+    let rotation = av.rotation.0 .0;
+    av.translation.0 .0.is_finite()
         && rotation.is_finite()
         && av.scale.0.is_finite()
         && av.scale.0 != 0.0

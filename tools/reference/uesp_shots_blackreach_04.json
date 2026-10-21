@@ -1,0 +1,18 @@
+{
+ "width": 1718,
+ "height": 1080,
+ "shots": [
+  {
+   "name": "SR-place-Blackreach_04",
+   "worldspace_id": 126562,
+   "interior_cell_id": null,
+   "position": [4012.0, 13238.0, 2100.0],
+   "yaw": 205.0,
+   "pitch": -18.0,
+   "hfov": 75.0,
+   "reference": "local/reference/uesp/SR-place-Blackreach_04.jpg",
+   "note": "Blackreach, north-east of the golden lattice orb BlackreachSun01 at (2112,9088,6336), the only one in the world. research-020 estimated the camera from the orb's position in the frame: its visible centre is about 1400 below the reference's origin (in the round-1 render of _03 the orb appears where an object about 1300 lower would), so at 2100 the camera sits about 5000 units away with the orb some 37 degrees up, which puts it in the upper third of the frame as in the reference. The render is still dominated by the Dwemer structures in front of the orb rather than the reference's open plaza with its gratings, so the camera is in the right quarter of the cavern but not on the reference's line. Confidence: area only.",
+   "confidence": "area only"
+  }
+ ]
+}

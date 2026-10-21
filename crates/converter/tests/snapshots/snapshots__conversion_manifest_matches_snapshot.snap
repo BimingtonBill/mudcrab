@@ -166,6 +166,42 @@ expression: manifest
         "lod_tree_type": 0
       },
       "version": 1
+    },
+    {
+      "built_from": "87c5e0a8c34c155d989f10462f6c5b518fa9fd883bdd2f5f78843d118cbfc5e7",
+      "id": "mudcrab.space_lighting",
+      "owns": {
+        "files": [],
+        "gltf_extensions": [],
+        "indexes": [],
+        "tables": [
+          "space_lighting"
+        ]
+      },
+      "sha256": "8ec0bd6c4d1d23e7daacedc2553cc7b224ee84bc42289d8003423db33f2b9cfc",
+      "stats": {
+        "space_lighting": 1
+      },
+      "version": 1
+    },
+    {
+      "built_from": "87c5e0a8c34c155d989f10462f6c5b518fa9fd883bdd2f5f78843d118cbfc5e7",
+      "id": "mudcrab.directional_snow",
+      "owns": {
+        "files": [],
+        "gltf_extensions": [],
+        "indexes": [],
+        "tables": [
+          "matos",
+          "static_materials"
+        ]
+      },
+      "sha256": "38cedb52da36be2e56d9d15d2ef3a41f133a50bd6c675c93e2cf77365f1f8f09",
+      "stats": {
+        "matos": 0,
+        "static_materials": 0
+      },
+      "version": 1
     }
   ],
   "failures": {},

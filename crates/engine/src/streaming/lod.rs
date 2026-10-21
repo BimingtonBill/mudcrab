@@ -4,6 +4,7 @@ use super::{
 };
 use crate::{
     config::{EngineConfig, TerrainLodDistances},
+    portal::{CellRole, PortalCamera, PortalPrewarm, PortalState},
     profiling::ProfilingState,
     world::{
         components::{CELL_SIZE, StreamingCamera},
@@ -54,30 +55,193 @@ pub(crate) fn lod_camera_far(reach_cells: i32) -> f32 {
     CELL_SIZE * (reach_cells as f32 + 0.5) * std::f32::consts::SQRT_2
 }
 
-/// The active exterior and its main streaming camera's cell.
+/// One exterior owner only: active exterior wins; an interior can use the actual
+/// exterior portal view. Simultaneous exterior-world demands remain unsupported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LodDemandRole {
+    Main,
+    Portal,
+    /// In-flight crossing residency only: never a drawn or proof-bearing view.
+    Pinned,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LodDemand {
     pub(super) world: u32,
     pub(super) center: IVec2,
+    pub(super) role: LodDemandRole,
+    pub(super) camera: Entity,
+    pub(super) main_camera: Option<Entity>,
+}
+
+impl LodDemand {
+    pub(super) fn contains_cell(self, world: u32, cell: IVec2, radius: i32) -> bool {
+        radius >= 0
+            && self.world == world
+            && (i64::from(cell.x) - i64::from(self.center.x)).abs() <= i64::from(radius)
+            && (i64::from(cell.y) - i64::from(self.center.y)).abs() <= i64::from(radius)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CrossingLodResidency {
+    demand: LodDemand,
+    door: Entity,
+    destination: crate::doors::DoorDestination,
+    source: ActiveSpace,
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
 pub(super) struct LodDemandViews<'w, 's> {
     space: Option<Res<'w, ActiveSpace>>,
-    main: Query<'w, 's, &'static Transform, With<StreamingCamera>>,
+    main: Query<'w, 's, (Entity, &'static Transform), With<StreamingCamera>>,
+    portal: Query<'w, 's, (Entity, &'static Camera, &'static Transform), With<PortalCamera>>,
+    prewarm: Option<Res<'w, PortalPrewarm>>,
+    cameras: Query<'w, 's, (), With<Camera>>,
+    policy: Option<Res<'w, crate::swap_bridge::destination::RequiredHandoff>>,
+    crossing: Option<Res<'w, crate::transition::PendingCrossing>>,
+    doors: Query<'w, 's, &'static crate::doors::LoadDoor>,
 }
 
 impl LodDemandViews<'_, '_> {
-    pub(super) fn current(&self, config: &EngineConfig, origin: IVec2) -> Option<LodDemand> {
-        let world = lod_worldspace(
+    pub(super) fn current(
+        &self,
+        config: &EngineConfig,
+        origin: IVec2,
+        portal: Option<&PortalState>,
+    ) -> Option<LodDemand> {
+        self.for_rendered_door(config, origin, self.rendered_door(portal))
+    }
+
+    fn rendered_door(&self, portal: Option<&PortalState>) -> Option<Entity> {
+        portal.and_then(|portal| {
+            self.prewarm
+                .as_ref()
+                .and_then(|prewarm| prewarm.rendering_door())
+                .or_else(|| portal.open_doorway().map(|doorway| doorway.door))
+        })
+    }
+
+    /// Keep only the last actually rendered portal's residency while that exact
+    /// crossing waits. A vanished view never contributes rendering or readiness.
+    pub(super) fn residency_demand(
+        &self,
+        config: &EngineConfig,
+        actual: Option<LodDemand>,
+        portal: Option<&PortalState>,
+        streaming: &mut LodStreaming,
+    ) -> Option<LodDemand> {
+        self.residency_for_door(
+            config,
+            actual,
+            self.rendered_door(portal),
+            portal.is_some(),
+            streaming,
+        )
+    }
+
+    fn residency_for_door(
+        &self,
+        config: &EngineConfig,
+        actual: Option<LodDemand>,
+        rendered_door: Option<Entity>,
+        portal_present: bool,
+        streaming: &mut LodStreaming,
+    ) -> Option<LodDemand> {
+        if let Some(demand) = actual {
+            streaming.crossing_residency = (|| {
+                if demand.role != LodDemandRole::Portal || demand.main_camera.is_none() {
+                    return None;
+                }
+                self.cameras.get(demand.main_camera?).ok()?;
+                let source = *self.space.as_deref()?;
+                source.interior?;
+                let door = rendered_door?;
+                let destination = self.doors.get(door).ok()?.destination.clone();
+                Some(CrossingLodResidency {
+                    demand,
+                    door,
+                    destination,
+                    source,
+                })
+            })();
+            return actual;
+        }
+        let pin = streaming.crossing_residency.as_ref().filter(|pin| {
+            config.stream_radius >= 0
+                && portal_present
+                && self.policy.is_some()
+                && self.crossing.as_deref().and_then(|pending| pending.door()) == Some(pin.door)
+                && self.space.as_deref() == Some(&pin.source)
+                && pin
+                    .demand
+                    .main_camera
+                    .is_some_and(|main| self.cameras.contains(main))
+                && self
+                    .main
+                    .single()
+                    .is_ok_and(|(entity, _)| Some(entity) == pin.demand.main_camera)
+                && self
+                    .portal
+                    .single()
+                    .is_ok_and(|(entity, _, _)| entity == pin.demand.camera)
+                && self
+                    .doors
+                    .get(pin.door)
+                    .is_ok_and(|door| door.destination == pin.destination)
+        });
+        if let Some(pin) = pin {
+            Some(LodDemand {
+                role: LodDemandRole::Pinned,
+                ..pin.demand
+            })
+        } else {
+            streaming.crossing_residency = None;
+            None
+        }
+    }
+
+    fn for_rendered_door(
+        &self,
+        config: &EngineConfig,
+        origin: IVec2,
+        rendered_door: Option<Entity>,
+    ) -> Option<LodDemand> {
+        if config.stream_radius < 0 {
+            return None;
+        }
+        let main = self.main.single().ok();
+        if let Some(world) = lod_worldspace(
             config.stream_radius,
             self.space.as_deref(),
             config.worldspace_id,
-        )?;
-        let camera = self.main.single().ok()?;
+        ) {
+            let (camera, transform) = main?;
+            return Some(LodDemand {
+                world,
+                center: streaming_center(config.acceptance_screenshot.is_some(), origin, transform),
+                role: LodDemandRole::Main,
+                camera,
+                main_camera: Some(camera),
+            });
+        }
+        let door = self.doors.get(rendered_door?).ok()?;
+        if door.destination.interior_cell_id.is_some() {
+            return None;
+        }
+        let world = door.destination.worldspace_id?;
+        let (camera, state, transform) = self.portal.single().ok()?;
+        if !state.is_active {
+            return None;
+        }
         Some(LodDemand {
             world,
-            center: streaming_center(config.acceptance_screenshot.is_some(), origin, camera),
+            // Acceptance-origin pinning describes the main screenshot pose, not
+            // a portal's independently mapped destination view.
+            center: streaming_center(false, origin, transform),
+            role: LodDemandRole::Portal,
+            camera,
+            main_camera: main.map(|(camera, _)| camera),
         })
     }
 }
@@ -86,8 +250,8 @@ impl LodDemandViews<'_, '_> {
 pub(super) struct LodStreaming {
     generation: u64,
     center: Option<IVec2>,
-    /// Exterior demand that produced the current terrain LOD plan.
     demand: Option<LodDemand>,
+    crossing_residency: Option<CrossingLodResidency>,
     /// The worldspace `center` belongs to; a door into another worldspace moves the centre too.
     worldspace_id: Option<u32>,
     requested_queries: HashSet<LodTier>,
@@ -606,6 +770,7 @@ pub(super) fn plan_lod_chunks(
     database: Res<WorldDatabase>,
     origin: Res<RenderOrigin>,
     views: LodDemandViews,
+    portal: Option<Res<PortalState>>,
     chunk_visibility: Query<(&Visibility, Option<&super::RetireHidden>)>,
     chunk_roots: Query<(&LodChunkRoot, Option<&PendingLodChunk>)>,
     mut streaming: ResMut<LodStreaming>,
@@ -628,7 +793,8 @@ pub(super) fn plan_lod_chunks(
     } else {
         budget.reserved_for_lod = false;
     }
-    let demand = views.current(&config, origin.0);
+    let actual = views.current(&config, origin.0, portal.as_deref());
+    let demand = views.residency_demand(&config, actual, portal.as_deref(), &mut streaming);
     plan_lod_demand_controlled(
         demand,
         commands,
@@ -855,6 +1021,90 @@ fn plan_lod_demand_controlled(
     profiler.record_elapsed("lod/plan", started);
 }
 
+pub(super) fn lod_role_layers(role: CellRole) -> RenderLayers {
+    match role {
+        CellRole::Active => crate::render::reflectable_world_layers(),
+        CellRole::Destination => RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+        CellRole::Hidden => RenderLayers::none(),
+    }
+}
+
+fn lod_root_role(key: ChunkKey, status: &LodChunkStatus, demand: Option<LodDemand>) -> CellRole {
+    match (demand, status) {
+        (Some(demand), LodChunkStatus::Loading { .. } | LodChunkStatus::Ready { .. })
+            if key.worldspace_id == demand.world =>
+        {
+            match demand.role {
+                LodDemandRole::Main => CellRole::Active,
+                LodDemandRole::Portal => CellRole::Destination,
+                LodDemandRole::Pinned => CellRole::Hidden,
+            }
+        }
+        _ => CellRole::Hidden,
+    }
+}
+
+/// Run immediately after collect_lod_chunks, including its deferred spawns, so
+/// every cached root has a collision role before the next player frame.
+pub(super) fn sync_lod_roles(
+    mut commands: Commands,
+    streaming: Res<LodStreaming>,
+    existing_layers: Query<&RenderLayers>,
+    mut portal: Option<ResMut<PortalState>>,
+    far: Option<Res<super::far_stock::FarStock>>,
+    objects: Option<Res<super::lod_objects::ObjectLodStreaming>>,
+    trees: Option<Res<super::lod_trees::TreeLodStreaming>>,
+) {
+    for (&key, status) in &streaming.chunks {
+        let root = match status {
+            LodChunkStatus::Loading { root, .. }
+            | LodChunkStatus::Ready { root, .. }
+            | LodChunkStatus::Retiring { root, .. }
+            | LodChunkStatus::Held { root, .. } => *root,
+            LodChunkStatus::Failed { .. } => continue,
+        };
+        let role = lod_root_role(key, status, streaming.demand);
+        let layers = lod_role_layers(role);
+        if existing_layers
+            .get(root)
+            .is_ok_and(|current| *current == layers)
+        {
+            continue;
+        }
+        commands
+            .entity(root)
+            .try_insert((layers.clone(), Propagate(layers)));
+    }
+    let native = super::native_lod::publish_roles(
+        &mut commands,
+        objects
+            .as_deref()
+            .into_iter()
+            .flat_map(|objects| objects.roles())
+            .chain(trees.as_deref().into_iter().flat_map(|trees| trees.roles())),
+        &existing_layers,
+    );
+    if let Some(portal) = portal.as_deref_mut() {
+        portal.replace_lod_roles(
+            streaming
+                .chunks
+                .iter()
+                .filter_map(|(&key, status)| {
+                    let root = match status {
+                        LodChunkStatus::Loading { root, .. }
+                        | LodChunkStatus::Ready { root, .. }
+                        | LodChunkStatus::Retiring { root, .. }
+                        | LodChunkStatus::Held { root, .. } => *root,
+                        LodChunkStatus::Failed { .. } => return None,
+                    };
+                    Some((root, lod_root_role(key, status, streaming.demand)))
+                })
+                .chain(far.as_deref().into_iter().flat_map(|far| far.roles()))
+                .chain(native),
+        );
+    }
+}
+
 /// The layers a LOD ring chunk root carries, and the [`Propagate`] source the chunk's meshes pick
 /// up: the ring is distant *world* content, so the main camera draws it on the world layer and
 /// the water reflection draws it on either shadow route
@@ -867,7 +1117,7 @@ fn plan_lod_demand_controlled(
 /// One function so the layer choice is testable without standing up [`collect_lod_chunks`]'s
 /// database, asset server and budget; see `the_lod_ring_is_on_both_reflection_routes`.
 pub(super) fn lod_ring_layers() -> (RenderLayers, Propagate<RenderLayers>) {
-    let layers = crate::render::reflectable_world_layers();
+    let layers = lod_role_layers(CellRole::Active);
     (layers.clone(), Propagate(layers))
 }
 
@@ -879,7 +1129,7 @@ pub(super) fn collect_lod_chunks(
     database: Res<WorldDatabase>,
     asset_server: Res<AssetServer>,
     origin: Res<RenderOrigin>,
-    mut camera_projection: Query<&mut Projection, With<StreamingCamera>>,
+    mut camera_projection: Query<&mut Projection>,
     mut full_streaming: ResMut<StreamingWorld>,
     mut streaming: ResMut<LodStreaming>,
     mut horizon: ResMut<LodHorizon>,
@@ -938,6 +1188,26 @@ pub(super) fn collect_lod_chunks(
                         .into_iter()
                         .map(|metadata| (response.generation, metadata, None)),
                 );
+            }
+        }
+    }
+
+    // PortalFrame rebuilds its perspective from the main camera each frame.
+    // Widen both named views only when necessary, preserving its doorway clip.
+    if let Some(demand) = streaming.demand
+        && demand.role != LodDemandRole::Pinned
+        && horizon.reach_in(demand.world).is_some()
+    {
+        for camera in std::iter::once(demand.camera)
+            .chain(demand.main_camera.filter(|main| *main != demand.camera))
+        {
+            if let Ok(mut projection) = camera_projection.get_mut(camera) {
+                let required = lod_camera_far(config.terrain_lod.max_reach_cells());
+                if matches!(&*projection, Projection::Perspective(perspective) if perspective.far < required)
+                    && let Projection::Perspective(perspective) = &mut *projection
+                {
+                    perspective.far = required;
+                }
             }
         }
     }
@@ -1084,9 +1354,17 @@ pub(super) fn collect_lod_chunks(
         });
         let local_grid_x = min_grid.0 - i64::from(origin.0.x);
         let local_grid_y = min_grid.1 - i64::from(origin.0.y);
+        let role = streaming
+            .demand
+            .map_or(CellRole::Hidden, |demand| match demand.role {
+                LodDemandRole::Main => CellRole::Active,
+                LodDemandRole::Portal => CellRole::Destination,
+                LodDemandRole::Pinned => CellRole::Hidden,
+            });
+        let ring_layers = lod_role_layers(role);
+        let ring_propagation = Propagate(ring_layers.clone());
         let root = commands
             .spawn((
-                lod_ring_layers(),
                 Name::new(format!(
                     "LOD {:?} chunk {},{}",
                     key.tier, key.anchor.x, key.anchor.y
@@ -1107,6 +1385,8 @@ pub(super) fn collect_lod_chunks(
                     -(local_grid_y as f32) * CELL_SIZE,
                 ),
                 Visibility::Hidden,
+                ring_layers,
+                ring_propagation,
                 PendingLodChunk {
                     metadata,
                     asset: asset.clone(),
@@ -3673,7 +3953,7 @@ mod tests {
 mod terrain_primitive_identity_tests {
     use super::super::{TerrainIdentityAccess, TerrainPrimitiveIdentity, TerrainWorldspace};
     use super::*;
-    use bevy::ecs::system::{RunSystemOnce, SystemState};
+    use bevy::ecs::system::SystemState;
 
     fn resolve(world: &mut World, mesh: Entity) -> Option<TerrainPrimitiveIdentity> {
         let mut state = SystemState::<TerrainIdentityAccess>::new(world);
@@ -3879,6 +4159,323 @@ mod terrain_primitive_identity_tests {
         world.entity_mut(primitive).insert(TerrainWorldspace(72));
         assert_eq!(resolve(&mut world, primitive), None);
     }
+}
+
+#[cfg(test)]
+mod interior_portal_lod_tests {
+    use super::*;
+    use bevy::ecs::system::{RunSystemOnce, SystemState};
+
+    fn resolve(world: &mut World, rendered_door: Option<Entity>) -> Option<LodDemand> {
+        let mut state = SystemState::<LodDemandViews>::new(world);
+        let views = state.get(world).unwrap();
+        views.for_rendered_door(
+            world.resource::<EngineConfig>(),
+            world.resource::<RenderOrigin>().0,
+            rendered_door,
+        )
+    }
+
+    fn test_door() -> crate::doors::LoadDoor {
+        crate::doors::LoadDoor {
+            ref_id: 1,
+            destination: crate::doors::DoorDestination {
+                destination_ref_id: 2,
+                interior_cell_id: None,
+                worldspace_id: Some(77),
+                arrival_position: [0.0; 3],
+                arrival_rotation: [0.0; 3],
+            },
+            label: "fixture".into(),
+            auto_load: false,
+            outward: None,
+        }
+    }
+
+    #[test]
+    fn only_owned_active_exterior_portal_demands_lod_from_an_interior() {
+        let mut world = World::new();
+        world.insert_resource(EngineConfig::default());
+        world.insert_resource(RenderOrigin(IVec2::new(11, -9)));
+        world.insert_resource(ActiveSpace {
+            worldspace_id: Some(55),
+            interior: Some(10),
+        });
+        let main = world
+            .spawn((
+                StreamingCamera,
+                Transform::from_xyz(0.5 * CELL_SIZE, 0.0, -0.5 * CELL_SIZE),
+            ))
+            .id();
+        let portal_transform = Transform::from_xyz(2.5 * CELL_SIZE, 0.0, -3.5 * CELL_SIZE);
+        let camera = world
+            .spawn((
+                PortalCamera,
+                Camera {
+                    is_active: true,
+                    ..default()
+                },
+                portal_transform,
+            ))
+            .id();
+        let door = world.spawn(test_door()).id();
+        let demand = resolve(&mut world, Some(door)).unwrap();
+        assert_eq!(demand.world, 77);
+        assert_eq!(demand.role, LodDemandRole::Portal);
+        assert_eq!(demand.camera, camera);
+        assert_eq!(demand.main_camera, Some(main));
+        assert_eq!(
+            demand.center,
+            streaming_center(false, IVec2::new(11, -9), &portal_transform)
+        );
+        assert!(
+            resolve(&mut world, None).is_none(),
+            "a visible camera without an owned rendered door is insufficient"
+        );
+        // No PortalState means no portal authority even if a camera exists.
+        let mut state = SystemState::<LodDemandViews>::new(&mut world);
+        assert!(
+            state
+                .get(&world)
+                .unwrap()
+                .current(
+                    world.resource::<EngineConfig>(),
+                    world.resource::<RenderOrigin>().0,
+                    None
+                )
+                .is_none()
+        );
+        world.get_mut::<Camera>(camera).unwrap().is_active = false;
+        assert!(resolve(&mut world, Some(door)).is_none());
+        world.get_mut::<Camera>(camera).unwrap().is_active = true;
+        world
+            .get_mut::<crate::doors::LoadDoor>(door)
+            .unwrap()
+            .destination
+            .interior_cell_id = Some(20);
+        assert!(resolve(&mut world, Some(door)).is_none());
+        world
+            .get_mut::<crate::doors::LoadDoor>(door)
+            .unwrap()
+            .destination
+            .interior_cell_id = None;
+        world
+            .get_mut::<crate::doors::LoadDoor>(door)
+            .unwrap()
+            .destination
+            .worldspace_id = None;
+        assert!(resolve(&mut world, Some(door)).is_none());
+        world
+            .get_mut::<crate::doors::LoadDoor>(door)
+            .unwrap()
+            .destination
+            .worldspace_id = Some(77);
+        world.resource_mut::<ActiveSpace>().interior = None;
+        let demand = resolve(&mut world, Some(door)).unwrap();
+        assert_eq!(
+            (demand.world, demand.role, demand.camera),
+            (55, LodDemandRole::Main, main),
+            "active exterior retains priority over a different exterior portal"
+        );
+        world.resource_mut::<EngineConfig>().stream_radius = -1;
+        assert!(resolve(&mut world, Some(door)).is_none());
+    }
+
+    #[derive(Resource, Default)]
+    struct TestLodDistances(Option<crate::config::TerrainLodDistances>);
+
+    fn plan(world: &mut World, demand: Option<LodDemand>) {
+        world.init_resource::<TestLodDistances>();
+        let mut state = SystemState::<(
+            Commands,
+            Res<EngineConfig>,
+            Res<WorldDatabase>,
+            Query<(&Visibility, Option<&super::super::RetireHidden>)>,
+            Query<(&LodChunkRoot, Option<&PendingLodChunk>)>,
+            ResMut<LodStreaming>,
+            ResMut<StreamingMetrics>,
+            ResMut<ProfilingState>,
+            ResMut<TestLodDistances>,
+        )>::new(world);
+        let (
+            commands,
+            config,
+            database,
+            visibility,
+            roots,
+            streaming,
+            metrics,
+            profiler,
+            mut previous,
+        ) = state.get_mut(world).unwrap();
+        plan_lod_demand(
+            demand,
+            commands,
+            config,
+            database,
+            visibility,
+            roots,
+            streaming,
+            metrics,
+            profiler,
+            &mut previous.0,
+        );
+        state.apply(world);
+        world.run_system_once(sync_lod_roles).unwrap();
+    }
+
+    fn active(world: &mut World, entity: Entity) -> bool {
+        let mut state = SystemState::<(Res<PortalState>, Query<&ChildOf>)>::new(world);
+        let (portal, parents) = state.get(world).unwrap();
+        portal.is_in_active_space(entity, &parents)
+    }
+
+    #[test]
+    fn portal_main_promotion_keeps_chunk_and_generation_then_withdrawal_retires() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        converter::esm::exporter::create_tables(&connection).unwrap();
+        drop(connection);
+        let mut world = World::new();
+        world.insert_resource(EngineConfig::default());
+        world.insert_resource(WorldDatabase::open(&path).unwrap());
+        world.insert_resource(LodStreaming::default());
+        world.insert_resource(StreamingCommitBudget::default());
+        world.insert_resource(StreamingMetrics::default());
+        world.insert_resource(ProfilingState::default());
+        world.insert_resource(PortalState::default());
+        let camera = world.spawn_empty().id();
+        let main_camera = world.spawn_empty().id();
+        let origin = LodOrigin::new(0, 0);
+        let root = LodStreaming::spawn_ready_chunk_for_test(
+            &mut world,
+            77,
+            shared::lod::ChunkAnchor::new(0, 0),
+            origin,
+        );
+        let mesh = world.spawn(ChildOf(root)).id();
+        let other = LodStreaming::spawn_ready_chunk_for_test(
+            &mut world,
+            88,
+            shared::lod::ChunkAnchor::new(0, 0),
+            origin,
+        );
+        let demand = LodDemand {
+            world: 77,
+            center: IVec2::ZERO,
+            role: LodDemandRole::Portal,
+            camera,
+            main_camera: Some(main_camera),
+        };
+        plan(&mut world, Some(demand));
+        let generation = world.resource::<LodStreaming>().generation;
+        assert!(
+            !world.resource::<LodStreaming>().pending_queries.is_empty(),
+            "the actual planner submits LOD queries for the portal owner"
+        );
+        let key = ChunkKey::new(77, LodTier::Tier16, shared::lod::ChunkAnchor::new(0, 0));
+        assert!(
+            matches!(world.resource::<LodStreaming>().chunks.get(&key), Some(LodChunkStatus::Ready { root: current, .. }) if *current == root)
+        );
+        assert_eq!(
+            *world.get::<RenderLayers>(root).unwrap(),
+            lod_role_layers(CellRole::Destination)
+        );
+        assert_eq!(
+            world.get::<Propagate<RenderLayers>>(root).unwrap().0,
+            lod_role_layers(CellRole::Destination)
+        );
+        assert!(!active(&mut world, mesh));
+        assert!(
+            !active(&mut world, other),
+            "another world at the same grid is never active"
+        );
+        assert_eq!(
+            *world.get::<RenderLayers>(other).unwrap(),
+            RenderLayers::none()
+        );
+        plan(
+            &mut world,
+            Some(LodDemand {
+                role: LodDemandRole::Main,
+                camera: main_camera,
+                ..demand
+            }),
+        );
+        assert_eq!(world.resource::<LodStreaming>().generation, generation);
+        assert!(active(&mut world, mesh));
+        assert_eq!(
+            *world.get::<RenderLayers>(root).unwrap(),
+            crate::render::reflectable_world_layers()
+        );
+        plan(&mut world, Some(demand));
+        assert_eq!(world.resource::<LodStreaming>().generation, generation);
+        assert!(!active(&mut world, mesh));
+        plan(&mut world, None);
+        assert!(
+            matches!(world.resource::<LodStreaming>().chunks.get(&key), Some(LodChunkStatus::Retiring { root: current, .. }) if *current == root)
+        );
+        assert_eq!(
+            *world.get::<RenderLayers>(root).unwrap(),
+            RenderLayers::none()
+        );
+        assert!(!active(&mut world, mesh));
+    }
+
+    #[test]
+    fn role_sync_includes_new_loading_roots_without_readiness_components() {
+        let mut world = World::new();
+        world.insert_resource(LodStreaming::default());
+        world.insert_resource(PortalState::default());
+        let camera = world.spawn_empty().id();
+        let root = world.spawn_empty().id();
+        let child = world.spawn(ChildOf(root)).id();
+        let origin = LodOrigin::new(0, 0);
+        let key = ChunkKey::new(77, LodTier::Tier16, shared::lod::ChunkAnchor::new(0, 0));
+        {
+            let mut streaming = world.resource_mut::<LodStreaming>();
+            streaming.demand = Some(LodDemand {
+                world: 77,
+                center: IVec2::ZERO,
+                role: LodDemandRole::Portal,
+                camera,
+                main_camera: None,
+            });
+            streaming.chunks.insert(
+                key,
+                LodChunkStatus::Loading {
+                    root,
+                    origin,
+                    generation: 1,
+                },
+            );
+        }
+        world.run_system_once(sync_lod_roles).unwrap();
+        assert!(
+            !active(&mut world, child),
+            "new cache entries must not inherit unknown-is-active before becoming ready"
+        );
+        assert_eq!(
+            *world.get::<RenderLayers>(root).unwrap(),
+            lod_role_layers(CellRole::Destination)
+        );
+        world.resource_mut::<LodStreaming>().demand = None;
+        world.run_system_once(sync_lod_roles).unwrap();
+        assert!(!active(&mut world, child));
+        assert_eq!(
+            *world.get::<RenderLayers>(root).unwrap(),
+            RenderLayers::none()
+        );
+        world.resource_mut::<LodStreaming>().chunks.clear();
+        world.run_system_once(sync_lod_roles).unwrap();
+        assert!(
+            active(&mut world, child),
+            "the complete role replacement removes roots no longer in the cache"
+        );
+    }
+
+    #[test]
     fn terrain_tiers_do_not_share_coverage_across_worlds_or_unknown_ancestry() {
         let mut world = World::new();
         world.insert_resource(EngineConfig {
@@ -3973,6 +4570,226 @@ mod terrain_primitive_identity_tests {
             *world.get::<Visibility>(current).unwrap(),
             Visibility::Hidden,
             "same-world near terrain still replaces its far tier"
+        );
+    }
+    fn inflight_fixture() -> (World, tempfile::TempDir, Entity, Entity, Entity) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        converter::esm::exporter::create_tables(&connection).unwrap();
+        drop(connection);
+        let mut world = World::new();
+        world.insert_resource(EngineConfig {
+            worldspace_id: 77,
+            ..default()
+        });
+        world.insert_resource(RenderOrigin(IVec2::ZERO));
+        world.insert_resource(ActiveSpace {
+            worldspace_id: Some(77),
+            interior: Some(10),
+        });
+        world.insert_resource(WorldDatabase::open(&path).unwrap());
+        world.insert_resource(LodStreaming::default());
+        world.insert_resource(StreamingCommitBudget::default());
+        world.insert_resource(StreamingMetrics::default());
+        world.insert_resource(ProfilingState::default());
+        world.insert_resource(PortalState::default());
+        world.insert_resource(crate::swap_bridge::destination::RequiredHandoff);
+        let transform = Transform::from_xyz(0.5 * CELL_SIZE, 0.0, -0.5 * CELL_SIZE);
+        let main = world
+            .spawn((StreamingCamera, Camera::default(), transform))
+            .id();
+        let camera = world
+            .spawn((
+                PortalCamera,
+                Camera {
+                    is_active: true,
+                    ..default()
+                },
+                transform,
+            ))
+            .id();
+        let door = world.spawn(test_door()).id();
+        world.insert_resource(crate::transition::PendingCrossing::for_test(door));
+        (world, directory, door, main, camera)
+    }
+
+    fn next_residency(world: &mut World, rendered_door: Option<Entity>) -> Option<LodDemand> {
+        let portal_present = world.contains_resource::<PortalState>();
+        let mut state = SystemState::<(
+            LodDemandViews,
+            Res<EngineConfig>,
+            Res<RenderOrigin>,
+            ResMut<LodStreaming>,
+        )>::new(world);
+        let (views, config, origin, mut streaming) = state.get_mut(world).unwrap();
+        let actual = views.for_rendered_door(&config, origin.0, rendered_door);
+        views.residency_for_door(
+            &config,
+            actual,
+            rendered_door,
+            portal_present,
+            &mut streaming,
+        )
+    }
+
+    #[test]
+    fn pending_crossing_gap_keeps_queries_and_chunks_hidden_then_main_reuses_them() {
+        let (mut world, _directory, door, _main, camera) = inflight_fixture();
+        let origin = LodOrigin::new(0, 0);
+        let anchor = shared::lod::ChunkAnchor::new(0, 0);
+        let root = LodStreaming::spawn_ready_chunk_for_test(&mut world, 77, anchor, origin);
+        let child = world.spawn(ChildOf(root)).id();
+        let demand = next_residency(&mut world, Some(door)).unwrap();
+        assert_eq!(demand.role, LodDemandRole::Portal);
+        plan(&mut world, Some(demand));
+        let generation = world.resource::<LodStreaming>().generation;
+        let queries = world.resource::<LodStreaming>().pending_queries.clone();
+        assert!(!queries.is_empty());
+        world.get_mut::<Camera>(camera).unwrap().is_active = false;
+        let demand = next_residency(&mut world, None).unwrap();
+        assert_eq!(demand.role, LodDemandRole::Pinned);
+        plan(&mut world, Some(demand));
+        let key = ChunkKey::new(77, LodTier::Tier16, anchor);
+        assert!(
+            matches!(world.resource::<LodStreaming>().chunks.get(&key), Some(LodChunkStatus::Ready { root: retained, .. }) if *retained == root)
+        );
+        assert_eq!(world.resource::<LodStreaming>().generation, generation);
+        assert_eq!(world.resource::<LodStreaming>().pending_queries, queries);
+        assert_eq!(
+            *world.get::<RenderLayers>(root).unwrap(),
+            RenderLayers::none()
+        );
+        assert!(!active(&mut world, child));
+        // Inactive camera motion/rebasing cannot reinterpret the saved absolute grid.
+        world.get_mut::<Transform>(camera).unwrap().translation.x += CELL_SIZE * 30.0;
+        world.resource_mut::<RenderOrigin>().0 = IVec2::new(-30, 0);
+        assert_eq!(
+            next_residency(&mut world, None).unwrap().center,
+            demand.center
+        );
+        world.get_mut::<Transform>(camera).unwrap().translation.x -= CELL_SIZE * 30.0;
+        world.resource_mut::<RenderOrigin>().0 = IVec2::ZERO;
+        world.get_mut::<Camera>(camera).unwrap().is_active = true;
+        let demand = next_residency(&mut world, Some(door)).unwrap();
+        assert_eq!(demand.role, LodDemandRole::Portal);
+        plan(&mut world, Some(demand));
+        assert_eq!(world.resource::<LodStreaming>().generation, generation);
+        assert_eq!(
+            *world.get::<RenderLayers>(root).unwrap(),
+            lod_role_layers(CellRole::Destination)
+        );
+        // DoorTransition clears the pending request and switches the active space.
+        world.insert_resource(crate::transition::PendingCrossing::default());
+        world.resource_mut::<ActiveSpace>().interior = None;
+        let demand = next_residency(&mut world, None).unwrap();
+        assert_eq!(demand.role, LodDemandRole::Main);
+        plan(&mut world, Some(demand));
+        assert!(
+            world
+                .resource::<LodStreaming>()
+                .crossing_residency
+                .is_none()
+        );
+        assert_eq!(world.resource::<LodStreaming>().generation, generation);
+        assert!(active(&mut world, child));
+        assert!(
+            matches!(world.resource::<LodStreaming>().chunks.get(&key), Some(LodChunkStatus::Ready { root: retained, .. }) if *retained == root)
+        );
+    }
+
+    #[test]
+    fn crossing_pin_releases_on_every_owner_identity_or_request_change() {
+        // Each case starts with an actual portal view, not fabricated saved state.
+        for change in 0..13 {
+            let (mut world, _directory, door, main, camera) = inflight_fixture();
+            let demand = next_residency(&mut world, Some(door)).unwrap();
+            plan(&mut world, Some(demand));
+            world.get_mut::<Camera>(camera).unwrap().is_active = false;
+            assert_eq!(
+                next_residency(&mut world, None).unwrap().role,
+                LodDemandRole::Pinned
+            );
+            match change {
+                0 => {
+                    world.insert_resource(crate::transition::PendingCrossing::default());
+                }
+                1 => {
+                    let replacement = world.spawn(test_door()).id();
+                    world
+                        .insert_resource(crate::transition::PendingCrossing::for_test(replacement));
+                }
+                2 => {
+                    world.resource_mut::<ActiveSpace>().interior = Some(11);
+                }
+                3 => {
+                    world.resource_mut::<ActiveSpace>().worldspace_id = Some(88);
+                }
+                4 => {
+                    world.entity_mut(door).despawn();
+                }
+                5 => {
+                    world
+                        .get_mut::<crate::doors::LoadDoor>(door)
+                        .unwrap()
+                        .destination
+                        .arrival_position[0] = 128.0;
+                }
+                6 => {
+                    world.entity_mut(camera).despawn();
+                    world.spawn((
+                        PortalCamera,
+                        Camera {
+                            is_active: false,
+                            ..default()
+                        },
+                        Transform::default(),
+                    ));
+                }
+                7 => {
+                    world.entity_mut(main).despawn();
+                    world.spawn((StreamingCamera, Transform::default()));
+                }
+                8 => {
+                    world.remove_resource::<crate::swap_bridge::destination::RequiredHandoff>();
+                }
+                9 => {
+                    world.remove_resource::<PortalState>();
+                }
+                10 => {
+                    world.resource_mut::<EngineConfig>().stream_radius = -1;
+                }
+                11 => {
+                    world.entity_mut(main).remove::<Camera>();
+                }
+                12 => {
+                    world.entity_mut(camera).remove::<Camera>();
+                }
+                _ => unreachable!(),
+            }
+            let demand = next_residency(&mut world, None);
+            assert!(demand.is_none(), "release case {change}");
+            assert!(
+                world
+                    .resource::<LodStreaming>()
+                    .crossing_residency
+                    .is_none(),
+                "release case {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn vanished_portal_without_pending_crossing_cannot_seed_a_later_pin() {
+        let (mut world, _directory, door, _main, camera) = inflight_fixture();
+        assert!(next_residency(&mut world, Some(door)).is_some());
+        world.insert_resource(crate::transition::PendingCrossing::default());
+        world.get_mut::<Camera>(camera).unwrap().is_active = false;
+        assert!(next_residency(&mut world, None).is_none());
+        world.insert_resource(crate::transition::PendingCrossing::for_test(door));
+        assert!(
+            next_residency(&mut world, None).is_none(),
+            "a new request cannot revive an old withdrawn portal pose"
         );
     }
 }

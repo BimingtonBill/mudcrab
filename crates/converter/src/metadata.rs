@@ -1025,7 +1025,27 @@ async fn progress_event(progress: &Sender<ProgressEvent>, stage: ProgressStage, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::CacheEntry;
+    use crate::cache::{CacheEntry, retained_configuration_matches};
+
+    #[test]
+    fn old_dev_101_601_configuration_hash_matches_what_that_converter_recorded() {
+        // The 101_601 converter hashed its raw schema number and the fields main 16 had (no
+        // texture_encoder, which arrived with main 22).
+        let directory = tempfile::tempdir().unwrap();
+        let config =
+            crate::config::PipelineConfig::new(directory.path(), directory.path().join("output"));
+        let recorded = hash_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "schema": 101_601,
+                "texture_etc1s_quality": config.texture_fallback_quality,
+                "texture_uastc_level": config.texture_uastc_level,
+                "script_abi_version": config.script_abi_version,
+                "texture_zstd_level": config.texture_zstd_level,
+            }))
+            .unwrap(),
+        );
+        assert!(retained_configuration_matches(&config, 101_601, &recorded).unwrap());
+    }
 
     #[test]
     fn retained_sampler_aliases_require_exact_source_bytes() {

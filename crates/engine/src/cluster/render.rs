@@ -8,6 +8,8 @@
 //! fetches positions, octahedral normals and quantised UVs from the payload sections in storage
 //! buffers: there is no vertex or index buffer.
 
+#[path = "far.rs"]
+mod far;
 #[path = "gpu_contract.rs"]
 mod gpu_contract;
 #[path = "handoff.rs"]
@@ -201,6 +203,8 @@ use std::{
     sync::Arc,
 };
 
+use crate::snow::SnowMaterial;
+
 /// Actual stock geometry for standalone fixtures without a certified glTF template.
 /// Keep the same handle that the stock path draws; runtime mutation revokes proof.
 #[derive(Resource, Default)]
@@ -294,10 +298,15 @@ fn batch_tangent_layout(
 fn material_geometry(
     id: bevy::asset::UntypedAssetId,
     standard: &Assets<StandardMaterial>,
+    snow: Option<&Assets<SnowMaterial>>,
     terrain: Option<&Assets<super::terrain::ClusterTerrainMaterial>>,
 ) -> Option<super::material_geometry::GeometryRequirements> {
     let material = if id.type_id() == std::any::TypeId::of::<StandardMaterial>() {
         standard.get(id.typed::<StandardMaterial>())
+    } else if id.type_id() == std::any::TypeId::of::<SnowMaterial>() {
+        snow?
+            .get(id.typed::<SnowMaterial>())
+            .map(|material| &material.base)
     } else if id.type_id() == std::any::TypeId::of::<super::terrain::ClusterTerrainMaterial>() {
         terrain?
             .get(id.typed::<super::terrain::ClusterTerrainMaterial>())
@@ -376,11 +385,13 @@ fn create_dummy_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 #[derive(bevy::ecs::system::SystemParam)]
 struct BatchMaterialEvents<'w, 's> {
     standard: MessageReader<'w, 's, AssetEvent<StandardMaterial>>,
+    snow: MessageReader<'w, 's, AssetEvent<SnowMaterial>>,
     terrain: Option<Res<'w, Messages<AssetEvent<super::terrain::ClusterTerrainMaterial>>>>,
 }
 
 type BatchMaterialAssets<'w> = (
     Res<'w, Assets<StandardMaterial>>,
+    Option<Res<'w, Assets<SnowMaterial>>>,
     Option<Res<'w, Assets<super::terrain::ClusterTerrainMaterial>>>,
 );
 
@@ -424,6 +435,14 @@ fn extract_batch_materials(
             dirty.insert(event_asset_id(event).untyped());
         }
     }
+    let mut snow_hits = 0usize;
+    for event in events.snow.read() {
+        if out.named.contains(&event_asset_id(event).untyped()) {
+            changed = true;
+            snow_hits += 1;
+            dirty.insert(event_asset_id(event).untyped());
+        }
+    }
     let mut terrain_changed = false;
     if let Some(events) = events.terrain.as_ref() {
         for event in terrain_cursor.read(events) {
@@ -435,9 +454,9 @@ fn extract_batch_materials(
         }
     }
     changed |= terrain_changed;
-    let (standard, terrain) = &*assets;
+    let (standard, snow, terrain) = &*assets;
     for id in dirty {
-        match material_geometry(id, standard, terrain.as_deref()) {
+        match material_geometry(id, standard, snow.as_deref(), terrain.as_deref()) {
             Some(requirements) => {
                 out.geometry.insert(id, requirements);
             }
@@ -453,6 +472,7 @@ fn extract_batch_materials(
             handles_changed,
             standard = ?standard_hits.iter().take(4).collect::<Vec<_>>(),
             standard_count = standard_hits.len(),
+            snow_hits,
             terrain_changed,
             "cluster batch materials changed"
         );
@@ -475,6 +495,7 @@ fn event_asset_id<A: Asset>(event: &AssetEvent<A>) -> AssetId<A> {
 #[derive(bevy::ecs::system::SystemParam)]
 struct CarrierWatch<'w, 's> {
     markers: Query<'w, 's, (Entity, &'static MainEntity, &'static ClusterBatch)>,
+    far_pipeline_log: Local<'s, HashMap<usize, String>>,
     carrier_scratch: Local<'s, Vec<Option<(Entity, MainEntity)>>>,
 }
 
@@ -648,10 +669,10 @@ pub fn world_from_local(record: &InstanceRecord) -> Mat4 {
 /// Copies the graphics settings' cluster error thresholds into [`ClusterSettings`] whenever they
 /// change, so a preset, a flag, the settings file or the graphics panel sets the cluster detail.
 pub fn follow_graphics_quality(
-    graphics: Res<crate::graphics_settings::GraphicsSettings>,
+    graphics: Option<Res<crate::graphics_settings::GraphicsSettings>>,
     settings: Option<ResMut<ClusterSettings>>,
 ) {
-    let Some(mut settings) = settings else {
+    let (Some(graphics), Some(mut settings)) = (graphics, settings) else {
         return;
     };
     if !graphics.is_changed() && !settings.is_added() {
@@ -846,6 +867,7 @@ struct ViewGpu {
     instance_mask_bytes: Vec<u8>,
     terrain_clip_bytes: Vec<u8>,
     terrain_clip_inputs: Option<handoff::TerrainClipInputs>,
+    far: Option<far::Binding>,
     prepass_pipelines: HashMap<u32, CachedRenderPipelineId>,
     shadow_pipelines: HashMap<u32, CachedRenderPipelineId>,
     args: Buffer,
@@ -879,7 +901,7 @@ struct ViewGpu {
     plan_hash: Option<u64>,
     /// What the last walk over the batches was made from, kept only when it left nothing out for
     /// want of a prepared material, mesh or pipeline: the same again means the same plan.
-    walk_stamp: Option<[u64; 8]>,
+    walk_stamp: Option<[u64; 10]>,
     /// The cull epoch each prepass draw group last drew in (see [`DrawClusterIndirect`]'s `ONCE`).
     prepass_drawn: std::sync::Mutex<HashMap<u32, u32>>,
     walk_carriers: Vec<Option<(Entity, MainEntity)>>,
@@ -917,6 +939,7 @@ struct GroupDraw {
     count_offset: u64,
     /// The most clusters the group's batches can select between them.
     max_count: u32,
+    far: bool,
 }
 
 /// The draw groups of one view. Batches whose draws would bind the same pipeline and the same
@@ -965,6 +988,7 @@ impl DrawGroups {
                 args_offset: u64::from(next) * 16,
                 count_offset: group as u64 * 4,
                 max_count: *slots,
+                far: false,
             });
             next += slots;
         }
@@ -1376,7 +1400,13 @@ struct ClusterPipelines {
     prepass_material_version: u64,
     /// Keyed by the material's type too: two material types with equal mesh keys still have
     /// different bind group layouts and fragment shaders.
-    render: HashMap<ClusterMaterialPipelineKey, CachedRenderPipelineId>,
+    render: HashMap<(ClusterMaterialPipelineKey, bool), CachedRenderPipelineId>,
+    /// Layout limits are fixed for this pipeline cache's device. A refused
+    /// optional variant uses the ordinary terrain pipeline with the same key.
+    far_layout_refusals: HashSet<ClusterMaterialPipelineKey>,
+    /// Only compiled optional variants may replace an ordinary terrain draw.
+    far_ready: HashSet<CachedRenderPipelineId>,
+    far_readiness_revision: u64,
 }
 
 impl ClusterPipelines {
@@ -1387,22 +1417,59 @@ impl ClusterPipelines {
         }
     }
 
-    /// Cache successful ordinary specializations by the complete material key.
-    /// Failed specialization is retried; compilation readiness is checked by
-    /// the draw/readiness consumers rather than by pipeline creation.
+    fn refresh_far_readiness(&mut self, mut ready: impl FnMut(CachedRenderPipelineId) -> bool) {
+        let next: HashSet<_> = self
+            .render
+            .iter()
+            .filter_map(|((_, far), &id)| (*far && ready(id)).then_some(id))
+            .collect();
+        if self.far_ready != next {
+            self.far_ready = next;
+            self.far_readiness_revision = self.far_readiness_revision.wrapping_add(1);
+        }
+    }
+
+    /// Resolve exactly the variant that can be queued. Optional layout refusal
+    /// is sticky for this device/key; material specialization failures are not.
     fn forward_pipeline(
         &mut self,
         key: ClusterMaterialPipelineKey,
-        mut build: impl FnMut() -> Option<RenderPipelineDescriptor>,
+        far: bool,
+        limits: &wgpu::Limits,
+        mut build: impl FnMut(bool) -> Option<RenderPipelineDescriptor>,
         mut queue: impl FnMut(RenderPipelineDescriptor) -> CachedRenderPipelineId,
-    ) -> Option<CachedRenderPipelineId> {
-        if let Some(id) = self.render.get(&key) {
-            return Some(*id);
+        mut ready: impl FnMut(CachedRenderPipelineId) -> bool,
+    ) -> Option<(CachedRenderPipelineId, bool)> {
+        let mut far = far && !self.far_layout_refusals.contains(&key);
+        loop {
+            if let Some(id) = self.render.get(&(key.clone(), far)) {
+                if far && !ready(*id) {
+                    far = false;
+                    continue;
+                }
+                return Some((*id, far));
+            }
+            let descriptor = build(far)?;
+            if far
+                && let Err(reason) =
+                    crate::far_terrain_shadows::layout::validate(&descriptor, limits)
+            {
+                note_pipeline_failure("canonical terrain shadow layout", &reason);
+                self.far_layout_refusals.insert(key.clone());
+                far = false;
+                continue;
+            }
+            let id = queue(descriptor);
+            self.render.insert((key.clone(), far), id);
+            if far && !ready(id) {
+                info!(
+                    "optional terrain forward pipeline queued; retaining ordinary terrain until compiled"
+                );
+                far = false;
+                continue;
+            }
+            return Some((id, far));
         }
-        let descriptor = build()?;
-        let id = queue(descriptor);
-        self.render.insert(key, id);
-        Some(id)
     }
 }
 
@@ -2043,6 +2110,7 @@ struct StockLookups<'w> {
     sources: Res<'w, handoff::Sources>,
     materials: Res<'w, ErasedRenderAssets<PreparedMaterial>>,
     render_meshes: Res<'w, RenderAssets<RenderMesh>>,
+    far: Option<Res<'w, crate::far_terrain_shadows::render::State>>,
 }
 
 /// The draw functions the camera queue registers its items with.
@@ -2081,6 +2149,7 @@ fn queue_cluster_batches(
 ) {
     perf_span!("cluster::queue_batches::total");
     let markers = carriers.markers;
+    let far_pipeline_log = &mut carriers.far_pipeline_log;
     let mut carrier_scratch = carriers.carrier_scratch;
     let _timer = queue_stats::Timed::start(&queue_stats::BATCH_NANOS);
     queue_stats::frame_done();
@@ -2088,6 +2157,7 @@ fn queue_cluster_batches(
         sources,
         materials,
         render_meshes,
+        far: far_state,
     } = stock;
     let Some(gpu) = gpu.as_deref_mut() else {
         return;
@@ -2095,6 +2165,39 @@ fn queue_cluster_batches(
     let Some(dummy_mesh) = dummy_mesh else {
         return;
     };
+    if far_state.is_some() {
+        // Async compilation and shader reloads do not emit material events. A
+        // changed compiled optional set must wake an otherwise unchanged walk.
+        pipelines.refresh_far_readiness(|id| pipeline_cache.get_render_pipeline(id).is_some());
+        if bevy::log::tracing::enabled!(target: "engine::cluster::render::far_pipeline", bevy::log::tracing::Level::DEBUG)
+        {
+            for ((_, far), &id) in &pipelines.render {
+                if !far {
+                    continue;
+                }
+                let state = match pipeline_cache.get_render_pipeline_state(id) {
+                    CachedPipelineState::Queued => "queued".to_owned(),
+                    CachedPipelineState::Creating(..) => "creating".to_owned(),
+                    CachedPipelineState::Ok(_) => "ready".to_owned(),
+                    CachedPipelineState::Err(error) => format!("error: {error}"),
+                };
+                if far_pipeline_log.get(&id.id()) != Some(&state) {
+                    far_pipeline_log.insert(id.id(), state.clone());
+                    // A pipeline queued this frame is not in the cache's descriptor list yet, and
+                    // reading its descriptor indexes past the end (as `stock_drawable` guards).
+                    let descriptor = (!matches!(
+                        pipeline_cache.get_render_pipeline_state(id),
+                        CachedPipelineState::Queued
+                    ))
+                    .then(|| pipeline_cache.get_render_pipeline_descriptor(id));
+                    debug!(target: "engine::cluster::render::far_pipeline", pipeline = id.id(),
+                        %state, vertex = ?descriptor.map(|descriptor| &descriptor.vertex.shader),
+                        fragment = ?descriptor.and_then(|descriptor| descriptor.fragment.as_ref().map(|stage| &stage.shader)),
+                        "optional terrain pipeline progress");
+                }
+            }
+        }
+    }
     let draw_function = queue_draw_functions.opaque.read().id::<DrawClusterBatch>();
     let alpha_mask_draw_function = queue_draw_functions
         .alpha_mask
@@ -2125,6 +2228,7 @@ fn queue_cluster_batches(
             let view_gpu = new_view_gpu(&device, &pipeline_cache, gpu);
             gpu.views.insert(key, view_gpu);
         }
+        far::refresh(gpu, key, far_state.as_deref(), &device, &pipeline_cache);
         // The walk below is skipped when everything it reads is what it read last time. The
         // batch materials' own version stands for the prepared materials (see there); the exact
         // index-to-identity carrier mapping is compared independently of query arrival order.
@@ -2133,8 +2237,12 @@ fn queue_cluster_batches(
             &(dummy_mesh.plain.id(), dummy_mesh.tangent.id()),
             &mut mesh_hasher,
         );
-        let stamp: [u64; 8] = [
+        let stamp: [u64; 10] = [
             sources.layout_version,
+            gpu.views[&key]
+                .far
+                .as_ref()
+                .map_or(0, |binding| binding.prepared.nonce),
             view_key.bits(),
             std::hash::Hasher::finish(&mesh_hasher),
             batch_materials.version,
@@ -2149,6 +2257,7 @@ fn queue_cluster_batches(
                 ) << 1)
                 | (u64::from(render_meshes.get(dummy_mesh.plain.id()).is_some()) << 2)
                 | (u64::from(render_meshes.get(dummy_mesh.tangent.id()).is_some()) << 3),
+            pipelines.far_readiness_revision,
         ];
         if gpu.views[&key].walk_stamp == Some(stamp) && gpu.views[&key].walk_carriers == *carriers {
             queue_stats::bump(&queue_stats::BATCH_SKIPPED);
@@ -2224,13 +2333,25 @@ fn queue_cluster_batches(
                 },
                 tangents,
             };
+            let mut far_variant = is_terrain
+                && far::current(gpu, &gpu.views[&key], far_state.as_deref())
+                && !pipelines.far_layout_refusals.contains(&pipeline_key);
+            let selected_far = if far_variant {
+                pipelines
+                    .render
+                    .get(&(pipeline_key.clone(), true))
+                    .map(|id| pipelines.far_ready.contains(id))
+            } else {
+                Some(false)
+            };
             // What this batch resolved to last time, when none of its inputs has changed since:
             // the same material instance, prepared material (by address, which moves when the
             // asset is prepared again) and mesh, under the same view key.
             let material_address = std::ptr::from_ref(material) as usize;
             let properties = material_properties_hash(material);
             let cached = gpu.views[&key].memo[index].filter(|memo| {
-                memo.properties == properties
+                Some(memo.resolved.far) == selected_far
+                    && memo.properties == properties
                     && memo.asset_id == asset_id
                     && memo.material_address == material_address
                     && memo.material_slot == u32::from(material.binding.slot)
@@ -2247,24 +2368,33 @@ fn queue_cluster_batches(
                 None => {
                     let pipeline = pipelines.forward_pipeline(
                         pipeline_key.clone(),
-                        || {
+                        far_variant,
+                        &device.limits(),
+                        |far| {
                             build_descriptor(
                                 &material_pipeline,
                                 pipeline_key.clone(),
                                 &render_mesh.layout,
                                 material,
-                                &gpu.draw_layout,
+                                if far {
+                                    &gpu.views[&key].far.as_ref().unwrap().layout
+                                } else {
+                                    &gpu.draw_layout
+                                },
                                 &asset_server,
+                                far,
                             )
                         },
                         |descriptor| pipeline_cache.queue_render_pipeline(descriptor),
+                        |id| pipeline_cache.get_render_pipeline(id).is_some(),
                     );
-                    let Some(pipeline_id) = pipeline else {
+                    let Some((pipeline_id, selected_far)) = pipeline else {
                         invalidate_batch_material(gpu, index);
                         terrain_walk[2] += u32::from(is_terrain);
                         incomplete = true;
                         continue;
                     };
+                    far_variant = selected_far;
                     gpu.batches[index].material = Some(asset_id);
                     gpu.batches[index].tangents = Some(tangents);
                     gpu.generation = gpu.generation.wrapping_add(1);
@@ -2324,6 +2454,7 @@ fn queue_cluster_batches(
                     });
                     let resolved = ResolvedBatch {
                         pipeline: pipeline_id,
+                        far: far_variant,
                         material_group: material.binding.group.0,
                         alpha_mask: phase_kind,
                         bindless: material.properties.bindless,
@@ -2364,6 +2495,7 @@ fn queue_cluster_batches(
                 main_entity: MainEntity::from(Entity::PLACEHOLDER),
                 index: index as u32,
                 pipeline: resolved.pipeline,
+                far: resolved.far,
                 material_group: resolved.material_group,
                 alpha_mask,
                 bindless: resolved.bindless,
@@ -2489,6 +2621,12 @@ fn queue_cluster_batches(
             std::sync::atomic::Ordering::Relaxed,
         );
         groups.apply(view_gpu, &queue, order);
+        for draw in view_gpu.draws.values_mut() {
+            draw.far = ready_batches
+                .iter()
+                .find(|ready| ready.index == draw.representative)
+                .is_some_and(|ready| ready.far);
+        }
         view_gpu.plan_hash = Some(plan_hash);
         view_gpu.plan_has_opaque = representatives.iter().any(|ready| !ready.alpha_mask);
         view_gpu.plan_has_alpha_mask = representatives.iter().any(|ready| ready.alpha_mask);
@@ -2612,6 +2750,7 @@ fn carrier_shortage(group: usize) {
 /// What a batch's draw needs, resolved from its material.
 #[derive(Clone, Copy)]
 struct ResolvedBatch {
+    far: bool,
     pipeline: CachedRenderPipelineId,
     material_group: u32,
     /// `Some(false)` opaque, `Some(true)` alpha mask, `None` a phase the cluster path skips.
@@ -2641,6 +2780,7 @@ struct BatchMemo {
 /// A batch that is ready to draw in one view.
 #[derive(Clone, Copy)]
 struct ReadyBatch {
+    far: bool,
     render_entity: Entity,
     main_entity: MainEntity,
     index: u32,
@@ -2657,6 +2797,7 @@ fn build_descriptor(
     material: &PreparedMaterial,
     draw_layout: &BindGroupLayoutDescriptor,
     asset_server: &AssetServer,
+    far: bool,
 ) -> Option<bevy::render::render_resource::RenderPipelineDescriptor> {
     let key = key.material;
     let mesh_key: MeshPipelineKey = key.mesh_key.downcast();
@@ -2695,9 +2836,25 @@ fn build_descriptor(
             fragment.shader_defs.push("BINDLESS".into());
         }
     }
-    descriptor.vertex.shader =
-        asset_server.load("embedded://engine/cluster/shaders/cluster_draw.wgsl");
+    descriptor.vertex.shader = asset_server.load(if far {
+        "embedded://engine/far_terrain_shadows/cluster_draw.wgsl"
+    } else {
+        "embedded://engine/cluster/shaders/cluster_draw.wgsl"
+    });
     descriptor.vertex.buffers.clear();
+    if far {
+        descriptor.fragment.as_mut()?.shader =
+            asset_server.load("embedded://engine/far_terrain_shadows/terrain_material.wgsl");
+        descriptor
+            .vertex
+            .shader_defs
+            .push("CLUSTER_FAR_TERRAIN_SHADOWS".into());
+        descriptor
+            .fragment
+            .as_mut()?
+            .shader_defs
+            .push("CLUSTER_FAR_TERRAIN_SHADOWS".into());
+    }
     descriptor.label = Some("cluster pipeline".into());
     Some(descriptor)
 }
@@ -3166,6 +3323,7 @@ fn new_view_gpu(
         instance_mask_bytes: Vec::new(),
         terrain_clip_bytes: Vec::new(),
         terrain_clip_inputs: None,
+        far: None,
         prepass_pipelines: HashMap::new(),
         shadow_pipelines: HashMap::new(),
         args,
@@ -3264,8 +3422,8 @@ type DrawClusterBatch = (
     SetMeshViewBindingArrayBindGroup<1>,
     SetClusterMeshBindGroup<2>,
     SetClusterMaterialBindGroup<3>,
-    SetClusterDataBindGroup<4>,
-    DrawClusterIndirect,
+    far::SetForwardData<4>,
+    DrawClusterIndirect<true>,
 );
 
 /// The stock `SetMaterialBindGroup`, but resolving the material through the source entity.
@@ -3373,9 +3531,11 @@ fn view_gpu<'a>(gpu: &'a ClusterGpu, view: &ExtractedView) -> Option<&'a ViewGpu
 /// counts in between so each is drawn once, but a cluster group's arguments are the same in both
 /// passes and would draw all of its geometry twice. It draws in the early pass, whose depth also
 /// feeds the occlusion culling of the stock meshes.
-struct DrawClusterIndirect<const ONCE: bool = false>;
+struct DrawClusterIndirect<const FORWARD: bool = false, const ONCE: bool = false>;
 
-impl<P: PhaseItem, const ONCE: bool> RenderCommand<P> for DrawClusterIndirect<ONCE> {
+impl<P: PhaseItem, const FORWARD: bool, const ONCE: bool> RenderCommand<P>
+    for DrawClusterIndirect<FORWARD, ONCE>
+{
     type Param = SRes<ClusterGpu>;
     type ViewQuery = &'static ExtractedView;
     type ItemQuery = &'static ClusterBatch;
@@ -3425,6 +3585,9 @@ impl<P: PhaseItem, const ONCE: bool> RenderCommand<P> for DrawClusterIndirect<ON
             // zero vertices, so they cost a skipped draw each and nothing else.
             pass.multi_draw_indirect(&view_gpu.args, draw.args_offset, draw.max_count);
         }
+        if FORWARD && draw.far {
+            far::note_encoded_draw(gpu, view_gpu);
+        }
         RenderCommandResult::Success
     }
 }
@@ -3438,7 +3601,7 @@ type DrawClusterPrepass = (
     SetClusterMeshBindGroup<2>,
     SetClusterMaterialBindGroup<3>,
     SetClusterDataBindGroup<4>,
-    DrawClusterIndirect<true>,
+    DrawClusterIndirect<false, true>,
 );
 
 /// Stock opaque depth-only specialization has an empty material layout at
@@ -3452,7 +3615,7 @@ type DrawClusterDepthOnlyPrepass = (
     SetClusterMeshBindGroup<2>,
     SetPrepassViewEmptyBindGroup<3>,
     SetClusterDataBindGroup<4>,
-    DrawClusterIndirect<true>,
+    DrawClusterIndirect<false, true>,
 );
 
 /// Inspect the descriptor after material specialization; do not infer layout
@@ -4204,6 +4367,7 @@ fn note_terrain_views(
 /// Publishes only terrain batches whose material and camera pipeline can actually draw.
 #[allow(clippy::too_many_arguments)]
 fn publish_terrain_readiness(
+    far_state: Option<Res<crate::far_terrain_shadows::render::State>>,
     gpu: Option<Res<ClusterGpu>>,
     pipelines: Res<ClusterPipelines>,
     cache: Res<PipelineCache>,
@@ -4285,6 +4449,9 @@ fn publish_terrain_readiness(
             .values()
             .filter_map(|view| {
                 let memo = view.memo.get(batch as usize).and_then(Option::as_ref)?;
+                if memo.resolved.far && !far::current(&gpu, view, far_state.as_deref()) {
+                    return None;
+                }
                 cache
                     .get_render_pipeline(memo.resolved.pipeline)
                     .is_some()
@@ -4346,64 +4513,170 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ordinary_forward_pipeline_reuses_exact_keys_and_retries_failed_specialization() {
+    fn optional_layout_refusal_queues_ordinary_once_and_does_not_retry_the_refused_variant() {
+        let draw = BindGroupLayoutDescriptor::new(
+            "cluster draw fixture",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::VERTEX,
+                (
+                    storage_buffer_read_only_sized(false, None),
+                    storage_buffer_read_only_sized(false, None),
+                    storage_buffer_read_only_sized(false, None),
+                    storage_buffer_read_only_sized(false, None),
+                    storage_buffer_read_only_sized(false, None),
+                    storage_buffer_read_only_sized(false, None),
+                    storage_buffer_read_only_sized(false, None),
+                ),
+            ),
+        );
+        let descriptor = |far| {
+            let mut layout = vec![BindGroupLayoutDescriptor::default(); 4];
+            layout[3]
+                .entries
+                .push(uniform_buffer_sized(false, None).build(0, ShaderStages::FRAGMENT));
+            layout.push(if far {
+                far::forward_layout(&draw)
+            } else {
+                draw.clone()
+            });
+            RenderPipelineDescriptor {
+                layout,
+                ..default()
+            }
+        };
+        let limits = wgpu::Limits {
+            max_bind_groups: 5,
+            max_uniform_buffers_per_shader_stage: 3,
+            ..default()
+        };
+        assert!(crate::far_terrain_shadows::layout::validate(&descriptor(false), &limits).is_ok());
+        assert!(crate::far_terrain_shadows::layout::validate(&descriptor(true), &limits).is_err());
         let key = ClusterMaterialPipelineKey {
             material: ErasedMaterialPipelineKey {
                 mesh_key: ErasedMeshPipelineKey::new(MeshPipelineKey::empty()),
-                material_key: ErasedMaterialKey::new(0_u32),
+                material_key: bevy::material::key::ErasedMaterialKey::new(0_u32),
                 type_id: std::any::TypeId::of::<StandardMaterial>(),
             },
             tangents: true,
         };
         let mut pipelines = ClusterPipelines::default();
+        let mut built = Vec::new();
         let mut queued = 0;
-        assert_eq!(
-            pipelines.forward_pipeline(
+        for _ in 0..2 {
+            let selected = pipelines.forward_pipeline(
                 key.clone(),
-                || None,
+                true,
+                &limits,
+                |far| {
+                    built.push(far);
+                    Some(descriptor(far))
+                },
                 |_| {
                     queued += 1;
                     CachedRenderPipelineId::INVALID
-                }
-            ),
-            None
-        );
-        assert!(pipelines.render.is_empty());
-        assert_eq!(queued, 0);
-        for _ in 0..2 {
-            assert_eq!(
-                pipelines.forward_pipeline(
-                    key.clone(),
-                    || Some(default()),
-                    |_| {
-                        queued += 1;
-                        CachedRenderPipelineId::INVALID
-                    }
-                ),
-                Some(CachedRenderPipelineId::INVALID)
+                },
+                |_| true,
             );
+            assert_eq!(selected, Some((CachedRenderPipelineId::INVALID, false)));
         }
+        assert_eq!(built, [true, false]);
         assert_eq!(queued, 1);
+        assert!(pipelines.far_layout_refusals.contains(&key));
+        assert!(!pipelines.render.contains_key(&(key, true)));
+
+        // Refusal is exact to the specialization, not a permanent global off switch.
         let other = ClusterMaterialPipelineKey {
             material: ErasedMaterialPipelineKey {
-                material_key: ErasedMaterialKey::new(1_u32),
-                ..key.material
+                mesh_key: ErasedMeshPipelineKey::new(MeshPipelineKey::empty()),
+                material_key: bevy::material::key::ErasedMaterialKey::new(1_u32),
+                type_id: std::any::TypeId::of::<StandardMaterial>(),
             },
-            tangents: key.tangents,
+            tangents: true,
         };
-        assert_eq!(
+        let other_descriptor = |far| {
+            let mut descriptor = descriptor(far);
+            descriptor.layout[3].entries.clear();
+            descriptor
+        };
+        assert!(
+            crate::far_terrain_shadows::layout::validate(&other_descriptor(true), &limits).is_ok()
+        );
+        let selected = pipelines.forward_pipeline(
+            other.clone(),
+            true,
+            &limits,
+            |far| Some(other_descriptor(far)),
+            |_| CachedRenderPipelineId::INVALID,
+            |_| true,
+        );
+        assert_eq!(selected, Some((CachedRenderPipelineId::INVALID, true)));
+        assert!(!pipelines.far_layout_refusals.contains(&other));
+    }
+
+    #[test]
+    fn uncompiled_optional_pipeline_keeps_ordinary_and_readiness_changes_wake_the_walk() {
+        use std::cell::Cell;
+        let key = ClusterMaterialPipelineKey {
+            material: ErasedMaterialPipelineKey {
+                mesh_key: ErasedMeshPipelineKey::new(MeshPipelineKey::empty()),
+                material_key: bevy::material::key::ErasedMaterialKey::new(0_u32),
+                type_id: std::any::TypeId::of::<StandardMaterial>(),
+            },
+            tangents: true,
+        };
+        let mut pipelines = ClusterPipelines::default();
+        let compiled = Cell::new(false);
+        let mut built = Vec::new();
+        let mut queued = 0;
+        let mut select = |pipelines: &mut ClusterPipelines| {
             pipelines.forward_pipeline(
-                other,
-                || Some(default()),
+                key.clone(),
+                true,
+                &wgpu::Limits::default(),
+                |far| {
+                    built.push(far);
+                    Some(RenderPipelineDescriptor::default())
+                },
                 |_| {
                     queued += 1;
                     CachedRenderPipelineId::INVALID
-                }
-            ),
-            Some(CachedRenderPipelineId::INVALID)
+                },
+                |_| compiled.get(),
+            )
+        };
+        // Queued, unresolved imports and failed compilation all lack a compiled
+        // pipeline. None of them may replace ordinary geometry or requeue it.
+        for _ in 0..3 {
+            assert_eq!(
+                select(&mut pipelines),
+                Some((CachedRenderPipelineId::INVALID, false))
+            );
+        }
+        pipelines.refresh_far_readiness(|_| compiled.get());
+        assert_eq!(pipelines.far_readiness_revision, 0);
+
+        compiled.set(true);
+        pipelines.refresh_far_readiness(|_| compiled.get());
+        assert_eq!(pipelines.far_readiness_revision, 1);
+        assert_eq!(
+            select(&mut pipelines),
+            Some((CachedRenderPipelineId::INVALID, true))
         );
+        pipelines.refresh_far_readiness(|_| compiled.get());
+        assert_eq!(pipelines.far_readiness_revision, 1);
+
+        // A shader withdrawal/reload revokes the optional selection and wakes
+        // the cached walk again, without a material event or a new pipeline.
+        compiled.set(false);
+        pipelines.refresh_far_readiness(|_| compiled.get());
+        assert_eq!(pipelines.far_readiness_revision, 2);
+        assert_eq!(
+            select(&mut pipelines),
+            Some((CachedRenderPipelineId::INVALID, false))
+        );
+        assert_eq!(built, [true, false]);
         assert_eq!(queued, 2);
-        assert_eq!(pipelines.render.len(), 2);
+        assert!(pipelines.far_layout_refusals.is_empty());
     }
 
     #[test]
@@ -4700,10 +4973,16 @@ mod tangent_layout_regressions {
         pipelines.prepass.insert(plain.clone(), None);
         pipelines
             .render
-            .insert(plain.clone(), CachedRenderPipelineId::INVALID);
+            .insert((plain.clone(), false), CachedRenderPipelineId::INVALID);
+        pipelines
+            .render
+            .insert((plain.clone(), true), CachedRenderPipelineId::INVALID);
+        pipelines.far_layout_refusals.insert(plain);
         assert!(!pipelines.shadow_mask.contains_key(&tangent));
         assert!(!pipelines.prepass.contains_key(&tangent));
-        assert!(!pipelines.render.contains_key(&tangent));
+        assert!(!pipelines.render.contains_key(&(tangent.clone(), false)));
+        assert!(!pipelines.render.contains_key(&(tangent.clone(), true)));
+        assert!(!pipelines.far_layout_refusals.contains(&tangent));
     }
 
     #[test]
@@ -4734,35 +5013,53 @@ mod tangent_layout_regressions {
     }
 
     #[test]
-    fn extraction_reads_the_actual_standard_and_terrain_bases() {
+    fn extraction_reads_the_actual_standard_snow_and_terrain_bases() {
         use crate::cluster::terrain::ClusterTerrainMaterial;
         let mut standard = Assets::<StandardMaterial>::default();
+        let mut snow = Assets::<SnowMaterial>::default();
         let mut terrain = Assets::<ClusterTerrainMaterial>::default();
         let base = StandardMaterial {
             depth_map: Some(Handle::default()),
             ..default()
         };
         let standard_handle = standard.add(base.clone());
+        let snow_handle = snow.add(SnowMaterial {
+            base: base.clone(),
+            extension: default(),
+        });
         let terrain_handle = terrain.add(ClusterTerrainMaterial {
             base,
             extension: default(),
         });
         for id in [
             standard_handle.id().untyped(),
+            snow_handle.id().untyped(),
             terrain_handle.id().untyped(),
         ] {
-            let requirements = material_geometry(id, &standard, Some(&terrain)).unwrap();
+            let requirements =
+                material_geometry(id, &standard, Some(&snow), Some(&terrain)).unwrap();
             assert!(requirements.supported && requirements.tangents);
         }
         standard.get_mut(&standard_handle).unwrap().depth_map = None;
         assert!(
-            !material_geometry(standard_handle.id().untyped(), &standard, Some(&terrain))
-                .unwrap()
-                .tangents
+            !material_geometry(
+                standard_handle.id().untyped(),
+                &standard,
+                Some(&snow),
+                Some(&terrain)
+            )
+            .unwrap()
+            .tangents
         );
         standard.remove(standard_handle.id());
         assert!(
-            material_geometry(standard_handle.id().untyped(), &standard, Some(&terrain)).is_none()
+            material_geometry(
+                standard_handle.id().untyped(),
+                &standard,
+                Some(&snow),
+                Some(&terrain)
+            )
+            .is_none()
         );
     }
 
@@ -4827,6 +5124,7 @@ mod tangent_layout_regressions {
         let mut main = MainWorld::default();
         main.init_resource::<Assets<StandardMaterial>>();
         main.init_resource::<Messages<AssetEvent<StandardMaterial>>>();
+        main.init_resource::<Messages<AssetEvent<SnowMaterial>>>();
         main.init_resource::<ClusterBatchHandles>();
         let handle = main
             .resource_mut::<Assets<StandardMaterial>>()
@@ -4891,18 +5189,25 @@ mod tangent_layout_regressions {
     }
 
     #[test]
-    fn optional_terrain_events_refresh_the_extended_material_base() {
+    fn snow_and_optional_terrain_events_refresh_the_extended_material_bases() {
         use crate::cluster::terrain::ClusterTerrainMaterial;
         use bevy::render::MainWorld;
         let mut main = MainWorld::default();
         main.init_resource::<Assets<StandardMaterial>>();
+        main.init_resource::<Assets<SnowMaterial>>();
         main.init_resource::<Assets<ClusterTerrainMaterial>>();
         main.init_resource::<Messages<AssetEvent<StandardMaterial>>>();
+        main.init_resource::<Messages<AssetEvent<SnowMaterial>>>();
         main.init_resource::<Messages<AssetEvent<ClusterTerrainMaterial>>>();
         main.init_resource::<ClusterBatchHandles>();
+        let snow = main
+            .resource_mut::<Assets<SnowMaterial>>()
+            .add(SnowMaterial::default());
         let terrain = main
             .resource_mut::<Assets<ClusterTerrainMaterial>>()
             .add(ClusterTerrainMaterial::default());
+        main.resource_mut::<ClusterBatchHandles>()
+            .set(0, snow.clone());
         main.resource_mut::<ClusterBatchHandles>()
             .set(1, terrain.clone());
         let mut render = World::new();
@@ -4915,6 +5220,13 @@ mod tangent_layout_regressions {
         {
             let mut main = render.resource_mut::<MainWorld>();
             main.increment_change_tick();
+            main.resource_mut::<Assets<SnowMaterial>>()
+                .get_mut(&snow)
+                .unwrap()
+                .base
+                .normal_map_texture = Some(Handle::default());
+            main.resource_mut::<Messages<AssetEvent<SnowMaterial>>>()
+                .write(AssetEvent::Modified { id: snow.id() });
             main.resource_mut::<Assets<ClusterTerrainMaterial>>()
                 .get_mut(&terrain)
                 .unwrap()
@@ -4926,6 +5238,7 @@ mod tangent_layout_regressions {
         schedule.run(&mut render);
         let out = render.resource::<ClusterBatchMaterials>();
         assert!(out.version > before);
+        assert!(out.geometry[&snow.id().untyped()].tangents);
         assert!(out.geometry[&terrain.id().untyped()].tangents);
     }
 
@@ -4935,6 +5248,7 @@ mod tangent_layout_regressions {
         let mut main = MainWorld::default();
         main.init_resource::<Assets<StandardMaterial>>();
         main.init_resource::<Messages<AssetEvent<StandardMaterial>>>();
+        main.init_resource::<Messages<AssetEvent<SnowMaterial>>>();
         main.init_resource::<ClusterBatchHandles>();
         let pending = main.resource::<Assets<StandardMaterial>>().reserve_handle();
         main.resource_mut::<ClusterBatchHandles>()
@@ -4977,6 +5291,7 @@ mod tangent_layout_regressions {
         let mut main = MainWorld::default();
         main.init_resource::<Assets<StandardMaterial>>();
         main.init_resource::<Messages<AssetEvent<StandardMaterial>>>();
+        main.init_resource::<Messages<AssetEvent<SnowMaterial>>>();
         main.init_resource::<ClusterBatchHandles>();
         let material = main
             .resource_mut::<Assets<StandardMaterial>>()

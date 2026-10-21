@@ -6,7 +6,7 @@
 //! as the camera moves replaces this module's loading; reference mapping is validated separately.
 //!
 //! A batch is the instances that draw with one stock material: the same model, glTF material
-//! slot and winding. The material is the one the stock path draws that primitive
+//! slot, winding and snow material. The material is the one the stock path draws that primitive
 //! with, loaded through the same glTF label, so the engine's material handler has treated it
 //! identically.
 
@@ -18,9 +18,10 @@ use super::{
     render::{ClusterBatchHandles, ClusterInstance, ClusterScene, SceneBlock, world_from_local},
 };
 use crate::{
-    config::EngineConfig,
-    render::WaterReflectionCamera,
-    streaming::{ActiveSpace, RenderOrigin},
+    graphics_settings::GraphicsCamera,
+    portal::{PortalCamera, PortalPrewarm, PortalState},
+    snow::{DirectionalSnowCatalog, SnowCoverage, SnowMaterial, snow_material},
+    streaming::{ActiveCell, RenderOrigin},
     world::components::StreamingCamera,
 };
 use bevy::{
@@ -42,8 +43,8 @@ mod derived_overlay_tests;
 
 /// Registers the converted cluster package draw path.
 pub struct ClusterPackagePlugin {
-    /// The converted dataset the stock path loads from (`--assets`). Its models are
-    /// what the clusters replace.
+    /// The converted dataset the stock path loads from (`--assets`): its world database says
+    /// which static is snow-covered, and its models are what the clusters replace.
     pub base: PathBuf,
     /// The cluster overlay folder resolved for that dataset (`--clusters`): `clusters.db` with the
     /// cluster tables, `clusters/` payloads and `overlay.json`.
@@ -294,10 +295,10 @@ fn poll_package_validation(
 impl Plugin for ClusterPackagePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(super::source_identity::SourceIdentityPlugin);
+        app.add_plugins(crate::streaming::far_stock::FarStockPlugin);
         if self.terrain {
             app.add_plugins(super::terrain::ClusterTerrainPlugin);
         }
-        app.add_plugins(crate::streaming::far_stock::FarStockPlugin);
         app.add_plugins(super::render::ClusterRenderPlugin)
             .insert_resource(PackageSource {
                 base: self.base.clone(),
@@ -318,6 +319,9 @@ impl Plugin for ClusterPackagePlugin {
                         .run_if(resource_exists::<LazyBatches>),
                     // After the loader, which sets the pending count this adds to.
                     count_blocks_not_resident.after(load_batches_in_view),
+                    promote_snow_sources
+                        .before(load_batches_in_view)
+                        .run_if(resource_exists::<LazyBatches>),
                 ),
             );
     }
@@ -338,6 +342,8 @@ struct BatchKey {
     material_index: Option<u32>,
     /// Mirrored instances use the glTF loader's scale-inverted variant of the material.
     scale_inverted: bool,
+    /// The snow static the instance belongs to, 0 for bare.
+    snow_static: u32,
 }
 
 fn hex(hash: &[u8; 32]) -> String {
@@ -404,9 +410,10 @@ fn record_batch_key(
     domain: ChunkDomain,
     blocks: &[super::terrain::TerrainBlock],
     scale_inverted: bool,
+    snow_static: u32,
 ) -> Result<BatchKey, String> {
-    let (model_path, material_index) = match domain {
-        ChunkDomain::Object => (row.model_path.clone(), row.material_index),
+    let (model_path, material_index, snow_static) = match domain {
+        ChunkDomain::Object => (row.model_path.clone(), row.material_index, snow_static),
         ChunkDomain::Terrain(index) => {
             let block = blocks
                 .get(index as usize)
@@ -418,13 +425,14 @@ fn record_batch_key(
             }
             // Package-local block identity keeps equal MCL bytes with distinct
             // atlases/worldspaces separate, even if their meshes remain pooled.
-            (format!("cluster-terrain:{index}"), None)
+            (format!("cluster-terrain:{index}"), None, 0)
         }
     };
     Ok(BatchKey {
         model_path,
         material_index,
         scale_inverted,
+        snow_static,
     })
 }
 
@@ -510,6 +518,13 @@ fn native_materials(path: &Path) -> Vec<bool> {
         .collect()
 }
 
+/// A snow batch whose base material is still loading: the snow material is built from it.
+struct PendingSnow {
+    batch: u32,
+    base: Handle<StandardMaterial>,
+    coverage: SnowCoverage,
+}
+
 /// A payload reused by any object retains the ordinary tangent-generation path.
 pub(crate) fn terrain_only_meshes(instances: &[ClusterInstance]) -> std::collections::HashSet<u32> {
     let mut terrain = std::collections::HashSet::new();
@@ -552,6 +567,7 @@ fn stop_unusable_overlay(
 fn load_cluster_package(
     mut commands: Commands,
     gate: PackageLoadGate<'_, '_>,
+    snow_catalog: Option<Res<DirectionalSnowCatalog>>,
     mut handles: ResMut<ClusterBatchHandles>,
     mut images: ResMut<Assets<Image>>,
     mut terrain_materials: Option<ResMut<Assets<super::terrain::ClusterTerrainMaterial>>>,
@@ -672,7 +688,7 @@ fn load_cluster_package(
     let mut mesh_index: HashMap<(String, u32), u32> = HashMap::new();
     let mut scene_meshes: Vec<ClusterMeshAsset> = Vec::new();
     let mut batch_index: HashMap<(BatchKey, u32), u32> = HashMap::new();
-    let mut batch_keys: Vec<(BatchKey, u32)> = Vec::new();
+    let mut batch_keys: Vec<(BatchKey, Option<SnowCoverage>, u32)> = Vec::new();
     // Where each instance is, for loading its batch's material when it comes into view.
     let mut instance_spheres: Vec<(Vec3, f32)> = Vec::new();
     let mut instances: Vec<ClusterInstance> = Vec::new();
@@ -796,6 +812,13 @@ fn load_cluster_package(
                 return;
             };
             let matrix = world_from_local(record);
+            let coverage = (record.base_form_id != 0)
+                .then(|| {
+                    snow_catalog
+                        .as_deref()
+                        .and_then(|catalog| catalog.coverage_for(record.base_form_id))
+                })
+                .flatten();
             let terrain_blocks = terrain
                 .as_ref()
                 .map_or(&[][..], |terrain| terrain.blocks.as_slice());
@@ -804,6 +827,11 @@ fn load_cluster_package(
                 chunk_source.domain,
                 terrain_blocks,
                 matrix.determinant() < 0.0,
+                if coverage.is_some() {
+                    record.base_form_id
+                } else {
+                    0
+                },
             ) {
                 Ok(key) => key,
                 Err(reason) => {
@@ -819,7 +847,7 @@ fn load_cluster_package(
             let batch = *batch_index
                 .entry((key.clone(), primitive))
                 .or_insert_with(|| {
-                    batch_keys.push((key, primitive));
+                    batch_keys.push((key, coverage, primitive));
                     (batch_keys.len() - 1) as u32
                 });
             if let ChunkDomain::Terrain(index) = chunk_source.domain {
@@ -891,9 +919,10 @@ fn load_cluster_package(
         batches: batch_keys
             .iter()
             .zip(batch_spheres)
-            .map(|((key, primitive), spheres)| LazyBatch {
+            .map(|((key, coverage, primitive), spheres)| LazyBatch {
                 key: key.clone(),
                 primitive: *primitive,
+                coverage: *coverage,
                 bounds: enclosing_sphere(
                     &spheres
                         .iter()
@@ -924,11 +953,16 @@ fn load_cluster_package(
             .collect(),
         in_flight: Vec::new(),
         failed: Vec::new(),
+        pending_snow: Vec::new(),
     });
     info!(
         meshes = scene_meshes.len(),
         instances = instances.len(),
         batches = batch_keys.len(),
+        snowed_batches = batch_keys
+            .iter()
+            .filter(|(_, coverage, _)| coverage.is_some())
+            .count(),
         blocks = chunk_paths.len(),
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
         "cluster package loaded"
@@ -1185,9 +1219,18 @@ fn lazy_instance_world(
     }
 }
 
-/// The streaming camera and its water reflection share the active exterior world.
-fn lazy_camera_world(streaming: bool, reflection: bool, active_world: Option<u32>) -> Option<u32> {
-    if streaming || reflection {
+/// Same camera ownership policy as render handoff: only the actual portal destination,
+/// the streaming main camera, and its water reflection have a certified world.
+fn lazy_camera_world(
+    portal: bool,
+    streaming: bool,
+    graphics: Option<&GraphicsCamera>,
+    active_world: Option<u32>,
+    portal_world: Option<u32>,
+) -> Option<u32> {
+    if portal {
+        portal_world
+    } else if streaming || graphics == Some(&GraphicsCamera::WaterReflection) {
         active_world
     } else {
         None
@@ -1259,6 +1302,7 @@ fn lazy_view_distance(
 struct LazyBatch {
     key: BatchKey,
     primitive: u32,
+    coverage: Option<SnowCoverage>,
     /// Absolute spheres retain each instance's certified PLACED world, not its storage block.
     spheres: Vec<LazySphere>,
     /// One sphere around all of `spheres`: a batch whose own is out of the view has no instance in
@@ -1267,8 +1311,8 @@ struct LazyBatch {
     /// The model's scene, requested first, by the same path and label the cell loader uses, so
     /// the asset server loads the model's file once for both. Asking for one of the file's
     /// other labels while the cell loader's scene load is in flight is a second load of the
-    /// file, and a second load re-instances every drawn copy of the model, losing
-    /// the stock-visibility annotations on those copies.
+    /// file, and a second load re-instances every drawn copy of the model, which loses what
+    /// the engine did to those copies (hidden cluster-owned primitives, the snow material).
     /// Held only until the file is in; the material is requested then.
     scene: Option<Handle<WorldAsset>>,
     /// One forced retry must publish a new result before old dependency failure is terminal.
@@ -1296,7 +1340,7 @@ pub(super) struct LazyBatches {
     /// Every model scene the loader has asked for, kept for the run. The cell loader asks for the
     /// same scenes by the same path; if this side let go of one while the other's load or spawn
     /// was in flight, the asset would be freed and loaded again, which re-instances the stock copy
-    /// and loses its cluster-owned primitive visibility annotations.
+    /// of every drawn model (losing the hide of its cluster-owned primitives and its snow swap).
     scenes: HashMap<String, Handle<WorldAsset>>,
     /// Failed cached dependencies get at most one forced restart per source path.
     retried_sources: std::collections::HashSet<String>,
@@ -1310,6 +1354,8 @@ pub(super) struct LazyBatches {
     in_flight: Vec<usize>,
     /// Terminal source/material failures remain explicit, separate from pending work.
     failed: Vec<usize>,
+    /// Snow batches waiting for their base material.
+    pending_snow: Vec<PendingSnow>,
 }
 
 fn next_layout_scope() -> u64 {
@@ -1329,7 +1375,9 @@ impl LazyBatches {
                     model_path: model_path.to_owned(),
                     material_index: Some(0),
                     scale_inverted: false,
+                    snow_static: 0,
                 },
+                coverage: None,
                 spheres: Vec::new(),
                 bounds: (Vec3::ZERO, 0.0),
                 scene: Some(scene.clone()),
@@ -1347,6 +1395,7 @@ impl LazyBatches {
             unrequested: Vec::new(),
             in_flight: vec![0],
             failed: Vec::new(),
+            pending_snow: Vec::new(),
         }
     }
 
@@ -1421,8 +1470,9 @@ fn load_batches_in_view(
             &Camera,
             &bevy::camera::primitives::Frustum,
             &GlobalTransform,
+            Option<&GraphicsCamera>,
             Has<StreamingCamera>,
-            Has<WaterReflectionCamera>,
+            Has<PortalCamera>,
         ),
         With<Camera3d>,
     >,
@@ -1434,8 +1484,13 @@ fn load_batches_in_view(
     time: Res<Time>,
     mut settled: Local<bool>,
     origin: Option<Res<RenderOrigin>>,
-    config: Res<EngineConfig>,
-    (active, preload): (Option<Res<ActiveSpace>>, Option<Res<ClusterBatchPreload>>),
+    (active, prewarm, portal, doors, preload): (
+        Option<Res<ActiveCell>>,
+        Option<Res<PortalPrewarm>>,
+        Option<Res<PortalState>>,
+        Query<&crate::doors::LoadDoor>,
+        Option<Res<ClusterBatchPreload>>,
+    ),
 ) {
     let _timer = super::render::queue_stats::Timed::start(&super::render::queue_stats::LOAD_NANOS);
     let Some(scene) = scene else {
@@ -1446,27 +1501,44 @@ fn load_batches_in_view(
         + origin.map_or(Vec3::ZERO, |origin| {
             super::render::render_origin_offset(origin.0)
         });
-    let active_world = if active
+    let active_world = active
         .as_ref()
-        .is_some_and(|active| active.interior.is_some())
-    {
-        None
-    } else {
-        Some(
-            active
+        .and_then(|active| active.interior.is_none().then_some(active.worldspace_id));
+    // Aggregate held/prewarmed cells are not the portal camera's ownership domain.
+    let rendered_door = prewarm
+        .as_ref()
+        .and_then(|prewarm| prewarm.rendering_door())
+        .or_else(|| {
+            portal
                 .as_ref()
-                .and_then(|active| active.worldspace_id)
-                .unwrap_or(config.worldspace_id),
-        )
-    };
+                .and_then(|portal| portal.open_doorway())
+                .map(|doorway| doorway.door)
+        });
+    let portal_world = rendered_door
+        .and_then(|door| doors.get(door).ok())
+        .and_then(|door| {
+            door.destination
+                .interior_cell_id
+                .is_none()
+                .then_some(door.destination.worldspace_id)
+                .flatten()
+        });
     let views: Vec<LazyView> = cameras
         .iter()
         .filter(|(camera, ..)| camera.is_active)
-        .map(|(_, frustum, transform, streaming, reflection)| LazyView {
-            frustum: *frustum,
-            transform: *transform,
-            world: lazy_camera_world(streaming, reflection, active_world),
-        })
+        .map(
+            |(_, frustum, transform, graphics, streaming, is_portal)| LazyView {
+                frustum: *frustum,
+                transform: *transform,
+                world: lazy_camera_world(
+                    is_portal,
+                    streaming,
+                    graphics,
+                    active_world,
+                    portal_world,
+                ),
+            },
+        )
         .collect();
     let lazy = &mut *lazy;
     let mut entered = 0u64;
@@ -1512,6 +1584,7 @@ fn load_batches_in_view(
                 batch.scene = None;
                 request_material(
                     &mut handles,
+                    &mut lazy.pending_snow,
                     batch,
                     index,
                     &lazy.assets_dir,
@@ -1534,7 +1607,11 @@ fn load_batches_in_view(
                 standard_materials.contains(id),
                 batch.key.material_index.is_none() || asset_server.is_loaded_with_dependencies(id),
             );
-            if material_ready || load_failed {
+            let snow_pending = lazy
+                .pending_snow
+                .iter()
+                .any(|item| item.batch == index as u32);
+            if (material_ready && !snow_pending) || load_failed {
                 batch.loading = None;
                 // The batch's objects start drawing from the cluster path (the stock primitives
                 // replacement must be coordinated for each view).
@@ -1789,6 +1866,7 @@ fn asset_failed<A: Asset>(server: &AssetServer, id: AssetId<A>) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn request_material(
     handles: &mut ResMut<ClusterBatchHandles>,
+    pending_snow: &mut Vec<PendingSnow>,
     batch: &mut LazyBatch,
     index: usize,
     assets_dir: &Path,
@@ -1815,7 +1893,39 @@ fn request_material(
         None => standard_materials.add(StandardMaterial::default()),
     };
     batch.loading = Some(base.clone());
-    handles.set(index as u32, base);
+    match batch.coverage {
+        Some(coverage) => pending_snow.push(PendingSnow {
+            batch: index as u32,
+            base,
+            coverage,
+        }),
+        None => handles.set(index as u32, base),
+    }
+}
+
+/// Gives a snow batch its snow material once the base material it extends has loaded.
+fn promote_snow_sources(
+    mut lazy: ResMut<LazyBatches>,
+    mut handles: ResMut<ClusterBatchHandles>,
+    standard_materials: Res<Assets<StandardMaterial>>,
+    mut snow_materials: ResMut<Assets<SnowMaterial>>,
+    asset_server: Res<AssetServer>,
+) {
+    if lazy.pending_snow.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut lazy.pending_snow);
+    for item in pending {
+        if asset_failed(&asset_server, item.base.id()) {
+            continue;
+        }
+        let Some(base) = standard_materials.get(&item.base) else {
+            lazy.pending_snow.push(item);
+            continue;
+        };
+        let handle = snow_materials.add(snow_material(base.clone(), &item.coverage));
+        handles.set(item.batch, handle);
+    }
 }
 
 #[cfg(test)]
@@ -1915,17 +2025,21 @@ mod tests {
                 batch: None,
             })
             .collect();
-        let object = record_batch_key(&row, ChunkDomain::Object, &blocks, true).unwrap();
+        let object = record_batch_key(&row, ChunkDomain::Object, &blocks, true, 123).unwrap();
         assert_eq!(object.model_path, "meshes/native-object.glb");
         assert_eq!(object.material_index, Some(4));
         assert!(object.scale_inverted);
+        assert_eq!(object.snow_static, 123);
         let keys: Vec<_> = (0..2)
             .map(|index| {
-                record_batch_key(&row, ChunkDomain::Terrain(index), &blocks, false).unwrap()
+                record_batch_key(&row, ChunkDomain::Terrain(index), &blocks, false, 999).unwrap()
             })
             .collect();
         assert!(keys[0] != keys[1]);
-        assert!(keys.iter().all(|key| key.material_index.is_none()));
+        assert!(
+            keys.iter()
+                .all(|key| key.material_index.is_none() && key.snow_static == 0)
+        );
         let mut handles = ClusterBatchHandles::default();
         let mut batches = HashMap::new();
         for (index, key) in keys.into_iter().enumerate() {
@@ -1951,13 +2065,13 @@ mod tests {
         assert_eq!(TerrainViewBlock::from(&blocks[0]).batch, Some(0));
         assert_eq!(TerrainViewBlock::from(&blocks[1]).batch, Some(1));
         // Object resolution after terrain binding still uses the untouched GLB slot.
-        let after = record_batch_key(&row, ChunkDomain::Object, &blocks, true).unwrap();
+        let after = record_batch_key(&row, ChunkDomain::Object, &blocks, true, 123).unwrap();
         assert!(object == after);
         assert_eq!(row.model_path, "meshes/native-object.glb");
         assert_eq!(row.material_index, Some(4));
-        assert!(record_batch_key(&row, ChunkDomain::Terrain(2), &blocks, false).is_err());
+        assert!(record_batch_key(&row, ChunkDomain::Terrain(2), &blocks, false, 0).is_err());
         blocks[1].primitive_index = 1;
-        assert!(record_batch_key(&row, ChunkDomain::Terrain(1), &blocks, false).is_err());
+        assert!(record_batch_key(&row, ChunkDomain::Terrain(1), &blocks, false, 0).is_err());
     }
 
     #[test]
@@ -2537,13 +2651,29 @@ mod lazy_world_tests {
     }
 
     #[test]
-    fn public_camera_roles_and_world_changes_keep_main_and_reflection_demand() {
-        let main = lazy_camera_world(true, false, Some(10));
-        let reflection = lazy_camera_world(false, true, Some(10));
-        assert_eq!((main, reflection), (Some(10), Some(10)));
-        assert_eq!(lazy_camera_world(false, false, Some(10)), None);
-        assert_eq!(lazy_camera_world(true, false, None), None);
-        assert_eq!(lazy_camera_world(false, true, None), None);
+    fn camera_roles_and_world_only_changes_keep_actual_portal_and_reflection_demand() {
+        let main = lazy_camera_world(false, true, None, Some(10), Some(20));
+        let portal = lazy_camera_world(
+            true,
+            false,
+            Some(&GraphicsCamera::Portal),
+            Some(10),
+            Some(20),
+        );
+        let reflection = lazy_camera_world(
+            false,
+            false,
+            Some(&GraphicsCamera::WaterReflection),
+            Some(10),
+            Some(20),
+        );
+        assert_eq!((main, portal, reflection), (Some(10), Some(20), Some(10)));
+        assert_eq!(
+            lazy_camera_world(false, false, None, Some(10), Some(20)),
+            None
+        );
+        assert_eq!(lazy_camera_world(false, true, None, None, Some(20)), None);
+        assert_eq!(lazy_camera_world(true, true, None, Some(10), None), None);
         let camera = view(main);
         let changed_world = view(Some(20));
         assert_ne!(
@@ -2552,6 +2682,7 @@ mod lazy_world_tests {
             "same-pose world switch must invalidate ScanCache"
         );
         assert_eq!(camera.snapshot(), view(main).snapshot());
+        assert!(distance(&[sphere(LazyWorld::Placed(20))], &view(portal)).is_finite());
     }
 
     #[test]

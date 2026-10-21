@@ -26,7 +26,7 @@ bevy = { version = "0.19.0", default-features = false, features = [
     "morph_animation", "morph", "smaa_luts", "tonemapping_luts",
     "bevy_render", "bevy_core_pipeline", "bevy_gizmos_render", "bevy_anti_alias",
     "bevy_gltf", "bevy_pbr", "bevy_post_process", "gltf_animation",
-    "basis-universal", "pbr_specular_textures", "zstd_c",
+    "basis-universal", "pbr_specular_textures", "jpeg", "zstd_c",
 ] }
 
 # Scripting & Database
@@ -56,6 +56,12 @@ ktx2 = "0.5"
 project-wormhole-nif = { path = "vendor/project-wormhole-nif" }
 project-wormhole-esm = "0.1.0"
 
+# Mudcrab Plus (portal branch only): bevy_render 0.19.0 vendored for the parallel command-encoder finish
+# (impl-1132, analysis-1131). See vendor/bevy_render-0.19.0/MUDCRAB-README.md. Remove this line and the
+# folder to go back to the crates.io crate.
+[patch.crates-io]
+bevy_render = { path = "vendor/bevy_render-0.19.0" }
+
 # Workspace profile optimization
 [profile.dev]
 opt-level = 1
@@ -70,6 +76,22 @@ opt-level = 3
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+# A release build for walking a tour, and for nothing else: the same optimised code without the
+# link-time pass `release` pays for.
+#
+# `release` above is the profile everything measured or published uses - acceptance, profiling,
+# benchmarks, sign-off. This one is a development convenience, and its frames are not comparable
+# with the accepted build's (LTO off changes the frame rate, and the tour's capture density comes
+# from the frame rate). Build it with `cargo build --profile release-fast -p engine`; it lands in
+# `target/release-fast/`. See docs/demo/README.md, section 4.1.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+# Rebuilds recompile only what changed (Phase 2 Dev's websearch-544: most of a release rebuild is
+# the LTO link, which this profile already skips).
+incremental = true
 
 # Optimised builds for trying changes, not for measuring them: release without link-time
 # optimisation and with the incremental cache, so a one-file edit relinks in well under a
@@ -89,7 +111,3 @@ debug = 0
 inherits = "release"
 opt-level = "s"
 strip = "debuginfo"
-
-# Public shared clock and destination draw proof use the vendored renderer seams.
-[patch.crates-io]
-bevy_render = { path = "vendor/bevy_render-0.19.0" }

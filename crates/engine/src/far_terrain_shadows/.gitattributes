@@ -1,0 +1,3 @@
+# Preserve the exact upstream license bytes checked by lighting_tests.rs.
+BEVY-LICENSE-MIT text eol=lf
+BEVY-LICENSE-APACHE text eol=lf

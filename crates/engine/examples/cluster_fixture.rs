@@ -21,6 +21,7 @@ use engine::cluster::{
         world_from_local,
     },
 };
+use engine::snow::{SnowCoverage, SnowMaterial, snow_material, snow_material_object_1p};
 use std::path::PathBuf;
 
 const MCL: &[u8] = include_bytes!("../../shared/tests/data/cluster/fixture.mcl");
@@ -67,6 +68,11 @@ struct OriginShift(Vec3);
 /// Whether the materials are alpha-cutout (`AlphaMode::Mask`) with a texture that has holes.
 #[derive(Resource, Clone, Copy)]
 struct Cutout(bool);
+
+/// Whether every second instance is snow-covered, drawn with the engine's snow material in a
+/// batch of its own.
+#[derive(Resource, Clone, Copy)]
+struct Snow(bool);
 
 /// Whether the materials carry a normal map, and the stock mesh the tangents the glTF loader
 /// would generate for it.
@@ -146,6 +152,7 @@ fn main() {
     let mut shadows = false;
     let mut height = 0.0_f32;
     let mut pool_copies = 1_u32;
+    let mut snow = false;
     let mut cutout = false;
     let mut normal_mapped = false;
     let mut shift = Vec3::ZERO;
@@ -177,6 +184,7 @@ fn main() {
             }
             "--fixed-count" => fixed_count_draw = true,
             "--shadows" => shadows = true,
+            "--snow" => snow = true,
             "--cutout" => cutout = true,
             "--normal-map" => normal_mapped = true,
             "--origin-shift" => {
@@ -222,11 +230,7 @@ fn main() {
             }),
             ..default()
         }))
-        .add_plugins(ClusterRenderPlugin)
-        .insert_resource(engine::graphics_settings::GraphicsSettings {
-            cluster_error_pixels: error_pixels,
-            ..default()
-        })
+        .add_plugins((ClusterRenderPlugin, engine::snow::SnowMaterialPlugin))
         .insert_resource(ClusterSettings {
             error_pixels,
             fixed_count_draw,
@@ -238,6 +242,7 @@ fn main() {
         .insert_resource(Shadows(shadows))
         .insert_resource(Height(height))
         .insert_resource(PoolCopies(pool_copies))
+        .insert_resource(Snow(snow))
         .insert_resource(Cutout(cutout))
         .insert_resource(NormalMapped(normal_mapped))
         .insert_resource(OriginShift(shift))
@@ -260,9 +265,11 @@ fn setup(
     height: Res<Height>,
     pool_copies: Res<PoolCopies>,
     material_count: Res<MaterialCount>,
+    snow: Res<Snow>,
     cutout: Res<Cutout>,
     normal_mapped: Res<NormalMapped>,
     origin_shift: Res<OriginShift>,
+    mut snow_materials: ResMut<Assets<SnowMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -270,6 +277,18 @@ fn setup(
     let checker_image = images.add(checker(cutout.0));
     let normal_map = normal_mapped.0.then(|| images.add(ridges()));
     let material_count = material_count.0.max(1);
+    let snow_handle = snow_materials.add(snow_material(
+        StandardMaterial {
+            base_color_texture: Some(checker_image.clone()),
+            normal_map_texture: normal_map.clone(),
+            perceptual_roughness: 0.45,
+            metallic: 0.1,
+            ..default()
+        },
+        &SnowCoverage::new(&snow_material_object_1p(), 90.0),
+    ));
+    // The batch the snow instances use: after the plain materials.
+    let snow_batch = material_count;
     // Each material tints the same texture, so a wrong batch shows as a wrong colour.
     let palette: Vec<Handle<StandardMaterial>> = (0..material_count)
         .map(|index| {
@@ -332,11 +351,19 @@ fn setup(
             for (index, record) in block.instances.iter().enumerate() {
                 let mut transform = Transform::from_matrix(world_from_local(record));
                 transform.translation += origin_shift.0;
-                commands.spawn((
-                    Mesh3d(handle.clone()),
-                    MeshMaterial3d(palette[index % palette.len()].clone()),
-                    transform,
-                ));
+                if snow.0 && index % 2 == 1 {
+                    commands.spawn((
+                        Mesh3d(handle.clone()),
+                        MeshMaterial3d(snow_handle.clone()),
+                        transform,
+                    ));
+                } else {
+                    commands.spawn((
+                        Mesh3d(handle.clone()),
+                        MeshMaterial3d(palette[index % palette.len()].clone()),
+                        transform,
+                    ));
+                }
             }
         }
         Mode::Cluster => {
@@ -354,7 +381,11 @@ fn setup(
                     .map(|(index, record)| ClusterInstance {
                         identity: engine::cluster::render::ClusterInstanceIdentity::Fixture,
                         mesh: index as u32 % copies,
-                        batch: index as u32 % material_count,
+                        batch: if snow.0 && index % 2 == 1 {
+                            snow_batch
+                        } else {
+                            index as u32 % material_count
+                        },
                         world_from_local: world_from_local(record),
                         source_worldspace: 0,
                     })
@@ -374,6 +405,14 @@ fn setup(
                     world
                         .resource_mut::<ClusterBatchHandles>()
                         .set(index as u32, material);
+                });
+            }
+            if snow.0 {
+                let snow_handle = snow_handle.clone();
+                commands.queue(move |world: &mut World| {
+                    world
+                        .resource_mut::<ClusterBatchHandles>()
+                        .set(snow_batch, snow_handle);
                 });
             }
         }

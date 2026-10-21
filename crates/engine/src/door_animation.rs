@@ -101,6 +101,8 @@ mod tests {
                         arrival_position: [0.0; 3],
                         arrival_rotation: [0.0; 3],
                     },
+                    auto_load: false,
+                    outward: None,
                 },
                 MeshHandle("meshes/test.glb".into()),
                 FormId(7),

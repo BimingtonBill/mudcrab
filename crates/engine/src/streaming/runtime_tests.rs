@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
     streaming::{
-        RenderOrigin, StaticCollisionCache, admission::SceneDemand, control::ControllerReasons,
+        ActiveCell, PrestreamCells, RenderOrigin, StaticCollisionCache, admission::SceneDemand,
+        control::ControllerReasons,
     },
     streaming_preparation::StreamingPreparationPlugin,
     world::{
@@ -38,6 +39,9 @@ fn fixture(enabled: bool) -> (App, tempfile::TempDir) {
     })
     .init_resource::<SceneAdmission>()
     .init_resource::<StreamingWorld>()
+    .init_resource::<ActiveCell>()
+    .init_resource::<PrestreamCells>()
+    .init_resource::<crate::snow::DirectionalSnowCatalog>()
     .init_resource::<StreamingMetrics>()
     .init_resource::<StaticCollisionCache>()
     .init_resource::<ProfilingState>()

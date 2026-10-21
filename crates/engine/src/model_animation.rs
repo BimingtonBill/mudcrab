@@ -317,3 +317,9 @@ mod tests {
         assert_eq!(start_offset(17, 0.0), 0.0);
     }
 }
+
+#[cfg(test)]
+mod source_readiness_tests;
+
+#[cfg(test)]
+mod playback_tests;

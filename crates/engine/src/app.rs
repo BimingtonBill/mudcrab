@@ -1,10 +1,17 @@
+#[cfg(test)]
+use crate::atmosphere::SKY_COLOR;
 use crate::{
+    atmosphere::{
+        CAVERN_AMBIENT_BRIGHTNESS, CAVERN_AMBIENT_COLOR, DAY_SUN_ILLUMINANCE,
+        SKY_AMBIENT_BRIGHTNESS, SKY_AMBIENT_COLOR, atmosphere_applies,
+    },
     color_pipeline::{SceneGradeSource, SkyrimCinematicPostPlugin},
     config::{EngineConfig, MAX_IO_THREADS},
     console::{ConsolePlugin, console_closed},
     extensions::{open_features, read_data_extensions},
     metrics::AcceptanceMetricsPlugin,
     physics::{MovementTuning, PhysicsFixturePlugin, WorldPlayerPlugin},
+    pose_capture::PoseCapturePlugin,
     profiling::{ProfilingPlugin, ProfilingState},
     remote::{RemoteSettings, add_remote_plugins},
     render::{
@@ -74,6 +81,10 @@ fn prepare_start_camera(config: &mut EngineConfig) -> Result<Option<InitialWorld
         return Ok(None);
     };
     color_eyre::eyre::ensure!(
+        config.portal.demo_tour.is_none() && config.portal.portal_bench.is_none(),
+        "--start-shot cannot be combined with --demo-tour or --portal-bench; choose one camera driver"
+    );
+    color_eyre::eyre::ensure!(
         config.shots.is_none()
             && config.matched_route.is_none()
             && !config.benchmark_only
@@ -129,7 +140,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let shots_active = shots.is_some();
     let route = prepare_route(&mut config)?;
     configure_io_task_pool(config.io_threads)?;
-    let interactive_world_physics = config.interactive_world_physics();
+    // The graphics settings (--graphics, the knob flags, --tonemapper and the settings file): a
+    // value that is not one is fatal first, with the valid ones, before anything is opened or
+    // written, rather than a silent default (`crate::graphics_settings`).
+    let mut graphics =
+        crate::graphics_settings::from_config(&config).map_err(color_eyre::eyre::Report::msg)?;
+    let interactive_world_physics = world_physics_player(&config);
     let streaming_fixture_dir = if config.streaming_fixture {
         let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
         config.assets_dir = fixture.path.clone();
@@ -269,6 +285,19 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         }
     }
     let sky_palette = grade_source.sky_palette(config.visual_preset);
+    if config.portal.tonemapper.is_none()
+        && config.portal.graphics.is_none()
+        && config.portal.graphics_file.is_none()
+    {
+        graphics.tonemapper = tone_map_source.bevy_tonemapping;
+    } else {
+        tone_map_source.bevy_tonemapping = graphics.tonemapper;
+    }
+    let start_shot = crate::pose_capture::start_shot_run(&config)?;
+    color_eyre::eyre::ensure!(
+        start_shot.is_none() || runtime_data.is_some(),
+        "--start-shot needs the world database and cell cache"
+    );
     let movement_tuning = (interactive_world_physics
         && runtime_data.is_some()
         && !config.streaming_fixture)
@@ -288,7 +317,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 .as_ref()
                 .map_or_else(|| (1600, 900).into(), |pose| pose.resolution.clone()),
         },
-        present_mode: if config.is_benchmark_run() && !config.benchmark_vsync {
+        present_mode: if config.times_frames() && !config.benchmark_vsync {
             PresentMode::AutoNoVsync
         } else {
             PresentMode::AutoVsync
@@ -300,7 +329,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // A timing run opens on screen, in the middle, to be watched (the user asked, 2026-09-26).
         position: if config.window_offscreen() {
             WindowPosition::At(crate::window_parking::PARKED_POSITION)
-        } else if config.is_benchmark_run() || shots_active {
+        } else if config.times_frames() || shots_active {
             WindowPosition::Centered(bevy::window::MonitorSelection::Primary)
         } else {
             WindowPosition::Automatic
@@ -309,11 +338,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ..default()
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));
+    // A shots run is interactive in the same sense the demo tour is: sky and underground lighting,
+    // portals and lights, but no player controller, no fly camera and no objective text. It poses
+    // the camera itself, so nothing else may move it.
+    let shots_mode = shots.is_some();
+    // Interactive walking only; acceptance and benchmark runs keep the scripted fly camera.
+    let walk = config.walks();
+    let graphics_cycle = config.portal.graphics_cycle;
     let mut app = App::new();
-    app.insert_resource(config.graphics.clone());
-    if config.window_offscreen() {
-        app.add_plugins(crate::window_parking::WindowParkingPlugin);
-    }
     if let Some((settings, file)) = preferences {
         app.insert_resource(settings).insert_resource(file);
     }
@@ -329,7 +361,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     if let Some(asset_lock) = asset_lock {
         app.insert_resource(AssetDirectoryReadLock { _guard: asset_lock });
     }
-    if config.is_benchmark_run() || shots_active || config.hidden_window {
+    if config.times_frames() || shots_active || config.hidden_window {
         // Acceptance runs are commonly left unfocused while the campaign driver
         // advances through its scenarios. Bevy's game default throttles an
         // unfocused window to 60 Hz, which makes a 16.67 ms P95 gate measure the
@@ -343,6 +375,18 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // The run fingerprint is measurement data: an ordinary play session neither builds one nor
     // pays for the startup system that reads it.
     let records_measurements = crate::fingerprint::records_measurements(&config);
+    let room_culling = crate::room_culling::RoomCullingPlugin::from_config(&config);
+    // The two renderer switches of impl-1132 (Mudcrab Plus). Both default to today's behaviour:
+    // every backend, and stock Bevy's serial encoder finish. The finish switch is process-wide and
+    // is set here, once, before the first frame.
+    crate::render_backend::apply_process_switches(&config);
+    // `vulkan` is checked against the machine first: Bevy's renderer setup panics when it finds no
+    // adapter, so a machine without Vulkan falls back to `all` and the run says so.
+    let backend_choice = crate::render_backend::resolve_backends(
+        config.render_backends,
+        crate::render_backend::vulkan_adapter_present,
+    );
+    let wgpu_settings = crate::render_backend::wgpu_settings(backend_choice.effective);
     // `--cull-counter` needs Bevy's debug copy flag on the indirect buffers, so `RenderPlugin` is
     // built with it whenever the counter asks.
     let cull_counter = crate::cull_counter::CullCounterPlugin::from_config(&config);
@@ -354,7 +398,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .build()
         .disable::<bevy::render::RenderPlugin>()
         .add_before::<bevy::render::RenderPlugin>(RendererInitPlugin::new(
-            bevy::render::settings::WgpuSettings::default(),
+            wgpu_settings.unwrap_or_default(),
             cull_counter_flags,
         ))
         .set(asset_plugin)
@@ -368,6 +412,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             custom_layer: crate::bug_report::logging::report_log_layer,
             // Bevy's default filter plus: gilrs logs an unknown-gamepad-mapping line and
             // this engine has no gamepad input.
+            filter: "wgpu=error,naga=warn,gilrs=off".to_string(),
             ..default()
         });
     // The loader is registered while renderer plugins build, before the world readers below are
@@ -385,44 +430,11 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .insert_resource(render_asset_budget)
         .init_resource::<StreamingMetrics>()
         .add_plugins(default_plugins)
-        .add_plugins((
-            FrameTimeDiagnosticsPlugin::default(),
-            LogDiagnosticsPlugin {
-                debug: true,
-                ..default()
-            },
-            AcceptanceMetricsPlugin,
-            ProfilingPlugin,
-        ))
-        // The renderâ†’main "prepared and drawable" bridge. Registered for every
-        // run: it is what publishes the render world's own answer to "is this surface drawn?" into
-        // the main world, and it changes nothing else about the frame.
-        .add_plugins(crate::swap_bridge::SwapBridgePlugin)
-        // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
-        // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
-        .add_plugins(crate::lights::LightsPlugin)
-        .add_systems(PostUpdate, keep_windows_hidden)
-        .add_plugins(crate::terrain_merge::TerrainMergePlugin::new(
-            terrain_merge.as_ref(),
-        ));
-    if interactive_world_physics {
-        app.add_plugins(crate::settings_ui::SettingsPlugin);
-    }
-    app.add_plugins((cull_counter, crate::aabb_guard::AabbGuardPlugin))
-        .add_plugins((
-            SkyPlugin,
-            VercidiumRendererPlugin,
-            crate::visibility_optimization::VisibilityOptimizationPlugin,
-            crate::terrain_upload::TerrainUploadPlugin,
-            crate::mesh_residency_audit::MeshResidencyAuditPlugin,
-            SkyrimCinematicPostPlugin,
-            crate::bug_report::BugReportPlugin,
-            crate::emittance::EmittancePlugin,
-            crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
-            ConsolePlugin,
-            crate::nif_material::NifMaterialPlugin,
-        ));
-    // Trace features may already have installed the render diagnostics.
+        .add_plugins(crate::render_backend::RenderBackendLogPlugin {
+            problem: backend_choice.problem,
+        });
+    // Bevy's own `trace` features (`--features tracy`) add the render diagnostics themselves; a
+    // second add panics, so add them only when the default plugins did not.
     if !app.world().resource::<EngineConfig>().no_render_diagnostics
         && !app.is_plugin_added::<RenderDiagnosticsPlugin>()
     {
@@ -430,9 +442,47 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     }
     #[cfg(feature = "renderdoc")]
     app.add_plugins(crate::renderdoc_trigger::RenderDocTriggerPlugin);
-    add_camera_and_capture_systems(&mut app);
+    app.add_plugins((
+        FrameTimeDiagnosticsPlugin::default(),
+        LogDiagnosticsPlugin {
+            debug: true,
+            ..default()
+        },
+        AcceptanceMetricsPlugin,
+        ProfilingPlugin,
+        cull_counter,
+        crate::aabb_guard::AabbGuardPlugin,
+    ))
+    .add_plugins((
+        VercidiumRendererPlugin,
+        crate::visibility_optimization::VisibilityOptimizationPlugin,
+        crate::terrain_upload::TerrainUploadPlugin,
+        crate::mesh_residency_audit::MeshResidencyAuditPlugin,
+        SkyrimCinematicPostPlugin,
+        crate::bug_report::BugReportPlugin,
+        crate::emittance::EmittancePlugin,
+        crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
+        ConsolePlugin,
+        crate::nif_material::NifMaterialPlugin,
+    ))
+    // The render→main "prepared and drawable" bridge (design-1091 C1). Registered for every
+    // run: it is what publishes the render world's own answer to "is this surface drawn?" into
+    // the main world, and it changes nothing else about the frame.
+    .add_plugins(crate::swap_bridge::SwapBridgePlugin)
+    // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
+    // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
+    .add_plugins(crate::lights::LightsPlugin)
+    // Registered for every run; with `--room-culling` off it adds no system.
+    .add_plugins(room_culling)
+    .add_systems(PostUpdate, keep_windows_hidden)
+    .add_plugins(crate::terrain_merge::TerrainMergePlugin::new(
+        terrain_merge.as_ref(),
+    ));
     if let Some(terrain_merge) = terrain_merge {
         app.insert_resource(terrain_merge);
+    }
+    if interactive_world_physics {
+        app.add_plugins(crate::settings_ui::SettingsPlugin);
     }
     if shots_active || app.world().resource::<EngineConfig>().stdin_console {
         app.add_plugins(crate::capture_frame::CaptureFramePlugin);
@@ -446,9 +496,56 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         app.init_resource::<StreamingBenchmarkRoute>()
             .add_systems(PreUpdate, drive_streaming_benchmark_route);
     }
+    // The scripted fly camera: a walked run hands the camera to the player's own controller
+    // (`PlayerPlugin`, added by the portal plugin), and a shots run poses the camera itself, at
+    // an exact Creation position, and takes no input. The capture system runs in every run.
+    add_camera_and_capture_systems(&mut app, !walk && !shots_mode);
     add_remote_plugins(&mut app, remote);
     if records_measurements {
         app.add_plugins(crate::fingerprint::RunFingerprintPlugin);
+    }
+    let demo_tour = app
+        .world()
+        .resource::<EngineConfig>()
+        .portal
+        .demo_tour
+        .clone();
+    // The runs that are looked at rather than measured: sky and underground lighting, portals and
+    // lights, and no acceptance capture. A pure function of the configuration (H7), so this gate
+    // and the portal's own wiring cannot disagree about the sort of run this is.
+    let interactive = app.world().resource::<EngineConfig>().interactive();
+    // A demo tour's output folder, made before anything renders: a folder the engine cannot write
+    // is fatal, and this is where the run can still report it as an error - a plugin build cannot.
+    if let Some(output_dir) = demo_tour.as_ref() {
+        std::fs::create_dir_all(output_dir)
+            .wrap_err_with(|| format!("failed to create {}", output_dir.display()))?;
+    }
+    if let Some(run) = shots.as_ref() {
+        // `--shots` hands its run over as a resource: the file was loaded above, before the window
+        // existed, and the plugin that runs it is the portal (H3).
+        app.insert_resource(run.clone());
+    }
+    let atmosphere = {
+        let config = app.world().resource::<EngineConfig>();
+        // The *configured* ring, not the one resolved for the worldspace the run starts in: the
+        // ring a run draws follows the worldspace the camera is in
+        // ([`EngineConfig::effective_terrain_radius`]), so a run that starts where LOD exists and
+        // crosses into a worldspace without it draws the ring there - and needs the sky, the fog
+        // and the per-space lighting that ring is looked at with. The question this install answers
+        // is whether the run can draw a ring anywhere, and the benchmark rule's ring-off (set on
+        // `config.terrain_radius`, `config.rs`) is what keeps a measured run's lighting flat.
+        atmosphere_applies(interactive, config.terrain_radius, config.stream_radius)
+    };
+    if atmosphere {
+        // The sky, the fog, the ambient and the per-space lighting, in one call: the plugin owns
+        // the clear colour and the system that writes them (`crate::atmosphere`).
+        app.add_plugins(crate::atmosphere::AtmospherePlugin);
+        // Each sky camera's dome, coloured from the space that camera shows (`crate::sky_dome`).
+        // Upstream main's `SkyPlugin` is not added: it writes every camera's clear colour and fog
+        // from one global palette, which is `crate::atmosphere`'s and `crate::portal`'s job here.
+        app.add_plugins(crate::sky_dome::SkyDomePlugin);
+    } else {
+        app.add_plugins(SkyPlugin);
     }
     if let Some((database, catalog, features, cache, ground_height, spawn_ground_height)) =
         runtime_data
@@ -456,7 +553,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         if let Some(environment) = environment {
             app.insert_resource(environment);
         }
-        // Install validated capabilities before streaming registers its readers.
+        // The data set's extensions and the readers of those that are usable (snow, per-space
+        // lighting, the portal graph); a feature whose extension is not usable inserts nothing, and
+        // `StreamingPlugin` builds no system for it. Before the plugin, which looks for the snow
+        // catalogue.
         features.install(&mut app);
         app.insert_resource(database)
             .insert_resource(catalog)
@@ -464,35 +564,47 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(ground_height)
             .insert_resource(crate::physics::WalkSpawnGroundHeight(spawn_ground_height))
             .add_plugins(StreamingPlugin);
-        // The startup plugin lifts pacing until the world is ready unless --paced-startup
-        // was requested. The cover is opt-in and is never applied to shots.
+        // The first load runs with the streaming pacing lifted, behind a black cover, until the
+        // world is first ready (`crate::pacing::startup::StartupLoadPlugin`); `--paced-startup`
+        // and a capture run install nothing.
         app.add_plugins(crate::pacing::startup::StartupLoadPlugin);
-        let cluster_config = app.world().resource::<EngineConfig>();
-        let selector = cluster_config.clusters.clone();
-        let base = cluster_config.assets_dir.clone();
-        let preload = cluster_config.cluster_preload_batches;
-        let min_instance_pixels = cluster_config.cluster_min_instance_pixels;
-        let prepass = cluster_config.cluster_prepass;
-        let own_statics = cluster_config.cluster_own_statics;
-        let terrain = cluster_config.cluster_terrain;
-        let quality = cluster_config.graphics.clone();
+        // Register the cluster path only when requested. Certified per-view replacement
+        // determines which stock primitives it may replace.
+        let (selector, base) = {
+            let config = app.world().resource::<EngineConfig>();
+            (config.clusters.clone(), config.assets_dir.clone())
+        };
         if let Some(selector) = selector {
-            if preload {
-                app.insert_resource(crate::cluster::package::ClusterBatchPreload);
-            }
-            app.insert_resource(crate::cluster::render::ClusterSettings {
-                error_pixels: quality.cluster_error_pixels,
-                terrain_error_pixels: quality.cluster_terrain_error_pixels,
-                min_instance_pixels: min_instance_pixels.unwrap_or(0.0),
-                prepass,
-                own_statics,
-                ..default()
-            });
             // Resolve the overlay among the base's own (`<assets>/derived`). Asynchronous
             // certification checks its binding once under reader locks before any overlay read;
             // a missing, ambiguous or foreign overlay stops the requested cluster run.
             let overlay = shared::cluster_overlay::resolve_overlay(&base, &selector)
                 .wrap_err("--clusters")?;
+            let (min_instance_pixels, prepass, terrain) = {
+                let config = app.world().resource::<EngineConfig>();
+                (
+                    config.cluster_min_instance_pixels,
+                    config.cluster_prepass,
+                    config.cluster_terrain,
+                )
+            };
+            if app
+                .world()
+                .resource::<EngineConfig>()
+                .cluster_preload_batches
+            {
+                app.insert_resource(crate::cluster::package::ClusterBatchPreload);
+            }
+            let own_statics = app.world().resource::<EngineConfig>().cluster_own_statics;
+            // The error thresholds follow the graphics settings
+            // (`crate::cluster::render::follow_graphics_quality`).
+            let defaults = crate::cluster::render::ClusterSettings::default();
+            app.insert_resource(crate::cluster::render::ClusterSettings {
+                min_instance_pixels: min_instance_pixels.unwrap_or(defaults.min_instance_pixels),
+                prepass,
+                own_statics,
+                ..defaults
+            });
             // The blocks reach the GPU nearest the start position first. A block's bounds are in
             // Creation coordinates (z up), unlike its instances' transforms, so the start position
             // is compared as it is.
@@ -507,6 +619,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 terrain,
                 priority_point,
             });
+            if app
+                .world()
+                .resource::<EngineConfig>()
+                .cluster_far_terrain_shadows
+            {
+                app.add_plugins(crate::far_terrain_shadows::runtime::FarTerrainShadowsPlugin);
+            }
         }
         if let (Some(plan), Some(ground)) = (route, route_ground) {
             info!(
@@ -522,14 +641,89 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 // where the route put it.
                 .add_systems(PreUpdate, drive_route);
         }
-        app.add_systems(Startup, setup_world);
-        if interactive_world_physics {
-            app.add_plugins((WorldPlayerPlugin, crate::door_crossing::DoorCrossingPlugin));
-            crate::model_animation::add_ordinary_animation_plugins(&mut app);
-            // `coc`/`coe` move the player, so they come with it, as `tcl` does: a run without a
-            // player (a benchmark, `--shots`, headless) lists neither in Help.
-            crate::cell_commands::register_cell_commands(&mut app);
+        // A walked run's world collision: the streamer builds the colliders and enables only the
+        // player's space (`crate::portal::gate_cell_colliders`), and `crate::player` walks on them
+        // through rapier ray casts. Only rapier itself is added - not main's capsule player
+        // (`WorldPlayerPlugin`), which knows nothing of doors.
+        if crate::streaming::builds_world_colliders(app.world().resource::<EngineConfig>()) {
+            app.add_plugins(crate::physics::PhysicsCorePlugin);
         }
+        // The portal, in one call: the crossing for every run that opened the world, and everything
+        // else the demo is - the doorway image, the door and model animation, the player, the demo
+        // tour, the shots run - for the runs that are looked at rather than measured. Which of them
+        // this run gets is the plugin's own decision (docs/design/portal-plugin.md).
+        app.add_plugins(crate::portal::PortalPlugin);
+        // The portal graph (`crate::portal_graph`) is a resource of the `mudcrab.door_links`
+        // extension, inserted above by `features.install`. The transition layer reads it every
+        // frame to rank the doors the camera is most likely to take next and pre-stream what is
+        // behind them (`transition::predicted_doors`); without the extension there is no graph.
+        // The graphics settings, applied to the main, portal and water cameras and the sun, for
+        // every run that opened the world (a `--shots` run included); `M` cycles the tonemapper
+        // (`crate::graphics_settings`). Auto exposure is not in Bevy's default plugins.
+        // The focus after a seamless crossing (`eye-focus`, off by default): built only when the run
+        // starts with it on, so a run without it has neither its systems nor the main camera's
+        // warm-up blur (`crate::eye_adjust`).
+        let eye_focus =
+            builds_eye_focus(app.world().resource::<EngineConfig>(), graphics.eye_focus);
+        app.add_plugins((
+            bevy::post_process::auto_exposure::AutoExposurePlugin,
+            crate::graphics_settings::GraphicsSettingsPlugin { settings: graphics },
+        ));
+        if eye_focus {
+            app.add_plugins(crate::eye_adjust::EyeAdjustPlugin);
+        }
+        // `--graphics-cycle <seconds>`: the anti-aliasing stepped through every switch on its own,
+        // to reproduce a crash in switching it live (impl-239).
+        if let Some(period) = graphics_cycle {
+            app.insert_resource(crate::graphics_settings::GraphicsCycle::new(period));
+        }
+        // `--portal-bench`: the portal timed at a fixed list of dense doors, in GPU, CPU and frame
+        // time (`crate::portal_bench`). The doors file is read here, where a file the run cannot
+        // use is still an error rather than a panic.
+        let portal_bench = app.world().resource::<EngineConfig>().portal.clone();
+        if let Some(path) = portal_bench.portal_bench {
+            let doors = crate::portal_bench::DoorsFile::load(&path)?;
+            let output = portal_bench
+                .bench_out
+                .unwrap_or_else(|| PathBuf::from(crate::config::DEFAULT_PORTAL_BENCH_OUT));
+            let timing_seconds = portal_bench
+                .bench_seconds
+                .unwrap_or(crate::portal_bench::DEFAULT_TIMING_SECONDS);
+            app.add_plugins(crate::portal_bench::PortalBenchPlugin {
+                doors,
+                output,
+                timing_seconds,
+            });
+        }
+        if interactive {
+            // The pose capture: `P` saves the camera's pose to `local/reference/manual-poses.jsonl`,
+            // and `--start-shot` starts the run at one (`crate::pose_capture`). Added here rather
+            // than by the portal plugin, which is what adds the other camera-driving runs' plugins:
+            // it is not the portal's - it reads the camera, the space it stands in and the
+            // shots-file contract - and it needs the world the streaming plugin has just opened.
+            app.add_plugins(PoseCapturePlugin { start: start_shot });
+            // (Skyrim's LIGH references: `LightsPlugin` is registered for every run above.)
+            // Light spilling through the doorway the portal draws, both ways
+            // (`crate::portal_spill`). Opt-in (`--portal-light-spill`) until it passes on
+            // doorways it was not fitted on: it softens the colour seam everywhere but brightens
+            // interiors that are already brighter than the porch (impl-210's held-out set).
+            // `--portal-light-spill` is refused without seamless doors (`EngineConfig::from_args`).
+            if app.world().resource::<EngineConfig>().portal.light_spill {
+                app.add_plugins(crate::portal_spill::PortalSpillPlugin);
+            }
+        }
+        if !app.world().resource::<EngineConfig>().headless {
+            // Field notes: `F12` takes a screenshot, writes the pose and a state snapshot, and
+            // asks for a note (`crate::field_notes`). Every windowed run that has opened the
+            // world gets it, not only the ones `interactive` covers - a person can be at the
+            // keyboard of a plain flight too - which is why this is its own gate rather than
+            // riding the one above.
+            app.add_plugins(crate::field_notes::FieldNotesPlugin);
+            app.add_plugins(crate::graphics_panel::GraphicsPanelPlugin);
+        }
+        app.add_systems(Startup, setup_world);
+        let load_screen = load_screen_crossing(app.world().resource::<EngineConfig>());
+        install_world_player_and_crossing(&mut app, interactive_world_physics, load_screen);
         if app.world().resource::<EngineConfig>().streaming_fixture {
             app.init_resource::<StreamingFixtureState>()
                 .add_systems(Startup, setup_streaming_fixture_visual)
@@ -574,10 +768,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             output = %run.output_dir.display(),
             "rendering camera poses"
         );
-        app.add_plugins((
-            crate::capture_frame::CaptureFramePlugin,
-            ShotsPlugin { run },
-        ));
+        if !app.is_plugin_added::<ShotsPlugin>() {
+            app.add_plugins(ShotsPlugin { run });
+        }
     }
     let exit = app.run();
     drop(app);
@@ -625,7 +818,7 @@ fn keep_windows_hidden(config: Res<EngineConfig>, mut windows: Query<&mut Window
 /// has to upload, and a loaded machine left whole rooms undrawn in the frame it
 /// photographed (research-283). The timing runs keep the configured budget.
 fn upload_budget(config: &EngineConfig) -> RenderAssetBytesPerFrame {
-    let captures = config.shots.is_some();
+    let captures = config.portal.shots.is_some() || config.portal.demo_tour.is_some();
     RenderAssetBytesPerFrame {
         max_bytes: if captures {
             None
@@ -678,6 +871,10 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
     } else {
         "--shots"
     };
+    color_eyre::eyre::ensure!(
+        config.portal.start_shot.is_none(),
+        "{mode} and --start-shot cannot be used together; choose one camera driver"
+    );
     let other_mode = config.benchmark_only
         || config.benchmark_frames.is_some()
         || config.benchmark_duration_secs.is_some()
@@ -695,7 +892,7 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         "{mode} renders the converted world on its own: it cannot be combined with a benchmark, \
          an acceptance screenshot, --auto-fly-speed, --route or a fixture"
     );
-    if config.headless {
+    if !config.is_benchmark_run() {
         // The logger is not installed yet, so a `warn!` here would never be seen.
         eprintln!("warning: {mode} photographs the window, so --headless is ignored");
     }
@@ -799,8 +996,8 @@ fn configure_benchmark_priority(_benchmark_active: bool) -> Result<()> {
 /// bevy_gltf's loader loads a file's textures inside `IoTaskPool::scope`, whose `block_on` ticks
 /// the pool's shared executor on the calling thread while it waits. So a glTF load waiting for its
 /// textures picks up the next queued glTF load and runs it on the same stack, that one does the
-/// same, and so on: the nesting is as deep as the queue of model loads. Measured while
-/// streaming Markarth's dense city interiors: each nested load costs about 85 KiB, and one thread
+/// same, and so on: the nesting is as deep as the queue of model loads. Measured on the portal
+/// bench's Markarth door (`--profile quick`): each nested load costs about 85 KiB, and one thread
 /// reached 8,074 KiB (about 95 loads deep) and overflowed the 8 MiB this used to be. A dense cell
 /// queues hundreds of distinct models at once (the largest interior has 522), plus its
 /// neighbours, so the reservation has to cover the whole queue, not a typical load.
@@ -1154,6 +1351,45 @@ fn cross_streaming_fixture_interior(
     state.interior.observe(away, roots);
 }
 
+/// Whether this run's camera is main's rapier walking player ([`WorldPlayerPlugin`]).
+///
+/// On a run whose load doors are the vanilla load screen (`crate::config::LoadDoors`): main's
+/// capsule player is the one that crossing (`crate::door_crossing`, PR #128) was written for. A
+/// seamless-door run keeps the portal's own walking player (`crate::player::PlayerPlugin`,
+/// `--walk`), which carries the camera through a doorway into the room beyond, and the free camera
+/// otherwise. A scripted tour and a `--start-shot` run drive the camera themselves on either. (The
+/// streamer builds the terrain and static colliders for walked runs either way; the gate is not
+/// about them.)
+fn world_physics_player(config: &EngineConfig) -> bool {
+    config.has_capsule_player()
+}
+
+/// Whether this run is built with the vanilla load-screen crossing (`crate::door_crossing`): load
+/// doors are not seamless, and something can use a door - main's walking player, or a run that is
+/// looked at (the tour's activation, a shots or start-shot run).
+/// One owner wires the player and the broader scripted/interactive load-screen crossing.
+fn install_world_player_and_crossing(app: &mut App, player: bool, load_screen: bool) {
+    if player {
+        app.add_plugins(WorldPlayerPlugin);
+        crate::model_animation::add_ordinary_animation_plugins(app);
+        // Cell commands move the player and are absent from camera-only runs.
+        crate::cell_commands::register_cell_commands(app);
+    }
+    if load_screen {
+        app.add_plugins(crate::door_crossing::DoorCrossingPlugin);
+    }
+}
+
+fn load_screen_crossing(config: &EngineConfig) -> bool {
+    !config.seamless_doors() && (world_physics_player(config) || config.interactive())
+}
+
+/// Whether this run is built with the focus after a crossing (`crate::eye_adjust::EyeAdjustPlugin`):
+/// the `eye-focus` setting is on at the start, and there is a seamless crossing for it to follow.
+fn builds_eye_focus(config: &EngineConfig, eye_focus: bool) -> bool {
+    eye_focus && config.seamless_doors() && config.interactive()
+}
+
 fn validate_streaming_fixture(
     config: Res<EngineConfig>,
     mut state: ResMut<StreamingFixtureState>,
@@ -1256,8 +1492,17 @@ fn terrain_fixture_image(pixel: [u8; 4]) -> Image {
     image
 }
 
+/// Whether a sun spawned from `config` casts shadows: always, except under `--shadows off`.
+///
+/// Every sun the engine spawns asks this, fixtures included, so the measurement switch means the
+/// same thing in every mode. A run without a configuration keeps the shadows.
+pub(crate) fn sun_shadow_maps_enabled(config: Option<&EngineConfig>) -> bool {
+    config.is_none_or(|config| config.shadows)
+}
+
 fn setup_material_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -1305,7 +1550,13 @@ fn setup_material_fixture(
             CanonicalMaterialKind::Emissive,
             StandardMaterial {
                 base_color: Color::srgb(0.08, 0.08, 0.08),
-                emissive: LinearRgba::new(6.0, 1.2, 0.15, 1.0),
+                // A *converted* emissive, at the magnitude the converter writes and put through the
+                // same exposure `render::SkyrimMaterialHandler` puts every streamed material
+                // through: the Blackreach mushroom caps publish `[0.212, 0.992, 1.0]` at a strength
+                // of 2.0 (`docs/research/visual-gaps-spec.md`, gap 1). The box is what a glowing
+                // surface of the game looks like - which is what the check on it has to be able to
+                // tell from a glow that has lost its scale.
+                emissive: crate::render::exposed_emissive(LinearRgba::new(0.424, 1.984, 2.0, 1.0)),
                 ..default()
             },
         ),
@@ -1342,7 +1593,6 @@ fn setup_material_fixture(
         crate::color_pipeline::SceneColorPipeline::default(),
         Transform::from_xyz(0.0, 5.0, 18.0).looking_at(Vec3::ZERO, Vec3::Y),
         StreamingCamera,
-        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
@@ -1350,7 +1600,7 @@ fn setup_material_fixture(
     commands.spawn((
         DirectionalLight {
             illuminance: 10_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(&LIGHT_LAYERS),
@@ -1361,6 +1611,30 @@ fn setup_material_fixture(
         brightness: 120.0,
         ..default()
     });
+}
+
+/// Whether an emissive is at the magnitude the engine's lighting works in: brighter than a mid-grey
+/// surface of the dimmest lit space, so that a converted glow is a glow, and not so far above one
+/// that it is a lamp of its own.
+///
+/// The comparison is in Bevy's own units, where the ambient of `crate::atmosphere` puts a surface
+/// at `albedo * brightness * colour`, and both that surface and the emissive are then multiplied by
+/// the camera's exposure on the way to the screen (`bevy_pbr/src/render/pbr_functions.wgsl:863` for
+/// the lit sum and `:840` for an emissive whose alpha is 1), so the two are directly comparable
+/// without knowing the exposure. The reference is a mid-grey surface of Blackreach, the dimmest lit
+/// space the game has ([`CAVERN_AMBIENT_BRIGHTNESS`], [`CAVERN_AMBIENT_COLOR`]).
+///
+/// A converted emissive that never met `crate::lights::EMISSIVE_EXPOSURE` is a thousandth of a
+/// surface's brightness and reads as black - which is what this check is for
+/// (`docs/research/visual-gaps-spec.md`, gap 1) - and the band's upper edge is what stops the
+/// scale from being raised until a glow is a lamp that clips every frame it is in.
+pub(crate) fn emissive_is_visible(emissive: LinearRgba) -> bool {
+    let luminance = 0.2126 * emissive.red + 0.7152 * emissive.green + 0.0722 * emissive.blue;
+    let mid_grey_surface = 0.5 * CAVERN_AMBIENT_BRIGHTNESS * {
+        let linear = LinearRgba::from(CAVERN_AMBIENT_COLOR);
+        0.2126 * linear.red + 0.7152 * linear.green + 0.0722 * linear.blue
+    };
+    (mid_grey_surface * 0.3..=mid_grey_surface * 8.0).contains(&luminance)
 }
 
 fn validate_material_fixture(
@@ -1392,7 +1666,7 @@ fn validate_material_fixture(
                     CanonicalMaterialKind::Blend if material.alpha_mode != AlphaMode::Blend => {
                         Err("blend mode was not preserved".to_owned())
                     }
-                    CanonicalMaterialKind::Emissive if material.emissive.red <= 0.0 => {
+                    CanonicalMaterialKind::Emissive if !emissive_is_visible(material.emissive) => {
                         Err("emissive intensity was lost".to_owned())
                     }
                     CanonicalMaterialKind::DoubleSided
@@ -1500,6 +1774,7 @@ fn terrain_water_fixture_snapshot() -> TerrainSnapshot {
 
 fn setup_terrain_water_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     reflection: Res<WaterReflectionTexture>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
@@ -1553,7 +1828,7 @@ fn setup_terrain_water_fixture(
                         quadrant,
                         texture_handles.clone(),
                     )
-                    .expect("canonical terrain fixture must build"),
+                    .expect("the canonical terrain fixture must build"),
                 }),
             ),
             TerrainWaterFixtureTerrain,
@@ -1589,7 +1864,6 @@ fn setup_terrain_water_fixture(
         crate::color_pipeline::SceneColorPipeline::default(),
         Transform::from_xyz(CELL_SIZE_HALF, 1800.0, 2600.0).looking_at(target, Vec3::Y),
         StreamingCamera,
-        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
@@ -1597,16 +1871,16 @@ fn setup_terrain_water_fixture(
     ));
     commands.spawn((
         DirectionalLight {
-            illuminance: 12_000.0,
-            shadow_maps_enabled: true,
+            illuminance: DAY_SUN_ILLUMINANCE,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(&LIGHT_LAYERS),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.48, 0.55, 0.7),
-        brightness: 160.0,
+        color: SKY_AMBIENT_COLOR,
+        brightness: SKY_AMBIENT_BRIGHTNESS,
         ..default()
     });
 }
@@ -1623,13 +1897,8 @@ fn validate_terrain_water_fixture(
     if state.finished || terrain.iter().count() != 4 || water.iter().count() != 1 {
         return;
     }
-    // The fixture exists to show terrain without game data, so it is only valid if its materials
-    // render the overlay weight field the streamed path uses - the point of the scene.
     let valid_terrain = terrain.iter().all(|(mesh, handle)| {
-        let Some(material) = terrain_materials.get(handle) else {
-            return false;
-        };
-        meshes.get(mesh).is_some() && material.extension.reads_weight_field()
+        terrain_materials.get(handle).is_some() && meshes.get(mesh).is_some()
     });
     let valid_water = water
         .single()
@@ -1660,6 +1929,7 @@ struct TransformBoundsFixtureState {
 
 fn setup_transform_bounds_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -1764,15 +2034,14 @@ fn setup_transform_bounds_fixture(
         crate::color_pipeline::SceneColorPipeline::default(),
         Transform::from_xyz(2.0, 5.5, 16.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
         StreamingCamera,
-        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
     ));
     commands.spawn((
         DirectionalLight {
-            illuminance: 12_000.0,
-            shadow_maps_enabled: true,
+            illuminance: DAY_SUN_ILLUMINANCE,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(&LIGHT_LAYERS),
@@ -1902,6 +2171,7 @@ struct RendererFixtureState {
 
 fn setup_renderer_fixture(
     mut commands: Commands,
+    config: Option<Res<EngineConfig>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -1972,15 +2242,14 @@ fn setup_renderer_fixture(
         crate::color_pipeline::SceneColorPipeline::default(),
         Transform::from_xyz(0.0, 1.5, 16.0).looking_at(Vec3::ZERO, Vec3::Y),
         StreamingCamera,
-        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
     ));
     commands.spawn((
         DirectionalLight {
-            illuminance: 12_000.0,
-            shadow_maps_enabled: true,
+            illuminance: DAY_SUN_ILLUMINANCE,
+            shadow_maps_enabled: sun_shadow_maps_enabled(config.as_deref()),
             ..default()
         },
         RenderLayers::from_layers(&LIGHT_LAYERS),
@@ -2093,7 +2362,12 @@ pub(crate) fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
     if !(shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION..=converter_schema_version())
         .contains(&manifest.schema_version)
     {
-        let rejection = if manifest.schema_version < shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION {
+        let rejection = if shared::is_retired_dev_schema(manifest.schema_version) {
+            AssetSetRejection::RetiredDevNumbering {
+                kind: "converter schema",
+                found: manifest.schema_version,
+            }
+        } else if manifest.schema_version < shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION {
             AssetSetRejection::ConverterSchemaOlder {
                 found: manifest.schema_version,
             }
@@ -2124,8 +2398,15 @@ pub(crate) fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
     )
     .wrap_err("invalid integration report")?;
     if !shared::supports_runtime_world_database_schema(report.schema_version) {
-        let rejection = AssetSetRejection::WorldDatabaseSchema {
-            found: report.schema_version,
+        let rejection = if shared::is_retired_dev_schema(report.schema_version) {
+            AssetSetRejection::RetiredDevNumbering {
+                kind: "world database schema",
+                found: report.schema_version,
+            }
+        } else {
+            AssetSetRejection::WorldDatabaseSchema {
+                found: report.schema_version,
+            }
         };
         color_eyre::eyre::bail!(
             "{}",
@@ -2162,6 +2443,9 @@ enum AssetSetRejection {
     ConverterSchemaOlder { found: u32 },
     /// The converter that wrote the set is newer than every schema this engine accepts.
     ConverterSchemaNewer { found: u32 },
+    /// An older Mudcrab dev build wrote the set under its retired private schema numbering
+    /// (`shared::RETIRED_DEV_SCHEMA_FLOOR` and up). `kind` names which number it is.
+    RetiredDevNumbering { kind: &'static str, found: u32 },
     /// The converter stopped early or skipped inputs (`complete: false`); `schema` is the one the
     /// manifest names.
     IncompleteConversion { schema: u32 },
@@ -2200,6 +2484,11 @@ fn asset_set_rejection_message(assets_dir: &Path, rejection: AssetSetRejection) 
              {converter_max}; update the engine and rebuild it (`cargo build --release -p \
              engine`), or reconvert with a converter at schema {converter_max}",
             manifest.display()
+        ),
+        AssetSetRejection::RetiredDevNumbering { kind, found } => format!(
+            "this data set was converted by an older Mudcrab dev build ({kind} {found}); convert \
+             it again with this build: `{reconvert}` (the converter reuses what it can from the \
+             previous conversion)"
         ),
         AssetSetRejection::IncompleteConversion { schema } => format!(
             "the asset conversion did not finish: {} reports complete=false at converter schema \
@@ -2279,46 +2568,102 @@ pub(crate) fn camera_far_plane(stream_radius: i32, terrain_radius: i32) -> f32 {
     crate::world::components::CELL_SIZE * (radius + 2) as f32 * 2.0
 }
 
-/// Creation units in a metre. The renderer keeps one Creation unit per world unit.
+/// The distance fog of an exterior: clear up to the edge of the full-detail grid, fully opaque at
+/// the far edge of the terrain ring, in [`crate::atmosphere::SKY_COLOR`] or the underground colour of the space. The
+/// ring then fades into the sky it is drawn against instead of ending in a cliff.
+///
+/// With no ring - a `terrain_radius` at or below `stream_radius`, which is the engine before the
+/// ring existed - there is nothing beyond the full-detail grid to fade, and the fog is off.
+///
+/// `lod_reach` is how far distant terrain reaches ([`crate::streaming::LodHorizon`]) when the
+/// world has LOD data, and `None` when it has none. The terrain LOD draws beyond the ring, under
+/// the ring's own cells where those are ready and past them where they are not, so fog that is
+/// opaque at the ring's edge would hide all of it as sky colour. With LOD the fog is still clear
+/// up to the full-detail grid but ends where the LOD does, ring or no ring: the horizon fades into
+/// the sky instead of ending in a cliff, and the ring keeps what it is for, full-detail landscape
+/// close in. The end is never nearer than the ring's own.
+pub(crate) fn exterior_fog(
+    stream_radius: i32,
+    terrain_radius: i32,
+    lod_reach: Option<f32>,
+    color: Color,
+) -> DistanceFog {
+    let cell = crate::world::components::CELL_SIZE;
+    let start = cell * (stream_radius.max(0) + 1) as f32;
+    let ring_end =
+        (terrain_radius > stream_radius).then(|| cell * (terrain_radius.max(0) + 1) as f32);
+    let end = match (lod_reach, ring_end) {
+        (Some(reach), ring) => reach.max(ring.unwrap_or(0.0)),
+        (None, Some(ring)) => ring,
+        (None, None) => return fog_off(color),
+    };
+    if !end.is_finite() || end <= start {
+        return fog_off(color);
+    }
+    DistanceFog {
+        color,
+        falloff: FogFalloff::Linear { start, end },
+        directional_light_color: Color::NONE,
+        directional_light_exponent: 8.0,
+    }
+}
+
+/// Fog that cannot be reached: it starts past any far plane the camera has, so no mesh in the space
+/// is ever fogged. Used indoors, where the fog would be wrong - a Dwemer hall three thousand units
+/// across has no haze - while the component stays on the camera, so the shader pipeline (and the
+/// frame that follows a crossing) does not have to be rebuilt when it comes back.
+pub(crate) fn fog_off(color: Color) -> DistanceFog {
+    const OFF_START: f32 = crate::world::components::CELL_SIZE * 100.0;
+    DistanceFog {
+        color,
+        falloff: FogFalloff::Linear {
+            start: OFF_START,
+            end: OFF_START * 2.0,
+        },
+        directional_light_color: Color::NONE,
+        directional_light_exponent: 8.0,
+    }
+}
+
+/// Creation units in a metre: Skyrim's unit is 1.43 cm and this engine renders one Creation unit as
+/// one Bevy world unit, so a distance a renderer's default expresses in metres is
+/// [`CREATION_UNITS_PER_METRE`] times larger here. `crate::lights` converts the point lights'
+/// intensity at the same ratio.
 const CREATION_UNITS_PER_METRE: f32 = 70.0;
 
-/// The number of cascades the sun's shadow map is split into. Four is Bevy's default and its
-/// per-light maximum on desktop (`MAX_CASCADES_PER_LIGHT`, `bevy_pbr-0.19.0`
-/// `src/render/light.rs:228`), and with [`sun_shadow_cascades`] reaching the far corner of the
-/// drawn grid, fewer would mean larger cascades and coarser shadows everywhere the player looks.
-const SUN_SHADOW_CASCADES: usize = 4;
+/// The cascades the sun's shadow map is split into. Bevy supports four (`MAX_CASCADES_PER_LIGHT`,
+/// bevy_pbr-0.19.0 `src/render/light.rs:228`) and clamps a light that asks for more, and
+/// [`sun_shadow_cascades`] reaches 248 m, so fewer cascades would mean larger ones and visibly
+/// coarser shadows everywhere the player looks.
+pub(crate) const SUN_SHADOW_CASCADES: usize = 4;
 
-/// The size of each of the sun's cascades, in texels a side. This is Bevy's own default, which
-/// `DirectionalLightShadowMap` documents as having to be a power of two, and it is stated here
-/// rather than left implicit so that the resolution the sun's shadows are drawn at is this
-/// engine's decision instead of a Bevy default that can move under it.
-const SUN_SHADOW_MAP_SIZE: usize = 2048;
+/// A cascade's shadow map, in texels a side. This is Bevy's own default
+/// (`bevy_light-0.19.0` `src/directional_light.rs:202-206`), written out rather than left implicit
+/// so that it is chosen together with the cascade distances that were fitted to it: at
+/// [`SUN_SHADOW_CASCADES`] the nearest cascade draws a centimetre of the world per texel and the
+/// farthest 24 cm, and 4096 - four times the memory and four times the fill - is not what this
+/// world's geometry is short of.
+pub(crate) const SUN_SHADOW_MAP_SIZE: usize = 2048;
 
-/// The most cells, from the camera's cell to the far edge of the drawn grid, that
-/// [`sun_shadow_cascades`] fits the sun's shadow range to. `--stream-radius` accepts any integer,
-/// and a radius of 100000 would ask for a range of hundreds of millions of units, in which the
-/// outermost cascade's texels are wider than the cells they are meant to shadow. The engine's own
-/// worlds are a handful of cells across, so the cap is far past anything that streams at a usable
-/// frame rate: it only keeps a nonsense radius from asking for gigametre cascades.
-const SUN_SHADOW_MAX_GRID_CELLS: i32 = 256;
-
-/// The sun's shadow cascades, fitted to a world whose unit is about 1.43 cm.
+/// The sun's shadow cascades, fitted to a world whose unit is 1.43 cm.
 ///
-/// # Why the sun cast no shadows
+/// # Where the shadows were
 ///
-/// `DirectionalLight::shadow_maps_enabled` is already true, but without a [`CascadeShadowConfig`]
-/// of its own the sun gets Bevy's default, which is built for a metre-scale world: four cascades
-/// with a first far bound of 10 and a maximum distance of 150, split geometrically into the far
-/// bounds 10 / 24.7 / 60.8 / 150. Read in Creation units that is a shadow map spent on the two
-/// metres of ground around the camera, with every house, tree and cell of the streamed world
-/// outside the last cascade - the sun lights the scene and none of it falls in shadow.
+/// Nothing in the world cast one, and this is why. `DirectionalLight::shadow_maps_enabled` was
+/// already true, but the sun had no [`CascadeShadowConfig`], so it used Bevy's default - which is
+/// built for a metre-scale world. `CascadeShadowConfigBuilder::default` (bevy_light-0.19.0
+/// `src/cascade.rs:135-158`) is four cascades from a first far bound of 10 to a maximum distance
+/// of 150, split geometrically into the bounds 10 / 24.7 / 60.8 / 150. Read in Creation units that
+/// is a shadow map spent on the 2.1 metres of ground around the camera, with the first cascade
+/// ending 14 cm in front of the lens: every house, tree and mill of the demo stood outside the
+/// last cascade, so the sun lit the whole scene and none of it fell in shadow.
 ///
 /// # The distances
 ///
 /// The first two are Bevy's defaults read in metres and converted at [`CREATION_UNITS_PER_METRE`]:
-/// a first cascade far bound of 10 m (700 units), and a near clamp of 0.1 m (7 units) below which
-/// no shadow is drawn, which is the same 10 cm Bevy's default works at. The overlap between
-/// cascades is left at the builder's default; only the distances are fitted to this world.
+/// a first cascade far bound of 10 m (700 units) and a near clamp of 0.1 m (7 units), which is where
+/// the first cascade's ortho box starts, so anything nearer the camera than 10 cm is unshadowed -
+/// the same distance Bevy's default works at.
 ///
 /// [`maximum_distance`] starts as a property of the drawn world:
 /// `streaming::plan_cells` requests `config.stream_radius` cells around the camera's cell and keeps
@@ -2336,21 +2681,68 @@ const SUN_SHADOW_MAX_GRID_CELLS: i32 = 256;
 /// stream. At the default `unload_radius` of 3 the last bound is about 23,200 units, a third of a
 /// kilometre.
 ///
-/// # The cost
+/// At the default `stream_radius` of 2 that is 17,378 units, or 248 m, split into the far bounds
+/// 700 / 2,042 / 5,959 / 17,378. At the engine's 45 degree vertical field of view those four
+/// cascades draw 0.96 cm, 2.8 cm, 8.2 cm and 24 cm of the world per shadow texel. The fifth of a
+/// cascade that each overlaps the previous one by is Bevy's default and is left as it is: it is the
+/// band the shader blends two cascades over, and it should stay a proportion of the cascade.
 ///
-/// This is the first configuration in which the shadow pass draws the streamed world rather than a
-/// patch of ground in front of the camera: it draws the union of the cascades, which is the
-/// camera's view out to `maximum_distance`, so it draws on the order of what the main pass draws
-/// again. A frame rate that suffers is turned back up by, in order of how much they give,
-/// `maximum_distance`, which is the geometry the pass draws at all, [`SUN_SHADOW_CASCADES`], which
-/// is how many passes it is split over, and [`SUN_SHADOW_MAP_SIZE`], which is fill rate rather than
-/// geometry. The biases are left at Bevy's defaults. Measure that cost rather than assume it: the
-/// synthetic scenario (`scripts/phase2-profile.ps1 -Scenario synthetic`) runs this setup without
-/// game data, and `docs/roadmap/02-profiling.md` holds the campaign and its regression thresholds.
+/// # The cost, and the knobs
 ///
-/// [sqrt(2)]: std::f32::consts::SQRT_2
+/// This is the first configuration in which the shadow pass draws the world at all. The union of
+/// the cascades is the camera's frustum out to 17,378 units, which is everything the full-detail
+/// grid holds, so the pass costs about what the main opaque pass costs again; the portal camera
+/// renders cascades of its own on top (`crate::portal`), so a doorway in view adds a second set.
+/// `streaming.rs` has this engine's one measurement of that: taking the ring's terrain out of the
+/// shadow pass took a twelve-cell Pale view from 30 to 59 frames a second. A frame rate that
+/// suffers is turned back up by, in order of how much they give: [`maximum_distance`] here, which
+/// is the geometry the pass draws at all; [`SUN_SHADOW_CASCADES`], which is how many passes it is
+/// split over; and [`SUN_SHADOW_MAP_SIZE`], which is fill rate rather than geometry.
+///
+/// # The biases are left alone, on the numbers
+///
+/// `DirectionalLight::shadow_depth_bias` is 0.02 (`bevy_light-0.19.0`
+/// `src/directional_light.rs:165`) and is added to the fragment's world position along the light's
+/// direction (`bevy_pbr-0.19.0` `src/render/shadows.wgsl:192`), so in this world it is a 0.29 mm
+/// step - three orders of magnitude below the texel-sized depth error it would have to correct, and
+/// a constant that would have to grow with the cascade to mean anything at all. The work is done
+/// by `shadow_normal_bias`, 1.8 (`src/directional_light.rs:167`), which is scale-free as it stands:
+/// the shader multiplies it by the cascade's own texel size (`shadows.wgsl:191`), and the
+/// extraction multiplies it by sqrt(2) for the worst case on the diagonal (`render/light.rs:811`),
+/// so it is 2.5 texels of offset along the surface normal in every cascade - about 2 cm under the
+/// player and 42 units in the last one, where a texel is 24 cm across anyway. That is the same
+/// trade Bevy's default makes in a metre world, so neither value was changed on a guess: if a run
+/// shows acne on distant ground the knob is `shadow_normal_bias`, and if small objects lose their
+/// contact shadows it is too high. Neither could be judged here, where no GPU was in the loop.
+///
 /// [`maximum_distance`]: CascadeShadowConfigBuilder::maximum_distance
-pub(crate) fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
+pub(crate) fn sun_shadow_cascades(
+    stream_radius: i32,
+    cascades: usize,
+    distance: Option<f32>,
+) -> CascadeShadowConfig {
+    // The `+ 1` is the camera's own cell: the grid is `stream_radius` cells around the camera's
+    // cell rather than around the camera, and the camera may stand at the far edge of its own. A
+    // radius the command line can be given as negative leaves nothing to load; clamped to 0 it is
+    // the camera's own cell alone, which still leaves the first cascade inside the last.
+    let full_detail = crate::world::components::CELL_SIZE * (stream_radius.max(0) + 1) as f32;
+    let first_cascade_far_bound = 10.0 * CREATION_UNITS_PER_METRE;
+    CascadeShadowConfigBuilder {
+        minimum_distance: 0.1 * CREATION_UNITS_PER_METRE,
+        // A reach the settings name is kept past the first cascade, which the builder requires.
+        maximum_distance: distance.map_or(full_detail * std::f32::consts::SQRT_2, |distance| {
+            distance.max(first_cascade_far_bound * 1.01)
+        }),
+        first_cascade_far_bound,
+        num_cascades: cascades.max(1),
+        overlap_proportion: 0.2,
+    }
+    .into()
+}
+
+const SUN_SHADOW_MAX_GRID_CELLS: i32 = 256;
+
+pub(crate) fn world_sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
     // Cells draw out to `unload_radius`, one ring past the requested `stream_radius`, and the
     // `+ 1` is the camera's own cell: the grid is `unload_radius` cells around that cell rather
     // than around the camera, which may stand at the far edge of its own. The radius is clamped
@@ -2395,7 +2787,8 @@ fn sun_rotation(config: &EngineConfig) -> Quat {
 
 /// Where `setup_world` stands the camera relative to the point it looks at, the centre of the cell
 /// at the origin of the world grid: the acceptance screenshot is taken from far above it, the
-/// The camera offsets stay shared between startup and route driving.
+/// walk-around view from behind and above it. [`sun_shadow_cascades`] measures its range from the
+/// camera, so the offsets live here rather than in two places.
 fn camera_offset(config: &EngineConfig) -> Vec3 {
     if config.streaming_benchmark_route_speed.is_some() {
         Vec3::new(0.0, 6000.0, 0.0)
@@ -2413,12 +2806,13 @@ fn setup_world(
     shot_output: Option<Res<ShotOutputImage>>,
     config: Res<EngineConfig>,
     ground_height: Option<Res<InitialCameraGroundHeight>>,
+    start_pose: Option<Res<crate::portal::StartPose>>,
     tuning: Option<Res<MovementTuning>>,
     start_camera: Option<Res<InitialWorldCameraPose>>,
 ) {
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
     let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
-    let camera_offset = if config.interactive_world_physics() {
+    let camera_offset = if world_physics_player(&config) {
         let tuning = tuning.as_deref().cloned().unwrap_or_default();
         crate::physics::player_start_camera(&tuning, Vec3::ZERO)
     } else {
@@ -2441,13 +2835,20 @@ fn setup_world(
             IVec2::new(config.start_grid.0, config.start_grid.1),
         );
         let tuning = tuning.as_deref().cloned().unwrap_or_default();
-        camera_transform.translation = if config.interactive_world_physics() {
+        camera_transform.translation = if world_physics_player(&config) {
             crate::physics::player_start_camera(&tuning, feet)
         } else {
             feet + Vec3::Y * tuning.eye_height
         };
         camera_transform.rotation =
             crate::streaming::creation_rotation_to_bevy([0.0, 0.0, config.start_yaw]);
+    }
+    if let Some(pose) = start_pose {
+        camera_transform = pose.camera;
+        if world_physics_player(&config) {
+            let tuning = tuning.as_deref().cloned().unwrap_or_default();
+            camera_transform.translation = crate::physics::player_start_camera(&tuning, pose.feet);
+        }
     }
     let mut perspective = PerspectiveProjection { far, ..default() };
     if let Some(pose) = start_camera {
@@ -2499,10 +2900,11 @@ fn setup_world(
         DirectionalLight {
             color: weather_lighting.sunlight,
             illuminance: crate::lights::SUN_ILLUMINANCE,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: sun_shadow_maps_enabled(Some(&config)),
             ..default()
         },
-        sun_shadow_cascades(&config),
+        world_sun_shadow_cascades(&config),
+        crate::graphics_settings::MainSun,
         RenderLayers::from_layers(&LIGHT_LAYERS),
         Transform::from_rotation(sun_rotation(&config)),
     ));
@@ -2537,22 +2939,28 @@ fn initial_camera_ground_height(
     .unwrap_or(0.0))
 }
 
-/// Sample finite local terrain below the actual startup camera pose, if available.
+/// Sample finite local terrain at the startup XY: shot, authored feet, then cell centre.
+/// This bounds the Rapier support query; sampled terrain alone never releases the WALK hold.
 fn initial_walk_ground_height(
     config: &EngineConfig,
     database_path: &std::path::Path,
     cache: &CellCache,
     shot: Option<&crate::shots::Shot>,
 ) -> Result<Option<f32>> {
-    let sample_position = shot
-        .map(|shot| Vec2::new(shot.position[0], shot.position[1]))
-        .or_else(|| config.start_position.map(|p| Vec2::new(p[0], p[1])))
-        .unwrap_or_else(|| {
-            Vec2::new(
-                (config.start_grid.0 as f32 + 0.5) * crate::world::components::CELL_SIZE,
-                (config.start_grid.1 as f32 + 0.5) * crate::world::components::CELL_SIZE,
+    let sample_position = shot.map_or_else(
+        || {
+            config.start_position.map_or_else(
+                || {
+                    Vec2::new(
+                        (config.start_grid.0 as f32 + 0.5) * crate::world::components::CELL_SIZE,
+                        (config.start_grid.1 as f32 + 0.5) * crate::world::components::CELL_SIZE,
+                    )
+                },
+                |position| Vec2::new(position[0], position[1]),
             )
-        });
+        },
+        |shot| Vec2::new(shot.position[0], shot.position[1]),
+    );
     if !sample_position.is_finite()
         || (sample_position.x / crate::world::components::CELL_SIZE).floor() as i32
             != config.start_grid.0
@@ -2862,20 +3270,17 @@ fn bounded_auto_flight_direction(
     state.axis * state.sign
 }
 
-/// The two `Update` systems every run gets, both gated on the console being closed. The console
+/// The `Update` systems every run gets (the fly camera only when the run uses it), both gated on the console being closed. The console
 /// owns the keyboard while it is open and on the frame it closes, so the free camera must not fly
 /// on those keys and the acceptance screenshot must not enqueue a capture of the open overlay into
 /// the PNG the acceptance check reads. Both frames are rejected by the predicate, and
 /// `refresh_console_ui` hides the overlay on the closing frame, before the capture resumes on the
 /// next update.
-fn add_camera_and_capture_systems(app: &mut App) {
-    app.add_systems(
-        Update,
-        (
-            fly_camera.run_if(console_closed),
-            capture_acceptance_screenshot.run_if(console_closed),
-        ),
-    );
+fn add_camera_and_capture_systems(app: &mut App, fly_camera_enabled: bool) {
+    app.add_systems(Update, capture_acceptance_screenshot.run_if(console_closed));
+    if fly_camera_enabled {
+        app.add_systems(Update, fly_camera.run_if(console_closed));
+    }
 }
 
 fn fly_camera(
@@ -2964,7 +3369,7 @@ fn capture_acceptance_screenshot(
     renderer: Res<RendererMetrics>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     // Surfaces a view can see that the render world has not confirmed drawn: an acceptance
-    // screenshot must not be taken while one is outstanding (design-1091 Â§4).
+    // screenshot must not be taken while one is outstanding (design-1091 §4).
     waiting: Query<
         Has<crate::swap_bridge::SwapInCameraView>,
         With<crate::swap_bridge::SwapWaiting>,
@@ -3048,7 +3453,8 @@ struct ScreenshotCaptureState {
 
 #[cfg(test)]
 mod tests {
-    /// The terrain fixture exercises the same overlay weight field as streamed terrain.
+    /// A `--route` file shares the camera with neither `--shots` nor `--matched-route`. The refusal
+    /// comes before the shots file is read, so the file names here need not exist.
     #[test]
     fn terrain_water_fixture_quadrants_carry_their_weight_field() {
         let terrain = terrain_water_fixture_snapshot();
@@ -3094,6 +3500,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::atmosphere::UNDERGROUND_COLOR;
     use crate::console::ConsoleState;
     use bevy::asset::{AssetApp, AssetPlugin};
     use bevy::input::ButtonState;
@@ -3292,6 +3699,72 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("--matched-route"));
         assert!(message.contains("benchmark"));
+    }
+
+    #[test]
+    fn single_start_pose_rejects_portal_camera_drivers_before_loading() {
+        for mode in ["--demo-tour", "--portal-bench"] {
+            for reversed in [false, true] {
+                let args = if reversed {
+                    [
+                        mode,
+                        "unused-output",
+                        "--load-doors",
+                        "seamless",
+                        "--start-shot",
+                        "missing-pose.json",
+                    ]
+                } else {
+                    [
+                        "--start-shot",
+                        "missing-pose.json",
+                        mode,
+                        "unused-output",
+                        "--load-doors",
+                        "seamless",
+                    ]
+                };
+                let mut config = EngineConfig::run_from_args(args.map(str::to_owned));
+                let original = (config.worldspace_id, config.start_grid);
+                let Err(error) = prepare_start_camera(&mut config) else {
+                    panic!("conflicting camera drivers must be refused");
+                };
+                let message = error.to_string();
+                assert!(message.contains("--start-shot") && message.contains(mode));
+                assert_eq!((config.worldspace_id, config.start_grid), original);
+            }
+        }
+    }
+
+    #[test]
+    fn matched_route_rejects_named_start_pose_before_loading_or_changing_space() {
+        for reversed in [false, true] {
+            let args = if reversed {
+                [
+                    "--matched-route",
+                    "missing-route.json",
+                    "--start-shot",
+                    "missing-pose.json",
+                    "pose",
+                ]
+            } else {
+                [
+                    "--start-shot",
+                    "missing-pose.json",
+                    "pose",
+                    "--matched-route",
+                    "missing-route.json",
+                ]
+            };
+            let mut config = EngineConfig::run_from_args(args.map(str::to_owned));
+            let original = (config.worldspace_id, config.start_grid);
+            let Err(error) = prepare_shots(&mut config) else {
+                panic!("conflicting camera drivers must be refused");
+            };
+            let message = error.to_string();
+            assert!(message.contains("--start-shot") && message.contains("--matched-route"));
+            assert_eq!((config.worldspace_id, config.start_grid), original);
+        }
     }
 
     #[test]
@@ -3819,6 +4292,9 @@ mod tests {
         .insert_resource(WaterReflectionTexture(Handle::<Image>::default()))
         .init_resource::<ProfilingState>()
         .init_resource::<StreamingFixtureState>()
+        // No render plugin runs here, so the fixture's invalidation message has no policy reader;
+        // the message itself still has to be registered for the fixture to be able to send it.
+        .add_message::<InvalidateSecondaryViews>()
         .add_plugins(StreamingPlugin)
         .add_systems(
             PreUpdate,
@@ -3990,7 +4466,7 @@ mod tests {
     /// scope opened on a pool thread (bevy_gltf's texture scope) runs the other queued tasks on its
     /// own stack while it waits. This queues `LOADS` tasks behind a blocked single-thread pool,
     /// each of which takes a 64 KiB frame and then opens a scope, the shape of a glTF load. They
-    /// nest far past the 8 MiB the pool used to have (the overflow seen streaming a dense city), and must finish
+    /// nest far past the 8 MiB the pool used to have (the portal bench's overflow), and must finish
     /// on [`IO_TASK_STACK_BYTES`].
     #[test]
     fn the_io_pool_stack_holds_a_queue_of_loads_nested_in_scopes() {
@@ -4046,6 +4522,36 @@ mod tests {
         );
     }
 
+    /// The canonical fixture's emissive box is a converted material, and this is what catches a
+    /// glow that has lost its scale: the same emissive at the magnitude the converter publishes -
+    /// the Blackreach caps' `[0.212, 0.992, 1.0]` times their strength of 2.0 - has to read as
+    /// invisible, and the same value after the engine's exposure as visible. A check that only
+    /// asked for a positive channel passed while every glow of the game rendered black.
+    ///
+    /// Together with the upper edge this brackets `EMISSIVE_EXPOSURE` on both sides, which is what
+    /// makes it worth having: below about 20 the converted glows are still lost in the ambient, and
+    /// above about 240 every frame a glow is in clips.
+    #[test]
+    fn the_canonical_emissive_is_checked_against_the_ambient_it_sits_in() {
+        let converted = LinearRgba::new(0.424, 1.984, 2.0, 1.0);
+        assert!(
+            !emissive_is_visible(converted),
+            "a raw glTF emissive is exactly the state this fixture has to fail on"
+        );
+        assert!(
+            emissive_is_visible(crate::render::exposed_emissive(converted)),
+            "and the same material after the engine's emissive scale is the state it has to pass"
+        );
+        assert!(
+            !emissive_is_visible(LinearRgba::NONE),
+            "a material with no emissive is not a glow"
+        );
+        assert!(
+            !emissive_is_visible(LinearRgba::new(1.0e6, 1.0e6, 1.0e6, 1.0)),
+            "and neither is a lamp of its own: the band has an upper edge"
+        );
+    }
+
     #[test]
     fn rejects_conflicting_fixture_modes() {
         let mut config = EngineConfig {
@@ -4070,7 +4576,7 @@ mod tests {
         assert!(screenshot_assets_ready(&settled_metrics, 0, true, &config));
 
         // A surface waiting on the render world holds the screenshot back until it is confirmed
-        // drawn: the acceptance screenshot must not photograph a stand-in or a hole (design-1091 Â§4).
+        // drawn: the acceptance screenshot must not photograph a stand-in or a hole (design-1091 §4).
         assert!(!screenshot_assets_ready(&settled_metrics, 1, true, &config));
 
         let mut failed_metrics = settled_metrics.clone();
@@ -4138,7 +4644,7 @@ mod tests {
             })
             .insert_resource(ProfilingState::default())
             .insert_resource(TimeUpdateStrategy::ManualDuration(step));
-        add_camera_and_capture_systems(&mut app);
+        add_camera_and_capture_systems(&mut app, true);
         app.world_mut().spawn((Window::default(), PrimaryWindow));
         app
     }
@@ -4279,7 +4785,7 @@ mod tests {
     #[test]
     fn the_sun_shadows_cover_the_drawn_grid() {
         let config = EngineConfig::default();
-        let cascades = sun_shadow_cascades(&config);
+        let cascades = world_sun_shadow_cascades(&config);
         let cell = crate::world::components::CELL_SIZE;
         assert_eq!(config.stream_radius, 2);
         // Cells are requested inside the stream radius and kept until they leave the unload ring,
@@ -4355,7 +4861,7 @@ mod tests {
             sun_shadow_distance_limit: Some(8_000.0),
             ..EngineConfig::default()
         };
-        let cascades = sun_shadow_cascades(&cap);
+        let cascades = world_sun_shadow_cascades(&cap);
         assert!((cascades.bounds[3] - 8_000.0).abs() < 0.01);
         assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
 
@@ -4363,14 +4869,14 @@ mod tests {
             sun_shadow_distance_limit: Some(23_200.0),
             ..EngineConfig::default()
         };
-        let cascades = sun_shadow_cascades(&max_grid);
+        let cascades = world_sun_shadow_cascades(&max_grid);
         assert!((cascades.bounds[3] - 23_200.0).abs() < 0.01);
 
         let short_range = EngineConfig {
             sun_shadow_distance_limit: Some(700.0),
             ..EngineConfig::default()
         };
-        let cascades = sun_shadow_cascades(&short_range);
+        let cascades = world_sun_shadow_cascades(&short_range);
         assert!((cascades.bounds[3] - 700.0).abs() < 0.01);
         assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
     }
@@ -4419,14 +4925,14 @@ mod tests {
         let above = corner.hypot(camera_offset(&overhead).y);
         assert!(above > walk_around, "the camera's height counts");
 
-        let cascades = sun_shadow_cascades(&overhead);
+        let cascades = world_sun_shadow_cascades(&overhead);
         assert!(
             (cascades.bounds[3] - above).abs() < 1.0,
             "the overhead camera's range reaches its own corner: {} against {above}",
             cascades.bounds[3]
         );
 
-        let walk_around_cascades = sun_shadow_cascades(&EngineConfig::default());
+        let walk_around_cascades = world_sun_shadow_cascades(&EngineConfig::default());
         assert!(
             (walk_around_cascades.bounds[3] - walk_around).abs() < 1.0,
             "and the walk-around camera's reaches its: {} against {walk_around}",
@@ -4449,7 +4955,7 @@ mod tests {
                 (config.stream_radius, config.unload_radius),
                 (radius, radius + 1)
             );
-            let cascades = sun_shadow_cascades(&config);
+            let cascades = world_sun_shadow_cascades(&config);
             assert_eq!(cascades.bounds.len(), SUN_SHADOW_CASCADES);
             assert_eq!(
                 cascades.bounds[0],
@@ -4493,7 +4999,7 @@ mod tests {
             unload_radius: -3,
             ..EngineConfig::default()
         };
-        let cascades = sun_shadow_cascades(&nothing);
+        let cascades = world_sun_shadow_cascades(&nothing);
         assert!(cascades.bounds[3] > 10.0 * CREATION_UNITS_PER_METRE);
         assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
 
@@ -4503,7 +5009,7 @@ mod tests {
         let gigametres = EngineConfig::run_from_args(args);
         let widest = cell * SUN_SHADOW_MAX_GRID_CELLS as f32 * std::f32::consts::SQRT_2;
         let reach = widest.hypot(camera_offset(&gigametres).y);
-        let cascades = sun_shadow_cascades(&gigametres);
+        let cascades = world_sun_shadow_cascades(&gigametres);
         assert!(
             (cascades.bounds[3] - reach).abs() < 1.0,
             "a radius of 100000 cells is capped at {SUN_SHADOW_MAX_GRID_CELLS}: {} against {reach}",
@@ -4535,35 +5041,103 @@ mod tests {
         crate::color_pipeline::assert_scene_camera_output(app.world_mut(), 5);
     }
 
-    /// The engine's startup path is `setup_world`, not the helper above, so the sun it spawns is
-    /// what has to carry the cascades - along with the shadow map size they are drawn at.
+    /// The sun is what has to carry the cascades: without a configuration of its own it gets
+    /// Bevy's, which covers the two metres in front of the camera.
     #[test]
     fn setup_world_spawns_the_sun_with_its_cascades() {
-        let config = EngineConfig::default();
+        let config = EngineConfig {
+            sun_shadow_distance_limit: Some(7_000.0),
+            ..default()
+        };
         let mut app = App::new();
-        app.insert_resource(config.clone())
+        app.insert_resource(config)
             .add_systems(Startup, setup_world);
         app.update();
 
         let world = app.world_mut();
-        let mut suns = world.query::<(&DirectionalLight, &CascadeShadowConfig)>();
+        // The source sun, not the unshadowed copy a shadowless view may add.
+        let mut suns = world.query_filtered::<
+            (&DirectionalLight, &CascadeShadowConfig),
+            Without<crate::shadow_route::UnshadowedSun>,
+        >();
         let Ok((light, cascades)) = suns.single(world) else {
             panic!("setup_world spawns one shadow-casting directional light");
         };
         assert!(light.shadow_maps_enabled);
-
-        let expected = sun_shadow_cascades(&config);
+        // This explicit cap lies inside the streamed grid. Derive its expected cascade input
+        // independently of the world-range helper so ignoring the configured cap fails here.
+        let expected: CascadeShadowConfig = CascadeShadowConfigBuilder {
+            minimum_distance: 0.1 * CREATION_UNITS_PER_METRE,
+            maximum_distance: 7_000.0,
+            first_cascade_far_bound: 10.0 * CREATION_UNITS_PER_METRE,
+            num_cascades: SUN_SHADOW_CASCADES,
+            ..default()
+        }
+        .into();
         assert_eq!(cascades.bounds, expected.bounds);
         assert_eq!(cascades.minimum_distance, expected.minimum_distance);
-
-        // `resource` panics if `setup_world` left the shadow map size unset, which is one of the
-        // two ways this test can fail.
-        let shadow_map = world.resource::<DirectionalLightShadowMap>();
-        assert_eq!(shadow_map.size, SUN_SHADOW_MAP_SIZE);
     }
 
-    /// A placed object is kept out of the reflection pass by its layer, so the streaming camera has
-    /// to keep drawing that layer or the objects would vanish from the player's own view.
+    /// `--shadows off` is a measurement switch for the sun's shadow maps.
+    #[test]
+    fn the_shadows_off_switch_turns_off_the_source_suns_shadow_maps() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            shadows: false,
+            ..default()
+        })
+        .add_systems(Startup, setup_world);
+        app.update();
+
+        let world = app.world_mut();
+        let mut suns = world
+            .query_filtered::<&DirectionalLight, Without<crate::shadow_route::UnshadowedSun>>();
+        let sun = suns.single(world).expect("one source sun");
+        assert!(!sun.shadow_maps_enabled);
+    }
+
+    /// `--shadows off` has to mean the same in the fixture scenes, which are the measurement scenes.
+    #[test]
+    fn the_shadows_off_switch_reaches_every_fixture_sun() {
+        for (shadows, expected) in [(false, false), (true, true)] {
+            let mut app = App::new();
+            app.insert_resource(EngineConfig {
+                shadows,
+                ..default()
+            })
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<Assets<TerrainMaterial>>()
+            .init_resource::<Assets<WaterMaterial>>()
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .add_systems(
+                Startup,
+                (
+                    setup_material_fixture,
+                    setup_terrain_water_fixture,
+                    setup_transform_bounds_fixture,
+                    setup_renderer_fixture,
+                ),
+            );
+            app.update();
+            let world = app.world_mut();
+            let suns: Vec<_> = world
+                .query::<&DirectionalLight>()
+                .iter(world)
+                .map(|sun| sun.shadow_maps_enabled)
+                .collect();
+            assert_eq!(suns.len(), 4, "each fixture spawns one sun");
+            assert!(
+                suns.iter().all(|enabled| *enabled == expected),
+                "--shadows {}: {suns:?}",
+                if shadows { "on" } else { "off" }
+            );
+        }
+    }
+
+    /// The streaming camera draws the world (layer 0) and the water planes ([`WATER_LAYER`]):
+    /// whatever lives on a layer it does not render vanishes from the player's own view.
     #[test]
     fn the_streaming_camera_renders_every_layer_the_world_uses() {
         let mut app = App::new();
@@ -4577,16 +5151,105 @@ mod tests {
         let layers = cameras
             .single(app.world())
             .expect("the streaming camera must be spawned");
-        for layer in [
-            crate::render::WORLD_LAYER,
-            WATER_LAYER,
-            crate::render::PLACED_OBJECT_LAYER,
-        ] {
+        for layer in MAIN_VIEW_LAYERS {
             assert!(
                 layers.intersects(&RenderLayers::layer(layer)),
                 "the streaming camera must render layer {layer}"
             );
         }
+    }
+
+    /// Main's capsule player walks a load-screen run (the vanilla default); a seamless-door run, a
+    /// tour and a start shot keep the camera to themselves.
+    /// One crossing per run: the load screen never with seamless doors, and the seamless crossing
+    /// (`crate::transition`, added by the portal plugin) never with the load screen.
+    #[test]
+    fn composed_world_wiring_installs_one_crossing_plugin_for_each_run_mode() {
+        let args = |list: &[&str]| EngineConfig::run_from_args(list.iter().map(|a| a.to_string()));
+        for config in [
+            EngineConfig::default(),
+            args(&["--demo-tour", "out"]),
+            args(&["--load-doors", "seamless"]),
+        ] {
+            let player = world_physics_player(&config);
+            let crossing = load_screen_crossing(&config);
+            let mut app = App::new();
+            app.insert_resource(config)
+                .init_resource::<bevy::gltf::extensions::GltfExtensionHandlers>();
+            install_world_player_and_crossing(&mut app, player, crossing);
+            assert_eq!(app.is_plugin_added::<WorldPlayerPlugin>(), player);
+            assert_eq!(
+                app.is_plugin_added::<crate::door_crossing::DoorCrossingPlugin>(),
+                crossing
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_is_built_with_one_door_crossing() {
+        let args = |list: &[&str]| EngineConfig::run_from_args(list.iter().map(|a| a.to_string()));
+        assert!(load_screen_crossing(&EngineConfig::default()));
+        assert!(load_screen_crossing(&args(&["--demo-tour", "out"])));
+        for seamless in [
+            args(&["--load-doors", "seamless"]),
+            args(&["--load-doors", "seamless", "--walk"]),
+            args(&["--load-doors", "seamless", "--demo-tour", "out"]),
+        ] {
+            assert!(!load_screen_crossing(&seamless));
+        }
+        // A benchmark has no one at a door and builds neither.
+        assert!(!load_screen_crossing(&args(&["--benchmark-frames", "10"])));
+    }
+
+    /// Eye focus is off by default and, off or without seamless doors, not built at all.
+    #[test]
+    fn eye_focus_is_built_only_when_on_with_seamless_doors() {
+        let args = |list: &[&str]| EngineConfig::run_from_args(list.iter().map(|a| a.to_string()));
+        let defaults = crate::graphics_settings::GraphicsSettings::default();
+        assert!(!defaults.eye_focus, "off by default, as in Skyrim");
+        let seamless_tour = args(&["--load-doors", "seamless", "--demo-tour", "out"]);
+        assert!(!builds_eye_focus(&seamless_tour, defaults.eye_focus));
+        assert!(builds_eye_focus(&seamless_tour, true));
+        assert!(!builds_eye_focus(&args(&["--demo-tour", "out"]), true));
+    }
+
+    #[test]
+    fn the_world_physics_player_walks_only_with_load_screen_doors() {
+        assert!(EngineConfig::default().interactive_world_physics());
+        assert!(world_physics_player(&EngineConfig::default()));
+        let seamless = EngineConfig::run_from_args(["--load-doors", "seamless"].map(str::to_owned));
+        assert!(!world_physics_player(&seamless));
+        let tour = EngineConfig::run_from_args(["--demo-tour", "out"].map(str::to_owned));
+        assert!(!world_physics_player(&tour));
+    }
+
+    /// The shadowless reflection route only works while nothing the player sees, and nothing that
+    /// lights the player's world, is on the replica layer.
+    #[test]
+    fn the_main_camera_and_the_source_sun_never_share_the_replica_layer() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .add_systems(Startup, setup_world);
+        app.update();
+
+        let replica = RenderLayers::layer(crate::render::UNSHADOWED_REFLECTION_LAYER);
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&RenderLayers, With<StreamingCamera>>();
+        let camera = cameras.single(app.world()).expect("the streaming camera");
+        assert!(!camera.intersects(&replica));
+
+        // The engine sun may carry no layers at all, which is layer 0.
+        let mut suns = app.world_mut().query_filtered::<Option<&RenderLayers>, (
+            With<DirectionalLight>,
+            Without<crate::shadow_route::UnshadowedSun>,
+        )>();
+        let suns: Vec<_> = suns
+            .iter(app.world())
+            .map(|layers| layers.cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(suns.len(), 1, "setup_world spawns one source sun");
+        assert!(!suns[0].intersects(&replica));
     }
 
     #[test]
@@ -4665,28 +5328,267 @@ mod tests {
         assert!(state.offset.abs() <= AUTO_FLIGHT_HALF_SPAN);
     }
 
-    /// The far plane includes the whole terrain ring, including its far corner.
-    /// Weather fog is owned by `sky::SkyPlugin`, independently of the terrain ring.
+    /// The numbers the default run draws the ring with, and the two properties that make the pair
+    /// work: the fog is clear where the full-detail grid ends and opaque where the camera can no
+    /// longer see terrain, and everything the fog fades is inside the far plane.
     #[test]
-    fn the_default_far_plane_covers_the_terrain_ring() {
+    fn the_default_far_plane_and_fog_cover_the_terrain_ring() {
         let config = EngineConfig::default();
+        // The ring this run draws where the worldspace has no LOD data, which is what this test is
+        // about: the far plane is measured from the ring the run draws, not the configured one.
         let far = camera_far_plane(config.stream_radius, config.effective_terrain_radius(false));
         let cell = crate::world::components::CELL_SIZE;
         assert_eq!(config.stream_radius, 2);
         assert_eq!(config.terrain_radius, crate::config::DEFAULT_TERRAIN_RADIUS);
         assert_eq!(far, cell * (config.terrain_radius + 2) as f32 * 2.0);
-        let corner = std::f32::consts::SQRT_2 * (config.terrain_radius as f32 + 1.0) * cell;
+
+        let DistanceFog {
+            falloff: FogFalloff::Linear { start, end },
+            color,
+            ..
+        } = exterior_fog(config.stream_radius, config.terrain_radius, None, SKY_COLOR)
+        else {
+            panic!("an exterior with a ring fogs linearly");
+        };
+        assert_eq!(
+            color, SKY_COLOR,
+            "the ring fades into the sky it is drawn against"
+        );
+        assert_eq!(
+            start,
+            cell * 3.0,
+            "clear up to the far edge of the full-detail grid"
+        );
+        assert_eq!(
+            end,
+            cell * (config.terrain_radius + 1) as f32,
+            "opaque at the far edge of the ring, where the last ring cell is"
+        );
+        assert!(
+            end < far,
+            "the fog is opaque before the far plane clips anything: a cliff of fog is as bad as a \
+             cliff of terrain"
+        );
+
+        // The whole ring is inside the far plane, corner included: the corner cell's far side is
+        // sqrt(2) * (terrain_radius + 1) cells from the camera cell's centre.
+        let corner = (2.0_f32).sqrt() * (config.terrain_radius as f32 + 1.0) * cell;
         assert!(
             corner < far,
             "corner {corner} is outside the far plane {far}"
         );
     }
 
+    /// No ring means nothing beyond the full-detail grid to fade, so the fog is off and the far
+    /// plane is the one the engine drew the inner grid with before the ring existed.
     #[test]
-    fn without_a_ring_the_far_plane_preserves_full_detail_reach() {
-        let config = EngineConfig::default();
-        let far = camera_far_plane(config.stream_radius, config.effective_terrain_radius(true));
+    fn without_a_ring_the_far_plane_and_the_fog_are_what_they_were() {
+        let far = camera_far_plane(
+            2,
+            EngineConfig {
+                terrain_radius: 2,
+                ..EngineConfig::default()
+            }
+            .effective_terrain_radius(true),
+        );
         assert_eq!(far, crate::world::components::CELL_SIZE * 4.0 * 2.0);
+
+        let DistanceFog {
+            falloff: FogFalloff::Linear { start, .. },
+            ..
+        } = exterior_fog(2, 2, None, SKY_COLOR)
+        else {
+            panic!("the falloff is linear whether the fog is on or off");
+        };
+        assert!(
+            start > far,
+            "with no ring the fog starts past the far plane, so nothing is ever fogged"
+        );
+    }
+
+    /// With the world's LOD data the fog still starts where the full-detail grid ends but reaches
+    /// out to the LOD's horizon, so distant terrain beyond the ring is drawn and not fogged out as
+    /// sky colour at the ring's edge; without LOD data it is the ring's, as before.
+    #[test]
+    fn the_exterior_fog_reaches_the_lod_horizon_when_the_world_has_lod() {
+        let cell = crate::world::components::CELL_SIZE;
+        let linear = |fog: DistanceFog| {
+            let DistanceFog {
+                falloff: FogFalloff::Linear { start, end },
+                ..
+            } = fog
+            else {
+                panic!("the exterior fog is linear");
+            };
+            (start, end)
+        };
+        let defaults = EngineConfig::default();
+        let horizon = cell * 91.0;
+
+        assert_eq!(
+            linear(exterior_fog(
+                defaults.stream_radius,
+                defaults.terrain_radius,
+                None,
+                SKY_COLOR
+            )),
+            (cell * 3.0, cell * (defaults.terrain_radius + 1) as f32),
+            "no LOD data: the ring's own fog"
+        );
+        assert_eq!(
+            linear(exterior_fog(
+                defaults.stream_radius,
+                defaults.terrain_radius,
+                Some(horizon),
+                SKY_COLOR
+            )),
+            (cell * 3.0, horizon),
+            "LOD data: clear up to the grid's edge, opaque at the LOD's horizon"
+        );
+        assert_eq!(
+            linear(exterior_fog(
+                defaults.stream_radius,
+                defaults.terrain_radius,
+                Some(cell * 2.0),
+                SKY_COLOR
+            ))
+            .1,
+            cell * (defaults.terrain_radius + 1) as f32,
+            "a horizon nearer than the ring never pulls the fog in over the ring"
+        );
+        // No ring, but LOD: the horizon is what there is to fade, so it is fogged too; a LOD
+        // horizon inside the grid has nothing to fade and the fog stays off.
+        assert_eq!(
+            linear(exterior_fog(2, 2, Some(horizon), SKY_COLOR)).1,
+            horizon
+        );
+        assert!(
+            linear(exterior_fog(2, 2, Some(cell), SKY_COLOR)).0
+                > camera_far_plane(defaults.stream_radius, 2)
+        );
+    }
+
+    /// The sun's cascades as the demo's look (`current`) asks for them.
+    fn today_cascades(config: &EngineConfig) -> CascadeShadowConfig {
+        sun_shadow_cascades(config.stream_radius, SUN_SHADOW_CASCADES, None)
+    }
+
+    /// The sun's shadows reach every cell the streamer holds in full, whichever way the camera
+    /// faces, and the shader's view of them is a usable one: far bounds that increase (its
+    /// `get_cascade_index` returns the first bound the fragment is inside, so a bound out of order
+    /// hands every fragment beyond it to a cascade that cannot see it) and a near clamp below the
+    /// first bound. The two near distances are Bevy's own defaults read in metres; the last is this
+    /// engine's full-detail grid, which is the part a run of the demo depends on.
+    #[test]
+    fn the_sun_shadows_cover_the_full_detail_grid() {
+        let config = EngineConfig::default();
+        let cascades = today_cascades(&config);
+        let cell = crate::world::components::CELL_SIZE;
+        assert_eq!(config.stream_radius, 2);
+        assert_eq!(cascades.bounds.len(), SUN_SHADOW_CASCADES);
+
+        assert_eq!(
+            cascades.minimum_distance,
+            0.1 * CREATION_UNITS_PER_METRE,
+            "Bevy's 10 cm near clamp, in Creation units"
+        );
+        assert_eq!(
+            cascades.bounds[0],
+            10.0 * CREATION_UNITS_PER_METRE,
+            "and its 10 m first cascade, which is 700 units here"
+        );
+
+        // The camera stands somewhere inside its own cell and the grid is `stream_radius` cells
+        // around that cell, so the grid's far corner is `stream_radius + 1` cells away on each of
+        // the two axes.
+        let axis = cell * (config.stream_radius as f32 + 1.0);
+        let corner = axis * std::f32::consts::SQRT_2;
+        assert!(
+            cascades.bounds[3] > axis,
+            "the grid straight ahead is shadowed: {} covers {axis}",
+            cascades.bounds[3]
+        );
+        // `calculate_cascade_bounds` reaches the maximum distance geometrically, so the last bound
+        // is the requested distance to within a rounding error rather than to the bit.
+        assert!(
+            (cascades.bounds[3] - corner).abs() < 1.0,
+            "and its far corner is inside the last cascade too: {} against {corner}",
+            cascades.bounds[3]
+        );
+
+        assert!(
+            cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]),
+            "the far bounds increase: {:?}",
+            cascades.bounds
+        );
+        assert!(cascades.minimum_distance < cascades.bounds[0]);
+        assert!((0.0..1.0).contains(&cascades.overlap_proportion));
+    }
+
+    /// The ring is outside the sun's range on purpose - it casts nothing, so covering it would take
+    /// texel size from the shadows that can be seen without adding a caster - so a larger
+    /// `--terrain-radius` does not move the range, and the coverage above holds at every radius the
+    /// command line accepts. A larger `--stream-radius` does move it: the range follows what the
+    /// streamer holds in full, which is what the shadows are for.
+    #[test]
+    fn the_shadow_range_follows_the_full_detail_grid_and_not_the_ring() {
+        let cell = crate::world::components::CELL_SIZE;
+        let default = today_cascades(&EngineConfig::default()).bounds;
+
+        for radius in [2, 8, 16, crate::config::MAX_TERRAIN_RADIUS] {
+            let config =
+                EngineConfig::run_from_args(["--terrain-radius".to_owned(), radius.to_string()]);
+            assert_eq!(config.terrain_radius, radius);
+            assert_eq!(
+                today_cascades(&config).bounds,
+                default,
+                "a {radius} cell ring is the fog's and the far plane's business, not the sun's"
+            );
+        }
+
+        let wider = today_cascades(&EngineConfig::run_from_args([
+            "--stream-radius".to_owned(),
+            "4".to_owned(),
+        ]));
+        assert!(
+            wider.bounds[3] > default[3],
+            "a wider full-detail grid is more world to shadow"
+        );
+        assert!((wider.bounds[3] - cell * 5.0 * std::f32::consts::SQRT_2).abs() < 1.0);
+
+        // A stream radius as negative as the command line allows loads nothing, and the distance
+        // derived from it would be negative - which `CascadeShadowConfigBuilder::build` rejects by
+        // panic. The engine clamps it and starts.
+        let nothing = EngineConfig {
+            stream_radius: -4,
+            ..EngineConfig::default()
+        };
+        assert!(today_cascades(&nothing).bounds[3] > 0.0);
+    }
+
+    /// An interior has no ring and no haze, and the fog it gets cannot reach anything the space
+    /// draws - while staying on the camera, so a crossing does not rebuild the pipeline.
+    #[test]
+    fn the_fog_of_an_interior_cannot_reach_its_geometry() {
+        let defaults = EngineConfig::default();
+        // The far plane an interior run starts with: its exterior's ring, which is the largest one
+        // a run of these tests draws.
+        let far = camera_far_plane(
+            defaults.stream_radius,
+            defaults.effective_terrain_radius(false),
+        );
+        let DistanceFog {
+            falloff: FogFalloff::Linear { start, end },
+            ..
+        } = fog_off(UNDERGROUND_COLOR)
+        else {
+            panic!("the falloff is linear whether the fog is on or off");
+        };
+        assert!(
+            start > far,
+            "start {start} must be past the far plane {far}"
+        );
+        assert!(start < end);
     }
 
     #[test]
@@ -4713,13 +5615,23 @@ mod tests {
     /// for the render world's upload backlog, so a capture run uploads unthrottled.
     #[test]
     fn capture_runs_upload_without_a_budget() {
-        let mut config = EngineConfig::default();
-        let normal = upload_budget(&config).max_bytes;
-        config.shots = Some(PathBuf::from("shots.json"));
-        assert_eq!(upload_budget(&config).max_bytes, None);
-        config.shots = None;
-        config.benchmark_frames = Some(10);
-        assert_eq!(upload_budget(&config).max_bytes, normal);
+        let with = |set: fn(&mut EngineConfig)| {
+            let mut config = EngineConfig::default();
+            set(&mut config);
+            upload_budget(&config).max_bytes
+        };
+        assert_eq!(
+            with(|c| c.portal.shots = Some(PathBuf::from("shots.json"))),
+            None
+        );
+        assert_eq!(
+            with(|c| c.portal.demo_tour = Some(PathBuf::from("tour.json"))),
+            None
+        );
+        assert_eq!(
+            with(|c| c.portal.portal_bench = Some(PathBuf::from("bench.json"))),
+            Some(16 * 1024 * 1024)
+        );
     }
 
     /// An assets directory the engine was given.
@@ -4821,6 +5733,65 @@ mod tests {
         );
         assert!(
             message.contains("cargo build --release -p engine"),
+            "{message}"
+        );
+    }
+
+    /// A data set an older dev build wrote under its private numbering (converter 102 401, world
+    /// database 100 701) is not "newer than this engine": it was written by another build, and the
+    /// fix is to convert it again.
+    #[test]
+    fn retired_dev_schema_numbers_say_convert_again_not_newer_than_the_engine() {
+        let directory = tempfile::tempdir().unwrap();
+        write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
+        std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
+        let config = EngineConfig {
+            assets_dir: directory.path().to_owned(),
+            ..default()
+        };
+
+        std::fs::write(
+            directory.path().join("conversion-manifest.json"),
+            br#"{"schema_version":102401,"complete":true}"#,
+        )
+        .unwrap();
+        let message = format!("{:#}", validate_runtime_assets(&config).unwrap_err());
+        assert!(
+            message.contains(
+                "this data set was converted by an older Mudcrab dev build (converter schema 102401)"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("convert it again with this build"),
+            "{message}"
+        );
+        assert!(!message.contains("newer than this engine"), "{message}");
+
+        // The converter's own number is fine; the report's retired world database number is the
+        // same story.
+        std::fs::write(
+            directory.path().join("conversion-manifest.json"),
+            format!(
+                r#"{{"schema_version":{},"complete":true}}"#,
+                converter_schema_version()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("integration-report.json"),
+            br#"{"schema_version":100701,"passed":true}"#,
+        )
+        .unwrap();
+        let message = format!("{:#}", validate_runtime_assets(&config).unwrap_err());
+        assert!(
+            message.contains(
+                "this data set was converted by an older Mudcrab dev build (world database schema 100701)"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("convert it again with this build"),
             "{message}"
         );
     }
@@ -5275,6 +6246,7 @@ mod tests {
             hfov: 60.0,
             reference: None,
             note: None,
+            open_door: None,
         };
 
         assert_eq!(

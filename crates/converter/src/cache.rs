@@ -18,6 +18,28 @@ mod rv_b_tests;
 // alone do not establish compatible output semantics.
 pub const CONVERTER_SCHEMA_VERSION: u32 = shared::LOD_CONVERTER_SCHEMA_VERSION;
 
+/// The main schema an OLD dev-numbered manifest was built on, or `None` for a number `main`
+/// could have written itself.
+///
+/// Until 2026-10-16 the `dev` tree (then `plus`/`portal`) numbered its output privately as
+/// `100_000 + main * 100 + revision` so that a `main` engine refused it. Data sets converted
+/// then still exist, for example `SkyrimConverted-portal-rooms-terrain` (converter 102_401,
+/// world database 100_701). Dev now writes `main`'s producer and world database numbers,
+/// so such a number appears only in an input manifest, never in output.
+///
+/// Only the places that decide script, archive, texture-setting and configuration-hash reuse
+/// from an old manifest call this, so `--reuse-assets` on such a set behaves like a pack
+/// produced by `main`'s converter of that version (for 102_401, producer 24). Meshes of a
+/// legacy-numbered pack are never reusable: [`can_reuse_meshes_for_producer`] compares raw
+/// numbers like `main`, and their glTF differs from the new core.
+pub(crate) const fn legacy_dev_schema_to_main(version: u32) -> Option<u32> {
+    if version >= 100_000 && version <= 199_999 {
+        Some((version - 100_000) / 100)
+    } else {
+        None
+    }
+}
+
 /// Provenance journal the converter keeps inside a staging directory.
 ///
 /// A staging directory outlives the run that filled it, so a resumed run finds
@@ -348,7 +370,11 @@ pub struct ConversionManifest {
 /// The producer-27 to producer-28 transition changes only texture container bytes,
 /// so producer-27 scripts remain valid.
 pub(crate) fn can_reuse_scripts_and_archives(schema: u32) -> bool {
-    matches!(schema, 12..=24 | 26 | 27)
+    // An old dev-numbered manifest counts as the main producer it was built on.
+    matches!(
+        legacy_dev_schema_to_main(schema).unwrap_or(schema),
+        12..=24 | 26 | 27
+    )
 }
 
 /// Published producer-24 meshes retain the producer-26 byte contract, and producer-27
@@ -364,6 +390,7 @@ pub(crate) fn can_reuse_meshes(schema: u32) -> bool {
 /// Each pair names a byte-identical GLB contract; `(24, 26)` must never be read as
 /// transitive, so `(24, 28)` and `(26, 28)` are deliberately absent.
 pub(crate) fn can_reuse_meshes_for_producer(schema: u32, current: u32) -> bool {
+    // Raw numbers only: an old dev-numbered pack (see `legacy_dev_schema_to_main`) never pairs.
     schema == current || matches!((schema, current), (24, 26) | (27, 28))
 }
 
@@ -510,6 +537,10 @@ fn configuration_hash_with_identity(
     schema: u32,
     identity: Option<&serde_json::Value>,
 ) -> Result<String> {
+    // The hashed "schema" field keeps the raw number (an old dev-numbered output recorded its own
+    // number there), but which fields exist depends on the main version it is built on; a raw
+    // 101_601 would otherwise pass every `>= 22` gate and hash fields that converter never had.
+    let main = legacy_dev_schema_to_main(schema).unwrap_or(schema);
     let mut relevant = serde_json::json!({
         "schema": schema,
         "texture_etc1s_quality": config.texture_fallback_quality,
@@ -532,10 +563,10 @@ fn configuration_hash_with_identity(
             "data": std::fs::canonicalize(&config.data_dir)?,
         });
     }
-    if schema >= 16 {
+    if main >= 16 {
         relevant["texture_zstd_level"] = serde_json::json!(config.texture_zstd_level);
     }
-    if schema >= 22 {
+    if main >= 22 {
         // CPU native-BC output and GPU UASTC output have different contracts;
         // quality changes bytes, while GPU batch size only changes scheduling.
         relevant["texture_encoder"] = match config.texture_encoder {
@@ -611,10 +642,12 @@ pub fn asset_configuration_hash_for_schema(
         }),
         _ => color_eyre::eyre::bail!("unsupported asset cache kind {source_ext}"),
     };
-    if source_ext == "dds" && schema >= 16 {
+    // An old dev-numbered schema selects the field set of the main version it was built on.
+    let main = legacy_dev_schema_to_main(schema).unwrap_or(schema);
+    if source_ext == "dds" && main >= 16 {
         relevant["texture_zstd_level"] = serde_json::json!(config.texture_zstd_level);
     }
-    if source_ext == "dds" && schema >= 22 {
+    if source_ext == "dds" && main >= 22 {
         relevant["texture_encoder"] = match config.texture_encoder {
             crate::config::TextureEncoder::Cpu => serde_json::json!({"mode": "cpu"}),
             crate::config::TextureEncoder::Gpu { quality, .. } => {
@@ -1055,7 +1088,10 @@ pub(crate) fn retained_configuration_matches(
     if recorded == configuration_hash_for_schema(config, schema)? {
         return Ok(true);
     }
-    if !matches!(schema, 15 | 16) || config.texture_zstd_level != 6 {
+    // An old dev-numbered 15 or 16 (101_601) takes the same native route as main's.
+    if !matches!(legacy_dev_schema_to_main(schema).unwrap_or(schema), 15 | 16)
+        || config.texture_zstd_level != 6
+    {
         return Ok(false);
     }
     let native = serde_json::json!({
@@ -2074,6 +2110,32 @@ mod tests {
     }
 
     #[test]
+    fn old_dev_numbers_map_to_their_main_version_and_main_numbers_do_not() {
+        // Old dev sets: converter 102_401 (main 24), world database 100_701 (main 7).
+        assert_eq!(legacy_dev_schema_to_main(102_401), Some(24));
+        assert_eq!(legacy_dev_schema_to_main(102_601), Some(26));
+        assert_eq!(legacy_dev_schema_to_main(100_701), Some(7));
+        assert_eq!(legacy_dev_schema_to_main(100_000), Some(0));
+        assert_eq!(legacy_dev_schema_to_main(199_999), Some(999));
+        // Anything `main` can write is untouched, including the current numbers.
+        for version in [0, 15, 24, 26, 99_999, 200_000] {
+            assert_eq!(legacy_dev_schema_to_main(version), None, "{version}");
+        }
+        assert_eq!(CONVERTER_SCHEMA_VERSION, 28);
+        assert_eq!(shared::WORLD_DATABASE_SCHEMA_VERSION, 9);
+        assert!(can_reuse_scripts_and_archives(102_401));
+        assert!(can_reuse_scripts_and_archives(102_601));
+        assert!(!can_reuse_scripts_and_archives(25));
+        // Meshes of an old dev-numbered pack are never reusable, not even as producer 24.
+        for legacy in [100_701, 101_601, 102_401, 102_601] {
+            assert!(!can_reuse_meshes(legacy), "{legacy}");
+        }
+        assert!(!can_reuse_meshes(24));
+        assert!(!can_reuse_meshes(26));
+        assert!(can_reuse_meshes(27));
+    }
+
+    #[test]
     fn v91_lod_staging_identity_excludes_lighting_and_old_lod_schemas() {
         let directory = tempfile::tempdir().unwrap();
         let config =
@@ -2106,7 +2168,11 @@ mod tests {
 
     #[test]
     fn recent_schema_migrations_reuse_only_unchanged_asset_kinds() {
-        for schema_version in [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26] {
+        for schema_version in [
+            12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26,
+            // 101_601, 102_401 and 102_601 are old dev-numbered sets (main 16, 24 and 26).
+            101_601, 102_401, 102_601,
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");
             let mut manifest = ConversionManifest {
@@ -2125,6 +2191,20 @@ mod tests {
                     },
                 );
             }
+            manifest.archives.insert(
+                "Skyrim - Meshes0.bsa".to_owned(),
+                IngestionCacheEntry {
+                    source_hash: "archive".to_owned(),
+                    selection: IngestionSelection::All,
+                    recipe: String::new(),
+                    reader_version: 0,
+                    files: vec![IngestedFile {
+                        path: "meshes/architecture/wall.nif".to_owned(),
+                        size: 1,
+                        hash: "file".to_owned(),
+                    }],
+                },
+            );
             fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
             let migrated = ConversionManifest::load(&path).unwrap();
@@ -2134,6 +2214,7 @@ mod tests {
             assert!(!migrated.entries.contains_key("meshes/a.glb"));
             assert!(!migrated.entries.contains_key("textures/a.ktx2"));
             assert!(migrated.entries.contains_key("scripts/a.luau"));
+            assert_eq!(migrated.archives, manifest.archives);
         }
     }
 
@@ -2149,6 +2230,8 @@ mod tests {
             (CONVERTER_SCHEMA_VERSION, Some(26), false),
             (24, Some(CONVERTER_SCHEMA_VERSION), false),
             (26, Some(CONVERTER_SCHEMA_VERSION), false),
+            // An old dev-numbered 24 keeps its scripts but never its meshes.
+            (102_401, None, false),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");

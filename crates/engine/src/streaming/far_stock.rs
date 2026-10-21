@@ -2,20 +2,20 @@
 //! Coverage selects demand only; render-world handoff still decides every primitive/view/pass.
 
 use super::{
-    ActiveSpace, PendingAssetProfile, RenderOrigin, RetireHidden, StreamingCommitBudget,
-    StreamingWorld,
-    lod::{LodDemand, LodDemandViews},
+    PendingAssetProfile, RenderOrigin, StreamingCommitBudget, StreamingWorld,
+    lod::{LodDemand, LodDemandRole, LodDemandViews, LodStreaming},
     reference_spawn::{ReferenceSpawnContext, spawn_reference},
 };
 use crate::cluster::source_fallback::SourceFallbackDemand;
 use crate::{
     cluster::{package::ValidatedPackage, reader::CertifiedPackage},
     config::EngineConfig,
+    portal::{CellRole, DistantRoleRoot, PortalState, StreamedCellKey},
     profiling::ProfilingState,
+    snow::DirectionalSnowCatalog,
     world::{
         components::{
-            CellRef, ExpectedModelBounds, ExteriorCellGrid, FormId, InstanceBounds,
-            StreamedCellKey, StreamedCellRoot, WorldTransform,
+            CellRef, ExpectedModelBounds, ExteriorCellGrid, FormId, InstanceBounds, WorldTransform,
         },
         database::{CellKey, ReferenceResponse, ReferenceRow, WorldDatabase},
     },
@@ -92,7 +92,7 @@ pub(crate) struct FarStock {
     /// Planning groups requests by cell, so each queued cell occurs exactly once.
     queued_keys: HashSet<CellKey>,
     near_roots: HashMap<CellKey, Entity>,
-    near_states: HashMap<Entity, bool>,
+    near_roles: HashMap<Entity, CellRole>,
     fallback_revision: Option<u64>,
     fallback_references: BTreeSet<u32>,
     qualification_pending: bool,
@@ -104,11 +104,16 @@ impl Plugin for FarStockPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FarStock>()
             .init_resource::<SourceFallbackDemand>()
-            .add_systems(Update, plan.before(super::plan_cells))
+            .add_systems(
+                Update,
+                plan.after(super::sync_active_space)
+                    .before(super::plan_cells),
+            )
             .add_systems(
                 Update,
                 collect
                     .after(super::lod::collect_lod_chunks)
+                    .before(super::lod::sync_lod_roles)
                     .before(super::arm_pending_models),
             )
             .add_systems(
@@ -127,42 +132,12 @@ fn cell_world(key: CellKey) -> Option<u32> {
     }
 }
 
-/// A sparse source holder is a real exterior root, separate from resident cell accounting.
-#[derive(Component)]
-struct DistantSourceRoot;
-
-fn holder_visibility(active: bool) -> Visibility {
-    if active {
-        Visibility::Inherited
-    } else {
-        Visibility::Hidden
+fn role(demand: Option<LodDemand>) -> CellRole {
+    match demand.map(|d| d.role) {
+        Some(LodDemandRole::Main) => CellRole::Active,
+        Some(LodDemandRole::Portal) => CellRole::Destination,
+        _ => CellRole::Hidden,
     }
-}
-
-/// A near root can receive sources only while the actual active exterior owns it.
-/// Mere visibility is insufficient; require the loader's stamped identity and live root marker.
-fn near_active(world: &World, root: Entity) -> bool {
-    let (Some(key), Some(space), Some(config)) = (
-        world.get::<StreamedCellKey>(root),
-        world.get_resource::<ActiveSpace>(),
-        world.get_resource::<EngineConfig>(),
-    ) else {
-        return false;
-    };
-    world.get::<StreamedCellRoot>(root).is_some()
-        && world.get::<crate::swap_bridge::SwapStandIn>(root).is_none()
-        && world.get::<RetireHidden>(root).is_none()
-        && world
-            .get::<Visibility>(root)
-            .is_some_and(|v| *v != Visibility::Hidden)
-        && space.interior.is_none()
-        && cell_world(key.0) == Some(space.exterior_worldspace(config.worldspace_id))
-}
-
-fn demand_contains(demand: LodDemand, world: u32, cell: IVec2, reach: i32) -> bool {
-    world == demand.world
-        && (i64::from(cell.x) - i64::from(demand.center.x)).abs() <= i64::from(reach.max(0))
-        && (i64::from(cell.y) - i64::from(demand.center.y)).abs() <= i64::from(reach.max(0))
 }
 
 fn needs_stock(reference: &crate::cluster::reader::PlacedReference) -> bool {
@@ -185,8 +160,7 @@ fn complete_source_key(
     (reference.coverage == CoverageState::Complete
         && reference.model_path.is_some()
         && snapshot.source_cell_id == source_cell
-        && demand_contains(
-            demand,
+        && demand.contains_cell(
             snapshot.placed_worldspace_id,
             IVec2::new(snapshot.cell.0, snapshot.cell.1),
             reach,
@@ -211,6 +185,8 @@ fn plan(
     config: Res<EngineConfig>,
     origin: Res<RenderOrigin>,
     views: LodDemandViews,
+    portal: Option<Res<PortalState>>,
+    mut lod: ResMut<LodStreaming>,
     package: Option<Res<ValidatedPackage>>,
     mut fallback: Option<ResMut<SourceFallbackDemand>>,
     mut far: ResMut<FarStock>,
@@ -262,7 +238,7 @@ fn plan(
             commands
                 .queue(move |world: &mut World| retire_sources(world, package, owners, holders));
             far.near_roots.clear();
-            far.near_states.clear();
+            far.near_roles.clear();
             far.desired.clear();
             far.pending.clear();
             far.clear_queued();
@@ -296,7 +272,8 @@ fn plan(
             fallback_changed = true;
         }
     }
-    let demand = views.current(&config, origin.0);
+    let actual = views.current(&config, origin.0, portal.as_deref());
+    let demand = views.residency_demand(&config, actual, portal.as_deref(), &mut lod);
     // Full models belong only to the loaded grid. Distant parity is native BTO/BTT.
     let reach = config.stream_radius.max(0);
     if !changed_package && !fallback_changed && far.demand == demand && far.reach == reach {
@@ -353,12 +330,12 @@ fn plan(
         commands
             .queue(move |world: &mut World| retire_sources(world, old_package, owners, holders));
         far.near_roots.clear();
-        far.near_states.clear();
+        far.near_roles.clear();
         far.package = Some(package.0.clone());
     }
     far.demand = demand;
     far.reach = reach;
-    far.near_states.clear();
+    far.near_roles.clear();
     let retired: HashMap<_, _> = far
         .retain_owners(|id, _| desired.contains_key(id))
         .into_iter()
@@ -464,7 +441,9 @@ fn collect(
     config: Res<EngineConfig>,
     database: Res<WorldDatabase>,
     asset_server: Res<AssetServer>,
+    snow: Res<DirectionalSnowCatalog>,
     origin: Res<RenderOrigin>,
+    stamps: Option<Res<crate::portal::StreamedCellLayerStamps>>,
     mut far: ResMut<FarStock>,
     mut streaming: ResMut<StreamingWorld>,
     mut budget: ResMut<StreamingCommitBudget>,
@@ -562,7 +541,7 @@ fn collect(
             );
             continue;
         }
-        let active = far.demand.is_some();
+        let current_role = role(far.demand);
         let holder = *far.holders.entry(key).or_insert_with(|| {
             let CellKey::Exterior { grid_x, grid_y, .. } = key else {
                 unreachable!()
@@ -570,31 +549,37 @@ fn collect(
             commands
                 .spawn((
                     Name::new(format!("Exact distant sources {key:?}")),
-                    DistantSourceRoot,
+                    DistantRoleRoot,
                     StreamedCellKey(key),
                     ExteriorCellGrid(IVec2::new(grid_x, grid_y)),
                     Transform::from_translation(super::grid_translation(
                         IVec2::new(grid_x, grid_y),
                         origin.0,
                     )),
-                    holder_visibility(active),
+                    holder_visibility(current_role),
                 ))
                 .id()
         });
         commands.queue(move |world: &mut World| {
-            if let Err(reason) = validate_holder(world, holder, key) {
-                with_far(world, |world, far| {
-                    far.failed.insert(key, reason.clone());
-                    world.entity_mut(holder).insert(FailedOwnerRoot);
-                    fatal(world, reason);
-                });
+            if let Err(reason) = sync_holder_role(world, holder, current_role) {
+                fatal(world, reason);
             }
+        });
+        // Use the ordinary spawner's placed-object source unless portal isolation owns stamps.
+        let layers = stamps.as_ref().map(|_| match current_role {
+            CellRole::Active => crate::render::reflectable_world_layers(),
+            CellRole::Destination => {
+                bevy::camera::visibility::RenderLayers::layer(crate::portal::DESTINATION_LAYER)
+            }
+            CellRole::Hidden => bevy::camera::visibility::RenderLayers::none(),
         });
         let mut spawned = Vec::new();
         let mut missing_models = Vec::new();
         commands.entity(holder).with_children(|parent| {
             let mut context = ReferenceSpawnContext {
                 key,
+                stamp: layers.as_ref(),
+                snow: &snow,
                 model_sequence: &mut streaming.next_model_sequence,
                 asset_server: &asset_server,
                 profiler: &mut profiler,
@@ -936,6 +921,12 @@ impl FarStock {
             holder: self.holders.get(&key).copied(),
         }
     }
+    pub(super) fn roles(&self) -> impl Iterator<Item = (Entity, CellRole)> + '_ {
+        self.holders
+            .values()
+            .copied()
+            .map(|root| (root, role(self.demand)))
+    }
     /// Reserve an already existing source before the ordinary spawn loop; no second scene load.
     pub(super) fn take_adoptions(
         &mut self,
@@ -966,7 +957,6 @@ fn holder(world: &mut World, far: &mut FarStock, key: CellKey) -> Result<Entity,
     if let Some(&root) = far.holders.get(&key)
         && world.get_entity(root).is_ok()
     {
-        validate_holder(world, root, key)?;
         return Ok(root);
     }
     let CellKey::Exterior { grid_x, grid_y, .. } = key else {
@@ -976,74 +966,40 @@ fn holder(world: &mut World, far: &mut FarStock, key: CellKey) -> Result<Entity,
     let root = world
         .spawn((
             Name::new(format!("Exact distant sources {key:?}")),
-            DistantSourceRoot,
+            DistantRoleRoot,
             StreamedCellKey(key),
             ExteriorCellGrid(IVec2::new(grid_x, grid_y)),
             Transform::from_translation(super::grid_translation(
                 IVec2::new(grid_x, grid_y),
                 origin,
             )),
-            holder_visibility(far.demand.is_some()),
+            holder_visibility(role(far.demand)),
         ))
         .id();
+    sync_holder_role(world, root, role(far.demand))?;
     far.holders.insert(key, root);
     Ok(root)
 }
 
-fn validate_holder(world: &World, root: Entity, key: CellKey) -> Result<(), String> {
-    if world.get::<DistantSourceRoot>(root).is_none()
-        || world.get::<StreamedCellRoot>(root).is_some()
-        || world.get::<ChildOf>(root).is_some()
-        || world.get::<StreamedCellKey>(root).map(|stamp| stamp.0) != Some(key)
-        || !matches!(key, CellKey::Exterior { .. })
-    {
-        return Err("sparse source holder lost its exact unparented exterior identity".into());
+fn holder_visibility(role: CellRole) -> Visibility {
+    if role == CellRole::Hidden {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
     }
-    Ok(())
 }
 
-/// All fallible topology checks precede transfer writes, including physics changes.
-fn transfer_domain(
-    world: &World,
-    owner: &Owner,
-    to: Entity,
-    key: CellKey,
-) -> Result<Vec<Entity>, String> {
-    for (root, expected) in [(owner.parent, owner.key), (to, key)] {
-        if world.get::<StreamedCellKey>(root).map(|stamp| stamp.0) != Some(expected)
-            || (world.get::<StreamedCellRoot>(root).is_none()
-                && world.get::<DistantSourceRoot>(root).is_none())
-            || (world.get::<StreamedCellRoot>(root).is_some()
-                && world.get::<DistantSourceRoot>(root).is_some())
-            || world.get::<ChildOf>(root).is_some()
-        {
-            return Err(
-                "source transfer requires unparented owners with exact cell identities".into(),
-            );
-        }
+fn sync_holder_role(world: &mut World, root: Entity, role: CellRole) -> Result<(), String> {
+    // Retain role-owner validation, transfer/collider authority and the seamless source registry.
+    crate::portal::sync_distant_role(world, root, role)?;
+    if !world.contains_resource::<crate::portal::StreamedCellLayerStamps>() {
+        // Ordinary stock is a placed-object hierarchy, including scenes arriving after a refresh
+        // or transfer. Visibility carries Hidden; portal roles must not replace this layer source.
+        world
+            .entity_mut(root)
+            .insert(bevy::app::Propagate(super::PLACED_OBJECT_RENDER_LAYERS));
     }
-    if owner.parent == to
-        || world.get::<ChildOf>(owner.entity).map(ChildOf::parent) != Some(owner.parent)
-    {
-        return Err("source transfer requires distinct owners and a direct source child".into());
-    }
-    let mut nodes = Vec::new();
-    let mut seen = HashSet::new();
-    let mut pending = vec![owner.entity];
-    while let Some(entity) = pending.pop() {
-        if !seen.insert(entity)
-            || entity == to
-            || world.get::<StreamedCellRoot>(entity).is_some()
-            || world.get::<DistantSourceRoot>(entity).is_some()
-        {
-            return Err("source transfer would cycle or move a nested owner root".into());
-        }
-        nodes.push(entity);
-        if let Some(children) = world.get::<Children>(entity) {
-            pending.extend(children.iter());
-        }
-    }
-    Ok(nodes)
+    Ok(())
 }
 
 fn move_owner(
@@ -1093,26 +1049,9 @@ fn move_owner(
         // Preserve an edited source as stock; moving ownership must not reset runtime edits.
         pose.translation += old_parent.translation - new_parent.translation;
     }
-    // Validate the public hierarchy contract before any write. Source layers belong
-    // to the reference/model/mod and survive reparenting without being replaced.
-    let nodes = transfer_domain(world, owner, to, key)?;
-    for entity in nodes {
-        if world
-            .get::<bevy_rapier3d::prelude::Collider>(entity)
-            .is_some()
-        {
-            if far {
-                world
-                    .entity_mut(entity)
-                    .insert(bevy_rapier3d::prelude::ColliderDisabled);
-            } else {
-                world
-                    .entity_mut(entity)
-                    .remove::<bevy_rapier3d::prelude::ColliderDisabled>();
-            }
-        }
-    }
-    world.entity_mut(owner.entity).insert(ChildOf(to));
+    let target_role =
+        crate::portal::owned_root_role(world, to).ok_or("new source owner has no proved role")?;
+    crate::portal::rebind_reference_layers(world, owner.entity, owner.parent, to, target_role)?;
     let expected = world.get::<ExpectedModelBounds>(owner.entity).copied();
     let matrix = pose.to_matrix();
     world
@@ -1222,8 +1161,8 @@ pub(super) fn queue_adopt(commands: &mut Commands, root: Entity, key: CellKey, i
                 };
                 owner.near_key = Some(key);
                 owner.near_root = Some(root);
-                if near_active(world, root)
-                    && far.demand.is_some()
+                if crate::portal::owned_root_role(world, root) == Some(role(far.demand))
+                    && role(far.demand) != CellRole::Hidden
                     && let Err(reason) = move_owner(
                         world,
                         &mut owner,
@@ -1249,7 +1188,7 @@ pub(super) fn queue_adopt(commands: &mut Commands, root: Entity, key: CellKey, i
 
 fn register_near(world: &mut World, far: &mut FarStock, root: Entity, key: CellKey) {
     far.near_roots.insert(key, root);
-    far.near_states.remove(&root);
+    far.near_roles.remove(&root);
     let Some(placing_world) = cell_world(key) else {
         return;
     };
@@ -1304,7 +1243,7 @@ pub(super) fn queue_revive(commands: &mut Commands, root: Entity, key: CellKey) 
     commands.queue(move |world: &mut World| {
         with_far(world, |world, far| {
             far.near_roots.insert(key, root);
-            far.near_states.remove(&root);
+            far.near_roles.remove(&root);
             let ids: Vec<_> = far
                 .by_near_key
                 .get(&key)
@@ -1338,8 +1277,11 @@ fn refresh_holders(world: &mut World, far: &mut FarStock) {
         !empty
     });
     for &root in far.holders.values() {
-        let visible = holder_visibility(far.demand.is_some());
+        let visible = holder_visibility(role(far.demand));
         world.entity_mut(root).insert(visible);
+        if let Err(reason) = sync_holder_role(world, root, role(far.demand)) {
+            fatal(world, reason);
+        }
     }
 }
 
@@ -1349,7 +1291,7 @@ fn reconcile_near(world: &mut World, far: &mut FarStock) {
         .iter()
         .map(|(&key, &root)| (key, root))
         .collect();
-    let drawing = far.demand.is_some();
+    let drawing_role = role(far.demand);
     let mut moved = false;
     for (key, root) in roots {
         if world
@@ -1357,14 +1299,16 @@ fn reconcile_near(world: &mut World, far: &mut FarStock) {
             .is_none()
         {
             far.near_roots.remove(&key);
-            far.near_states.remove(&root);
+            far.near_roles.remove(&root);
             continue;
         }
-        let current = near_active(world, root);
-        if far.near_states.insert(root, current) == Some(current) {
+        let Some(current) = crate::portal::owned_root_role(world, root) else {
+            continue;
+        };
+        if far.near_roles.insert(root, current) == Some(current) {
             continue;
         }
-        if !drawing {
+        if drawing_role == CellRole::Hidden {
             continue;
         }
         let ids: Vec<_> = far
@@ -1373,7 +1317,7 @@ fn reconcile_near(world: &mut World, far: &mut FarStock) {
             .collect();
         for id in ids {
             let owner = far.owners.get(&id).unwrap();
-            let target_near = current;
+            let target_near = current == drawing_role;
             if (target_near && owner.parent == root) || (!target_near && owner.far) {
                 continue;
             }
@@ -1462,150 +1406,3 @@ fn retire_sources(
 #[cfg(test)]
 #[path = "far_stock_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-mod public_vanilla_tests {
-    use super::*;
-    use crate::cluster::reader::ReferencePose;
-    use bevy::{app::Propagate, camera::visibility::RenderLayers};
-    use bevy_rapier3d::prelude::{Collider, ColliderDisabled};
-
-    fn key(x: i32) -> CellKey {
-        CellKey::Exterior {
-            worldspace_id: 7,
-            grid_x: x,
-            grid_y: -2,
-        }
-    }
-
-    fn root(world: &mut World, key: CellKey, distant: bool) -> Entity {
-        let CellKey::Exterior { grid_x, grid_y, .. } = key else {
-            unreachable!()
-        };
-        let mut entity = world.spawn((
-            StreamedCellKey(key),
-            Transform::from_translation(super::super::grid_translation(
-                IVec2::new(grid_x, grid_y),
-                IVec2::ZERO,
-            )),
-            Visibility::Inherited,
-        ));
-        if distant {
-            entity.insert(DistantSourceRoot);
-        } else {
-            entity.insert(StreamedCellRoot);
-        }
-        entity.id()
-    }
-
-    fn owner(world: &mut World, parent: Entity, key: CellKey, pose: ReferencePose) -> Owner {
-        let (_, transform) =
-            super::super::reference_placement(pose.position, pose.rotation, pose.scale, key);
-        let entity = world.spawn((transform, ChildOf(parent))).id();
-        Owner {
-            entity,
-            parent,
-            key,
-            near_key: Some(key),
-            near_root: Some(parent),
-            far: false,
-            row: None,
-            physics_requested: true,
-        }
-    }
-
-    #[test]
-    fn vanilla_active_source_uses_configured_or_explicit_exterior_and_actual_retirement() {
-        let mut world = World::new();
-        world.insert_resource(EngineConfig {
-            worldspace_id: 7,
-            ..default()
-        });
-        world.init_resource::<ActiveSpace>();
-        let root = root(&mut world, key(0), false);
-        assert!(near_active(&world, root));
-        world.resource_mut::<ActiveSpace>().worldspace_id = Some(8);
-        assert!(!near_active(&world, root));
-        world.resource_mut::<ActiveSpace>().worldspace_id = Some(7);
-        world.resource_mut::<ActiveSpace>().interior = Some(9);
-        assert!(!near_active(&world, root));
-        world.resource_mut::<ActiveSpace>().interior = None;
-        world
-            .entity_mut(root)
-            .insert(RetireHidden(Visibility::Inherited));
-        assert!(!near_active(&world, root));
-        world.entity_mut(root).remove::<RetireHidden>();
-        assert!(near_active(&world, root));
-        world.entity_mut(root).remove::<StreamedCellKey>();
-        assert!(!near_active(&world, root));
-    }
-
-    #[test]
-    fn vanilla_transfer_retains_placement_layers_entity_and_collision_authority() {
-        let mut world = World::new();
-        let near = root(&mut world, key(-1), false);
-        let distant = root(&mut world, key(2), true);
-        let pose = ReferencePose {
-            position: [-4000.25, -7000.5, 12.0],
-            rotation: [0.1, 0.2, 0.3],
-            scale: 1.25,
-        };
-        let mut owner = owner(&mut world, near, key(-1), pose);
-        let entity = owner.entity;
-        let layers = RenderLayers::layer(23);
-        world
-            .entity_mut(entity)
-            .insert((Propagate(layers.clone()), Collider::ball(1.0)));
-        move_owner(&mut world, &mut owner, distant, key(2), true, Some(pose)).unwrap();
-        assert_eq!(owner.entity, entity);
-        assert_eq!(world.get::<ChildOf>(entity).unwrap().parent(), distant);
-        assert_eq!(
-            world.get::<Transform>(entity),
-            Some(
-                &super::super::reference_placement(
-                    pose.position,
-                    pose.rotation,
-                    pose.scale,
-                    key(2)
-                )
-                .1
-            )
-        );
-        assert_eq!(
-            world.get::<Propagate<RenderLayers>>(entity).unwrap().0,
-            layers
-        );
-        assert!(world.get::<ColliderDisabled>(entity).is_some());
-        move_owner(&mut world, &mut owner, near, key(-1), false, Some(pose)).unwrap();
-        assert_eq!(world.get::<ChildOf>(entity).unwrap().parent(), near);
-        assert!(world.get::<ColliderDisabled>(entity).is_none());
-        assert_eq!(
-            world.get::<Propagate<RenderLayers>>(entity).unwrap().0,
-            layers
-        );
-    }
-
-    #[test]
-    fn vanilla_transfer_rejects_wrong_stamp_and_nested_owner_before_writes() {
-        let mut world = World::new();
-        let near = root(&mut world, key(0), false);
-        let distant = root(&mut world, key(1), true);
-        let pose = ReferencePose {
-            position: [0.0; 3],
-            rotation: [0.0; 3],
-            scale: 1.0,
-        };
-        let mut owner = owner(&mut world, near, key(0), pose);
-        world.entity_mut(owner.entity).insert(Collider::ball(1.0));
-        let before = *world.get::<Transform>(owner.entity).unwrap();
-        world.entity_mut(distant).insert(StreamedCellKey(key(2)));
-        assert!(move_owner(&mut world, &mut owner, distant, key(1), true, Some(pose)).is_err());
-        world.entity_mut(distant).insert(StreamedCellKey(key(1)));
-        world.spawn((StreamedCellRoot, ChildOf(owner.entity)));
-        assert!(move_owner(&mut world, &mut owner, distant, key(1), true, Some(pose)).is_err());
-        assert_eq!(world.get::<ChildOf>(owner.entity).unwrap().parent(), near);
-        assert_eq!(world.get::<Transform>(owner.entity), Some(&before));
-        assert!(world.get::<ColliderDisabled>(owner.entity).is_none());
-        assert_eq!(owner.parent, near);
-    }
-}

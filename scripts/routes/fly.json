@@ -1,0 +1,122 @@
+{
+  "name": "fly",
+  "description": "Flying travel at 900 units/s, 400 units above the ground: the travel route (Riverwood road to the hills south-east of Whiterun), one long straight leg west across the tundra, then the check route north past Rorikstead. About 130,000 units. For stutter and pop-in while moving fast, the way a player flies the demo (F, Ctrl for fast). The speed matches the player's fly speeds (crate::player FLY_SPEED and FLY_FAST_SPEED).",
+  "notes": [
+    "Waypoints are travel.json then check.json unchanged; the leg between them is new. 400 units of eye height keeps the camera above every water level on the way (travel's notes put water at most a few hundred units above the terrain)."
+  ],
+  "worldspace": "0x3c",
+  "speed": 900,
+  "eye_height": 400,
+  "loop": false,
+  "start": "world_ready",
+  "waypoints": [
+    [
+      19600,
+      -46650
+    ],
+    [
+      23904,
+      -42336
+    ],
+    [
+      24864,
+      -41280
+    ],
+    [
+      25248,
+      -40512
+    ],
+    [
+      26400,
+      -40032
+    ],
+    [
+      26880,
+      -39552
+    ],
+    [
+      26976,
+      -39072
+    ],
+    [
+      29280,
+      -36864
+    ],
+    [
+      30048,
+      -35328
+    ],
+    [
+      31008,
+      -33504
+    ],
+    [
+      31200,
+      -32736
+    ],
+    [
+      32256,
+      -31200
+    ],
+    [
+      32544,
+      -30432
+    ],
+    [
+      32544,
+      -28512
+    ],
+    [
+      32160,
+      -28032
+    ],
+    [
+      -49179,
+      -39276
+    ],
+    [
+      -50016,
+      -37920
+    ],
+    [
+      -49728,
+      -36960
+    ],
+    [
+      -49920,
+      -34944
+    ],
+    [
+      -52608,
+      -31968
+    ],
+    [
+      -52800,
+      -31488
+    ],
+    [
+      -52800,
+      -30048
+    ],
+    [
+      -52512,
+      -28704
+    ],
+    [
+      -52800,
+      -27360
+    ],
+    [
+      -53088,
+      -26400
+    ],
+    [
+      -53472,
+      -26016
+    ],
+    [
+      -53472,
+      -16992
+    ]
+  ]
+}

@@ -1,0 +1,84 @@
+{
+ "*": {
+  "Model": "MODL",
+  "ObjectBounds": "OBND",
+  "VirtualMachineAdapter": "VMAD",
+  "Destructible": "DEST",
+  "Items": "CNTO",
+  "Effects": "EFID",
+  "MajorFlags": "(header)",
+  "IsDeleted": "(header)",
+  "MutagenObjectType": "(header)"
+ },
+ "STAT": {
+  "MaxAngle": "DNAM",
+  "Material": "DNAM",
+  "Model": "MODL",
+  "ObjectBounds": "OBND",
+  "DistantLod": "MNAM"
+ },
+ "LTEX": {
+  "HavokFriction": "HNAM",
+  "HavokRestitution": "HNAM",
+  "TextureSpecularExponent": "SNAM",
+  "Grasses": "GNAM"
+ },
+ "IMGS": {
+  "ENAM": "ENAM"
+ },
+ "VOLI": {
+  "PhaseFunctionContribution": "LNAM",
+  "PhaseFunctionScattering": "MNAM",
+  "SamplingRepartitionRangeFactor": "NNAM"
+ },
+ "WTHR": {
+  "SkyUpperColor": "NAM0",
+  "FogNearColor": "NAM0",
+  "UnknownColor": "NAM0",
+  "AmbientColor": "NAM0",
+  "SunlightColor": "NAM0",
+  "SunColor": "NAM0",
+  "StarsColor": "NAM0",
+  "SkyLowerColor": "NAM0",
+  "HorizonColor": "NAM0",
+  "EffectLightingColor": "NAM0",
+  "CloudLodDiffuseColor": "NAM0",
+  "CloudLodAmbientColor": "NAM0",
+  "FogFarColor": "NAM0",
+  "SkyStaticsColor": "NAM0",
+  "WaterMultiplierColor": "NAM0",
+  "SunGlareColor": "NAM0",
+  "MoonGlareColor": "NAM0",
+  "FogDistanceDayNear": "FNAM",
+  "FogDistanceDayFar": "FNAM",
+  "FogDistanceNightNear": "FNAM",
+  "FogDistanceNightFar": "FNAM",
+  "FogDistanceDayPower": "FNAM",
+  "FogDistanceNightPower": "FNAM",
+  "FogDistanceDayMax": "FNAM",
+  "FogDistanceNightMax": "FNAM",
+  "WindSpeed": "DATA",
+  "TransDelta": "DATA",
+  "SunGlare": "DATA",
+  "SunDamage": "DATA",
+  "ThunderLightningFrequency": "DATA",
+  "Flags": "DATA",
+  "LightningColor": "DATA",
+  "WindDirection": "DATA",
+  "WindDirectionRange": "DATA",
+  "ImageSpaces": "IMSP",
+  "VolumetricLighting": "HNAM",
+  "DirectionalAmbientLightingColors": "DALC",
+  "Precipitation": "MNAM"
+ },
+ "REGN": {
+  "RegionAreas": "RPLI",
+  "Sounds": "RDSA",
+  "Weather": "RDWT",
+  "Objects": "RDOT",
+  "Map": "RDMP"
+ },
+ "CLMT": {
+  "WeatherTypes": "WLST"
+ }
+}

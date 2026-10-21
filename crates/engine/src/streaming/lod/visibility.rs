@@ -50,6 +50,7 @@ use super::{
 };
 use crate::{
     config::{EngineConfig, TerrainLodDistances},
+    portal::PortalState,
     profiling::ProfilingState,
 };
 use bevy::{
@@ -1188,6 +1189,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     config: Res<EngineConfig>,
     origin: Res<RenderOrigin>,
     views: LodDemandViews,
+    portal: Option<Res<PortalState>>,
     mut inputs: TerrainLodInputs,
     mut streaming: ParamSet<(Res<LodStreaming>, ResMut<LodStreaming>)>,
     mut metrics: ResMut<StreamingMetrics>,
@@ -1200,7 +1202,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     mut budget: Option<ResMut<StreamingCommitBudget>>,
 ) {
     let started = Instant::now();
-    let demand = views.current(&config, origin.0);
+    let demand = views.current(&config, origin.0, portal.as_deref());
     let selection = Selection {
         world: demand.map(|demand| demand.world),
         origin: origin.0,

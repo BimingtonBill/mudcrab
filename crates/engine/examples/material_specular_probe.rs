@@ -116,12 +116,14 @@ fn fixtures(output: &std::path::Path, legacy: bool) -> PathBuf {
                 alpha: 1.0,
                 alpha_mode: NifAlphaMode::Opaque,
                 alpha_threshold: None,
+                blend_factors: None,
                 glossiness: *exponent,
                 specular_color: [1.0; 3],
                 specular_strength: *strength,
                 emissive_color: [0.0; 3],
                 emissive_multiple: 0.0,
                 double_sided: false,
+                effect_falloff: None,
                 textures: if mask.is_some() {
                     vec![NifTextureSlot {
                         slot: 1,

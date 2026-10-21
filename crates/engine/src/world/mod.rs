@@ -4,6 +4,7 @@ pub mod database;
 mod enable_state;
 pub mod environment;
 pub mod imagespace;
+pub mod lighting;
 pub mod object_lod;
 
 /// Rejects a database-supplied relative path that could escape the assets

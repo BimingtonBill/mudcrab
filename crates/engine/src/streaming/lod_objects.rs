@@ -23,13 +23,12 @@
 //! from `lod_chunks`), interiors (distant LOD follows the exterior the player is in, like terrain
 //! LOD), and a block the manifest does not vouch for ([`crate::world::object_lod`]).
 
-#[cfg(test)]
-use super::lod::LodStreaming;
 use super::{
     RenderOrigin, StreamingCommitBudget, StreamingMetrics,
     lod::{
-        LodChunkFailure, LodChunkGridOrigin, LodDemand, LodDemandViews,
-        classify_asset_load_failure, lod_retry_deadline, lod_ring_layers, verify_payload_hash,
+        LodChunkFailure, LodChunkGridOrigin, LodDemand, LodDemandRole, LodDemandViews,
+        LodStreaming, classify_asset_load_failure, lod_retry_deadline, lod_ring_layers,
+        verify_payload_hash,
     },
 };
 use crate::{
@@ -512,6 +511,21 @@ impl ObjectLodStreaming {
         })
     }
 
+    pub(super) fn roles(&self) -> impl Iterator<Item = (Entity, crate::portal::CellRole)> + '_ {
+        self.blocks.values().filter_map(|status| match status {
+            BlockStatus::Loading { root } | BlockStatus::Ready { root } => Some((
+                *root,
+                if self.worldspace_id.is_some() {
+                    super::native_lod::demand_role(self.demand)
+                } else {
+                    crate::portal::CellRole::Hidden
+                },
+            )),
+            BlockStatus::Retiring { root, .. } => Some((*root, crate::portal::CellRole::Hidden)),
+            BlockStatus::Failed { .. } => None,
+        })
+    }
+
     fn ready_keys(&self) -> HashSet<BlockKey> {
         self.blocks
             .iter()
@@ -565,6 +579,7 @@ impl Plugin for ObjectLodPlugin {
                         .before(super::collect_cells),
                     collect_object_lod
                         .after(super::lod::collect_lod_chunks)
+                        .before(super::lod::sync_lod_roles)
                         .before(super::arm_pending_models),
                     track_object_lod
                         .after(super::lod::track_lod_readiness)
@@ -702,6 +717,8 @@ fn plan_object_lod(
     mut commands: Commands,
     config: Res<EngineConfig>,
     views: LodDemandViews,
+    portal: Option<Res<crate::portal::PortalState>>,
+    mut lod: ResMut<LodStreaming>,
     origin: Res<RenderOrigin>,
 
     settings: Option<Res<GraphicsSettings>>,
@@ -751,8 +768,11 @@ fn plan_object_lod(
             }
         }
     }
-    let actual = views.current(&config, origin.0);
-    let demand = actual;
+    let actual = views.current(&config, origin.0, portal.as_deref());
+    let demand = views.residency_demand(&config, actual, portal.as_deref(), &mut lod);
+    // With owned statics (`--cluster-own-statics`) the cluster package draws the objects it owns
+    // at every distance, and there is no object LOD without them yet: the baked blocks would draw
+    // the same placements a second time.
     let wanted_world = (settings.as_ref().is_none_or(|s| s.lod_objects)
         && !config.cluster_own_statics)
         .then_some(demand)
@@ -770,11 +790,11 @@ fn plan_object_lod(
         }
         let in_interior = actual.is_none();
         let holding = config.lod_keep_hidden_in_interiors
-            && !config.cluster_own_statics
             && in_interior
             && settings
                 .as_ref()
                 .is_none_or(|settings| settings.lod_objects)
+            && !config.cluster_own_statics
             && (streaming.worldspace_id.is_some() || streaming.held_worldspace.is_some());
         // Hiding happens once, on the frame the visit starts: blocks that finish loading later
         // are spawned hidden, so a held visit costs nothing per frame.
@@ -913,7 +933,7 @@ fn plan_object_lod(
         // Visibility of every ready block: it draws exactly when the walk shows it.
         for status in streaming.blocks.values() {
             if let BlockStatus::Ready { root } = status {
-                let visibility = if demand.is_some() {
+                let visibility = if demand.is_some_and(|d| d.role != LodDemandRole::Pinned) {
                     Visibility::Inherited
                 } else {
                     Visibility::Hidden

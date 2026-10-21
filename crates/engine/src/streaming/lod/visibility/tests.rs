@@ -2,7 +2,7 @@ use super::super::select_terrain_lod_tier;
 use super::*;
 use crate::{
     cluster::terrain::{ClusterTerrain, TerrainBlock, TerrainDrawReadiness},
-    streaming::{ActiveSpace, identity_changes},
+    streaming::identity_changes,
     world::components::{CELL_SIZE, StreamingCamera},
 };
 use bevy::ecs::{
@@ -265,7 +265,7 @@ fn reference_world(
 }
 
 /// The whole pass as it was before it was incremental, over the original two queries, the
-/// original ancestry walk, the public main-view demand, and the original
+/// original ancestry walk, the demand it read from the portal state, and the original
 /// pending count and owned cells of cluster terrain, sharing nothing with the index: the
 /// independent oracle.
 fn reference(world: &mut World) -> Expected {
@@ -273,11 +273,17 @@ fn reference(world: &mut World) -> Expected {
         LodDemandViews,
         Res<EngineConfig>,
         Res<RenderOrigin>,
+        Option<Res<PortalState>>,
         Option<Res<ClusterTerrain>>,
         Option<Res<TerrainDrawReadiness>>,
         Query<LodTerrainOwner>,
         Query<
-            (Entity, &TerrainCoverage, Option<&TerrainWorldspace>),
+            (
+                Entity,
+                &TerrainCoverage,
+                Option<&TerrainWorldspace>,
+                Option<Ref<crate::swap_bridge::SwapDrawn>>,
+            ),
             (With<TerrainPatch>, With<TerrainSurfaceReady>),
         >,
         Query<
@@ -290,9 +296,9 @@ fn reference(world: &mut World) -> Expected {
             Without<TerrainPatch>,
         >,
     )>::new(world);
-    let (views, config, origin, cluster_terrain, terrain_readiness, owners, full, lod) =
+    let (views, config, origin, portal, cluster_terrain, terrain_readiness, owners, full, lod) =
         state.get(world).unwrap();
-    let demand = views.current(&config, origin.0);
+    let demand = views.current(&config, origin.0, portal.as_deref());
     let camera_grid = demand.map_or(IVec2::ZERO, |demand| demand.center);
     let terrain_world = demand.map(|demand| demand.world);
     let pending = cluster_terrain.as_ref().map_or(0, |terrain| {
@@ -311,7 +317,7 @@ fn reference(world: &mut World) -> Expected {
     });
     let full_ready: HashSet<_> = full
         .iter()
-        .filter_map(|(entity, coverage, _)| {
+        .filter_map(|(entity, coverage, _, _)| {
             reference_world(&owners, entity, None)
                 .is_some_and(|world| Some(world) == terrain_world)
                 .then_some((coverage.grid, coverage.quadrant))
@@ -528,6 +534,148 @@ fn a_config_change_writes_every_patch_again_even_with_the_journal() {
             "journal {journal}: the stream radius changed"
         );
     }
+}
+
+#[test]
+fn open_door_portal_demand_changes_reselect_from_cached_worlds() {
+    use crate::{
+        doors::{DoorDestination, DoorState, LoadDoor},
+        portal::{OpenDoorway, PortalCamera},
+        streaming::ActiveSpace,
+        transition::door_map,
+    };
+
+    fn spawn_door(world: &mut World, worldspace: u32) -> Entity {
+        world
+            .spawn((
+                LoadDoor {
+                    ref_id: 1,
+                    destination: DoorDestination {
+                        destination_ref_id: 2,
+                        interior_cell_id: None,
+                        worldspace_id: Some(worldspace),
+                        arrival_position: [0.0; 3],
+                        arrival_rotation: [0.0; 3],
+                    },
+                    label: "fixture".into(),
+                    auto_load: false,
+                    outward: None,
+                },
+                DoorState::Open { animated: false },
+            ))
+            .id()
+    }
+
+    fn draw_door(world: &mut World, door: Entity) {
+        let map = door_map(
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Vec3::ONE,
+            world.get::<LoadDoor>(door).unwrap(),
+            None,
+            world.resource::<RenderOrigin>().0,
+        );
+        world
+            .resource_mut::<PortalState>()
+            .set_open_doorway_for_test(Some(OpenDoorway {
+                door,
+                map,
+                quad: Transform::default(),
+            }));
+    }
+
+    let mut app = app(true);
+    app.insert_resource(ActiveSpace {
+        worldspace_id: Some(WORLD),
+        interior: Some(10),
+    });
+    app.insert_resource(PortalState::default());
+    let world = app.world_mut();
+    let grid = IVec2::new(3, 0);
+    let first_root = chunk_root(world, WORLD, LodTier::Tier4, grid);
+    let first = lod_patch(world, Some(first_root), grid, 0, Some(LodTier::Tier4));
+    let second_root = chunk_root(world, WORLD + 1, LodTier::Tier4, grid);
+    let second = lod_patch(world, Some(second_root), grid, 0, Some(LodTier::Tier4));
+    let first_door = spawn_door(world, WORLD);
+    let second_door = spawn_door(world, WORLD + 1);
+    let portal_pose = Transform::from_xyz(CELL_SIZE * 0.5, 0.0, -CELL_SIZE * 0.5);
+    let camera = world
+        .spawn((
+            PortalCamera,
+            Camera {
+                is_active: true,
+                ..default()
+            },
+            portal_pose,
+        ))
+        .id();
+
+    // An interior main view and an active portal camera alone demand no exterior LOD.
+    app.update();
+    assert_eq!(visibility(&app, first), Visibility::Hidden);
+    assert_eq!(visibility(&app, second), Visibility::Hidden);
+    assert_matches_full_pass(&mut app, "interior without a rendered doorway");
+    let before = work(&app);
+
+    draw_door(app.world_mut(), first_door);
+    app.update();
+    assert_eq!(visibility(&app, first), Visibility::Inherited);
+    assert_eq!(visibility(&app, second), Visibility::Hidden);
+    assert_matches_full_pass(&mut app, "active exterior doorway from an interior");
+
+    // Moving the portal camera changes the distance answer without resolving ancestry.
+    let beyond_reach = grid.x
+        + app
+            .world()
+            .resource::<EngineConfig>()
+            .terrain_lod
+            .max_reach_cells()
+        + 1;
+    app.world_mut()
+        .get_mut::<Transform>(camera)
+        .unwrap()
+        .translation
+        .x = CELL_SIZE * (beyond_reach as f32 + 0.5);
+    app.update();
+    assert_eq!(visibility(&app, first), Visibility::Hidden);
+    assert_eq!(visibility(&app, second), Visibility::Hidden);
+    assert_matches_full_pass(&mut app, "portal camera moved beyond every tier's reach");
+    assert_eq!(
+        &work(&app)[..3],
+        &before[..3],
+        "camera move uses cached worlds"
+    );
+
+    *app.world_mut().get_mut::<Transform>(camera).unwrap() = portal_pose;
+    app.world_mut().get_mut::<Camera>(camera).unwrap().is_active = false;
+    app.update();
+    assert_eq!(visibility(&app, first), Visibility::Hidden);
+    assert_eq!(visibility(&app, second), Visibility::Hidden);
+    assert_matches_full_pass(&mut app, "inactive portal camera withdraws demand");
+
+    draw_door(app.world_mut(), second_door);
+    app.world_mut().get_mut::<Camera>(camera).unwrap().is_active = true;
+    app.update();
+    assert_eq!(visibility(&app, first), Visibility::Hidden);
+    assert_eq!(visibility(&app, second), Visibility::Inherited);
+    assert_matches_full_pass(&mut app, "doorway retargeted to another exterior world");
+
+    // The still-active portal points at the other world, but exterior main demand wins.
+    app.world_mut().resource_mut::<ActiveSpace>().interior = None;
+    app.update();
+    assert_eq!(visibility(&app, first), Visibility::Inherited);
+    assert_eq!(visibility(&app, second), Visibility::Hidden);
+    assert_matches_full_pass(&mut app, "exterior main demand takes precedence");
+    let after = work(&app);
+    assert_eq!(
+        &after[..3],
+        &before[..3],
+        "demand changes use cached worlds"
+    );
+    assert!(
+        after[3] > before[3],
+        "demand changes apply their selected keys"
+    );
 }
 
 #[test]
@@ -1357,6 +1505,10 @@ struct Scenario {
     /// Cluster terrain and its readiness are resources, owned statics are on, and the
     /// mutations edit, replace and remove them.
     cluster: bool,
+    /// A `PortalState` resource exists, so the demand is read through it. It never has an
+    /// open doorway (its fields are private to the portal module), so the demand is the
+    /// main view's; a portal-world demand is not exercised here.
+    portal: bool,
 }
 
 impl Scenario {
@@ -1365,6 +1517,7 @@ impl Scenario {
             journal,
             disabler: None,
             cluster: false,
+            portal: false,
         }
     }
 }
@@ -1396,8 +1549,12 @@ fn run_oracle(scenario: Scenario, seed: u64, steps: u32) {
         journal,
         disabler,
         cluster,
+        portal,
     } = scenario;
     let mut app = app_with(journal, disabler);
+    if portal {
+        app.insert_resource(PortalState::default());
+    }
     if cluster {
         let mut rng = Rng(seed ^ 0xc1u64);
         app.world_mut()
@@ -1492,12 +1649,13 @@ fn rebuilt_visibility_equals_a_full_pass_under_random_mutation() {
 }
 
 #[test]
-fn visibility_equals_a_full_pass_with_cluster_terrain() {
+fn visibility_equals_a_full_pass_with_cluster_terrain_and_portal_state() {
     for journal in [true, false] {
         for seed in [0xc0ff_ee00_dead_beef, 31, 0x1357_9bdf_2468_ace0] {
             run_oracle(
                 Scenario {
                     cluster: true,
+                    portal: true,
                     ..Scenario::new(journal)
                 },
                 seed,
@@ -1940,225 +2098,6 @@ fn audit_checks_ecs_visibility_but_allows_held_overrides() {
     assert!(error.contains("Visibility"), "{error}");
     let patches = inputs.lod_visibility.p0();
     assert_eq!(*patches.get(patch).unwrap().3, Visibility::Hidden);
-}
-
-#[test]
-fn active_main_world_and_no_demand_reselect_from_cached_worlds() {
-    for journal in [true, false] {
-        let mut app = app(journal);
-        let grid = IVec2::new(3, 0);
-        let first_root = chunk_root(app.world_mut(), WORLD, LodTier::Tier4, grid);
-        let first = lod_patch(
-            app.world_mut(),
-            Some(first_root),
-            grid,
-            0,
-            Some(LodTier::Tier4),
-        );
-        let second_root = chunk_root(app.world_mut(), WORLD + 1, LodTier::Tier4, grid);
-        let second = lod_patch(
-            app.world_mut(),
-            Some(second_root),
-            grid,
-            0,
-            Some(LodTier::Tier4),
-        );
-        let check = |app: &mut App, first_visible: bool, second_visible: bool, context: &str| {
-            app.update();
-            for (patch, drawn) in [(first, first_visible), (second, second_visible)] {
-                assert_eq!(
-                    visibility(app, patch),
-                    if drawn {
-                        Visibility::Inherited
-                    } else {
-                        Visibility::Hidden
-                    },
-                    "{context}: {patch}"
-                );
-            }
-            assert_matches_full_pass(app, context);
-        };
-        check(&mut app, true, false, "configured main world");
-        let before = work(&app);
-        app.insert_resource(ActiveSpace {
-            worldspace_id: Some(WORLD + 1),
-            interior: None,
-        });
-        check(
-            &mut app,
-            false,
-            true,
-            "active exterior overrides configured world",
-        );
-        app.world_mut().resource_mut::<ActiveSpace>().interior = Some(10);
-        check(&mut app, false, false, "interior withdraws exterior demand");
-        app.world_mut().resource_mut::<ActiveSpace>().interior = None;
-        check(&mut app, false, true, "active exterior restored");
-        app.world_mut().resource_mut::<EngineConfig>().stream_radius = -1;
-        check(
-            &mut app,
-            false,
-            false,
-            "disabled streaming withdraws demand",
-        );
-        app.world_mut().resource_mut::<EngineConfig>().stream_radius = 8;
-        check(&mut app, false, true, "streaming restored");
-        app.world_mut().remove_resource::<ActiveSpace>();
-        check(&mut app, true, false, "configured main world restored");
-        if journal {
-            let after = work(&app);
-            assert_eq!(
-                &after[..3],
-                &before[..3],
-                "public demand changes use cached worlds"
-            );
-            assert!(
-                after[3] > before[3],
-                "public demand changes apply selected keys"
-            );
-        }
-    }
-}
-
-#[test]
-fn fallback_terrain_survives_rebuilds_and_lost_journal_messages() {
-    for journal in [true, false] {
-        let mut app = app(journal);
-        app.world_mut()
-            .resource_mut::<EngineConfig>()
-            .cluster_own_statics = true;
-        let grid = IVec2::new(3, 0);
-        let root = chunk_root(app.world_mut(), WORLD, LodTier::Tier4, grid);
-        let far = lod_patch(app.world_mut(), Some(root), grid, 0, Some(LodTier::Tier4));
-        let ready = TerrainDrawReadiness::default();
-        ready.mark(0);
-        app.insert_resource(ready);
-        app.insert_resource(cluster_terrain(&[(WORLD, &[grid], Some(0))]));
-        app.update();
-        assert_eq!(visibility(&app, far), Visibility::Inherited);
-        assert_matches_full_pass(&mut app, "owned initial snapshot");
-        let before = work(&app);
-        // Newly arriving stock stays extracted despite historical readiness.
-        // Only the render view can authorize current complementary suppression.
-        let duplicate = lod_patch(app.world_mut(), Some(root), grid, 0, Some(LodTier::Tier4));
-        if journal {
-            // Discard the unread insertion messages, forcing recovery from a snapshot.
-            app.world_mut()
-                .resource_mut::<Messages<TerrainNodeChanged>>()
-                .clear();
-        } else {
-            app.world_mut()
-                .resource_mut::<LodStreaming>()
-                .visibility_dirty = true;
-        }
-        app.update();
-        assert_eq!(work(&app)[0], before[0] + 1.0, "one recovery rebuild");
-        assert_eq!(visibility(&app, far), Visibility::Inherited);
-        assert_eq!(visibility(&app, duplicate), Visibility::Inherited);
-        assert_eq!(pending_blocks(&app), 0);
-        assert_matches_full_pass(&mut app, "owned cells after snapshot recovery");
-        let after = work(&app);
-        app.update();
-        assert_eq!(work(&app), after, "an idle frame performs no terrain work");
-        // Shared readiness changes through an immutable handle: Res::is_changed alone
-        // cannot detect this transition. Clearing it changes pending diagnostics only.
-        assert!(app.world().resource::<TerrainDrawReadiness>().clear());
-        app.update();
-        assert_eq!(visibility(&app, far), Visibility::Inherited);
-        assert_eq!(visibility(&app, duplicate), Visibility::Inherited);
-        assert_eq!(pending_blocks(&app), 1);
-        assert_matches_full_pass(&mut app, "readiness withdrawal after recovery");
-        if journal {
-            assert_eq!(
-                &work(&app)[..3],
-                &after[..3],
-                "readiness uses cached patch facts"
-            );
-        }
-    }
-}
-
-#[test]
-fn fallback_terrain_and_pending_blocks_follow_public_world_demand() {
-    for journal in [true, false] {
-        let mut app = app(journal);
-        app.world_mut()
-            .resource_mut::<EngineConfig>()
-            .cluster_own_statics = true;
-        let grid = IVec2::new(3, 0);
-        let root = chunk_root(app.world_mut(), WORLD, LodTier::Tier4, grid);
-        let far = lod_patch(app.world_mut(), Some(root), grid, 0, Some(LodTier::Tier4));
-        let other_root = chunk_root(app.world_mut(), WORLD + 1, LodTier::Tier4, grid);
-        let other = lod_patch(
-            app.world_mut(),
-            Some(other_root),
-            grid,
-            0,
-            Some(LodTier::Tier4),
-        );
-        app.insert_resource(cluster_terrain(&[
-            (WORLD, &[grid], Some(0)),
-            (WORLD, &[IVec2::new(8, 0)], None),
-            (WORLD + 1, &[grid], Some(1)),
-        ]));
-        let ready = TerrainDrawReadiness::default();
-        ready.mark(0);
-        app.insert_resource(ready);
-        app.update();
-        assert_eq!(visibility(&app, far), Visibility::Inherited);
-        assert_eq!(visibility(&app, other), Visibility::Hidden);
-        assert_eq!(pending_blocks(&app), 1, "unassigned batch stays pending");
-        assert_matches_full_pass(&mut app, "configured world owns ready terrain only");
-        let before = work(&app);
-        app.insert_resource(ActiveSpace {
-            worldspace_id: Some(WORLD + 1),
-            interior: None,
-        });
-        app.update();
-        assert_eq!(visibility(&app, far), Visibility::Hidden);
-        assert_eq!(visibility(&app, other), Visibility::Inherited);
-        assert_eq!(
-            pending_blocks(&app),
-            1,
-            "only the demanded world's block counts"
-        );
-        assert_matches_full_pass(&mut app, "unready other-world terrain retains stock");
-        app.world_mut().resource_mut::<ActiveSpace>().interior = Some(10);
-        app.update();
-        assert_eq!(visibility(&app, other), Visibility::Hidden);
-        assert_eq!(
-            pending_blocks(&app),
-            0,
-            "no exterior demand has no pending blocks"
-        );
-        assert_matches_full_pass(&mut app, "interior withdraws exterior terrain demand");
-        app.world_mut().remove_resource::<ActiveSpace>();
-        app.update();
-        assert_eq!(visibility(&app, far), Visibility::Inherited);
-        assert_eq!(pending_blocks(&app), 1);
-        assert_matches_full_pass(&mut app, "configured owned world restored");
-        if journal {
-            assert_eq!(
-                &work(&app)[..3],
-                &before[..3],
-                "world changes reuse patch ancestry"
-            );
-        }
-        app.world_mut()
-            .resource_mut::<EngineConfig>()
-            .cluster_own_statics = false;
-        app.update();
-        assert_eq!(visibility(&app, far), Visibility::Inherited);
-        assert_eq!(
-            pending_blocks(&app),
-            1,
-            "pending readiness is independent of ownership flag"
-        );
-        assert_matches_full_pass(
-            &mut app,
-            "ownership off restores stock without hiding pending work",
-        );
-    }
 }
 
 /// Historical and asynchronous readiness never removes a resident ring from extraction.

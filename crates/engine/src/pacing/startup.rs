@@ -6,36 +6,20 @@
 //! render-asset upload budget, the model spawn cap and the unload budgets. The configured values
 //! come back on the ready frame (or once the load has made no progress for
 //! [`STARTUP_LIFT_TIMEOUT_SECONDS`]). The world shows while it loads; with `--startup-cover` the load
-//! is hidden behind a black cover that fades out when the configured pacing is restored.
+//! is hidden behind a black cover that fades out on the restore, the trade a door crossing makes
+//! behind its fade ([`crate::door_crossing`], whose upload-budget and overlay helpers it reuses).
 //! The lift is on by default; `--paced-startup` installs nothing. A capture run (`--shots`,
-//! supported automated capture) is lifted but never covered.
+//! `--demo-tour`) is lifted but never covered.
 
 use super::{READY_FRAMES_REQUIRED, world_ready_inputs_at_frame_end};
 use crate::{
     config::EngineConfig,
+    door_crossing::{FADE_SECONDS, set_alpha, set_upload_budget},
     streaming::{ActiveSpace, RenderOrigin, StreamingMetrics, StreamingWorld},
     swap_bridge::{WaitingVisibility, pending_drawn},
     world::components::StreamingCamera,
 };
 use bevy::{prelude::*, render::render_asset::RenderAssetBytesPerFrame};
-
-/// Duration of the public startup cover fade, in seconds.
-pub const FADE_SECONDS: f32 = 0.25;
-
-fn set_upload_budget(
-    budget: &mut Option<ResMut<RenderAssetBytesPerFrame>>,
-    max_bytes: Option<usize>,
-) {
-    if let Some(budget) = budget {
-        budget.max_bytes = max_bytes;
-    }
-}
-
-fn set_alpha<C: Component>(overlay: &mut Query<&mut BackgroundColor, With<C>>, alpha: f32) {
-    for mut colour in overlay.iter_mut() {
-        colour.0 = Color::srgba(0.0, 0.0, 0.0, alpha.clamp(0.0, 1.0));
-    }
-}
 
 /// Longest the first load may go without any progress before the lift ends anyway, in seconds. A
 /// safety net against a load that has stopped, not a limit on a long one: the portal-heavy start
@@ -498,7 +482,10 @@ mod tests {
         // `--shots` (and `--demo-tour`): the load is faster, but nothing is drawn over the frames,
         // because a photograph must never find a black cover up.
         let mut app = startup_app(EngineConfig {
-            shots: Some("poses.json".into()),
+            portal: crate::config::PortalOptions {
+                shots: Some("poses.json".into()),
+                ..default()
+            },
             ..configured_pacing()
         });
         set_interior(&mut app, 77, false);

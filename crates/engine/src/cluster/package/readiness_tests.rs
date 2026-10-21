@@ -5,10 +5,9 @@ use bevy::{asset::AssetPlugin, ecs::system::RunSystemOnce};
 fn app() -> App {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, AssetPlugin::default()))
-        .init_resource::<crate::config::EngineConfig>()
-        .init_resource::<crate::graphics_settings::GraphicsSettings>()
         .init_asset::<WorldAsset>()
         .init_asset::<StandardMaterial>()
+        .init_asset::<SnowMaterial>()
         .init_resource::<ClusterBatchHandles>()
         .init_resource::<crate::streaming::StreamingMetrics>()
         .insert_resource(ClusterScene {
@@ -29,7 +28,9 @@ fn batch() -> LazyBatch {
             model_path: "invented-loader-fixture.glb".into(),
             material_index: None,
             scale_inverted: false,
+            snow_static: 0,
         },
+        coverage: None,
         spheres: vec![LazySphere {
             center: Vec3::ZERO,
             radius: 1.0,
@@ -56,6 +57,7 @@ fn install_batch(app: &mut App, batch: LazyBatch, in_flight: bool) {
         prefetch_in_flight: Vec::new(),
         unrequested: if in_flight { Vec::new() } else { vec![0] },
         in_flight: if in_flight { vec![0] } else { Vec::new() },
+        pending_snow: Vec::new(),
         failed: Vec::new(),
     });
 }
@@ -63,6 +65,12 @@ fn install_batch(app: &mut App, batch: LazyBatch, in_flight: bool) {
 fn load(app: &mut App) {
     app.world_mut()
         .run_system_once(load_batches_in_view)
+        .unwrap();
+}
+
+fn promote(app: &mut App) {
+    app.world_mut()
+        .run_system_once(promote_snow_sources)
         .unwrap();
 }
 
@@ -178,6 +186,67 @@ fn default_material_batch_requests_and_retains_the_shared_source_scene() {
     assert!(lazy.batches[0].scene.is_none());
     assert_eq!(lazy.source_scene(0).unwrap().id(), source.id());
     assert_eq!(lazy.scenes[&path].id(), source.id());
+}
+
+#[test]
+fn snow_assembly_remains_pending_until_the_actual_base_asset_can_be_promoted() {
+    let mut app = app();
+    let base = app
+        .world()
+        .resource::<AssetServer>()
+        .add(StandardMaterial::default());
+    app.update();
+    assert!(
+        app.world()
+            .resource::<AssetServer>()
+            .is_loaded_with_dependencies(base.id())
+    );
+    let saved = app
+        .world_mut()
+        .resource_mut::<Assets<StandardMaterial>>()
+        .remove(base.id())
+        .unwrap();
+    let mut wanted = batch();
+    wanted.requested = true;
+    wanted.loading = Some(base.clone());
+    install_batch(&mut app, wanted, true);
+    app.world_mut()
+        .resource_mut::<LazyBatches>()
+        .pending_snow
+        .push(PendingSnow {
+            batch: 0,
+            base: base.clone(),
+            coverage: SnowCoverage {
+                up: Vec3::Y,
+                cos_max_angle: 0.5,
+                falloff_scale: 1.0,
+                falloff_bias: 0.0,
+                normal_dampener: 1.0,
+                color: [255; 3],
+                single_pass: true,
+            },
+        });
+
+    promote(&mut app);
+    load(&mut app);
+    assert_eq!(pending(&app), 1);
+    assert_eq!(app.world().resource::<LazyBatches>().pending_snow.len(), 1);
+    assert!(app.world().resource::<Assets<SnowMaterial>>().is_empty());
+
+    app.world_mut()
+        .resource_mut::<Assets<StandardMaterial>>()
+        .insert(base.id(), saved)
+        .unwrap();
+    // Even a loaded base cannot settle before the assembly producer has run.
+    load(&mut app);
+    assert_eq!(pending(&app), 1);
+    promote(&mut app);
+    load(&mut app);
+    assert_eq!(pending(&app), 0);
+    let lazy = app.world().resource::<LazyBatches>();
+    assert!(lazy.pending_snow.is_empty());
+    assert!(lazy.in_flight.is_empty());
+    assert_eq!(app.world().resource::<Assets<SnowMaterial>>().len(), 1);
 }
 
 #[test]
