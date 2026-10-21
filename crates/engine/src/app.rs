@@ -2033,6 +2033,9 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
             config.assets_dir.display()
         );
     }
+    // An old full-copy cluster dataset (cluster tables inside the base) has no reader, with or
+    // without --clusters: the message names the rebuild command.
+    shared::cluster_overlay::refuse_full_copy(&config.assets_dir)?;
     if config.allow_incomplete_assets {
         crate::world::database::validate_lod_build_contract(
             &config.assets_dir,
@@ -5037,6 +5040,81 @@ mod tests {
             .unwrap();
             validate_runtime_assets(&config).unwrap();
         }
+    }
+
+    #[test]
+    fn an_old_full_copy_cluster_dataset_is_refused_with_or_without_clusters() {
+        let directory = tempfile::tempdir().unwrap();
+        for required in ["skyrim_world.db", "cell_cache.rkyv"] {
+            std::fs::write(directory.path().join(required), []).unwrap();
+        }
+        write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
+        std::fs::write(
+            directory.path().join("conversion-manifest.json"),
+            format!(
+                r#"{{"schema_version":{},"complete":true}}"#,
+                converter_schema_version()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("integration-report.json"),
+            format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
+        let mut config = EngineConfig {
+            assets_dir: directory.path().to_owned(),
+            ..default()
+        };
+        validate_runtime_assets(&config).unwrap();
+        // Cluster tables inside the base database: there is no reader for this layout.
+        Connection::open(directory.path().join("skyrim_world.db"))
+            .unwrap()
+            .execute_batch("CREATE TABLE cluster_meshes(x INTEGER);")
+            .unwrap();
+        for _ in [()] {
+            let error = format!("{:#}", validate_runtime_assets(&config).unwrap_err());
+            assert!(
+                error.contains("old full-copy cluster dataset")
+                    && error.contains("converter derive-clusters")
+                    && error.contains(&directory.path().display().to_string()),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_a_passing_integration_report() {
+        let directory = tempfile::tempdir().unwrap();
+        for required in ["skyrim_world.db", "cell_cache.rkyv"] {
+            std::fs::write(directory.path().join(required), []).unwrap();
+        }
+        // The current schema with its (empty) LOD tables, as the converter writes it.
+        write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
+        std::fs::write(
+            directory.path().join("conversion-manifest.json"),
+            format!(
+                r#"{{"schema_version":{},"complete":true}}"#,
+                converter_schema_version()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("integration-report.json"),
+            format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
+        let config = EngineConfig {
+            assets_dir: directory.path().to_owned(),
+            ..default()
+        };
+        validate_runtime_assets(&config).unwrap();
     }
 
     #[test]
