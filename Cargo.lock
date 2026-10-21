@@ -2372,6 +2372,7 @@ dependencies = [
  "tokio",
  "walkdir",
  "wgpu",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
