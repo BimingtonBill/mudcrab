@@ -4755,9 +4755,10 @@ mod tests {
         // up on, and the next shot of the file is rendered as if the failed one had never been in
         // it. The run is a failure - a shot that was asked for was not rendered - so it exits
         // non-zero after the others are on disk.
+        let output = tempfile::tempdir().expect("temporary shots folder");
         let mut run = ShotsRun::for_portal(
             ShotsFile::from_json(&two_door_example()).unwrap(),
-            PathBuf::from("out"),
+            output.path().into(),
         );
         assert_eq!(run.file.shots.len(), 2);
         run.door = Some(DoorRun::new(0x0001_CBB0));
