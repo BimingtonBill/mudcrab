@@ -616,6 +616,7 @@ impl Plugin for SeamlessDoorAnimationPlugin {
             .init_resource::<ArrivalOpenings>()
             .init_resource::<PendingDoorOpens>()
             .init_resource::<FarDoorDrive>()
+            .add_observer(withdraw_source_binding_playback)
             .add_systems(
                 Update,
                 (
@@ -1667,6 +1668,36 @@ fn node_swing_degrees(clip: &AnimationClip, target: AnimationTargetId) -> Option
 /// once, in a frame that is already a scene being re-instanced.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 struct ReattachPose(DoorState);
+
+/// The public resolver withdraws its binding before installing a replacement graph. Clear
+/// outgoing seamless playback synchronously at that handoff, while its graph identity is still
+/// installed. Reset transitions together with playback; neither belongs to a foreign graph.
+fn withdraw_source_binding_playback(
+    discarded: On<Discard, SourceClipBinding>,
+    doors: Query<(&DoorAnimation, &DerivedGraph), With<DerivedSource>>,
+    mut players: Query<(
+        &AnimationGraphHandle,
+        &mut AnimationPlayer,
+        Option<&mut AnimationTransitions>,
+    )>,
+) {
+    let Ok((animation, graph)) = doors.get(discarded.entity) else {
+        return;
+    };
+    let Some(player) = animation.player else {
+        return;
+    };
+    let Ok((installed, mut playback, transitions)) = players.get_mut(player) else {
+        return;
+    };
+    if installed.0 != graph.0 {
+        return;
+    }
+    playback.stop_all();
+    if let Some(mut transitions) = transitions {
+        *transitions = AnimationTransitions::new();
+    }
+}
 
 /// Drops a door's animation when the `AnimationPlayer` it recorded no longer exists, so that
 /// [`request_door_models`] and [`attach_door_animations`] give the door its clips again on the model
@@ -3357,6 +3388,147 @@ mod tests {
         );
         assert!(app.world().get::<DerivedGraph>(model.door).is_none());
         assert_eq!(state(&app, model.door), DoorState::Open { animated: false });
+    }
+
+    #[test]
+    fn newly_published_source_keeps_its_derived_graph_and_opening_clock() {
+        let mut app = door_app();
+        let model = door_with_model(&mut app, WIDE_SWING_DEGREES);
+        app.world_mut().write_message(OpenDoor { door: model.door });
+        app.update();
+        assert_eq!(state(&app, model.door), DoorState::Opening);
+        let graph = app
+            .world()
+            .get::<DerivedGraph>(model.door)
+            .unwrap()
+            .0
+            .clone();
+        app.update();
+        assert_eq!(state(&app, model.door), DoorState::Opening);
+        assert_eq!(
+            app.world().get::<DerivedGraph>(model.door).unwrap().0,
+            graph
+        );
+        let open = app
+            .world()
+            .get::<DoorAnimation>(model.door)
+            .unwrap()
+            .open
+            .unwrap();
+        let at = player(&app, model.player)
+            .animation(open.node)
+            .unwrap()
+            .seek_time();
+        assert!(at > 0.0 && at < 0.5);
+        assert!(leaf_degrees(&app, model.moved) > 0.0);
+        assert!(leaf_degrees(&app, model.moved) < WIDE_SWING_DEGREES * 0.5);
+    }
+
+    #[test]
+    fn ready_same_player_close_revision_restores_closed_without_stale_playback_or_leaf_motion() {
+        let mut app = door_app();
+        let model = door_with_model(&mut app, WIDE_SWING_DEGREES);
+        let target = *app.world().get::<AnimationTargetId>(model.moved).unwrap();
+        let original_open = {
+            let pending = app.world().get::<PendingDoorModel>(model.door).unwrap();
+            app.world()
+                .resource::<Assets<Gltf>>()
+                .get(pending.model.as_ref().unwrap())
+                .unwrap()
+                .named_animations[OPEN_CLIP]
+                .clone()
+        };
+        let original_close = app
+            .world_mut()
+            .resource_mut::<Assets<AnimationClip>>()
+            .add(clip_swinging(CLIP_SECONDS, target, WIDE_SWING_DEGREES, 0.0));
+        app.world_mut()
+            .entity_mut(model.player)
+            .insert(SourceClips(vec![
+                ("Open".into(), original_open),
+                ("Close".into(), original_close),
+            ]));
+        app.update();
+        activate(&mut app, model.door);
+        step(&mut app, 12);
+        activate(&mut app, model.door);
+        step(&mut app, 2);
+        assert_eq!(state(&app, model.door), DoorState::Closing);
+        let close = app
+            .world()
+            .get::<DoorAnimation>(model.door)
+            .unwrap()
+            .close
+            .unwrap();
+        let at = player(&app, model.player)
+            .animation(close.node)
+            .unwrap()
+            .seek_time();
+        assert!(at > 0.0 && at < CLIP_SECONDS);
+        assert!(leaf_degrees(&app, model.moved) > 0.0);
+        let old_derived = app
+            .world()
+            .get::<DerivedGraph>(model.door)
+            .unwrap()
+            .0
+            .clone();
+        let before = *app.world().get::<Transform>(model.moved).unwrap();
+        let (open, close) = {
+            let mut clips = app.world_mut().resource_mut::<Assets<AnimationClip>>();
+            (
+                clips.add(clip_swinging(2.0, target, 0.0, 100.0)),
+                clips.add(clip_swinging(3.0, target, 100.0, 0.0)),
+            )
+        };
+        app.world_mut()
+            .entity_mut(model.player)
+            .insert(SourceClips(vec![
+                ("Open".into(), open.clone()),
+                ("Close".into(), close.clone()),
+            ]));
+
+        app.update();
+
+        assert_eq!(state(&app, model.door), DoorState::Closed);
+        let binding = app.world().get::<SourceClipBinding>(model.door).unwrap();
+        assert_eq!(binding.source, model.player);
+        assert_eq!(binding.players, vec![model.player]);
+        let derived = &app.world().get::<DerivedGraph>(model.door).unwrap().0;
+        assert_ne!(derived, &old_derived);
+        assert_ne!(binding.graph.as_ref(), Some(derived));
+        assert_eq!(
+            &app.world()
+                .get::<AnimationGraphHandle>(model.player)
+                .unwrap()
+                .0,
+            derived
+        );
+        assert!(
+            app.world()
+                .get::<AnimationTransitions>(model.player)
+                .is_some()
+        );
+        assert!(
+            player(&app, model.player)
+                .playing_animations()
+                .next()
+                .is_none()
+        );
+        assert_eq!(*app.world().get::<Transform>(model.moved).unwrap(), before);
+        step(&mut app, 8);
+        assert_eq!(state(&app, model.door), DoorState::Closed);
+        assert!(
+            player(&app, model.player)
+                .playing_animations()
+                .next()
+                .is_none()
+        );
+        assert_eq!(*app.world().get::<Transform>(model.moved).unwrap(), before);
+        let inventory = &app.world().get::<SourceClips>(model.player).unwrap().0;
+        assert_eq!(
+            inventory,
+            &vec![("Open".into(), open), ("Close".into(), close)]
+        );
     }
 
     #[test]
