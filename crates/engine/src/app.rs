@@ -394,7 +394,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             AcceptanceMetricsPlugin,
             ProfilingPlugin,
         ))
-        // The render→main "prepared and drawable" bridge. Registered for every
+        // The renderâ†’main "prepared and drawable" bridge. Registered for every
         // run: it is what publishes the render world's own answer to "is this surface drawn?" into
         // the main world, and it changes nothing else about the frame.
         .add_plugins(crate::swap_bridge::SwapBridgePlugin)
@@ -473,6 +473,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         let preload = cluster_config.cluster_preload_batches;
         let min_instance_pixels = cluster_config.cluster_min_instance_pixels;
         let prepass = cluster_config.cluster_prepass;
+        let own_statics = cluster_config.cluster_own_statics;
         let quality = cluster_config.graphics.clone();
         if let Some(selector) = selector {
             if preload {
@@ -483,6 +484,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 terrain_error_pixels: quality.cluster_terrain_error_pixels,
                 min_instance_pixels: min_instance_pixels.unwrap_or(0.0),
                 prepass,
+                own_statics,
                 ..default()
             });
             // Resolve the overlay among the base's own (`<assets>/derived`). Asynchronous
@@ -2981,7 +2983,7 @@ fn capture_acceptance_screenshot(
     renderer: Res<RendererMetrics>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     // Surfaces a view can see that the render world has not confirmed drawn: an acceptance
-    // screenshot must not be taken while one is outstanding (design-1091 §4).
+    // screenshot must not be taken while one is outstanding (design-1091 Â§4).
     waiting: Query<
         Has<crate::swap_bridge::SwapInCameraView>,
         With<crate::swap_bridge::SwapWaiting>,
@@ -4086,7 +4088,7 @@ mod tests {
         assert!(screenshot_assets_ready(&settled_metrics, 0, true, &config));
 
         // A surface waiting on the render world holds the screenshot back until it is confirmed
-        // drawn: the acceptance screenshot must not photograph a stand-in or a hole (design-1091 §4).
+        // drawn: the acceptance screenshot must not photograph a stand-in or a hole (design-1091 Â§4).
         assert!(!screenshot_assets_ready(&settled_metrics, 1, true, &config));
 
         let mut failed_metrics = settled_metrics.clone();

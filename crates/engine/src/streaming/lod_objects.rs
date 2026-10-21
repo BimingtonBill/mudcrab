@@ -753,9 +753,8 @@ fn plan_object_lod(
     }
     let actual = views.current(&config, origin.0);
     let demand = actual;
-    let wanted_world = settings
-        .as_ref()
-        .is_none_or(|s| s.lod_objects)
+    let wanted_world = (settings.as_ref().is_none_or(|s| s.lod_objects)
+        && !config.cluster_own_statics)
         .then_some(demand)
         .flatten()
         .map(|d| d.world)
@@ -771,6 +770,7 @@ fn plan_object_lod(
         }
         let in_interior = actual.is_none();
         let holding = config.lod_keep_hidden_in_interiors
+            && !config.cluster_own_statics
             && in_interior
             && settings
                 .as_ref()

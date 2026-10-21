@@ -297,6 +297,7 @@ impl Plugin for ClusterPackagePlugin {
         if self.terrain {
             app.add_plugins(super::terrain::ClusterTerrainPlugin);
         }
+        app.add_plugins(crate::streaming::far_stock::FarStockPlugin);
         app.add_plugins(super::render::ClusterRenderPlugin)
             .insert_resource(PackageSource {
                 base: self.base.clone(),

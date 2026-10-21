@@ -4,6 +4,7 @@ use bevy::prelude::{Reflect, Resource, warn};
 use color_eyre::{Result, eyre::WrapErr};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use shared::cluster_recipe::classify::CELL_SIZE;
 use shared::lod::{ChunkAnchor, ChunkKey, LodOrigin, LodTier, chunk_payload_path};
 use std::{
     collections::{BTreeSet, HashSet},
@@ -135,6 +136,13 @@ pub enum DatabaseRequest {
         query: LodChunkQuery,
         queued_at: Instant,
     },
+    LoadReferences {
+        generation: u64,
+        key: CellKey,
+        reference_ids: BTreeSet<u32>,
+        responses: Sender<ReferenceResponse>,
+        queued_at: Instant,
+    },
     Shutdown,
 }
 
@@ -150,6 +158,17 @@ pub struct DatabaseResponse {
     pub queue_wait_micros: u64,
     pub total_request_micros: u64,
     pub row_count: usize,
+}
+
+/// One sparse request's exact selected rows; its bounded response channel is caller-owned.
+#[derive(Debug)]
+pub struct ReferenceResponse {
+    pub generation: u64,
+    pub key: CellKey,
+    pub result: std::result::Result<Vec<ReferenceRow>, String>,
+    pub query_micros: u64,
+    pub queue_wait_micros: u64,
+    pub total_request_micros: u64,
 }
 
 /// World-space AABB used to discover LOD chunks. Bounds are XY Creation units.
@@ -563,6 +582,46 @@ impl WorldDatabase {
     pub fn try_lod_response(&self) -> Option<LodChunkResponse> {
         self.lod_responses.try_recv().ok()
     }
+
+    /// Request exact exterior references on the existing worker, independently of cell/LOD
+    /// response polling. A canceled receiver does not cancel or stop that shared worker.
+    pub fn request_references(
+        &self,
+        generation: u64,
+        key: CellKey,
+        reference_ids: BTreeSet<u32>,
+    ) -> Result<Receiver<ReferenceResponse>> {
+        enqueue_reference_query(&self.requests, generation, key, reference_ids)
+    }
+}
+
+fn enqueue_reference_query(
+    requests: &Sender<DatabaseRequest>,
+    generation: u64,
+    key: CellKey,
+    reference_ids: BTreeSet<u32>,
+) -> Result<Receiver<ReferenceResponse>> {
+    color_eyre::eyre::ensure!(
+        matches!(key, CellKey::Exterior { .. }),
+        "sparse reference requests require an exterior position grid"
+    );
+    let (responses, receiver) = bounded(1);
+    let request = DatabaseRequest::LoadReferences {
+        generation,
+        key,
+        reference_ids,
+        responses,
+        queued_at: Instant::now(),
+    };
+    match requests.try_send(request) {
+        Ok(()) => Ok(receiver),
+        Err(TrySendError::Full(_)) => Err(color_eyre::eyre::eyre!(
+            "world database request queue is full"
+        )),
+        Err(TrySendError::Disconnected(_)) => {
+            Err(color_eyre::eyre::eyre!("world database worker stopped"))
+        }
+    }
 }
 
 fn enqueue_lod_query(
@@ -719,6 +778,43 @@ fn worker(
                     .is_err()
                 {
                     break;
+                }
+            }
+            DatabaseRequest::LoadReferences {
+                generation,
+                key,
+                reference_ids,
+                responses: reference_responses,
+                queued_at,
+            } => {
+                let queue_wait_micros = elapsed_micros(queued_at);
+                let started = Instant::now();
+                let result = match &mut setup {
+                    Ok((connection, query)) => {
+                        load_references(connection, query, key, &reference_ids)
+                            .map_err(|error| format!("{error:#}"))
+                    }
+                    Err(error) => Err(error.clone()),
+                };
+                let query_micros = elapsed_micros(started);
+                // Exactly one reply fits the fresh one-slot channel. A canceled sparse
+                // consumer must not stop unrelated cell/LOD requests on this worker.
+                let response = ReferenceResponse {
+                    generation,
+                    key,
+                    result,
+                    query_micros,
+                    queue_wait_micros,
+                    total_request_micros: elapsed_micros(queued_at),
+                };
+                if let Err(TrySendError::Full(_)) = reference_responses.try_send(response) {
+                    // DatabaseRequest is public: a caller can supply a full or rendezvous
+                    // channel instead of request_references' fresh one-slot receiver.
+                    warn!(
+                        generation,
+                        ?key,
+                        "sparse reference reply channel has no capacity"
+                    );
                 }
             }
         }
@@ -1233,6 +1329,43 @@ impl ReferenceQuery {
             enable_errors: HashSet::new(),
         })
     }
+
+    /// Resolves each row's new-game enable state from its own inputs and its parent chain, which
+    /// may lead outside the loaded cell. A reference whose chain cannot be resolved (a missing or
+    /// cyclic parent) stays in the payload but reads as initially disabled, and each kind of
+    /// failure is logged once for the connection.
+    fn resolve_enable_states(
+        &mut self,
+        connection: &Connection,
+        rows: Vec<(ReferenceRow, InitialEnableInputs)>,
+    ) -> Result<Vec<ReferenceRow>> {
+        let mut references = Vec::with_capacity(rows.len());
+        for (mut reference, inputs) in rows {
+            let state = self
+                .enable_states
+                .resolve(reference.form_id, inputs, |parent| {
+                    connection
+                        .prepare_cached(&self.parent_sql)?
+                        .query_row([parent], |row| map_enable_inputs(row, 0))
+                        .optional()
+                })
+                .wrap_err_with(|| format!("enable state of reference {:08X}", reference.form_id))?;
+            reference.initially_enabled = match state {
+                Ok(enabled) => enabled,
+                Err(error) => {
+                    if self.enable_errors.insert(error) {
+                        bevy::log::warn!(
+                            "reference {:08X}: {error}; unresolved references will not spawn",
+                            reference.form_id
+                        );
+                    }
+                    false
+                }
+            };
+            references.push(reference);
+        }
+        Ok(references)
+    }
 }
 
 fn load_cell(
@@ -1326,6 +1459,60 @@ fn load_cell(
         cell_id,
         references,
     })
+}
+
+/// Selected-ID lookups use the same projection as near streaming, but membership is exact
+/// placed-world plus the shared cluster recipe's position grid, never an owning CELL or Rtree.
+/// The rows carry the same enable state and door enrichment a cell load gives them.
+fn load_references(
+    connection: &Connection,
+    query: &mut ReferenceQuery,
+    key: CellKey,
+    reference_ids: &BTreeSet<u32>,
+) -> Result<Vec<ReferenceRow>> {
+    let CellKey::Exterior {
+        worldspace_id,
+        grid_x,
+        grid_y,
+    } = key
+    else {
+        color_eyre::eyre::bail!("sparse reference requests require an exterior position grid");
+    };
+    if reference_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT {} FROM \"references\" r{} \
+         WHERE r.id=?1 AND r.is_exterior=1 AND r.worldspace_id=?2",
+        query.columns, query.joins
+    );
+    let mut statement = connection.prepare_cached(&sql)?;
+    let mut rows = Vec::with_capacity(reference_ids.len());
+    for &reference_id in reference_ids {
+        let (reference, inputs) = statement
+            .query_row(params![reference_id, worldspace_id], map_reference)
+            .optional()?
+            .ok_or_else(|| color_eyre::eyre::eyre!(
+                "reference {reference_id:08X} is missing or not exterior in placed world {worldspace_id:08X}"
+            ))?;
+        color_eyre::eyre::ensure!(
+            reference.position[..2]
+                .iter()
+                .all(|value| value.is_finite()),
+            "reference {reference_id:08X} has non-finite XY position"
+        );
+        let position_grid = (
+            (reference.position[0] / CELL_SIZE).floor() as i32,
+            (reference.position[1] / CELL_SIZE).floor() as i32,
+        );
+        color_eyre::eyre::ensure!(
+            position_grid == (grid_x, grid_y),
+            "reference {reference_id:08X} position grid {position_grid:?} differs from requested ({grid_x}, {grid_y})"
+        );
+        rows.push((reference, inputs));
+    }
+    let references = query.resolve_enable_states(connection, rows)?;
+    Ok(references)
 }
 
 fn map_enable_inputs(
@@ -1497,6 +1684,55 @@ mod tests {
                 INSERT INTO exterior_spatial VALUES(30,8200,8200,-12200,-12200,50,50,10,60);
                 INSERT INTO "references" VALUES(31,99,20,8250,-12150,55,0,0,0,1);
                 INSERT INTO exterior_spatial VALUES(31,8250,8250,-12150,-12150,55,55,99,60);"#,
+            ).unwrap();
+    }
+
+    // Minimal door projection: no interior names or worldspaces, so the label stays empty.
+    fn door_fixture(connection: &Connection) {
+        connection.execute_batch(
+            r#"CREATE TABLE door_links(ref_id INTEGER PRIMARY KEY,destination_ref_id INTEGER NOT NULL,
+                pos_x REAL NOT NULL,pos_y REAL NOT NULL,pos_z REAL NOT NULL,
+                rot_x REAL NOT NULL,rot_y REAL NOT NULL,rot_z REAL NOT NULL,
+                destination_cell_id INTEGER,destination_worldspace_id INTEGER);
+            INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(99,NULL,NULL,NULL);
+            INSERT INTO door_links VALUES(30,77,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);"#,
+        ).unwrap();
+    }
+
+    fn sparse_reference_fixture(connection: &Connection) {
+        fixture(connection);
+        door_fixture(connection);
+        light_fixture(connection);
+        connection
+            .execute_batch(
+                r#"CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT);
+                INSERT INTO records VALUES(20,'DOOR'),(22,'LIGH');
+                UPDATE lights SET id=22 WHERE id=20;
+                UPDATE "references" SET radius_override=NULL WHERE id=30;
+                UPDATE "references" SET radius_override=850.8 WHERE id=40;
+                INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(11,60,0,0),(12,614,0,0);
+                UPDATE "references" SET cell_id=11 WHERE id=31;
+                UPDATE door_links SET destination_ref_id=31,destination_cell_id=11,destination_worldspace_id=60 WHERE ref_id=30;
+                INSERT INTO door_links VALUES(31,30,8201,-12201,51,0,0,1,10,60);
+                ALTER TABLE "references" ADD COLUMN is_exterior INTEGER;
+                ALTER TABLE "references" ADD COLUMN worldspace_id INTEGER;
+                UPDATE "references" SET is_exterior=1,worldspace_id=60;
+                INSERT INTO "references"(id,cell_id,base_form_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,scale,is_exterior,worldspace_id) VALUES
+                    (55,12,20,8200,-12200,50,0,0,0,1,1,614),
+                    (56,99,20,8200,-12200,50,0,0,0,1,0,NULL),
+                    (57,11,20,12288,-12200,50,0,0,0,1,1,60),
+                    (60,11,20,-0.25,-4096,50,0,0,0,1,1,60),
+                    (61,11,20,-4096,-0.25,50,0,0,0,1,1,60),
+                    (62,11,20,-4096.25,-4096,50,0,0,0,1,1,60),
+                    (63,11,20,0,0,50,0,0,0,1,1,60),
+                    (64,11,20,4096,-4096,50,0,0,0,1,1,60);"#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO \"references\"(id,cell_id,base_form_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,scale,is_exterior,worldspace_id) \
+                 VALUES(58,11,20,?1,-12200,50,0,0,0,1,1,60)",
+                [f64::INFINITY],
             )
             .unwrap();
     }
@@ -1509,6 +1745,264 @@ mod tests {
              ALTER TABLE \"references\" ADD COLUMN enable_parent_flags INTEGER;",
             )
             .unwrap();
+    }
+
+    fn sparse_key(worldspace_id: u32, grid_x: i32, grid_y: i32) -> CellKey {
+        CellKey::Exterior {
+            worldspace_id,
+            grid_x,
+            grid_y,
+        }
+    }
+
+    fn sparse_rows(
+        connection: &Connection,
+        key: CellKey,
+        ids: impl IntoIterator<Item = u32>,
+    ) -> Result<Vec<ReferenceRow>> {
+        load_references(
+            connection,
+            &mut ReferenceQuery::for_connection(connection, fixture_features(connection))?,
+            key,
+            &ids.into_iter().collect(),
+        )
+    }
+
+    #[test]
+    fn sparse_references_select_only_sorted_ids_and_use_placed_world_and_position() {
+        let connection = Connection::open_in_memory().unwrap();
+        sparse_reference_fixture(&connection);
+        // The exact-ID path does not need a cell-wide spatial query, even for a persistent
+        // reference whose owning CELL disagrees with its position grid.
+        connection
+            .execute("DROP TABLE exterior_spatial", [])
+            .unwrap();
+        let rows = sparse_rows(&connection, sparse_key(60, 2, -3), [40, 30]).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.form_id).collect::<Vec<_>>(),
+            [30, 40]
+        );
+        let persistent = sparse_rows(&connection, sparse_key(60, 2, -3), [31]).unwrap();
+        assert_eq!(persistent[0].cell_id, 11, "authored CELL stays intact");
+        assert!(sparse_rows(&connection, sparse_key(60, 0, 0), [31]).is_err());
+        let child = sparse_rows(&connection, sparse_key(614, 2, -3), [55]).unwrap();
+        assert_eq!(child[0].cell_id, 12);
+        assert!(sparse_rows(&connection, sparse_key(60, 2, -3), [55]).is_err());
+    }
+
+    #[test]
+    fn sparse_references_preserve_all_near_projection_and_door_enrichment() {
+        let connection = Connection::open_in_memory().unwrap();
+        sparse_reference_fixture(&connection);
+        let key = sparse_key(60, 2, -3);
+        let near = load_cell(&connection, 1, key).unwrap();
+        let sparse = sparse_rows(&connection, key, [30, 40]).unwrap();
+        assert_eq!(near.references.len(), 3);
+        for actual in &sparse {
+            let expected = near
+                .references
+                .iter()
+                .find(|row| row.form_id == actual.form_id)
+                .unwrap();
+            assert_eq!(actual.form_id, expected.form_id);
+            assert_eq!(actual.initially_enabled, expected.initially_enabled);
+            assert_eq!(actual.cell_id, expected.cell_id);
+            assert_eq!(actual.base_form_id, expected.base_form_id);
+            assert_eq!(actual.base_record_type, expected.base_record_type);
+            assert_eq!(actual.model_path, expected.model_path);
+            assert_eq!(actual.position, expected.position);
+            assert_eq!(actual.rotation, expected.rotation);
+            assert_eq!(actual.scale, expected.scale);
+            assert_eq!(actual.bounds_min, expected.bounds_min);
+            assert_eq!(actual.bounds_max, expected.bounds_max);
+            assert_eq!(actual.bounds_valid, expected.bounds_valid);
+            assert_eq!(actual.door, expected.door);
+            assert_eq!(actual.light, expected.light);
+            assert_eq!(actual.emittance, expected.emittance);
+            assert_eq!(actual.light_radius_override, expected.light_radius_override);
+        }
+        let door = sparse[0].door.as_ref().unwrap();
+        assert_eq!(door, &DoorLinkRow {
+            label: String::new(),
+            destination_ref_id: 31,
+            destination_cell_id: Some(11),
+            destination_worldspace_id: Some(60),
+            arrival_position: [-947.038, 3958.835, 591.917],
+            arrival_rotation: [0.0, 0.0, 2.96989],
+        });
+        assert!(sparse[1].light.is_some());
+        assert_eq!(sparse[1].light_radius_override, Some(850.8));
+    }
+
+    #[test]
+    fn sparse_references_reject_the_whole_batch_for_any_invalid_selected_id() {
+        let connection = Connection::open_in_memory().unwrap();
+        sparse_reference_fixture(&connection);
+        for (id, reason) in [
+            (999, "missing or not exterior"),
+            (55, "missing or not exterior"),
+            (56, "missing or not exterior"),
+            (57, "position grid"),
+            (58, "non-finite XY"),
+        ] {
+            let error = sparse_rows(&connection, sparse_key(60, 2, -3), [30, id])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("{id:08X}")), "{error}");
+            assert!(error.contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn sparse_references_use_floor_at_negative_and_exact_cell_boundaries() {
+        let connection = Connection::open_in_memory().unwrap();
+        sparse_reference_fixture(&connection);
+        for (id, x, y) in [
+            (60, -1, -1),
+            (61, -1, -1),
+            (62, -2, -1),
+            (63, 0, 0),
+            (64, 1, -1),
+        ] {
+            let rows = sparse_rows(&connection, sparse_key(60, x, y), [id]).unwrap();
+            assert_eq!(rows[0].form_id, id);
+            assert!(sparse_rows(&connection, sparse_key(60, x + 1, y), [id]).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_sparse_requests_do_not_require_new_columns_or_read_a_cell() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        assert_eq!(
+            load_cell(&connection, 1, sparse_key(60, 2, -3))
+                .unwrap()
+                .references
+                .len(),
+            2
+        );
+        // This exterior key has no owning cell, and the old fixture lacks the new placement
+        // columns. Empty selection still succeeds without preparing any reference SQL.
+        assert!(
+            sparse_rows(&connection, sparse_key(614, 900, 900), [])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(sparse_rows(&connection, sparse_key(60, 2, -3), [30]).is_err());
+        assert!(sparse_rows(&connection, CellKey::Interior(10), []).is_err());
+    }
+
+    #[test]
+    fn sparse_worker_responses_are_isolated_and_canceled_receivers_do_not_stop_cells() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("OWNER.txt"),
+            "database sparse worker test\n",
+        )
+        .unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        sparse_reference_fixture(&connection);
+        drop(connection);
+        let key = sparse_key(60, 2, -3);
+        let child_key = sparse_key(614, 2, -3);
+        let (requests, request_rx) = bounded(8);
+        let first = enqueue_reference_query(&requests, 7, key, BTreeSet::from([30])).unwrap();
+        let second =
+            enqueue_reference_query(&requests, 8, child_key, BTreeSet::from([55])).unwrap();
+        let canceled = enqueue_reference_query(&requests, 9, key, BTreeSet::from([30])).unwrap();
+        let failed = enqueue_reference_query(&requests, 10, key, BTreeSet::from([999])).unwrap();
+        let empty = enqueue_reference_query(&requests, 11, key, BTreeSet::new()).unwrap();
+        let (zero_capacity, stalled_receiver) = bounded(0);
+        requests
+            .send(DatabaseRequest::LoadReferences {
+                generation: 99,
+                key,
+                reference_ids: BTreeSet::from([30]),
+                responses: zero_capacity,
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+        assert_eq!(first.capacity(), Some(1));
+        assert_eq!(second.capacity(), Some(1));
+        drop(canceled);
+        requests
+            .send(DatabaseRequest::Load {
+                generation: 12,
+                key,
+                detail: CellDetail::Full,
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+        requests.send(DatabaseRequest::Shutdown).unwrap();
+        let (responses, response_rx) = unbounded();
+        let (lod_responses, lod_rx) = unbounded();
+        worker(
+            path,
+            WorldDatabaseFeatures {
+                door_links: crate::world::database::DoorLinksAccess::LegacyExtension,
+            },
+            request_rx,
+            responses,
+            lod_responses,
+        );
+        for (receiver, generation, expected_key, id) in
+            [(first, 7, key, 30), (second, 8, child_key, 55)]
+        {
+            let response = receiver.recv().unwrap();
+            assert_eq!(response.generation, generation);
+            assert_eq!(response.key, expected_key);
+            let rows = response.result.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].form_id, id);
+            assert!(response.total_request_micros >= response.queue_wait_micros);
+            assert!(response.total_request_micros >= response.query_micros);
+            assert!(receiver.try_recv().is_err());
+        }
+        let failed = failed.recv().unwrap();
+        assert_eq!(failed.generation, 10);
+        assert!(failed.result.is_err());
+        let empty = empty.recv().unwrap();
+        assert_eq!(empty.generation, 11);
+        assert!(empty.result.unwrap().is_empty());
+        let ordinary = response_rx.recv().unwrap();
+        assert_eq!(ordinary.generation, 12);
+        assert_eq!(ordinary.result.unwrap().references.len(), 3);
+        assert!(response_rx.try_recv().is_err());
+        assert!(lod_rx.try_recv().is_err());
+        assert!(stalled_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn sparse_requests_report_backpressure_disconnection_and_interior_keys() {
+        let database = WorldDatabase::saturated_queue();
+        let key = sparse_key(60, 2, -3);
+        let response = database
+            .request_references(1, key, BTreeSet::from([30]))
+            .unwrap();
+        assert_eq!(response.capacity(), Some(1));
+        assert!(
+            database
+                .request_references(2, key, BTreeSet::from([31]))
+                .unwrap_err()
+                .to_string()
+                .contains("request queue is full")
+        );
+        assert!(
+            database
+                .request_references(3, CellKey::Interior(10), BTreeSet::new())
+                .unwrap_err()
+                .to_string()
+                .contains("exterior position grid")
+        );
+        let (requests, request_rx) = bounded(1);
+        drop(request_rx);
+        assert!(
+            enqueue_reference_query(&requests, 4, key, BTreeSet::from([30]))
+                .unwrap_err()
+                .to_string()
+                .contains("worker stopped")
+        );
     }
 
     #[test]
@@ -1530,6 +2024,7 @@ mod tests {
         assert!(!denied.joins.contains("door_links"));
         assert!(denied.columns.contains(ABSENT_DOOR_COLUMNS));
     }
+
     #[test]
     fn enable_metadata_does_not_decode_reserved_door_slots() {
         let connection = Connection::open_in_memory().unwrap();

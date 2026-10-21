@@ -435,6 +435,8 @@ pub fn uv_transform(offset: Vec2, scale: Vec2) -> bevy::math::Affine2 {
 struct PlayState {
     /// The animated materials, for the visible-user scan.
     animated: HashSet<AssetId<StandardMaterial>>,
+    /// The animated materials a cluster batch draws with (it may draw anywhere, any frame).
+    clustered: HashSet<AssetId<StandardMaterial>>,
     frames: u64,
     played: usize,
 }
@@ -450,11 +452,11 @@ fn animate_materials(
     mut standard: ResMut<Assets<StandardMaterial>>,
     animated_standard: Res<AnimatedStandardMaterials>,
     users: Query<(&MeshMaterial3d<StandardMaterial>, &ViewVisibility)>,
+    cluster: Option<Res<crate::cluster::render::ClusterBatchHandles>>,
     mut state: Local<PlayState>,
 ) {
     let seconds = time.elapsed_secs();
     let state = &mut *state;
-    let mut drawn = HashSet::new();
     let grown = state.animated.len() != animated_standard.animated.len();
     if grown {
         state.animated = animated_standard
@@ -463,6 +465,16 @@ fn animate_materials(
             .map(|(id, _)| *id)
             .collect();
     }
+    if let Some(cluster) = cluster.as_ref()
+        && (grown || cluster.is_changed())
+    {
+        state.clustered = cluster
+            .ids()
+            .filter_map(|id| id.try_typed::<StandardMaterial>().ok())
+            .filter(|id| state.animated.contains(id))
+            .collect();
+    }
+    let mut drawn: HashSet<AssetId<StandardMaterial>> = state.clustered.clone();
     if !state.animated.is_empty() {
         drawn.extend(
             users
@@ -478,6 +490,7 @@ fn animate_materials(
     if state.frames.is_multiple_of(600) {
         info!(
             animated = state.animated.len(),
+            clustered = state.clustered.len(),
             played_per_frame = state.played as f64 / 600.0,
             "standard material animation"
         );

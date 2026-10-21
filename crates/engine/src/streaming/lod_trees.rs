@@ -348,9 +348,7 @@ fn plan_tree_lod(
     };
     let actual = views.current(&config, origin.0);
     let demand = actual;
-    let world = settings
-        .as_ref()
-        .is_none_or(|s| s.lod_trees)
+    let world = (settings.as_ref().is_none_or(|s| s.lod_trees) && !config.cluster_own_statics)
         .then_some(demand)
         .flatten()
         .map(|d| d.world)
@@ -375,6 +373,7 @@ fn plan_tree_lod(
             info!("distant tree LOD stopped: nothing to draw in the active space");
         }
         let holding = config.lod_keep_hidden_in_interiors
+            && !config.cluster_own_statics
             && actual.is_none()
             && settings.as_ref().is_none_or(|settings| settings.lod_trees)
             && streaming.catalog.worldspace_id.is_some();

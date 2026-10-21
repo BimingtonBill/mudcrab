@@ -165,10 +165,12 @@ pub struct EngineConfig {
     /// benchmark still measures the ring it always did.
     pub terrain_radius_given: bool,
     /// The cluster overlay (ADR-0013 output, `<assets>/derived/clusters-<settings-id>`) to draw
-    /// objects from as additional cluster draws. `--clusters [label |
+    /// objects from, as clusters in place of the stock models it owns. `--clusters [label |
     /// settings-id | path]`: the text names one overlay of `--assets`, empty for the only one.
     /// Unset draws nothing extra.
     pub clusters: Option<String>,
+    /// Experiment: hide certified owned exterior primitives once at instance spawn.
+    pub cluster_own_statics: bool,
     /// `--cluster-preload-batches`: request every cluster batch's material during the startup
     /// load, nearest first, instead of as each comes into view. The startup cover then waits for
     /// all of them, and nothing a view or a crossing proof depends on changes during play.
@@ -443,7 +445,7 @@ impl WaterReflectionPreset {
 /// | 16 | 1,064 | 20 | 54.2 ms |
 ///
 /// Each ring cell is four landscape draws of its own - one per quadrant, each with its own
-/// material - and costs the frame about 20 µs, so a ring's price is its cell count. Eight is the
+/// material - and costs the frame about 20 Âµs, so a ring's price is its cell count. Eight is the
 /// largest that stays clearly above the sixty-frame acceptance gate with the whole Pale in view;
 /// ten and twelve sit on the gate and sixteen falls through it. Frames were measured while other
 /// work ran on this machine and single runs differ by a quarter either way, so read the table as
@@ -476,6 +478,7 @@ impl Default for EngineConfig {
             object_lod: ObjectLodSettings::default(),
             terrain_radius: DEFAULT_TERRAIN_RADIUS,
             clusters: None,
+            cluster_own_statics: false,
             cluster_preload_batches: false,
             cluster_min_instance_pixels: None,
             cluster_prepass: true,
@@ -660,7 +663,9 @@ Streaming:
                                         where the worldspace has terrain LOD data; vanilla's view)
   --clusters [label|settings-id|path]   draw this cluster overlay of --assets (built by converter
                                         derive-clusters under <assets>/derived) as GPU-selected
-                                        clusters (ADR-0013)
+                                        clusters in place of the stock models it owns (ADR-0013)
+  --cluster-own-statics                 hide certified owned exterior primitives at spawn
+                                        (requires --clusters; ownership experiment)
   --cluster-preload-batches             load every cluster batch during the startup load instead
                                         of as it comes into view (requires --clusters)
   --cluster-min-instance-pixels <px>    skip instances whose bounding sphere spans fewer pixels (default: 0, none)
@@ -1205,6 +1210,7 @@ impl EngineConfig {
                         config.terrain_radius_given = true;
                     }
                 }
+                "--cluster-own-statics" => config.cluster_own_statics = true,
                 "--cluster-preload-batches" => config.cluster_preload_batches = true,
                 "--clusters" => {
                     // The selector is optional: bare `--clusters` means the only overlay.
@@ -1855,6 +1861,13 @@ impl EngineConfig {
             });
         }
         config.drop_jump_the_run_would_overwrite();
+        if config.cluster_own_statics && config.clusters.is_none() {
+            return Err(ConfigError::invalid_value(
+                "--cluster-own-statics",
+                None,
+                "--clusters",
+            ));
+        }
         if config.cluster_preload_batches && config.clusters.is_none() {
             return Err(ConfigError::invalid_value(
                 "--cluster-preload-batches",
@@ -2580,6 +2593,15 @@ mod tests {
     }
 
     #[test]
+    fn cluster_ownership_requires_a_package_and_is_accepted_with_one() {
+        assert!(!EngineConfig::default().cluster_own_statics);
+        assert!(EngineConfig::from_args(["--cluster-own-statics".to_owned()]).is_err());
+        assert!(
+            run_config(&["--clusters", "fixture", "--cluster-own-statics"]).cluster_own_statics
+        );
+    }
+
+    #[test]
     fn batch_preload_is_off_by_default_and_requires_a_package() {
         assert!(!EngineConfig::default().cluster_preload_batches);
         assert!(EngineConfig::from_args(["--cluster-preload-batches".to_owned()]).is_err());
@@ -2596,9 +2618,9 @@ mod tests {
         );
         // Bare, before another option or at the end: the only overlay.
         assert_eq!(run_config(&["--clusters"]).clusters.as_deref(), Some(""));
-        let config = run_config(&["--clusters", "--cluster-preload-batches"]);
+        let config = run_config(&["--clusters", "--cluster-own-statics"]);
         assert_eq!(config.clusters.as_deref(), Some(""));
-        assert!(config.cluster_preload_batches);
+        assert!(config.cluster_own_statics);
         // The old option is gone.
         assert!(EngineConfig::from_args(["--cluster-package".to_owned(), "x".to_owned()]).is_err());
     }

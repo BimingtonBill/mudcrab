@@ -10,10 +10,32 @@
 
 #[path = "gpu_contract.rs"]
 mod gpu_contract;
+#[path = "handoff.rs"]
+mod handoff;
 use gpu_contract::{CullParams, STAGES};
 
 #[path = "stable_order.rs"]
 mod stable_order;
+
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SourceExtraction;
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct ViewDomains<'w> {
+    sources: Res<'w, handoff::Sources>,
+}
+impl ViewDomains<'_> {
+    pub(crate) fn world(&self, key: RetainedViewEntity) -> Option<Option<u32>> {
+        self.sources
+            .worlds
+            .get(&key.main_entity)
+            .or_else(|| self.sources.worlds.get(&key.auxiliary_entity))
+            .copied()
+    }
+    pub(crate) fn origin(&self) -> IVec2 {
+        self.sources.origin
+    }
+}
 
 use super::assets::ClusterMeshAsset;
 pub use super::instance_identity::ClusterInstanceIdentity;
@@ -549,6 +571,10 @@ pub struct ClusterSettings {
     /// the camera has one. Off leaves them out of it, as before the prepass existed: what ambient
     /// occlusion, temporal anti-aliasing and the water's reflections read then has no clusters.
     pub prepass: bool,
+    /// `--cluster-own-statics`: owned stock primitives are hidden once at spawn
+    /// (`super::ownership`), so a view draws its selection base as it is, with no per-reference
+    /// stock overlay and no stock material comparison.
+    pub own_statics: bool,
 }
 
 impl Default for ClusterSettings {
@@ -559,6 +585,7 @@ impl Default for ClusterSettings {
             terrain_error_pixels: 1.0,
             fixed_count_draw: false,
             prepass: true,
+            own_statics: false,
         }
     }
 }
@@ -591,6 +618,7 @@ pub struct ClusterRenderPlugin;
 
 impl Plugin for ClusterRenderPlugin {
     fn build(&self, app: &mut App) {
+        handoff::install(app);
         embedded_asset!(app, "shaders/cluster_cull.wgsl");
         embedded_asset!(app, "shaders/cluster_draw.wgsl");
         embedded_asset!(app, "shaders/cluster_prepass.wgsl");
@@ -643,11 +671,6 @@ impl Plugin for ClusterRenderPlugin {
                         .in_set(RenderSystems::Queue)
                         .before(RenderSystems::QueueMeshes)
                         .after(queue_cluster_batches),
-                    upload_cluster_instance_masks
-                        .in_set(RenderSystems::QueueMeshes)
-                        .after(queue_cluster_batches)
-                        .after(queue_cluster_shadows)
-                        .before(publish_terrain_readiness),
                     publish_terrain_readiness
                         .in_set(RenderSystems::QueueMeshes)
                         .after(queue_cluster_batches)
@@ -689,8 +712,12 @@ struct ViewGpu {
     last_seen: std::time::Instant,
     /// Draw commands require a cull encoded for the current frame/epoch.
     last_cull_epoch: u32,
-    /// A05 draws all uploaded instances; A06 replaces this with certified selection.
-    draw_all_mask: Option<DrawAllMaskStamp>,
+    selection: Option<handoff::Selection>,
+    /// The visible-set-independent part of `selection` ([`handoff::SelectionBase`]).
+    selection_base: Option<Arc<handoff::SelectionBase>>,
+    instance_mask_bytes: Vec<u8>,
+    terrain_clip_bytes: Vec<u8>,
+    terrain_clip_inputs: Option<handoff::TerrainClipInputs>,
     prepass_pipelines: HashMap<u32, CachedRenderPipelineId>,
     shadow_pipelines: HashMap<u32, CachedRenderPipelineId>,
     args: Buffer,
@@ -725,6 +752,9 @@ struct ViewGpu {
     /// What the last walk over the batches was made from, kept only when it left nothing out for
     /// want of a prepared material, mesh or pipeline: the same again means the same plan.
     walk_stamp: Option<[u64; 7]>,
+    /// Per batch, whether it was drawable in this view, and what that was decided from
+    /// (`handoff::cached_batch_readiness`).
+    readiness_memo: Option<(u64, Vec<bool>)>,
     /// The cull epoch each prepass draw group last drew in (see [`DrawClusterIndirect`]'s `ONCE`).
     prepass_drawn: std::sync::Mutex<HashMap<u32, u32>>,
     walk_carriers: Vec<Option<(Entity, MainEntity)>>,
@@ -750,88 +780,6 @@ struct ViewGpu {
     cull_bind_group: BindGroup,
     draw_bind_group: BindGroup,
     shadow_bind_group: BindGroup,
-}
-
-/// The mask belongs to one GPU scene and one batch-table layout. Material generations
-/// may change independently of instance growth; neither may reuse an obsolete upload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DrawAllMaskStamp {
-    identity: u64,
-    generation: u64,
-    capacity: u32,
-    instances: u32,
-    mask_base: u32,
-}
-
-/// WGSL reads four little-endian u32 words per vec4, 128 instance bits per entry.
-/// Only actual uploaded instances are enabled. Clear the previous high-water tail
-/// on shrink, and leave the unaddressed allocation tail at its initial zero value.
-fn draw_all_instance_mask(capacity: u32, instances: u32, previous_instances: u32) -> Vec<u8> {
-    assert!(
-        instances <= capacity,
-        "instance mask exceeds the GPU allocation"
-    );
-    assert!(
-        previous_instances <= capacity,
-        "mask high-water mark exceeds allocation"
-    );
-    let entries = instances.max(previous_instances).div_ceil(128);
-    let mut bytes = Vec::with_capacity(entries as usize * 16);
-    for word in 0..u64::from(entries) * 4 {
-        let bits = u64::from(instances).saturating_sub(word * 32).min(32) as u32;
-        let mask = if bits == 0 {
-            0
-        } else {
-            u32::MAX >> (32 - bits)
-        };
-        bytes.extend_from_slice(&mask.to_le_bytes());
-    }
-    bytes
-}
-
-impl DrawAllMaskStamp {
-    fn upload(self, previous: Option<Self>) -> Option<Vec<u8>> {
-        if previous == Some(self) {
-            return None;
-        }
-        // A new allocation/layout starts zeroed. Its old high-water mark is irrelevant.
-        let previous_instances = previous
-            .filter(|old| {
-                old.identity == self.identity
-                    && old.capacity == self.capacity
-                    && old.mask_base == self.mask_base
-            })
-            .map_or(0, |old| old.instances);
-        Some(draw_all_instance_mask(
-            self.capacity,
-            self.instances,
-            previous_instances,
-        ))
-    }
-}
-
-/// Queue planning owns the batch prefix; this preparation writes only its mask suffix.
-/// Run after both camera and shadow plans, including frames when their walks are cached.
-fn upload_cluster_instance_masks(gpu: Option<ResMut<ClusterGpu>>, queue: Res<RenderQueue>) {
-    let Some(mut gpu) = gpu else {
-        return;
-    };
-    let stamp = DrawAllMaskStamp {
-        identity: gpu.identity,
-        generation: gpu.generation,
-        capacity: gpu.capacity_instances,
-        instances: gpu.total_instances,
-        mask_base: gpu.batches.len().max(1) as u32,
-    };
-    for view in gpu.views.values_mut() {
-        let Some(bytes) = stamp.upload(view.draw_all_mask) else {
-            continue;
-        };
-        if !bytes.is_empty() {
-            queue.write_buffer(&view.batch_table, u64::from(stamp.mask_base) * 16, &bytes);
-        }
-        view.draw_all_mask = Some(stamp);
-    }
 }
 
 /// One indirect draw covering every batch of a draw group.
@@ -1983,8 +1931,8 @@ fn queue_cluster_batches(
         };
         let mut alpha_mask_phase = alpha_mask_phases.get_mut(&view.retained_view_entity);
         // Carriers are draw-command identities, not scene geometry. Their own
-        // default render layer must not exclude a camera. A05 enables every
-        // uploaded instance; the compute pass still applies geometric and LOD culling.
+        // default render layer must not exclude the destination camera. Exact
+        // per-view object/world/layer selection is made by the instance mask.
         let Some(view_key) = view_key_cache.get(&view.retained_view_entity).copied() else {
             continue;
         };
@@ -2987,7 +2935,11 @@ fn new_view_gpu(
     ViewGpu {
         last_seen: std::time::Instant::now(),
         last_cull_epoch: 0,
-        draw_all_mask: None,
+        selection: None,
+        selection_base: None,
+        instance_mask_bytes: Vec::new(),
+        terrain_clip_bytes: Vec::new(),
+        terrain_clip_inputs: None,
         prepass_pipelines: HashMap::new(),
         shadow_pipelines: HashMap::new(),
         args,
@@ -3007,6 +2959,7 @@ fn new_view_gpu(
         memo: vec![None; gpu.batches.len()],
         plan_hash: None,
         walk_stamp: None,
+        readiness_memo: None,
         prepass_drawn: std::sync::Mutex::new(HashMap::new()),
         walk_carriers: Vec::new(),
         plan_items: Vec::new(),
@@ -4428,137 +4381,5 @@ mod tests {
                 &rewritten[base + 156..base + 176]
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod draw_all_mask_tests {
-    use super::{DrawAllMaskStamp, draw_all_instance_mask};
-
-    #[test]
-    fn mask_matches_shader_addressing_at_word_and_vec4_boundaries() {
-        for capacity in [1, 31, 32, 33, 127, 128, 129, 257] {
-            for instances in 0..=capacity {
-                let bytes = draw_all_instance_mask(capacity, instances, 0);
-                assert_eq!(bytes.len(), instances.div_ceil(128) as usize * 16);
-                for index in 0..bytes.len() as u32 * 8 {
-                    // Same vec4 index, word lane and bit shift as instance_in_view in WGSL.
-                    let offset = ((index >> 7) * 16 + ((index >> 5) & 3) * 4) as usize;
-                    let word = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-                    assert_eq!((word & (1 << (index & 31))) != 0, index < instances);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn growth_rewrites_partial_words_and_enables_only_arrived_instances() {
-        let mut gpu_bytes = vec![0; 48]; // capacity 257, rounded to three vec4 entries
-        for instances in [1, 31, 32, 33, 127, 128, 129, 257] {
-            let bytes = draw_all_instance_mask(257, instances, 0);
-            gpu_bytes[..bytes.len()].copy_from_slice(&bytes);
-            for index in 0..384 {
-                assert_eq!(
-                    (gpu_bytes[index / 8] & (1 << (index % 8))) != 0,
-                    index < instances as usize
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn shrink_clears_the_previous_high_water_tail_including_empty_scene() {
-        let mut gpu_bytes = draw_all_instance_mask(257, 257, 0);
-        let mut previous = 257;
-        for instances in [129, 33, 0] {
-            let bytes = draw_all_instance_mask(257, instances, previous);
-            gpu_bytes[..bytes.len()].copy_from_slice(&bytes);
-            for index in 0..384 {
-                assert_eq!(
-                    (gpu_bytes[index / 8] & (1 << (index % 8))) != 0,
-                    index < instances as usize
-                );
-            }
-            previous = instances;
-        }
-    }
-
-    #[test]
-    fn empty_mask_needs_no_upload() {
-        assert!(draw_all_instance_mask(257, 0, 0).is_empty());
-    }
-
-    #[test]
-    fn cache_key_invalidates_every_gpu_or_layout_dependency() {
-        let stamp = DrawAllMaskStamp {
-            identity: 1,
-            generation: 2,
-            capacity: 257,
-            instances: 33,
-            mask_base: 7,
-        };
-        for changed in [
-            DrawAllMaskStamp {
-                identity: 2,
-                ..stamp
-            },
-            DrawAllMaskStamp {
-                generation: 3,
-                ..stamp
-            },
-            DrawAllMaskStamp {
-                capacity: 258,
-                ..stamp
-            },
-            DrawAllMaskStamp {
-                instances: 34,
-                ..stamp
-            },
-            DrawAllMaskStamp {
-                mask_base: 8,
-                ..stamp
-            },
-        ] {
-            assert!(changed.upload(Some(stamp)).is_some());
-        }
-        assert!(stamp.upload(Some(stamp)).is_none());
-        assert!(stamp.upload(None).is_some()); // A recreated view must upload the same scene.
-    }
-
-    #[test]
-    fn cache_clears_old_tail_but_does_not_copy_it_into_a_new_allocation() {
-        let old = DrawAllMaskStamp {
-            identity: 1,
-            generation: 2,
-            capacity: 257,
-            instances: 257,
-            mask_base: 7,
-        };
-        let shrunk = DrawAllMaskStamp {
-            instances: 1,
-            ..old
-        };
-        let bytes = shrunk.upload(Some(old)).unwrap();
-        assert_eq!(bytes.len(), 48);
-        assert_eq!(bytes[0], 1);
-        assert!(bytes[1..].iter().all(|byte| *byte == 0));
-        let recreated = DrawAllMaskStamp {
-            identity: 2,
-            capacity: 1,
-            ..shrunk
-        };
-        assert_eq!(recreated.upload(Some(old)).unwrap().len(), 16);
-    }
-
-    #[test]
-    #[should_panic(expected = "instance mask exceeds the GPU allocation")]
-    fn mask_refuses_instances_beyond_capacity() {
-        draw_all_instance_mask(128, 129, 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "mask high-water mark exceeds allocation")]
-    fn mask_refuses_an_invalid_high_water_mark() {
-        draw_all_instance_mask(128, 1, 129);
     }
 }

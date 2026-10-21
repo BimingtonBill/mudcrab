@@ -125,3 +125,9 @@ pub mod shadow_buckets;
 pub mod source_identity;
 /// Shared terrain material and validated package consumer.
 pub mod terrain;
+
+pub(crate) mod ownership;
+
+pub(crate) mod instance_mask;
+
+pub(crate) mod source_fallback;

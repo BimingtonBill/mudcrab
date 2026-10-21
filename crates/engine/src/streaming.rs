@@ -15,8 +15,8 @@ use crate::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
             CELL_SIZE, CellRef, DistantTerrainRoot, ExpectedModelBounds, ExteriorCellGrid, FormId,
-            InstanceBounds, MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch,
-            WaterSurface, WorldPosition, WorldTransform,
+            InstanceBounds, MeshHandle, StreamedCellKey, StreamedCellRoot, StreamingCamera,
+            TerrainPatch, WaterSurface, WorldPosition, WorldTransform,
         },
         database::{
             AssetCatalog, CellDetail, CellKey, CellPayload, DatabaseRequest, DatabaseResponse,
@@ -50,6 +50,9 @@ use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+pub(crate) mod far_stock;
+mod reference_spawn;
+pub(crate) use reference_spawn::{ReferenceSpawnContext, reference_placement, spawn_reference};
 pub(crate) mod identity_changes;
 pub(crate) mod lod;
 mod lod_objects;
@@ -229,6 +232,13 @@ impl Plugin for StreamingPlugin {
     fn build(&self, app: &mut App) {
         identity_changes::install(app.world_mut());
         app.add_systems(Last, terrain_identity::validate_relationships);
+        if app
+            .world()
+            .get_resource::<EngineConfig>()
+            .is_some_and(|config| config.cluster_own_statics)
+        {
+            crate::cluster::ownership::install(app);
+        }
         app.init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
@@ -915,10 +925,19 @@ pub struct StreamingMetrics {
     pub unrecovered_lod_chunks: usize,
     pub resident_lod_chunks: usize,
     pub pending_lod_chunks: usize,
-    /// Cluster batches whose material is wanted by a view but not yet loaded.
+    /// Cluster batches whose material is wanted by a view but not yet loaded, so a view with
+    /// one is not settled (`--clusters`).
     pub pending_cluster_batches: usize,
     /// Demanded cluster source/material loads that failed permanently; never readiness.
     pub failed_cluster_batches: usize,
+    /// Current exact distant-stock cell requests not yet submitted to the database.
+    pub queued_far_stock_queries: usize,
+    /// Submitted exact distant-stock cells, including answers awaiting the commit budget.
+    pub pending_far_stock_queries: usize,
+    /// Current distant stock still awaiting fresh scoped render qualification feedback.
+    pub pending_far_stock_qualification: usize,
+    /// Current-demand exact source query, ownership or asset failures; never readiness.
+    pub failed_far_stock_sources: usize,
     pub ready_lod_terrain_patches: u64,
     pub visible_lod_terrain_patches: usize,
     pub total_lod_query_micros: u64,
@@ -1221,6 +1240,56 @@ enum CellStatus {
 /// each.
 #[derive(Component, Debug, Clone, Copy)]
 pub(crate) struct RetireHidden(Visibility);
+
+/// Read-only proof of streaming-owned distance retirement. An arbitrary hidden
+/// cell/reference never produces this fact; the marker remembers an actual hide.
+#[derive(SystemParam)]
+pub(crate) struct RetiredCellAccess<'w, 's> {
+    cells: Query<
+        'w,
+        's,
+        (&'static Visibility, &'static RetireHidden),
+        With<crate::world::components::StreamedCellKey>,
+    >,
+}
+
+impl RetiredCellAccess<'_, '_> {
+    pub(crate) fn contains(&self, cell: Entity) -> bool {
+        self.cells.get(cell).is_ok_and(|(visibility, original)| {
+            *visibility == Visibility::Hidden && original.0 != Visibility::Hidden
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_distance_retired_for_cluster_test(
+    world: &mut World,
+    cell: Entity,
+    retired: bool,
+) {
+    if retired {
+        let mut state = bevy::ecs::system::SystemState::<(
+            Commands,
+            Query<(&Visibility, Option<&RetireHidden>)>,
+        )>::new(world);
+        {
+            let (mut commands, roots) = state
+                .get_mut(world)
+                .expect("retirement test query resources");
+            hide_retiring_root(&mut commands, &roots, cell);
+        }
+        state.apply(world);
+    } else {
+        let original = world
+            .get::<RetireHidden>(cell)
+            .expect("actual retirement marker")
+            .0;
+        world
+            .entity_mut(cell)
+            .insert(original)
+            .remove::<RetireHidden>();
+    }
+}
 
 /// The space the player is in. The planner streams only this space: the active interior when
 /// there is one, otherwise the exterior cells around the camera in the active worldspace. A load
@@ -1667,6 +1736,9 @@ fn plan_cells(
                     commands.entity(root).try_insert(original);
                     commands.entity(root).try_remove::<RetireHidden>();
                 }
+                if config.clusters.is_some() && detail == CellDetail::Full {
+                    far_stock::queue_revive(&mut commands, root, *key);
+                }
                 revived += 1;
             }
             return true;
@@ -1678,6 +1750,9 @@ fn plan_cells(
         if paces_its_unload(*key, &space, config.worldspace_id) {
             match status {
                 CellStatus::Resident { root, detail } => {
+                    if config.clusters.is_some() {
+                        far_stock::queue_release(&mut commands, *root);
+                    }
                     hide_retiring_root(&mut commands, &roots, *root);
                     *status = CellStatus::Retiring {
                         root: *root,
@@ -1700,6 +1775,9 @@ fn plan_cells(
                     detail,
                     ..
                 } => {
+                    if config.clusters.is_some() {
+                        far_stock::queue_release(&mut commands, *root);
+                    }
                     hide_retiring_root(&mut commands, &roots, *root);
                     *status = CellStatus::Retiring {
                         root: *root,
@@ -1733,7 +1811,11 @@ fn plan_cells(
         };
         let unload_started = measure_space_unload.then(Instant::now);
         if let Some(root) = unload_root {
-            commands.entity(root).try_despawn();
+            if config.clusters.is_some() {
+                far_stock::queue_despawn(&mut commands, root);
+            } else {
+                commands.entity(root).try_despawn();
+            }
         }
         // The entities the queued despawn will remove. Only counted when profiling, because
         // walking a subtree costs time on the very frame a crossing pays for.
@@ -1946,7 +2028,9 @@ fn hide_retiring_root(
     }
     let original = *visibility;
     commands.queue(move |world: &mut World| {
-        if let Ok(mut entity) = world.get_entity_mut(root) {
+        if !far_stock::removal_blocked(world, root)
+            && let Ok(mut entity) = world.get_entity_mut(root)
+        {
             entity.insert((RetireHidden(original), Visibility::Hidden));
         }
     });
@@ -2257,6 +2341,12 @@ fn despawn_cells(world: &mut World) {
 /// The count walks `Children` first, so the batch span covers the accounting as well as the
 /// recursive removal. The walk is only paid on frames that unload cells.
 fn despawn_subtree(world: &mut World, root: Entity) -> usize {
+    if world.contains_resource::<far_stock::FarStock>() {
+        far_stock::release(world, root);
+    }
+    if far_stock::removal_blocked(world, root) {
+        return 0;
+    }
     let mut entities = 0usize;
     let mut stack = vec![root];
     while let Some(entity) = stack.pop() {
@@ -2528,9 +2618,11 @@ fn probe_retire_visibility(
 /// pacing spends from - because a system function takes at most sixteen parameters, and
 /// [`collect_cells`] - the commit path - is at that limit.
 #[derive(SystemParam)]
-struct CommitCatalogs<'w> {
+struct CommitCatalogs<'w, 's> {
     assets: Res<'w, AssetCatalog>,
     budget: ResMut<'w, StreamingCommitBudget>,
+    far: Option<ResMut<'w, far_stock::FarStock>>,
+    reference_entities: Query<'w, 's, (), With<FormId>>,
 }
 
 /// Hands the root a detail change replaces over to the stand-in hold (design-1091 Â§3): the cell
@@ -2547,7 +2639,9 @@ struct CommitCatalogs<'w> {
 /// which is what `crate::swap_bridge`'s detail-change hand-over reads to decide when the hold ends.
 fn hold_replaced_root(commands: &mut Commands, replaced: Entity) {
     commands.queue(move |world: &mut World| {
-        if let Ok(mut entity) = world.get_entity_mut(replaced) {
+        if !far_stock::removal_blocked(world, replaced)
+            && let Ok(mut entity) = world.get_entity_mut(replaced)
+        {
             entity.remove::<(StreamedCellRoot, DistantTerrainRoot)>();
             entity.insert(SwapStandIn::default());
         }
@@ -2810,6 +2904,11 @@ fn collect_cells(
                             );
                             metrics.ring_cells_empty = metrics.ring_cells_empty.saturating_add(1);
                             profiler.increment("streaming/ring_cells_invalid_terrain", 1);
+                            if config.clusters.is_some()
+                                && let Some(root) = replaced
+                            {
+                                far_stock::queue_release(&mut commands, root);
+                            }
                             fail_cell(
                                 &mut commands,
                                 &mut streaming,
@@ -2870,6 +2969,11 @@ fn collect_cells(
                     );
                     metrics.ring_cells_empty = metrics.ring_cells_empty.saturating_add(1);
                     profiler.increment("streaming/ring_cells_without_terrain", 1);
+                    if config.clusters.is_some()
+                        && let Some(root) = replaced
+                    {
+                        far_stock::queue_release(&mut commands, root);
+                    }
                     fail_cell(
                         &mut commands,
                         &mut streaming,
@@ -2901,6 +3005,15 @@ fn collect_cells(
                         metrics.full_cells_without_terrain.saturating_add(1);
                     profiler.increment("streaming/full_cells_without_terrain", 1);
                 }
+                let adoptions = if detail == CellDetail::Full {
+                    catalogs.far.as_deref_mut().map(|far| {
+                        far.take_adoptions(payload.key, &mut payload.references, |entity| {
+                            catalogs.reference_entities.contains(entity)
+                        })
+                    })
+                } else {
+                    None
+                };
                 let committed_key = payload.key;
                 let cell_id = payload.cell_id;
                 let drawn_merged = merged.is_some();
@@ -2959,6 +3072,9 @@ fn collect_cells(
                 if terrain_less {
                     commands.entity(root).insert(TerrainLess);
                 }
+                if let Some(adoptions) = adoptions {
+                    far_stock::queue_adopt(&mut commands, root, committed_key, adoptions);
+                }
                 streaming
                     .cells
                     .insert(response.key, CellStatus::Resident { root, detail });
@@ -2967,6 +3083,9 @@ fn collect_cells(
                 // is confirmed drawn - in the same frame the two are drawn together, never in
                 // neither - or, loudly and counted, when the hold bound passes.
                 if let Some(replaced) = replaced {
+                    if config.clusters.is_some() {
+                        far_stock::queue_release(&mut commands, replaced);
+                    }
                     hold_replaced_root(&mut commands, replaced);
                 }
                 // A full commit of a previously failed cell ends its failure record: the rescue is
@@ -2988,6 +3107,11 @@ fn collect_cells(
                     debug!(?response.key, %error, "the ring holds nothing at this grid");
                     metrics.ring_cells_empty = metrics.ring_cells_empty.saturating_add(1);
                     profiler.increment("streaming/ring_cells_without_a_cell", 1);
+                    if config.clusters.is_some()
+                        && let Some(root) = replaced
+                    {
+                        far_stock::queue_release(&mut commands, root);
+                    }
                     fail_cell(
                         &mut commands,
                         &mut streaming,
@@ -3094,7 +3218,7 @@ fn fail_cell(
         "full-detail failures go through record_failed_cell"
     );
     if let Some(replaced) = replaced {
-        commands.entity(replaced).try_despawn();
+        far_stock::queue_despawn(commands, replaced);
     }
     streaming.cells.insert(
         key,
@@ -3604,6 +3728,7 @@ fn spawn_cell_with_options(
     let mut root_commands = commands.spawn((
         Name::new(format!("Cell {:08X}", payload.cell_id)),
         CellRef(payload.cell_id),
+        StreamedCellKey(payload.key),
         Transform::from_translation(root_translation),
         Visibility::default(),
     ));
@@ -3832,129 +3957,18 @@ fn spawn_cell_with_options(
         if detail == CellDetail::Full {
             let references_started = Instant::now();
             let mut model_loads = 0u64;
+            let mut context = ReferenceSpawnContext {
+                key: payload.key,
+                model_sequence,
+                asset_server,
+                profiler,
+                world_physics: terrain_physics,
+                lights,
+                schedule_scenes,
+            };
             for reference in payload.references {
-                if !reference.initially_enabled {
-                    continue;
-                }
-                let creation_position = Vec3::from_array(reference.position);
-                let world_position = WorldPosition::from_creation_units(creation_position);
-                let translation = match payload.key {
-                    CellKey::Exterior { grid_x, grid_y, .. } => {
-                        let cell_origin = IVec2::new(grid_x, grid_y);
-                        creation_to_bevy(world_position.relative_to(cell_origin))
-                    }
-                    CellKey::Interior(_) => creation_to_bevy(creation_position),
-                };
-                let rotation = creation_rotation_to_bevy(reference.rotation);
-                let transform = Transform::from_translation(translation)
-                    .with_rotation(rotation)
-                    .with_scale(Vec3::splat(reference.scale));
-                let model_bounds = reference.bounds_valid.then(|| {
-                    ExpectedModelBounds::new(
-                        Vec3::from_array(reference.bounds_min),
-                        Vec3::from_array(reference.bounds_max),
-                    )
-                });
-                let model_bounds = model_bounds.flatten();
-                let bounds = model_bounds.map(|bounds| {
-                    InstanceBounds::transformed(bounds.min, bounds.max, transform.to_matrix())
-                });
-                let mut entity = parent.spawn((
-                    Name::new(format!("Reference {:08X}", reference.form_id)),
-                    FormId(reference.form_id),
-                    CellRef(reference.cell_id),
-                    world_position,
-                    WorldTransform(transform.to_matrix()),
-                    transform,
-                    // Every mesh this reference draws belongs to the placed-object layer, so the water
-                    // reflection pass - which renders the world layer only - leaves it out. The meshes
-                    // arrive later as descendants from the converted glb, so the layer is propagated
-                    // instead of inserted here; see `render::add_placed_object_layer_propagation`.
-                    Propagate(PLACED_OBJECT_RENDER_LAYERS),
-                ));
-                if let Some(bounds) = bounds.zip(model_bounds) {
-                    entity.insert(bounds);
-                }
-                // The colour the reference's `XEMI` source lends its model's `External_Emittance`
-                // surfaces once they are instantiated below it; see `crate::emittance`.
-                if let Some(rgb) = reference.emittance {
-                    entity.insert(crate::emittance::ReferenceEmittance::from_srgb(rgb));
-                }
-                // A child of the reference, so the light sits where the reference is and follows it
-                // through a render-origin rebase - and, because it is a descendant of the cell root,
-                // through the cell unload that despawns the reference.
-                if let Some(light) = reference.light.as_ref().and_then(|row| {
-                    crate::lights::point_light(row, reference.light_radius_override)
-                }) {
-                    let marker = crate::lights::SkyrimLight {
-                        form_id: reference.form_id,
-                        cell_id: reference.cell_id,
-                    };
-                    if !lights {
-                        entity.insert(crate::lights::DeferredPointLight { light, marker });
-                    } else {
-                        // A reference without a model has no visibility components, so its light child
-                        // could never become visible: Bevy warned (B0004) and extract_lights dropped every
-                        // such light. The reference needs Visibility for the hierarchy to propagate.
-                        entity.insert(Visibility::default());
-                        entity.with_child((
-                            Name::new(format!("Light {:08X}", reference.form_id)),
-                            light,
-                            marker,
-                            // Not the reference's propagated placed-object layer: a light keeps
-                            // `LIGHT_LAYERS` so it reaches the world layer and both cameras.
-                            crate::render::light_render_layers(),
-                        ));
-                    }
-                }
-                if let Some(door) =
-                    crate::doors::load_door(reference.form_id, reference.door.as_ref())
-                {
-                    entity.insert(door);
-                }
-                if let Some(path) = reference.model_path.and_then(converted_model_path) {
-                    model_loads += 1;
-                    let sequence = *model_sequence;
-                    *model_sequence = model_sequence.saturating_add(1);
-                    if schedule_scenes {
-                        let (center, radius) =
-                            requests::reference_geometry(world_position, &transform, bounds);
-                        entity.insert(requests::SceneRequest {
-                            path: path.clone(),
-                            cell: Some(payload.key),
-                            coarse_terrain: false,
-                            retry_cleanup: None,
-                            content_identity: None,
-                            sequence,
-                            center,
-                            radius,
-                            collision_candidate: terrain_physics
-                                && fixed_collision_record_eligible(
-                                    reference.base_record_type.as_deref(),
-                                ),
-                            handle: None,
-                            started: Instant::now(),
-                            allow_retry: false,
-                        });
-                    } else {
-                        let handle =
-                            asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.clone()));
-                        profiler.observe_scene(handle.id(), asset_server);
-                        entity.insert(PendingModel { handle, sequence });
-                    }
-                    entity.insert((
-                        MeshHandle(path.clone()),
-                        PendingAssetProfile {
-                            started: Instant::now(),
-                            scene_spawned: false,
-                            path,
-                            form_id: reference.form_id,
-                            base_form_id: reference.base_form_id,
-                            base_record_type: reference.base_record_type,
-                            static_physics: terrain_physics,
-                            cell_id: reference.cell_id,
-                        },
-                    ));
+                if let Some((_, requested)) = spawn_reference(parent, reference, &mut context) {
+                    model_loads += u64::from(requested);
                 }
             }
             profiler.record_elapsed("streaming/spawn_references", references_started);
@@ -4212,6 +4226,7 @@ fn arm_pending_models(
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
     mut runtime: Option<ResMut<runtime::StreamingRuntime>>,
+    mut ownership: crate::cluster::ownership::OwnershipGate,
 ) {
     use bevy::math::DVec3;
     let started = Instant::now();
@@ -4233,6 +4248,7 @@ fn arm_pending_models(
             position: DVec3::NAN,
             forward: DVec3::NAN,
         });
+    ownership.begin_frame();
     let mut ready: Vec<_> = pending
         .iter()
         .filter(|(entity, model, request)| {
@@ -4241,6 +4257,13 @@ fn arm_pending_models(
                     .as_ref()
                     .is_none_or(|streaming| requests::relevant(request, streaming))
             }) && model_can_spawn(world_assets.as_deref(), &asset_server, &model.handle)
+                && ownership.can_arm(
+                    *entity,
+                    world_assets
+                        .as_deref()
+                        .and_then(|assets| assets.get(&model.handle)),
+                    &mut commands,
+                )
         })
         .map(|(entity, model, request)| {
             let rank = request
@@ -13278,6 +13301,52 @@ mod tests {
             app.update();
         }
         app.world().resource::<StreamingMetrics>().clone()
+    }
+
+    // --- Paced model spawns (upstream main's `arm_pending_models`) ------------------------------
+
+    #[test]
+    fn cluster_ownership_defers_instantiation_until_the_certificate_can_decide() {
+        use crate::cluster::{
+            ownership::{OwnershipFacts, OwnershipReference, install},
+            reader::producer_fixture_tests::published_for_loader,
+        };
+        let directory = published_for_loader();
+        let package = std::sync::Arc::new(
+            crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
+        );
+        let mut app = model_app();
+        install(&mut app);
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::new(2.0, 4.0, 6.0));
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let model = add_converted_model(&mut app, converted_scene_with_material(mesh, material));
+        let root = spawn_pending_reference(&mut app, model, 0);
+        app.world_mut()
+            .entity_mut(root)
+            .insert(OwnershipReference(0x00F9907));
+        app.update();
+        assert!(app.world().get::<PendingModel>(root).is_some());
+        assert!(app.world().get::<WorldAssetRoot>(root).is_none());
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .pending_asset_instances,
+            1
+        );
+        // The certificate proves this reference is not owned; unrelated unresolved
+        // certified references must not prevent its ordinary model from spawning.
+        app.world_mut()
+            .resource_mut::<OwnershipFacts>()
+            .publish(&package, Default::default());
+        app.update();
+        assert!(app.world().get::<PendingModel>(root).is_none());
+        assert!(app.world().get::<WorldAssetRoot>(root).is_some());
     }
 
     #[test]

@@ -27,6 +27,40 @@ pub(super) struct NativeLodCell {
     pub cell: IVec2,
 }
 
+/// Without qualified contributor paths/relation proof, far native ownership wins.
+#[derive(Resource, Default)]
+pub(crate) struct FarNativePolicy {
+    pub revision: u64,
+    window: Option<(u32, IVec2, i32)>,
+    /// With owned statics (`--cluster-own-statics`) the cluster draws what it owns at every
+    /// distance and no native far LOD draws it, so nothing is withheld for one.
+    owned: bool,
+}
+impl FarNativePolicy {
+    pub(crate) fn cluster_inside_grid(&self, world: u32, cell: IVec2) -> bool {
+        self.owned
+            || self.window.is_some_and(|(w, center, radius)| {
+                w == world
+                    && (i64::from(cell.x) - i64::from(center.x)).abs() <= i64::from(radius)
+                    && (i64::from(cell.y) - i64::from(center.y)).abs() <= i64::from(radius)
+            })
+    }
+}
+
+/// Beyond the loaded grid, a cluster is withheld where native LOD may hold the same placement:
+/// trees (billboards) and possible object LOD contributors, which need both the base's Has
+/// Distant LOD flag (or missing base data) and the placement's Visible When Distant flag.
+/// A placement without Visible When Distant is not in object LOD, so its cluster draws.
+pub(crate) fn suppress_unqualified_far_cluster(
+    inside_grid: bool,
+    tree_lod_source: bool,
+    base_has_distant_lod: Option<bool>,
+    visible_when_distant: bool,
+) -> bool {
+    !inside_grid
+        && (tree_lod_source || (visible_when_distant && base_has_distant_lod != Some(false)))
+}
+
 /// Entities whose forward draw proof is missing that a periodic log line names, per view.
 const STUCK_SAMPLES: usize = 4;
 
@@ -192,6 +226,7 @@ impl Plugin for NativeLodPlugin {
         if let Some(render) = app.get_sub_app_mut(RenderApp) {
             render
                 .init_resource::<DrawStats>()
+                .init_resource::<FarNativePolicy>()
                 .init_resource::<Inputs>()
                 .init_resource::<Filters>()
                 .add_systems(ExtractSchedule, (publish, extract).chain())
@@ -247,6 +282,7 @@ type WalkKey = (u64, HashMap<Entity, BlockKey>, HashMap<CellKey, Entity>);
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn extract(
     mut out: ResMut<Inputs>,
+    mut policy: ResMut<FarNativePolicy>,
     native: Extract<Query<(Entity, &NativeLodCell)>>,
     cells: Extract<Res<StreamingWorld>>,
     pending: Extract<PendingUnder>,
@@ -255,6 +291,7 @@ fn extract(
     objects: Extract<Res<ObjectLodStreaming>>,
     config: Extract<Res<crate::config::EngineConfig>>,
     origin: Extract<Res<RenderOrigin>>,
+    views: Extract<super::lod::LodDemandViews>,
     mut timing: Local<crate::profiling::PeriodicTiming>,
     root_visibility: Extract<
         Query<(
@@ -270,6 +307,14 @@ fn extract(
     ),
 ) {
     let started = std::time::Instant::now();
+    let window = views
+        .current(&config, origin.0)
+        .map(|d| (d.world, d.center, config.stream_radius));
+    if policy.window != window || policy.owned != config.cluster_own_statics {
+        policy.window = window;
+        policy.owned = config.cluster_own_statics;
+        policy.revision = policy.revision.wrapping_add(1);
+    }
     // An object LOD state with no ready block (object LOD switched off, or nothing loaded yet)
     // gives the filter nothing to select or hide, and makes it walk every near cell for nothing.
     out.objects = objects
@@ -662,10 +707,99 @@ mod tests {
         assert!(qualified_cell(true, []));
     }
     #[test]
+    fn missing_contributor_policy_keeps_far_native_for_every_world_and_boundary() {
+        let policy = FarNativePolicy {
+            revision: 1,
+            window: Some((7, IVec2::new(-2, 3), 2)),
+            owned: false,
+        };
+        assert!(policy.cluster_inside_grid(7, IVec2::new(-4, 5)));
+        assert!(!policy.cluster_inside_grid(7, IVec2::new(-5, 5)));
+        assert!(!policy.cluster_inside_grid(8, IVec2::new(-2, 3)));
+        assert!(!FarNativePolicy::default().cluster_inside_grid(7, IVec2::ZERO));
+    }
+
+    #[test]
+    fn owned_statics_withhold_no_far_cluster_anywhere() {
+        let policy = FarNativePolicy {
+            revision: 1,
+            window: None,
+            owned: true,
+        };
+        for (world, cell) in [(7, IVec2::new(-500, 900)), (8, IVec2::ZERO)] {
+            let inside = policy.cluster_inside_grid(world, cell);
+            assert!(inside);
+            for flag in [None, Some(false), Some(true)] {
+                for vwd in [false, true] {
+                    for tree in [false, true] {
+                        assert!(!suppress_unqualified_far_cluster(inside, tree, flag, vwd));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_contribution_proof_cannot_retire_native_geometry() {
+        for flag in [None, Some(false), Some(true)] {
+            for vwd in [false, true] {
+                for tree in [false, true] {
+                    assert!(!suppress_unqualified_far_cluster(true, tree, flag, vwd));
+                }
+                assert!(suppress_unqualified_far_cluster(false, true, flag, vwd));
+            }
+        }
+        assert!(suppress_unqualified_far_cluster(false, false, None, true));
+        assert!(suppress_unqualified_far_cluster(
+            false,
+            false,
+            Some(true),
+            true
+        ));
+        assert!(!suppress_unqualified_far_cluster(
+            false,
+            false,
+            Some(false),
+            true
+        ));
+        // A placement without Visible When Distant is not in object LOD: its cluster draws.
+        for flag in [None, Some(false), Some(true)] {
+            assert!(!suppress_unqualified_far_cluster(false, false, flag, false));
+        }
+    }
+
+    #[test]
     fn held_hidden_roots_are_not_vacuous_draw_proof() {
         assert!(!loaded_root_visible(Visibility::Hidden, true));
         assert!(!loaded_root_visible(Visibility::Inherited, false));
         assert!(loaded_root_visible(Visibility::Inherited, true));
+    }
+
+    #[test]
+    fn nested_native_and_cluster_filters_restore_exact_visibility() {
+        use bevy::render::view::visibility::RenderVisibleEntitiesClass;
+        let ids: Vec<_> = (1..=3)
+            .map(|id| {
+                (
+                    Entity::from_raw_u32(id + 100).unwrap(),
+                    MainEntity::from(Entity::from_raw_u32(id).unwrap()),
+                )
+            })
+            .collect();
+        let mut class = RenderVisibleEntitiesClass::default();
+        class.update_cpu_culled_entities(&ids);
+        let raw = class.clone();
+        let mut native = ClassFilter::default();
+        let mut clusters = ClassFilter::default();
+        native.apply(&mut class, &[ids[0].1].into_iter().collect());
+        clusters.apply(&mut class, &[ids[1].1].into_iter().collect());
+        assert_eq!(class.iter_visible().count(), 1);
+        assert_eq!(class.iter_visible().next().unwrap().1, &ids[2].1);
+        clusters.restore(&mut class);
+        native.restore(&mut class);
+        assert_eq!(class.entities_cpu_culling, raw.entities_cpu_culling);
+        assert_eq!(class.added_entities, raw.added_entities);
+        assert_eq!(class.removed_entities, raw.removed_entities);
     }
 
     #[test]

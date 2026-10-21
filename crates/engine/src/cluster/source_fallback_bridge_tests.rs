@@ -1,0 +1,605 @@
+//! Real producer and loader inputs through source extraction and the fallback publisher.
+use super::*;
+use crate::cluster::{
+    assets::{ClusterBlockAsset, ClusterMeshAsset},
+    reader::{
+        CertifiedPackage, RecordKey,
+        producer_fixture_tests::{published_for_billboard_loader, published_for_loader},
+    },
+    render::{ClusterInstance, world_from_local},
+    source_identity::actual_loader_tests::{loader_app, wait_for_loaded},
+};
+use bevy::{
+    gltf::Gltf,
+    world_serialization::{WorldAsset, WorldAssetRoot, WorldInstance},
+};
+use std::fs;
+
+struct Fixture {
+    app: App,
+    render: World,
+    schedule: Schedule,
+    certificate: Arc<CertifiedPackage>,
+    refs: BTreeSet<u32>,
+    source: Handle<WorldAsset>,
+    mesh: ClusterMeshAsset,
+    _model: Handle<Gltf>,
+    // Both worlds and their certificate/asset handles drop before the synthetic files.
+    directory: tempfile::TempDir,
+}
+
+impl Fixture {
+    fn new(billboard: bool, normal_map: bool) -> Self {
+        let directory = if billboard {
+            published_for_billboard_loader()
+        } else {
+            published_for_loader()
+        };
+        let certificate = Arc::new(
+            crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
+        );
+        let refs: BTreeSet<_> = certificate
+            .records()
+            .map(|(_, row)| row.reference)
+            .collect();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(
+            certificate
+                .records()
+                .map(|(_, row)| row.worldspace)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2,
+            "the producer fixture covers parent and placed child worlds"
+        );
+        for reference in &refs {
+            assert!(certificate.reference_complete(*reference));
+        }
+        let model_path = certificate
+            .reference_model_path(*refs.first().unwrap())
+            .unwrap()
+            .to_owned();
+        let db = crate::cluster::overlay_fixture::read_db(directory.path());
+        let mesh_path: String = db
+            .query_row(
+                "SELECT payload_path FROM cluster_meshes WHERE model_path=?1 AND primitive_index=0",
+                [&model_path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mesh = ClusterMeshAsset::from_bytes(
+            fs::read(
+                crate::cluster::overlay_fixture::overlay_path(directory.path()).join(mesh_path),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut paths = db.prepare("SELECT payload_path FROM cluster_chunks ORDER BY worldspace_id,tier,anchor_x,anchor_y").unwrap();
+        let mut instances = Vec::new();
+        for path in paths.query_map([], |row| row.get::<_, String>(0)).unwrap() {
+            let bytes = fs::read(
+                crate::cluster::overlay_fixture::overlay_path(directory.path()).join(path.unwrap()),
+            )
+            .unwrap();
+            let block = ClusterBlockAsset::from_bytes(&bytes).unwrap();
+            assert_eq!(block.meshes.len(), 1);
+            assert_eq!(block.meshes[0].mesh_hash, mesh.mesh_hash);
+            for (ordinal, record) in block.instances.iter().enumerate() {
+                assert_eq!(record.mesh, 0);
+                let key = RecordKey {
+                    worldspace: block.worldspace_id,
+                    tier: block.tier,
+                    anchor: [block.anchor_x, block.anchor_y],
+                    ordinal: ordinal as u32,
+                };
+                let identity = certificate
+                    .record(&key)
+                    .expect("actual MCI record has authoritative identity");
+                assert!(refs.contains(&identity.reference));
+                instances.push(ClusterInstance {
+                    identity: ClusterInstanceIdentity::Object(key),
+                    mesh: 0,
+                    batch: 0,
+                    world_from_local: world_from_local(record),
+                    source_worldspace: record.source_worldspace_id,
+                });
+            }
+        }
+        assert_eq!(instances.len(), refs.len());
+        drop(paths);
+        drop(db);
+        let mut app = loader_app(directory.path());
+        app.init_asset::<StandardMaterial>()
+            .init_resource::<ClusterBatchHandles>()
+            .init_resource::<SourceFallbackDemand>()
+            .init_resource::<crate::cluster::ownership::OwnershipFacts>()
+            .insert_resource(ValidatedPackage(certificate.clone()));
+        let model: Handle<Gltf> = app
+            .world()
+            .resource::<AssetServer>()
+            .load(model_path.clone());
+        wait_for_loaded(&mut app, &model);
+        let source = app
+            .world()
+            .resource::<Assets<Gltf>>()
+            .get(&model)
+            .unwrap()
+            .scenes[0]
+            .clone();
+        let mut material = StandardMaterial::default();
+        if normal_map {
+            material.normal_map_texture = Some(
+                app.world_mut()
+                    .resource_mut::<Assets<Image>>()
+                    .add(Image::default()),
+            );
+        }
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(material);
+        app.world_mut()
+            .resource_mut::<ClusterBatchHandles>()
+            .set(0, material);
+        let lazy = LazyBatches::for_source_test(&model_path, source.clone());
+        assert_eq!(lazy.source_scene(0), Some(&source));
+        assert!(lazy.source_scene(1).is_none());
+        app.insert_resource(lazy).insert_resource(ClusterScene {
+            certificate: Some(certificate.clone()),
+            terrain_blocks: Vec::new(),
+            meshes: vec![mesh.clone()],
+            instances,
+            origin_offset: Vec3::ZERO,
+            blocks: Vec::new(),
+        });
+        let mut render = World::new();
+        render.init_resource::<Sources>();
+        let mut schedule = Schedule::new(ExtractSchedule);
+        schedule.add_systems((super::super::extract_sources, publish).chain());
+        Self {
+            app,
+            render,
+            schedule,
+            certificate,
+            refs,
+            source,
+            mesh,
+            _model: model,
+            directory,
+        }
+    }
+
+    fn extract(&mut self) {
+        // Model the next main-world frame without spawning any stock scene.
+        self.app.world_mut().increment_change_tick();
+        let mut main = MainWorld::default();
+        std::mem::swap(self.app.world_mut(), &mut *main);
+        self.render.insert_resource(main);
+        self.schedule.run(&mut self.render);
+        let mut main = self.render.remove_resource::<MainWorld>().unwrap();
+        std::mem::swap(self.app.world_mut(), &mut *main);
+    }
+
+    fn take(&mut self) -> Option<(u64, BTreeSet<u32>)> {
+        self.app
+            .world_mut()
+            .resource_mut::<SourceFallbackDemand>()
+            .consume_for_package(&self.certificate)
+            .map(|(revision, refs)| (revision, refs.clone()))
+    }
+
+    fn scene_tick(&self) -> Tick {
+        self.app
+            .world()
+            .get_resource_ref::<ClusterScene>()
+            .unwrap()
+            .last_changed()
+    }
+
+    fn assert_no_stock_scene(&mut self) {
+        let world = self.app.world_mut();
+        assert_eq!(world.query::<&WorldAssetRoot>().iter(world).count(), 0);
+        assert_eq!(world.query::<&WorldInstance>().iter(world).count(), 0);
+    }
+}
+
+#[test]
+fn ownership_retries_a_pending_template_that_becomes_valid_without_scene_changes() {
+    use crate::cluster::ownership::OwnershipFacts;
+    let mut fixture = Fixture::new(false, false);
+    fixture.app.init_resource::<OwnershipFacts>();
+    let templates = fixture
+        .app
+        .world_mut()
+        .remove_resource::<Assets<WorldAsset>>()
+        .unwrap();
+    let tick = fixture.scene_tick();
+    fixture.extract();
+    for reference in &fixture.refs {
+        assert!(
+            !fixture
+                .app
+                .world()
+                .resource::<OwnershipFacts>()
+                .can_spawn(*reference)
+        );
+    }
+    fixture.app.insert_resource(templates);
+    fixture.extract();
+    assert_eq!(fixture.scene_tick(), tick);
+    for reference in &fixture.refs {
+        assert!(
+            fixture
+                .app
+                .world()
+                .resource::<OwnershipFacts>()
+                .can_spawn(*reference)
+        );
+    }
+}
+
+#[test]
+fn pending_false_then_loaded_billboard_false_publishes_exact_complete_sources() {
+    let mut fixture = Fixture::new(true, false);
+    let templates = fixture
+        .app
+        .world_mut()
+        .remove_resource::<Assets<WorldAsset>>()
+        .unwrap();
+    fixture.extract();
+    let sources = fixture.render.resource::<Sources>();
+    assert_eq!(sources.templates, [false]);
+    assert!(sources.source_fallback_batches.is_empty());
+    let (pending_revision, pending) = fixture
+        .take()
+        .expect("fresh definitive-negative projection");
+    // This report describes only definite refusals. Empty does not authorize
+    // clusters, stock suppression, or template/pipeline readiness.
+    assert!(
+        pending.is_empty(),
+        "a missing template is not a definitive refusal"
+    );
+    assert!(fixture.take().is_none(), "one delivery per extraction");
+    fixture.app.insert_resource(templates);
+    let template = fixture
+        .app
+        .world()
+        .resource::<Assets<WorldAsset>>()
+        .get(&fixture.source)
+        .unwrap();
+    let mut extras = template
+        .world
+        .try_query::<&bevy::gltf::GltfExtras>()
+        .unwrap();
+    assert!(extras.iter(&template.world).any(|extras| {
+        crate::billboard::BillboardMode::from_extras(&extras.value)
+            == Some(crate::billboard::BillboardMode::TurnAboutUp)
+    }));
+    let mut static_models = template.world.try_query::<&SourceStaticModel>().unwrap();
+    assert_eq!(
+        static_models
+            .iter(&template.world)
+            .map(|marker| marker.0)
+            .collect::<Vec<_>>(),
+        [true],
+        "the actual loader tags a static primitive; its authored billboard is the refusal"
+    );
+    assert!(!template_valid(template, &HashSet::new()));
+    fixture.extract();
+    let sources = fixture.render.resource::<Sources>();
+    assert_eq!(
+        sources.templates,
+        [false],
+        "the positive vector itself did not change"
+    );
+    assert_eq!(sources.source_fallback_batches, BTreeSet::from([0]));
+    let (revision, refs) = fixture.take().unwrap();
+    assert!(revision > pending_revision);
+    assert_eq!(refs, fixture.refs);
+    assert!(fixture.take().is_none());
+    fixture.extract();
+    assert_eq!(fixture.take(), Some((revision, refs)));
+    fixture.assert_no_stock_scene();
+}
+
+#[test]
+fn late_tangent_failure_reprojects_cached_pending_inputs_without_a_scene_tick_change() {
+    let mut fixture = Fixture::new(false, true);
+    let tick = fixture.scene_tick();
+    assert_eq!(fixture.mesh.prepared_tangents_usable(), None);
+    fixture.extract();
+    let sources = fixture.render.resource::<Sources>();
+    assert_eq!(sources.templates, [true]);
+    assert_eq!(sources.normal_maps, [true]);
+    assert!(sources.source_fallback_batches.is_empty());
+    assert!(
+        fixture.take().is_none(),
+        "pending tangents cannot publish qualification"
+    );
+    fixture.extract();
+    assert!(
+        fixture.take().is_none(),
+        "an unchanged pending projection stays unavailable"
+    );
+    assert_eq!(fixture.scene_tick(), tick);
+    fixture.mesh.clone().fail_tangents_for_test();
+    assert_eq!(fixture.mesh.prepared_tangents_usable(), Some(false));
+    assert_eq!(fixture.scene_tick(), tick);
+    fixture.extract();
+    assert_eq!(fixture.scene_tick(), tick);
+    assert!(
+        fixture
+            .render
+            .resource::<Sources>()
+            .source_fallback_batches
+            .is_empty()
+    );
+    let (revision, refs) = fixture
+        .take()
+        .expect("completed failure must reproject the exact references");
+    assert_eq!(refs, fixture.refs);
+    fixture.extract();
+    assert_eq!(fixture.take(), Some((revision, refs)));
+    fixture.assert_no_stock_scene();
+}
+
+#[test]
+fn a_missing_normal_mapped_mesh_withdraws_previously_published_fallback_feedback() {
+    let mut fixture = Fixture::new(false, true);
+    fixture.mesh.clone().fail_tangents_for_test();
+    fixture.extract();
+    assert_eq!(fixture.take().unwrap().1, fixture.refs);
+    fixture
+        .app
+        .world_mut()
+        .resource_mut::<ClusterScene>()
+        .meshes
+        .clear();
+    fixture.extract();
+    assert!(fixture.take().is_none());
+    assert!(
+        fixture
+            .app
+            .world()
+            .resource::<SourceFallbackDemand>()
+            .for_package(&fixture.certificate)
+            .is_none()
+    );
+    for reference in &fixture.refs {
+        assert!(
+            !fixture
+                .app
+                .world()
+                .resource::<crate::cluster::ownership::OwnershipFacts>()
+                .can_spawn(*reference)
+        );
+    }
+}
+
+#[test]
+fn absent_or_mismatched_source_scope_withdraws_previously_published_feedback() {
+    for case in [
+        "missing_scene",
+        "missing_certificate",
+        "different_certificate",
+    ] {
+        let mut fixture = Fixture::new(false, true);
+        fixture.mesh.clone().fail_tangents_for_test();
+        fixture.extract();
+        assert_eq!(fixture.take().unwrap().1, fixture.refs);
+        match case {
+            "missing_scene" => {
+                fixture.app.world_mut().remove_resource::<ClusterScene>();
+            }
+            "missing_certificate" => {
+                fixture
+                    .app
+                    .world_mut()
+                    .remove_resource::<ValidatedPackage>();
+            }
+            "different_certificate" => {
+                let other = Arc::new(
+                    crate::cluster::overlay_fixture::open_fixture(fixture.directory.path(), false)
+                        .unwrap(),
+                );
+                assert!(!Arc::ptr_eq(&fixture.certificate, &other));
+                fixture
+                    .app
+                    .world_mut()
+                    .resource_mut::<ClusterScene>()
+                    .certificate = Some(other);
+            }
+            _ => unreachable!(),
+        }
+        fixture.extract();
+        assert!(fixture.take().is_none(), "{case}");
+        assert!(
+            fixture
+                .app
+                .world()
+                .resource::<SourceFallbackDemand>()
+                .for_package(&fixture.certificate)
+                .is_none(),
+            "{case}"
+        );
+        for reference in &fixture.refs {
+            assert!(
+                !fixture
+                    .app
+                    .world()
+                    .resource::<crate::cluster::ownership::OwnershipFacts>()
+                    .can_spawn(*reference),
+                "{case}"
+            );
+        }
+    }
+}
+
+fn assert_incremental_matches_full(
+    projection: &mut Projection,
+    facts: &mut OwnershipFacts,
+    certificate: &Arc<CertifiedPackage>,
+    scene: &ClusterScene,
+    tick: u32,
+    sources: &Sources,
+    visited: usize,
+) {
+    let update = projection
+        .update(certificate, scene, Tick::new(tick), sources, true)
+        .unwrap();
+    assert_eq!(
+        update.visited, visited,
+        "only affected batches may be visited"
+    );
+    facts.publish_updates(certificate, update.reset, update.ownership);
+    let full = references_requiring_source(
+        certificate,
+        scene,
+        &sources.source_fallback_batches,
+        &sources.normal_maps,
+        Some(&sources.templates),
+    )
+    .unwrap();
+    assert_eq!(
+        projection
+            .reference_counts
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        full.references
+    );
+    assert_eq!(
+        projection
+            .pending_tangents
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        full.pending_tangents
+    );
+    assert_eq!(facts.projected_records(), &full.ownership);
+}
+
+#[test]
+fn incremental_projection_matches_full_across_readiness_scene_and_certificate_changes() {
+    let fixture = Fixture::new(false, false);
+    let mut scene = fixture.app.world().resource::<ClusterScene>().clone();
+    scene.instances[1].batch = 1;
+    let mut sources = Sources {
+        templates: vec![false, false],
+        normal_maps: vec![false, false],
+        ..default()
+    };
+    let mut projection = Projection::default();
+    let mut facts = OwnershipFacts::default();
+    let package = &fixture.certificate;
+    assert_incremental_matches_full(&mut projection, &mut facts, package, &scene, 1, &sources, 2);
+    assert_incremental_matches_full(&mut projection, &mut facts, package, &scene, 1, &sources, 0);
+    sources.templates[0] = true;
+    assert_incremental_matches_full(&mut projection, &mut facts, package, &scene, 1, &sources, 1);
+    sources.templates[1] = true;
+    assert_incremental_matches_full(&mut projection, &mut facts, package, &scene, 1, &sources, 1);
+    sources.normal_maps[0] = true;
+    assert_incremental_matches_full(&mut projection, &mut facts, package, &scene, 1, &sources, 1);
+    assert_incremental_matches_full(&mut projection, &mut facts, package, &scene, 1, &sources, 0);
+    fixture.mesh.clone().fail_tangents_for_test();
+    assert_incremental_matches_full(&mut projection, &mut facts, package, &scene, 1, &sources, 1);
+    sources.source_fallback_batches.insert(1);
+    assert_incremental_matches_full(&mut projection, &mut facts, package, &scene, 1, &sources, 1);
+    sources.source_fallback_batches.clear();
+    assert_incremental_matches_full(&mut projection, &mut facts, package, &scene, 1, &sources, 1);
+    sources.normal_maps[0] = false;
+    sources.templates[1] = false;
+    assert_incremental_matches_full(&mut projection, &mut facts, package, &scene, 1, &sources, 2);
+    scene.instances.pop();
+    assert_incremental_matches_full(&mut projection, &mut facts, package, &scene, 2, &sources, 1);
+    let replacement = Arc::new(
+        crate::cluster::overlay_fixture::open_fixture(fixture.directory.path(), false).unwrap(),
+    );
+    assert_incremental_matches_full(
+        &mut projection,
+        &mut facts,
+        &replacement,
+        &scene,
+        2,
+        &sources,
+        1,
+    );
+    sources.normal_maps[0] = true;
+    scene.meshes.clear();
+    assert!(
+        projection
+            .update(&replacement, &scene, Tick::new(3), &sources, true)
+            .is_err()
+    );
+    assert!(
+        references_requiring_source(
+            &replacement,
+            &scene,
+            &sources.source_fallback_batches,
+            &sources.normal_maps,
+            Some(&sources.templates)
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn fallback_reference_union_retains_a_reference_required_by_another_batch() {
+    let fixture = Fixture::new(false, false);
+    let mut scene = fixture.app.world().resource::<ClusterScene>().clone();
+    // The union is by reference rather than batch. A repeated occurrence exercises
+    // this property without inventing identity outside the real certificate.
+    scene.instances.truncate(1);
+    let mut repeated = scene.instances[0];
+    repeated.batch = 1;
+    scene.instances.push(repeated);
+    let mut sources = Sources {
+        source_fallback_batches: BTreeSet::from([0, 1]),
+        ..default()
+    };
+    let mut projection = Projection::default();
+    let first = projection
+        .update(&fixture.certificate, &scene, Tick::new(1), &sources, false)
+        .unwrap();
+    let mut demand = SourceFallbackDemand::default();
+    demand.update(Some(&fixture.certificate), first.added);
+    let (revision, references) = demand.for_package(&fixture.certificate).unwrap();
+    let references = references.clone();
+    sources.source_fallback_batches.remove(&1);
+    let update = projection
+        .update(&fixture.certificate, &scene, Tick::new(1), &sources, false)
+        .unwrap();
+    assert_eq!(update.visited, 1);
+    assert!(update.added.is_empty());
+    assert!(update.removed.is_empty());
+    assert!(!demand.update_delta(&fixture.certificate, &update.added, &update.removed));
+    assert_eq!(
+        demand.consume_for_package(&fixture.certificate),
+        Some((revision, &references))
+    );
+    sources.source_fallback_batches = BTreeSet::from([1]);
+    let update = projection
+        .update(&fixture.certificate, &scene, Tick::new(1), &sources, false)
+        .unwrap();
+    assert_eq!(update.visited, 2);
+    assert!(update.added.is_empty());
+    assert!(update.removed.is_empty());
+    assert!(!demand.update_delta(&fixture.certificate, &update.added, &update.removed));
+    assert_eq!(
+        demand.consume_for_package(&fixture.certificate),
+        Some((revision, &references))
+    );
+    sources.source_fallback_batches.clear();
+    let update = projection
+        .update(&fixture.certificate, &scene, Tick::new(1), &sources, false)
+        .unwrap();
+    assert_eq!(update.visited, 1);
+    assert!(demand.update_delta(&fixture.certificate, &update.added, &update.removed));
+    assert!(
+        demand
+            .for_package(&fixture.certificate)
+            .unwrap()
+            .1
+            .is_empty()
+    );
+}

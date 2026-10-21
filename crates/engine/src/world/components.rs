@@ -169,3 +169,8 @@ mod tests {
         assert!(ExpectedModelBounds::new(Vec3::ZERO, Vec3::splat(f32::NAN)).is_none());
     }
 }
+
+/// The complete cell identity carried by a streamed root, including exterior worldspace.
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
+#[reflect(Component)]
+pub struct StreamedCellKey(pub crate::world::database::CellKey);

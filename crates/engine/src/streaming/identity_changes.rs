@@ -152,6 +152,7 @@ pub(crate) fn install(world: &mut World) {
         SourcePrimitiveTransform,
         SourceStaticModel,
         SourceNodePose,
+        crate::world::components::StreamedCellKey,
         super::RetireHidden,
         super::AssetFailed,
         super::TerrainCoverage,

@@ -53,6 +53,16 @@ pub struct WorldReadyInputs {
     /// will still change the frame, so the world is not ready while either is nonzero.
     pub pending_lod_queries: usize,
     pub pending_lod_chunks: usize,
+    /// Cluster batches a view wants whose material has not loaded.
+    pub pending_cluster_batches: usize,
+    pub failed_cluster_batches: usize,
+    /// Exact distant stock requests queued or awaiting commit, and current demanded failures.
+    /// These are loading facts; they do not certify that any render pass drew the source.
+    pub queued_far_stock_queries: usize,
+    pub pending_far_stock_queries: usize,
+    /// Current distant stock still awaiting fresh scoped render qualification feedback.
+    pub pending_far_stock_qualification: usize,
+    pub failed_far_stock_sources: usize,
     /// Distant object blocks and tree billboard blocks requested but not yet spawned.
     pub pending_lod_objects: usize,
 }
@@ -72,6 +82,12 @@ impl WorldReadyInputs {
             && self.pending_drawn == 0
             && self.pending_lod_queries == 0
             && self.pending_lod_chunks == 0
+            && self.pending_cluster_batches == 0
+            && self.failed_cluster_batches == 0
+            && self.queued_far_stock_queries == 0
+            && self.pending_far_stock_queries == 0
+            && self.pending_far_stock_qualification == 0
+            && self.failed_far_stock_sources == 0
             && self.pending_lod_objects == 0
     }
 
@@ -94,6 +110,12 @@ impl WorldReadyInputs {
             pending_drawn,
             pending_lod_queries: metrics.pending_lod_queries,
             pending_lod_chunks: metrics.pending_lod_chunks,
+            pending_cluster_batches: metrics.pending_cluster_batches,
+            failed_cluster_batches: metrics.failed_cluster_batches,
+            queued_far_stock_queries: metrics.queued_far_stock_queries,
+            pending_far_stock_queries: metrics.pending_far_stock_queries,
+            pending_far_stock_qualification: metrics.pending_far_stock_qualification,
+            failed_far_stock_sources: metrics.failed_far_stock_sources,
             pending_lod_objects: metrics.pending_lod_object_blocks
                 + metrics.pending_lod_tree_blocks
                 + metrics.unrecovered_lod_object_blocks
@@ -585,6 +607,26 @@ mod tests {
         assert!(ready_inputs().is_ready());
     }
 
+    #[test]
+    fn world_ready_maps_current_distant_stock_work_and_failures() {
+        let metrics = StreamingMetrics {
+            queued_far_stock_queries: 2,
+            pending_far_stock_queries: 3,
+            pending_far_stock_qualification: 7,
+            failed_far_stock_sources: 5,
+            ..default()
+        };
+        let inputs = WorldReadyInputs::from_streaming(&metrics, 0, 25, 25, 0);
+        assert_eq!(inputs.queued_far_stock_queries, 2);
+        assert_eq!(inputs.pending_far_stock_queries, 3);
+        assert_eq!(inputs.pending_far_stock_qualification, 7);
+        assert_eq!(inputs.failed_far_stock_sources, 5);
+        assert!(!inputs.is_ready());
+        assert!(
+            WorldReadyInputs::from_streaming(&StreamingMetrics::default(), 0, 25, 25, 0).is_ready()
+        );
+    }
+
     /// "Ready" means drawn, not validated (design-1091 §4): a surface a view can see that the render
     /// world has not confirmed drawn holds the mark, so the benchmark does not time a stand-in or a
     /// hole - and, on its own, nothing else can be the reason.
@@ -613,7 +655,7 @@ mod tests {
 
     #[test]
     fn each_condition_alone_holds_the_world_back() {
-        let holds_back: [fn(&mut WorldReadyInputs); 11] = [
+        let holds_back: [fn(&mut WorldReadyInputs); 15] = [
             |i| i.resident_window_cells = 24,
             |i| i.loading_cells = 1,
             |i| i.active_requests = 1,
@@ -623,6 +665,10 @@ mod tests {
             |i| i.pending_drawn = 1,
             |i| i.pending_lod_queries = 1,
             |i| i.pending_lod_chunks = 1,
+            |i| i.queued_far_stock_queries = 1,
+            |i| i.pending_far_stock_queries = 1,
+            |i| i.pending_far_stock_qualification = 7,
+            |i| i.failed_far_stock_sources = 1,
             |i| i.pending_lod_objects = 1,
             |i| i.window_cells = 0,
         ];

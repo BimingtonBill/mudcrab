@@ -614,6 +614,7 @@ fn update_destination_reports(
     generations: Res<Generations>,
     results: Res<RenderResults>,
     streaming: Option<Res<StreamingWorld>>,
+    far: Option<Res<crate::streaming::far_stock::FarStock>>,
     pending_under: PendingUnder,
     assets: LandingAssets,
     mut reports: ResMut<DestinationReports>,
@@ -649,6 +650,25 @@ fn update_destination_reports(
                     }
                     (residency, assets_pending)
                 });
+        // Only this request's exact placed-world cells matter here. Global far-horizon work
+        // belongs to whole-view settling, and a sparse source holder never proves geometry or
+        // a pass drawable. Keep the render-world proof below unchanged.
+        if let Some(far) = far.as_deref() {
+            for &cell in request.coverage.iter() {
+                let state = far.cell_state(cell);
+                assets_pending += state.pending;
+                if state.failed {
+                    residency = Residency::AssetsFailed(cell);
+                }
+                if let Some(root) = state.holder {
+                    let inspected = assets.inspect_under(root);
+                    assets_pending += pending_under.count(root) + inspected.waiting;
+                    if pending_under.failed(root) > 0 || !inspected.failed.is_empty() {
+                        residency = Residency::AssetsFailed(cell);
+                    }
+                }
+            }
+        }
         let evaluated = results
             .proofs
             .get(&id)
