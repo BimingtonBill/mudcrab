@@ -477,3 +477,561 @@ fn empty_scene_root_derived_no_clip_survives_source_edits_without_repeated_root_
         no_root(&loaded);
     }
 }
+
+// These fixtures exercise the extension hooks through GltfPlugin, not a synthetic inventory.
+mod named_actual_loader {
+    use super::*;
+    use bevy::{
+        animation::{AnimatedBy, AnimationPlugin, AnimationTargetId, graph::AnimationNodeType},
+        time::TimeUpdateStrategy,
+        world_serialization::{WorldInstance, WorldInstanceSpawner},
+    };
+
+    fn animated_glb(scale: f32) -> Vec<u8> {
+        let mut binary = Vec::new();
+        let mut views = Vec::new();
+        let mut accessors = Vec::new();
+        let mut animations = Vec::new();
+        // Different durations and directions make swapped names or stale replacement clips visible.
+        for (name, duration, start, end) in [
+            ("Open", 2.0_f32, 0.0, 4.0),
+            ("Close", 4.0, 4.0, 0.0),
+            ("Idle", 6.0, 10.0, 22.0),
+        ] {
+            let time_view = views.len();
+            views.push(serde_json::json!({
+                "buffer":0,"byteOffset":binary.len(),"byteLength":8
+            }));
+            for value in [0.0_f32, duration] {
+                binary.extend(value.to_le_bytes());
+            }
+            let output_view = views.len();
+            views.push(serde_json::json!({
+                "buffer":0,"byteOffset":binary.len(),"byteLength":24
+            }));
+            for value in [start * scale, 0.0, 0.0, end * scale, 0.0, 0.0] {
+                binary.extend(value.to_le_bytes());
+            }
+            let input = accessors.len();
+            accessors.push(serde_json::json!({
+                "bufferView":time_view,"componentType":5126,"count":2,"type":"SCALAR",
+                "min":[0.0],"max":[duration]
+            }));
+            let output = accessors.len();
+            accessors.push(serde_json::json!({
+                "bufferView":output_view,"componentType":5126,"count":2,"type":"VEC3"
+            }));
+            animations.push(serde_json::json!({
+                "name":name,
+                "samplers":[{"input":input,"output":output,"interpolation":"LINEAR"}],
+                "channels":[{"sampler":0,"target":{"node":1,"path":"translation"}}]
+            }));
+        }
+        let mut json = serde_json::to_vec(&serde_json::json!({
+            "asset":{"version":"2.0"},
+            "buffers":[{"byteLength":binary.len()}],
+            "bufferViews":views,"accessors":accessors,"animations":animations,
+            "nodes":[{"name":"Hinge","children":[1]},{"name":"Leaf"}],
+            "scenes":[{"name":"Invented animated scene","nodes":[0]}],"scene":0
+        }))
+        .unwrap();
+        while !json.len().is_multiple_of(4) {
+            json.push(b' ');
+        }
+        let mut bytes = Vec::new();
+        bytes.extend(b"glTF");
+        bytes.extend(2_u32.to_le_bytes());
+        bytes.extend((12_u32 + 8 + json.len() as u32 + 8 + binary.len() as u32).to_le_bytes());
+        bytes.extend((json.len() as u32).to_le_bytes());
+        bytes.extend(b"JSON");
+        bytes.extend(json);
+        bytes.extend((binary.len() as u32).to_le_bytes());
+        bytes.extend(b"BIN\0");
+        bytes.extend(binary);
+        bytes
+    }
+
+    fn app(directory: &std::path::Path) -> App {
+        loader_app_with(directory, |app| {
+            app.add_plugins(AnimationPlugin)
+                .register_type::<AnimationPlayer>()
+                .register_type::<AnimationTargetId>()
+                .register_type::<AnimatedBy>()
+                // Async loading cannot advance the authored playback clock.
+                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO))
+                .add_plugins(ModelAnimationPlugin);
+        })
+    }
+
+    fn scene(app: &mut App, path: &'static str, animations: bool) -> Handle<WorldAsset> {
+        let root: Handle<Gltf> = app
+            .world()
+            .resource::<AssetServer>()
+            .load_with_settings(path, move |settings: &mut GltfLoaderSettings| {
+                settings.load_animations = animations
+            });
+        wait_for_loaded(app, &root);
+        let gltfs = app.world().resource::<Assets<Gltf>>();
+        let gltf = gltfs.get(&root).unwrap();
+        let source = gltf.scenes[0].clone();
+        let scenes = app.world().resource::<Assets<WorldAsset>>();
+        let template = scenes.get(&source).unwrap();
+        if animations {
+            let mut inventories = template.world.try_query::<&SourceClips>().unwrap();
+            assert_eq!(gltf.animations.len(), 3);
+            assert_eq!(gltf.named_animations.len(), 3);
+            let inventory = inventories.single(&template.world).unwrap();
+            assert_eq!(
+                inventory.0.len(),
+                3,
+                "on_scene_completed retained the named inventory"
+            );
+            for (name, duration) in [("Open", 2.0), ("Close", 4.0), ("Idle", 6.0)] {
+                let clip = &inventory.0.iter().find(|(n, _)| n == name).unwrap().1;
+                assert_eq!(
+                    clip,
+                    gltf.named_animations.get(name).unwrap(),
+                    "on_animations_collected retained the actual labeled clip"
+                );
+                assert_eq!(
+                    app.world()
+                        .resource::<Assets<AnimationClip>>()
+                        .get(clip)
+                        .unwrap()
+                        .duration(),
+                    duration
+                );
+            }
+        } else {
+            assert!(gltf.animations.is_empty() && gltf.named_animations.is_empty());
+            let count = template
+                .world
+                .try_query::<&SourceClips>()
+                .map_or(0, |mut q| q.iter(&template.world).count());
+            assert_eq!(
+                count, 0,
+                "disabled loading of actual animation content must not certify static"
+            );
+        }
+        drop(root);
+        until(app, |app| {
+            app.world()
+                .resource::<AssetServer>()
+                .get_handle::<Gltf>(path)
+                .is_none()
+        });
+        source
+    }
+
+    fn spawn(app: &mut App, source: &Handle<WorldAsset>, form: u32, door: bool) -> Entity {
+        let reference = app
+            .world_mut()
+            .spawn((
+                MeshHandle("invented-animated.glb".into()),
+                FormId(form),
+                WorldAssetRoot(source.clone()),
+            ))
+            .id();
+        if door {
+            app.world_mut().entity_mut(reference).insert(LoadDoor {
+                ref_id: form,
+                label: "Invented destination".into(),
+                auto_load: false,
+                outward: None,
+                destination: crate::doors::DoorDestination {
+                    destination_ref_id: form + 1,
+                    interior_cell_id: Some(19),
+                    worldspace_id: None,
+                    arrival_position: [0.0; 3],
+                    arrival_rotation: [0.0; 3],
+                },
+            });
+        }
+        reference
+    }
+
+    fn ready(app: &App, reference: Entity) -> bool {
+        app.world()
+            .get::<WorldInstance>(reference)
+            .is_some_and(|instance| {
+                app.world()
+                    .resource::<WorldInstanceSpawner>()
+                    .instance_is_ready(**instance)
+            })
+    }
+
+    fn leaf(app: &App, reference: Entity) -> Entity {
+        let mut pending = vec![reference];
+        let mut leaves = Vec::new();
+        while let Some(entity) = pending.pop() {
+            if app
+                .world()
+                .get::<Name>(entity)
+                .is_some_and(|n| n.as_str() == "Leaf")
+            {
+                leaves.push(entity);
+            }
+            if let Some(children) = app.world().get::<Children>(entity) {
+                pending.extend(children.iter());
+            }
+        }
+        assert_eq!(leaves.len(), 1);
+        leaves[0]
+    }
+
+    fn binding(app: &App, reference: Entity) -> SourceClipBinding {
+        let binding = app
+            .world()
+            .get::<SourceClipBinding>(reference)
+            .unwrap()
+            .clone();
+        let inventory = app.world().get::<SourceClips>(binding.source).unwrap();
+        assert_eq!(inventory.0.len(), 3);
+        assert_eq!(binding.players.len(), 1);
+        let player = binding.players[0];
+        assert_eq!(
+            app.world()
+                .get::<AnimatedBy>(leaf(app, reference))
+                .unwrap()
+                .0,
+            player,
+            "scene instancing remapped the target to this instance's player"
+        );
+        assert_eq!(
+            app.world().get::<AnimationGraphHandle>(player).unwrap().0,
+            *binding.graph.as_ref().unwrap()
+        );
+        let graphs = app.world().resource::<Assets<AnimationGraph>>();
+        let graph = graphs.get(binding.graph.as_ref().unwrap()).unwrap();
+        for (name, node) in [
+            ("Open", binding.open),
+            ("Close", binding.close),
+            ("Idle", binding.idle.map(|i| i.0)),
+        ] {
+            if let Some(node) = node {
+                let AnimationNodeType::Clip(handle) = &graph.graph[node].node_type else {
+                    panic!("binding must select an authored clip");
+                };
+                assert_eq!(
+                    handle,
+                    &inventory.0.iter().find(|(n, _)| n == name).unwrap().1
+                );
+            }
+        }
+        binding
+    }
+
+    fn sample(
+        app: &mut App,
+        reference: Entity,
+        node: AnimationNodeIndex,
+        time: f32,
+        expected_x: f32,
+    ) {
+        let player = app
+            .world()
+            .get::<SourceClipBinding>(reference)
+            .unwrap()
+            .players[0];
+        {
+            let mut playback = app.world_mut().get_mut::<AnimationPlayer>(player).unwrap();
+            playback.stop_all();
+            playback.play(node).seek_to(time).pause();
+        }
+        // Graph threading consumes asset events asynchronously with respect to binding insertion.
+        // Wait for the actual curve outcome; never replace it with an elapsed-frame answer.
+        until(app, |app| {
+            (app.world()
+                .get::<Transform>(leaf(app, reference))
+                .unwrap()
+                .translation
+                - Vec3::new(expected_x, 0.0, 0.0))
+            .length()
+                < 0.0001
+        });
+        let actual = app
+            .world()
+            .get::<Transform>(leaf(app, reference))
+            .unwrap()
+            .translation;
+        assert!(
+            (actual - Vec3::new(expected_x, 0.0, 0.0)).length() < 0.0001,
+            "named clip at {time}: expected x={expected_x}, got {actual:?}"
+        );
+    }
+
+    fn directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("OWNER.txt"),
+            "Real named animation loader test fixture.\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("invented-animated.glb"),
+            animated_glb(1.0),
+        )
+        .unwrap();
+        fs::write(directory.path().join("replacement.glb"), animated_glb(2.0)).unwrap();
+        directory
+    }
+
+    #[test]
+    fn actual_named_glb_binds_door_clips_and_plays_each_instances_authored_idle() {
+        let directory = directory();
+        let mut app = app(directory.path());
+        let source = scene(&mut app, "invented-animated.glb", true);
+        let first = spawn(&mut app, &source, 1, false);
+        let second = spawn(&mut app, &source, 2, false);
+        let door = spawn(&mut app, &source, 3, true);
+        until(&mut app, |app| {
+            [first, second, door]
+                .iter()
+                .all(|r| app.world().get::<SourceClipBinding>(*r).is_some())
+        });
+        until(&mut app, |app| {
+            app.world()
+                .get::<Transform>(leaf(app, first))
+                .unwrap()
+                .translation
+                .x
+                == 12.0
+                && app
+                    .world()
+                    .get::<Transform>(leaf(app, second))
+                    .unwrap()
+                    .translation
+                    .x
+                    == 14.0
+        });
+        let first_binding = binding(&app, first);
+        let second_binding = binding(&app, second);
+        let door_binding = binding(&app, door);
+        assert_ne!(first_binding.source, second_binding.source);
+        assert_ne!(first_binding.players, second_binding.players);
+        for (reference, binding, phase, x) in [
+            (first, &first_binding, 1.0, 12.0),
+            (second, &second_binding, 2.0, 14.0),
+        ] {
+            assert!(binding.open.is_none() && binding.close.is_none());
+            let (node, duration) = binding.idle.unwrap();
+            assert_eq!(duration, 6.0);
+            let active = app
+                .world()
+                .get::<AnimationPlayer>(binding.players[0])
+                .unwrap()
+                .animation(node)
+                .unwrap();
+            assert_eq!(active.seek_time(), phase);
+            assert_eq!(
+                app.world()
+                    .get::<Transform>(leaf(&app, reference))
+                    .unwrap()
+                    .translation,
+                Vec3::new(x, 0.0, 0.0)
+            );
+        }
+        assert!(door_binding.idle.is_none());
+        assert!(
+            app.world()
+                .get::<AnimationPlayer>(door_binding.players[0])
+                .unwrap()
+                .playing_animations()
+                .next()
+                .is_none()
+        );
+        sample(&mut app, door, door_binding.open.unwrap(), 0.5, 1.0);
+        sample(&mut app, door, door_binding.close.unwrap(), 1.0, 3.0);
+        assert_eq!(
+            app.world()
+                .get::<Transform>(leaf(&app, first))
+                .unwrap()
+                .translation
+                .x,
+            12.0,
+            "door playback cannot drive the other instance's target"
+        );
+    }
+
+    #[test]
+    fn actual_animated_scene_replacement_rebinds_inventory_and_retires_only_outgoing_instance() {
+        let directory = directory();
+        let mut app = app(directory.path());
+        let source = scene(&mut app, "invented-animated.glb", true);
+        let replacement = scene(&mut app, "replacement.glb", true);
+        let reference = spawn(&mut app, &source, 1, false);
+        let survivor = spawn(&mut app, &source, 2, false);
+        until(&mut app, |app| {
+            [reference, survivor]
+                .iter()
+                .all(|r| app.world().get::<SourceClipBinding>(*r).is_some())
+        });
+        let old = binding(&app, reference);
+        let other = binding(&app, survivor);
+        let old_leaf = leaf(&app, reference);
+        let old_clip = app
+            .world()
+            .get::<SourceClips>(old.source)
+            .unwrap()
+            .0
+            .iter()
+            .find(|(n, _)| n == "Idle")
+            .unwrap()
+            .1
+            .id();
+        app.world_mut()
+            .entity_mut(reference)
+            .insert(WorldAssetRoot(replacement.clone()));
+        until(&mut app, |app| {
+            app.world().get_entity(old.source).is_err()
+                && app
+                    .world()
+                    .get::<SourceClipBinding>(reference)
+                    .is_some_and(|b| b.source != old.source)
+        });
+        until(&mut app, |app| {
+            app.world()
+                .get::<Transform>(leaf(app, reference))
+                .unwrap()
+                .translation
+                .x
+                == 24.0
+        });
+        let new = binding(&app, reference);
+        assert!(app.world().get_entity(old_leaf).is_err());
+        assert!(
+            old.players
+                .iter()
+                .all(|p| app.world().get_entity(*p).is_err())
+        );
+        assert_ne!(new.graph, old.graph);
+        let new_clip = app
+            .world()
+            .get::<SourceClips>(new.source)
+            .unwrap()
+            .0
+            .iter()
+            .find(|(n, _)| n == "Idle")
+            .unwrap()
+            .1
+            .id();
+        assert_ne!(
+            new_clip, old_clip,
+            "replacement came from a second actual loader inventory"
+        );
+        assert_eq!(binding(&app, survivor).source, other.source);
+        assert_eq!(
+            app.world()
+                .get::<Transform>(leaf(&app, reference))
+                .unwrap()
+                .translation
+                .x,
+            24.0
+        );
+        sample(&mut app, reference, new.idle.unwrap().0, 3.0, 32.0);
+        assert_eq!(
+            app.world()
+                .get::<Transform>(leaf(&app, survivor))
+                .unwrap()
+                .translation
+                .x,
+            14.0
+        );
+        // Dropping the root Gltf did not collect the clips retained by live scene inventories.
+        assert!(
+            app.world()
+                .resource::<Assets<AnimationClip>>()
+                .contains(old_clip)
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<AnimationClip>>()
+                .contains(new_clip)
+        );
+        let new_source = new.source;
+        let new_players = new.players.clone();
+        app.world_mut().entity_mut(reference).despawn();
+        until(&mut app, |app| app.world().get_entity(new_source).is_err());
+        assert!(
+            new_players
+                .iter()
+                .all(|p| app.world().get_entity(*p).is_err())
+        );
+        assert_eq!(binding(&app, survivor).source, other.source);
+        for path in ["invented-animated.glb", "replacement.glb"] {
+            assert!(
+                app.world()
+                    .resource::<AssetServer>()
+                    .get_handle::<Gltf>(path)
+                    .is_none()
+            );
+        }
+        let old_scene_id = source.id();
+        let old_graph_id = old.graph.as_ref().unwrap().id();
+        app.world_mut().entity_mut(survivor).despawn();
+        drop(old);
+        drop(other);
+        drop(source);
+        until(&mut app, |app| {
+            !app.world()
+                .resource::<Assets<WorldAsset>>()
+                .contains(old_scene_id)
+                && !app
+                    .world()
+                    .resource::<Assets<AnimationClip>>()
+                    .contains(old_clip)
+                && !app
+                    .world()
+                    .resource::<Assets<AnimationGraph>>()
+                    .contains(old_graph_id)
+        });
+        assert!(
+            app.world()
+                .resource::<Assets<WorldAsset>>()
+                .contains(replacement.id()),
+            "collecting the old source cannot collect the retained replacement"
+        );
+    }
+
+    #[test]
+    fn actual_animated_glb_with_animation_loading_disabled_stays_unresolved_after_scene_completion()
+    {
+        let directory = directory();
+        let bytes = fs::read(directory.path().join("invented-animated.glb")).unwrap();
+        let authored = bevy::gltf::gltf::Gltf::from_slice(&bytes).unwrap();
+        assert_eq!(
+            authored
+                .animations()
+                .map(|a| a.name().unwrap())
+                .collect::<Vec<_>>(),
+            ["Open", "Close", "Idle"]
+        );
+        let mut app = app(directory.path());
+        let source = scene(&mut app, "invented-animated.glb", false);
+        let reference = spawn(&mut app, &source, 1, false);
+        until(&mut app, |app| ready(app, reference));
+        let target = leaf(&app, reference);
+        assert!(app.world().get::<AnimatedBy>(target).is_none());
+        // Repeated resolver calls after proven scene completion cannot turn absence into static proof.
+        for _ in 0..8 {
+            app.update();
+            assert!(ready(&app, reference));
+            assert!(app.world().get::<SourceClipBinding>(reference).is_none());
+            assert!(app.world().get::<IdleStarted>(reference).is_none());
+            let mut pending = vec![reference];
+            while let Some(entity) = pending.pop() {
+                assert!(app.world().get::<SourceClips>(entity).is_none());
+                assert!(app.world().get::<AnimationPlayer>(entity).is_none());
+                if let Some(children) = app.world().get::<Children>(entity) {
+                    pending.extend(children.iter());
+                }
+            }
+        }
+        assert!(
+            app.world()
+                .resource::<AssetServer>()
+                .get_handle::<Gltf>("invented-animated.glb")
+                .is_none()
+        );
+    }
+}
