@@ -43,7 +43,7 @@ use bevy::{
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     render::view::screenshot::{Screenshot, save_to_disk},
     tasks::{IoTaskPool, TaskPoolBuilder},
-    window::{MonitorSelection, PresentMode, WindowPlugin, WindowPosition},
+    window::{PresentMode, WindowPlugin, WindowPosition},
     winit::WinitSettings,
 };
 use color_eyre::Result;
@@ -268,21 +268,31 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 .as_ref()
                 .map_or_else(|| (1600, 900).into(), |pose| pose.resolution.clone()),
         },
-        // Visible timing and shots runs open in the middle of the primary screen.
-        position: if benchmark_active || shots_active {
-            WindowPosition::Centered(MonitorSelection::Primary)
-        } else {
-            WindowPosition::Automatic
-        },
-        present_mode: if benchmark_active && !config.benchmark_vsync {
+        present_mode: if config.is_benchmark_run() && !config.benchmark_vsync {
             PresentMode::AutoNoVsync
         } else {
             PresentMode::AutoVsync
         },
+        // A tour or a shots run starts parked: placed where no monitor is and not focused, but a
+        // full-size window with its taskbar entry, so it renders, its screenshots are unchanged, and
+        // clicking the entry brings it on screen (`crate::window_parking`). A minimised window would
+        // render at 1x1 pixels.
+        // A timing run opens on screen, in the middle, to be watched (the user asked, 2026-09-26).
+        position: if config.window_offscreen() {
+            WindowPosition::At(crate::window_parking::PARKED_POSITION)
+        } else if config.is_benchmark_run() || shots_active {
+            WindowPosition::Centered(bevy::window::MonitorSelection::Primary)
+        } else {
+            WindowPosition::Automatic
+        },
+        focused: !config.window_offscreen(),
         ..default()
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));
     let mut app = App::new();
+    if config.window_offscreen() {
+        app.add_plugins(crate::window_parking::WindowParkingPlugin);
+    }
     if let Some((settings, file)) = preferences {
         app.insert_resource(settings).insert_resource(file);
     }
@@ -298,12 +308,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     if let Some(asset_lock) = asset_lock {
         app.insert_resource(AssetDirectoryReadLock { _guard: asset_lock });
     }
-    if benchmark_active || shots_active || config.hidden_window {
+    if config.is_benchmark_run() || shots_active || config.hidden_window {
         // Acceptance runs are commonly left unfocused while the campaign driver
         // advances through its scenarios. Bevy's game default throttles an
         // unfocused window to 60 Hz, which makes a 16.67 ms P95 gate measure the
-        // event-loop sleep instead of renderer performance. A shots run left
-        // behind other windows would likewise starve its settle rule of frames.
+        // event-loop sleep instead of renderer performance. A shots run left behind other windows would likewise starve its settle rule of frames.
+        // A `--tour-bench` run is
+        // parked unfocused off screen too, and read 16.67 ms in every state until
+        // it ran continuously as well (2026-09-25).
         app.insert_resource(WinitSettings::continuous());
     }
     let render_asset_budget = upload_budget(&config);

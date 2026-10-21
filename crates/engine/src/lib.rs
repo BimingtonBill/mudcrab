@@ -43,6 +43,7 @@ pub mod terrain_merge;
 pub mod terrain_upload;
 pub mod tone_mapping;
 pub mod visibility_optimization;
+pub mod window_parking;
 pub mod world;
 
 pub use app::run;

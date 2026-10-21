@@ -72,6 +72,8 @@ impl TerrainLodDistances {
 
 #[derive(Debug, Clone, Resource)]
 pub struct EngineConfig {
+    /// Keep an automated capture window on screen instead of parking it off screen.
+    pub show_window: bool,
     /// Explicit launch options. Saved interactive settings defer to these and to `--ini`.
     pub settings_overrides: Vec<String>,
     pub assets_dir: PathBuf,
@@ -217,6 +219,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             settings_overrides: Vec::new(),
+            show_window: false,
             assets_dir: PathBuf::from("modern_assets"),
             bug_report_dir: None,
             worldspace_id: 0x3c,
@@ -418,6 +421,7 @@ Diagnostics:
   --physics-fixture                     run the physics fixture (no world database)
   --streaming-fixture                   stream the fixture world instead of the full asset set
 
+  --show-window                         keep an automated run's window on screen
 Help:
   -h, --help                            print this message and exit
 
@@ -549,6 +553,15 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl EngineConfig {
+    /// Whether the window opens off-screen: in the runs nobody watches - a scripted tour and a shots
+    /// run - so they do not cover the user's screen or take focus while they work (the user asked
+    /// for it, 2026-09-24). The window is still a real, rendered window of its full size, so frames
+    /// and screenshots are as before; `--show-window` keeps it on screen.
+    pub fn window_offscreen(&self) -> bool {
+        // A timing run is not parked: it opens on screen, in the middle (`app::run`).
+        !self.show_window && !self.is_benchmark_run() && self.shots.is_some()
+    }
+
     pub fn streaming_controls_enabled(&self) -> bool {
         self.adaptive_streaming || self.max_streaming_backlog != 0 || self.streaming_memory_mib != 0
     }
@@ -1205,6 +1218,7 @@ impl EngineConfig {
                         )
                     })?);
                 }
+                "--show-window" => config.show_window = true,
                 "--shots" => {
                     config.shots = Some(take_value("--shots", "a shots file path", args.next())?);
                 }
@@ -3679,5 +3693,17 @@ mod tests {
     /// True when a script spells out a finite number.
     fn is_number_literal(value: &str) -> bool {
         value.parse::<f64>().is_ok_and(f64::is_finite)
+    }
+    #[test]
+    fn automated_runs_open_their_window_off_screen_unless_asked_not_to() {
+        let args = |list: &[&str]| {
+            EngineConfig::run_from_args(list.iter().map(|value| (*value).to_owned()))
+        };
+        assert!(args(&["--shots", "shots.json"]).window_offscreen());
+        assert!(!args(&["--shots", "shots.json", "--show-window"]).window_offscreen());
+        assert!(
+            !args(&["--walk"]).window_offscreen(),
+            "a run someone plays is on screen"
+        );
     }
 }
