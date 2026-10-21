@@ -352,6 +352,7 @@ struct Selection {
     camera_grid: IVec2,
     stream_radius: i32,
     distances: TerrainLodDistances,
+    own_statics: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -458,12 +459,27 @@ fn count_desync(stats: &mut TerrainLodStats, reason: &str, key: PatchKey, entity
     error!(?key, %entity, reason, "terrain LOD visibility index desynchronized");
 }
 
+/// What decides cluster terrain's share of the pass. Presence of each optional resource is part
+/// of it: removing one changes the owned cells and the pending count while the world, the
+/// revision and the flag stay as they were.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClusterStamp {
+    world: Option<u32>,
+    readiness_revision: u64,
+    own_statics: bool,
+    terrain: bool,
+    readiness: bool,
+}
+
 #[derive(Default)]
 pub(in crate::streaming) struct TerrainLodIndex {
     mode: Mode,
     selection: Option<Selection>,
     /// The demanded world counts are taken for.
     world: Option<u32>,
+    cluster_stamp: Option<ClusterStamp>,
+    /// Cells whose far terrain cluster terrain owns; their stock LOD patches are not drawn.
+    owned: HashSet<IVec2>,
     /// Retained batches and confirmed merged cells feed the same tier decision as source patches.
     retained: HashMap<PatchKey, u8>,
     merged: HashSet<PatchKey>,
@@ -509,9 +525,15 @@ impl TerrainLodIndex {
             self.world = selection.world;
             self.recount();
             self.apply_all = true;
-        } else if (previous.stream_radius, previous.distances)
-            != (selection.stream_radius, selection.distances)
-        {
+        } else if (
+            previous.stream_radius,
+            previous.distances,
+            previous.own_statics,
+        ) != (
+            selection.stream_radius,
+            selection.distances,
+            selection.own_statics,
+        ) {
             // A config change writes every patch again, so a `Visibility` changed from outside is
             // restored by it as it always was.
             self.apply_all = true;
@@ -550,6 +572,20 @@ impl TerrainLodIndex {
             if let Some(entry) = patches.get(&entity).filter(|entry| !entry.near) {
                 dirty.insert(entry.key());
             }
+        }
+    }
+
+    fn set_owned(&mut self, owned: HashSet<IVec2>) {
+        let changed: HashSet<IVec2> = self.owned.symmetric_difference(&owned).copied().collect();
+        self.owned = owned;
+        if !changed.is_empty() {
+            self.dirty.extend(
+                self.keys
+                    .keys()
+                    .chain(self.retained.keys())
+                    .filter(|key| changed.contains(&key.0))
+                    .copied(),
+            );
         }
     }
 
@@ -807,6 +843,7 @@ impl TerrainLodIndex {
             keys,
             patches,
             dirty,
+            owned,
             retained,
             merged,
             overrides,
@@ -839,9 +876,12 @@ impl TerrainLodIndex {
                     debug_assert!(false, "key member {entity} has no patch entry");
                     continue;
                 };
+                // With owned statics cluster terrain owns the far terrain of the cell: the stock
+                // far patch there is not drawn at all.
                 let visible = tier.is_some()
                     && entry.counted
-                    && entry.coverage.tier == tier;
+                    && entry.coverage.tier == tier
+                    && !owned.contains(&entry.coverage.grid);
                 if visible != entry.visible {
                     entry.visible = visible;
                     if visible {
@@ -1011,7 +1051,8 @@ impl TerrainLodIndex {
                         .ok_or_else(|| format!("key {key:?} member {entity} has no patch entry"))?;
                     let expected_visible = expected_tier.is_some()
                         && entry.counted
-                        && entry.coverage.tier == expected_tier;
+                        && entry.coverage.tier == expected_tier
+                        && !self.owned.contains(&entry.coverage.grid);
                     if entry.visible != expected_visible {
                         return Err(format!(
                             "patch {entity} visibility {} differs from selected {expected_visible}",
@@ -1089,6 +1130,51 @@ impl TerrainLodIndex {
     }
 }
 
+/// Cluster terrain blocks of the demanded world whose draw batch is not ready yet.
+fn pending_cluster_terrain_blocks(
+    world: Option<u32>,
+    terrain: Option<&crate::cluster::terrain::ClusterTerrain>,
+    readiness: Option<&crate::cluster::terrain::TerrainDrawReadiness>,
+) -> usize {
+    terrain.map_or(0, |terrain| {
+        terrain
+            .blocks
+            .iter()
+            .filter(|block| Some(block.worldspace_id) == world)
+            .filter(|block| {
+                !block
+                    .batch
+                    .is_some_and(|batch| readiness.is_some_and(|ready| ready.contains(batch)))
+            })
+            .count()
+    })
+}
+
+/// With owned statics (`--cluster-own-statics`) cluster terrain owns the far terrain of every
+/// cell its drawable blocks cover.
+fn owned_cells(
+    config: &EngineConfig,
+    world: Option<u32>,
+    terrain: Option<&crate::cluster::terrain::ClusterTerrain>,
+    readiness: Option<&crate::cluster::terrain::TerrainDrawReadiness>,
+) -> HashSet<IVec2> {
+    if !config.cluster_own_statics {
+        return HashSet::new();
+    }
+    terrain
+        .zip(readiness)
+        .map(|(terrain, ready)| {
+            terrain
+                .blocks
+                .iter()
+                .filter(|block| Some(block.worldspace_id) == world)
+                .filter(|block| block.batch.is_some_and(|batch| ready.contains(batch)))
+                .flat_map(|block| block.cells.iter().copied())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::streaming) fn update_terrain_lod_visibility(
     config: Res<EngineConfig>,
@@ -1098,6 +1184,8 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     mut streaming: ParamSet<(Res<LodStreaming>, ResMut<LodStreaming>)>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
+    cluster_terrain: Option<Res<crate::cluster::terrain::ClusterTerrain>>,
+    terrain_readiness: Option<Res<crate::cluster::terrain::TerrainDrawReadiness>>,
     mut index: Local<TerrainLodIndex>,
     audit: Option<Res<TerrainAudit>>,
     mut batches: terrain_batching::LodBatchVisibility,
@@ -1111,7 +1199,27 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
         camera_grid: demand.map_or(IVec2::ZERO, |demand| demand.center),
         stream_radius: config.stream_radius,
         distances: config.terrain_lod,
+        own_statics: config.cluster_own_statics,
     };
+    let cluster_stamp = ClusterStamp {
+        world: selection.world,
+        readiness_revision: terrain_readiness
+            .as_ref()
+            .map_or(0, |ready| ready.revision()),
+        own_statics: selection.own_statics,
+        terrain: cluster_terrain.is_some(),
+        readiness: terrain_readiness.is_some(),
+    };
+    // The readiness set is shared state behind an `Arc`, and its revision counts changes to that
+    // set only. A replaced resource can start over at the same revision with a different set, so
+    // the resource being added or written is a change as well.
+    let cluster_changed = index.cluster_stamp != Some(cluster_stamp)
+        || cluster_terrain
+            .as_ref()
+            .is_some_and(|terrain| terrain.is_changed())
+        || terrain_readiness
+            .as_ref()
+            .is_some_and(|readiness| readiness.is_changed());
     let replaced = std::mem::take(&mut streaming.p1().replaced_source_quadrants);
     let removals = inputs.removals(&replaced);
     let batches_removed = batches.removed();
@@ -1192,6 +1300,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
         // changed selection is a trigger too: `sync_selection` has just queued its work.
         // A newly ready patch is a trigger even when retained/merged coverage did not change.
         index.mode != Mode::Legacy
+            || cluster_changed
             || flagged
             || removals
             || inputs
@@ -1227,9 +1336,30 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
         inputs.changed_visibility(&mut changed);
         index.changed = changed;
         index.note_overrides();
-        if selection_moved || flagged || removals || external_changed || batches_removed {
+        if selection_moved
+            || cluster_changed
+            || flagged
+            || removals
+            || external_changed
+            || batches_removed
+        {
             index.restore_overrides();
         }
+    }
+
+    if rebuild || cluster_changed {
+        metrics.pending_cluster_terrain_blocks = pending_cluster_terrain_blocks(
+            selection.world,
+            cluster_terrain.as_deref(),
+            terrain_readiness.as_deref(),
+        );
+        index.set_owned(owned_cells(
+            &config,
+            selection.world,
+            cluster_terrain.as_deref(),
+            terrain_readiness.as_deref(),
+        ));
+        index.cluster_stamp = Some(cluster_stamp);
     }
 
     let refresh = index.has_work();
@@ -1239,21 +1369,35 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
             index.reselect(&mut inputs.lod_visibility.p0(), &selection);
         }
     }
-    // Build the semantic mask from this one index. Batch-only keys retain their tier inputs.
+    // Build the semantic mask from this one index. Batch-only keys retain their tier inputs;
+    // owned cluster cells suppress stock geometry for both representations.
     if refresh
         || submission_dirty
         || external_changed
         || batches_removed
         || selection_moved
+        || cluster_changed
         || removals
     {
         let mut selected: HashMap<_, _> = index
             .keys
             .iter()
-            .map(|(&key, state)| (key, state.selected))
+            .map(|(&key, state)| {
+                (
+                    key,
+                    if index.owned.contains(&key.0) {
+                        None
+                    } else {
+                        state.selected
+                    },
+                )
+            })
             .collect();
         for (&key, &available) in &index.retained {
             selected.entry(key).or_insert_with(|| {
+                if index.owned.contains(&key.0) {
+                    return None;
+                }
                 select_ready_terrain_lod_tier(
                     chebyshev_grid_distance(key.0, selection.camera_grid),
                     index.merged.contains(&key),
@@ -1263,7 +1407,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
             });
         }
         let semantic_changed = index.batch_selection != selected;
-        if semantic_changed || selection_moved || removals || batches_removed {
+        if semantic_changed || selection_moved || cluster_changed || removals || batches_removed {
             let mut state = streaming.p1();
             state.visibility_revision = state.visibility_revision.wrapping_add(1);
         }

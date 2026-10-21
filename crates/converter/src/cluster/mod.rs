@@ -23,6 +23,11 @@ pub mod report;
 pub mod resolve;
 pub mod scope;
 pub mod stage;
+pub(crate) mod terrain_atlas;
+pub mod terrain_geometry;
+pub mod terrain_publish;
+pub(crate) mod terrain_sources;
+pub mod terrain_stage;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_support;
 
@@ -87,6 +92,10 @@ pub(crate) fn derive_requested(config: &PipelineConfig) -> bool {
 
 /// Refuses cluster requests a conversion cannot honour, before any work starts.
 pub(crate) fn validate_request(config: &PipelineConfig) -> Result<()> {
+    ensure!(
+        !config.cluster_terrain || derive_requested(config),
+        "--cluster-terrain requires cluster/auto LOD with LOD enabled"
+    );
     ensure!(
         !config.cluster_bench_baked,
         "--cluster-bench-baked is not supported by conversion: cluster data is derived as an overlay \
@@ -174,25 +183,194 @@ impl Overlay {
     }
 }
 
+/// The raw DDS root a derive retry must name: only a terrain request, and only when the published
+/// base holds no `vfs` of its own (a full conversion's runtime pack never does; a metadata
+/// rebuild's output does). `staged_vfs` is the raw DDS root a conversion holds, if one still
+/// exists: the detached terrain-sources `vfs`, or the staging `vfs` when it could not be moved.
+fn retry_terrain_sources(
+    config: &PipelineConfig,
+    base: &Path,
+    staged_vfs: Option<&Path>,
+) -> Result<Option<std::path::PathBuf>> {
+    if !config.cluster_terrain || base.join("vfs").try_exists()? {
+        return Ok(None);
+    }
+    Ok(staged_vfs.map(Path::to_path_buf))
+}
+
+/// True when a failed derive can only be retried from the conversion's staging folder, which the
+/// caller must then keep (it holds the raw terrain DDS the published base does not). Only the
+/// case where [`detach_terrain_sources`] could not move them: once detached, staging is not needed.
+pub(crate) fn staging_needed_for_retry(
+    config: &PipelineConfig,
+    base: &Path,
+    staged_vfs: Option<&Path>,
+) -> bool {
+    derive_requested(config)
+        && retry_terrain_sources(config, base, staged_vfs).is_ok_and(|sources| sources.is_some())
+}
+
+/// The raw terrain DDS of a full conversion, moved out of its staging folder into a folder of
+/// their own beside the output before the overlay derive. The conversion staging then holds
+/// nothing a retry needs and is removed whole, so a failed derive can never leave a folder that
+/// `find_resumable_staging` would offer for resume.
+#[derive(Debug)]
+pub(crate) struct DetachedTerrainSources {
+    folder: std::path::PathBuf,
+}
+
+impl DetachedTerrainSources {
+    /// The raw DDS root a derive or its retry names.
+    pub(crate) fn vfs(&self) -> std::path::PathBuf {
+        self.folder.join("vfs")
+    }
+
+    /// Removes the folder after the derive consumed it. The overlay is already published, so a
+    /// folder that will not go is only a warning.
+    pub(crate) fn remove(self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.folder) {
+            eprintln!(
+                "warning: could not remove the raw terrain textures {}: {error}",
+                self.folder.display()
+            );
+        }
+    }
+}
+
+fn is_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+/// Moves a full conversion's raw `staging/vfs` to `<output>.terrain-sources-<pid>-<stamp>/vfs`
+/// (a rename beside the output: no copy, no change to the base) when a terrain derive needs it
+/// and the published base holds no `vfs` of its own. `Ok(None)` when no terrain derive needs it.
+/// Refuses, leaving everything where it is, when `vfs` is a link or holds the Skyrim Data folder:
+/// nothing outside the conversion's own extracted files is ever moved or later removed.
+pub(crate) fn detach_terrain_sources(
+    config: &PipelineConfig,
+    base: &Path,
+    staging: &Path,
+) -> Result<Option<DetachedTerrainSources>> {
+    use color_eyre::eyre::{WrapErr, eyre};
+    let staged_vfs = staging.join("vfs");
+    if !derive_requested(config)
+        || retry_terrain_sources(config, base, Some(&staged_vfs))?.is_none()
+    {
+        return Ok(None);
+    }
+    let metadata = std::fs::symlink_metadata(&staged_vfs)
+        .wrap_err_with(|| format!("failed to inspect {}", staged_vfs.display()))?;
+    ensure!(
+        metadata.is_dir() && !is_link(&metadata),
+        "the raw terrain textures {} are not a plain folder, so they are not moved",
+        staged_vfs.display()
+    );
+    let vfs_path = std::fs::canonicalize(&staged_vfs)?;
+    let data_path = std::fs::canonicalize(&config.data_dir).wrap_err_with(|| {
+        format!(
+            "could not compare {} with the Skyrim Data folder {}",
+            staged_vfs.display(),
+            config.data_dir.display()
+        )
+    })?;
+    ensure!(
+        !data_path.starts_with(&vfs_path),
+        "the raw terrain textures {} hold the Skyrim Data folder {}, so they are not moved",
+        staged_vfs.display(),
+        config.data_dir.display()
+    );
+    let name = base
+        .file_name()
+        .ok_or_else(|| eyre!("the asset output {} has no name", base.display()))?
+        .to_string_lossy();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let folder = base.with_file_name(format!(
+        "{name}.terrain-sources-{}-{stamp}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&folder)
+        .wrap_err_with(|| format!("failed to create {}", folder.display()))?;
+    let owner = folder.join("OWNER.txt");
+    let moved = std::fs::write(
+        &owner,
+        format!(
+            "owner: converter, raw terrain textures for the cluster overlay of {}\n\
+             keep-until: the overlay derive succeeds, or a retry of `converter derive-clusters \
+             --terrain-sources` has\n",
+            base.display()
+        ),
+    )
+    .and_then(|()| std::fs::rename(&staged_vfs, folder.join("vfs")));
+    if let Err(error) = moved {
+        // Nothing moved: drop the folder this call made (OWNER.txt only), never anything else.
+        let _ = std::fs::remove_file(&owner);
+        let _ = std::fs::remove_dir(&folder);
+        return Err(error).wrap_err_with(|| {
+            format!(
+                "failed to move the raw terrain textures {} to {}",
+                staged_vfs.display(),
+                folder.display()
+            )
+        });
+    }
+    Ok(Some(DetachedTerrainSources { folder }))
+}
+
 /// The exact command that derives the overlay again over the published base with this
 /// conversion's cluster settings.
-fn retry_command(config: &PipelineConfig, base: &Path) -> String {
-    format!(
-        "converter derive-clusters {} --triangle-threshold {} --jobs {} --label default --replace",
+fn retry_command(config: &PipelineConfig, base: &Path, terrain_sources: Option<&Path>) -> String {
+    let mut command = format!(
+        "converter derive-clusters {} --triangle-threshold {} --jobs {}",
         shared::cluster_overlay::quote_argument(&base.display().to_string()),
         config.cluster_triangle_threshold,
         config.cpu_jobs
-    )
+    );
+    if config.cluster_terrain {
+        command.push_str(" --terrain");
+    }
+    if let Some(sources) = terrain_sources {
+        command.push_str(&format!(
+            " --terrain-sources {}",
+            shared::cluster_overlay::quote_argument(&sources.display().to_string())
+        ));
+    }
+    command.push_str(" --label default --replace");
+    command
 }
 
-/// Context for an overlay failure after the base has been published.
-pub(crate) fn overlay_failure_context(config: &PipelineConfig, base: &Path) -> String {
-    format!(
+/// Context for any error after the base is published: the base is valid, only the overlay is
+/// missing, and the run is not a resumable conversion.
+pub(crate) fn overlay_failure_context(
+    config: &PipelineConfig,
+    base: &Path,
+    staged_vfs: Option<&Path>,
+) -> String {
+    let sources = retry_terrain_sources(config, base, staged_vfs)
+        .ok()
+        .flatten();
+    let mut text = format!(
         "the base conversion at {} is published and valid; the cluster overlay was not derived. \
          This is not a resumable conversion. Derive only the overlay with: {}",
         base.display(),
-        retry_command(config, base)
-    )
+        retry_command(config, base, sources.as_deref())
+    );
+    if let Some(sources) = &sources {
+        text.push_str(&format!(
+            " (the raw terrain textures are kept in {}; delete that folder after a successful retry)",
+            sources.parent().unwrap_or(sources).display()
+        ));
+    }
+    text
 }
 
 /// Derives the cluster overlay over the just-published base, for `cluster` and `auto` alike: the
@@ -206,6 +384,7 @@ pub(crate) fn overlay_failure_context(config: &PipelineConfig, base: &Path) -> S
 pub(crate) fn derive_after_publish(
     config: &PipelineConfig,
     base: &Path,
+    staged_vfs: Option<&Path>,
     early_probe: Option<(probe::ProbeResult, f64)>,
     hooks: &PostPublish,
 ) -> Result<Overlay> {
@@ -217,30 +396,183 @@ pub(crate) fn derive_after_publish(
         label: "default".into(),
         replace: false,
         keep_failed_staging: false,
+        terrain: config.cluster_terrain,
+        terrain_sources: retry_terrain_sources(config, base, staged_vfs)?,
         jobs: config.cpu_jobs,
         triangle_threshold: config.cluster_triangle_threshold,
         include_trees: false,
     };
     (hooks.derive)(&options, early_probe)
         .map(|derived| Overlay::Derived(Box::new(derived)))
-        .map_err(|error| error.wrap_err(overlay_failure_context(config, base)))
+        .map_err(|error| error.wrap_err(overlay_failure_context(config, base, staged_vfs)))
 }
 
-/// Finalizes the certified object extension against the current core authority.
+/// One certified publication order for full conversion and extension-only derivation.
+/// Both geometry producers finish before the final base hash; terrain metadata
+/// depends on that final hash. The caller owns the destination's exclusive lock.
 pub fn finalize_certified_extensions(
     settings: &stage::StageSettings,
     context: &publish::PublishContext<'_>,
     manifest: &ConversionManifest,
     builder_identity: &str,
+    with_terrain: bool,
 ) -> Result<(Vec<shared::extensions::ExtensionEntry>, Vec<String>)> {
+    let staging = context.staging();
+    // A full-copy package carries its core in the staging folder; an overlay reads its base in
+    // place (database read-only, files under the base) and stages only the cluster store.
+    let core_root = context.core_root();
     let authority = authority::CoreAuthority::open(
         context.open_core_read_only()?,
-        context.core_root(),
+        core_root,
         manifest,
         settings,
         builder_identity.to_owned(),
     )?;
+    let mut notices = Vec::new();
+    let terrain = if with_terrain {
+        if !context.is_overlay() {
+            // The DDS source contract must read this run's actual producer entries,
+            // not a missing (fresh build) or stale (resumed build) staged manifest.
+            // This is private staging under the caller's exclusive publication lock;
+            // the complete extension envelope is composed before publication.
+            manifest.save(&staging.join("conversion-manifest.json"))?;
+        }
+        // An overlay's base already holds its own finished manifest, cell cache and LOD recipe.
+        let report = terrain_stage::run_with_report(core_root, context, None)?;
+        notices.extend(report.notices);
+        report.publication
+    } else {
+        None
+    };
+    if let Some(proof) = &terrain {
+        proof.validate(context)?;
+    }
     let base = publish::finalize_base(context, Some(&authority))?;
-    Ok((vec![base.extension], Vec::new()))
+    let mut extensions = Vec::new();
+    if let Some(proof) = &terrain {
+        extensions.push(terrain_publish::finalize(context, &base, proof)?);
+    }
+    extensions.push(base.extension);
+    Ok((extensions, notices))
 }
 
+#[cfg(test)]
+mod detach_tests {
+    use super::*;
+    use std::fs;
+
+    fn terrain_config(data: &Path, output: &Path) -> PipelineConfig {
+        let mut config = PipelineConfig::new(data, output);
+        config.lod_mode = LodMode::Cluster;
+        config.cluster_terrain = true;
+        config
+    }
+
+    #[test]
+    fn detaching_moves_only_the_raw_vfs_beside_the_output() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("Data");
+        let output = root.path().join("assets");
+        let staging = root.path().join("assets.staging-1-2");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::create_dir_all(staging.join("vfs/textures")).unwrap();
+        fs::write(staging.join("vfs/textures/a.dds"), b"raw").unwrap();
+        fs::write(staging.join("skyrim_world.db"), b"db").unwrap();
+
+        let config = terrain_config(&data, &output);
+        let detached = detach_terrain_sources(&config, &output, &staging)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            fs::read(detached.vfs().join("textures/a.dds")).unwrap(),
+            b"raw"
+        );
+        assert!(detached.vfs().parent().unwrap().join("OWNER.txt").is_file());
+        assert!(!staging.join("vfs").exists());
+        assert!(staging.join("skyrim_world.db").is_file());
+        assert!(
+            !detached
+                .vfs()
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".staging-")
+        );
+        let folder = detached.vfs().parent().unwrap().to_path_buf();
+        detached.remove();
+        assert!(!folder.exists());
+        assert!(data.is_dir() && output.is_dir());
+    }
+
+    #[test]
+    fn nothing_is_detached_unless_a_terrain_derive_needs_the_raw_vfs() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("Data");
+        let output = root.path().join("assets");
+        let staging = root.path().join("assets.staging-1-2");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(staging.join("vfs")).unwrap();
+
+        let mut no_terrain = terrain_config(&data, &output);
+        no_terrain.cluster_terrain = false;
+        assert!(
+            detach_terrain_sources(&no_terrain, &output, &staging)
+                .unwrap()
+                .is_none()
+        );
+        let mut baked = terrain_config(&data, &output);
+        baked.lod_mode = LodMode::Baked;
+        assert!(
+            detach_terrain_sources(&baked, &output, &staging)
+                .unwrap()
+                .is_none()
+        );
+        // A base that holds its own vfs is the retry's source, so the staging one is not needed.
+        fs::create_dir_all(output.join("vfs")).unwrap();
+        let config = terrain_config(&data, &output);
+        assert!(
+            detach_terrain_sources(&config, &output, &staging)
+                .unwrap()
+                .is_none()
+        );
+        assert!(staging.join("vfs").is_dir());
+    }
+
+    #[test]
+    fn a_vfs_holding_the_data_folder_is_refused_and_left_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("assets");
+        let staging = root.path().join("assets.staging-1-2");
+        let data = staging.join("vfs/Data");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(data.join("Skyrim.esm"), b"game").unwrap();
+
+        let config = terrain_config(&data, &output);
+        let error = detach_terrain_sources(&config, &output, &staging).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("hold the Skyrim Data folder"),
+            "{error:#}"
+        );
+        assert!(data.join("Skyrim.esm").is_file());
+        let beside: Vec<_> = fs::read_dir(root.path()).unwrap().collect();
+        assert_eq!(beside.len(), 2, "a folder was left beside the output");
+    }
+
+    #[test]
+    fn a_missing_vfs_is_an_error_not_a_silent_skip() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("Data");
+        let output = root.path().join("assets");
+        let staging = root.path().join("assets.staging-1-2");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        let config = terrain_config(&data, &output);
+        assert!(detach_terrain_sources(&config, &output, &staging).is_err());
+    }
+}

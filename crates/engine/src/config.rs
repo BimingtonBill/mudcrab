@@ -171,6 +171,8 @@ pub struct EngineConfig {
     pub clusters: Option<String>,
     /// Experiment: hide certified owned exterior primitives once at instance spawn.
     pub cluster_own_statics: bool,
+    /// Draw packaged terrain clusters, clipping against ready near terrain.
+    pub cluster_terrain: bool,
     /// `--cluster-preload-batches`: request every cluster batch's material during the startup
     /// load, nearest first, instead of as each comes into view. The startup cover then waits for
     /// all of them, and nothing a view or a crossing proof depends on changes during play.
@@ -479,6 +481,7 @@ impl Default for EngineConfig {
             terrain_radius: DEFAULT_TERRAIN_RADIUS,
             clusters: None,
             cluster_own_statics: false,
+            cluster_terrain: false,
             cluster_preload_batches: false,
             cluster_min_instance_pixels: None,
             cluster_prepass: true,
@@ -664,6 +667,7 @@ Streaming:
   --clusters [label|settings-id|path]   draw this cluster overlay of --assets (built by converter
                                         derive-clusters under <assets>/derived) as GPU-selected
                                         clusters in place of the stock models it owns (ADR-0013)
+  --cluster-terrain                     draw terrain included in the cluster overlay
   --cluster-own-statics                 hide certified owned exterior primitives at spawn
                                         (requires --clusters; ownership experiment)
   --cluster-preload-batches             load every cluster batch during the startup load instead
@@ -1211,6 +1215,7 @@ impl EngineConfig {
                     }
                 }
                 "--cluster-own-statics" => config.cluster_own_statics = true,
+                "--cluster-terrain" => config.cluster_terrain = true,
                 "--cluster-preload-batches" => config.cluster_preload_batches = true,
                 "--clusters" => {
                     // The selector is optional: bare `--clusters` means the only overlay.
@@ -1861,6 +1866,22 @@ impl EngineConfig {
             });
         }
         config.drop_jump_the_run_would_overwrite();
+        if config.cluster_terrain && !config.cluster_prepass {
+            return Err(ConfigError::invalid_value(
+                "--cluster-terrain",
+                None,
+                "the cluster prepass enabled",
+            ));
+        }
+
+        if config.cluster_terrain && config.clusters.is_none() {
+            return Err(ConfigError::invalid_value(
+                "--cluster-terrain",
+                None,
+                "--clusters naming an overlay with terrain",
+            ));
+        }
+
         if config.cluster_own_statics && config.clusters.is_none() {
             return Err(ConfigError::invalid_value(
                 "--cluster-own-statics",
@@ -2590,6 +2611,26 @@ mod tests {
         assert!(!EngineConfig::default().terrain_audit);
         assert!(EngineConfig::from_args(["--terrain-audit".to_owned()]).is_ok());
         assert!(run_config(&["--terrain-audit"]).terrain_audit);
+    }
+
+    #[test]
+    fn clustered_terrain_requires_an_explicit_package_and_prepass() {
+        assert!(!EngineConfig::default().cluster_terrain);
+        assert!(EngineConfig::from_args(["--cluster-terrain".to_owned()]).is_err());
+        let config = run_config(&["--clusters", "fixture", "--cluster-terrain"]);
+        assert!(config.cluster_terrain && config.cluster_prepass);
+        assert!(
+            EngineConfig::from_args(
+                [
+                    "--clusters",
+                    "fixture",
+                    "--cluster-terrain",
+                    "--no-cluster-prepass",
+                ]
+                .map(str::to_owned)
+            )
+            .is_err()
+        );
     }
 
     #[test]

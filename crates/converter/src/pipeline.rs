@@ -489,12 +489,16 @@ impl AssetPipeline {
         report.artifacts.push(PathBuf::from(
             shared::streaming_costs::STREAMING_COST_FILE_NAME,
         ));
-        // A later cleanup failure must never offer the published pack's hard-linked
+        // A later cleanup/detach failure must never offer the published pack's hard-linked
         // staging files for conversion resume. The marker is outside the published base.
         fs::write(staging.join(".base-published"), b"base already published\n").map_err(
             |error| PipelineFailure {
                 error: color_eyre::Report::from(error).wrap_err(
-                    crate::cluster::overlay_failure_context(&config, &config.output_dir),
+                    crate::cluster::overlay_failure_context(
+                        &config,
+                        &config.output_dir,
+                        Some(&staging.join("vfs")),
+                    ),
                 ),
                 staging: None,
                 cancelled: cancellation.is_cancelled(),
@@ -535,9 +539,11 @@ impl AssetPipeline {
         // already published, so a folder that cannot or must not be removed is only a warning.
         // The base is published and valid, with no cluster tables or payloads. Release its
         // exclusive writer lock so the overlay derivation takes its own shared lock on it (the
-        // repair ownership stays held to the end), then derive the object overlay from the
-        // finished base. The published base remains valid if derivation fails.
+        // repair ownership stays held to the end), then derive from the raw terrain DDS of
+        // staging/vfs. A terrain derive moves them out first into a folder of their own, so the
+        // staging folder (a resume candidate) is removed whatever the derive does.
         drop(output_lock);
+        let staged_vfs = staging.join("vfs");
         if crate::cluster::derive_requested(&config) {
             send(
                 &progress_tx,
@@ -549,24 +555,62 @@ impl AssetPipeline {
             )
             .await;
         }
-        let overlay = if crate::cluster::derive_requested(&config) && cancellation.is_cancelled() {
-            Err(color_eyre::Report::from(Interrupted::new()).wrap_err(
-                crate::cluster::overlay_failure_context(&config, &config.output_dir),
-            ))
-        } else {
-            crate::cluster::derive_after_publish(
-                &config,
-                &config.output_dir,
-                early_probe,
-                &post_publish,
-            )
+        let detached =
+            crate::cluster::detach_terrain_sources(&config, &config.output_dir, &staging);
+        let (overlay, raw_sources) = match detached {
+            // Not movable: the retry names the raw DDS where they still are, in staging.
+            Err(error) => (
+                Err(error.wrap_err(crate::cluster::overlay_failure_context(
+                    &config,
+                    &config.output_dir,
+                    Some(&staged_vfs),
+                ))),
+                None,
+            ),
+            Ok(raw) => {
+                let raw_vfs = raw.as_ref().map(|sources| sources.vfs());
+                let overlay =
+                    if crate::cluster::derive_requested(&config) && cancellation.is_cancelled() {
+                        Err(color_eyre::Report::from(Interrupted::new()).wrap_err(
+                            crate::cluster::overlay_failure_context(
+                                &config,
+                                &config.output_dir,
+                                raw_vfs.as_deref(),
+                            ),
+                        ))
+                    } else {
+                        crate::cluster::derive_after_publish(
+                            &config,
+                            &config.output_dir,
+                            raw_vfs.as_deref(),
+                            early_probe,
+                            &post_publish,
+                        )
+                    };
+                (overlay, raw)
+            }
         };
         match overlay {
             Ok(overlay) => {
                 overlay.record(&mut report);
+                // The derive consumed the raw terrain textures.
+                if let Some(raw) = raw_sources {
+                    raw.remove();
+                }
             }
             Err(error) => {
                 // The base stays published and valid, so this is not a resumable conversion.
+                // A detached raw-source folder is the failure's only keepsake; staging is kept
+                // only when the raw terrain DDS could not be moved out of it.
+                if raw_sources.is_some()
+                    || !crate::cluster::staging_needed_for_retry(
+                        &config,
+                        &config.output_dir,
+                        Some(&staged_vfs),
+                    )
+                {
+                    remove_staging(&staging, &config.data_dir);
+                }
                 return Err(PipelineFailure {
                     error,
                     staging: None,
@@ -3429,6 +3473,7 @@ fn invalidate_staged_generated_outputs(staging: &Path) -> Result<()> {
         "lod-manifest.json",
         "cluster-manifest.json",
         "cluster-report.json",
+        "cluster-terrain-manifest.json",
         "metadata-rebuild.json",
         "metadata-source-conversion-manifest.json",
     ] {
@@ -6979,7 +7024,11 @@ mod tests {
     fn invalidation_removes_every_staged_cluster_output() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path();
-        let manifests = ["cluster-manifest.json", "cluster-report.json"];
+        let manifests = [
+            "cluster-manifest.json",
+            "cluster-report.json",
+            "cluster-terrain-manifest.json",
+        ];
         for manifest in manifests {
             fs::write(staging.join(manifest), b"{}").unwrap();
         }

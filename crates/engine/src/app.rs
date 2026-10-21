@@ -474,6 +474,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         let min_instance_pixels = cluster_config.cluster_min_instance_pixels;
         let prepass = cluster_config.cluster_prepass;
         let own_statics = cluster_config.cluster_own_statics;
+        let terrain = cluster_config.cluster_terrain;
         let quality = cluster_config.graphics.clone();
         if let Some(selector) = selector {
             if preload {
@@ -503,7 +504,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             app.add_plugins(crate::cluster::package::ClusterPackagePlugin {
                 base,
                 overlay,
-                terrain: false,
+                terrain,
                 priority_point,
             });
         }

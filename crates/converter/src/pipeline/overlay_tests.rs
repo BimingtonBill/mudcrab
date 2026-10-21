@@ -315,7 +315,8 @@ async fn derive_failure_keeps_the_published_base_and_names_the_exact_retry() {
         label: "default".into(),
         replace: false,
         keep_failed_staging: false,
-
+        terrain: false,
+        terrain_sources: None,
         jobs,
         triangle_threshold: DEFAULT_TRIANGLE_THRESHOLD,
         include_trees: false,
@@ -338,6 +339,113 @@ fn terrain_source_folders_beside(output: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+#[tokio::test]
+async fn terrain_derive_failure_keeps_only_the_raw_vfs_in_a_folder_a_resume_cannot_find() {
+    let world = world(true);
+    let mut config = config(&world, LodMode::Cluster);
+    config.cluster_terrain = true;
+    config.cluster_triangle_threshold = 2048;
+    let failure = convert(config, FAILING).await.unwrap_err();
+    let text = format!("{:#}", failure.error);
+    assert!(text.contains("injected derive failure"), "{text}");
+    assert!(
+        text.contains("--triangle-threshold 2048 --jobs 2 --terrain --terrain-sources '"),
+        "{text}"
+    );
+    let raw = quoted_after(&text, "--terrain-sources '");
+    assert!(raw.ends_with("vfs") && raw.is_dir(), "{text}");
+    assert!(
+        raw.read_dir().unwrap().next().is_some(),
+        "the kept raw terrain textures are empty"
+    );
+    let folder = raw.parent().unwrap();
+    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.contains(".terrain-sources-"), "{name}");
+    assert!(!name.contains(".staging-"), "{name}");
+    assert_eq!(
+        fs::canonicalize(folder.parent().unwrap()).unwrap(),
+        fs::canonicalize(world.output.parent().unwrap()).unwrap()
+    );
+    assert!(folder.join("OWNER.txt").is_file());
+    assert_eq!(
+        terrain_source_folders_beside(&world.output)
+            .iter()
+            .map(|path| fs::canonicalize(path).unwrap())
+            .collect::<Vec<_>>(),
+        vec![fs::canonicalize(folder).unwrap()]
+    );
+    assert!(
+        text.contains(&format!("kept in {}", folder.display())),
+        "{text}"
+    );
+    assert!(text.contains("delete that folder"), "{text}");
+    assert!(failure.staging.is_none(), "the conversion is not resumable");
+    // The conversion staging goes whole: nothing a resume could pick up is left behind.
+    no_staging_beside(&world.output);
+    assert_eq!(crate::find_resumable_staging(&world.output), None);
+    assert!(
+        !world.output.join("vfs").exists(),
+        "the runtime base never holds the raw terrain textures"
+    );
+    assert_clusterless_base(&world.output);
+}
+
+static TERRAIN_SOURCES_SEEN: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Checks the raw root is present while deriving, then derives a plain overlay: the fixture
+/// world has no terrain recipe, so only the terrain request is dropped.
+fn terrain_sources_checking_derive(
+    options: &DeriveOptions,
+    probe: Option<(ProbeResult, f64)>,
+) -> color_eyre::Result<DeriveReport> {
+    let sources = options.terrain_sources.clone().expect("raw terrain root");
+    assert!(options.terrain);
+    assert!(sources.is_dir(), "the raw root is gone before the derive");
+    assert!(sources.read_dir().unwrap().next().is_some());
+    *TERRAIN_SOURCES_SEEN.lock().unwrap() = Some(sources);
+    derive_extensions::run_fixture_with_probe(
+        &DeriveOptions {
+            source: options.source.clone(),
+            label: options.label.clone(),
+            replace: false,
+            keep_failed_staging: false,
+            terrain: false,
+            terrain_sources: None,
+            jobs: options.jobs,
+            triangle_threshold: options.triangle_threshold,
+            include_trees: false,
+        },
+        probe,
+    )
+}
+
+#[tokio::test]
+async fn successful_terrain_derive_consumes_the_raw_sources_and_the_staging() {
+    let world = world(true);
+    let mut config = config(&world, LodMode::Cluster);
+    config.cluster_terrain = true;
+    let hooks = PostPublish {
+        probe: crate::cluster::fixture_probe,
+        derive: terrain_sources_checking_derive,
+    };
+    convert(config, hooks).await.unwrap();
+    let sources = TERRAIN_SOURCES_SEEN.lock().unwrap().take().unwrap();
+    assert!(sources.ends_with("vfs"));
+    assert!(
+        sources
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .contains(".terrain-sources-")
+    );
+    assert!(
+        !sources.parent().unwrap().exists(),
+        "the raw terrain textures outlive the derive that consumed them"
+    );
+    assert!(terrain_source_folders_beside(&world.output).is_empty());
+    no_staging_beside(&world.output);
+    assert_accepted_overlay(&world.output);
+}
 
 #[tokio::test]
 async fn a_non_terrain_derive_failure_leaves_no_raw_sources_folder() {
@@ -359,7 +467,16 @@ async fn unsupported_cluster_requests_fail_before_any_work() {
         failure.to_string().contains("cluster-stage --bench-baked"),
         "{failure}"
     );
-
+    let mut baked_terrain = config(&world, LodMode::Baked);
+    baked_terrain.cluster_terrain = true;
+    let failure = convert(baked_terrain, PostPublish::FIXTURE)
+        .await
+        .unwrap_err();
+    assert!(
+        failure.to_string().contains("--cluster-terrain requires"),
+        "{failure}"
+    );
+    assert!(!world.output.exists());
 }
 
 #[tokio::test]

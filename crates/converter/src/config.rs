@@ -100,6 +100,9 @@ pub struct PipelineConfig {
     /// Build the stand-in baked object chunks beside the cluster stage, for timing only.
     #[serde(default)]
     pub cluster_bench_baked: bool,
+    /// Add clustered terrain beside the core terrain and baked LOD outputs.
+    #[serde(default)]
+    pub cluster_terrain: bool,
     /// Build the merged-terrain outputs (#215) after the world database and the land textures:
     /// the land texture arrays, one merged mesh per exterior cell and the terrain chunk files.
     /// Off by default, because the engine half that reads them has not landed, and converted
@@ -212,6 +215,7 @@ impl PipelineConfig {
             lod_mode: crate::cluster::LodMode::default(),
             cluster_triangle_threshold: crate::cluster::DEFAULT_TRIANGLE_THRESHOLD,
             cluster_bench_baked: false,
+            cluster_terrain: false,
             merged_terrain: false,
             terrain_default_texture: TerrainDefaultTexture::default(),
             terrain_ini: None,

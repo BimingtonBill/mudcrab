@@ -68,12 +68,14 @@ impl SyntheticBase {
 
     /// Options for the real derivation of this base. Scheduling and the label are fixed; the
     /// threshold of 1 clusters the 18-triangle model.
-    pub fn derive_options(&self) -> DeriveOptions {
+    pub fn derive_options(&self, terrain: bool) -> DeriveOptions {
         DeriveOptions {
             source: self.base.clone(),
             label: "default".into(),
             replace: false,
             keep_failed_staging: false,
+            terrain,
+            terrain_sources: None,
             jobs: 1,
             triangle_threshold: 1,
             include_trees: false,

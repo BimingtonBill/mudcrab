@@ -51,6 +51,7 @@ struct Cli {
     lod_mode: converter::cluster::LodMode,
     cluster_triangle_threshold: u32,
     cluster_bench_baked: bool,
+    cluster_terrain: bool,
     merged_terrain: bool,
     terrain_default_texture: TerrainDefaultTexture,
     terrain_ini: Option<PathBuf>,
@@ -79,6 +80,7 @@ impl Cli {
         config.lod_mode = self.lod_mode;
         config.cluster_triangle_threshold = self.cluster_triangle_threshold;
         config.cluster_bench_baked = self.cluster_bench_baked;
+        config.cluster_terrain = self.cluster_terrain;
         config.merged_terrain = self.merged_terrain;
         config.terrain_default_texture = self.terrain_default_texture;
         config.terrain_ini = self.terrain_ini.clone();
@@ -624,6 +626,9 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
     if cli.cluster_bench_baked {
         command.push_str(" --cluster-bench-baked");
     }
+    if cli.cluster_terrain {
+        command.push_str(" --cluster-terrain");
+    }
     // A resumed run must build the same generated outputs: the terrain stage is rebuilt from
     // the records on every run, so dropping the option would publish without it, and an option
     // the stage reads must not be switched silently.
@@ -743,13 +748,15 @@ fn parse_derive_options(args: &[OsString]) -> Result<converter::derive_extension
     use converter::derive_extensions::DeriveOptions;
     ensure!(
         !args.is_empty(),
-        "usage: converter derive-clusters <base> [--label L] [--replace] [--keep-failed-staging] [--include-trees] [--jobs N] [--triangle-threshold N]"
+        "usage: converter derive-clusters <base> [--label L] [--replace] [--keep-failed-staging] [--terrain] [--terrain-sources VFS] [--include-trees] [--jobs N] [--triangle-threshold N]"
     );
     let mut options = DeriveOptions {
         source: PathBuf::from(&args[0]),
         label: "default".into(),
         replace: false,
         keep_failed_staging: false,
+        terrain: false,
+        terrain_sources: None,
         jobs: std::thread::available_parallelism().map_or(1, usize::from),
         triangle_threshold: converter::cluster::DEFAULT_TRIANGLE_THRESHOLD,
         include_trees: false,
@@ -764,6 +771,11 @@ fn parse_derive_options(args: &[OsString]) -> Result<converter::derive_extension
             }
             Some("--replace") => options.replace = true,
             Some("--keep-failed-staging") => options.keep_failed_staging = true,
+            Some("--terrain") => options.terrain = true,
+            Some("--terrain-sources") => {
+                options.terrain_sources =
+                    Some(PathBuf::from(next_value(&mut flags, "--terrain-sources")?))
+            }
             Some("--include-trees") => options.include_trees = true,
             Some("--jobs") => {
                 options.jobs = parse_u32(next_value(&mut flags, "--jobs")?, "--jobs")? as usize
@@ -783,7 +795,7 @@ fn parse_derive_options(args: &[OsString]) -> Result<converter::derive_extension
 fn derive_clusters(args: &[OsString]) -> Result<()> {
     if args.len() == 1 && matches!(args[0].to_str(), Some("--help" | "-h")) {
         println!(
-            "usage: converter derive-clusters <base> [--label L] [--replace] [--keep-failed-staging] [--include-trees] [--jobs N] [--triangle-threshold N]"
+            "usage: converter derive-clusters <base> [--label L] [--replace] [--keep-failed-staging] [--terrain] [--terrain-sources VFS] [--include-trees] [--jobs N] [--triangle-threshold N]"
         );
         return Ok(());
     }
@@ -1175,6 +1187,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut lod_mode = converter::cluster::LodMode::default();
     let mut cluster_triangle_threshold = converter::cluster::DEFAULT_TRIANGLE_THRESHOLD;
     let mut cluster_bench_baked = false;
+    let mut cluster_terrain = false;
     let mut merged_terrain = false;
     let mut terrain_default_texture = TerrainDefaultTexture::default();
     let mut terrain_ini = None;
@@ -1300,6 +1313,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
                 )?
             }
             Some("--cluster-bench-baked") => cluster_bench_baked = true,
+            Some("--cluster-terrain") => cluster_terrain = true,
             Some("--merged-terrain") => merged_terrain = true,
             Some("--terrain-default-texture") => {
                 terrain_option.get_or_insert("--terrain-default-texture");
@@ -1440,6 +1454,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         lod_mode,
         cluster_triangle_threshold,
         cluster_bench_baked,
+        cluster_terrain,
         merged_terrain,
         terrain_default_texture,
         terrain_ini,
@@ -1514,9 +1529,10 @@ fn usage() -> &'static str {
                  [--terrain-ini FILE] [--terrain-allow-downscale]
                  [--plugins-file FILE] [--skyrim-ccc-file FILE] [--skyrim-ini-file FILE]
                  [--lod-mode auto|cluster|baked] [--cluster-triangle-threshold N]
+                 [--cluster-bench-baked] [--cluster-terrain]
        converter check <output directory> [--full]
        converter refresh-extensions <output directory>
-       converter derive-clusters <base> [--label L] [--replace] [--keep-failed-staging] [--include-trees] [--jobs N] [--triangle-threshold N]
+       converter derive-clusters <base> [--label L] [--replace] [--keep-failed-staging] [--terrain] [--terrain-sources VFS] [--include-trees] [--jobs N] [--triangle-threshold N]
        converter repair-failed <Skyrim Data> <output directory> [--mo2-instance DIR]
                  [--mo2-profile NAME] [--no-lod] [--apply]
                  [--texture-encoder cpu|gpu] [--gpu-quality N] [--gpu-batch-mb N]
@@ -1584,6 +1600,7 @@ default) adds nothing. `cluster` and `auto` publish the base first, then derive 
 under <base>/derived/. The adapter is probed once and recorded; offline derivation runs even
 when an auto probe reports missing runtime features. A derivation error leaves the base valid
 and prints the command to retry just the overlay.
+--cluster-terrain adds terrain clusters and their dependency metadata; requires cluster/auto LOD.
 --cluster-triangle-threshold sets the smallest primitive that gets clusters (default 1024).
 --cluster-bench-baked is refused in full conversions. Use standalone cluster-stage --bench-baked
 against the published base for the measurement-only baked comparison.
@@ -2190,12 +2207,14 @@ mod tests {
             "--cluster-triangle-threshold",
             "2048",
             "--cluster-bench-baked",
+            "--cluster-terrain",
         ]))
         .unwrap();
         let config = cli.pipeline_config();
         assert_eq!(config.lod_mode, converter::cluster::LodMode::Cluster);
         assert_eq!(config.cluster_triangle_threshold, 2048);
         assert!(config.cluster_bench_baked);
+        assert!(config.cluster_terrain);
         let resumed = resume_command("converter", &cli, Path::new("staging"));
         assert!(resumed.contains("--lod-mode cluster"), "{resumed}");
         assert!(
@@ -2203,6 +2222,7 @@ mod tests {
             "{resumed}"
         );
         assert!(resumed.contains("--cluster-bench-baked"), "{resumed}");
+        assert!(resumed.contains("--cluster-terrain"), "{resumed}");
     }
 
     /// Selection inputs survive parsing and the command printed after interruption.
@@ -2312,6 +2332,7 @@ mod tests {
             lod_mode: converter::cluster::LodMode::default(),
             cluster_triangle_threshold: converter::cluster::DEFAULT_TRIANGLE_THRESHOLD,
             cluster_bench_baked: false,
+            cluster_terrain: false,
             merged_terrain: false,
             terrain_default_texture: TerrainDefaultTexture::White,
             terrain_ini: None,

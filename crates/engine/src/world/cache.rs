@@ -54,6 +54,22 @@ impl CellCache {
         Ok(Self { mmap, index })
     }
 
+    /// Borrow only heights from the already validated archive, without cloning
+    /// normals, colours or texture layers. The caller retains this cache owner.
+    pub(crate) fn terrain_heights(
+        &self,
+        cell_id: u32,
+    ) -> Option<(u16, u16, impl ExactSizeIterator<Item = f32> + '_)> {
+        // SAFETY: open validated these exact immutable mapped bytes, as for terrain.
+        let archived = unsafe { rkyv::access_unchecked::<shared::ArchivedCellCache>(&self.mmap) };
+        let cell = archived.cells.get(*self.index.get(&cell_id)?)?;
+        Some((
+            cell.width.into(),
+            cell.height.into(),
+            cell.heights.iter().copied().map(Into::into),
+        ))
+    }
+
     pub fn terrain(&self, cell_id: u32) -> Option<TerrainSnapshot> {
         // SAFETY: `open` already validated these exact bytes with `rkyv::access`
         // (which runs bytecheck over the whole `ArchivedCellCache`) before this
@@ -99,13 +115,13 @@ impl CellCache {
     /// Height of the cell's centre sample (the one the start position and `coc`/`coe` stand on),
     /// or `None` for a cell with no terrain in the cache.
     pub fn centre_height(&self, cell_id: u32) -> Option<f32> {
-        let terrain = self.terrain(cell_id)?;
-        let width = usize::from(terrain.width);
-        let height = usize::from(terrain.height);
+        let (width, height, mut heights) = self.terrain_heights(cell_id)?;
+        let width = usize::from(width);
+        let height = usize::from(height);
         let index = (height / 2)
             .checked_mul(width)
             .and_then(|row| row.checked_add(width / 2))?;
-        terrain.heights.get(index).copied()
+        heights.nth(index)
     }
 
     pub fn len(&self) -> usize {

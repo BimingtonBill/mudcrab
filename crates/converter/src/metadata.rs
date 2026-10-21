@@ -253,6 +253,7 @@ impl AssetPipeline {
         crate::cluster::derive_after_publish(
             &config,
             &config.output_dir,
+            None,
             early_probe,
             &post_publish,
         )?

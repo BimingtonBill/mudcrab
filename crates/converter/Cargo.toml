@@ -41,6 +41,7 @@ project-wormhole-shared = "0.1.0"
 project-wormhole-esm.workspace = true
 mlua.workspace = true
 zstd = "0.13"
+ruzstd = "0.9.1"
 # The encoder runs on native Vulkan, Metal or DX12 only (no GL, no WebGPU).
 wgpu = { version = "29.0.4", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
 tempfile = "3.20"
@@ -54,7 +55,6 @@ sha2 = { workspace = true, features = ["asm"] }
 [dev-dependencies]
 insta = { version = "1.48", features = ["json", "redactions"] }
 proptest = { version = "1.11", default-features = false, features = ["std"] }
-ruzstd = "0.9.1"
 dummy-content = { path = "../dummy-content" }
 
 [build-dependencies]

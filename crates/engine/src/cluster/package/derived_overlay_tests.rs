@@ -15,12 +15,13 @@ use converter::{
     test_support::SyntheticBase,
 };
 use shared::{
-    cluster_overlay::read_metadata,
+    cluster_overlay::{binding_check_metrics, read_metadata},
+    extensions::{CLUSTER_TERRAIN, CLUSTERS},
 };
 use std::path::Path;
 
-fn derive(base: &SyntheticBase) -> DeriveReport {
-    derive_extensions::run(&base.derive_options()).expect("real derivation of the base")
+fn derive(base: &SyntheticBase, terrain: bool) -> DeriveReport {
+    derive_extensions::run(&base.derive_options(terrain)).expect("real derivation of the base")
 }
 
 /// Runs the real loader system over a certified package and returns the app holding its result.
@@ -52,9 +53,86 @@ fn load(base: &Path, overlay: &Path, terrain: bool, package: Arc<CertifiedPackag
 }
 
 #[test]
+fn derived_object_and_terrain_overlay_certifies_and_loads() {
+    let base = SyntheticBase::complete();
+    let derived = derive(&base, true);
+    assert!(!derived.incomplete_core);
+    let produced = |id: &str| {
+        derived
+            .extensions
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap_or_else(|| panic!("the derivation produced no {id} extension"))
+    };
+    let (produced_base, produced_terrain) = (produced(CLUSTERS), produced(CLUSTER_TERRAIN));
+
+    let started = std::time::Instant::now();
+
+    // The consumer's envelope recomputes both extension hashes from the overlay's tables and files and
+    // checks the `owns` lists and the terrain manifest's `requires` hash against what it read.
+    let opened = envelope::open(base.path(), &derived.output, true).expect("envelope::open");
+    assert_eq!(&opened.base, produced_base);
+    assert_eq!(opened.terrain.as_ref(), Some(produced_terrain));
+    assert_eq!(opened.builder_identity, derived.stage.builder_identity);
+    let metadata = read_metadata(&derived.output).unwrap();
+    assert_eq!(metadata.base_failure_count, 0);
+    assert_eq!(opened.metadata.settings_id, metadata.settings_id);
+    drop(opened);
+    // An object-only open of a terrain overlay is also valid: the terrain entry is simply unread.
+    drop(envelope::open(base.path(), &derived.output, false).expect("object-only open"));
+
+    let (calls_before, ms_before) = binding_check_metrics();
+    let certified_started = std::time::Instant::now();
+    let package = Arc::new(
+        CertifiedPackage::open(base.path(), &derived.output, true).expect("CertifiedPackage::open"),
+    );
+    let certified_ms = certified_started.elapsed().as_secs_f64() * 1000.0;
+    assert!(
+        package.records().count() > 0,
+        "the object reference is certified"
+    );
+
+    let loader_started = std::time::Instant::now();
+    let app = load(base.path(), &derived.output, true, package.clone());
+    let loader_ms = loader_started.elapsed().as_secs_f64() * 1000.0;
+    let scene = app.world().resource::<ClusterScene>();
+    assert!(Arc::ptr_eq(scene.certificate.as_ref().unwrap(), &package));
+    assert!(!scene.meshes.is_empty());
+    assert_eq!(scene.terrain_blocks.len(), 1, "one terrain block");
+    assert!(
+        scene
+            .instances
+            .iter()
+            .any(|instance| matches!(instance.identity, ClusterInstanceIdentity::Object(_)))
+    );
+    assert!(
+        scene
+            .instances
+            .iter()
+            .any(|instance| matches!(instance.identity, ClusterInstanceIdentity::Terrain { .. }))
+    );
+    assert!(app.world().contains_resource::<LazyBatches>());
+    assert!(app.world().contains_resource::<TerrainBatchIds>());
+
+    // Measurement only (process-wide counters, so other tests in this process may add to the
+    // delta): one certification and the subsequent loader reuse one launch receipt. The two
+    // independent envelope opens above are intentionally outside this measurement.
+    let (calls_after, ms_after) = binding_check_metrics();
+    eprintln!(
+        "derived overlay open+certify+load: total {:.1} ms (certify {certified_ms:.1} ms, loader \
+         {loader_ms:.1} ms); certify+load binding checks +{} calls, +{:.1} ms",
+        started.elapsed().as_secs_f64() * 1000.0,
+        calls_after - calls_before,
+        ms_after - ms_before
+    );
+    drop(app);
+    drop(package);
+}
+
+#[test]
 fn derived_object_overlay_certifies_and_loads() {
     let base = SyntheticBase::complete();
-    let derived = derive(&base);
+    let derived = derive(&base, false);
     assert!(!derived.incomplete_core);
     let produced = derived.extensions.iter()
         .find(|entry| entry.id == shared::extensions::CLUSTERS)
@@ -84,7 +162,7 @@ fn derived_object_overlay_certifies_and_loads() {
 #[test]
 fn overlay_derived_over_a_base_with_a_recorded_failure_opens_and_loads() {
     let base = SyntheticBase::with_failed_asset();
-    let derived = derive(&base);
+    let derived = derive(&base, false);
     let mut config = crate::config::EngineConfig {
         assets_dir: base.path().to_owned(),
         ..Default::default()

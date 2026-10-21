@@ -1,7 +1,7 @@
 //! Add optional clusters to an unchanged core. This is not a conversion or a
 //! repair: existing incompleteness remains visible in the resulting dataset.
 use crate::{
-    cache::{CONVERTER_SCHEMA_VERSION, ConversionManifest},
+    cache::{CONVERTER_SCHEMA_VERSION, ConversionManifest, hash_file},
     check::{CheckMode, CheckProblem, check_output},
     cluster::{self, publish::PublishContext, stage::StageSettings},
 };
@@ -28,6 +28,9 @@ pub struct DeriveOptions {
     pub label: String,
     pub replace: bool,
     pub keep_failed_staging: bool,
+    pub terrain: bool,
+    /// Raw DDS root, verified against the current core LOD source recipe.
+    pub terrain_sources: Option<PathBuf>,
     pub jobs: usize,
     pub triangle_threshold: u32,
     pub include_trees: bool,
@@ -105,7 +108,7 @@ pub fn resolved_settings(options: &DeriveOptions) -> ResolvedBuildSettings {
             &cluster::identity::identity_inputs(options.triangle_threshold).identity(),
         ),
         options.triangle_threshold,
-        false,
+        options.terrain,
         options.include_trees,
     )
 }
@@ -113,6 +116,15 @@ pub fn resolved_settings(options: &DeriveOptions) -> ResolvedBuildSettings {
 /// The overlay folder id: the hash of the exact object [`resolved_settings`] records.
 pub fn settings_id(options: &DeriveOptions) -> String {
     resolved_settings(options).settings_id()
+}
+
+/// `path` without a Windows verbatim prefix (`\\?\D:\x` becomes `D:\x`) so a recorded host path
+/// can be pasted into a command. UNC verbatim paths and every other path are unchanged.
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(rest) if !rest.starts_with(r"UNC\") => PathBuf::from(rest),
+        _ => path,
+    }
 }
 
 pub(crate) fn run_with_probe(
@@ -139,6 +151,39 @@ fn run_with_space(
     let source_lock = AssetLock::acquire_shared(&source)?;
     let source = source_lock.asset_dir();
     let (raw_manifest, manifest, incomplete) = preflight(source)?;
+    ensure!(
+        options.terrain || options.terrain_sources.is_none(),
+        "--terrain-sources requires --terrain"
+    );
+    let terrain_contract = options
+        .terrain
+        .then(|| cluster::terrain_sources::TerrainSourceContract::open(source))
+        .transpose()?;
+    let core_vfs = source.join("vfs");
+    // Host path of the raw DDS root, recorded only when the base has no VFS of its own.
+    let mut terrain_sources = None;
+    let terrain_root = if let Some(contract) = &terrain_contract {
+        let has_core_vfs = core_vfs.try_exists()?;
+        let root = if has_core_vfs {
+            if let Some(explicit) = &options.terrain_sources {
+                ensure!(
+                    fs::canonicalize(explicit)? == fs::canonicalize(&core_vfs)?,
+                    "an existing core VFS cannot be replaced"
+                );
+            }
+            core_vfs
+        } else {
+            options.terrain_sources.clone().ok_or_else(|| color_eyre::eyre::eyre!(
+                "terrain derivation requires --terrain-sources <raw DDS root> when the core has no VFS"))?
+        };
+        verify_terrain_input_root(&root, contract)?;
+        if !has_core_vfs {
+            terrain_sources = Some(without_verbatim_prefix(fs::canonicalize(&root)?));
+        }
+        Some(root)
+    } else {
+        None
+    };
     let build_settings = resolved_settings(options);
     build_settings.validate()?;
     let id = build_settings.settings_id();
@@ -174,7 +219,7 @@ fn run_with_space(
             "existing overlay settings id differs from its destination"
         );
     }
-    derive_storage::admit(source, &derived, &output, false, |_| {
+    derive_storage::admit(source, &derived, &output, options.terrain, |_| {
         space.available()
     })?;
     let result = (|| {
@@ -218,7 +263,7 @@ fn run_with_space(
             &output,
             &staging,
             source,
-            None,
+            terrain_root.as_deref(),
         )?
         .with_space(&space);
         let (stage, _) = cluster::stage::run_stage_guarded(
@@ -238,6 +283,7 @@ fn run_with_space(
             &context,
             &manifest,
             &stage.builder_identity,
+            options.terrain,
         )?;
         ensure!(
             stage.builder_identity == build_settings.builder_identity,
@@ -269,7 +315,7 @@ fn run_with_space(
             label: options.label.clone(),
             settings_id: id,
             build_settings,
-            terrain_sources: None,
+            terrain_sources,
             base_core_identity: core,
             base_fingerprint: shared::cluster_overlay::base_fingerprint(source)?,
             base_failure_count,
@@ -505,6 +551,8 @@ mod settings_tests {
             label: "default".into(),
             replace: false,
             keep_failed_staging: false,
+            terrain: false,
+            terrain_sources: None,
             jobs: 1,
             triangle_threshold: 1024,
             include_trees: false,
@@ -527,12 +575,73 @@ mod settings_tests {
         options.label = "other".into();
         options.replace = true;
         options.keep_failed_staging = true;
+        options.terrain_sources = Some(PathBuf::from("E:/raw"));
         assert_eq!(resolved_settings(&options), settings);
         assert_eq!(settings_id(&options), settings.settings_id());
         options.include_trees = true;
         assert_ne!(settings_id(&options), settings.settings_id());
     }
 
+    #[test]
+    fn a_verbatim_prefix_is_dropped_from_a_recorded_host_path() {
+        assert_eq!(
+            without_verbatim_prefix(PathBuf::from(r"\\?\D:\raw dds")),
+            PathBuf::from(r"D:\raw dds")
+        );
+        for unchanged in [r"\\?\UNC\server\share", r"D:\raw", "/raw"] {
+            assert_eq!(
+                without_verbatim_prefix(PathBuf::from(unchanged)),
+                PathBuf::from(unchanged)
+            );
+        }
+    }
+}
+
+// Private helpers for derive_extensions.rs. Source paths/hashes are supplied
+// only by TerrainSourceContract after binding them to the current core recipe.
+fn verified_input_file(root: &Path, relative: &str) -> Result<PathBuf> {
+    for ancestor in std::path::absolute(root)?.ancestors() {
+        ensure!(
+            !is_link(&fs::symlink_metadata(ancestor)?),
+            "terrain source root has a linked ancestor: {}",
+            ancestor.display()
+        );
+    }
+    let mut path = root.to_owned();
+    ensure!(
+        fs::symlink_metadata(root)?.is_dir() && !is_link(&fs::symlink_metadata(root)?),
+        "terrain source root is not a regular directory"
+    );
+    for component in Path::new(relative).components() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("unsafe terrain input path");
+        };
+        path.push(name);
+        ensure!(
+            !is_link(&fs::symlink_metadata(&path)?),
+            "linked terrain input path: {}",
+            path.display()
+        );
+    }
+    ensure!(
+        fs::symlink_metadata(&path)?.is_file(),
+        "terrain source is not a regular file: {}",
+        path.display()
+    );
+    Ok(path)
+}
+
+fn verify_terrain_input_root(
+    root: &Path,
+    contract: &cluster::terrain_sources::TerrainSourceContract,
+) -> Result<()> {
+    for (path, hash) in contract.sources() {
+        ensure!(
+            hash_file(&verified_input_file(root, path)?)? == hash,
+            "terrain source bytes disagree with the current core recipe: {path}"
+        );
+    }
+    Ok(())
 }
 
 #[path = "derive_storage.rs"]

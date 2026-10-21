@@ -1,6 +1,6 @@
 use super::*;
 use crate::derive_database;
-use crate::{cache::{CacheEntry, hash_file}, cluster::probe::ProbeResult, esm::exporter::create_tables};
+use crate::{cache::CacheEntry, cluster::probe::ProbeResult, esm::exporter::create_tables};
 use shared::extensions::{CLUSTERS, DataExtensions, ExtensionHasher, ExtensionOwns};
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -129,7 +129,8 @@ fn fixture() -> Fixture {
             label: "default".into(),
             replace: false,
             keep_failed_staging: false,
-
+            terrain: false,
+            terrain_sources: None,
             jobs: 1,
             triangle_threshold: 12,
             include_trees: false,
@@ -494,8 +495,138 @@ fn settings_id_excludes_jobs_and_label_but_tracks_build_settings() {
     fixture.options.triangle_threshold += 1;
     assert_ne!(settings_id(&fixture.options), baseline);
     fixture.options.triangle_threshold -= 1;
+    fixture.options.terrain = true;
+    assert_ne!(settings_id(&fixture.options), baseline);
+    fixture.options.terrain = false;
     fixture.options.include_trees = true;
     assert_ne!(settings_id(&fixture.options), baseline);
+}
+
+// Direct source verification uses invented bytes; this does not test DDS decoding.
+mod terrain_input_verification_tests {
+    use super::*;
+    use crate::cache::hash_bytes;
+    use crate::cluster::terrain_sources::TerrainSourceContract;
+
+    const INPUT_A: &str = "textures/landscape/invented-copy-a.dds";
+    const INPUT_B: &str = "textures/landscape/invented-copy-b.dds";
+    const BYTES_A: &[u8] = b"invented raw terrain input a";
+    const BYTES_B: &[u8] = b"invented raw terrain input b";
+
+    struct TerrainInputFixture {
+        _directory: TempDir,
+        raw: PathBuf,
+        staging: PathBuf,
+        contract: TerrainSourceContract,
+    }
+
+    fn terrain_input_fixture() -> TerrainInputFixture {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("OWNER.txt"),
+            "owner: terrain input helper test\n",
+        )
+        .unwrap();
+        let raw = directory.path().join("raw");
+        let converted = directory.path().join("converted");
+        let staging = directory.path().join("staging");
+        for path in [&raw, &converted, &staging] {
+            fs::create_dir(path).unwrap();
+            fs::write(
+                path.join("OWNER.txt"),
+                "owner: terrain input helper fixture root\n",
+            )
+            .unwrap();
+        }
+        for (relative, bytes) in [(INPUT_A, BYTES_A), (INPUT_B, BYTES_B)] {
+            let path = raw.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        // Neither unrelated files nor source ownership metadata belongs to the
+        // selective temporary VFS; its OWNER must be the helper's own marker.
+        fs::write(raw.join("source-only.bin"), b"unrelated raw source bytes").unwrap();
+        fs::write(
+            staging.join("retained-core.bin"),
+            b"retained staging core bytes",
+        )
+        .unwrap();
+        let db = Connection::open(converted.join("skyrim_world.db")).unwrap();
+        create_tables(&db).unwrap();
+        db.execute(
+            "INSERT INTO lod_build(id,build_identity) VALUES(1,?1)",
+            ["ab".repeat(32)],
+        )
+        .unwrap();
+        drop(db);
+        let sources = BTreeMap::from([
+            (INPUT_A, hash_bytes(BYTES_A)),
+            (INPUT_B, hash_bytes(BYTES_B)),
+        ]);
+        let entries: BTreeMap<_, _> = sources.iter().map(|(path, hash)| {
+            (*path, serde_json::json!({"source_hash": format!("{hash}:texture-encoding:ColorSrgb")}))
+        }).collect();
+        fs::write(
+            converted.join("conversion-manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": CONVERTER_SCHEMA_VERSION,
+                "entries": entries,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            converted.join("lod-manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "build_identity": "ab".repeat(32),
+                "converter_schema": CONVERTER_SCHEMA_VERSION,
+                "world_database_schema": shared::WORLD_DATABASE_SCHEMA_VERSION,
+                "chunks": 0,
+                "land_texture_repeats_per_cell": shared::LAND_TEXTURE_REPEATS_PER_CELL,
+                "terrain_sources": sources,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let contract = TerrainSourceContract::open(&converted).unwrap();
+        TerrainInputFixture {
+            _directory: directory,
+            raw,
+            staging,
+            contract,
+        }
+    }
+
+    fn terrain_input_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(root: &Path, directory: &Path, result: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect(root, &path, result);
+                } else {
+                    result.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut result = BTreeMap::new();
+        collect(root, root, &mut result);
+        result
+    }
+
+    #[test]
+    fn terrain_inputs_are_verified_in_place_without_any_staged_copy() {
+        let f = terrain_input_fixture();
+        let source_before = terrain_input_tree(&f.raw);
+        let staging_before = terrain_input_tree(&f.staging);
+        verify_terrain_input_root(&f.raw, &f.contract).unwrap();
+        assert_eq!(terrain_input_tree(&f.raw), source_before);
+        assert_eq!(terrain_input_tree(&f.staging), staging_before);
+        fs::write(f.raw.join(INPUT_A), b"changed raw source bytes").unwrap();
+        assert!(verify_terrain_input_root(&f.raw, &f.contract).is_err());
+    }
 }
 
 #[test]

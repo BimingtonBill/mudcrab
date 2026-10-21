@@ -938,6 +938,10 @@ pub struct StreamingMetrics {
     pub pending_far_stock_qualification: usize,
     /// Current-demand exact source query, ownership or asset failures; never readiness.
     pub failed_far_stock_sources: usize,
+    /// Diagnostic count of current-world terrain batches without the legacy cross-view proof.
+    /// This includes blocks outside the requested view, so it must not gate settling:
+    /// exact per-view readiness accepts drawable stock terrain or its cluster replacement.
+    pub pending_cluster_terrain_blocks: usize,
     pub ready_lod_terrain_patches: u64,
     pub visible_lod_terrain_patches: usize,
     pub total_lod_query_micros: u64,
@@ -2623,6 +2627,7 @@ struct CommitCatalogs<'w, 's> {
     budget: ResMut<'w, StreamingCommitBudget>,
     far: Option<ResMut<'w, far_stock::FarStock>>,
     reference_entities: Query<'w, 's, (), With<FormId>>,
+    cluster_terrain: Option<Res<'w, crate::cluster::terrain::ClusterTerrain>>,
 }
 
 /// Hands the root a detail change replaces over to the stand-in hold (design-1091 Â§3): the cell
@@ -2866,8 +2871,29 @@ fn collect_cells(
         match response.result {
             Ok(mut payload) => {
                 let mut terrain = cache.terrain(payload.cell_id);
-                // A cell with a snapshot is drawn from merged data when the merged path is ready
-                // and the cell's own data passes every check; otherwise by quadrant, counted.
+                if let (Some(terrain), Some(cluster)) =
+                    (terrain.as_mut(), catalogs.cluster_terrain.as_deref())
+                    && let CellKey::Exterior {
+                        worldspace_id,
+                        grid_x,
+                        grid_y,
+                    } = payload.key
+                    && let Some(heights) =
+                        cluster.canonical_heights(worldspace_id, IVec2::new(grid_x, grid_y))
+                {
+                    // The cluster adapter and near mesh/collider must use the same canonical edge heights.
+                    let changed: Vec<_> = terrain
+                        .heights
+                        .iter()
+                        .zip(heights)
+                        .enumerate()
+                        .filter_map(|(index, (old, new))| {
+                            ((old - new).abs() > EDGE_MATCH_TOLERANCE).then_some(index)
+                        })
+                        .collect();
+                    terrain.heights = heights.to_vec();
+                    recompute_packed_normals(terrain, &changed);
+                }
                 let mut merged = terrain.as_ref().and_then(|_| {
                     choose_merged_terrain(
                         assets.merge.as_deref_mut(),
@@ -2877,8 +2903,21 @@ fn collect_cells(
                         &mut profiler,
                     )
                 });
-                if let Some(terrain) = &mut terrain {
-                    let validation = settle_cell_terrain(
+                if let Some(terrain) = terrain.as_mut() {
+                    let canonical =
+                        catalogs
+                            .cluster_terrain
+                            .as_deref()
+                            .and_then(|cluster| match payload.key {
+                                CellKey::Exterior {
+                                    worldspace_id,
+                                    grid_x,
+                                    grid_y,
+                                } => cluster
+                                    .canonical_heights(worldspace_id, IVec2::new(grid_x, grid_y)),
+                                CellKey::Interior(_) => None,
+                            });
+                    let validation = settle_cell_terrain_canonical(
                         payload.key,
                         payload.cell_id,
                         merged.take(),
@@ -2887,6 +2926,7 @@ fn collect_cells(
                         &mut continuity,
                         &mut metrics,
                         &mut profiler,
+                        canonical,
                     )
                     .map(|settled| merged = settled);
                     if let Err(reason) = validation {
@@ -4933,6 +4973,7 @@ fn should_hold_response(
 /// with the reason. A cell with no merged data validates and welds as the quadrant path always has.
 /// The settled merged data, if the cell keeps it, is returned.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn settle_cell_terrain(
     key: CellKey,
     cell_id: u32,
@@ -4943,10 +4984,53 @@ fn settle_cell_terrain(
     metrics: &mut StreamingMetrics,
     profiler: &mut ProfilingState,
 ) -> Result<Option<MergedSpawn>, String> {
+    settle_cell_terrain_canonical(
+        key, cell_id, merged, terrain, catalog, continuity, metrics, profiler, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_cell_terrain_canonical(
+    key: CellKey,
+    cell_id: u32,
+    merged: Option<MergedSpawn>,
+    terrain: &mut TerrainSnapshot,
+    catalog: &AssetCatalog,
+    continuity: &mut TerrainContinuity,
+    metrics: &mut StreamingMetrics,
+    profiler: &mut ProfilingState,
+    canonical: Option<&[f32]>,
+) -> Result<Option<MergedSpawn>, String> {
     let mut merged = merged;
     if let Some(spawn) = &mut merged {
         let weld_started = Instant::now();
-        let welded = weld_merged_cell(key, &mut spawn.cell, continuity, metrics);
+        let welded = if let Some(heights) = canonical {
+            // Both near representations consume the cluster's finalized whole-world seam choice.
+            let (_, normals) = crate::terrain_merge::mesh::cell_to_grid(&spawn.cell)?;
+            if heights.len().saturating_mul(3) != normals.len() {
+                return Err("canonical terrain grid dimensions differ".to_owned());
+            }
+            let grid = TerrainSnapshot {
+                cell_id,
+                width: shared::LAND_SIDE,
+                height: shared::LAND_SIDE,
+                heights: heights.to_vec(),
+                normals: terrain.normals.clone(),
+                vertex_colors: Vec::new(),
+                layers: Vec::new(),
+                water_height: None,
+                water_type_form_id: None,
+            };
+            crate::terrain_merge::mesh::write_grid(
+                &mut spawn.cell,
+                &grid.heights,
+                &terrain.normals,
+            );
+            continuity.edges.insert(key, TerrainEdges::of(&grid));
+            Ok(())
+        } else {
+            weld_merged_cell(key, &mut spawn.cell, continuity, metrics)
+        };
         profiler.record_elapsed("streaming/terrain_seam_weld", weld_started);
         if let Err(reason) = welded {
             merged = None;
@@ -4964,7 +5048,12 @@ fn settle_cell_terrain(
         profiler.record_elapsed("streaming/terrain_validation", validation_started);
         validation?;
         let weld_started = Instant::now();
-        let welded = validate_and_register_terrain_edges(key, terrain, continuity, metrics);
+        let welded = if canonical.is_some() {
+            continuity.edges.insert(key, TerrainEdges::of(terrain));
+            Ok(())
+        } else {
+            validate_and_register_terrain_edges(key, terrain, continuity, metrics)
+        };
         profiler.record_elapsed("streaming/terrain_seam_weld", weld_started);
         welded?;
     }

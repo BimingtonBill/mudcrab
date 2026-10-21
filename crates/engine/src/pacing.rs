@@ -603,6 +603,34 @@ mod tests {
     }
 
     #[test]
+    fn global_terrain_diagnostic_does_not_block_a_drawn_stock_view() {
+        let mut metrics = StreamingMetrics {
+            pending_cluster_terrain_blocks: 37,
+            ..default()
+        };
+        let ready = WorldReadyInputs::from_streaming(&metrics, 0, 25, 25, 0);
+        assert!(
+            ready.is_ready(),
+            "global legacy terrain readiness is not current-view demand"
+        );
+        metrics.pending_cluster_batches = 1;
+        let waiting = WorldReadyInputs::from_streaming(&metrics, 0, 25, 25, 0);
+        assert!(
+            !waiting.is_ready(),
+            "actual pending cluster batches still hold readiness"
+        );
+        metrics.pending_cluster_batches = 0;
+        metrics.failed_cluster_batches = 1;
+        assert!(!WorldReadyInputs::from_streaming(&metrics, 0, 25, 25, 0).is_ready());
+        metrics.failed_cluster_batches = 0;
+        let undrawn = WorldReadyInputs::from_streaming(&metrics, 1, 25, 25, 0);
+        assert!(
+            !undrawn.is_ready(),
+            "current-view actual draw readiness remains required"
+        );
+    }
+
+    #[test]
     fn a_fully_loaded_window_is_ready() {
         assert!(ready_inputs().is_ready());
     }
