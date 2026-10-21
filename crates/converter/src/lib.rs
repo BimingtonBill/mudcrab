@@ -20,6 +20,7 @@ pub mod lod;
 pub mod material;
 pub mod mesh;
 mod metadata;
+pub mod nif_animation;
 pub mod pipeline;
 /// The portal's distant-LOD inventory (`lod_grid`, `lod_block`, the tree
 /// billboards). #105's terrain-chunk LOD lives in [`lod`]; the two run side by

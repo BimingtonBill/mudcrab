@@ -494,10 +494,7 @@ impl AssetPipeline {
         fs::write(staging.join(".base-published"), b"base already published\n").map_err(
             |error| PipelineFailure {
                 error: color_eyre::Report::from(error).wrap_err(
-                    crate::cluster::overlay_failure_context(
-                        &config,
-                        &config.output_dir,
-                    ),
+                    crate::cluster::overlay_failure_context(&config, &config.output_dir),
                 ),
                 staging: None,
                 cancelled: cancellation.is_cancelled(),
@@ -1752,7 +1749,12 @@ fn reusable_manifest(
             }
             _ => unreachable!(),
         };
-        let settings_match = if let Some(recorded) = manifest.asset_configuration_hashes.get(kind) {
+        // A historical combined settings proof cannot attest authored transform clips.
+        let settings_match = if kind == "nif"
+            && !manifest.asset_configuration_hashes.contains_key(kind)
+        {
+            false
+        } else if let Some(recorded) = manifest.asset_configuration_hashes.get(kind) {
             recorded == &asset_configuration_hash_for_schema(config, producer, kind)?
         } else {
             // Older manifests have one combined proof. Require an exact known

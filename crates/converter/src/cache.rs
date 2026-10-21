@@ -596,7 +596,8 @@ pub fn asset_configuration_hash_for_schema(
     source_ext: &str,
 ) -> Result<String> {
     let mut relevant = match source_ext {
-        "nif" => serde_json::json!({"mesh_producer": schema}),
+        "nif" => serde_json::json!({"mesh_producer": schema,
+            "authored_transform_animation": crate::nif_animation::PRODUCER_VERSION}),
         "dds" => serde_json::json!({
             "texture_producer": schema,
             "texture_etc1s_quality": config.texture_fallback_quality,
@@ -1148,6 +1149,19 @@ fn hash_open_file(mut file: &fs::File) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_animation_changes_the_nif_asset_proof() {
+        let config = crate::config::PipelineConfig::new("Data", "output");
+        let old = hash_bytes(
+            &serde_json::to_vec(&serde_json::json!({"mesh_producer": CONVERTER_SCHEMA_VERSION}))
+                .unwrap(),
+        );
+        assert_ne!(
+            asset_configuration_hash_for_schema(&config, CONVERTER_SCHEMA_VERSION, "nif").unwrap(),
+            old
+        );
+    }
 
     /// Historical absence stays unknown while known loss and success round-trip distinctly.
     #[test]

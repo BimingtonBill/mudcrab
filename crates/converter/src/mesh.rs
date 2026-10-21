@@ -209,6 +209,15 @@ impl MeshConverter {
             &shape_blocks,
             output,
         )?;
+        let glb = if diagnostics.block_types.contains_key("NiControllerManager") {
+            let (animated, warnings) = crate::nif_animation::append_nif_animations(&glb, nif_path)?;
+            for warning in warnings {
+                eprintln!("{}: {warning}", nif_path.display());
+            }
+            animated
+        } else {
+            glb
+        };
         ensure!(
             glb.len() >= 12 && &glb[..4] == b"glTF",
             "NIF exporter produced an invalid GLB header"
