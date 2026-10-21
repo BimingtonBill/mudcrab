@@ -115,6 +115,46 @@ struct PendingPreparations {
     resumed_total: u64,
     canceled_total: u64,
     logged_samples: usize,
+    /// Where the observed candidates came from, summed since the last report.
+    sources: CandidateSources,
+}
+
+/// Where the candidates of [`observe_deferred_mesh_preparation`] came from, summed over
+/// [`CandidateSources::REPORT_EVERY`] frames: in a settled scene every count should be near zero.
+#[derive(Default)]
+struct CandidateSources {
+    frames: u64,
+    changed: u64,
+    added: u64,
+    dirty_views: u64,
+    dirty_view_visible: u64,
+    pending: u64,
+    candidates: u64,
+}
+
+impl CandidateSources {
+    const REPORT_EVERY: u64 = 600;
+
+    fn frame_done(&mut self) {
+        self.frames += 1;
+        if !self.frames.is_multiple_of(Self::REPORT_EVERY) {
+            return;
+        }
+        info!(
+            frames = Self::REPORT_EVERY,
+            changed = self.changed,
+            added = self.added,
+            dirty_views = self.dirty_views,
+            dirty_view_visible = self.dirty_view_visible,
+            pending = self.pending,
+            candidates = self.candidates,
+            "late mesh preparation candidate sources"
+        );
+        *self = Self {
+            frames: self.frames,
+            ..default()
+        };
+    }
 }
 
 #[derive(Default)]
@@ -351,28 +391,39 @@ fn observe_deferred_mesh_preparation(
     };
     pending.observed_dirty_views.clear();
     let mut candidates: HashSet<_> = dirty.changed_renderables.iter().copied().collect();
+    let mut sources = std::mem::take(&mut pending.sources);
+    sources.changed += candidates.len() as u64;
     for (extracted_view, view) in &views {
         if let Some(class) = view.get::<Mesh3d>() {
+            sources.added += class.added_entities().len() as u64;
             candidates.extend(class.added_entities().iter().map(|&(_, entity)| entity));
             if dirty.views.contains(&extracted_view.retained_view_entity) {
                 pending
                     .observed_dirty_views
                     .insert(extracted_view.retained_view_entity);
+                sources.dirty_views += 1;
+                let before = candidates.len();
                 candidates.extend(class.iter_visible().map(|(_, &entity)| entity));
+                sources.dirty_view_visible += (candidates.len() - before) as u64;
             }
         }
     }
     for light in &shadow_views {
         for (retained_view, view) in &light.subviews {
             if let Some(class) = view.get::<Mesh3d>() {
+                sources.added += class.added_entities().len() as u64;
                 candidates.extend(class.added_entities().iter().map(|&(_, entity)| entity));
                 if dirty.views.contains(retained_view) {
                     pending.observed_dirty_views.insert(*retained_view);
+                    sources.dirty_views += 1;
+                    let before = candidates.len();
                     candidates.extend(class.iter_visible().map(|(_, &entity)| entity));
+                    sources.dirty_view_visible += (candidates.len() - before) as u64;
                 }
             }
         }
     }
+    let before_pending = candidates.len();
     // A material may become ready after the entity's visibility/change events have expired.
     // Its existing pending queue supplies the candidate when the mesh instance first appears.
     for queues in [
@@ -386,6 +437,10 @@ fn observe_deferred_mesh_preparation(
         add_queue_candidates(&mut candidates, queues);
     }
     let candidate_count = candidates.len();
+    sources.pending += (candidate_count - before_pending) as u64;
+    sources.candidates += candidate_count as u64;
+    sources.frame_done();
+    pending.sources = sources;
     let canceled_before = pending.canceled_total;
     let newly_tracked = pending.observe_candidates(
         candidates,
