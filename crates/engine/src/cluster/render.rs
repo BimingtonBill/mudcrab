@@ -19,6 +19,9 @@ use gpu_contract::{CullParams, STAGES};
 #[path = "stable_order.rs"]
 mod stable_order;
 
+#[path = "pipeline_diagnostics.rs"]
+mod pipeline_diagnostics;
+
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SourceExtraction;
 
@@ -843,6 +846,7 @@ impl Plugin for ClusterRenderPlugin {
                         .after(queue_cluster_batches)
                         .after(queue_cluster_prepass)
                         .after(queue_cluster_shadows),
+                    pipeline_diagnostics::report.in_set(RenderSystems::Cleanup),
                 ),
             )
             // The cull is encoded into the frame's own command encoder at the start of the render

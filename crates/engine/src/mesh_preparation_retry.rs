@@ -167,13 +167,26 @@ impl PendingPreparations {
 }
 
 #[derive(SystemParam)]
-struct PreparationResources<'w> {
+struct PreparationResources<'w, 's> {
     instances: Option<Res<'w, RenderMeshInstances>>,
     meshes: Option<Res<'w, RenderAssets<RenderMesh>>>,
     allocator: Option<Res<'w, MeshAllocator>>,
     material_pending: Option<Res<'w, PendingMeshMaterialQueues>>,
     prepass_pending: Option<Res<'w, PendingPrepassMeshMaterialQueues>>,
     shadow_pending: Option<Res<'w, PendingShadowQueues>>,
+    views: Query<'w, 's, &'static ExtractedView>,
+    opaque_phases: Option<
+        Res<
+            'w,
+            bevy::render::render_phase::ViewBinnedRenderPhases<
+                bevy::core_pipeline::core_3d::Opaque3d,
+            >,
+        >,
+    >,
+    material_instances: Option<Res<'w, bevy::pbr::RenderMaterialInstances>>,
+    prepared_materials: Option<
+        Res<'w, bevy::render::erased_render_asset::ErasedRenderAssets<bevy::pbr::PreparedMaterial>>,
+    >,
 }
 
 fn add_queue_candidates(candidates: &mut HashSet<MainEntity>, queues: &PendingQueues) {
@@ -252,7 +265,7 @@ fn resume_deferred_mesh_preparation(
     mut pending: ResMut<PendingPreparations>,
     mut dirty: Option<ResMut<DirtySpecializations>>,
     mut reextract: Option<ResMut<MeshesToReextractNextFrame>>,
-    resources: PreparationResources,
+    resources: PreparationResources<'_, '_>,
 ) {
     let (Some(instances), Some(meshes), Some(allocator), Some(dirty)) = (
         resources.instances.as_ref(),
@@ -300,7 +313,7 @@ fn resume_deferred_mesh_preparation(
 fn observe_deferred_mesh_preparation(
     mut pending: ResMut<PendingPreparations>,
     dirty: Option<Res<DirtySpecializations>>,
-    resources: PreparationResources,
+    resources: PreparationResources<'_, '_>,
     views: Query<(&ExtractedView, &RenderVisibleEntities)>,
     shadow_views: Query<&RenderShadowMapVisibleEntities>,
 ) {
@@ -377,7 +390,7 @@ fn observe_deferred_mesh_preparation(
 fn observe_late_shadow_preparation(
     mut pending: ResMut<PendingPreparations>,
     dirty: Option<Res<DirtySpecializations>>,
-    resources: PreparationResources,
+    resources: PreparationResources<'_, '_>,
     shadow_views: Query<&RenderShadowMapVisibleEntities>,
 ) {
     let (Some(dirty), Some(instances), Some(meshes)) = (
@@ -428,9 +441,10 @@ fn observe_late_shadow_preparation(
 // Include Bevy's material/prepass/shadow pending queues as well as our missing-mesh retries.
 fn publish_retry_readiness(
     pending: Res<PendingPreparations>,
-    resources: PreparationResources,
+    resources: PreparationResources<'_, '_>,
     bridge: Option<Res<crate::capture_frame::RetryReadiness>>,
     pipelines: Option<Res<bevy::render::render_resource::PipelineCache>>,
+    mut last_report: Local<Option<std::time::Instant>>,
 ) {
     let Some(bridge) = bridge else {
         return;
@@ -447,8 +461,85 @@ fn publish_retry_readiness(
         add_queue_candidates(&mut candidates, queues);
     }
     candidates.extend(pending.meshes.keys().copied());
-    *bridge.0.lock().unwrap() =
-        pipelines.map(|pipelines| candidates.len() + pipelines.waiting_pipelines().count());
+    let waiting_pipelines = pipelines
+        .as_ref()
+        .map(|pipelines| pipelines.waiting_pipelines().count());
+    *bridge.0.lock().unwrap() = waiting_pipelines.map(|waiting| candidates.len() + waiting);
+    if last_report.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(1)) {
+        *last_report = Some(std::time::Instant::now());
+        let rows = |queues: Option<&PendingQueues>| {
+            queues.map_or(0, |queues| {
+                queues
+                    .values()
+                    .map(|view| view.current_frame.len() + view.prev_frame.len())
+                    .sum::<usize>()
+            })
+        };
+        // Why each pending entity is still pending: Bevy re-queues an entity while its
+        // material instance, mesh instance or prepared material is absent, and a ready
+        // pipeline does not release it.
+        let (mut no_material_instance, mut no_mesh_instance, mut material_not_prepared) =
+            (0usize, 0usize, 0usize);
+        let mut unprepared = HashSet::new();
+        for entity in &candidates {
+            let Some(instance) = resources
+                .material_instances
+                .as_ref()
+                .and_then(|instances| instances.instances.get(entity))
+            else {
+                no_material_instance += 1;
+                continue;
+            };
+            if resources
+                .instances
+                .as_ref()
+                .is_none_or(|instances| instances.render_mesh_queue_data(*entity).is_none())
+            {
+                no_mesh_instance += 1;
+            } else if resources
+                .prepared_materials
+                .as_ref()
+                .is_some_and(|materials| materials.get(instance.asset_id).is_none())
+            {
+                material_not_prepared += 1;
+                unprepared.insert(instance.asset_id);
+            }
+        }
+        let alive: HashSet<_> = resources
+            .views
+            .iter()
+            .map(|view| view.retained_view_entity)
+            .collect();
+        for (name, queues) in [
+            ("forward", resources.material_pending.as_ref().map(|q| &q.0)),
+            ("prepass", resources.prepass_pending.as_ref().map(|q| &q.0)),
+            ("shadow", resources.shadow_pending.as_ref().map(|q| &q.0)),
+        ] {
+            for (view, rows) in queues.into_iter().flat_map(|queues| queues.iter()) {
+                if rows.current_frame.is_empty() && rows.prev_frame.is_empty() {
+                    continue;
+                }
+                info!(target: "engine::mesh_preparation_retry",
+                    queue = name, ?view, current = rows.current_frame.len(),
+                    previous = rows.prev_frame.len(),
+                    view_alive = alive.contains(view),
+                    has_opaque_phase = resources
+                        .opaque_phases
+                        .as_ref()
+                        .is_some_and(|phases| phases.contains_key(view)),
+                    "pending queue by view");
+            }
+        }
+        info!(target: "engine::mesh_preparation_retry",
+            no_material_instance, no_mesh_instance, material_not_prepared,
+            unprepared_materials = unprepared.len(),
+            pending_entities = candidates.len(), waiting_pipelines,
+            missing_meshes = pending.meshes.len(),
+            forward_rows = rows(resources.material_pending.as_ref().map(|q| &q.0)),
+            prepass_rows = rows(resources.prepass_pending.as_ref().map(|q| &q.0)),
+            shadow_rows = rows(resources.shadow_pending.as_ref().map(|q| &q.0)),
+            "specialization retry attribution");
+    }
 }
 
 #[cfg(test)]
