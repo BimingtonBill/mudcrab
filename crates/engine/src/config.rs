@@ -70,6 +70,8 @@ impl TerrainLodDistances {
     }
 }
 
+/// Bevy Remote Protocol's default HTTP port, used by `--remote` unless `--remote-port` is given.
+pub const DEFAULT_REMOTE_PORT: u16 = 15702;
 #[derive(Debug, Clone, Resource)]
 pub struct EngineConfig {
     /// Keep an automated capture window on screen instead of parking it off screen.
@@ -208,6 +210,9 @@ pub struct EngineConfig {
     pub transform_bounds_fixture: bool,
     pub renderer_fixture: bool,
     pub streaming_fixture: bool,
+    /// Serve the Bevy Remote Protocol on 127.0.0.1 (`--remote`). Needs the `remote` feature.
+    pub remote: bool,
+    pub remote_port: u16,
     /// Whether a streamed `LIGH` reference places a point light (`--lights`). Off by default, so
     /// every run that does not ask for lights renders exactly as it did before.
     pub lights: bool,
@@ -313,6 +318,8 @@ impl Default for EngineConfig {
             transform_bounds_fixture: false,
             renderer_fixture: false,
             streaming_fixture: false,
+            remote: false,
+            remote_port: DEFAULT_REMOTE_PORT,
             lights: false,
             physics_fixture: false,
         }
@@ -420,6 +427,10 @@ Diagnostics:
   --renderer-fixture                    run the renderer fixture (no world database)
   --physics-fixture                     run the physics fixture (no world database)
   --streaming-fixture                   stream the fixture world instead of the full asset set
+
+Remote:
+  --remote                              serve the Bevy Remote Protocol on 127.0.0.1 (needs the remote feature)
+  --remote-port <port>                  port for --remote (default: 15702); implies --remote
 
   --show-window                         keep an automated run's window on screen
 Help:
@@ -1259,6 +1270,13 @@ impl EngineConfig {
                 "--transform-bounds-fixture" => config.transform_bounds_fixture = true,
                 "--renderer-fixture" => config.renderer_fixture = true,
                 "--streaming-fixture" => config.streaming_fixture = true,
+                "--remote" => config.remote = true,
+                "--remote-port" => {
+                    config.remote = true;
+                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
+                        config.remote_port = value;
+                    }
+                }
                 "--lights" => config.lights = true,
                 "--physics-fixture" => config.physics_fixture = true,
                 unknown => return Err(ConfigError::unrecognized(unknown)),
@@ -3705,5 +3723,21 @@ mod tests {
             !args(&["--walk"]).window_offscreen(),
             "a run someone plays is on screen"
         );
+    }
+    #[test]
+    fn parses_remote_options() {
+        let config = EngineConfig::run_from_args(["--remote"].map(str::to_owned));
+        assert!(config.remote);
+        assert_eq!(config.remote_port, DEFAULT_REMOTE_PORT);
+
+        let config =
+            EngineConfig::run_from_args(["--remote", "--remote-port", "16000"].map(str::to_owned));
+        assert!(config.remote);
+        assert_eq!(config.remote_port, 16_000);
+
+        // A port on its own asks for the server too rather than being silently ignored.
+        let config = EngineConfig::run_from_args(["--remote-port", "16001"].map(str::to_owned));
+        assert!(config.remote);
+        assert_eq!(config.remote_port, 16_001);
     }
 }

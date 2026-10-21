@@ -2,13 +2,16 @@ use bevy::prelude::*;
 
 pub const CELL_SIZE: f32 = 4096.0;
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[reflect(Component)]
 pub struct FormId(pub u32);
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[reflect(Component)]
 pub struct CellRef(pub u32);
 
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq)]
+#[reflect(Component)]
 pub struct WorldPosition {
     pub grid: IVec2,
     pub local: Vec3,
@@ -40,16 +43,20 @@ impl WorldPosition {
     }
 }
 
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq)]
+#[reflect(Component)]
 pub struct WorldTransform(pub Mat4);
 
-#[derive(Component, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Component, Reflect, Debug, Clone, PartialEq, Eq, Hash)]
+#[reflect(Component)]
 pub struct MeshHandle(pub String);
 
-#[derive(Component, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Component, Reflect, Debug, Clone, PartialEq, Eq, Hash)]
+#[reflect(Component)]
 pub struct MaterialHandle(pub String);
 
-#[derive(Component, Debug, Clone, Copy)]
+#[derive(Component, Reflect, Debug, Clone, Copy)]
+#[reflect(Component)]
 pub struct InstanceBounds {
     pub min: Vec3,
     pub max: Vec3,
@@ -58,7 +65,8 @@ pub struct InstanceBounds {
 /// Aggregate model-space bounds produced by the converter after applying the
 /// complete glTF node hierarchy. Runtime validation compares these bounds with
 /// the meshes Bevy actually spawned before an instance is accepted.
-#[derive(Component, Debug, Clone, Copy, PartialEq)]
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq)]
+#[reflect(Component)]
 pub struct ExpectedModelBounds {
     pub min: Vec3,
     pub max: Vec3,
@@ -94,19 +102,24 @@ impl InstanceBounds {
     }
 }
 
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub struct StreamingCamera;
 
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub struct StreamedCellRoot;
 
-#[derive(Component, Debug, Clone, Copy)]
+#[derive(Component, Reflect, Debug, Clone, Copy)]
+#[reflect(Component)]
 pub struct ExteriorCellGrid(pub IVec2);
 
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub struct TerrainPatch;
 
-#[derive(Component)]
+#[derive(Component, Reflect)]
+#[reflect(Component)]
 pub struct WaterSurface;
 
 #[cfg(test)]

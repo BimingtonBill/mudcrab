@@ -390,7 +390,8 @@ impl StreamingCommitBudget {
     }
 }
 
-#[derive(Resource, Debug, Clone, Default, Serialize)]
+#[derive(Resource, Reflect, Debug, Clone, Default, Serialize)]
+#[reflect(Resource)]
 pub struct StreamingMetrics {
     pub requests_submitted: u64,
     pub responses_received: u64,
@@ -560,7 +561,7 @@ pub struct StreamingMetrics {
     pub asset_failures: Vec<AssetFailure>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Reflect, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssetFailure {
     pub model_path: String,
     pub reference_form_id: u32,
@@ -733,7 +734,8 @@ enum CellStatus {
     Failed,
 }
 
-#[derive(Resource, Debug, Clone, Copy)]
+#[derive(Resource, Reflect, Debug, Clone, Copy)]
+#[reflect(Resource)]
 pub struct RenderOrigin(pub IVec2);
 
 /// The space the player is in. The planner streams only this space: the active interior when

@@ -5,6 +5,7 @@ use crate::{
     metrics::AcceptanceMetricsPlugin,
     physics::{MovementTuning, PhysicsFixturePlugin, WorldPlayerPlugin},
     profiling::{ProfilingPlugin, ProfilingState},
+    remote::{RemoteSettings, add_remote_plugins},
     render::{
         LIGHT_LAYERS, MAIN_VIEW_LAYERS, RendererMetrics, TerrainExtension, TerrainMaterial,
         VercidiumRendererPlugin, WATER_LAYER, WaterExtension, WaterMaterial,
@@ -113,6 +114,10 @@ struct AssetDirectoryReadLock {
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
     validate_fixture_selection(&config)?;
+    let remote = RemoteSettings::from_config(&config)?;
+    // `--route`: read here, before the window and the world are opened, so that a route the run
+    // cannot follow is fatal first and the start cell is the route's. (Portal reads `--shots`
+    // itself, further down, once the world database is open.)
     let mut preferences = config
         .interactive_world_physics()
         .then(|| crate::settings::prepare_settings(&mut config));
@@ -400,6 +405,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         app.init_resource::<StreamingBenchmarkRoute>()
             .add_systems(PreUpdate, drive_streaming_benchmark_route);
     }
+    add_remote_plugins(&mut app, remote);
     if let Some((database, catalog, cache, ground_height, spawn_ground_height)) = runtime_data {
         if let Some(environment) = environment {
             app.insert_resource(environment);
