@@ -1225,6 +1225,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     // The readiness set is shared state behind an `Arc`, and its revision counts changes to that
     // set only. A replaced resource can start over at the same revision with a different set, so
     // the resource being added or written is a change as well.
+    let cluster_span = ::bevy::log::info_span!("lod::visibility::cluster_and_removals").entered();
     let cluster_changed = index.cluster_stamp != Some(cluster_stamp)
         || cluster_terrain
             .as_ref()
@@ -1238,6 +1239,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     let upload_completed = batches.upload_completed();
     let submission_dirty = streaming.p0().submission_dirty;
     streaming.p1().submission_dirty = false;
+    drop(cluster_span);
     let merged_removed = inputs.removed_merged.read().count() != 0;
     let surfaces_drawn = inputs.drawn_swaps.read().count() != 0;
     let drawn_withdrawn = inputs.removed_drawn.read().count() != 0;
@@ -1310,6 +1312,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
         streaming.p1().visibility_dirty = false;
     }
 
+    let decide_span = ::bevy::log::info_span!("lod::visibility::decide").entered();
     let selection_moved = index.sync_selection(selection);
     let journaled = inputs.journaled();
     let unsupported = !journaled && inputs.unsupported_domain();
@@ -1352,6 +1355,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
             || external_changed
             || index.has_work()
     };
+    drop(decide_span);
     if rebuild {
         {
             perf_span!("lod::visibility::rebuild");
@@ -1453,6 +1457,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     if refresh {
         profiler.increment("lod/selection_refreshes", 1);
     }
+    let budget_span = ::bevy::log::info_span!("lod::visibility::budget").entered();
     let mut activated = false;
     if let Some(budget) = budget.as_deref_mut() {
         let mut state = streaming.p1();
@@ -1476,6 +1481,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
             );
         }
     }
+    drop(budget_span);
     if refresh || submission_dirty || upload_completed || activated {
         let (retained_quadrants, generated, batched, visible) = batches.counts();
         profiler.set_gauge("lod/batched_terrain_quadrants", retained_quadrants as f64);

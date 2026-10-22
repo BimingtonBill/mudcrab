@@ -479,8 +479,15 @@ fn extract(
         .map(|main| main.id())
         .chain(merged.iter().map(|(entity, ..)| entity))
         .chain(built.batch_entities.iter().copied());
+    let watch_span = ::bevy::log::info_span!(
+        "terrain_handoff::extract::watch",
+        identities = snapshot.len(),
+        batch_draws = built.batch_entities.len()
+    )
+    .entered();
     let (surfaces_moved, waiting) = changes.surfaces_moved(terrain);
     let counts = changes.counts();
+    drop(watch_span);
     let unchanged = built
         .identities
         .as_ref()
