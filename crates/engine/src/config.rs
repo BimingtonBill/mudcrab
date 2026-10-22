@@ -375,6 +375,9 @@ pub struct EngineConfig {
     /// Maximum settling time per shot, in seconds.
     pub shots_settle_timeout: f32,
     pub diagnostic_asset_fallbacks: bool,
+    /// `--diagnostic-pipelines`: once a second, log the cluster pipeline cardinality and why
+    /// pending specializations are still pending. Off, the reporting systems are not installed.
+    pub diagnostic_pipelines: bool,
     pub material_fixture: bool,
     pub terrain_water_fixture: bool,
     pub transform_bounds_fixture: bool,
@@ -707,6 +710,7 @@ impl Default for EngineConfig {
             shots_out: None,
             shots_settle_timeout: crate::shots::SETTLE_TIMEOUT_SECONDS,
             diagnostic_asset_fallbacks: false,
+            diagnostic_pipelines: false,
             material_fixture: false,
             terrain_water_fixture: false,
             transform_bounds_fixture: false,
@@ -862,6 +866,7 @@ Benchmark and profiling:
 Diagnostics:
   --bug-report-dir <dir>                local bug-report directory (default: per-user application data)
   --diagnostic-asset-fallbacks          log every fallback asset substitution
+  --diagnostic-pipelines                log pipeline cardinality and pending-specialization causes once a second
   --water-reflection <planar|ssr|on|off>  measurement switch and Water Plus: ssr (default) marches the screen in the
                                         water shader, never renders the reflection view and copies the opaque colour
                                         once per view that draws water; planar (the same as on) renders the mirrored
@@ -1898,6 +1903,7 @@ impl EngineConfig {
                     )?);
                 }
                 "--diagnostic-asset-fallbacks" => config.diagnostic_asset_fallbacks = true,
+                "--diagnostic-pipelines" => config.diagnostic_pipelines = true,
                 "--material-fixture" => config.material_fixture = true,
                 "--terrain-water-fixture" => config.terrain_water_fixture = true,
                 "--transform-bounds-fixture" => config.transform_bounds_fixture = true,
@@ -4711,6 +4717,7 @@ mod tests {
             "--shots-out",
             "evidence/riverwood",
             "--diagnostic-asset-fallbacks",
+            "--diagnostic-pipelines",
             "--material-fixture",
             "--terrain-water-fixture",
             "--transform-bounds-fixture",
@@ -4757,6 +4764,8 @@ mod tests {
         );
         assert_eq!(config.shots_out, Some(PathBuf::from("evidence/riverwood")));
         assert!(config.diagnostic_asset_fallbacks);
+        assert!(config.diagnostic_pipelines);
+        assert!(!EngineConfig::default().diagnostic_pipelines);
         assert!(config.material_fixture);
         assert!(config.terrain_water_fixture);
         assert!(config.transform_bounds_fixture);

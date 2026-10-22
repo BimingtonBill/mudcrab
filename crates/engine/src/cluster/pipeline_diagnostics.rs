@@ -1,15 +1,18 @@
 //! Separate semantic specialization keys, actual pipelines and per-entity retries.
+//! Installed only with `--diagnostic-pipelines`, so a run without it spends nothing here.
 use super::*;
 
-pub(super) fn report(
+pub(super) fn install(render: &mut bevy::app::SubApp, enabled: bool) {
+    if enabled {
+        render.add_systems(Render, report.in_set(RenderSystems::Cleanup));
+    }
+}
+
+fn report(
     pipelines: Res<ClusterPipelines>,
     cache: Res<PipelineCache>,
     mut last: Local<Option<std::time::Instant>>,
 ) {
-    if !bevy::log::tracing::enabled!(target: "engine::cluster::pipeline_diagnostics", bevy::log::tracing::Level::INFO)
-    {
-        return;
-    }
     if last.is_some_and(|last| last.elapsed() < std::time::Duration::from_secs(1)) {
         return;
     }
@@ -62,5 +65,25 @@ pub(super) fn report(
             tangent_keys = keys.iter().filter(|(key, _)| key.tangents).count(),
             queued = states[0], creating = states[1], ready = states[2], failed = states[3],
             "cluster pipeline cardinality");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render_systems(enabled: bool) -> usize {
+        let mut app = App::new();
+        install(app.main_mut(), enabled);
+        app.world()
+            .get_resource::<Schedules>()
+            .and_then(|schedules| schedules.get(Render))
+            .map_or(0, |schedule| schedule.systems_len())
+    }
+
+    #[test]
+    fn the_report_exists_only_with_the_diagnostics_flag() {
+        assert_eq!(render_systems(false), 0, "off must install nothing");
+        assert_eq!(render_systems(true), 1);
     }
 }

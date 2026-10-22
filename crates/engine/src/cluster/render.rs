@@ -801,9 +801,14 @@ impl Plugin for ClusterRenderPlugin {
             ExtractResourcePlugin::<super::package::TerrainBatchIds>::default(),
             ExtractResourcePlugin::<super::terrain::TerrainDrawReadiness>::default(),
         ));
+        let diagnostics = app
+            .world()
+            .get_resource::<crate::config::EngineConfig>()
+            .is_some_and(|config| config.diagnostic_pipelines);
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
+        pipeline_diagnostics::install(render_app, diagnostics);
         render_app
             .init_resource::<ClusterPipelines>()
             .init_resource::<ClusterSettings>()
@@ -846,7 +851,6 @@ impl Plugin for ClusterRenderPlugin {
                         .after(queue_cluster_batches)
                         .after(queue_cluster_prepass)
                         .after(queue_cluster_shadows),
-                    pipeline_diagnostics::report.in_set(RenderSystems::Cleanup),
                 ),
             )
             // The cull is encoded into the frame's own command encoder at the start of the render
