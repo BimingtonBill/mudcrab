@@ -118,7 +118,13 @@ impl Plugin for VercidiumRendererPlugin {
         .add_systems(Startup, setup_water_reflection)
         .add_systems(
             Update,
-            (sync_renderer_metrics, apply_water_settings).after(crate::settings_ui::SettingsUiSet),
+            sync_renderer_metrics.after(crate::settings_ui::SettingsUiSet),
+        )
+        // After Bevy turns this frame's asset changes into events, so water added this frame gets
+        // its settings (and a static capture's pinned clock) before this frame is extracted.
+        .add_systems(
+            PostUpdate,
+            apply_water_settings.after(bevy::asset::AssetEventSystems),
         )
         // The reflection is prepared in `PostUpdate` before transform propagation, not in
         // `Update`: a camera teleported this frame must be mirrored by *this* frame's pose, and
@@ -4208,7 +4214,10 @@ mod tests {
         app.add_plugins((bevy::app::TaskPoolPlugin::default(), AssetPlugin::default()))
             .init_asset::<WaterMaterial>()
             .init_resource::<crate::settings::RenderingSettings>()
-            .add_systems(Update, apply_water_settings);
+            .add_systems(
+                PostUpdate,
+                apply_water_settings.after(bevy::asset::AssetEventSystems),
+            );
         app
     }
 
@@ -4311,9 +4320,10 @@ mod tests {
         let mut app = water_settings_app();
         app.init_resource::<WaterSettingsVisits>();
         app.insert_resource(water_shots_run());
-        for _ in 0..3 {
-            add_test_water(&mut app, WaterExtension::default());
-        }
+        // Held, so the materials live for the whole test: a dropped handle frees its asset.
+        let _kept: Vec<_> = (0..3)
+            .map(|_| add_test_water(&mut app, WaterExtension::default()))
+            .collect();
         // The first frame applies everything; the next ones consume the asset events, including
         // the echo of its own writes.
         for _ in 0..4 {
@@ -4409,7 +4419,10 @@ mod tests {
         app.init_resource::<Time>()
             .init_resource::<Assets<WaterMaterial>>()
             .add_message::<AssetEvent<WaterMaterial>>()
-            .add_systems(Update, apply_water_settings);
+            .add_systems(
+                PostUpdate,
+                apply_water_settings.after(bevy::asset::AssetEventSystems),
+            );
         let handle = app
             .world_mut()
             .resource_mut::<Assets<WaterMaterial>>()
