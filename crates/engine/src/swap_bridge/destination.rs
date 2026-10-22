@@ -266,6 +266,9 @@ pub struct RequestId(u64);
 pub struct DestinationRequests {
     next: u64,
     requests: HashMap<RequestId, DestinationRequest>,
+    /// Moves on every change to the pending set or a pending request's key or scope, and on
+    /// nothing else, so an observer skips a frame in which no request changed.
+    revision: u64,
 }
 
 impl DestinationRequests {
@@ -274,6 +277,7 @@ impl DestinationRequests {
         self.next += 1;
         let id = RequestId(self.next);
         self.requests.insert(id, request);
+        self.revision += 1;
         id
     }
 
@@ -302,6 +306,7 @@ impl DestinationRequests {
             request.passes = passes;
             request.coverage = coverage;
             request.handoff = handoff;
+            self.revision += 1;
         }
         Some(request.key)
     }
@@ -312,13 +317,27 @@ impl DestinationRequests {
     /// under the new generation and no report for the old one can satisfy it. Nothing is bumped here.
     pub fn rebase(&mut self, id: RequestId, generations: &Generations) -> Option<DestinationKey> {
         let request = self.requests.get_mut(&id)?;
-        request.key.generation = generations.current(request.key.world);
+        let generation = generations.current(request.key.world);
+        if request.key.generation != generation {
+            request.key.generation = generation;
+            self.revision += 1;
+        }
         Some(request.key)
     }
 
     /// Removes a request; true when it was pending.
     pub fn withdraw(&mut self, id: RequestId) -> bool {
-        self.requests.remove(&id).is_some()
+        let removed = self.requests.remove(&id).is_some();
+        if removed {
+            self.revision += 1;
+        }
+        removed
+    }
+
+    /// The change counter: equal values mean no request was added, withdrawn, re-keyed or
+    /// re-scoped in between.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// The pending requests.

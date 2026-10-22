@@ -34,6 +34,7 @@ pub(super) fn install(app: &mut App) {
     };
     render
         .init_resource::<Published>()
+        .init_resource::<CandidateObserver>()
         .add_systems(
             ExtractSchedule,
             observe_candidates
@@ -56,9 +57,11 @@ pub(super) fn install(app: &mut App) {
 #[path = "destination_scope.rs"]
 mod destination_scope;
 
-#[derive(Default)]
+#[derive(Default, Resource)]
 struct CandidateObserver {
     versions: Option<(u64, u64)>,
+    /// The request set last recorded: (the resource's insertion tick, its revision).
+    requests: Option<(bevy::ecs::change_detection::Tick, u64)>,
     certificate: Option<Arc<crate::cluster::reader::CertifiedPackage>>,
     scene_present: bool,
     index: destination_scope::BatchCells,
@@ -66,6 +69,9 @@ struct CandidateObserver {
     // Keep the dependency scope of stored reports after their request is withdrawn.
     // A later change must revoke those reports as well as pending requests.
     scopes: HashMap<DestinationKey, Arc<[CellKey]>>,
+    /// Walks over the pending requests or stored scopes; a settled frame adds none.
+    #[cfg(test)]
+    walks: usize,
 }
 
 fn observe_candidates(
@@ -75,29 +81,30 @@ fn observe_candidates(
     mut main: ResMut<MainWorld>,
     frame: Option<Res<RenderFrame>>,
     invalidations: Option<ResMut<RenderInvalidations>>,
-    mut previous: Local<CandidateObserver>,
+    mut previous: ResMut<CandidateObserver>,
 ) {
-    let pending: HashSet<_> = main
-        .get_resource::<DestinationRequests>()
-        .into_iter()
-        .flat_map(|requests| requests.iter())
-        .map(|(_, request)| {
+    let previous = &mut *previous;
+    // Record each request's scope when the request set changes: the scope must outlive a
+    // withdrawn request whose report is still stored. An unchanged set costs nothing.
+    let requests = main
+        .get_resource_change_ticks::<DestinationRequests>()
+        .zip(main.get_resource::<DestinationRequests>())
+        .map(|(ticks, requests)| (ticks.added, requests));
+    let stamp = requests
+        .as_ref()
+        .map(|(added, requests)| (*added, requests.revision()));
+    if previous.requests != stamp {
+        previous.requests = stamp;
+        #[cfg(test)]
+        {
+            previous.walks += 1;
+        }
+        for (_, request) in requests.iter().flat_map(|(_, requests)| requests.iter()) {
             previous
                 .scopes
                 .insert(request.key, Arc::clone(&request.coverage));
-            request.key
-        })
-        .collect();
-    previous.scopes.retain(|key, _| {
-        let current = main
-            .get_resource::<Generations>()
-            .is_none_or(|generations| generations.current(key.world) == key.generation);
-        current
-            && (pending.contains(key)
-                || main
-                    .get_resource::<DestinationReports>()
-                    .is_some_and(|reports| reports.get(key).is_some()))
-    });
+        }
+    }
     let same_certificate = match (&previous.certificate, &sources.certificate) {
         (Some(old), Some(new)) => Arc::ptr_eq(old, new),
         (None, None) => true,
@@ -109,6 +116,27 @@ fn observe_candidates(
     if !scope_changed && previous.versions == Some((sources.candidate_version, materials.version)) {
         return;
     }
+    #[cfg(test)]
+    {
+        previous.walks += 1;
+    }
+    let pending: HashSet<_> = main
+        .get_resource::<DestinationRequests>()
+        .into_iter()
+        .flat_map(|requests| requests.iter())
+        .map(|(_, request)| request.key)
+        .collect();
+    // Stale scopes are dropped only here, where they are read.
+    previous.scopes.retain(|key, _| {
+        let current = main
+            .get_resource::<Generations>()
+            .is_none_or(|generations| generations.current(key.world) == key.generation);
+        current
+            && (pending.contains(key)
+                || main
+                    .get_resource::<DestinationReports>()
+                    .is_some_and(|reports| reports.get(key).is_some()))
+    });
     let source_changed = previous
         .versions
         .is_none_or(|(source, _)| source != sources.candidate_version);
@@ -1014,6 +1042,7 @@ mod terrain_candidate_regressions {
             main_world.init_resource::<Generations>();
             main_world.init_resource::<DestinationReports>();
             render.insert_resource(main_world);
+            render.init_resource::<CandidateObserver>();
             let mut observer = Schedule::default();
             observer.add_systems(observe_candidates);
             observer.run(&mut render);
@@ -1289,6 +1318,36 @@ mod terrain_candidate_regressions {
         h.apply_terrain(near_withdrawal());
         assert_ne!(generation(&h), before);
         assert!(!h.ready());
+    }
+
+    #[test]
+    fn settled_frames_walk_no_requests_or_scopes() {
+        let mut h = Harness::ready_on_stock();
+        let id = request_coverage(&mut h, vec![cover(GRID)]);
+        let walks = |h: &Harness| h.render.resource::<CandidateObserver>().walks;
+        let settled = walks(&h);
+        for _ in 0..8 {
+            // A waiting consumer rebases every frame; an unchanged generation is no change.
+            let mut main = h.render.resource_mut::<MainWorld>();
+            let generations = main.remove_resource::<Generations>().unwrap();
+            main.resource_mut::<DestinationRequests>()
+                .rebase(id, &generations);
+            main.insert_resource(generations);
+            h.observer.run(&mut h.render);
+        }
+        assert_eq!(
+            walks(&h),
+            settled,
+            "a settled frame walked requests or scopes"
+        );
+        h.render
+            .resource_mut::<MainWorld>()
+            .resource_mut::<DestinationRequests>()
+            .withdraw(id);
+        h.observer.run(&mut h.render);
+        assert_eq!(walks(&h), settled + 1, "a withdrawal is one change");
+        h.apply_terrain(near_withdrawal());
+        assert_eq!(walks(&h), settled + 2, "a candidate change is one change");
     }
 
     #[test]
