@@ -1003,55 +1003,98 @@ impl MaterialExtension for WaterExtension {
 #[derive(Resource, Clone)]
 pub struct WaterReflectionTexture(pub Handle<Image>);
 
-/// Apply live water controls without rewriting materials merely to advance their clock.
+/// What every water material is held to. A change re-applies it to all of them.
+#[derive(Clone, Copy, PartialEq)]
+struct WaterTargets {
+    wave: Vec4,
+    reflection: f32,
+    flow_normals: bool,
+    pinned_clock: Option<Vec4>,
+}
+
+/// Water materials inspected by [`apply_water_settings`]; a settled frame inspects none.
+#[cfg(test)]
+#[derive(Resource, Default)]
+struct WaterSettingsVisits(usize);
+
+/// Apply live water controls when they change, and to water that arrives or is replaced. The
+/// animation needs no material write: the shader reads Bevy's global time, one uniform per frame.
 fn apply_water_settings(
     settings: Option<Res<crate::settings::RenderingSettings>>,
     shots: Option<Res<crate::shots::ShotsRun>>,
+    mut events: MessageReader<AssetEvent<WaterMaterial>>,
     mut materials: ResMut<Assets<WaterMaterial>>,
+    mut applied: Local<Option<WaterTargets>>,
+    #[cfg(test)] mut visits: Option<ResMut<WaterSettingsVisits>>,
 ) {
-    let Some(settings) = settings else { return };
-    // A static capture claims a fixed water phase in its receipt, so every water material,
-    // including streamed cells that arrive later, must read that phase and not the shared clock.
-    let pinned_clock = shots
-        .as_ref()
-        .and_then(|shots| shots.water_time_seconds())
-        .map(|seconds| Vec4::new(seconds, 1.0, 0.0, 0.0));
-    let wanted_wave = Vec4::new(
-        settings.wave_scale,
-        settings.wave_speed,
-        if settings.water_waves {
-            settings.wave_strength
+    let Some(settings) = settings else {
+        events.clear();
+        return;
+    };
+    let targets = WaterTargets {
+        wave: Vec4::new(
+            settings.wave_scale,
+            settings.wave_speed,
+            if settings.water_waves {
+                settings.wave_strength
+            } else {
+                0.0
+            },
+            0.0,
+        ),
+        reflection: if settings.water_reflections {
+            settings.water_reflection_strength
         } else {
             0.0
         },
-        0.0,
-    );
-    let wanted_reflection = if settings.water_reflections {
-        settings.water_reflection_strength
-    } else {
-        0.0
+        flow_normals: settings.water_flow_normals,
+        // A static capture claims a fixed water phase in its receipt, so every water material,
+        // including streamed cells that arrive later, must read that phase and not the shared clock.
+        pinned_clock: shots
+            .as_ref()
+            .and_then(|shots| shots.water_time_seconds())
+            .map(|seconds| Vec4::new(seconds, 1.0, 0.0, 0.0)),
     };
-    let changed: Vec<_> = materials
-        .iter()
-        .filter_map(|(id, material)| {
-            let water = &material.extension;
-            let flow = f32::from(u8::from(
-                settings.water_flow_normals && water.flow_normal.is_some(),
-            ));
-            (water.settings.wave_scale_speed_strength != wanted_wave
-                || water.settings.flow_direction.w != flow
-                || water.settings.fresnel_reflectivity.z != wanted_reflection
-                || pinned_clock.is_some_and(|clock| water.settings.clock != clock))
-            .then_some((id, flow))
-        })
-        .collect();
-    for (id, flow) in changed {
+    let ids: Vec<_> = if *applied == Some(targets) {
+        // Our own writes come back as one `Modified` each; they then match and stop there.
+        events
+            .read()
+            .filter_map(|event| match event {
+                AssetEvent::Added { id } | AssetEvent::Modified { id } => Some(*id),
+                _ => None,
+            })
+            .collect()
+    } else {
+        *applied = Some(targets);
+        events.clear();
+        materials.ids().collect()
+    };
+    #[cfg(test)]
+    if let Some(visits) = visits.as_mut() {
+        visits.0 += ids.len();
+    }
+    for id in ids {
+        let Some(water) = materials.get(id).map(|material| &material.extension) else {
+            continue;
+        };
+        let flow = f32::from(u8::from(
+            targets.flow_normals && water.flow_normal.is_some(),
+        ));
+        let stale = water.settings.wave_scale_speed_strength != targets.wave
+            || water.settings.flow_direction.w != flow
+            || water.settings.fresnel_reflectivity.z != targets.reflection
+            || targets
+                .pinned_clock
+                .is_some_and(|clock| water.settings.clock != clock);
+        if !stale {
+            continue;
+        }
         if let Some(mut material) = materials.get_mut(id) {
             let water = &mut material.extension;
-            water.settings.wave_scale_speed_strength = wanted_wave;
+            water.settings.wave_scale_speed_strength = targets.wave;
             water.settings.flow_direction.w = flow;
-            water.settings.fresnel_reflectivity.z = wanted_reflection;
-            if let Some(clock) = pinned_clock {
+            water.settings.fresnel_reflectivity.z = targets.reflection;
+            if let Some(clock) = targets.pinned_clock {
                 water.settings.clock = clock;
             }
         }
@@ -4264,6 +4307,60 @@ mod tests {
     }
 
     #[test]
+    fn settled_water_frames_inspect_no_material() {
+        let mut app = water_settings_app();
+        app.init_resource::<WaterSettingsVisits>();
+        app.insert_resource(water_shots_run());
+        for _ in 0..3 {
+            add_test_water(&mut app, WaterExtension::default());
+        }
+        // The first frame applies everything; the next ones consume the asset events, including
+        // the echo of its own writes.
+        for _ in 0..4 {
+            app.update();
+        }
+        let settled = app.world().resource::<WaterSettingsVisits>().0;
+        for _ in 0..8 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<WaterSettingsVisits>().0,
+            settled,
+            "a settled frame inspected water materials"
+        );
+        let arriving = add_test_water(&mut app, WaterExtension::default());
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<Assets<WaterMaterial>>()
+                .get(&arriving)
+                .unwrap()
+                .extension
+                .settings
+                .clock,
+            Vec4::new(1.0, 1.0, 0.0, 0.0),
+            "arriving water still gets the pinned clock"
+        );
+        for _ in 0..3 {
+            app.update();
+        }
+        let after_arrival = app.world().resource::<WaterSettingsVisits>().0;
+        assert!(
+            after_arrival <= settled + 2,
+            "an arrival inspects only itself"
+        );
+        app.world_mut()
+            .resource_mut::<crate::settings::RenderingSettings>()
+            .wave_speed = 0.25;
+        app.update();
+        assert_eq!(
+            app.world().resource::<WaterSettingsVisits>().0,
+            after_arrival + 4,
+            "a settings change re-applies every water material once"
+        );
+    }
+
+    #[test]
     fn ordinary_and_route_water_keep_shared_and_authored_clocks() {
         for route in [false, true] {
             let mut app = water_settings_app();
@@ -4311,6 +4408,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<Time>()
             .init_resource::<Assets<WaterMaterial>>()
+            .add_message::<AssetEvent<WaterMaterial>>()
             .add_systems(Update, apply_water_settings);
         let handle = app
             .world_mut()
