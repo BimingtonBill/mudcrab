@@ -1049,11 +1049,18 @@ impl LodBatchVisibility<'_, '_> {
             if ready.is_none() || chunk.source_children.is_some() {
                 continue;
             }
-            for batch in &mut chunk.batches {
+            // Only a chunk whose batch is activated changes; the rest must not be marked
+            // changed, or every terrain consumer that watches batches redoes its work.
+            let mut activated = false;
+            for batch in &mut chunk.bypass_change_detection().batches {
                 if batch.pending_upload && readiness.is_ready(batch.mesh.id()) {
                     let owned = owned_source_mask(batch, world, &fallback_cells);
                     activate_uploaded_batch(batch, readiness, owned, &mut self.commands);
+                    activated = true;
                 }
+            }
+            if activated {
+                chunk.set_changed();
             }
         }
     }
@@ -1098,7 +1105,9 @@ impl LodBatchVisibility<'_, '_> {
                     .is_ok_and(|root| Some(root.terrain_key().worldspace_id) == world)
             });
             let initial_upload = chunk.source_children.is_some();
-            for batch in &mut chunk.batches {
+            // A chunk is marked changed only when one of its batches really changes.
+            let mut chunk_changed = false;
+            for batch in &mut chunk.bypass_change_detection().batches {
                 let selected =
                     batch
                         .members
@@ -1156,20 +1165,27 @@ impl LodBatchVisibility<'_, '_> {
                         readiness.request(batch.mesh.id());
                     }
                     changed_batches += 1;
+                    chunk_changed = true;
                 } else if !initial_upload
                     && batch.pending_upload
                     && readiness.is_ready(batch.mesh.id())
                 {
                     let owned = owned_source_mask(batch, chunk_world, &fallback_cells);
                     activate_uploaded_batch(batch, readiness, owned, &mut self.commands);
+                    chunk_changed = true;
                 }
                 if !initial_upload {
                     if !batch.pending_upload {
                         let owned = owned_source_mask(batch, chunk_world, &fallback_cells);
+                        let before = batch.fallback_selected;
                         select_source_fallbacks(batch, root, owned, &mut self.commands);
+                        chunk_changed |= batch.fallback_selected != before;
                     }
                     visible_batches += usize::from(selected != 0 && !batch.pending_upload);
                 }
+            }
+            if chunk_changed {
+                chunk.set_changed();
             }
         }
         (visible_quadrants, visible_batches, changed_batches)
