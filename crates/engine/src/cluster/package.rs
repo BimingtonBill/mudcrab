@@ -1437,8 +1437,10 @@ const LOAD_MARGIN: f32 = 2048.0;
 /// How long a material request may take before it is reported as stalled.
 const STALLED_SECONDS: f32 = 20.0;
 
-/// Materials that may be loading at once. Every request is a whole glTF with its textures; asking
-/// for all of a landscape's at once starves the engine's own streaming of the same task pool.
+/// Model files that may be loading at once. Every source is a whole glTF with its textures; asking
+/// for all of a landscape's at once starves the engine's own streaming of the same task pool. The
+/// limit counts files being read, not batches: a batch whose model is already loaded (or already
+/// being loaded for another batch) starts no read, and its material is a label of that model.
 const MAX_LOADING: usize = 16;
 
 /// What the last full look at the batches saw, so a frame in which nothing it depends on moved can
@@ -1543,8 +1545,12 @@ fn load_batches_in_view(
     let lazy = &mut *lazy;
     let mut entered = 0u64;
     let mut failed = 0u64;
-    // Requests that have finished (or failed) stop counting against the limit.
+    // Requests that have finished (or failed) stop counting against the limit. `loading` counts
+    // the batches still waiting (they hold readiness); `loading_sources` the model files being
+    // read for them, which is what the limit bounds.
     let mut loading = 0usize;
+    let mut loading_sources: std::collections::HashSet<AssetId<WorldAsset>> =
+        std::collections::HashSet::new();
     let in_flight = std::mem::take(&mut lazy.in_flight);
     let mut still_in_flight: Vec<usize> = Vec::with_capacity(in_flight.len());
     for index in in_flight {
@@ -1565,6 +1571,7 @@ fn load_batches_in_view(
                 );
                 if !published && !failed {
                     loading += 1;
+                    loading_sources.insert(scene.id());
                     still_in_flight.push(index);
                     continue;
                 }
@@ -1596,6 +1603,7 @@ fn load_batches_in_view(
                 loading += 1;
             } else {
                 loading += 1;
+                loading_sources.insert(scene.id());
             }
             still_in_flight.push(index);
             continue;
@@ -1726,12 +1734,6 @@ fn load_batches_in_view(
             profiler.increment("cluster/batch_hole_frames", holes);
         }
     }
-    if loading >= MAX_LOADING {
-        if let Some(metrics) = metrics.as_deref_mut() {
-            metrics.pending_cluster_batches = loading;
-        }
-        return;
-    }
     if unchanged {
         if let Some(metrics) = metrics.as_deref_mut() {
             metrics.pending_cluster_batches = loading + scan.waiting;
@@ -1769,7 +1771,7 @@ fn load_batches_in_view(
     }
     let wanted = candidates.len();
     let mut taken: Vec<usize> = Vec::new();
-    let mut source_slots = MAX_LOADING.saturating_sub(loading + prefetch_only);
+    let mut source_slots = MAX_LOADING.saturating_sub(loading_sources.len() + prefetch_only);
     let mut restarting_sources: HashMap<_, _> = lazy
         .in_flight
         .iter()
@@ -1782,9 +1784,6 @@ fn load_batches_in_view(
         })
         .collect();
     for (_, index) in candidates {
-        if taken.len() == MAX_LOADING - loading {
-            break;
-        }
         // A failure after certification handoff must not bypass a fresh load. Check only
         // this candidate: scanning all retained scenes would add world-sized work each frame.
         let path = &lazy.batches[index].key.model_path;
