@@ -371,23 +371,31 @@ struct TerrainInputs<'w, 's> {
     config: Res<'w, crate::config::EngineConfig>,
 }
 
-/// What can change the fallback surface map: a terrain entity's visibility, mesh, coverage or
-/// batch state, a draw obligation or a stand-in hold, or how many of each there are (a removal
-/// shows as a smaller count). Read every extraction, so a frame in which none of it moved keeps
-/// last frame's map instead of rebuilding it from every terrain identity.
+/// What can change the fallback surface map. Visibility, mesh and swap state are tracked on every
+/// streamed mesh, so a change there counts only on a terrain entity the map draws from; terrain
+/// coverage, batches and named holds count wherever they change, and a smaller count of them is a
+/// removal. Read every extraction, so a frame in which none of it moved keeps last frame's map
+/// instead of rebuilding it from every terrain identity.
 #[allow(clippy::type_complexity)]
 #[derive(SystemParam)]
 struct TerrainChanges<'w, 's> {
-    visibility: Query<'w, 's, (), (With<Mesh3d>, Changed<InheritedVisibility>)>,
-    meshes: Query<'w, 's, (), Changed<Mesh3d>>,
-    state: Query<
+    visibility: Query<'w, 's, Entity, (With<Mesh3d>, Changed<InheritedVisibility>)>,
+    meshes: Query<'w, 's, Entity, Changed<Mesh3d>>,
+    swaps: Query<
         'w,
         's,
-        (),
+        Entity,
         Or<(
             Changed<SwapSurface>,
             Changed<SwapDrawReceipt>,
             Added<SwapWaiting>,
+        )>,
+    >,
+    terrain: Query<
+        'w,
+        's,
+        (),
+        Or<(
             Added<SwapStandIn>,
             Changed<MergedTerrainCoverage>,
             Changed<TerrainWorldspace>,
@@ -396,36 +404,42 @@ struct TerrainChanges<'w, 's> {
             Added<RingTerrain>,
         )>,
     >,
-    waiting: Query<'w, 's, (), With<SwapWaiting>>,
+    waiting: Query<'w, 's, Entity, With<SwapWaiting>>,
     holds: Query<'w, 's, (), With<SwapStandIn>>,
-    receipts: Query<'w, 's, (), With<SwapDrawReceipt>>,
     merged: Query<'w, 's, (), With<MergedTerrainCoverage>>,
     batches: Query<'w, 's, (), With<LodTerrainBatches>>,
     rings: Query<'w, 's, (), With<RingTerrain>>,
 }
 
 impl TerrainChanges<'_, '_> {
-    fn counts(&self) -> [usize; 6] {
+    /// How many of each terrain input exist; only terrain entities' waits are counted.
+    fn counts(&self, terrain: impl Fn(Entity) -> bool) -> [usize; 5] {
         [
-            self.waiting.iter().count(),
+            self.waiting
+                .iter()
+                .filter(|entity| terrain(*entity))
+                .count(),
             self.holds.iter().count(),
-            self.receipts.iter().count(),
             self.merged.iter().count(),
             self.batches.iter().count(),
             self.rings.iter().count(),
         ]
     }
 
-    fn moved(&self) -> bool {
-        !self.visibility.is_empty() || !self.meshes.is_empty() || !self.state.is_empty()
+    fn moved(&self, terrain: impl Fn(Entity) -> bool) -> bool {
+        !self.terrain.is_empty()
+            || self.visibility.iter().any(&terrain)
+            || self.meshes.iter().any(&terrain)
+            || self.swaps.iter().any(&terrain)
     }
 }
 
-/// The identity snapshot and input counts the current surface map was built from.
+/// The identity snapshot, batch draws and input counts the current surface map was built from.
 #[derive(Default)]
 struct BuiltFrom {
     identities: Option<std::sync::Arc<HashMap<MainEntity, super::TerrainPrimitiveIdentity>>>,
-    counts: [usize; 6],
+    batch_entities: HashSet<Entity>,
+    counts: [usize; 5],
 }
 
 fn extract(
@@ -452,13 +466,19 @@ fn extract(
     // The identity index keeps its snapshot while nothing changed; holding the previous one here
     // makes a new snapshot a new allocation, so pointer identity says whether it moved.
     let snapshot = identities.identities_shared();
-    let counts = changes.counts();
+    // A terrain entity: an identity primitive, merged LAND, or a batch draw.
+    let is_terrain = |entity: Entity| {
+        snapshot.contains_key(&MainEntity::from(entity))
+            || merged.contains(entity)
+            || built.batch_entities.contains(&entity)
+    };
+    let counts = changes.counts(is_terrain);
     let unchanged = built
         .identities
         .as_ref()
         .is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &snapshot))
         && built.counts == counts
-        && !changes.moved();
+        && !changes.moved(is_terrain);
     built.identities = Some(std::sync::Arc::clone(&snapshot));
     built.counts = counts;
     if unchanged {
@@ -525,8 +545,10 @@ fn extract(
             },
         );
     }
+    built.batch_entities.clear();
     for (root, chunk) in batches {
         for (entity, mesh, coverage, source) in chunk.render_surfaces() {
+            built.batch_entities.insert(entity);
             if !visibility.get(entity).is_ok_and(|visible| visible.get()) {
                 continue;
             }
