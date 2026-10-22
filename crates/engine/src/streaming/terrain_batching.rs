@@ -815,6 +815,16 @@ impl LodBatchVisibility<'_, '_> {
         replaced_sources: &mut HashSet<Entity>,
         current: Option<&crate::swap_bridge::CurrentCoverageVisibility>,
     ) -> bool {
+        // Activation and retirement act only on chunks still holding their source hierarchy. Once
+        // every chunk has handed over there is nothing to decide, and a settled frame skips the
+        // fallback-cell set and the chunk walk below.
+        if !self
+            .chunks
+            .iter()
+            .any(|(_, chunk, _)| chunk.source_children.is_some())
+        {
+            return false;
+        }
         let fallback_cells = self.cluster_fallback_cells();
         let Some(readiness) = self.readiness.as_deref() else {
             return false;
