@@ -442,6 +442,9 @@ struct BenchmarkReport {
     cpu: CpuReport,
     /// Where the run's memory was: Bevy's CPU-side asset data and the GPU-side counters.
     memory: MemoryReport,
+    /// Full work change-driven systems did after the world was first ready (see
+    /// `work_counters`): empty, and `clean`, when every cache held in the settled frames.
+    settled_work: crate::work_counters::SettledWork,
     thresholds: Thresholds,
     passed: bool,
 }
@@ -765,6 +768,7 @@ fn collect_and_finish(
         scene,
         cpu,
         memory,
+        settled_work: crate::work_counters::snapshot(),
         thresholds: Thresholds {
             minimum_average_fps: config.accept_min_fps,
             maximum_p95_frame_ms: config.accept_p95_ms,

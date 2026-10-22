@@ -168,6 +168,7 @@ fn evaluate(
         stats.frames = stats.frames.wrapping_add(1);
         return;
     }
+    crate::work_counters::record("native_lod/draw_proof");
     evaluated.generation = Some(inputs.generation);
     evaluated.views = current_views;
     stats.pending = pending_now;
@@ -404,6 +405,7 @@ fn extract(
     if hierarchy_moved || walks.key != current {
         moved = true;
         perf_span!("native_lod::extract::walk");
+        crate::work_counters::record("native_lod/descendant_walk");
         out.object_meshes.clear();
         out.near.clear();
         let roots: HashMap<Entity, BlockKey> = out

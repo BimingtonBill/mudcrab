@@ -1334,6 +1334,11 @@ fn extract_sources(
     // immutable previous snapshot stays intact until candidate_worlds compares it.
     let asset_facts = out.invalidate_stock_meshes(&dropped_meshes, &mut work);
     let fresh = if refresh || !affected.references.is_empty() {
+        crate::work_counters::record(if refresh {
+            "cluster_sources/full_refresh"
+        } else {
+            "cluster_sources/reference_refresh"
+        });
         let mut facts = asset_facts.unwrap_or_else(|| QualifiedFacts {
             present: out.present.clone(),
             retired_refs: out.retired_refs.clone(),

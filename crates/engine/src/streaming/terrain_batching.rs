@@ -825,6 +825,7 @@ impl LodBatchVisibility<'_, '_> {
         {
             return false;
         }
+        crate::work_counters::record("terrain_batching/finalize_scan");
         let fallback_cells = self.cluster_fallback_cells();
         let Some(readiness) = self.readiness.as_deref() else {
             return false;

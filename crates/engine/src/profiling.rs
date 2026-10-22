@@ -397,6 +397,13 @@ impl Plugin for ProfilingPlugin {
                         .before(RenderSystems::Render),
                 );
         }
+        if app
+            .world()
+            .get_resource::<EngineConfig>()
+            .is_some_and(|config| config.change_report)
+        {
+            app.add_plugins(crate::change_report::ChangeReportPlugin);
+        }
         if std::env::var("MUDCRAB_PROFILE_DRAW_COUNTS").is_ok_and(|value| value == "1") {
             app.add_plugins(crate::indirect_metrics::IndirectDrawMetricsPlugin);
         }

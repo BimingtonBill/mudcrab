@@ -10,6 +10,7 @@ pub mod billboard;
 pub mod bug_report;
 mod capture_frame;
 pub mod cell_commands;
+pub mod change_report;
 pub mod cluster;
 pub mod color_pipeline;
 pub mod config;
@@ -89,6 +90,7 @@ pub mod view_policy;
 pub mod visibility_optimization;
 pub mod water_ssr;
 pub mod window_parking;
+pub mod work_counters;
 pub mod world;
 
 pub use app::run;

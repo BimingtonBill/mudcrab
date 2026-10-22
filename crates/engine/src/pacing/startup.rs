@@ -270,6 +270,7 @@ fn drive_startup_load(
         load.finished = true;
     }
     if latched {
+        crate::work_counters::mark_world_ready();
         info!(
             seconds = load.elapsed,
             // `seconds` stays for existing parsers; the virtual clock clamps long loading frames.

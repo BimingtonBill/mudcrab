@@ -290,6 +290,9 @@ pub struct EngineConfig {
     pub stdin_console: bool,
     /// Disable Bevy's GPU timing and pipeline-statistics query collection.
     pub no_render_diagnostics: bool,
+    /// Log, every 600 frames, which component types the main world marked changed
+    /// (`--change-report`): the inputs that make change-driven caches redo their work.
+    pub change_report: bool,
     pub benchmark_only: bool,
     pub benchmark_frames: Option<u32>,
     pub benchmark_duration_secs: Option<f64>,
@@ -665,6 +668,7 @@ impl Default for EngineConfig {
             start_shot: None,
             stdin_console: false,
             no_render_diagnostics: false,
+            change_report: false,
             benchmark_only: false,
             benchmark_frames: None,
             benchmark_duration_secs: None,
@@ -757,6 +761,7 @@ Assets and start position:
   --start-shot <file> [name]           start at the sole exterior pose, or a named pose in its space
   --stdin-console                     accept developer console commands on stdin
   --no-render-diagnostics             disable GPU timing and pipeline-statistics queries
+  --change-report                     log which components the world marks changed each frame
   --allow-incomplete-assets             run despite a failed manifest or integration-report gate
   --headless                            run without opening a window
   --hidden-window                       render screenshots without showing a window
@@ -1880,6 +1885,7 @@ impl EngineConfig {
                 }
                 "--stdin-console" => config.stdin_console = true,
                 "--no-render-diagnostics" => config.no_render_diagnostics = true,
+                "--change-report" => config.change_report = true,
                 "--shots-settle-timeout" => {
                     const EXPECTED: &str = "a positive number of seconds up to 600";
                     let raw = take_raw("--shots-settle-timeout", EXPECTED, args.next())?;

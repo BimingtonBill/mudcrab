@@ -516,6 +516,7 @@ fn extract(
         return;
     }
     perf_span!("terrain_handoff::extract::rebuild");
+    crate::work_counters::record("terrain_handoff/surface_map");
     out.revision = out.revision.wrapping_add(1);
     out.surfaces.clear();
     // Reuse the journaled exact identity index, including its ancestry validation.
@@ -853,6 +854,7 @@ fn gate(
                 .get(&key)
                 .is_none_or(|kept| kept.terrain != terrain.revision || kept.plan != plan);
             if stale {
+                crate::work_counters::record("terrain_handoff/gate_owned_set");
                 // Which entities the plan owns is a property of the surfaces alone; whether each is
                 // in this view is left to the class filter, which looks each one up.
                 let owned = if coverage.cells.is_empty() {

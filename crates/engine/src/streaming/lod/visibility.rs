@@ -1359,6 +1359,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     if rebuild {
         {
             perf_span!("lod::visibility::rebuild");
+            crate::work_counters::record("lod_visibility/rebuild");
             index.rebuild(&inputs);
         }
         if journaled {
@@ -1406,6 +1407,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     if refresh {
         {
             perf_span!("lod::visibility::apply");
+            crate::work_counters::record("lod_visibility/reselect");
             index.reselect(&mut inputs.lod_visibility.p0(), &selection);
         }
     }
@@ -1445,6 +1447,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     let (batched_visible, _, changed_batches) =
         if refresh || submission_dirty || external_changed || batches_removed {
             perf_span!("lod::visibility::batches");
+            crate::work_counters::record("lod_visibility/batch_update");
             batches.update_for_world(&index.batch_selection, selection.world)
         } else {
             if upload_completed {
