@@ -275,6 +275,8 @@ pub(super) struct LodStreaming {
     terrain_batch_activated_chunks: u64,
     terrain_batch_fallback_chunks: u64,
     terrain_batch_pending_cpu_chunks: usize,
+    /// Batched chunks whose initial selection is waiting for its GPU upload.
+    terrain_batch_pending_gpu_chunks: usize,
     terrain_batch_completion_report: Option<(u64, u64, u64)>,
     terrain_batch_controls_warned: bool,
 
@@ -1895,6 +1897,7 @@ fn record_terrain_batch_progress(
     pending_gpu: usize,
 ) {
     streaming.terrain_batch_pending_cpu_chunks = pending_cpu;
+    streaming.terrain_batch_pending_gpu_chunks = pending_gpu;
     profiler.set_gauge("lod/pending_terrain_batch_chunks", pending_cpu as f64);
     profiler.set_gauge(
         "lod/pending_initial_terrain_upload_chunks",
@@ -2453,7 +2456,12 @@ fn update_counts(
             })
             .map(|(_, metadata, _)| metadata.key),
     );
-    metrics.pending_lod_chunks = pending_keys.len();
+    // A chunk still being batched (its CPU preparation queued, or its first upload not on the GPU)
+    // will still change the frame and costs frame time until it is done, so it is loading work
+    // like a chunk that is not resident yet: the world is not ready while any is left.
+    metrics.pending_lod_chunks = pending_keys.len()
+        + streaming.terrain_batch_pending_cpu_chunks
+        + streaming.terrain_batch_pending_gpu_chunks;
     profiler.set_gauge("lod/resident_chunks", metrics.resident_lod_chunks as f64);
     profiler.set_gauge("lod/pending_chunks", metrics.pending_lod_chunks as f64);
 }
