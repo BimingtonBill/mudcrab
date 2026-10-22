@@ -371,25 +371,24 @@ struct TerrainInputs<'w, 's> {
     config: Res<'w, crate::config::EngineConfig>,
 }
 
-/// What can change the fallback surface map. Visibility, mesh and swap state are tracked on every
-/// streamed mesh, so a change there counts only on a terrain entity the map draws from; terrain
-/// coverage, batches and named holds count wherever they change, and a smaller count of them is a
-/// removal. Read every extraction, so a frame in which none of it moved keeps last frame's map
-/// instead of rebuilding it from every terrain identity.
+/// What can change the fallback surface map. Visibility, mesh and swap state are read only on the
+/// terrain entities the map draws from, through their own change ticks, so the cost follows the
+/// terrain, not every streamed mesh; terrain coverage, batches and named holds count wherever they
+/// change, and a smaller count of them is a removal. Read every extraction, so a frame in which none
+/// of it moved keeps last frame's map instead of rebuilding it from every terrain identity.
 #[allow(clippy::type_complexity)]
 #[derive(SystemParam)]
 struct TerrainChanges<'w, 's> {
-    visibility: Query<'w, 's, Entity, (With<Mesh3d>, Changed<InheritedVisibility>)>,
-    meshes: Query<'w, 's, Entity, Changed<Mesh3d>>,
-    swaps: Query<
+    surfaces: Query<
         'w,
         's,
-        Entity,
-        Or<(
-            Changed<SwapSurface>,
-            Changed<SwapDrawReceipt>,
-            Added<SwapWaiting>,
-        )>,
+        (
+            Option<Ref<'static, InheritedVisibility>>,
+            Option<Ref<'static, Mesh3d>>,
+            Option<Ref<'static, SwapSurface>>,
+            Option<Ref<'static, SwapDrawReceipt>>,
+            Has<SwapWaiting>,
+        ),
     >,
     terrain: Query<
         'w,
@@ -404,7 +403,6 @@ struct TerrainChanges<'w, 's> {
             Added<RingTerrain>,
         )>,
     >,
-    waiting: Query<'w, 's, Entity, With<SwapWaiting>>,
     holds: Query<'w, 's, (), With<SwapStandIn>>,
     merged: Query<'w, 's, (), With<MergedTerrainCoverage>>,
     batches: Query<'w, 's, (), With<LodTerrainBatches>>,
@@ -412,25 +410,32 @@ struct TerrainChanges<'w, 's> {
 }
 
 impl TerrainChanges<'_, '_> {
-    /// How many of each terrain input exist; only terrain entities' waits are counted.
-    fn counts(&self, terrain: impl Fn(Entity) -> bool) -> [usize; 5] {
-        [
-            self.waiting
-                .iter()
-                .filter(|entity| terrain(*entity))
-                .count(),
-            self.holds.iter().count(),
-            self.merged.iter().count(),
-            self.batches.iter().count(),
-            self.rings.iter().count(),
-        ]
+    /// Whether any of `terrain`'s surfaces changed, and how many of them wait on a swap (a
+    /// smaller number is a wait removed).
+    fn surfaces_moved(&self, terrain: impl Iterator<Item = Entity>) -> (bool, usize) {
+        let mut moved = false;
+        let mut waiting = 0;
+        for entity in terrain {
+            let Ok((visibility, mesh, surface, receipt, waits)) = self.surfaces.get(entity) else {
+                continue;
+            };
+            waiting += usize::from(waits);
+            moved |= visibility.is_some_and(|value| value.is_changed())
+                || mesh.is_some_and(|value| value.is_changed())
+                || surface.is_some_and(|value| value.is_changed())
+                || receipt.is_some_and(|value| value.is_changed());
+        }
+        (moved, waiting)
     }
 
-    fn moved(&self, terrain: impl Fn(Entity) -> bool) -> bool {
-        !self.terrain.is_empty()
-            || self.visibility.iter().any(&terrain)
-            || self.meshes.iter().any(&terrain)
-            || self.swaps.iter().any(&terrain)
+    /// How many named holds, merged LAND, batch roots and ring surfaces exist.
+    fn counts(&self) -> [usize; 4] {
+        [
+            self.holds.iter().len(),
+            self.merged.iter().len(),
+            self.batches.iter().len(),
+            self.rings.iter().len(),
+        ]
     }
 }
 
@@ -439,7 +444,8 @@ impl TerrainChanges<'_, '_> {
 struct BuiltFrom {
     identities: Option<std::sync::Arc<HashMap<MainEntity, super::TerrainPrimitiveIdentity>>>,
     batch_entities: HashSet<Entity>,
-    counts: [usize; 5],
+    counts: [usize; 4],
+    waiting: usize,
 }
 
 fn extract(
@@ -466,21 +472,26 @@ fn extract(
     // The identity index keeps its snapshot while nothing changed; holding the previous one here
     // makes a new snapshot a new allocation, so pointer identity says whether it moved.
     let snapshot = identities.identities_shared();
-    // A terrain entity: an identity primitive, merged LAND, or a batch draw.
-    let is_terrain = |entity: Entity| {
-        snapshot.contains_key(&MainEntity::from(entity))
-            || merged.contains(entity)
-            || built.batch_entities.contains(&entity)
-    };
-    let counts = changes.counts(is_terrain);
+    // The terrain entities: identity primitives, merged LAND and batch draws. An entity that just
+    // became one of them arrives with a new snapshot, a merged-coverage change or a batch change.
+    let terrain = snapshot
+        .keys()
+        .map(|main| main.id())
+        .chain(merged.iter().map(|(entity, ..)| entity))
+        .chain(built.batch_entities.iter().copied());
+    let (surfaces_moved, waiting) = changes.surfaces_moved(terrain);
+    let counts = changes.counts();
     let unchanged = built
         .identities
         .as_ref()
         .is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &snapshot))
         && built.counts == counts
-        && !changes.moved(is_terrain);
+        && built.waiting == waiting
+        && !surfaces_moved
+        && changes.terrain.is_empty();
     built.identities = Some(std::sync::Arc::clone(&snapshot));
     built.counts = counts;
+    built.waiting = waiting;
     if unchanged {
         return;
     }

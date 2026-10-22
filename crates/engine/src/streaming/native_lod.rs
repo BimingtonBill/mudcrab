@@ -398,10 +398,7 @@ fn extract(
     out.hidden_roots = hidden_roots;
     walks.demand = demand;
     let resident: HashMap<CellKey, Entity> = cells.full_resident_cells().collect();
-    let counts = [
-        changes.parented.iter().count(),
-        changes.meshes.iter().count(),
-    ];
+    let counts = [changes.parented.iter().len(), changes.meshes.iter().len()];
     let hierarchy_moved = !changes.hierarchy.is_empty();
     let current = Some((counts, roots, resident));
     if hierarchy_moved || walks.key != current {
@@ -459,7 +456,7 @@ fn extract(
         out.stream_radius = config.stream_radius;
         moved = true;
     }
-    let native_count = changes.native_count.iter().count();
+    let native_count = changes.native_count.iter().len();
     if moved || !changes.native.is_empty() || walks.native_count != native_count {
         out.native = native.iter().map(|(e, c)| (e.into(), *c)).collect();
         walks.native_count = native_count;
