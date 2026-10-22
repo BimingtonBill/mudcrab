@@ -1202,6 +1202,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     mut budget: Option<ResMut<StreamingCommitBudget>>,
 ) {
     let started = Instant::now();
+    let inputs_span = ::bevy::log::info_span!("lod::visibility::inputs").entered();
     let demand = views.current(&config, origin.0, portal.as_deref());
     let selection = Selection {
         world: demand.map(|demand| demand.world),
@@ -1301,6 +1302,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     } else {
         false
     };
+    drop(inputs_span);
     // The flag predates the journal: each place that sets it changes an input the journal
     // reports (a patch added or removed, a surface ready), so it only matters without one.
     let flagged = streaming.p0().visibility_dirty;
@@ -1371,6 +1373,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     // A pass that rewrites every patch needs no report of what was changed from outside. Any
     // other frame notes the differences, and the frames the old pass refreshed on apply them.
     if !index.apply_all {
+        perf_span!("lod::visibility::overrides");
         let mut changed = std::mem::take(&mut index.changed);
         inputs.changed_visibility(&mut changed);
         index.changed = changed;
@@ -1412,6 +1415,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
         || cluster_changed
         || removals
     {
+        perf_span!("lod::visibility::mask");
         let mut selected: HashMap<_, _> = index
             .keys
             .iter()
@@ -1436,6 +1440,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     }
     let (batched_visible, _, changed_batches) =
         if refresh || submission_dirty || external_changed || batches_removed {
+            perf_span!("lod::visibility::batches");
             batches.update_for_world(&index.batch_selection, selection.world)
         } else {
             if upload_completed {
@@ -1488,6 +1493,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     // Resident ring surfaces stay revealed for extraction. terrain_handoff makes
     // the complement independently for each render view against current assets
     // and the current cluster generation/plan, never historical readiness.
+    let ring_span = ::bevy::log::info_span!("lod::visibility::ring").entered();
     let mut ring_ready = 0usize;
     for (world, _, _, ready, mut visibility) in &mut inputs.ring {
         if ready {
@@ -1497,6 +1503,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
             ring_ready += usize::from(Some(world.0) == selection.world);
         }
     }
+    drop(ring_span);
     profiler.set_gauge("lod/ring_retained_ready_surfaces", ring_ready as f64);
     // The no-journal contract permits cached coverage between refreshes.
     // Journal mode remains exact and is audited on every invocation. Audit a
@@ -1525,7 +1532,10 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
         "lod/visible_terrain_patches",
         metrics.visible_lod_terrain_patches as f64,
     );
-    index.publish_stats(&mut profiler);
+    {
+        perf_span!("lod::visibility::stats");
+        index.publish_stats(&mut profiler);
+    }
     profiler.record_elapsed("lod/visibility", started);
 }
 

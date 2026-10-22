@@ -17,7 +17,7 @@ use bevy::{
     render::{
         Extract, ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems,
         sync_world::MainEntity,
-        view::{ExtractedView, RenderVisibleEntities},
+        view::{ExtractedView, RenderVisibleEntities, RetainedViewEntity},
     },
 };
 use std::collections::{HashMap, HashSet};
@@ -84,6 +84,9 @@ struct Inputs {
     origin: IVec2,
     distances: crate::config::TerrainLodDistances,
     stream_radius: i32,
+    /// Bumped whenever anything above changed, so a consumer can tell a frame with the same
+    /// inputs from a new one without comparing them.
+    generation: u64,
 }
 #[derive(Resource, Default)]
 struct Filters {
@@ -121,6 +124,13 @@ fn publish(mut main: ResMut<MainWorld>, stats: Res<DrawStats>) {
     }
 }
 
+/// What the last full evaluation saw: the input generation and the views it walked.
+#[derive(Default)]
+struct Evaluated {
+    generation: Option<u64>,
+    views: Vec<RetainedViewEntity>,
+}
+
 #[allow(clippy::type_complexity)]
 fn evaluate(
     inputs: Res<Inputs>,
@@ -134,8 +144,33 @@ fn evaluate(
         Has<NormalPrepass>,
         Has<MotionVectorPrepass>,
     )>,
+    mut evaluated: Local<Evaluated>,
 ) {
-    stats.pending = stats.awaiting + stats.drawn_twice + stats.drawn_by_nothing;
+    let pending_now = stats.awaiting + stats.drawn_twice + stats.drawn_by_nothing;
+    // Once every native draw is proven, the proof only changes with its inputs: the extracted
+    // inputs, the views, or what a view sees (Bevy lists the entities a view gained or lost this
+    // frame). With none of those moving, the last proof stands and nothing is walked.
+    let current_views: Vec<RetainedViewEntity> = views
+        .iter()
+        .map(|(view, ..)| view.retained_view_entity)
+        .collect();
+    let visible_moved = views.iter().any(|(_, visible, ..)| {
+        visible.get::<Mesh3d>().is_some_and(|class| {
+            !class.added_entities().is_empty() || !class.removed_entities.is_empty()
+        })
+    });
+    if stats.pending == 0
+        && pending_now == 0
+        && evaluated.generation == Some(inputs.generation)
+        && evaluated.views == current_views
+        && !visible_moved
+    {
+        stats.frames = stats.frames.wrapping_add(1);
+        return;
+    }
+    evaluated.generation = Some(inputs.generation);
+    evaluated.views = current_views;
+    stats.pending = pending_now;
     stats.visible = 0;
     stats.tree_cells = 0;
     stats.object_blocks = 0;
@@ -275,10 +310,30 @@ impl Plugin for NativeLodPlugin {
 #[derive(Default)]
 struct DescendantWalks {
     key: Option<WalkKey>,
+    demand: Option<super::lod::LodDemand>,
+    native_count: usize,
 }
 
-/// The structural epoch, the object LOD roots and the resident cells a walk was made from.
-type WalkKey = (u64, HashMap<Entity, BlockKey>, HashMap<CellKey, Entity>);
+/// The hierarchy counts, the object LOD roots and the resident cells a walk was made from.
+type WalkKey = (
+    [usize; 2],
+    HashMap<Entity, BlockKey>,
+    HashMap<CellKey, Entity>,
+);
+
+/// What can change the descendant walks and the native cell map: a parent link or mesh added or
+/// changed, or how many there are (a removal or a disabled entity shows as a smaller count).
+/// Narrower than the global structure epoch, which moves with every visibility or material
+/// component added anywhere in the world.
+#[allow(clippy::type_complexity)]
+#[derive(bevy::ecs::system::SystemParam)]
+struct NativeChanges<'w, 's> {
+    hierarchy: Query<'w, 's, (), Or<(Changed<ChildOf>, Added<Mesh3d>)>>,
+    parented: Query<'w, 's, (), With<ChildOf>>,
+    meshes: Query<'w, 's, (), With<Mesh3d>>,
+    native: Query<'w, 's, (), Changed<NativeLodCell>>,
+    native_count: Query<'w, 's, (), With<NativeLodCell>>,
+}
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn extract(
@@ -302,11 +357,7 @@ fn extract(
             Option<&bevy::camera::visibility::RenderLayers>,
         )>,
     >,
-    (structure, query_filters, mut walks): (
-        Extract<Option<Res<super::identity_changes::StructureEpoch>>>,
-        Extract<Res<bevy::ecs::entity_disabling::DefaultQueryFilters>>,
-        Local<DescendantWalks>,
-    ),
+    (changes, mut walks): (Extract<NativeChanges>, Local<DescendantWalks>),
 ) {
     let started = std::time::Instant::now();
     let window = views
@@ -322,7 +373,8 @@ fn extract(
     out.objects = objects
         .render_state()
         .filter(|objects| !objects.roots.is_empty());
-    out.hidden_roots.clear();
+    let demand = out.objects.as_ref().map(|objects| objects.demand);
+    let mut hidden_roots = HashSet::new();
     let roots: HashMap<Entity, BlockKey> = out
         .objects
         .as_ref()
@@ -339,17 +391,21 @@ fn extract(
             .get(*root)
             .is_ok_and(|(explicit, inherited, _)| loaded_root_visible(*explicit, inherited.get()))
         {
-            out.hidden_roots.insert(*key);
+            hidden_roots.insert(*key);
         }
     }
+    let mut moved = hidden_roots != out.hidden_roots || walks.demand != demand;
+    out.hidden_roots = hidden_roots;
+    walks.demand = demand;
     let resident: HashMap<CellKey, Entity> = cells.full_resident_cells().collect();
-    // Without the structural epoch (or with a default disabler it does not watch) a hierarchy
-    // change cannot be seen, so the walks are made every frame.
-    let epoch = structure
-        .as_deref()
-        .and_then(|structure| structure.covered_version(&query_filters));
-    let current = epoch.map(|epoch| (epoch, roots, resident));
-    if current.is_none() || walks.key != current {
+    let counts = [
+        changes.parented.iter().count(),
+        changes.meshes.iter().count(),
+    ];
+    let hierarchy_moved = !changes.hierarchy.is_empty();
+    let current = Some((counts, roots, resident));
+    if hierarchy_moved || walks.key != current {
+        moved = true;
         perf_span!("native_lod::extract::walk");
         out.object_meshes.clear();
         out.near.clear();
@@ -394,11 +450,22 @@ fn extract(
     }
 
     let _tail_span = ::bevy::log::info_span!("native_lod::extract::tail").entered();
-    out.origin = origin.0;
-    out.distances = config.terrain_lod;
-    out.stream_radius = config.stream_radius;
-    out.native = native.iter().map(|(e, c)| (e.into(), *c)).collect();
-    out.ready.clear();
+    if out.origin != origin.0
+        || out.distances != config.terrain_lod
+        || out.stream_radius != config.stream_radius
+    {
+        out.origin = origin.0;
+        out.distances = config.terrain_lod;
+        out.stream_radius = config.stream_radius;
+        moved = true;
+    }
+    let native_count = changes.native_count.iter().count();
+    if moved || !changes.native.is_empty() || walks.native_count != native_count {
+        out.native = native.iter().map(|(e, c)| (e.into(), *c)).collect();
+        walks.native_count = native_count;
+        moved = true;
+    }
+    let previous_ready = std::mem::take(&mut out.ready);
     // Which near cells are drawn whole is read only by `filter`, and only when it has object LOD
     // blocks or native tree cells to decide; each check walks the cell's whole hierarchy.
     let needed = out.objects.is_some() || !out.native.is_empty();
@@ -422,6 +489,9 @@ fn extract(
         {
             out.ready.insert(cell, layers.cloned().unwrap_or_default());
         }
+    }
+    if moved || out.ready != previous_ready {
+        out.generation = out.generation.wrapping_add(1);
     }
     timing.record("native_lod/extract", started.elapsed());
 }

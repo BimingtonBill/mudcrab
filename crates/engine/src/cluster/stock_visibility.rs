@@ -43,15 +43,24 @@ impl ClassFilter {
         let mut now_hidden = HashSet::default();
         let mut newly_hidden = Vec::new();
         let mut newly_stock = Vec::new();
-        // Only entities really in this view/class may enter persistent state.
-        for (render, main) in class.iter_visible() {
-            if hidden.contains(main) {
+        // Only entities really in this view/class may enter persistent state. Membership is looked
+        // up per named entity (the CPU list is sorted by main entity, the GPU list is a map), so
+        // the cost follows the hidden sets, not everything the view sees.
+        let mut cpu_hidden = false;
+        for main in hidden {
+            if let Some((pair, cpu)) = visible_pair(class, *main) {
                 now_hidden.insert(*main);
+                cpu_hidden |= cpu;
                 if !self.previous_hidden.contains(main) {
-                    newly_hidden.push((*render, *main));
+                    newly_hidden.push(pair);
                 }
-            } else if self.previous_hidden.contains(main) {
-                newly_stock.push((*render, *main));
+            }
+        }
+        for main in &self.previous_hidden {
+            if !hidden.contains(main)
+                && let Some((pair, _)) = visible_pair(class, *main)
+            {
+                newly_stock.push(pair);
             }
         }
 
@@ -76,25 +85,24 @@ impl ClassFilter {
         sorted_unique(&mut class.added_entities);
         sorted_unique(&mut class.removed_entities);
 
-        let mut index = 0;
-        class.entities_cpu_culling.retain(|pair| {
-            let position = index;
-            index += 1;
-            if now_hidden.contains(&pair.1) {
-                saved.cpu.push((position, *pair));
-                false
-            } else {
-                true
+        if cpu_hidden {
+            let mut index = 0;
+            class.entities_cpu_culling.retain(|pair| {
+                let position = index;
+                index += 1;
+                if now_hidden.contains(&pair.1) {
+                    saved.cpu.push((position, *pair));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for main in &now_hidden {
+            if let Some(render) = class.entities_gpu_culling.remove(main) {
+                saved.gpu.push((render, *main));
             }
-        });
-        class.entities_gpu_culling.retain(|main, render| {
-            if now_hidden.contains(main) {
-                saved.gpu.push((*render, *main));
-                false
-            } else {
-                true
-            }
-        });
+        }
         self.previous_hidden = now_hidden;
         self.saved = Some(saved);
     }
@@ -104,17 +112,22 @@ impl ClassFilter {
     pub fn restore(&mut self, class: &mut RenderVisibleEntitiesClass) {
         assert!(self.active, "visibility filter restored without apply");
         self.active = false;
-        let Some(saved) = self.saved.take() else {
+        let Some(mut saved) = self.saved.take() else {
             return;
         };
+        let saved_cpu = std::mem::take(&mut saved.cpu);
+        if saved_cpu.is_empty() {
+            Self::restore_gpu_and_events(class, saved);
+            return;
+        }
         // Reconstitute in place from the back, preserving every original slot.
         // Repeated Vec::insert would move the retained tail once per hidden
         // entity and become quadratic when a large view hands off to clusters.
         let cpu = &mut class.entities_cpu_culling;
         let mut retained = cpu.len();
-        let raw_len = retained + saved.cpu.len();
+        let raw_len = retained + saved_cpu.len();
         cpu.resize(raw_len, (Entity::PLACEHOLDER, Entity::PLACEHOLDER.into()));
-        let mut removed = saved.cpu.into_iter().rev().peekable();
+        let mut removed = saved_cpu.into_iter().rev().peekable();
         for index in (0..raw_len).rev() {
             if removed
                 .peek()
@@ -132,6 +145,10 @@ impl ClassFilter {
             removed.next().is_none() && retained == 0,
             "filtered CPU entries modified before restore"
         );
+        Self::restore_gpu_and_events(class, saved);
+    }
+
+    fn restore_gpu_and_events(class: &mut RenderVisibleEntitiesClass, saved: Saved) {
         for (render, main) in saved.gpu {
             assert!(
                 class.entities_gpu_culling.insert(main, render).is_none(),
@@ -141,6 +158,31 @@ impl ClassFilter {
         class.added_entities = saved.added;
         class.removed_entities = saved.removed;
     }
+}
+
+/// The view's own pairs for those of `mains` it sees, looked up one by one.
+pub fn visible_pairs<'a>(
+    class: &RenderVisibleEntitiesClass,
+    mains: impl IntoIterator<Item = &'a MainEntity>,
+) -> Vec<Pair> {
+    mains
+        .into_iter()
+        .filter_map(|main| visible_pair(class, *main).map(|(pair, _)| pair))
+        .collect()
+}
+
+/// The view's own pair for `main`, and whether it sits in the CPU-culled list.
+fn visible_pair(class: &RenderVisibleEntitiesClass, main: MainEntity) -> Option<(Pair, bool)> {
+    if let Ok(index) = class
+        .entities_cpu_culling
+        .binary_search_by_key(&main, |(_, main)| *main)
+    {
+        return Some((class.entities_cpu_culling[index], true));
+    }
+    class
+        .entities_gpu_culling
+        .get(&main)
+        .map(|render| ((*render, main), false))
 }
 
 fn sorted_unique(events: &mut Vec<Pair>) {

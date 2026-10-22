@@ -65,6 +65,8 @@ pub(crate) struct Surface {
 #[derive(Resource, Default)]
 pub(crate) struct RenderTerrain {
     pub surfaces: HashMap<MainEntity, Surface>,
+    /// Bumped whenever `surfaces` is rebuilt, so a consumer can keep what it derived from them.
+    revision: u64,
     origin: IVec2,
     radius: i32,
     explicit: bool,
@@ -369,10 +371,69 @@ struct TerrainInputs<'w, 's> {
     config: Res<'w, crate::config::EngineConfig>,
 }
 
+/// What can change the fallback surface map: a terrain entity's visibility, mesh, coverage or
+/// batch state, a draw obligation or a stand-in hold, or how many of each there are (a removal
+/// shows as a smaller count). Read every extraction, so a frame in which none of it moved keeps
+/// last frame's map instead of rebuilding it from every terrain identity.
+#[allow(clippy::type_complexity)]
+#[derive(SystemParam)]
+struct TerrainChanges<'w, 's> {
+    visibility: Query<'w, 's, (), (With<Mesh3d>, Changed<InheritedVisibility>)>,
+    meshes: Query<'w, 's, (), Changed<Mesh3d>>,
+    state: Query<
+        'w,
+        's,
+        (),
+        Or<(
+            Changed<SwapSurface>,
+            Changed<SwapDrawReceipt>,
+            Added<SwapWaiting>,
+            Added<SwapStandIn>,
+            Changed<MergedTerrainCoverage>,
+            Changed<TerrainWorldspace>,
+            Changed<LodTerrainBatches>,
+            Changed<LodChunkRoot>,
+            Added<RingTerrain>,
+        )>,
+    >,
+    waiting: Query<'w, 's, (), With<SwapWaiting>>,
+    holds: Query<'w, 's, (), With<SwapStandIn>>,
+    receipts: Query<'w, 's, (), With<SwapDrawReceipt>>,
+    merged: Query<'w, 's, (), With<MergedTerrainCoverage>>,
+    batches: Query<'w, 's, (), With<LodTerrainBatches>>,
+    rings: Query<'w, 's, (), With<RingTerrain>>,
+}
+
+impl TerrainChanges<'_, '_> {
+    fn counts(&self) -> [usize; 6] {
+        [
+            self.waiting.iter().count(),
+            self.holds.iter().count(),
+            self.receipts.iter().count(),
+            self.merged.iter().count(),
+            self.batches.iter().count(),
+            self.rings.iter().count(),
+        ]
+    }
+
+    fn moved(&self) -> bool {
+        !self.visibility.is_empty() || !self.meshes.is_empty() || !self.state.is_empty()
+    }
+}
+
+/// The identity snapshot and input counts the current surface map was built from.
+#[derive(Default)]
+struct BuiltFrom {
+    identities: Option<std::sync::Arc<HashMap<MainEntity, super::TerrainPrimitiveIdentity>>>,
+    counts: [usize; 6],
+}
+
 fn extract(
     mut out: ResMut<RenderTerrain>,
     mut identities: Extract<TerrainIdentityAccess>,
     inputs: Extract<TerrainInputs>,
+    changes: Extract<TerrainChanges>,
+    mut built: Local<BuiltFrom>,
 ) {
     let TerrainInputs {
         visibility,
@@ -385,14 +446,31 @@ fn extract(
         origin,
         config,
     } = &*inputs;
-    out.surfaces.clear();
     out.origin = origin.0;
     out.radius = config.stream_radius;
     out.explicit = config.terrain_radius_given;
+    // The identity index keeps its snapshot while nothing changed; holding the previous one here
+    // makes a new snapshot a new allocation, so pointer identity says whether it moved.
+    let snapshot = identities.identities_shared();
+    let counts = changes.counts();
+    let unchanged = built
+        .identities
+        .as_ref()
+        .is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &snapshot))
+        && built.counts == counts
+        && !changes.moved();
+    built.identities = Some(std::sync::Arc::clone(&snapshot));
+    built.counts = counts;
+    if unchanged {
+        return;
+    }
+    perf_span!("terrain_handoff::extract::rebuild");
+    out.revision = out.revision.wrapping_add(1);
+    out.surfaces.clear();
     // Reuse the journaled exact identity index, including its ancestry validation.
     // InheritedVisibility is refreshed by Bevy for primitive/root/intermediate
-    // in-place changes; it is read every extraction, without another ancestry cache.
-    for (main, identity) in identities.identities_shared().iter() {
+    // in-place changes; a change to it on any mesh rebuilds the map.
+    for (main, identity) in snapshot.iter() {
         if !visibility.get(main.id()).is_ok_and(|visible| visible.get()) {
             continue;
         }
@@ -690,50 +768,70 @@ type TerrainViews<'w, 's> = Query<
 /// so a stable owned fallback costs no queue work per frame while its extracted instance and
 /// allocations stay resident, and a withdrawn plan re-arms it in this same frame: the plan is
 /// rebuilt before this system runs and mesh queueing runs after it.
+/// The fallbacks one view's cluster plan owns, and the terrain revision and plan they were
+/// derived from. Neither moves in a settled frame, so the set is kept rather than re-derived.
+struct OwnedSurfaces {
+    terrain: u64,
+    plan: (u64, u64, u64),
+    owned: bevy::platform::collections::HashSet<MainEntity>,
+}
+
 fn gate(
     terrain: Res<RenderTerrain>,
     clusters: Res<ClusterCoverage>,
     mut filters: ResMut<GateFilters>,
     mut views: TerrainViews,
     mut shadows: Query<&mut RenderShadowMapVisibleEntities>,
+    mut owned_by_view: Local<HashMap<RetainedViewEntity, OwnedSurfaces>>,
 ) {
     let filters = &mut filters.0;
     assert!(filters.active.is_empty(), "terrain gate was not restored");
-    let mut wanted: HashMap<Domain, bevy::platform::collections::HashSet<MainEntity>> =
-        HashMap::new();
-    for (entity, view, light, visible, ..) in &views {
+    owned_by_view.retain(|key, _| clusters.views.contains_key(key));
+    let empty = bevy::platform::collections::HashSet::default();
+    let mut wanted: HashMap<
+        Domain,
+        std::borrow::Cow<bevy::platform::collections::HashSet<MainEntity>>,
+    > = HashMap::new();
+    for (_, view, ..) in &views {
+        let key = view.retained_view_entity;
+        if let Some(coverage) = clusters.views.get(&key) {
+            let plan = (coverage.generation, coverage.layout, coverage.plan);
+            let stale = owned_by_view
+                .get(&key)
+                .is_none_or(|kept| kept.terrain != terrain.revision || kept.plan != plan);
+            if stale {
+                // Which entities the plan owns is a property of the surfaces alone; whether each is
+                // in this view is left to the class filter, which looks each one up.
+                let owned = if coverage.cells.is_empty() {
+                    Default::default()
+                } else {
+                    terrain
+                        .surfaces
+                        .iter()
+                        .filter(|(_, surface)| cluster_owned(surface, &coverage.cells))
+                        .map(|(main, _)| *main)
+                        .collect()
+                };
+                owned_by_view.insert(
+                    key,
+                    OwnedSurfaces {
+                        terrain: terrain.revision,
+                        plan,
+                        owned,
+                    },
+                );
+            }
+        }
+    }
+    for (entity, view, light, ..) in &views {
         let key = view.retained_view_entity;
         let domain = domain(entity, key, light);
-        let visible = match domain {
-            Domain::Camera(_) => visible,
-            Domain::Shadow(light, key) => shadows
-                .get(light)
-                .ok()
-                .and_then(|shadow| shadow.subviews.get(&key)),
-        };
-        let empty = HashSet::new();
-        let cells = clusters
-            .views
-            .get(&key)
-            .map_or(&empty, |coverage| &coverage.cells);
-        let owned: bevy::platform::collections::HashSet<MainEntity> = visible
-            .and_then(|visible| visible.get::<Mesh3d>())
-            .into_iter()
-            .filter(|_| !cells.is_empty())
-            .flat_map(|class| class.iter_visible())
-            .filter(|(_, main)| {
-                terrain
-                    .surfaces
-                    .get(*main)
-                    .is_some_and(|surface| cluster_owned(surface, cells))
-            })
-            .map(|(_, main)| *main)
-            .collect();
+        let owned = owned_by_view.get(&key).map_or(&empty, |kept| &kept.owned);
         // Shared point/spot domains yield only after every consumer agrees.
         wanted
             .entry(domain)
-            .and_modify(|joint| joint.retain(|main| owned.contains(main)))
-            .or_insert(owned);
+            .and_modify(|joint| joint.to_mut().retain(|main| owned.contains(main)))
+            .or_insert(std::borrow::Cow::Borrowed(owned));
     }
     filters
         .saved
@@ -791,11 +889,13 @@ fn filter(
                     .ok()
                     .and_then(|shadow| shadow.subviews.get(&key)),
             };
+            // Only terrain surfaces can be complemented, so only they are collected.
             let visible: HashSet<_> = visible
                 .and_then(|visible| visible.get::<Mesh3d>())
                 .into_iter()
                 .flat_map(|class| class.iter_visible())
                 .map(|(_, main)| *main)
+                .filter(|main| terrain.surfaces.contains_key(main))
                 .collect();
             let forward = queued.forward(&key);
             let prepass = queued.prepass(&key);
@@ -874,11 +974,7 @@ fn filter(
         }
         .and_then(|visible| visible.classes.get_mut(&std::any::TypeId::of::<Mesh3d>()));
         if let Some(class) = class {
-            let pairs: Vec<_> = class
-                .iter_visible()
-                .filter(|(_, main)| hidden.contains(*main))
-                .map(|(entity, main)| (*entity, *main))
-                .collect();
+            let pairs = crate::cluster::stock_visibility::visible_pairs(class, &hidden);
             for key in &consumers[&domain] {
                 phases
                     .p1()
