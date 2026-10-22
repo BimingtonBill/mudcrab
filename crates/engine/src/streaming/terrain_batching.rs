@@ -604,13 +604,29 @@ fn spawn_render_mesh(
 #[derive(SystemParam)]
 pub(crate) struct LodBatchActivation<'w, 's> {
     chunks: Query<'w, 's, &'static LodTerrainBatches>,
+    readiness: Option<Res<'w, TerrainMeshUploadReadiness>>,
 }
 
 impl LodBatchActivation<'_, '_> {
+    /// Chunks still holding their source hierarchy whose first upload is not on the GPU yet: a
+    /// selected batch waiting for its mesh. A chunk whose batches are all uploaded is not loading
+    /// any more, even while its hand-over waits for a camera to draw the batch (a chunk seen only
+    /// by a shadow view keeps its source until then, which can take as long as the camera stays
+    /// still).
     pub(super) fn pending_count(&self) -> usize {
         self.chunks
             .iter()
-            .filter(|chunk| chunk.source_children.is_some())
+            .filter(|chunk| {
+                chunk.source_children.is_some()
+                    && chunk.batches.iter().any(|batch| {
+                        batch.selected != 0
+                            && batch.pending_upload
+                            && !self
+                                .readiness
+                                .as_deref()
+                                .is_some_and(|readiness| readiness.is_ready(batch.mesh.id()))
+                    })
+            })
             .count()
     }
 }
@@ -630,6 +646,9 @@ struct RetireBlockers {
     owned_undrawn_region_observed: usize,
     owned_undrawn_not_prepared: usize,
     other: usize,
+    /// The batches counted in `owned_undrawn_batch_viewed`, with the mesh they must draw, for the
+    /// per-batch probe in the stall log.
+    viewed_undrawn: Vec<(Entity, AssetId<Mesh>)>,
 }
 
 #[derive(SystemParam)]
@@ -759,6 +778,7 @@ impl LodBatchVisibility<'_, '_> {
                 }) {
                     if !current.is_unviewed(batch.entity) {
                         out.owned_undrawn_batch_viewed += 1;
+                        out.viewed_undrawn.push((batch.entity, batch.mesh.id()));
                     } else if !batch
                         .members
                         .iter()
@@ -857,11 +877,18 @@ impl LodBatchVisibility<'_, '_> {
                         }
                     }
                 }
-                for batch in &mut chunk.batches {
+                // Marked changed only when a batch is activated: a chunk waiting for its draw is
+                // scanned again every frame and must not make batch watchers redo their work.
+                let mut activated = false;
+                for batch in &mut chunk.bypass_change_detection().batches {
                     let owned = owned_source_mask(batch, world, &fallback_cells);
                     if owned != 0 && batch.pending_upload && readiness.is_ready(batch.mesh.id()) {
                         activate_uploaded_batch(batch, readiness, owned, &mut self.commands);
+                        activated = true;
                     }
+                }
+                if activated {
+                    chunk.set_changed();
                 }
             }
         }
@@ -1231,17 +1258,59 @@ pub(in crate::streaming) fn finalize_unviewed_lod_batches(
 
 /// Profiled cluster-terrain runs only: every 300 frames while chunks still hold their source
 /// hierarchy, log why each cannot retire. Ordinary runs install nothing.
+#[allow(clippy::type_complexity)]
 pub(in crate::streaming) fn log_terrain_retire_blockers(
     batches: LodBatchVisibility,
     current: crate::swap_bridge::CurrentCoverageVisibility,
+    probe: Query<(
+        Option<&Mesh3d>,
+        Option<&crate::swap_bridge::SwapDrawReceipt>,
+        Has<crate::swap_bridge::SwapWaiting>,
+        Has<crate::swap_bridge::SwapPrepared>,
+        Has<crate::swap_bridge::SwapDrawn>,
+        Has<crate::swap_bridge::SwapInCameraView>,
+        Option<&Visibility>,
+        Option<&InheritedVisibility>,
+        Option<&ViewVisibility>,
+    )>,
     mut frames: Local<u32>,
 ) {
     *frames = frames.wrapping_add(1);
     if (*frames).is_multiple_of(300) && batches.pending_count() != 0 {
-        info!(
-            blockers = ?batches.retire_blockers(&current),
-            "terrain batches awaiting source retirement"
-        );
+        let blockers = batches.retire_blockers(&current);
+        // Why a batch a camera sees has no draw receipt for its current mesh: the bridge's
+        // markers and the batch's own visibility, one line per batch.
+        for (entity, mesh) in &blockers.viewed_undrawn {
+            let Ok((
+                mesh3d,
+                receipt,
+                waiting,
+                prepared,
+                drawn,
+                in_view,
+                visibility,
+                inherited,
+                view,
+            )) = probe.get(*entity)
+            else {
+                info!(?entity, "viewed undrawn terrain batch is gone");
+                continue;
+            };
+            info!(
+                ?entity,
+                mesh_current = mesh3d.is_some_and(|m| m.0.id() == *mesh),
+                receipt_mesh_current = receipt.map(|r| r.mesh == *mesh),
+                waiting,
+                prepared,
+                drawn,
+                in_view,
+                ?visibility,
+                inherited = inherited.map(|v| v.get()),
+                view = view.map(|v| v.get()),
+                "viewed undrawn terrain batch"
+            );
+        }
+        info!(?blockers, "terrain batches awaiting source retirement");
     }
 }
 
@@ -2750,6 +2819,74 @@ mod tests {
         assert!(
             prepare(&mut app, &fixture).is_err(),
             "simulation content cannot be flattened"
+        );
+    }
+
+    #[test]
+    fn an_uploaded_chunk_waiting_for_its_draw_is_not_loading_and_stays_unmarked() {
+        let mut app = test_app();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<LodStreaming>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, update_terrain_lod_visibility);
+        // Cluster terrain owns the cell, so the hand-over waits for a draw of the batch.
+        enable_cluster_fallback(&mut app);
+        app.world_mut().spawn((
+            StreamingCamera,
+            Transform::from_xyz(CELL_SIZE * 0.5, 0.0, -CELL_SIZE * 0.5),
+        ));
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        let prepared = prepare(&mut app, &fixture).unwrap();
+        install_fixture(&mut app, &fixture, prepared);
+        app.world_mut()
+            .resource_mut::<LodStreaming>()
+            .visibility_dirty = true;
+        app.update();
+        let pending = |app: &mut App| {
+            app.world_mut()
+                .run_system_once(|activation: LodBatchActivation| activation.pending_count())
+                .unwrap()
+        };
+        assert_eq!(
+            pending(&mut app),
+            1,
+            "the batch upload is not on the GPU yet"
+        );
+        acknowledge_uploads(&app, fixture.root);
+        assert!(
+            !finalize_initial(&mut app),
+            "no draw yet: the source hierarchy stays"
+        );
+        assert!(
+            app.world()
+                .get::<LodTerrainBatches>(fixture.root)
+                .unwrap()
+                .source_children
+                .is_some()
+        );
+        assert_eq!(
+            pending(&mut app),
+            0,
+            "an uploaded chunk waiting only for its draw is not loading"
+        );
+        // A finalize pass that activates nothing must not mark the batches changed.
+        let before = app
+            .world()
+            .entity(fixture.root)
+            .get_ref::<LodTerrainBatches>()
+            .unwrap()
+            .last_changed();
+        app.world_mut().increment_change_tick();
+        assert!(!finalize_initial(&mut app));
+        assert_eq!(
+            app.world()
+                .entity(fixture.root)
+                .get_ref::<LodTerrainBatches>()
+                .unwrap()
+                .last_changed(),
+            before
         );
     }
 
