@@ -1453,12 +1453,12 @@ pub(crate) mod producer_fixture_tests {
         db.execute("INSERT INTO lod_build VALUES (1, ?1)", ["cd".repeat(32)])
             .unwrap();
         db.execute(
-            "INSERT INTO worldspaces VALUES (?1,'Parent',NULL,0,-32,-32)",
+            "INSERT INTO worldspaces(id,editor_id,parent_world,flags,lod_origin_x,lod_origin_y) VALUES (?1,'Parent',NULL,0,-32,-32)",
             [WORLD],
         )
         .unwrap();
         db.execute(
-            "INSERT INTO worldspaces VALUES (?1,'Child',?2,0,NULL,NULL)",
+            "INSERT INTO worldspaces(id,editor_id,parent_world,flags,lod_origin_x,lod_origin_y) VALUES (?1,'Child',?2,0,NULL,NULL)",
             params![CHILD, WORLD],
         )
         .unwrap();

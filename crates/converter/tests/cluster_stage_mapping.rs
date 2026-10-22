@@ -184,8 +184,8 @@ fn dataset() -> Dataset {
     connection
         .execute_batch(&format!(
             "INSERT INTO lod_build VALUES (1, '{}');
-             INSERT INTO worldspaces VALUES ({WORLD}, 'Tamriel', NULL, 0, -32, -32);
-             INSERT INTO worldspaces VALUES ({CHILD}, 'Child', {WORLD}, 0, NULL, NULL);",
+             INSERT INTO worldspaces(id,editor_id,parent_world,flags,lod_origin_x,lod_origin_y) VALUES ({WORLD}, 'Tamriel', NULL, 0, -32, -32);
+             INSERT INTO worldspaces(id,editor_id,parent_world,flags,lod_origin_x,lod_origin_y) VALUES ({CHILD}, 'Child', {WORLD}, 0, NULL, NULL);",
             CORE.repeat(32)
         ))
         .unwrap();

@@ -5487,18 +5487,27 @@ mod tests {
                 .filter(|line| !line.trim_start().starts_with('#'))
             {
                 let tokens = script_tokens(line);
-                for pair in tokens.windows(2) {
-                    let (option, value) = (pair[0].as_str(), pair[1].as_str());
-                    if !options.contains(&option) || !is_number_literal(value) {
+                for (index, option) in tokens.iter().map(String::as_str).enumerate() {
+                    // `--start-position` is the one option that takes three coordinates.
+                    let arity = if option == "--start-position" { 3 } else { 1 };
+                    let Some(values) = tokens.get(index + 1..index + 1 + arity) else {
+                        continue;
+                    };
+                    if !options.contains(&option)
+                        || !values.iter().all(|value| is_number_literal(value))
+                    {
                         continue;
                     }
-                    match EngineConfig::from_args([option.to_owned(), value.to_owned()]) {
+                    let arguments =
+                        std::iter::once(option.to_owned()).chain(values.iter().cloned());
+                    match EngineConfig::from_args(arguments) {
                         Ok(_) => checked += 1,
                         // A flag that takes no value is followed by the next word.
                         Err(ConfigError::UnexpectedArgument { .. }) => {}
                         Err(error) => panic!(
-                            "{} passes {option} {value}, which the parser refuses: {error}",
-                            path.display()
+                            "{} passes {option} {}, which the parser refuses: {error}",
+                            path.display(),
+                            values.join(" ")
                         ),
                     }
                 }

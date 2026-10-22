@@ -5642,8 +5642,12 @@ mod tests {
             ..Default::default()
         };
         let reused = reusable_manifest(&config, manifest.clone()).unwrap();
+        // A historical combined proof cannot attest authored transform clips, so the mesh is
+        // rebuilt; the texture and script candidates stay eligible.
+        let mut eligible = manifest.entries.clone();
+        eligible.remove("meshes/prior.nif");
         assert_eq!(
-            reused.entries, manifest.entries,
+            reused.entries, eligible,
             "metadata-only adapter identity must preserve eligible asset candidates"
         );
         assert_eq!(reused.schema_version, CONVERTER_SCHEMA_VERSION);

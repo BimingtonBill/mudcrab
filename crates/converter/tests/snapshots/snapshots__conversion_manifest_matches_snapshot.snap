@@ -76,11 +76,11 @@ expression: manifest
   },
   "asset_configuration_hashes": {
     "dds": "1495cf3ec0f02a297c0bf31210e650b2c41df7f8b5e2bdda71f0a65f84b9db65",
-    "nif": "1efcbe41597406d3477c232fd242b3120148ecfa301361214e1ef0d6d5f4cc65",
+    "nif": "902f0ff129fad88532153495f9c18264c8e7beb8be3de135cca953fbdd443bcb",
     "pex": "0d16fa82d1877173478e8277d014f2642b4dab09f7b916b370dff6681b7c3275"
   },
   "complete": true,
-  "configuration_hash": "32ecc67d2c18c73e6a15f3a6ff1c768c466b840d1bd7aeb53f5bc7ac9325218f",
+  "configuration_hash": "4d57a69e67b5dd1a0b65a85e7dac261948be877f6f4b39b9159367efd2d215f3",
   "entries": {
     "meshes/generated.nif": {
       "output": "meshes/generated.glb",

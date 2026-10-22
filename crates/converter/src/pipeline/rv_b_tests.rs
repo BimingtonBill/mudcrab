@@ -292,7 +292,7 @@ async fn reader_switch_reuses_archives_and_assets_but_rebuilds_database_and_cell
     assert!(fixture.output.join("cell_cache_preserved.rkyv").is_file());
 }
 
-/// Known full legacy proofs retain assets; arbitrary metadata hashes cannot replace them.
+/// Known full legacy proofs retain textures and scripts, not meshes; arbitrary metadata hashes cannot replace them.
 #[tokio::test]
 async fn known_legacy_full_hashes_reuse_assets_without_kind_keys() {
     for contract in [
@@ -360,8 +360,10 @@ async fn known_legacy_full_hashes_reuse_assets_without_kind_keys() {
         }
         let report = publish(config.clone()).await;
         let rejected = matches!(contract, "unproven" | "projection-3-nonenglish");
-        assert_eq!(report.converted, if rejected { 5 } else { 0 });
-        assert_eq!(report.cache_hits, if rejected { 1 } else { 6 });
+        // A legacy combined proof cannot attest the authored transform clips a mesh now carries
+        // (`reusable_manifest`), so the one mesh is rebuilt even when the proof is known.
+        assert_eq!(report.converted, if rejected { 5 } else { 1 });
+        assert_eq!(report.cache_hits, if rejected { 1 } else { 5 });
         assert_asset_bytes(&fixture.output, &expected);
         let published = manifest(&fixture.output);
         assert_eq!(published.archives, archive_proof);
@@ -748,13 +750,15 @@ async fn historical_legacy_reader_identity_survives_repeated_metadata_migrations
             original.configuration_hash
         );
         let report = publish(second_config).await;
+        // The mesh is rebuilt because a retained combined proof cannot attest authored transform
+        // clips (`reusable_manifest`); the archive cache is the other rebuilt asset.
         assert_eq!(
-            report.converted, 1,
+            report.converted, 2,
             "metadata retention did not copy the archive cache"
         );
         assert_eq!(
-            report.cache_hits, 5,
-            "original current-producer asset settings remain proven"
+            report.cache_hits, 4,
+            "original current-producer texture and script settings remain proven"
         );
         assert_asset_bytes(&second_output, &expected);
     }

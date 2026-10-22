@@ -2750,7 +2750,7 @@ mod empty_certified_loader_tests {
         db.execute("INSERT INTO lod_build VALUES(1,?1)", ["cd".repeat(32)])
             .unwrap();
         db.execute(
-            "INSERT INTO worldspaces VALUES(112,'Invented',NULL,0,0,0)",
+            "INSERT INTO worldspaces(id,editor_id,parent_world,flags,lod_origin_x,lod_origin_y) VALUES(112,'Invented',NULL,0,0,0)",
             [],
         )
         .unwrap();

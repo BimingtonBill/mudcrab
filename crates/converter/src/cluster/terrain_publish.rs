@@ -368,7 +368,7 @@ mod tests {
         db.execute("INSERT INTO lod_build VALUES (1, ?1)", [CORE])
             .unwrap();
         db.execute(
-            "INSERT INTO worldspaces VALUES (?1,'Invented',NULL,0,?2,?3)",
+            "INSERT INTO worldspaces(id,editor_id,parent_world,flags,lod_origin_x,lod_origin_y) VALUES (?1,'Invented',NULL,0,?2,?3)",
             params![WORLD, ORIGIN[0], ORIGIN[1]],
         )
         .unwrap();
