@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn nested_native_and_cluster_filters_restore_exact_visibility() {
         use bevy::render::view::visibility::RenderVisibleEntitiesClass;
-        let ids: Vec<_> = (1..=3)
+        let mut ids: Vec<_> = (1..=3)
             .map(|id| {
                 (
                     Entity::from_raw_u32(id + 100).unwrap(),
@@ -887,6 +887,8 @@ mod tests {
                 )
             })
             .collect();
+        // Bevy hands the class its CPU list sorted by main entity (opaque Ord, not row order).
+        ids.sort_by_key(|(_, main)| *main);
         let mut class = RenderVisibleEntitiesClass::default();
         class.update_cpu_culled_entities(&ids);
         let raw = class.clone();

@@ -4281,7 +4281,9 @@ mod selection_regressions {
                 hidden = (0..40).filter(|_| next() % 4 == 0).map(main).collect();
             }
             class.prepare_for_new_frame();
-            let pairs: Vec<_> = raw.iter().map(|id| pair(*id)).collect();
+            let mut pairs: Vec<_> = raw.iter().map(|id| pair(*id)).collect();
+            // Sorted by main entity, as Bevy's extraction hands it over.
+            pairs.sort_by_key(|(_, main)| *main);
             class.update_cpu_culled_entities(&pairs);
             filter.apply(&mut class, &hidden);
             let from_scratch: VisibleSet<MainEntity> =

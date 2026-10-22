@@ -1312,9 +1312,14 @@ mod tests {
         visible.classes.insert(
             std::any::TypeId::of::<Mesh3d>(),
             RenderVisibleEntitiesClass {
-                entities_cpu_culling: (1..=7)
-                    .map(|id| (Entity::from_raw_u32(100 + id).unwrap(), main(id)))
-                    .collect(),
+                // Sorted by main entity, as Bevy's extraction hands it over.
+                entities_cpu_culling: {
+                    let mut pairs: Vec<_> = (1..=7)
+                        .map(|id| (Entity::from_raw_u32(100 + id).unwrap(), main(id)))
+                        .collect();
+                    pairs.sort_by_key(|(_, main)| *main);
+                    pairs
+                },
                 ..default()
             },
         );
