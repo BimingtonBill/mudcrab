@@ -443,6 +443,8 @@ struct BuiltFrom {
     identities: Option<std::sync::Arc<HashMap<MainEntity, super::TerrainPrimitiveIdentity>>>,
     batch_entities: HashSet<Entity>,
     counts: [usize; 4],
+    frames: u32,
+    rebuilds: [u32; 4],
 }
 
 fn extract(
@@ -485,16 +487,32 @@ fn extract(
     let surfaces_moved = changes.surfaces_moved(is_terrain);
     let counts = changes.counts();
     drop(watch_span);
-    let unchanged = built
-        .identities
-        .as_ref()
-        .is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &snapshot))
-        && built.counts == counts
-        && !surfaces_moved
-        && changes.terrain.is_empty();
+    let reasons = [
+        !built
+            .identities
+            .as_ref()
+            .is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &snapshot)),
+        built.counts != counts,
+        surfaces_moved,
+        !changes.terrain.is_empty(),
+    ];
     built.identities = Some(std::sync::Arc::clone(&snapshot));
     built.counts = counts;
-    if unchanged {
+    // Rebuilds per trigger, reported every 600 extractions: a settled scene must show none.
+    built.frames += 1;
+    for (count, fired) in built.rebuilds.iter_mut().zip(reasons) {
+        *count += u32::from(fired);
+    }
+    if built.frames == 600 {
+        info!(
+            rebuilds_by_trigger = ?built.rebuilds,
+            triggers = "identity snapshot, input counts, terrain surface change, coverage/batch change",
+            "terrain surface map rebuilds over 600 extractions"
+        );
+        built.frames = 0;
+        built.rebuilds = [0; 4];
+    }
+    if !reasons.contains(&true) {
         return;
     }
     perf_span!("terrain_handoff::extract::rebuild");
