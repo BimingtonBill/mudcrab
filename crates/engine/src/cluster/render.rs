@@ -973,6 +973,12 @@ struct ViewGpu {
     /// Position in `plan_reps` of each representative batch index.
     plan_rep_positions: HashMap<u32, usize>,
     plan_epoch: u64,
+    /// Bumped by every write to what `handoff::batch_ready_with` reads of this view (its draws
+    /// and batch table, memo entries, plan representatives, prepass and shadow pipelines, far
+    /// binding), so a cached readiness can tell it is still exact.
+    pub(super) readiness_revision: u64,
+    /// The view's readiness from the last frame it was computed, with the key it was computed for.
+    pub(super) readiness_cache: Option<(handoff::ReadinessKey, Arc<Vec<bool>>)>,
     /// The `plan_epoch` the prepass phases were last filled for, the items it queued, and which
     /// of the two phases they went to.
     prepass_epoch: Option<u64>,
@@ -1138,6 +1144,7 @@ impl DrawGroups {
         }
         view_gpu.order = Some(order);
         let (draws, table) = self.plan();
+        view_gpu.readiness_revision += 1;
         view_gpu.draws.clear();
         for (group, draw) in draws.into_iter().enumerate() {
             view_gpu.draws.insert(group as u32, draw);
@@ -2605,11 +2612,10 @@ fn queue_cluster_batches(
                         alpha_mask: phase_kind,
                         bindless: material.properties.bindless,
                     };
-                    if let Some(entry) = gpu
-                        .views
-                        .get_mut(&key)
-                        .and_then(|view_gpu| view_gpu.memo.get_mut(index))
+                    if let Some(view_gpu) = gpu.views.get_mut(&key)
+                        && let Some(entry) = view_gpu.memo.get_mut(index)
                     {
+                        view_gpu.readiness_revision += 1;
                         *entry = Some(BatchMemo {
                             properties,
                             asset_id,
@@ -2792,6 +2798,7 @@ fn queue_cluster_batches(
         view_gpu.plan_has_opaque = representatives.iter().any(|ready| !ready.alpha_mask);
         view_gpu.plan_has_alpha_mask = representatives.iter().any(|ready| ready.alpha_mask);
         view_gpu.plan_reps = representatives.clone();
+        view_gpu.readiness_revision += 1;
         view_gpu.plan_rep_positions = representatives
             .iter()
             .enumerate()
@@ -3515,6 +3522,8 @@ fn new_view_gpu(
         plan_reps: Vec::new(),
         plan_rep_positions: HashMap::new(),
         plan_epoch: 0,
+        readiness_revision: 0,
+        readiness_cache: None,
         prepass_epoch: None,
         prepass_items: Vec::new(),
         prepass_groups: std::collections::HashSet::new(),
@@ -3973,6 +3982,7 @@ fn queue_cluster_prepass(
                 alpha_mask_phase.remove(previous);
             }
         }
+        view_gpu.readiness_revision += 1;
         view_gpu.prepass_pipelines = queued
             .iter()
             .map(|(ready, cached)| (ready.index, cached.pipeline))
@@ -4376,6 +4386,7 @@ fn queue_cluster_shadows(
                 groups.groups.len() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            view_gpu.readiness_revision += 1;
             view_gpu.shadow_pipelines = shadow_groups
                 .iter()
                 .map(|group| (group.index, group.pipeline))

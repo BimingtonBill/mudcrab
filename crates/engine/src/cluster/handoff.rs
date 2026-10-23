@@ -2351,6 +2351,10 @@ fn update_domain_visible(
 #[derive(Resource, Default)]
 struct Filters {
     frames: u64,
+    /// `BatchMaterialNow::fingerprint` of every batch, as of the last frame, and a count of the
+    /// frames on which it changed.
+    material_frame: Vec<usize>,
+    materials_revision: u64,
     /// One [`SelectionIndex`] per worldspace a view has selected in.
     indexes: HashMap<Option<u32>, SelectionIndex>,
     /// The current [`SelectionBase`]s, shared by views with the same inputs.
@@ -2377,7 +2381,8 @@ pub(super) struct Selection {
     /// The view's render layers the retired sources were filtered by.
     layers: RenderLayers,
     visible: bevy::platform::collections::HashSet<MainEntity>,
-    readiness: Vec<bool>,
+    /// Shared with the view's readiness cache, so an unchanged readiness compares by pointer.
+    readiness: Arc<Vec<bool>>,
     stock_materials: HashMap<MainEntity, Option<bevy::asset::UntypedAssetId>>,
     mask: super::super::instance_mask::InstanceMask,
     hidden: bevy::platform::collections::HashSet<MainEntity>,
@@ -2701,14 +2706,60 @@ type ReadinessDependencies<'a> = (
     Option<&'a crate::far_terrain_shadows::render::State>,
 );
 
-/// Each batch's prepared material when it is current for the batch (its slab bound, its slot
-/// the one the batch was built with): the part of readiness no view changes, so a frame looks it
-/// up once for all its views.
+/// What readiness reads of one batch that no view changes: its prepared material when that is
+/// current for the batch (its slab bound, its slot the one the batch was built with), and whether
+/// a shadow view may draw it with that material.
+#[derive(Clone, Copy)]
+struct BatchMaterialNow<'a> {
+    material: &'a PreparedMaterial,
+    shadow_ok: bool,
+}
+
+impl BatchMaterialNow<'_> {
+    /// The material's identity and the shadow check in one word (prepared materials are at least
+    /// 2-aligned, so the low bit is free); 0 for a batch with no current material.
+    fn fingerprint(this: Option<Self>) -> usize {
+        this.map_or(0, |now| {
+            std::ptr::from_ref(now.material) as usize | usize::from(now.shadow_ok)
+        })
+    }
+}
+
+/// The inputs a view's batch readiness was computed from. Equal keys mean an equal result: every
+/// view fact `batch_ready_with` reads moves `ViewGpu::readiness_revision`, every batch fact moves
+/// `materials` (this frame's material table differs from the last) or the batch materials'
+/// asset-event version, and pipeline compilation is counted per view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReadinessKey {
+    materials: u64,
+    material_events: u64,
+    generation: u64,
+    layout: u64,
+    batches: usize,
+    view: u64,
+    pipelines_ready: usize,
+    far_current: bool,
+    shadow: bool,
+    prepass: bool,
+}
+
+/// How many of the pipelines a view's readiness can name are compiled. The set itself is part of
+/// `ViewGpu::readiness_revision`; this catches one finishing compilation.
+fn view_pipelines_ready(view: &ViewGpu, cache: &PipelineCache) -> usize {
+    view.plan_reps
+        .iter()
+        .map(|rep| rep.pipeline)
+        .chain(view.shadow_pipelines.values().copied())
+        .chain(view.prepass_pipelines.values().copied())
+        .filter(|pipeline| cache.get_render_pipeline(*pipeline).is_some())
+        .count()
+}
+
 fn batch_materials_now<'a>(
     gpu: &ClusterGpu,
     materials: &'a ErasedRenderAssets<PreparedMaterial>,
     allocators: &MaterialBindGroupAllocators,
-) -> Vec<Option<&'a PreparedMaterial>> {
+) -> Vec<Option<BatchMaterialNow<'a>>> {
     // Sequential: the pool's tasks cannot hold borrows of the render world's assets.
     (0..gpu.batches.len())
         .map(|batch| batch_material(gpu, batch, materials, allocators))
@@ -2722,12 +2773,10 @@ fn views_batch_readiness(
     view: &ViewGpu,
     shadow: bool,
     prepass: bool,
-    current: &[Option<&PreparedMaterial>],
+    current: &[Option<BatchMaterialNow>],
     cache: &PipelineCache,
-    far_state: Option<&crate::far_terrain_shadows::render::State>,
+    far_current: bool,
 ) -> Vec<bool> {
-    // Whether the view's far binding is current is one fact per view, not per batch.
-    let far_current = !shadow && super::far::current(gpu, view, far_state);
     par_batches(gpu.batches.len(), |batch| {
         batch_ready_with(
             gpu,
@@ -2769,7 +2818,7 @@ fn batch_material<'a>(
     batch: usize,
     materials: &'a ErasedRenderAssets<PreparedMaterial>,
     allocators: &MaterialBindGroupAllocators,
-) -> Option<&'a PreparedMaterial> {
+) -> Option<BatchMaterialNow<'a>> {
     let asset = gpu.batches[batch].material?;
     let material = materials.get(asset)?;
     if allocators
@@ -2780,7 +2829,23 @@ fn batch_material<'a>(
         return None;
     }
     // A slot/group rewrite or a hot-reloaded specialization cannot inherit an old plan.
-    (gpu.batches[batch].material_slot == Some(u32::from(material.binding.slot))).then_some(material)
+    if gpu.batches[batch].material_slot != Some(u32::from(material.binding.slot)) {
+        return None;
+    }
+    let shadow_ok = material.properties.shadows_enabled
+        && match (material.properties.alpha_mode, &gpu.batches[batch].cutout) {
+            (AlphaMode::Opaque, None) => true,
+            (AlphaMode::Mask(_), Some(cutout)) => {
+                cutout.asset == asset
+                    && cutout.material_group == material.binding.group.0
+                    && cutout.material_key == material.properties.material_key
+            }
+            _ => false,
+        };
+    Some(BatchMaterialNow {
+        material,
+        shadow_ok,
+    })
 }
 
 fn batch_ready(
@@ -2809,7 +2874,7 @@ fn batch_ready_with(
     gpu: &ClusterGpu,
     view: &ViewGpu,
     batch: usize,
-    material: Option<&PreparedMaterial>,
+    material: Option<BatchMaterialNow>,
     far_current: impl FnOnce() -> bool,
     shadow: bool,
     prepass: bool,
@@ -2821,7 +2886,14 @@ fn batch_ready_with(
     let Some(draw) = view.draws.get(&group) else {
         return false;
     };
-    let (Some(material), Some(asset)) = (material, gpu.batches[batch].material) else {
+    let (
+        Some(BatchMaterialNow {
+            material,
+            shadow_ok,
+        }),
+        Some(asset),
+    ) = (material, gpu.batches[batch].material)
+    else {
         return false;
     };
     if !shadow
@@ -2836,16 +2908,8 @@ fn batch_ready_with(
         return false;
     }
     if shadow {
-        if !material.properties.shadows_enabled {
+        if !shadow_ok {
             return false;
-        }
-        match (material.properties.alpha_mode, &gpu.batches[batch].cutout) {
-            (AlphaMode::Opaque, None) => {}
-            (AlphaMode::Mask(_), Some(cutout))
-                if cutout.asset == asset
-                    && cutout.material_group == material.binding.group.0
-                    && cutout.material_key == material.properties.material_key => {}
-            _ => return false,
         }
         return view
             .shadow_pipelines
@@ -3488,9 +3552,10 @@ fn select_instances(
     mut shadows: Query<&mut RenderShadowMapVisibleEntities>,
     scene: Option<Res<ClusterScene>>,
     mut filters: ResMut<Filters>,
-    (native, settings, runtime_state, mut terrain_coverage, dirty): (
+    (native, settings, batch_materials, runtime_state, mut terrain_coverage, dirty): (
         Option<Res<crate::streaming::native_lod::FarNativePolicy>>,
         Option<Res<ClusterSettings>>,
+        Option<Res<super::ClusterBatchMaterials>>,
         Option<Res<super::super::runtime_state::RuntimeReferenceState>>,
         ResMut<crate::streaming::terrain_handoff::ClusterCoverage>,
         Option<Res<bevy::render::camera::DirtySpecializations>>,
@@ -3565,6 +3630,20 @@ fn select_instances(
         perf_span!("cluster::select::materials");
         batch_materials_now(&gpu, &materials, &allocators)
     };
+    // The table is rebuilt every frame (a bindless slab can lose its bind group with no event of
+    // its own); the views' cached readiness only needs to know whether it differs from the last.
+    if current_materials.len() != filters.material_frame.len()
+        || current_materials
+            .iter()
+            .zip(&filters.material_frame)
+            .any(|(now, last)| BatchMaterialNow::fingerprint(*now) != *last)
+    {
+        filters.material_frame = current_materials
+            .iter()
+            .map(|now| BatchMaterialNow::fingerprint(*now))
+            .collect();
+        filters.materials_revision += 1;
+    }
     // The views whose selection this frame rebuilt; only their masks can have changed.
     let mut rebuilt = HashSet::new();
     let mut covered_views = HashSet::new();
@@ -3584,15 +3663,58 @@ fn select_instances(
                 && settings.as_ref().is_none_or(|settings| settings.prepass);
             let layers: &RenderLayers = &layers_by_view[key];
             let readiness_span = ::bevy::log::info_span!("cluster::select::readiness").entered();
-            let readiness = views_batch_readiness(
-                &gpu,
-                &gpu.views[key],
+            let view_gpu = &gpu.views[key];
+            // Whether the view's far binding is current is one fact per view, not per batch.
+            let far_current = !shadow && super::far::current(&gpu, view_gpu, far_state.as_deref());
+            let readiness_key = ReadinessKey {
+                materials: filters.materials_revision,
+                material_events: batch_materials
+                    .as_ref()
+                    .map_or(0, |materials| materials.version),
+                generation: gpu.generation,
+                layout: gpu.layout_epoch,
+                batches: gpu.batches.len(),
+                view: view_gpu.readiness_revision,
+                pipelines_ready: view_pipelines_ready(view_gpu, &cache),
+                far_current,
                 shadow,
                 prepass,
-                &current_materials,
-                &cache,
-                far_state.as_deref(),
-            );
+            };
+            let readiness = match &view_gpu.readiness_cache {
+                Some((cached, readiness)) if *cached == readiness_key => {
+                    // Every test run proves the key names every input.
+                    #[cfg(debug_assertions)]
+                    assert_eq!(
+                        **readiness,
+                        views_batch_readiness(
+                            &gpu,
+                            view_gpu,
+                            shadow,
+                            prepass,
+                            &current_materials,
+                            &cache,
+                            far_current,
+                        ),
+                        "cluster readiness changed under an unchanged key {readiness_key:?}"
+                    );
+                    readiness.clone()
+                }
+                _ => {
+                    crate::work_counters::record("cluster_select/readiness");
+                    let readiness = Arc::new(views_batch_readiness(
+                        &gpu,
+                        view_gpu,
+                        shadow,
+                        prepass,
+                        &current_materials,
+                        &cache,
+                        far_current,
+                    ));
+                    gpu.views.get_mut(key).unwrap().readiness_cache =
+                        Some((readiness_key, readiness.clone()));
+                    readiness
+                }
+            };
             drop(readiness_span);
             let stamp = [
                 sources.version,
@@ -4063,7 +4185,9 @@ impl Selection {
     ) -> bool {
         self.stamp == stamp
             && self.visible == *visible
-            && self.readiness == readiness
+            // The view's cached readiness is shared, so an unchanged one is the same slice.
+            && (std::ptr::eq(self.readiness.as_slice(), readiness)
+                || self.readiness.as_slice() == readiness)
             && self.stock_materials == *stock_materials
     }
 }
@@ -4490,7 +4614,7 @@ mod selection_regressions {
             stamp: [7, 11, 13, 17, 1, 0, 0],
             layers: RenderLayers::default(),
             visible: visible(ids),
-            readiness: vec![true],
+            readiness: Arc::new(vec![true]),
             stock_materials: ids.iter().map(|id| (main(*id), None)).collect(),
             mask: super::super::super::instance_mask::InstanceMask::new(capacity),
             hidden: VisibleSet::default(),

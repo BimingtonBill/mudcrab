@@ -55,6 +55,7 @@ pub(super) fn refresh(
     {
         let view = gpu.views.get_mut(&key).unwrap();
         if view.far.take().is_some() {
+            view.readiness_revision += 1;
             view.terrain_clip_inputs = None;
         }
         return;
@@ -93,6 +94,7 @@ pub(super) fn refresh(
     );
     let view = gpu.views.get_mut(&key).unwrap();
     view.terrain_clip_inputs = None;
+    view.readiness_revision += 1;
     view.far = Some(Binding {
         key,
         prepared,
