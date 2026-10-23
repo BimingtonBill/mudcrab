@@ -605,6 +605,7 @@ fn spawn_render_mesh(
 pub(crate) struct LodBatchActivation<'w, 's> {
     chunks: Query<'w, 's, (Entity, &'static LodTerrainBatches)>,
     roots: Query<'w, 's, &'static super::LodChunkRoot>,
+    views: Query<'w, 's, &'static ViewVisibility>,
     readiness: Option<Res<'w, TerrainMeshUploadReadiness>>,
     config: Option<Res<'w, crate::config::EngineConfig>>,
     cluster_terrain: Option<Res<'w, crate::cluster::terrain::ClusterTerrain>>,
@@ -616,6 +617,7 @@ impl LodBatchActivation<'_, '_> {
         pending_chunks(
             self.chunks.iter(),
             &self.roots,
+            &self.views,
             self.readiness.as_deref(),
             self.config.as_deref(),
             self.cluster_terrain.as_deref(),
@@ -628,6 +630,7 @@ impl LodBatchActivation<'_, '_> {
 fn pending_chunks<'a>(
     chunks: impl Iterator<Item = (Entity, &'a LodTerrainBatches)> + Clone,
     roots: &Query<&super::LodChunkRoot>,
+    views: &Query<&ViewVisibility>,
     readiness: Option<&TerrainMeshUploadReadiness>,
     config: Option<&crate::config::EngineConfig>,
     cluster_terrain: Option<&crate::cluster::terrain::ClusterTerrain>,
@@ -642,22 +645,26 @@ fn pending_chunks<'a>(
     chunks
         .filter(|(entity, chunk)| {
             let world = roots.get(*entity).ok().map(|root| root.key.worldspace_id);
-            still_loading(chunk, world, &fallback_cells, readiness)
+            still_loading(chunk, world, &fallback_cells, readiness, |entity| {
+                views.get(entity).is_ok_and(|view| view.get())
+            })
         })
         .count()
 }
 
 /// Whether a chunk still holding its source hierarchy is loading work the world-ready check waits
-/// for. It is, until the only thing left is a camera drawing one of its cluster-owned batches: a
-/// chunk seen only by a shadow view keeps its source until the camera turns to it, which can
-/// take as long as the camera stays still, so that wait is settled. Every other step (uploads,
-/// source proofs, the hand-over itself) finishes on its own and counts as loading; with cluster
-/// terrain off no batch is owned, so every chunk counts until it hands over.
+/// for. It is, until the only thing left is a camera drawing one of its cluster-owned batches
+/// that some view sees: a chunk seen only by a shadow view keeps its source until the camera
+/// turns to it, which can take as long as the camera stays still, so that wait is settled. Every
+/// other step (uploads, source proofs, the hand-over of a batch no view sees) finishes on its own
+/// and counts as loading; with cluster terrain off no batch is owned, so every chunk counts until
+/// it hands over.
 fn still_loading(
     chunk: &LodTerrainBatches,
     world: Option<u32>,
     fallback_cells: &HashSet<(u32, IVec2)>,
     readiness: Option<&TerrainMeshUploadReadiness>,
+    viewed: impl Fn(Entity) -> bool,
 ) -> bool {
     if chunk.source_children.is_none() {
         return false;
@@ -665,16 +672,17 @@ fn still_loading(
     let Some(readiness) = readiness else {
         return true;
     };
-    let waits_only_for_draw =
-        chunk.batches.iter().any(|batch| {
-            owned_source_mask(batch, world, fallback_cells) != 0 && !batch.pending_upload
-        }) && chunk.batches.iter().all(|batch| {
-            batch.selected == 0 || !batch.pending_upload || readiness.is_ready(batch.mesh.id())
-        }) && chunk
-            .batches
-            .iter()
-            .flat_map(|batch| &batch.members)
-            .all(|member| readiness.is_ready(member.source.id()));
+    let waits_only_for_draw = chunk.batches.iter().any(|batch| {
+        owned_source_mask(batch, world, fallback_cells) != 0
+            && !batch.pending_upload
+            && viewed(batch.entity)
+    }) && chunk.batches.iter().all(|batch| {
+        batch.selected == 0 || !batch.pending_upload || readiness.is_ready(batch.mesh.id())
+    }) && chunk
+        .batches
+        .iter()
+        .flat_map(|batch| &batch.members)
+        .all(|member| readiness.is_ready(member.source.id()));
     !waits_only_for_draw
 }
 
@@ -726,6 +734,7 @@ struct RetireBlockers {
 
 #[derive(SystemParam)]
 pub(crate) struct LodBatchVisibility<'w, 's> {
+    views: Query<'w, 's, &'static ViewVisibility>,
     config: Option<Res<'w, crate::config::EngineConfig>>,
     cluster_terrain: Option<Res<'w, crate::cluster::terrain::ClusterTerrain>>,
     chunks: Query<
@@ -879,6 +888,7 @@ impl LodBatchVisibility<'_, '_> {
         pending_chunks(
             self.chunks.iter().map(|(entity, chunk, _)| (entity, chunk)),
             &self.roots,
+            &self.views,
             self.readiness.as_deref(),
             self.config.as_deref(),
             self.cluster_terrain.as_deref(),
@@ -3060,6 +3070,20 @@ mod tests {
                 .source_children
                 .is_some()
         );
+        assert_eq!(
+            pending(&mut app),
+            1,
+            "an owned batch no view sees hands over unviewed by itself: still loading"
+        );
+        let batch_entity = app
+            .world()
+            .get::<LodTerrainBatches>(fixture.root)
+            .unwrap()
+            .batches[0]
+            .entity;
+        app.world_mut()
+            .entity_mut(batch_entity)
+            .insert(ViewVisibility::VISIBLE);
         assert_eq!(
             pending(&mut app),
             0,
