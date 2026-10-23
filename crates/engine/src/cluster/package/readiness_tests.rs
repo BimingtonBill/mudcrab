@@ -59,6 +59,7 @@ fn install_batch(app: &mut App, batch: LazyBatch, in_flight: bool) {
         in_flight: if in_flight { vec![0] } else { Vec::new() },
         pending_snow: Vec::new(),
         failed: Vec::new(),
+        demanded: default(),
     });
 }
 
@@ -586,4 +587,76 @@ fn cached_scene_dependency_failure_retries_once_and_keeps_terminal_failure_expli
             "a terminal failure must not start an automatic reload loop"
         );
     }
+}
+
+#[test]
+fn demanded_batch_with_no_view_is_requested_and_holds_readiness() {
+    let mut app = app();
+    install_batch(&mut app, batch(), false);
+    load(&mut app);
+    assert_eq!(pending(&app), 0, "no view wants the batch on its own");
+    assert!(!app.world().resource::<LazyBatches>().requested(0));
+    assert_eq!(
+        app.world_mut().resource_mut::<LazyBatches>().demand(0),
+        Some(BatchDemand::Queued)
+    );
+    load(&mut app);
+    let lazy = app.world().resource::<LazyBatches>();
+    assert!(
+        lazy.requested(0),
+        "an ownership demand must not wait for a view"
+    );
+    assert_eq!(lazy.in_flight, [0]);
+    assert!(lazy.demanded.is_empty(), "a taken batch leaves the demand");
+    assert_eq!(pending(&app), 1, "the demanded batch holds readiness");
+    assert_eq!(
+        app.world_mut().resource_mut::<LazyBatches>().demand(0),
+        Some(BatchDemand::Underway)
+    );
+}
+
+#[test]
+fn demand_after_an_unchanged_view_scan_is_not_skipped_by_the_scan_cache() {
+    let mut app = app();
+    // An instance no view's world matches: views never request it on their own.
+    let mut unseen = batch();
+    unseen.spheres[0].world = LazyWorld::Unknown;
+    install_batch(&mut app, unseen, false);
+    app.world_mut().spawn((
+        Camera3d::default(),
+        Camera::default(),
+        bevy::camera::primitives::Frustum::default(),
+        GlobalTransform::IDENTITY,
+    ));
+    app.add_systems(Update, load_batches_in_view);
+    for _ in 0..3 {
+        app.update();
+    }
+    assert!(
+        !app.world().resource::<LazyBatches>().requested(0),
+        "no view requests a batch whose instance it cannot see"
+    );
+    assert_eq!(
+        app.world_mut().resource_mut::<LazyBatches>().demand(0),
+        Some(BatchDemand::Queued)
+    );
+    app.update();
+    assert!(app.world().resource::<LazyBatches>().requested(0));
+    assert_eq!(pending(&app), 1);
+}
+
+#[test]
+fn failed_batch_reports_its_terminal_state_to_demand() {
+    let mut app = app();
+    install_batch(&mut app, batch(), false);
+    {
+        let mut lazy = app.world_mut().resource_mut::<LazyBatches>();
+        lazy.unrequested.clear();
+        lazy.batches[0].requested = true;
+        lazy.failed.push(0);
+    }
+    let mut lazy = app.world_mut().resource_mut::<LazyBatches>();
+    assert_eq!(lazy.demand(0), Some(BatchDemand::Failed));
+    assert_eq!(lazy.demand(1), None);
+    assert!(lazy.demanded.is_empty());
 }

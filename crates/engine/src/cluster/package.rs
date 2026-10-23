@@ -317,6 +317,11 @@ impl Plugin for ClusterPackagePlugin {
                     load_batches_in_view
                         .after(load_cluster_package)
                         .run_if(resource_exists::<LazyBatches>),
+                    // Only with `--cluster-own-statics`, which installs the demand resource.
+                    super::ownership::demand_owned_batches
+                        .after(load_cluster_package)
+                        .before(load_batches_in_view)
+                        .run_if(super::ownership::batch_demand_pending),
                     // After the loader, which sets the pending count this adds to.
                     count_blocks_not_resident.after(load_batches_in_view),
                     promote_snow_sources
@@ -954,6 +959,7 @@ fn load_cluster_package(
         in_flight: Vec::new(),
         failed: Vec::new(),
         pending_snow: Vec::new(),
+        demanded: default(),
     });
     info!(
         meshes = scene_meshes.len(),
@@ -1356,6 +1362,21 @@ pub(super) struct LazyBatches {
     failed: Vec<usize>,
     /// Snow batches waiting for their base material.
     pending_snow: Vec<PendingSnow>,
+    /// Unrequested batches wanted regardless of the views: a stock reference held for its
+    /// one-time ownership decision is decided by them (`--cluster-own-statics`), wherever the
+    /// camera looks. A subset of `unrequested`; empty without that option.
+    demanded: std::collections::BTreeSet<usize>,
+}
+
+/// What [`LazyBatches::demand`] found for one batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BatchDemand {
+    /// The batch was neither requested nor demanded; the loader now requests it.
+    Queued,
+    /// Already requested (loading or loaded) or already demanded.
+    Underway,
+    /// Its source or material failed terminally; demanding it again changes nothing.
+    Failed,
 }
 
 fn next_layout_scope() -> u64 {
@@ -1396,7 +1417,75 @@ impl LazyBatches {
             in_flight: vec![0],
             failed: Vec::new(),
             pending_snow: Vec::new(),
+            demanded: default(),
         }
+    }
+
+    /// Unrequested batches with no instance in view, for ownership demand tests outside this
+    /// module. Each batch's only instance sits at `center`.
+    #[cfg(test)]
+    pub(crate) fn unrequested_for_test(count: usize, center: Vec3) -> Self {
+        Self {
+            layout_scope: next_layout_scope(),
+            batches: (0..count)
+                .map(|index| LazyBatch {
+                    primitive: 0,
+                    key: BatchKey {
+                        model_path: format!("demand-fixture-{index}.glb"),
+                        material_index: None,
+                        scale_inverted: false,
+                        snow_static: 0,
+                    },
+                    coverage: None,
+                    spheres: vec![LazySphere {
+                        center,
+                        radius: 1.0,
+                        world: LazyWorld::Fixture,
+                    }],
+                    bounds: (center, 1.0),
+                    scene: None,
+                    source_reload_from: None,
+                    loading: None,
+                    requested: false,
+                    requested_at: 0.0,
+                    reported: false,
+                })
+                .collect(),
+            assets_dir: PathBuf::new(),
+            native_by_model: HashMap::new(),
+            scenes: HashMap::new(),
+            retried_sources: default(),
+            prefetch_in_flight: Vec::new(),
+            unrequested: (0..count).collect(),
+            in_flight: Vec::new(),
+            failed: Vec::new(),
+            pending_snow: Vec::new(),
+            demanded: default(),
+        }
+    }
+
+    /// Wants `batch` loaded whether or not any view sees it. Requests made this way take their
+    /// turn after the batches in view, under the same file-load limit, and hold readiness like
+    /// them. `None` for an index outside the package.
+    pub(super) fn demand(&mut self, batch: u32) -> Option<BatchDemand> {
+        let index = batch as usize;
+        let entry = self.batches.get(index)?;
+        if self.failed.contains(&index) {
+            return Some(BatchDemand::Failed);
+        }
+        if entry.requested || self.unrequested.binary_search(&index).is_err() {
+            return Some(BatchDemand::Underway);
+        }
+        Some(if self.demanded.insert(index) {
+            BatchDemand::Queued
+        } else {
+            BatchDemand::Underway
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn requested(&self, batch: usize) -> bool {
+        self.batches[batch].requested
     }
 
     fn prefetch_only_in_flight(&self) -> usize {
@@ -1683,7 +1772,9 @@ fn load_batches_in_view(
     // all of them, and nothing the views or a crossing's destination proof depend on changes
     // under them during play. The scan cache must not stop the requests while any are left.
     let preload = preload.is_some();
+    // A demanded batch is wanted under an unchanged view too: it never waits for one.
     let unchanged = !(preload && !lazy.unrequested.is_empty())
+        && lazy.demanded.is_empty()
         && scan.valid
         && scan.offset == offset
         && scan.counts == counts
@@ -1760,7 +1851,8 @@ fn load_batches_in_view(
         }
         if nearest.is_finite() {
             candidates.push((nearest, index));
-        } else if preload {
+        } else if preload || lazy.demanded.contains(&index) {
+            // After every batch in view, in index order (the sort is stable).
             candidates.push((f32::MAX, index));
         }
     }
@@ -1841,6 +1933,9 @@ fn load_batches_in_view(
     }
     scan.waiting = wanted - taken.len();
     if !taken.is_empty() {
+        for index in &taken {
+            lazy.demanded.remove(index);
+        }
         lazy.unrequested.retain(|index| !taken.contains(index));
         lazy.in_flight.extend(taken);
     }
