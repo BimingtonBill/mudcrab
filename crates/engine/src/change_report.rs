@@ -37,6 +37,8 @@ struct ChangeWindow {
     changed: HashMap<ComponentId, u64>,
     /// Per component type: frames of the window in which at least one entity changed.
     frames_changed: HashMap<ComponentId, u32>,
+    /// Per component type: one entity it changed on this window, to name its owner.
+    sample: HashMap<ComponentId, Entity>,
     /// Entities that gained a `Name`, by name with its digits masked: what keeps being spawned.
     named: HashMap<String, u64>,
 }
@@ -47,9 +49,10 @@ fn report_changes(world: &mut World, mut window: Local<ChangeWindow>) {
         return;
     };
     let changed = changed_this_frame(world, last_scan, this_scan);
-    for (&id, &count) in &changed {
+    for (&id, &(count, entity)) in &changed {
         *window.changed.entry(id).or_default() += count;
         *window.frames_changed.entry(id).or_default() += 1;
+        window.sample.insert(id, entity);
     }
     let mut names = world.query::<Ref<Name>>();
     for name in names.iter(world) {
@@ -64,28 +67,67 @@ fn report_changes(world: &mut World, mut window: Local<ChangeWindow>) {
     let mut busiest: Vec<_> = window.changed.iter().map(|(&id, &n)| (id, n)).collect();
     busiest.sort_unstable_by_key(|(_, total)| std::cmp::Reverse(*total));
     let components = world.components();
+    let registry = world.get_resource::<AppTypeRegistry>().map(|r| r.read());
+    let describe_type = |id: ComponentId| -> String {
+        let info = components.get_info(id);
+        info.and_then(|info| info.type_id())
+            .zip(registry.as_ref())
+            .and_then(|(type_id, registry)| registry.get(type_id))
+            .map(|registration| {
+                registration
+                    .type_info()
+                    .type_path_table()
+                    .short_path()
+                    .to_owned()
+            })
+            .or_else(|| info.map(|info| info.name().shortname().to_string()))
+            .unwrap_or_else(|| format!("{id:?}"))
+    };
     // Release builds strip Bevy's component names (its `debug` feature); the reflection registry
     // keeps the type path of every registered type, so it names most components there.
-    let registry = world.get_resource::<AppTypeRegistry>().map(|r| r.read());
+    // The owner of a sample entity: its name, or its parent's, and its other reflected
+    // components, so even an unnamed component type says whose it is.
+    let owner = |entity: Entity| -> String {
+        let named = world
+            .get::<Name>(entity)
+            .map(|name| name.as_str().to_owned())
+            .or_else(|| {
+                world
+                    .get::<ChildOf>(entity)
+                    .and_then(|parent| world.get::<Name>(parent.parent()))
+                    .map(|name| format!("child of {name}"))
+            })
+            .unwrap_or_else(|| "unnamed".to_owned());
+        let kinds: Vec<String> = world
+            .inspect_entity(entity)
+            .map(|infos| {
+                infos
+                    .filter(|info| {
+                        info.type_id()
+                            .zip(registry.as_ref())
+                            .is_some_and(|(type_id, registry)| registry.get(type_id).is_some())
+                    })
+                    .take(10)
+                    .map(|info| describe_type(info.id()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        format!("{entity:?} {named} [{}]", kinds.join(", "))
+    };
     let lines: Vec<String> = busiest
         .iter()
         .take(TOP)
         .map(|(id, total)| {
-            let info = components.get_info(*id);
-            let reflected = info
-                .and_then(|info| info.type_id())
-                .zip(registry.as_ref())
-                .and_then(|(type_id, registry)| registry.get(type_id))
-                .map(|registration| registration.type_info().type_path_table().short_path());
-            let name = reflected
-                .map(str::to_owned)
-                .or_else(|| info.map(|info| info.name().shortname().to_string()))
-                .unwrap_or_else(|| format!("{id:?}"));
             format!(
-                "{name}: {:.1} entities/frame, changed in {} of {} frames",
+                "{}: {:.1} entities/frame, changed in {} of {} frames, e.g. {}",
+                describe_type(*id),
                 *total as f64 / f64::from(window.frames),
                 window.frames_changed.get(id).copied().unwrap_or(0),
-                window.frames
+                window.frames,
+                window
+                    .sample
+                    .get(id)
+                    .map_or_else(|| "-".to_owned(), |entity| owner(*entity))
             )
         })
         .collect();
@@ -117,6 +159,7 @@ fn report_changes(world: &mut World, mut window: Local<ChangeWindow>) {
     window.changed.clear();
     window.frames_changed.clear();
     window.named.clear();
+    window.sample.clear();
 }
 
 /// A name with every run of digits replaced by `#`, so "LOD terrain batch 12,7" and
@@ -140,9 +183,9 @@ fn changed_this_frame(
     world: &World,
     last_scan: bevy::ecs::change_detection::Tick,
     this_scan: bevy::ecs::change_detection::Tick,
-) -> HashMap<ComponentId, u64> {
+) -> HashMap<ComponentId, (u64, Entity)> {
     let storages = world.storages();
-    let mut changed: HashMap<ComponentId, u64> = HashMap::new();
+    let mut changed: HashMap<ComponentId, (u64, Entity)> = HashMap::new();
     let mut tables: HashSet<usize> = HashSet::new();
     for archetype in world.archetypes().iter() {
         if archetype.is_empty() {
@@ -158,12 +201,17 @@ fn changed_this_frame(
                 };
                 // SAFETY: this exclusive system holds the world, so no system writes a tick while
                 // it is read; each cell is read by value and no reference escapes.
-                let count = ticks
-                    .iter()
-                    .filter(|tick| unsafe { *tick.get() }.is_newer_than(last_scan, this_scan))
-                    .count();
-                if count != 0 {
-                    *changed.entry(id).or_default() += count as u64;
+                let mut first = None;
+                let mut count = 0u64;
+                for (row, tick) in ticks.iter().enumerate() {
+                    if unsafe { *tick.get() }.is_newer_than(last_scan, this_scan) {
+                        first.get_or_insert(row);
+                        count += 1;
+                    }
+                }
+                if let Some(row) = first {
+                    let entity = table.entities()[row];
+                    changed.entry(id).or_insert((0, entity)).0 += count;
                 }
             }
         }
@@ -171,15 +219,15 @@ fn changed_this_frame(
             let Some(set) = storages.sparse_sets.get(id) else {
                 continue;
             };
-            let count = archetype
-                .entities()
-                .iter()
-                .filter_map(|entity| set.get_changed_tick(entity.id()))
+            for entity in archetype.entities() {
+                let entity = entity.id();
                 // SAFETY: as above, the world is held exclusively and the tick is read by value.
-                .filter(|tick| unsafe { *tick.get() }.is_newer_than(last_scan, this_scan))
-                .count();
-            if count != 0 {
-                *changed.entry(id).or_default() += count as u64;
+                if set
+                    .get_changed_tick(entity)
+                    .is_some_and(|tick| unsafe { *tick.get() }.is_newer_than(last_scan, this_scan))
+                {
+                    changed.entry(id).or_insert((0, entity)).0 += 1;
+                }
             }
         }
     }
@@ -232,12 +280,16 @@ mod tests {
         let changed = changed_this_frame(&world, last, now);
         let id = |world: &World, type_id| world.components().get_id(type_id).unwrap();
         assert_eq!(
-            changed.get(&id(&world, std::any::TypeId::of::<Moved>())),
-            Some(&2)
+            changed
+                .get(&id(&world, std::any::TypeId::of::<Moved>()))
+                .map(|(count, _)| *count),
+            Some(2)
         );
         assert_eq!(
-            changed.get(&id(&world, std::any::TypeId::of::<Sparse>())),
-            Some(&1)
+            changed
+                .get(&id(&world, std::any::TypeId::of::<Sparse>()))
+                .map(|(count, sample)| (*count, *sample)),
+            Some((1, entities[3]))
         );
         assert_eq!(
             changed.get(&id(&world, std::any::TypeId::of::<Still>())),
