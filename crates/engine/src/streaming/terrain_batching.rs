@@ -7,6 +7,7 @@
 use super::{TerrainCoverage, TerrainSurfaceReady};
 use crate::terrain_upload::TerrainMeshUploadReadiness;
 use crate::visibility_optimization::StructuralHierarchyNode;
+use bevy::ecs::change_detection::Tick;
 use bevy::{
     animation::AnimatedBy,
     app::{Inherited, Propagate},
@@ -37,6 +38,7 @@ use shared::lod::{LodTier, nodes};
 use std::{
     any::TypeId,
     collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
 const BATCH_SIDE_CELLS: i32 = 2;
@@ -609,6 +611,7 @@ pub(crate) struct LodBatchActivation<'w, 's> {
     readiness: Option<Res<'w, TerrainMeshUploadReadiness>>,
     config: Option<Res<'w, crate::config::EngineConfig>>,
     cluster_terrain: Option<Res<'w, crate::cluster::terrain::ClusterTerrain>>,
+    fallback: Local<'s, std::cell::RefCell<FallbackCellsCache>>,
 }
 
 impl LodBatchActivation<'_, '_> {
@@ -619,10 +622,41 @@ impl LodBatchActivation<'_, '_> {
             &self.roots,
             &self.views,
             self.readiness.as_deref(),
-            self.config.as_deref(),
-            self.cluster_terrain.as_deref(),
+            || cached_fallback_cells(&self.fallback, &self.config, &self.cluster_terrain),
         )
     }
+}
+
+/// The cluster fallback cells, kept until the config or the cluster terrain changes: rebuilding
+/// the set (every cell of every registered block) on each call cost milliseconds per frame while
+/// a chunk waited for its hand-over.
+#[derive(Default)]
+struct FallbackCellsCache {
+    key: Option<(Option<Tick>, Option<Tick>)>,
+    cells: Arc<HashSet<(u32, IVec2)>>,
+}
+
+fn cached_fallback_cells(
+    cache: &std::cell::RefCell<FallbackCellsCache>,
+    config: &Option<Res<crate::config::EngineConfig>>,
+    cluster_terrain: &Option<Res<crate::cluster::terrain::ClusterTerrain>>,
+) -> Arc<HashSet<(u32, IVec2)>> {
+    let key = (
+        config.as_ref().map(|config| config.last_changed()),
+        cluster_terrain
+            .as_ref()
+            .map(|terrain| terrain.last_changed()),
+    );
+    let mut cache = cache.borrow_mut();
+    if cache.key != Some(key) {
+        crate::work_counters::record("terrain_batching/fallback_cells");
+        cache.cells = Arc::new(cluster_fallback_cells(
+            config.as_deref(),
+            cluster_terrain.as_deref(),
+        ));
+        cache.key = Some(key);
+    }
+    Arc::clone(&cache.cells)
 }
 
 /// How many chunks are [`still_loading`]. A settled scene holds no source hierarchy, so the
@@ -632,8 +666,7 @@ fn pending_chunks<'a>(
     roots: &Query<&super::LodChunkRoot>,
     views: &Query<&ViewVisibility>,
     readiness: Option<&TerrainMeshUploadReadiness>,
-    config: Option<&crate::config::EngineConfig>,
-    cluster_terrain: Option<&crate::cluster::terrain::ClusterTerrain>,
+    fallback_cells: impl FnOnce() -> Arc<HashSet<(u32, IVec2)>>,
 ) -> usize {
     if !chunks
         .clone()
@@ -641,7 +674,7 @@ fn pending_chunks<'a>(
     {
         return 0;
     }
-    let fallback_cells = cluster_fallback_cells(config, cluster_terrain);
+    let fallback_cells = fallback_cells();
     chunks
         .filter(|(entity, chunk)| {
             let world = roots.get(*entity).ok().map(|root| root.key.worldspace_id);
@@ -761,11 +794,12 @@ pub(crate) struct LodBatchVisibility<'w, 's> {
     meshes: Option<ResMut<'w, Assets<Mesh>>>,
     commands: Commands<'w, 's>,
     readiness: Option<Res<'w, TerrainMeshUploadReadiness>>,
+    fallback: Local<'s, std::cell::RefCell<FallbackCellsCache>>,
 }
 
 impl LodBatchVisibility<'_, '_> {
-    fn cluster_fallback_cells(&self) -> HashSet<(u32, IVec2)> {
-        cluster_fallback_cells(self.config.as_deref(), self.cluster_terrain.as_deref())
+    fn cluster_fallback_cells(&self) -> Arc<HashSet<(u32, IVec2)>> {
+        cached_fallback_cells(&self.fallback, &self.config, &self.cluster_terrain)
     }
 
     /// Why each chunk still holding its source hierarchy cannot retire, by first failing
@@ -890,8 +924,7 @@ impl LodBatchVisibility<'_, '_> {
             &self.roots,
             &self.views,
             self.readiness.as_deref(),
-            self.config.as_deref(),
-            self.cluster_terrain.as_deref(),
+            || self.cluster_fallback_cells(),
         )
     }
 
@@ -2989,6 +3022,46 @@ mod tests {
             prepare(&mut app, &fixture).is_err(),
             "simulation content cannot be flattened"
         );
+    }
+
+    #[test]
+    fn the_cluster_fallback_cells_are_rebuilt_only_when_their_inputs_change() {
+        let mut app = test_app();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<LodStreaming>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>();
+        enable_cluster_fallback(&mut app);
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        let prepared = prepare(&mut app, &fixture).unwrap();
+        install_fixture(&mut app, &fixture, prepared);
+        app.update();
+        // The same system instance keeps its cache from frame to frame.
+        app.add_systems(Update, |activation: LodBatchActivation| {
+            activation.pending_count();
+        });
+        let builds = || {
+            crate::work_counters::snapshot()
+                .before_ready
+                .get("terrain_batching/fallback_cells")
+                .copied()
+                .unwrap_or(0)
+        };
+        let start = builds();
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(
+            builds() - start,
+            1,
+            "three frames with a chunk waiting build the set once"
+        );
+        app.world_mut()
+            .resource_mut::<crate::cluster::terrain::ClusterTerrain>()
+            .set_changed();
+        app.update();
+        assert_eq!(builds() - start, 2, "a cluster terrain change rebuilds it");
     }
 
     #[test]
