@@ -14,9 +14,13 @@ pub struct ClassFilter {
     previous_hidden: HashSet<MainEntity>,
     active: bool,
     saved: Option<Saved>,
+    #[cfg(test)]
+    replays: usize,
 }
 
 struct Saved {
+    raw_cpu_len: usize,
+    raw_gpu_len: usize,
     cpu: Vec<(usize, Pair)>,
     gpu: Vec<Pair>,
     added: Vec<Pair>,
@@ -31,10 +35,38 @@ impl ClassFilter {
         assert!(!self.active, "visibility filter applied without restore");
         self.active = true;
         if hidden.is_empty() && self.previous_hidden.is_empty() {
+            self.saved = None;
+            return;
+        }
+
+        // Events and lengths reject changed classes cheaply. Slot/key pairs also catch renderer
+        // replacements that the raw visibility collector did not report as membership events.
+        if hidden == &self.previous_hidden
+            && class.added_entities.is_empty()
+            && class.removed_entities.is_empty()
+            && let Some(saved) = &self.saved
+            && class.entities_cpu_culling.len() == saved.raw_cpu_len
+            && class.entities_gpu_culling.len() == saved.raw_gpu_len
+            && saved
+                .cpu
+                .iter()
+                .all(|(slot, pair)| class.entities_cpu_culling.get(*slot) == Some(pair))
+            && saved
+                .gpu
+                .iter()
+                .all(|(render, main)| class.entities_gpu_culling.get(main) == Some(render))
+        {
+            Self::hide(class, saved);
+            #[cfg(test)]
+            {
+                self.replays += 1;
+            }
             return;
         }
 
         let mut saved = Saved {
+            raw_cpu_len: class.entities_cpu_culling.len(),
+            raw_gpu_len: class.entities_gpu_culling.len(),
             cpu: Vec::new(),
             gpu: Vec::new(),
             added: std::mem::take(&mut class.added_entities),
@@ -92,10 +124,22 @@ impl ClassFilter {
         sorted_unique(&mut class.added_entities);
         sorted_unique(&mut class.removed_entities);
 
-        if !cpu_slots.is_empty() {
-            cpu_slots.sort_unstable_by_key(|(slot, _)| *slot);
+        cpu_slots.sort_unstable_by_key(|(slot, _)| *slot);
+        saved.cpu = cpu_slots;
+        for main in &now_hidden {
+            if let Some(render) = class.entities_gpu_culling.get(main) {
+                saved.gpu.push((*render, *main));
+            }
+        }
+        Self::hide(class, &saved);
+        self.previous_hidden = now_hidden;
+        self.saved = Some(saved);
+    }
+
+    fn hide(class: &mut RenderVisibleEntitiesClass, saved: &Saved) {
+        if !saved.cpu.is_empty() {
             let cpu = &mut class.entities_cpu_culling;
-            let mut slots = cpu_slots.iter().map(|(slot, _)| *slot).peekable();
+            let mut slots = saved.cpu.iter().map(|(slot, _)| *slot).peekable();
             let mut kept = 0;
             for read in 0..cpu.len() {
                 if slots.next_if_eq(&read).is_some() {
@@ -105,15 +149,10 @@ impl ClassFilter {
                 kept += 1;
             }
             cpu.truncate(kept);
-            saved.cpu = cpu_slots;
         }
-        for main in &now_hidden {
-            if let Some(render) = class.entities_gpu_culling.remove(main) {
-                saved.gpu.push((render, *main));
-            }
+        for (_, main) in &saved.gpu {
+            class.entities_gpu_culling.remove(main);
         }
-        self.previous_hidden = now_hidden;
-        self.saved = Some(saved);
     }
 
     /// Restore in Cleanup, before next frame's CPU diff/GPU delta collectors.
@@ -121,11 +160,11 @@ impl ClassFilter {
     pub fn restore(&mut self, class: &mut RenderVisibleEntitiesClass) {
         assert!(self.active, "visibility filter restored without apply");
         self.active = false;
-        let Some(mut saved) = self.saved.take() else {
+        let Some(saved) = self.saved.as_mut() else {
             return;
         };
         let _restore_span = ::bevy::log::info_span!("stock_visibility::restore").entered();
-        let saved_cpu = std::mem::take(&mut saved.cpu);
+        let saved_cpu = &saved.cpu;
         if saved_cpu.is_empty() {
             Self::restore_gpu_and_events(class, saved);
             return;
@@ -137,7 +176,7 @@ impl ClassFilter {
         let mut retained = cpu.len();
         let raw_len = retained + saved_cpu.len();
         cpu.resize(raw_len, (Entity::PLACEHOLDER, Entity::PLACEHOLDER.into()));
-        let mut removed = saved_cpu.into_iter().rev().peekable();
+        let mut removed = saved_cpu.iter().rev().peekable();
         for index in (0..raw_len).rev() {
             if removed
                 .peek()
@@ -158,15 +197,15 @@ impl ClassFilter {
         Self::restore_gpu_and_events(class, saved);
     }
 
-    fn restore_gpu_and_events(class: &mut RenderVisibleEntitiesClass, saved: Saved) {
-        for (render, main) in saved.gpu {
+    fn restore_gpu_and_events(class: &mut RenderVisibleEntitiesClass, saved: &mut Saved) {
+        for &(render, main) in &saved.gpu {
             assert!(
                 class.entities_gpu_culling.insert(main, render).is_none(),
                 "filtered GPU entry modified before restore"
             );
         }
-        class.added_entities = saved.added;
-        class.removed_entities = saved.removed;
+        class.added_entities = std::mem::take(&mut saved.added);
+        class.removed_entities = std::mem::take(&mut saved.removed);
     }
 }
 
@@ -239,6 +278,140 @@ mod tests {
         let mut pairs = ids.iter().map(|id| pair(*id)).collect::<Vec<_>>();
         pairs.sort_by_key(|(_, main)| *main);
         class.update_cpu_culled_entities(&pairs);
+    }
+
+    fn assert_class_eq(class: &RenderVisibleEntitiesClass, raw: &RenderVisibleEntitiesClass) {
+        assert_eq!(class.entities_cpu_culling, raw.entities_cpu_culling);
+        assert_eq!(class.entities_gpu_culling, raw.entities_gpu_culling);
+        assert_eq!(class.added_entities, raw.added_entities);
+        assert_eq!(class.removed_entities, raw.removed_entities);
+    }
+
+    #[test]
+    fn settled_replay_preserves_cpu_gpu_events_and_exact_restore() {
+        let mut class = RenderVisibleEntitiesClass::default();
+        cpu_frame(&mut class, &[1, 2, 3]);
+        class.entities_gpu_culling.insert(pair(4).1, pair(4).0);
+        let mut filter = ClassFilter::default();
+        let hidden = hidden(&[2, 4]);
+        filter.apply(&mut class, &hidden);
+        filter.restore(&mut class);
+
+        for round in 1..=2 {
+            class.prepare_for_new_frame();
+            let raw = class.clone();
+            filter.apply(&mut class, &hidden);
+            assert_eq!(filter.replays, round);
+            assert_eq!(class.entities_cpu_culling, ordered(&[1, 3]));
+            assert!(class.entities_gpu_culling.is_empty());
+            assert!(class.added_entities.is_empty());
+            assert!(class.removed_entities.is_empty());
+            filter.restore(&mut class);
+            assert_class_eq(&class, &raw);
+        }
+    }
+
+    #[test]
+    fn raw_changes_reject_replay_and_match_the_general_path() {
+        // Events, lengths, CPU slots and GPU renderer pairs independently invalidate replay.
+        for change in 0..9 {
+            let mut class = RenderVisibleEntitiesClass::default();
+            cpu_frame(&mut class, &[1, 2, 3]);
+            class.entities_gpu_culling.insert(pair(4).1, pair(4).0);
+            let mut filter = ClassFilter::default();
+            let hidden = hidden(&[2, 4]);
+            filter.apply(&mut class, &hidden);
+            filter.restore(&mut class);
+            class.prepare_for_new_frame();
+            match change {
+                0 => class.added_entities.push(pair(1)),
+                1 => class.removed_entities.push(pair(9)),
+                2 => class.entities_cpu_culling = ordered(&[1, 2, 3, 5]),
+                3 => {
+                    class.entities_gpu_culling.insert(pair(5).1, pair(5).0);
+                }
+                4 => {
+                    let slot = class
+                        .entities_cpu_culling
+                        .iter()
+                        .position(|p| *p == pair(2))
+                        .unwrap();
+                    class.entities_cpu_culling[slot].0 = pair(20).0;
+                }
+                5 => {
+                    class.entities_gpu_culling.insert(pair(4).1, pair(40).0);
+                }
+                6 => class.entities_cpu_culling = ordered(&[2, 3, 5]),
+                7 => {
+                    class.entities_gpu_culling.remove(&pair(4).1);
+                    class.entities_gpu_culling.insert(pair(5).1, pair(5).0);
+                }
+                8 => {
+                    class.entities_cpu_culling = ordered(&[1, 3, 4]);
+                    class.entities_gpu_culling.remove(&pair(4).1);
+                    class.entities_gpu_culling.insert(pair(2).1, pair(2).0);
+                }
+                _ => unreachable!(),
+            }
+            let raw = class.clone();
+            let mut general_class = raw.clone();
+            let mut general = ClassFilter {
+                previous_hidden: hidden.clone(),
+                ..Default::default()
+            };
+            general.apply(&mut general_class, &hidden);
+            filter.apply(&mut class, &hidden);
+            assert_eq!(filter.replays, 0, "change {change}");
+            assert_class_eq(&class, &general_class);
+            assert_eq!(filter.previous_hidden, general.previous_hidden);
+            filter.restore(&mut class);
+            general.restore(&mut general_class);
+            assert_class_eq(&class, &raw);
+            assert_class_eq(&general_class, &raw);
+        }
+    }
+
+    #[test]
+    fn unhide_then_empty_noop_preserves_fresh_duplicate_events() {
+        let mut class = RenderVisibleEntitiesClass::default();
+        cpu_frame(&mut class, &[1, 2]);
+        let mut filter = ClassFilter::default();
+        filter.apply(&mut class, &hidden(&[2]));
+        filter.restore(&mut class);
+        class.prepare_for_new_frame();
+        filter.apply(&mut class, &hidden(&[]));
+        assert_eq!(class.added_entities, vec![pair(2)]);
+        filter.restore(&mut class);
+        class.added_entities.extend([pair(1), pair(1)]);
+        class.removed_entities.extend([pair(9), pair(9)]);
+        let raw = class.clone();
+        filter.apply(&mut class, &hidden(&[]));
+        assert_class_eq(&class, &raw);
+        filter.restore(&mut class);
+        assert_class_eq(&class, &raw);
+    }
+
+    #[test]
+    fn nested_replays_restore_each_incoming_class_after_outer_hide_changes() {
+        let mut class = RenderVisibleEntitiesClass::default();
+        cpu_frame(&mut class, &[1, 2, 3]);
+        class.entities_gpu_culling.insert(pair(4).1, pair(4).0);
+        let mut outer = ClassFilter::default();
+        let mut inner = ClassFilter::default();
+        for ids in [&[2][..], &[2], &[2], &[3], &[3], &[2, 4]] {
+            class.prepare_for_new_frame();
+            let raw = class.clone();
+            outer.apply(&mut class, &hidden(ids));
+            let outer_class = class.clone();
+            inner.apply(&mut class, &hidden(&[4]));
+            assert!(class.entities_gpu_culling.is_empty());
+            inner.restore(&mut class);
+            assert_class_eq(&class, &outer_class);
+            outer.restore(&mut class);
+            assert_class_eq(&class, &raw);
+        }
+        assert_eq!(outer.replays, 3);
+        assert_eq!(inner.replays, 3);
     }
 
     #[test]
