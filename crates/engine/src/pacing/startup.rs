@@ -49,6 +49,11 @@ struct ConfiguredPacing {
 }
 
 /// The startup lift's own state, advanced once a frame by [`drive_startup_load`].
+/// The first load made no progress in time. Triggered once, when the stall is reported, so
+/// observers can say what they are waiting for at no cost on any other frame.
+#[derive(Event, Debug, Clone, Copy)]
+pub struct StartupLoadStalled;
+
 #[derive(Resource, Default)]
 struct StartupLoad {
     /// Whether this run hides the load behind the cover
@@ -278,8 +283,11 @@ fn drive_startup_load(
             "startup load: the world is ready; the configured streaming pacing is back"
         );
     } else {
-        // What held the world back, so a stall names its cause.
+        // What held the world back, so a stall names its cause. Systems with more detail (the
+        // terrain hand-over) report it once through the event.
+        commands.trigger(StartupLoadStalled);
         warn!(
+            pending_lod_chunk_parts = ?metrics.pending_lod_chunk_parts,
             seconds = load.elapsed,
             stalled_seconds = load.stalled,
             timeout_seconds = STARTUP_LIFT_TIMEOUT_SECONDS,
@@ -602,6 +610,10 @@ mod tests {
             STEP,
         )));
         set_interior(&mut app, 77, false);
+        #[derive(Resource, Default)]
+        struct Stalls(u32);
+        app.init_resource::<Stalls>()
+            .add_observer(|_: On<StartupLoadStalled>, mut stalls: ResMut<Stalls>| stalls.0 += 1);
         let frames_to_timeout = (STARTUP_LIFT_TIMEOUT_SECONDS / STEP).ceil() as usize;
         for _ in 0..frames_to_timeout {
             app.update();
@@ -613,7 +625,13 @@ mod tests {
             0,
             "still lifted before the timeout"
         );
+        assert_eq!(app.world().resource::<Stalls>().0, 0);
         app.update();
+        assert_eq!(
+            app.world().resource::<Stalls>().0,
+            1,
+            "the stall is announced once, so detailed reports run only then"
+        );
         let config = app.world().resource::<EngineConfig>();
         assert_eq!(config.max_model_spawns_per_frame, 7);
         assert_eq!(config.max_unload_ms_per_frame, 2.5);
@@ -629,5 +647,6 @@ mod tests {
             None,
             "and the cover still comes down"
         );
+        assert_eq!(app.world().resource::<Stalls>().0, 1, "and never again");
     }
 }

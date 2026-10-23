@@ -1269,28 +1269,34 @@ pub(in crate::streaming) fn finalize_unviewed_lod_batches(
     }
 }
 
-/// Profiled cluster-terrain runs only: every 300 frames while chunks still hold their source
-/// hierarchy, log why each cannot retire. Ordinary runs install nothing.
+/// Why chunks still holding their source hierarchy cannot retire: the blocker counts, a probe of
+/// each batch a view sees but no camera has drawn, and each selected batch still waiting for its
+/// upload. Read-only; logged by [`log_terrain_retire_blockers`] and [`report_terrain_stall`].
 #[allow(clippy::type_complexity)]
-pub(in crate::streaming) fn log_terrain_retire_blockers(
-    batches: LodBatchVisibility,
-    current: crate::swap_bridge::CurrentCoverageVisibility,
-    probe: Query<(
-        Option<&Mesh3d>,
-        Option<&crate::swap_bridge::SwapDrawReceipt>,
-        Has<crate::swap_bridge::SwapWaiting>,
-        Has<crate::swap_bridge::SwapPrepared>,
-        Has<crate::swap_bridge::SwapDrawn>,
-        Has<crate::swap_bridge::SwapInCameraView>,
-        Option<&Visibility>,
-        Option<&InheritedVisibility>,
-        Option<&ViewVisibility>,
-    )>,
-    mut frames: Local<u32>,
-) {
-    *frames = frames.wrapping_add(1);
-    if (*frames).is_multiple_of(300) && batches.holding_source_count() != 0 {
-        let blockers = batches.retire_blockers(&current);
+#[derive(SystemParam)]
+pub(crate) struct RetireReport<'w, 's> {
+    batches: LodBatchVisibility<'w, 's>,
+    current: crate::swap_bridge::CurrentCoverageVisibility<'w, 's>,
+    probe: Query<
+        'w,
+        's,
+        (
+            Option<&'static Mesh3d>,
+            Option<&'static crate::swap_bridge::SwapDrawReceipt>,
+            Has<crate::swap_bridge::SwapWaiting>,
+            Has<crate::swap_bridge::SwapPrepared>,
+            Has<crate::swap_bridge::SwapDrawn>,
+            Has<crate::swap_bridge::SwapInCameraView>,
+            Option<&'static Visibility>,
+            Option<&'static InheritedVisibility>,
+            Option<&'static ViewVisibility>,
+        ),
+    >,
+}
+
+impl RetireReport<'_, '_> {
+    fn log(&self) {
+        let blockers = self.batches.retire_blockers(&self.current);
         // Why a batch a camera sees has no draw receipt for its current mesh: the bridge's
         // markers and the batch's own visibility, one line per batch.
         for (entity, mesh) in &blockers.viewed_undrawn {
@@ -1304,7 +1310,7 @@ pub(in crate::streaming) fn log_terrain_retire_blockers(
                 visibility,
                 inherited,
                 view,
-            )) = probe.get(*entity)
+            )) = self.probe.get(*entity)
             else {
                 info!(?entity, "viewed undrawn terrain batch is gone");
                 continue;
@@ -1325,8 +1331,8 @@ pub(in crate::streaming) fn log_terrain_retire_blockers(
         }
         info!(?blockers, "terrain batches awaiting source retirement");
         // Selected batches whose upload never arrived hold the world-ready check.
-        let readiness = batches.readiness.as_deref();
-        for (root, chunk, _) in batches.chunks.iter() {
+        let readiness = self.batches.readiness.as_deref();
+        for (root, chunk, _) in self.batches.chunks.iter() {
             if chunk.source_children.is_none() {
                 continue;
             }
@@ -1341,12 +1347,35 @@ pub(in crate::streaming) fn log_terrain_retire_blockers(
                         batch = ?batch.entity,
                         selected = batch.selected,
                         requested = readiness.is_some_and(|r| r.is_requested(id)),
-                        mesh_asset_exists = batches.meshes.as_deref().is_some_and(|m| m.contains(id)),
+                        mesh_asset_exists = self.batches.meshes.as_deref().is_some_and(|m| m.contains(id)),
                         "selected terrain batch waiting for its upload"
                     );
                 }
             }
         }
+    }
+}
+
+/// Profiled cluster-terrain runs only: every 300 frames while chunks still hold their source
+/// hierarchy, log why each cannot retire. Ordinary runs install nothing.
+pub(in crate::streaming) fn log_terrain_retire_blockers(
+    report: RetireReport,
+    mut frames: Local<u32>,
+) {
+    *frames = frames.wrapping_add(1);
+    if (*frames).is_multiple_of(300) && report.batches.holding_source_count() != 0 {
+        report.log();
+    }
+}
+
+/// Every cluster-terrain run: when the first load stalls, say once what the terrain hand-over is
+/// waiting for. Costs nothing on any other frame.
+pub(in crate::streaming) fn report_terrain_stall(
+    _stalled: On<crate::pacing::startup::StartupLoadStalled>,
+    report: RetireReport,
+) {
+    if report.batches.holding_source_count() != 0 {
+        report.log();
     }
 }
 

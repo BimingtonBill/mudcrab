@@ -2459,9 +2459,12 @@ fn update_counts(
     // A chunk still being batched (its CPU preparation queued, or its first upload not on the GPU)
     // will still change the frame and costs frame time until it is done, so it is loading work
     // like a chunk that is not resident yet: the world is not ready while any is left.
-    metrics.pending_lod_chunks = pending_keys.len()
-        + streaming.terrain_batch_pending_cpu_chunks
-        + streaming.terrain_batch_pending_gpu_chunks;
+    metrics.pending_lod_chunk_parts = [
+        pending_keys.len(),
+        streaming.terrain_batch_pending_cpu_chunks,
+        streaming.terrain_batch_pending_gpu_chunks,
+    ];
+    metrics.pending_lod_chunks = metrics.pending_lod_chunk_parts.iter().sum();
     profiler.set_gauge("lod/resident_chunks", metrics.resident_lod_chunks as f64);
     profiler.set_gauge("lod/pending_chunks", metrics.pending_lod_chunks as f64);
 }

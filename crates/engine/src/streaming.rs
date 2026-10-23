@@ -364,7 +364,8 @@ impl Plugin for StreamingPlugin {
             .filter(|config| config.clusters.is_some() && config.cluster_terrain)
         {
             let profiling = config.profile_output_dir.is_some();
-            app.add_systems(Last, lod::terrain_batching::finalize_unviewed_lod_batches);
+            app.add_systems(Last, lod::terrain_batching::finalize_unviewed_lod_batches)
+                .add_observer(lod::terrain_batching::report_terrain_stall);
             if profiling {
                 app.add_systems(
                     Last,
@@ -1081,6 +1082,9 @@ pub struct StreamingMetrics {
     pub unrecovered_lod_chunks: usize,
     pub resident_lod_chunks: usize,
     pub pending_lod_chunks: usize,
+    /// The parts of `pending_lod_chunks`: chunks not resident yet, chunks queued for CPU
+    /// batching, and chunks whose batch upload is not on the GPU yet. Read by the stall report.
+    pub pending_lod_chunk_parts: [usize; 3],
     /// Cluster batches whose material is wanted by a view but not yet loaded, so a view with
     /// one is not settled (`--clusters`).
     pub pending_cluster_batches: usize,
