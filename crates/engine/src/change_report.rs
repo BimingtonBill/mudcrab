@@ -37,6 +37,8 @@ struct ChangeWindow {
     changed: HashMap<ComponentId, u64>,
     /// Per component type: frames of the window in which at least one entity changed.
     frames_changed: HashMap<ComponentId, u32>,
+    /// Entities that gained a `Name`, by name with its digits masked: what keeps being spawned.
+    named: HashMap<String, u64>,
 }
 
 fn report_changes(world: &mut World, mut window: Local<ChangeWindow>) {
@@ -49,6 +51,12 @@ fn report_changes(world: &mut World, mut window: Local<ChangeWindow>) {
         *window.changed.entry(id).or_default() += count;
         *window.frames_changed.entry(id).or_default() += 1;
     }
+    let mut names = world.query::<Ref<Name>>();
+    for name in names.iter(world) {
+        if name.added().is_newer_than(last_scan, this_scan) {
+            *window.named.entry(name_pattern(name.as_str())).or_default() += 1;
+        }
+    }
     window.frames += 1;
     if window.frames < WINDOW {
         return;
@@ -56,13 +64,22 @@ fn report_changes(world: &mut World, mut window: Local<ChangeWindow>) {
     let mut busiest: Vec<_> = window.changed.iter().map(|(&id, &n)| (id, n)).collect();
     busiest.sort_unstable_by_key(|(_, total)| std::cmp::Reverse(*total));
     let components = world.components();
+    // Release builds strip Bevy's component names (its `debug` feature); the reflection registry
+    // keeps the type path of every registered type, so it names most components there.
+    let registry = world.get_resource::<AppTypeRegistry>().map(|r| r.read());
     let lines: Vec<String> = busiest
         .iter()
         .take(TOP)
         .map(|(id, total)| {
-            let name = components
-                .get_info(*id)
-                .map(|info| info.name().shortname().to_string())
+            let info = components.get_info(*id);
+            let reflected = info
+                .and_then(|info| info.type_id())
+                .zip(registry.as_ref())
+                .and_then(|(type_id, registry)| registry.get(type_id))
+                .map(|registration| registration.type_info().type_path_table().short_path());
+            let name = reflected
+                .map(str::to_owned)
+                .or_else(|| info.map(|info| info.name().shortname().to_string()))
                 .unwrap_or_else(|| format!("{id:?}"));
             format!(
                 "{name}: {:.1} entities/frame, changed in {} of {} frames",
@@ -78,9 +95,44 @@ fn report_changes(world: &mut World, mut window: Local<ChangeWindow>) {
         window.frames,
         lines.join("\n  ")
     );
+    let mut named: Vec<_> = window.named.iter().collect();
+    named.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(**count));
+    if !named.is_empty() {
+        let lines: Vec<String> = named
+            .iter()
+            .take(TOP)
+            .map(|(pattern, count)| format!("{pattern}: {count}"))
+            .collect();
+        info!(
+            "main-world entities named over {} frames (most first):
+  {}",
+            window.frames,
+            lines.join(
+                "
+  "
+            )
+        );
+    }
     window.frames = 0;
     window.changed.clear();
     window.frames_changed.clear();
+    window.named.clear();
+}
+
+/// A name with every run of digits replaced by `#`, so "LOD terrain batch 12,7" and
+/// "LOD terrain batch 3,1" count as one kind.
+fn name_pattern(name: &str) -> String {
+    let mut pattern = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_digit() {
+            if !pattern.ends_with('#') {
+                pattern.push('#');
+            }
+        } else {
+            pattern.push(c);
+        }
+    }
+    pattern
 }
 
 /// Entities whose component changed after `last_scan`, per component type.
@@ -147,6 +199,15 @@ mod tests {
     #[derive(Component, Default)]
     #[component(storage = "SparseSet")]
     struct Sparse(u32);
+
+    #[test]
+    fn names_count_as_one_kind_whatever_their_numbers() {
+        assert_eq!(
+            name_pattern("LOD terrain batch 12,7"),
+            "LOD terrain batch #,#"
+        );
+        assert_eq!(name_pattern("cell 0x3c"), "cell #x#c");
+    }
 
     #[test]
     fn counts_only_components_written_since_the_last_scan() {

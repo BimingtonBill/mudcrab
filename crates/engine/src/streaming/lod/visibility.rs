@@ -1405,6 +1405,20 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
 
     let refresh = index.has_work();
     if refresh {
+        // Which input started this pass's work: a settled scene must name none of them.
+        for (fired, name) in [
+            (selection_moved, "lod_visibility/trigger/selection_moved"),
+            (cluster_changed, "lod_visibility/trigger/cluster_changed"),
+            (flagged, "lod_visibility/trigger/flagged"),
+            (removals, "lod_visibility/trigger/removals"),
+            (external_changed, "lod_visibility/trigger/external_changed"),
+            (batches_removed, "lod_visibility/trigger/batches_removed"),
+            (rebuild, "lod_visibility/trigger/rebuild"),
+        ] {
+            if fired {
+                crate::work_counters::record(name);
+            }
+        }
         {
             perf_span!("lod::visibility::apply");
             crate::work_counters::record("lod_visibility/reselect");
