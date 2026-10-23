@@ -1746,7 +1746,7 @@ fn full_model_demand_is_bounded_by_the_loaded_grid_and_leaves_interiors_empty() 
     let far = app.world().resource::<FarStock>();
     assert!(!far.desired.is_empty());
     assert!(far.desired.values().all(|wanted| *wanted == key));
-    assert_eq!(far.reach, 0);
+    assert_eq!(far.reach, Some(0));
     app.world_mut().insert_resource(super::super::ActiveSpace {
         worldspace_id: Some(cell_world(key).unwrap()),
         interior: Some(77),
@@ -1778,4 +1778,152 @@ fn loaded_grid_bounds_are_world_exact_inclusive_and_role_independent() {
     demand.world = 18;
     assert!(!demand.contains_cell(17, demand.center, 2));
     assert!(demand.contains_cell(18, demand.center, 0));
+}
+
+#[test]
+fn owned_statics_desire_refused_models_beyond_stream_and_terrain_reach() {
+    let fixture = Fixture::new();
+    let (key, row, _) = fixture.selected();
+    let mut app = complete_plan_app(&fixture, key);
+    {
+        let mut config = app.world_mut().resource_mut::<EngineConfig>();
+        config.cluster_own_statics = true;
+        config.stream_radius = 0;
+    }
+    app.world_mut().resource_mut::<RenderOrigin>().0 = grid(key) + IVec2::new(200, 0);
+    app.update();
+    let far = app.world().resource::<FarStock>();
+    assert_eq!(
+        far.desired.get(&(cell_world(key).unwrap(), row.form_id)),
+        Some(&key)
+    );
+    let generation = far.generation;
+    app.update();
+    assert_eq!(app.world().resource::<FarStock>().generation, generation);
+}
+
+#[test]
+fn owned_statics_do_not_request_complete_models_without_fallback() {
+    let fixture = Fixture::from_directory(published_for_loader());
+    let (key, _) = fixture.rows.first().unwrap();
+    let mut app = complete_plan_app(&fixture, *key);
+    app.world_mut()
+        .resource_mut::<EngineConfig>()
+        .cluster_own_statics = true;
+    app.update();
+    assert!(app.world().resource::<FarStock>().desired.is_empty());
+}
+
+#[test]
+fn owned_statics_desire_runtime_fallback_beyond_stream_radius() {
+    let fixture = Fixture::from_directory(published_for_loader());
+    let (key, row) = fixture.rows.first().unwrap();
+    let mut app = complete_plan_app(&fixture, *key);
+    {
+        let mut config = app.world_mut().resource_mut::<EngineConfig>();
+        config.cluster_own_statics = true;
+        config.stream_radius = 0;
+    }
+    app.world_mut().resource_mut::<RenderOrigin>().0 = grid(*key) + IVec2::new(200, 0);
+    app.world_mut()
+        .resource_mut::<SourceFallbackDemand>()
+        .update(Some(&fixture.package), BTreeSet::from([row.form_id]));
+    app.update();
+    let far = app.world().resource::<FarStock>();
+    assert_eq!(
+        far.desired.get(&(cell_world(*key).unwrap(), row.form_id)),
+        Some(key)
+    );
+    assert_eq!(far.counted_worlds.len(), 1);
+    let generation = far.generation;
+    app.update();
+    assert_eq!(app.world().resource::<FarStock>().generation, generation);
+}
+
+#[test]
+fn stock_candidate_counts_split_world_exact_demand_and_deduplicate_fallback() {
+    let fixture = Fixture::new();
+    let demand = LodDemand {
+        world: 0x70,
+        center: IVec2::ZERO,
+        role: LodDemandRole::Main,
+        camera: Entity::PLACEHOLDER,
+        main_camera: None,
+    };
+    // Parent 0x100 is Partial at (0,0); 0x103/0x105 are refused at (-2,1).
+    // 0x101 belongs to the child world; 0x108 has no model; neither counts here.
+    let counts = stock_reference_counts(
+        &fixture.package,
+        demand,
+        0,
+        &BTreeSet::from([0x100, 0x101, 0x103, 0x108]),
+    );
+    assert_eq!(
+        counts,
+        StockReferenceCounts {
+            refused: RadiusCounts {
+                inside: 1,
+                beyond: 2
+            },
+            fallback: RadiusCounts {
+                inside: 1,
+                beyond: 1
+            },
+            total: RadiusCounts {
+                inside: 1,
+                beyond: 2
+            },
+        }
+    );
+}
+
+#[test]
+fn complete_runtime_fallback_counts_as_one_distant_candidate() {
+    let fixture = Fixture::from_directory(published_for_loader());
+    let (key, row) = fixture.rows.first().unwrap();
+    let counts = stock_reference_counts(
+        &fixture.package,
+        LodDemand {
+            world: cell_world(*key).unwrap(),
+            center: grid(*key) + IVec2::X,
+            role: LodDemandRole::Main,
+            camera: Entity::PLACEHOLDER,
+            main_camera: None,
+        },
+        0,
+        &BTreeSet::from([row.form_id]),
+    );
+    assert_eq!(
+        counts,
+        StockReferenceCounts {
+            refused: RadiusCounts::default(),
+            fallback: RadiusCounts {
+                inside: 0,
+                beyond: 1
+            },
+            total: RadiusCounts {
+                inside: 0,
+                beyond: 1
+            },
+        }
+    );
+}
+
+#[test]
+fn package_window_handles_sparse_unbounded_and_inclusive_bounded_queries() {
+    let fixture = Fixture::new();
+    let (key, _, _) = fixture.selected();
+    let world = cell_world(key).unwrap();
+    let cells = |center, reach| {
+        fixture
+            .package
+            .placed_cells_in_window(world, center, reach)
+            .map(|(grid, _)| grid.to_array())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(cells(IVec2::splat(i32::MAX), None), vec![[-2, 1], [0, 0]]);
+    assert_eq!(cells(IVec2::ZERO, Some(2)), vec![[-2, 1], [0, 0]]);
+    assert_eq!(cells(IVec2::ZERO, Some(1)), vec![[0, 0]]);
+    assert!(cells(IVec2::ZERO, Some(-1)).is_empty());
+    assert!(cells(IVec2::splat(i32::MAX), Some(0)).is_empty());
 }

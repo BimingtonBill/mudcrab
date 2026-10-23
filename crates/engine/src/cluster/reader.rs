@@ -594,19 +594,27 @@ impl CertifiedPackage {
         self.placed_references.get(&id)
     }
     /// Nonempty position cells in exactly this placing world, in grid order.
+    /// None selects the whole worldspace, matching owned clusters' unbounded object reach.
     pub(crate) fn placed_cells_in_window(
         &self,
         world: u32,
         center: IVec2,
-        radius: i32,
+        radius: Option<i32>,
     ) -> impl Iterator<Item = (IVec2, &[u32])> {
-        let low = center.y.saturating_sub(radius);
-        let high = center.y.saturating_add(radius);
-        (center.x.saturating_sub(radius)..=center.x.saturating_add(radius)).flat_map(move |x| {
-            self.placed_reference_cells
-                .range((world, x, low)..=(world, x, high))
-                .map(|((_, x, y), ids)| (IVec2::new(*x, *y), ids.as_slice()))
-        })
+        let (low, high) = radius.map_or((IVec2::splat(i32::MIN), IVec2::splat(i32::MAX)), |r| {
+            let r = r.max(0);
+            (
+                IVec2::new(center.x.saturating_sub(r), center.y.saturating_sub(r)),
+                IVec2::new(center.x.saturating_add(r), center.y.saturating_add(r)),
+            )
+        });
+        // Walk indexed cells, not every possible x coordinate of an unbounded/sparse world.
+        self.placed_reference_cells
+            .range((world, low.x, i32::MIN)..=(world, high.x, i32::MAX))
+            .filter(move |((_, _, y), _)| {
+                radius.is_none_or(|r| r >= 0) && *y >= low.y && *y <= high.y
+            })
+            .map(|((_, x, y), ids)| (IVec2::new(*x, *y), ids.as_slice()))
     }
 
     /// Every examined reference placed in this position cell of this placing worldspace,

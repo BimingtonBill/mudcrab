@@ -76,7 +76,8 @@ struct FarStockMeasurements {
 pub(crate) struct FarStock {
     package: Option<Arc<CertifiedPackage>>,
     demand: Option<LodDemand>,
-    reach: i32,
+    /// None matches owned clusters: every indexed placement in the demanded worldspace.
+    reach: Option<i32>,
     generation: u64,
     desired: HashMap<Identity, CellKey>,
     owners: HashMap<Identity, Owner>,
@@ -95,6 +96,7 @@ pub(crate) struct FarStock {
     near_roles: HashMap<Entity, CellRole>,
     fallback_revision: Option<u64>,
     fallback_references: BTreeSet<u32>,
+    counted_worlds: HashSet<u32>,
     qualification_pending: bool,
     measurements: FarStockMeasurements,
 }
@@ -148,10 +150,67 @@ fn needs_stock(reference: &crate::cluster::reader::PlacedReference) -> bool {
     reference.coverage != CoverageState::Complete && reference.model_path.is_some()
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RadiusCounts {
+    inside: usize,
+    beyond: usize,
+}
+
+impl RadiusCounts {
+    fn add(&mut self, inside: bool) {
+        if inside {
+            self.inside += 1;
+        } else {
+            self.beyond += 1;
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StockReferenceCounts {
+    refused: RadiusCounts,
+    fallback: RadiusCounts,
+    /// Union of refused and runtime fallback references; overlaps count only once.
+    total: RadiusCounts,
+}
+
+/// Model-bearing demand candidates, before the ordinary loader checks enable state or assets.
+fn stock_reference_counts(
+    package: &CertifiedPackage,
+    demand: LodDemand,
+    stream_radius: i32,
+    fallback_references: &BTreeSet<u32>,
+) -> StockReferenceCounts {
+    let mut counts = StockReferenceCounts::default();
+    for (grid, ids) in package.placed_cells_in_window(demand.world, demand.center, None) {
+        let inside = demand.contains_cell(demand.world, grid, stream_radius.max(0));
+        for id in ids {
+            let Some(reference) = package.placed_reference(*id) else {
+                continue;
+            };
+            if reference.model_path.is_none() {
+                continue;
+            }
+            let refused = needs_stock(reference);
+            let fallback = fallback_references.contains(id);
+            if refused {
+                counts.refused.add(inside);
+            }
+            if fallback {
+                counts.fallback.add(inside);
+            }
+            if refused || fallback {
+                counts.total.add(inside);
+            }
+        }
+    }
+    counts
+}
+
 fn complete_source_key(
     package: &CertifiedPackage,
     demand: LodDemand,
-    reach: i32,
+    reach: Option<i32>,
     reference_id: u32,
     source_cell: u32,
 ) -> Option<CellKey> {
@@ -160,11 +219,14 @@ fn complete_source_key(
     (reference.coverage == CoverageState::Complete
         && reference.model_path.is_some()
         && snapshot.source_cell_id == source_cell
-        && demand.contains_cell(
-            snapshot.placed_worldspace_id,
-            IVec2::new(snapshot.cell.0, snapshot.cell.1),
-            reach,
-        ))
+        && snapshot.placed_worldspace_id == demand.world
+        && reach.is_none_or(|radius| {
+            demand.contains_cell(
+                snapshot.placed_worldspace_id,
+                IVec2::new(snapshot.cell.0, snapshot.cell.1),
+                radius,
+            )
+        }))
     .then_some(CellKey::Exterior {
         worldspace_id: demand.world,
         grid_x: snapshot.cell.0,
@@ -247,6 +309,7 @@ fn plan(
             far.demand = None;
             far.fallback_revision = None;
             far.fallback_references.clear();
+            far.counted_worlds.clear();
             far.qualification_pending = false;
         }
         return;
@@ -258,6 +321,7 @@ fn plan(
     if changed_package {
         far.fallback_revision = None;
         far.fallback_references.clear();
+        far.counted_worlds.clear();
     }
     far.qualification_pending = true;
     let mut fallback_changed = false;
@@ -274,10 +338,37 @@ fn plan(
     }
     let actual = views.current(&config, origin.0, portal.as_deref());
     let demand = views.residency_demand(&config, actual, portal.as_deref(), &mut lod);
-    // Full models belong only to the loaded grid. Distant parity is native BTO/BTT.
-    let reach = config.stream_radius.max(0);
+    // Owned object selection has no distance cutoff: FarNativePolicy admits the whole world,
+    // lazy admission ignores the far plane, and the GPU cull uses only side and near planes.
+    // Terrain and native object LOD reaches therefore cannot bound its exact stock fallback.
+    // Without owned statics, keep loaded-grid stock demand and native BTO/BTT distant parity.
+    let reach = (!config.cluster_own_statics).then_some(config.stream_radius.max(0));
     if !changed_package && !fallback_changed && far.demand == demand && far.reach == reach {
         return;
+    }
+    if let Some(demand) = demand
+        && far.fallback_revision.is_some()
+        && far.counted_worlds.insert(demand.world)
+    {
+        let counts = stock_reference_counts(
+            &package.0,
+            demand,
+            config.stream_radius,
+            &far.fallback_references,
+        );
+        info!(
+            worldspace = demand.world,
+            center = ?demand.center,
+            stream_radius = config.stream_radius.max(0),
+            ?reach,
+            refused_inside = counts.refused.inside,
+            refused_beyond = counts.refused.beyond,
+            fallback_inside = counts.fallback.inside,
+            fallback_beyond = counts.fallback.beyond,
+            total_inside = counts.total.inside,
+            total_beyond = counts.total.beyond,
+            "exact stock demand candidates at first qualification (once per package/worldspace)"
+        );
     }
     let mut desired = HashMap::new();
     if let Some(demand) = demand {
