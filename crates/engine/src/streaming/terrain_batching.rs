@@ -603,36 +603,103 @@ fn spawn_render_mesh(
 /// Root-level pending count used by the CPU preparation queue.
 #[derive(SystemParam)]
 pub(crate) struct LodBatchActivation<'w, 's> {
-    chunks: Query<'w, 's, &'static LodTerrainBatches>,
+    chunks: Query<'w, 's, (Entity, &'static LodTerrainBatches)>,
+    roots: Query<'w, 's, &'static super::LodChunkRoot>,
     readiness: Option<Res<'w, TerrainMeshUploadReadiness>>,
+    config: Option<Res<'w, crate::config::EngineConfig>>,
+    cluster_terrain: Option<Res<'w, crate::cluster::terrain::ClusterTerrain>>,
 }
 
 impl LodBatchActivation<'_, '_> {
-    /// Chunks still holding their source hierarchy whose first upload is not on the GPU yet: a
-    /// selected batch waiting for its mesh. A chunk whose batches are all uploaded is not loading
-    /// any more, even while its hand-over waits for a camera to draw the batch (a chunk seen only
-    /// by a shadow view keeps its source until then, which can take as long as the camera stays
-    /// still).
+    /// Chunks the world-ready check waits for (see [`still_loading`]).
     pub(super) fn pending_count(&self) -> usize {
-        self.chunks
-            .iter()
-            .filter(|chunk| awaits_initial_upload(chunk, self.readiness.as_deref()))
-            .count()
+        pending_chunks(
+            self.chunks.iter(),
+            &self.roots,
+            self.readiness.as_deref(),
+            self.config.as_deref(),
+            self.cluster_terrain.as_deref(),
+        )
     }
 }
 
-/// Whether a chunk still holding its source hierarchy has a selected batch whose upload is not on
-/// the GPU yet: the one definition of a chunk the world-ready check waits for.
-fn awaits_initial_upload(
+/// How many chunks are [`still_loading`]. A settled scene holds no source hierarchy, so the
+/// fallback cells are gathered only while one is held.
+fn pending_chunks<'a>(
+    chunks: impl Iterator<Item = (Entity, &'a LodTerrainBatches)> + Clone,
+    roots: &Query<&super::LodChunkRoot>,
+    readiness: Option<&TerrainMeshUploadReadiness>,
+    config: Option<&crate::config::EngineConfig>,
+    cluster_terrain: Option<&crate::cluster::terrain::ClusterTerrain>,
+) -> usize {
+    if !chunks
+        .clone()
+        .any(|(_, chunk)| chunk.source_children.is_some())
+    {
+        return 0;
+    }
+    let fallback_cells = cluster_fallback_cells(config, cluster_terrain);
+    chunks
+        .filter(|(entity, chunk)| {
+            let world = roots.get(*entity).ok().map(|root| root.key.worldspace_id);
+            still_loading(chunk, world, &fallback_cells, readiness)
+        })
+        .count()
+}
+
+/// Whether a chunk still holding its source hierarchy is loading work the world-ready check waits
+/// for. It is, until the only thing left is a camera drawing one of its cluster-owned batches: a
+/// chunk seen only by a shadow view keeps its source until the camera turns to it, which can
+/// take as long as the camera stays still, so that wait is settled. Every other step (uploads,
+/// source proofs, the hand-over itself) finishes on its own and counts as loading; with cluster
+/// terrain off no batch is owned, so every chunk counts until it hands over.
+fn still_loading(
     chunk: &LodTerrainBatches,
+    world: Option<u32>,
+    fallback_cells: &HashSet<(u32, IVec2)>,
     readiness: Option<&TerrainMeshUploadReadiness>,
 ) -> bool {
-    chunk.source_children.is_some()
-        && chunk.batches.iter().any(|batch| {
-            batch.selected != 0
-                && batch.pending_upload
-                && !readiness.is_some_and(|readiness| readiness.is_ready(batch.mesh.id()))
+    if chunk.source_children.is_none() {
+        return false;
+    }
+    let Some(readiness) = readiness else {
+        return true;
+    };
+    let waits_only_for_draw =
+        chunk.batches.iter().any(|batch| {
+            owned_source_mask(batch, world, fallback_cells) != 0 && !batch.pending_upload
+        }) && chunk.batches.iter().all(|batch| {
+            batch.selected == 0 || !batch.pending_upload || readiness.is_ready(batch.mesh.id())
+        }) && chunk
+            .batches
+            .iter()
+            .flat_map(|batch| &batch.members)
+            .all(|member| readiness.is_ready(member.source.id()));
+    !waits_only_for_draw
+}
+
+/// The cells cluster terrain can draw in place of LOD terrain: a batch member in one is owned and
+/// its source retires only after the batch is drawn or proven unviewed.
+fn cluster_fallback_cells(
+    config: Option<&crate::config::EngineConfig>,
+    cluster_terrain: Option<&crate::cluster::terrain::ClusterTerrain>,
+) -> HashSet<(u32, IVec2)> {
+    if !config.is_some_and(|config| config.cluster_terrain && config.clusters.is_some()) {
+        return HashSet::new();
+    }
+    cluster_terrain
+        .iter()
+        .flat_map(|terrain| &terrain.blocks)
+        // Registration means this block can participate in cluster terrain selection.
+        // Pending package inventory alone owns no draw and adds no retirement obligation.
+        .filter(|block| block.batch.is_some())
+        .flat_map(|block| {
+            block
+                .cells
+                .iter()
+                .map(move |grid| (block.worldspace_id, *grid))
         })
+        .collect()
 }
 
 /// Counts of chunks by the first reason their source hierarchy cannot retire.
@@ -687,26 +754,7 @@ pub(crate) struct LodBatchVisibility<'w, 's> {
 
 impl LodBatchVisibility<'_, '_> {
     fn cluster_fallback_cells(&self) -> HashSet<(u32, IVec2)> {
-        if !self
-            .config
-            .as_ref()
-            .is_some_and(|config| config.cluster_terrain && config.clusters.is_some())
-        {
-            return HashSet::new();
-        }
-        self.cluster_terrain
-            .iter()
-            .flat_map(|terrain| &terrain.blocks)
-            // Registration means this block can participate in cluster terrain selection.
-            // Pending package inventory alone owns no draw and adds no retirement obligation.
-            .filter(|block| block.batch.is_some())
-            .flat_map(|block| {
-                block
-                    .cells
-                    .iter()
-                    .map(move |grid| (block.worldspace_id, *grid))
-            })
-            .collect()
+        cluster_fallback_cells(self.config.as_deref(), self.cluster_terrain.as_deref())
     }
 
     /// Why each chunk still holding its source hierarchy cannot retire, by first failing
@@ -817,12 +865,15 @@ impl LodBatchVisibility<'_, '_> {
             .count()
     }
 
-    /// Chunks the world-ready check waits for (see [`awaits_initial_upload`]).
+    /// Chunks the world-ready check waits for (see [`still_loading`]).
     pub(super) fn pending_count(&self) -> usize {
-        self.chunks
-            .iter()
-            .filter(|(_, chunk, _)| awaits_initial_upload(chunk, self.readiness.as_deref()))
-            .count()
+        pending_chunks(
+            self.chunks.iter().map(|(entity, chunk, _)| (entity, chunk)),
+            &self.roots,
+            self.readiness.as_deref(),
+            self.config.as_deref(),
+            self.cluster_terrain.as_deref(),
+        )
     }
 
     /// Immutable selection meshes still awaiting activation after their initial hierarchy transfer.
@@ -2885,6 +2936,41 @@ mod tests {
             prepare(&mut app, &fixture).is_err(),
             "simulation content cannot be flattened"
         );
+    }
+
+    #[test]
+    fn without_cluster_terrain_an_uploaded_chunk_loads_until_it_hands_over() {
+        let mut app = test_app();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<LodStreaming>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, update_terrain_lod_visibility);
+        app.world_mut().spawn((
+            StreamingCamera,
+            Transform::from_xyz(CELL_SIZE * 0.5, 0.0, -CELL_SIZE * 0.5),
+        ));
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        let prepared = prepare(&mut app, &fixture).unwrap();
+        install_fixture(&mut app, &fixture, prepared);
+        app.world_mut()
+            .resource_mut::<LodStreaming>()
+            .visibility_dirty = true;
+        app.update();
+        let pending = |app: &mut App| {
+            app.world_mut()
+                .run_system_once(|activation: LodBatchActivation| activation.pending_count())
+                .unwrap()
+        };
+        acknowledge_uploads(&app, fixture.root);
+        assert_eq!(
+            pending(&mut app),
+            1,
+            "an uploaded chunk that has not handed over yet is still loading"
+        );
+        assert!(finalize_initial(&mut app));
+        assert_eq!(pending(&mut app), 0);
     }
 
     #[test]

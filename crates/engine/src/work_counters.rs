@@ -36,6 +36,11 @@ pub fn mark_world_ready() {
     READY.store(true, Ordering::Relaxed);
 }
 
+/// Whether the world has been ready once, for diagnostics that only matter in settled frames.
+pub fn world_ready() -> bool {
+    READY.load(Ordering::Relaxed)
+}
+
 /// The counts so far, for the benchmark report.
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct SettledWork {

@@ -511,6 +511,8 @@ pub(in crate::streaming) struct TerrainLodIndex {
     /// Retained batches and confirmed merged cells feed the same tier decision as source patches.
     /// Current cluster ownership is applied per render view after extraction.
     retained: HashMap<PatchKey, u8>,
+    /// How many retained-coverage differences were logged (the first few only).
+    retained_reports: u8,
     merged: HashSet<PatchKey>,
     batch_selection: HashMap<PatchKey, Option<LodTier>>,
     batched_visible: usize,
@@ -1296,6 +1298,36 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
         let external_changed = index.retained != retained || index.merged != merged;
         if index.retained != retained {
             crate::work_counters::record("lod_visibility/external/retained_coverage");
+            // The first few differences after ready, so a coverage that keeps changing in a
+            // settled scene names its keys.
+            if crate::work_counters::world_ready() && index.retained_reports < 8 {
+                index.retained_reports += 1;
+                let added: Vec<_> = retained
+                    .keys()
+                    .filter(|key| !index.retained.contains_key(*key))
+                    .take(4)
+                    .collect();
+                let removed: Vec<_> = index
+                    .retained
+                    .keys()
+                    .filter(|key| !retained.contains_key(*key))
+                    .take(4)
+                    .collect();
+                let retiered: Vec<_> = retained
+                    .iter()
+                    .filter(|(key, tier)| index.retained.get(*key).is_some_and(|old| old != *tier))
+                    .map(|(key, tier)| (key, index.retained[key], *tier))
+                    .take(4)
+                    .collect();
+                info!(
+                    before = index.retained.len(),
+                    after = retained.len(),
+                    ?added,
+                    ?removed,
+                    ?retiered,
+                    "retained terrain coverage changed"
+                );
+            }
         }
         if index.merged != merged {
             crate::work_counters::record("lod_visibility/external/merged_land");
