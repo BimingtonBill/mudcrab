@@ -1294,6 +1294,12 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
             .flat_map(|(coverage, _, _)| (0..4).map(move |quadrant| (coverage.grid, quadrant)))
             .collect();
         let external_changed = index.retained != retained || index.merged != merged;
+        if index.retained != retained {
+            crate::work_counters::record("lod_visibility/external/retained_coverage");
+        }
+        if index.merged != merged {
+            crate::work_counters::record("lod_visibility/external/merged_land");
+        }
         index.retained_ready = retained_ready;
         if external_changed {
             index.retained = retained;
