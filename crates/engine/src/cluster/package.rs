@@ -960,6 +960,7 @@ fn load_cluster_package(
         failed: Vec::new(),
         pending_snow: Vec::new(),
         demanded: default(),
+        scenes_revision: 0,
     });
     info!(
         meshes = scene_meshes.len(),
@@ -1366,6 +1367,10 @@ pub(super) struct LazyBatches {
     /// one-time ownership decision is decided by them (`--cluster-own-statics`), wherever the
     /// camera looks. A subset of `unrequested`; empty without that option.
     demanded: std::collections::BTreeSet<usize>,
+    /// Bumped whenever `scenes` gains or loses a model, so a reader of `source_scene` can tell
+    /// an unchanged map without looking every batch up (the loader touches this resource every
+    /// frame, so its change tick says nothing).
+    scenes_revision: u64,
 }
 
 /// What [`LazyBatches::demand`] found for one batch.
@@ -1418,6 +1423,7 @@ impl LazyBatches {
             failed: Vec::new(),
             pending_snow: Vec::new(),
             demanded: default(),
+            scenes_revision: 0,
         }
     }
 
@@ -1461,6 +1467,7 @@ impl LazyBatches {
             failed: Vec::new(),
             pending_snow: Vec::new(),
             demanded: default(),
+            scenes_revision: 0,
         }
     }
 
@@ -1511,6 +1518,25 @@ impl LazyBatches {
 
     pub(super) fn source_primitive(&self, batch: u32) -> Option<u32> {
         Some(self.batches.get(batch as usize)?.primitive)
+    }
+
+    /// The batches whose source or material failed for good; the loader never retries them.
+    pub(super) fn failed_batches(&self) -> &[usize] {
+        &self.failed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_failed_for_test(&mut self, batch: usize) {
+        self.failed.push(batch);
+    }
+
+    pub(super) fn is_failed(&self, batch: u32) -> bool {
+        self.failed.contains(&(batch as usize))
+    }
+
+    /// What every `source_scene` answer depends on: the batch layout and the scene map.
+    pub(super) fn source_scenes_key(&self) -> (u64, u64) {
+        (self.layout_scope, self.scenes_revision)
     }
 
     pub(super) fn source_scene(&self, batch: u32) -> Option<&Handle<WorldAsset>> {
@@ -1885,6 +1911,7 @@ fn load_batches_in_view(
             .is_some_and(|handle| asset_failed(&asset_server, handle.id()))
         {
             lazy.scenes.remove(path);
+            lazy.scenes_revision += 1;
         }
         // Reusing a speculative source starts no additional I/O and must not be blocked
         // by the capacity that very source already occupies.
@@ -1898,6 +1925,9 @@ fn load_batches_in_view(
             source_slots -= 1;
         }
         let path = lazy.batches[index].key.model_path.clone();
+        if !lazy.scenes.contains_key(&path) {
+            lazy.scenes_revision += 1;
+        }
         let scene = lazy
             .scenes
             .entry(path.clone())

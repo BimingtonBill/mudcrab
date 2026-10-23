@@ -89,6 +89,8 @@ pub(super) struct Sources {
     stock_tangents: Vec<Option<bool>>,
     pub(super) layout_version: u64,
     lazy_layout_scope: Option<u64>,
+    /// `LazyBatches::source_scenes_key` when the template inputs were last compared.
+    lazy_scenes_key: Option<(u64, u64)>,
     fixture_layout_scope: bool,
     /// Definitive global template/material refusal, separate from loading false values.
     source_fallback_batches: BTreeSet<u32>,
@@ -298,6 +300,25 @@ struct TemplateAssets<'a> {
     scenes: Option<&'a Assets<WorldAsset>>,
     meshes: &'a Assets<Mesh>,
     fixtures: Option<&'a ClusterBatchStockMeshes>,
+}
+
+/// One batch's row: a stock fallback once the loader gave up on the batch (its source or material
+/// failed for good), nothing yet without a material handle, else the template decision.
+fn batch_row(
+    index: u32,
+    handle: Option<&bevy::asset::UntypedHandle>,
+    caches: TemplateCaches<'_>,
+    inputs: &TemplateAssets<'_>,
+) -> TemplateRow {
+    if inputs.lazy.is_some_and(|lazy| lazy.is_failed(index)) {
+        return TemplateRow {
+            fallback: true,
+            ..default()
+        };
+    }
+    handle.map_or_else(TemplateRow::default, |handle| {
+        template_row(index, handle, caches, inputs)
+    })
 }
 
 fn template_row(
@@ -1758,15 +1779,17 @@ fn extract_sources(
             .is_some_and(|meshes| meshes.is_changed());
     out.lazy_layout_scope = layout_scope;
     out.fixture_layout_scope = fixture_meshes.is_some();
+    let lazy_scenes_key = lazy.as_deref().map(LazyBatches::source_scenes_key);
     let mut redo = if full {
         out.template_rows = TemplateRows::default();
         (0..batches as u32).collect::<BTreeSet<u32>>()
     } else {
         let mut redo = std::mem::take(&mut out.template_rows.pending);
         if handles.is_changed()
-            || lazy.as_ref().is_some_and(|lazy| lazy.is_changed())
+            || lazy_scenes_key != out.lazy_scenes_key
             || out.template_inputs.len() != batches
         {
+            crate::work_counters::record("cluster_sources/template_input_scan");
             for index in 0..batches {
                 let input = (
                     handles.handles[index].as_ref().map(|handle| handle.id()),
@@ -1792,7 +1815,17 @@ fn extract_sources(
         }
         redo
     };
+    out.lazy_scenes_key = lazy_scenes_key;
     redo.extend(dropped_fixture_rows);
+    // A batch the loader gave up on (its source or material failed for good) draws stock: its row
+    // is decided once, as a fallback, so the references it decides are decided too.
+    if let Some(lazy) = lazy.as_ref().filter(|lazy| lazy.is_changed()) {
+        redo.extend(lazy.failed_batches().iter().filter_map(|&index| {
+            let index = u32::try_from(index).ok()?;
+            ((index as usize) < batches && !out.source_fallback_batches.contains(&index))
+                .then_some(index)
+        }));
+    }
     // With no row to decide again and the batch count unchanged, the stored rows are exact:
     // keep them in place rather than copying every batch's row each frame. `rebuilt` holds the
     // new templates and normal maps only when a row was decided again.
@@ -1846,22 +1879,19 @@ fn extract_sources(
             let Some(handle) = handles.handles.get(index as usize) else {
                 continue;
             };
-            let row = match handle {
-                Some(handle) => template_row(
-                    index,
-                    handle,
-                    TemplateCaches {
-                        geometry: &mut out.geometry_cache,
-                        templates: &mut out.template_cache,
-                        template_meshes: &mut out.template_meshes,
-                        invalid_templates: &out.invalid_templates,
-                        invalid_meshes: &out.invalid_meshes,
-                        rows: &mut out.template_rows,
-                    },
-                    &inputs,
-                ),
-                None => TemplateRow::default(),
-            };
+            let row = batch_row(
+                index,
+                handle.as_ref(),
+                TemplateCaches {
+                    geometry: &mut out.geometry_cache,
+                    templates: &mut out.template_cache,
+                    template_meshes: &mut out.template_meshes,
+                    invalid_templates: &out.invalid_templates,
+                    invalid_meshes: &out.invalid_meshes,
+                    rows: &mut out.template_rows,
+                },
+                &inputs,
+            );
             let input = (
                 handle.as_ref().map(|handle| handle.id()),
                 lazy.as_deref()
@@ -7710,6 +7740,29 @@ mod actual_stock_layout_regressions {
             )
         }
 
+        fn batch_row(&mut self, handle: Option<&bevy::asset::UntypedHandle>) -> TemplateRow {
+            super::batch_row(
+                0,
+                handle,
+                TemplateCaches {
+                    geometry: &mut self.state.geometry_cache,
+                    templates: &mut self.state.template_cache,
+                    template_meshes: &mut self.state.template_meshes,
+                    invalid_templates: &self.state.invalid_templates,
+                    invalid_meshes: &self.state.invalid_meshes,
+                    rows: &mut self.state.template_rows,
+                },
+                &TemplateAssets {
+                    standards: &self.standards,
+                    snow: None,
+                    lazy: Some(&self.lazy),
+                    scenes: Some(&self.scenes),
+                    meshes: &self.meshes,
+                    fixtures: None,
+                },
+            )
+        }
+
         fn edit_material(&mut self, edit: impl FnOnce(&mut StandardMaterial)) {
             edit(
                 &mut self
@@ -7718,6 +7771,21 @@ mod actual_stock_layout_regressions {
                     .unwrap(),
             );
             self.state.geometry_cache.remove(&self.material.id());
+        }
+    }
+
+    #[test]
+    fn a_batch_the_loader_gave_up_on_is_decided_as_a_stock_fallback() {
+        let mut input = Fixture::new(false);
+        let material = input.material.clone();
+        assert!(!input.batch_row(Some(&material)).fallback);
+        // Without a handle the batch is not decided yet: neither template nor fallback.
+        let row = input.batch_row(None);
+        assert!(!row.template && !row.fallback && !row.pending);
+        input.lazy.mark_failed_for_test(0);
+        for handle in [Some(&material), None] {
+            let row = input.batch_row(handle);
+            assert!(row.fallback && !row.template && !row.pending);
         }
     }
 

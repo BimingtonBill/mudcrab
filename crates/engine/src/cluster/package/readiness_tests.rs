@@ -60,6 +60,7 @@ fn install_batch(app: &mut App, batch: LazyBatch, in_flight: bool) {
         pending_snow: Vec::new(),
         failed: Vec::new(),
         demanded: default(),
+        scenes_revision: 0,
     });
 }
 
