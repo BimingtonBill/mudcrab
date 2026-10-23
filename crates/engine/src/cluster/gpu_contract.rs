@@ -36,6 +36,63 @@ mod tests {
     use std::mem::{offset_of, size_of};
 
     #[test]
+    fn production_cull_does_not_read_the_host_epoch() {
+        use wgpu::naga::{Expression, TypeInner, valid};
+
+        let module = naga_oil::compose::Composer::default()
+            .make_naga_module(naga_oil::compose::NagaModuleDescriptor {
+                source: include_str!("shaders/cluster_cull.wgsl"),
+                file_path: "cluster_cull.wgsl",
+                ..Default::default()
+            })
+            .expect("production shader validates");
+        let info = valid::Validator::new(valid::ValidationFlags::all(), valid::Capabilities::all())
+            .validate(&module)
+            .expect("production shader has resolved types");
+        let (params_type, ty) = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some("CullParams"))
+            .expect("cull uniform type");
+        let TypeInner::Struct { members, .. } = &ty.inner else {
+            panic!("cull uniform must be a struct");
+        };
+        let epoch_index = members
+            .iter()
+            .position(|member| member.name.as_deref() == Some("epoch"))
+            .expect("reserved epoch ABI field") as u32;
+        let check = |function: &wgpu::naga::Function, info: &valid::FunctionInfo| {
+            for (_, expression) in function.expressions.iter() {
+                if let Expression::AccessIndex { base, index } = *expression {
+                    let base_type = info[base].ty.inner_with(&module.types);
+                    let is_params = match *base_type {
+                        TypeInner::Pointer { base, .. } => base == params_type,
+                        TypeInner::Struct { .. } => info[base].ty.handle() == Some(params_type),
+                        _ => false,
+                    };
+                    assert!(
+                        !is_params || index != epoch_index,
+                        "the upload cache normalizes epoch; the shader must not read it"
+                    );
+                }
+                if let Expression::Load { pointer } = *expression {
+                    let ty = info[pointer].ty.inner_with(&module.types);
+                    assert!(
+                        !matches!(*ty, TypeInner::Pointer { base, .. } if base == params_type),
+                        "read cull members individually so epoch use stays checked"
+                    );
+                }
+            }
+        };
+        for (handle, function) in module.functions.iter() {
+            check(function, &info[handle]);
+        }
+        for (index, entry) in module.entry_points.iter().enumerate() {
+            check(&entry.function, info.get_entry_point(index));
+        }
+    }
+
+    #[test]
     fn cull_uniform_matches_production_wgsl_layout() {
         let module = naga_oil::compose::Composer::default()
             .make_naga_module(naga_oil::compose::NagaModuleDescriptor {

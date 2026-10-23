@@ -137,9 +137,11 @@ pub(super) mod queue_stats {
     pub static APPEND_NANOS: AtomicU64 = AtomicU64::new(0);
     pub static BLOCKS_APPENDED: AtomicU64 = AtomicU64::new(0);
     pub static CULL_NANOS: AtomicU64 = AtomicU64::new(0);
-    /// The cull encode in parts: the per-view buffer writes and clears, the two compute passes.
+    /// The cull encode in parts: the per-view buffer writes and clears, the eight compute passes.
     pub static CULL_WRITE_NANOS: AtomicU64 = AtomicU64::new(0);
     pub static CULL_PASS_NANOS: AtomicU64 = AtomicU64::new(0);
+    /// Actual per-view cull uniform writes in the reporting window; unchanged views add none.
+    pub static CULL_PARAMS_UPLOADS: AtomicU64 = AtomicU64::new(0);
     /// Draw groups in the camera's and in the latest rebuilt shadow view's plan: each is one
     /// indirect draw (and a pipeline and bind group switch) per view, encoded every frame.
     pub static GROUPS_CAMERA: AtomicU64 = AtomicU64::new(0);
@@ -184,7 +186,7 @@ pub(super) mod queue_stats {
         let per_frame = |nanos: u64| nanos as f64 / 1.0e6 / QUEUE_REPORT_EVERY as f64;
         bevy::log::info!(
             "cluster queue over {QUEUE_REPORT_EVERY} frames: batches {} full / {} skipped views ({} walked, {} batches taken up), {:.2} ms/frame; \
-             shadows {} full / {} skipped views, {:.2} ms/frame; source orders built {}; batch loader {:.2}, extract {:.2}, prepare {:.2}, cull {:.2} ms/frame (writes {:.2}, passes {:.2}); draw groups: camera {} ({} pipelines x {} material bind groups; {} of {} batches bindless), a shadow view {}",
+             shadows {} full / {} skipped views, {:.2} ms/frame; source orders built {}; batch loader {:.2}, extract {:.2}, prepare {:.2}, cull {:.2} ms/frame (writes {:.2}, passes {:.2}, params {} uploads); draw groups: camera {} ({} pipelines x {} material bind groups; {} of {} batches bindless), a shadow view {}",
             take(&BATCH_FULL),
             take(&BATCH_SKIPPED),
             take(&BATCH_WALKS),
@@ -200,6 +202,7 @@ pub(super) mod queue_stats {
             per_frame(take(&CULL_NANOS)),
             per_frame(take(&CULL_WRITE_NANOS)),
             per_frame(take(&CULL_PASS_NANOS)),
+            take(&CULL_PARAMS_UPLOADS),
             GROUPS_CAMERA.load(Relaxed),
             GROUP_PIPELINES.load(Relaxed),
             GROUP_BIND_GROUPS.load(Relaxed),
@@ -921,6 +924,8 @@ struct ViewGpu {
     /// One draw count per draw group.
     counts: Buffer,
     params: Buffer,
+    /// Exact contents last written to this allocation, including the first upload.
+    params_uploaded: Option<CullParams>,
     /// Per draw: instance, mesh, cluster within the mesh. Held so the bind groups stay valid.
     #[allow(dead_code)]
     visible: Buffer,
@@ -3173,7 +3178,9 @@ fn run_cluster_cull(
     #[cfg(feature = "tracy")]
     let write_span = bevy::log::info_span!("cluster::cull::params_and_clears").entered();
     let write_timer = queue_stats::Timed::start(&queue_stats::CULL_WRITE_NANOS);
-    let mut active: Vec<&ViewGpu> = Vec::new();
+    let instance_count = gpu.total_instances;
+    let instance_mask_base = gpu.batches.len().max(1) as u32;
+    let use_count = gpu.use_count;
     // The views that draw opaque 3D or cast shadows: the UI camera's view has neither phase.
     for view in views.iter().filter(|view| {
         opaque_phases.contains_key(&view.retained_view_entity)
@@ -3182,7 +3189,7 @@ fn run_cluster_cull(
         // A view with nothing to draw (no batch has a material yet) has no groups.
         let Some(view_gpu) = gpu
             .views
-            .get(&view.retained_view_entity)
+            .get_mut(&view.retained_view_entity)
             .filter(|view_gpu| {
                 cluster_cull_view_eligible(
                     view_gpu,
@@ -3193,25 +3200,34 @@ fn run_cluster_cull(
         else {
             continue;
         };
-        let params = cull_params(
-            view,
-            &settings,
-            gpu.total_instances,
-            gpu.batches.len().max(1) as u32,
-            epoch,
-        );
-        queue.write_buffer(&view_gpu.params, 0, bytemuck::bytes_of(&params));
+        let params = cull_params(view, &settings, instance_count, instance_mask_base, epoch);
+        if let Some(bytes) = cull_params_to_upload(&mut view_gpu.params_uploaded, params) {
+            queue.write_buffer(&view_gpu.params, 0, bytes);
+            queue_stats::bump(&queue_stats::CULL_PARAMS_UPLOADS);
+        }
         // The arguments and the counts start empty every frame.
         let encoder = ctx.command_encoder();
         // The draw reads only as many arguments as the count says where the adapter can read it
         // on the GPU, and every one of those is written by the cull; only the fixed-count
         // fallback draws the whole list and needs the unused tail to be empty draws.
-        if !gpu.use_count {
+        if !use_count {
             encoder.clear_buffer(&view_gpu.args, 0, None);
         }
         encoder.clear_buffer(&view_gpu.counts, 0, None);
-        active.push(view_gpu);
     }
+    let active: Vec<&ViewGpu> = views
+        .iter()
+        .filter_map(|view| {
+            let key = view.retained_view_entity;
+            gpu.views.get(&key).filter(|view_gpu| {
+                cluster_cull_view_eligible(
+                    view_gpu,
+                    opaque_phases.contains_key(&key),
+                    shadow_phases.contains_key(&key),
+                )
+            })
+        })
+        .collect();
     drop(write_timer);
     #[cfg(feature = "tracy")]
     drop(write_span);
@@ -3497,6 +3513,7 @@ fn new_view_gpu(
         args,
         counts,
         params,
+        params_uploaded: None,
         visible,
         instance_list,
         dispatch,
@@ -3536,6 +3553,22 @@ fn new_view_gpu(
         draw_bind_group,
         shadow_bind_group,
     }
+}
+
+fn cull_params_to_upload(
+    uploaded: &mut Option<CullParams>,
+    mut params: CullParams,
+) -> Option<&[u8]> {
+    // The shader keeps epoch in the ABI but never reads it. CPU cull and draw freshness
+    // epochs stay live; normalize only the uploaded bytes.
+    params.epoch = 0;
+    if uploaded
+        .as_ref()
+        .is_some_and(|previous| bytemuck::bytes_of(previous) == bytemuck::bytes_of(&params))
+    {
+        return None;
+    }
+    Some(bytemuck::bytes_of(uploaded.insert(params)))
 }
 
 /// The uniform block of the cull pass for `view`: frustum planes, camera, error scale, threshold,
@@ -4688,6 +4721,53 @@ fn publish_terrain_readiness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn cull_uniform_uploads_once_until_shader_inputs_change() {
+        let mut uploaded = None;
+        let mut params = CullParams::zeroed();
+        let first = cull_params_to_upload(&mut uploaded, params).expect("first upload");
+        assert_eq!(first, &[0; CULL_PARAMS_BYTES]);
+        assert!(cull_params_to_upload(&mut uploaded, params).is_none());
+        params.epoch = 42;
+        assert!(cull_params_to_upload(&mut uploaded, params).is_none());
+        params.instance_count = 17;
+        let bytes = cull_params_to_upload(&mut uploaded, params).expect("new instances");
+        assert_eq!(&bytes[108..112], &17_u32.to_ne_bytes());
+        assert_eq!(&bytes[124..128], &[0; 4]);
+        assert!(cull_params_to_upload(&mut uploaded, params).is_none());
+        uploaded = None;
+        assert!(cull_params_to_upload(&mut uploaded, params).is_some());
+    }
+
+    #[test]
+    fn cull_uniform_upload_observes_every_shader_input_byte() {
+        let params = CullParams::zeroed();
+        for byte in 0..std::mem::offset_of!(CullParams, epoch) {
+            let mut uploaded = Some(params);
+            let mut changed = params;
+            bytemuck::bytes_of_mut(&mut changed)[byte] = 1;
+            let bytes = cull_params_to_upload(&mut uploaded, changed)
+                .unwrap_or_else(|| panic!("shader input byte {byte} changed"));
+            assert_eq!(bytes[byte], 1);
+        }
+    }
+
+    #[test]
+    fn cull_uniform_upload_compares_float_bits_including_nan_and_signed_zero() {
+        let mut uploaded = None;
+        let mut params = CullParams::zeroed();
+        params.near = f32::from_bits(0x7fc0_0001);
+        assert!(cull_params_to_upload(&mut uploaded, params).is_some());
+        assert!(cull_params_to_upload(&mut uploaded, params).is_none());
+        params.near = f32::from_bits(0x7fc0_0002);
+        assert!(cull_params_to_upload(&mut uploaded, params).is_some());
+        params.near = 0.0;
+        assert!(cull_params_to_upload(&mut uploaded, params).is_some());
+        params.near = -0.0;
+        assert!(cull_params_to_upload(&mut uploaded, params).is_some());
+    }
 
     #[test]
     fn optional_layout_refusal_queues_ordinary_once_and_does_not_retry_the_refused_variant() {
