@@ -161,7 +161,8 @@ pub struct EngineConfig {
     /// settings-id | path]`: the text names one overlay of `--assets`, empty for the only one.
     /// Unset draws nothing extra.
     pub clusters: Option<String>,
-    /// Experiment: hide certified owned exterior primitives once at instance spawn.
+    /// Hide certified owned exterior primitives once at instance spawn.
+    /// Always enabled when a cluster overlay is selected.
     pub cluster_own_statics: bool,
     /// Draw packaged terrain clusters, clipping against ready near terrain.
     pub cluster_terrain: bool,
@@ -806,8 +807,8 @@ Streaming:
                                         derive-clusters under <assets>/derived) as GPU-selected
                                         clusters in place of the stock models it owns (ADR-0013)
   --cluster-terrain                     draw terrain included in the cluster overlay
-  --cluster-own-statics                 hide certified owned exterior primitives at spawn
-                                        (requires --clusters; ownership experiment)
+  --cluster-own-statics                 compatibility no-op alias (requires --clusters)
+                                        --clusters always enables static ownership
   --cluster-preload-batches             load every cluster batch during the startup load instead
                                         of as it comes into view (requires --clusters)
   --cluster-min-instance-pixels <px>    skip instances whose bounding sphere spans fewer pixels (default: 0, none)
@@ -2071,6 +2072,7 @@ impl EngineConfig {
                 "--clusters",
             ));
         }
+        config.cluster_own_statics = config.clusters.is_some();
         if config.cluster_preload_batches && config.clusters.is_none() {
             return Err(ConfigError::invalid_value(
                 "--cluster-preload-batches",
@@ -3250,10 +3252,55 @@ mod tests {
     #[test]
     fn cluster_ownership_requires_a_package_and_is_accepted_with_one() {
         assert!(!EngineConfig::default().cluster_own_statics);
-        assert!(EngineConfig::from_args(["--cluster-own-statics".to_owned()]).is_err());
-        assert!(
-            run_config(&["--clusters", "fixture", "--cluster-own-statics"]).cluster_own_statics
-        );
+        let error = EngineConfig::from_args(["--cluster-own-statics".to_owned()]).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::InvalidValue {
+                option: "--cluster-own-statics",
+                expected: "--clusters",
+                ..
+            }
+        ));
+        for arguments in [
+            ["--clusters", "fixture", "--cluster-own-statics"].as_slice(),
+            ["--cluster-own-statics", "--clusters", "fixture"].as_slice(),
+            ["--clusters", "--cluster-own-statics"].as_slice(),
+            ["--cluster-own-statics", "--clusters"].as_slice(),
+        ] {
+            assert!(run_config(arguments).cluster_own_statics);
+        }
+    }
+
+    #[test]
+    fn cluster_ownership_is_always_on_with_clusters() {
+        assert!(run_config(&["--clusters", "fixture"]).cluster_own_statics);
+        assert!(run_config(&["--clusters"]).cluster_own_statics);
+    }
+
+    #[test]
+    fn cluster_ownership_defaults_off_without_clusters() {
+        let config = run_config(&[]);
+        assert!(config.clusters.is_none());
+        assert!(!config.cluster_own_statics);
+    }
+
+    #[test]
+    fn cluster_ownership_opt_out_is_not_an_option() {
+        for arguments in [
+            ["--no-cluster-own-statics"].as_slice(),
+            ["--clusters", "--no-cluster-own-statics"].as_slice(),
+            ["--clusters", "fixture", "--no-cluster-own-statics"].as_slice(),
+            ["--no-cluster-own-statics", "--clusters", "fixture"].as_slice(),
+        ] {
+            let error =
+                EngineConfig::from_args(arguments.iter().map(|argument| (*argument).to_owned()))
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                ConfigError::UnknownOption { argument, .. }
+                    if argument == "--no-cluster-own-statics"
+            ));
+        }
     }
 
     #[test]
