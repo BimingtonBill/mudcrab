@@ -46,11 +46,15 @@ impl ClassFilter {
         // Only entities really in this view/class may enter persistent state. Membership is looked
         // up per named entity (the CPU list is sorted by main entity, the GPU list is a map), so
         // the cost follows the hidden sets, not everything the view sees.
-        let mut cpu_hidden = false;
+        // The CPU-list slots of the hidden entities, found by the same lookup, so taking them out
+        // is one compaction pass rather than a hash lookup per entity the view sees.
+        let mut cpu_slots = Vec::new();
         for main in hidden {
-            if let Some((pair, cpu)) = visible_pair(class, *main) {
+            if let Some((pair, slot)) = visible_pair(class, *main) {
                 now_hidden.insert(*main);
-                cpu_hidden |= cpu;
+                if let Some(slot) = slot {
+                    cpu_slots.push((slot, pair));
+                }
                 if !self.previous_hidden.contains(main) {
                     newly_hidden.push(pair);
                 }
@@ -85,18 +89,20 @@ impl ClassFilter {
         sorted_unique(&mut class.added_entities);
         sorted_unique(&mut class.removed_entities);
 
-        if cpu_hidden {
-            let mut index = 0;
-            class.entities_cpu_culling.retain(|pair| {
-                let position = index;
-                index += 1;
-                if now_hidden.contains(&pair.1) {
-                    saved.cpu.push((position, *pair));
-                    false
-                } else {
-                    true
+        if !cpu_slots.is_empty() {
+            cpu_slots.sort_unstable_by_key(|(slot, _)| *slot);
+            let cpu = &mut class.entities_cpu_culling;
+            let mut slots = cpu_slots.iter().map(|(slot, _)| *slot).peekable();
+            let mut kept = 0;
+            for read in 0..cpu.len() {
+                if slots.next_if_eq(&read).is_some() {
+                    continue;
                 }
-            });
+                cpu[kept] = cpu[read];
+                kept += 1;
+            }
+            cpu.truncate(kept);
+            saved.cpu = cpu_slots;
         }
         for main in &now_hidden {
             if let Some(render) = class.entities_gpu_culling.remove(main) {
@@ -181,18 +187,21 @@ pub fn visible_len(class: &RenderVisibleEntitiesClass) -> usize {
     class.entities_cpu_culling.len() + class.entities_gpu_culling.len()
 }
 
-/// The view's own pair for `main`, and whether it sits in the CPU-culled list.
-fn visible_pair(class: &RenderVisibleEntitiesClass, main: MainEntity) -> Option<(Pair, bool)> {
+/// The view's own pair for `main`, and its slot in the CPU-culled list when it sits there.
+fn visible_pair(
+    class: &RenderVisibleEntitiesClass,
+    main: MainEntity,
+) -> Option<(Pair, Option<usize>)> {
     if let Ok(index) = class
         .entities_cpu_culling
         .binary_search_by_key(&main, |(_, main)| *main)
     {
-        return Some((class.entities_cpu_culling[index], true));
+        return Some((class.entities_cpu_culling[index], Some(index)));
     }
     class
         .entities_gpu_culling
         .get(&main)
-        .map(|render| ((*render, main), false))
+        .map(|render| ((*render, main), None))
 }
 
 fn sorted_unique(events: &mut Vec<Pair>) {

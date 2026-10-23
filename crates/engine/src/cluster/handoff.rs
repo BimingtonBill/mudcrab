@@ -1758,14 +1758,9 @@ fn extract_sources(
             .is_some_and(|meshes| meshes.is_changed());
     out.lazy_layout_scope = layout_scope;
     out.fixture_layout_scope = fixture_meshes.is_some();
-    let (mut templates, mut normal_maps, mut source_fallback_batches, redo) = if full {
+    let mut redo = if full {
         out.template_rows = TemplateRows::default();
-        (
-            vec![false; batches],
-            vec![false; batches],
-            BTreeSet::new(),
-            (0..batches as u32).collect::<BTreeSet<u32>>(),
-        )
+        (0..batches as u32).collect::<BTreeSet<u32>>()
     } else {
         let mut redo = std::mem::take(&mut out.template_rows.pending);
         if handles.is_changed()
@@ -1785,8 +1780,8 @@ fn extract_sources(
             }
             // Truncation must remove old inverse memberships and pending rows too.
             for index in batches..out.template_inputs.len() {
-                out.template_rows
-                    .remove(index as u32, out.template_inputs[index]);
+                let previous = out.template_inputs[index];
+                out.template_rows.remove(index as u32, previous);
             }
         }
         for id in &dropped_materials {
@@ -1795,90 +1790,110 @@ fn extract_sources(
         for id in &dropped_scenes {
             redo.extend(out.template_rows.by_scene.get(id).into_iter().flatten());
         }
-        (
-            out.templates.clone(),
-            out.normal_maps.clone(),
-            out.source_fallback_batches.clone(),
-            redo,
-        )
+        redo
     };
-    templates.resize(batches, false);
-    normal_maps.resize(batches, false);
-    let mut stock_tangents = if full {
-        vec![None; batches]
-    } else {
-        out.stock_tangents.clone()
-    };
-    stock_tangents.resize(batches, None);
-    let inputs = TemplateAssets {
-        standards: &standards,
-        snow: snow.as_deref(),
-        lazy: lazy.as_deref(),
-        scenes: assets.as_deref(),
-        meshes: stock_meshes,
-        fixtures: fixture_meshes.as_deref(),
-    };
-    let mut redo = redo;
     redo.extend(dropped_fixture_rows);
-    source_fallback_batches.retain(|index| (*index as usize) < batches);
-    out.template_inputs.truncate(batches);
-    for index in redo {
-        if index as usize >= batches {
-            continue;
-        }
-        if let Some(&previous) = out.template_inputs.get(index as usize) {
-            out.template_rows.remove(index, previous);
-        }
-        work.template_rows += 1;
-        let Some(handle) = handles.handles.get(index as usize) else {
-            continue;
-        };
-        let row = match handle {
-            Some(handle) => template_row(
-                index,
-                handle,
-                TemplateCaches {
-                    geometry: &mut out.geometry_cache,
-                    templates: &mut out.template_cache,
-                    template_meshes: &mut out.template_meshes,
-                    invalid_templates: &out.invalid_templates,
-                    invalid_meshes: &out.invalid_meshes,
-                    rows: &mut out.template_rows,
-                },
-                &inputs,
-            ),
-            None => TemplateRow::default(),
-        };
-        let input = (
-            handle.as_ref().map(|handle| handle.id()),
-            lazy.as_deref()
-                .and_then(|lazy| lazy.source_scene(index))
-                .map(|scene| scene.id()),
-        );
-        if out.template_inputs.len() <= index as usize {
-            out.template_inputs.resize(index as usize + 1, (None, None));
-        }
-        out.template_inputs[index as usize] = input;
-        templates[index as usize] = row.template;
-        normal_maps[index as usize] = row.normal_map;
-        stock_tangents[index as usize] = row.stock_tangents;
-        if row.fallback {
-            source_fallback_batches.insert(index);
+    // With no row to decide again and the batch count unchanged, the stored rows are exact:
+    // keep them in place rather than copying every batch's row each frame. `rebuilt` holds the
+    // new templates and normal maps only when a row was decided again.
+    let unchanged = !full
+        && redo.is_empty()
+        && out.template_inputs.len() == batches
+        && out.templates.len() == batches
+        && out.normal_maps.len() == batches
+        && out.stock_tangents.len() == batches
+        && out
+            .source_fallback_batches
+            .last()
+            .is_none_or(|last| (*last as usize) < batches);
+    let mut layout_changed = false;
+    let rebuilt = (!unchanged).then(|| {
+        let (mut templates, mut normal_maps, mut source_fallback_batches) = if full {
+            (vec![false; batches], vec![false; batches], BTreeSet::new())
         } else {
-            source_fallback_batches.remove(&index);
+            (
+                out.templates.clone(),
+                out.normal_maps.clone(),
+                out.source_fallback_batches.clone(),
+            )
+        };
+        templates.resize(batches, false);
+        normal_maps.resize(batches, false);
+        let mut stock_tangents = if full {
+            vec![None; batches]
+        } else {
+            out.stock_tangents.clone()
+        };
+        stock_tangents.resize(batches, None);
+        let inputs = TemplateAssets {
+            standards: &standards,
+            snow: snow.as_deref(),
+            lazy: lazy.as_deref(),
+            scenes: assets.as_deref(),
+            meshes: stock_meshes,
+            fixtures: fixture_meshes.as_deref(),
+        };
+        source_fallback_batches.retain(|index| (*index as usize) < batches);
+        out.template_inputs.truncate(batches);
+        for index in std::mem::take(&mut redo) {
+            if index as usize >= batches {
+                continue;
+            }
+            if let Some(&previous) = out.template_inputs.get(index as usize) {
+                out.template_rows.remove(index, previous);
+            }
+            work.template_rows += 1;
+            let Some(handle) = handles.handles.get(index as usize) else {
+                continue;
+            };
+            let row = match handle {
+                Some(handle) => template_row(
+                    index,
+                    handle,
+                    TemplateCaches {
+                        geometry: &mut out.geometry_cache,
+                        templates: &mut out.template_cache,
+                        template_meshes: &mut out.template_meshes,
+                        invalid_templates: &out.invalid_templates,
+                        invalid_meshes: &out.invalid_meshes,
+                        rows: &mut out.template_rows,
+                    },
+                    &inputs,
+                ),
+                None => TemplateRow::default(),
+            };
+            let input = (
+                handle.as_ref().map(|handle| handle.id()),
+                lazy.as_deref()
+                    .and_then(|lazy| lazy.source_scene(index))
+                    .map(|scene| scene.id()),
+            );
+            if out.template_inputs.len() <= index as usize {
+                out.template_inputs.resize(index as usize + 1, (None, None));
+            }
+            out.template_inputs[index as usize] = input;
+            templates[index as usize] = row.template;
+            normal_maps[index as usize] = row.normal_map;
+            stock_tangents[index as usize] = row.stock_tangents;
+            if row.fallback {
+                source_fallback_batches.insert(index);
+            } else {
+                source_fallback_batches.remove(&index);
+            }
+            if row.pending {
+                out.template_rows.pending.insert(index);
+            }
         }
-        if row.pending {
-            out.template_rows.pending.insert(index);
+        layout_changed = out.stock_tangents != stock_tangents;
+        if layout_changed {
+            out.stock_tangents = stock_tangents;
+            out.layout_version = out.layout_version.wrapping_add(1);
         }
-    }
-    let layout_changed = out.stock_tangents != stock_tangents;
-    if layout_changed {
-        out.stock_tangents = stock_tangents;
-        out.layout_version = out.layout_version.wrapping_add(1);
-    }
-    // Pending=false -> loaded-invalid=false does not change templates. Keep its
-    // negative demand independently so that transition cannot be lost.
-    out.source_fallback_batches = source_fallback_batches;
+        // Pending=false -> loaded-invalid=false does not change templates. Keep its
+        // negative demand independently so that transition cannot be lost.
+        out.source_fallback_batches = source_fallback_batches;
+        (templates, normal_maps)
+    });
     drop(templates_span);
     let templates_elapsed = templates_started.elapsed();
     let terrain_started = std::time::Instant::now();
@@ -1988,8 +2003,13 @@ fn extract_sources(
     let stock_primitives_changed = fresh
         .as_ref()
         .is_some_and(|facts| out.stock_primitives != facts.stock_primitives);
-    let templates_changed = out.templates != templates;
-    if templates_changed && bevy::log::tracing::enabled!(bevy::log::tracing::Level::DEBUG) {
+    let templates_changed = rebuilt
+        .as_ref()
+        .is_some_and(|(templates, _)| out.templates != *templates);
+    if templates_changed
+        && bevy::log::tracing::enabled!(bevy::log::tracing::Level::DEBUG)
+        && let Some((templates, _)) = rebuilt.as_ref()
+    {
         for (index, &valid) in templates.iter().enumerate() {
             if out.templates.get(index).copied().unwrap_or(false) == valid {
                 continue;
@@ -2005,7 +2025,9 @@ fn extract_sources(
                 "cluster source template qualification changed");
         }
     }
-    let normal_maps_changed = out.normal_maps != normal_maps;
+    let normal_maps_changed = rebuilt
+        .as_ref()
+        .is_some_and(|(_, normal_maps)| out.normal_maps != *normal_maps);
     let worlds_changed = out.worlds != worlds;
     let light_dependencies_changed = out.light_dependencies != light_dependencies;
     let terrain_change = fresh_terrain
@@ -2049,8 +2071,12 @@ fn extract_sources(
                     retired_eligibility,
                     bound,
                     stock_primitives,
-                    templates: &templates,
-                    normal_maps: &normal_maps,
+                    templates: rebuilt
+                        .as_ref()
+                        .map_or(&out.templates, |(templates, _)| templates),
+                    normal_maps: rebuilt
+                        .as_ref()
+                        .map_or(&out.normal_maps, |(_, normal_maps)| normal_maps),
                     worlds: &worlds,
                     light_dependencies: &light_dependencies,
                     terrain,
@@ -2098,8 +2124,10 @@ fn extract_sources(
             out.bound = facts.bound;
             out.stock_primitives = facts.stock_primitives;
         }
-        out.templates = templates;
-        out.normal_maps = normal_maps;
+        if let Some((templates, normal_maps)) = rebuilt {
+            out.templates = templates;
+            out.normal_maps = normal_maps;
+        }
         out.worlds = worlds;
         out.light_dependencies = light_dependencies;
         if let Some(terrain) = fresh_terrain {
@@ -2629,60 +2657,93 @@ fn table_group(view: &ViewGpu, batch: usize) -> Option<u32> {
         .then(|| u32::from_le_bytes(row[4..8].try_into().unwrap()))
 }
 
-/// Evaluate every batch against this render invocation's exact view plan and
-/// resources. Successful readiness is revalidated too; it is not monotonic.
-fn cached_batch_readiness(
-    gpu: &mut ClusterGpu,
-    key: RetainedViewEntity,
-    materials_version: Option<u64>,
-    shadow: bool,
-    prepass: bool,
-    dependencies: (
-        &PipelineCache,
-        &ErasedRenderAssets<PreparedMaterial>,
-        &MaterialBindGroupAllocators,
-        Option<&crate::far_terrain_shadows::render::State>,
-    ),
-) -> Vec<bool> {
-    // Revalidate successful predicates too. Material slabs, pipeline state and far
-    // bindings are current render facts, not a monotonic historical receipt.
-    let _ = materials_version;
-    views_batch_readiness(gpu, &gpu.views[&key], shadow, prepass, dependencies)
+type ReadinessDependencies<'a> = (
+    &'a PipelineCache,
+    &'a ErasedRenderAssets<PreparedMaterial>,
+    &'a MaterialBindGroupAllocators,
+    Option<&'a crate::far_terrain_shadows::render::State>,
+);
+
+/// Each batch's prepared material when it is current for the batch (its slab bound, its slot
+/// the one the batch was built with): the part of readiness no view changes, so a frame looks it
+/// up once for all its views.
+fn batch_materials_now<'a>(
+    gpu: &ClusterGpu,
+    materials: &'a ErasedRenderAssets<PreparedMaterial>,
+    allocators: &MaterialBindGroupAllocators,
+) -> Vec<Option<&'a PreparedMaterial>> {
+    // Sequential: the pool's tasks cannot hold borrows of the render world's assets.
+    (0..gpu.batches.len())
+        .map(|batch| batch_material(gpu, batch, materials, allocators))
+        .collect()
 }
 
+/// Evaluate every batch against this render invocation's exact view plan and
+/// resources. Successful readiness is revalidated too; it is not monotonic.
 fn views_batch_readiness(
     gpu: &ClusterGpu,
     view: &ViewGpu,
     shadow: bool,
     prepass: bool,
-    dependencies: (
-        &PipelineCache,
-        &ErasedRenderAssets<PreparedMaterial>,
-        &MaterialBindGroupAllocators,
-        Option<&crate::far_terrain_shadows::render::State>,
-    ),
+    current: &[Option<&PreparedMaterial>],
+    cache: &PipelineCache,
+    far_state: Option<&crate::far_terrain_shadows::render::State>,
 ) -> Vec<bool> {
+    // Whether the view's far binding is current is one fact per view, not per batch.
+    let far_current = !shadow && super::far::current(gpu, view, far_state);
+    par_batches(gpu.batches.len(), |batch| {
+        batch_ready_with(
+            gpu,
+            view,
+            batch,
+            current[batch],
+            || far_current,
+            shadow,
+            prepass,
+            cache,
+        )
+    })
+}
+
+/// `f` over every batch index, split across the compute pool when there are enough batches.
+fn par_batches<T: Send + 'static>(batches: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     /// Below this many batches a chunk costs more to hand out than it saves.
     const CHUNK: usize = 512;
-    let batches = gpu.batches.len();
-    let ready = |range: std::ops::Range<usize>| -> Vec<bool> {
-        range
-            .map(|batch| batch_ready(gpu, view, batch, shadow, prepass, dependencies))
-            .collect()
-    };
+    let run = |range: std::ops::Range<usize>| -> Vec<T> { range.map(&f).collect() };
     let pool = bevy::tasks::ComputeTaskPool::get();
     let threads = pool.thread_num().max(1);
     if batches <= CHUNK || threads == 1 {
-        return ready(0..batches);
+        return run(0..batches);
     }
     let chunk = batches.div_ceil(threads).max(CHUNK);
     pool.scope(|scope| {
         for start in (0..batches).step_by(chunk) {
-            let ready = &ready;
-            scope.spawn(async move { ready(start..(start + chunk).min(batches)) });
+            let run = &run;
+            scope.spawn(async move { run(start..(start + chunk).min(batches)) });
         }
     })
-    .concat()
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn batch_material<'a>(
+    gpu: &ClusterGpu,
+    batch: usize,
+    materials: &'a ErasedRenderAssets<PreparedMaterial>,
+    allocators: &MaterialBindGroupAllocators,
+) -> Option<&'a PreparedMaterial> {
+    let asset = gpu.batches[batch].material?;
+    let material = materials.get(asset)?;
+    if allocators
+        .get(&asset.type_id())
+        .and_then(|allocator| allocator.get(material.binding.group))
+        .is_none_or(|slab| slab.bind_group().is_none())
+    {
+        return None;
+    }
+    // A slot/group rewrite or a hot-reloaded specialization cannot inherit an old plan.
+    (gpu.batches[batch].material_slot == Some(u32::from(material.binding.slot))).then_some(material)
 }
 
 fn batch_ready(
@@ -2691,37 +2752,41 @@ fn batch_ready(
     batch: usize,
     shadow: bool,
     prepass: bool,
-    dependencies: (
-        &PipelineCache,
-        &ErasedRenderAssets<PreparedMaterial>,
-        &MaterialBindGroupAllocators,
-        Option<&crate::far_terrain_shadows::render::State>,
-    ),
+    dependencies: ReadinessDependencies,
 ) -> bool {
     let (cache, materials, allocators, far_state) = dependencies;
+    batch_ready_with(
+        gpu,
+        view,
+        batch,
+        batch_material(gpu, batch, materials, allocators),
+        || super::far::current(gpu, view, far_state),
+        shadow,
+        prepass,
+        cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_ready_with(
+    gpu: &ClusterGpu,
+    view: &ViewGpu,
+    batch: usize,
+    material: Option<&PreparedMaterial>,
+    far_current: impl FnOnce() -> bool,
+    shadow: bool,
+    prepass: bool,
+    cache: &PipelineCache,
+) -> bool {
     let Some(group) = table_group(view, batch) else {
         return false;
     };
     let Some(draw) = view.draws.get(&group) else {
         return false;
     };
-    let Some(asset) = gpu.batches[batch].material else {
+    let (Some(material), Some(asset)) = (material, gpu.batches[batch].material) else {
         return false;
     };
-    let Some(material) = materials.get(asset) else {
-        return false;
-    };
-    if allocators
-        .get(&asset.type_id())
-        .and_then(|allocator| allocator.get(material.binding.group))
-        .is_none_or(|slab| slab.bind_group().is_none())
-    {
-        return false;
-    }
-    // A slot/group rewrite or a hot-reloaded specialization cannot inherit an old plan.
-    if gpu.batches[batch].material_slot != Some(u32::from(material.binding.slot)) {
-        return false;
-    }
     if !shadow
         && view
             .memo
@@ -2729,7 +2794,7 @@ fn batch_ready(
             .copied()
             .flatten()
             .is_some_and(|memo| memo.resolved.far)
-        && !super::far::current(gpu, view, far_state)
+        && !far_current()
     {
         return false;
     }
@@ -3386,10 +3451,9 @@ fn select_instances(
     mut shadows: Query<&mut RenderShadowMapVisibleEntities>,
     scene: Option<Res<ClusterScene>>,
     mut filters: ResMut<Filters>,
-    (native, settings, batch_materials, runtime_state, mut terrain_coverage, dirty): (
+    (native, settings, runtime_state, mut terrain_coverage, dirty): (
         Option<Res<crate::streaming::native_lod::FarNativePolicy>>,
         Option<Res<ClusterSettings>>,
-        Option<Res<super::ClusterBatchMaterials>>,
         Option<Res<super::super::runtime_state::RuntimeReferenceState>>,
         ResMut<crate::streaming::terrain_handoff::ClusterCoverage>,
         Option<Res<bevy::render::camera::DirtySpecializations>>,
@@ -3460,6 +3524,10 @@ fn select_instances(
         (None, None) => true,
         _ => false,
     };
+    let current_materials = {
+        perf_span!("cluster::select::materials");
+        batch_materials_now(&gpu, &materials, &allocators)
+    };
     // The views whose selection this frame rebuilt; only their masks can have changed.
     let mut rebuilt = HashSet::new();
     let mut covered_views = HashSet::new();
@@ -3479,13 +3547,14 @@ fn select_instances(
                 && settings.as_ref().is_none_or(|settings| settings.prepass);
             let layers: &RenderLayers = &layers_by_view[key];
             let readiness_span = ::bevy::log::info_span!("cluster::select::readiness").entered();
-            let readiness = cached_batch_readiness(
-                &mut gpu,
-                *key,
-                batch_materials.as_ref().map(|materials| materials.version),
+            let readiness = views_batch_readiness(
+                &gpu,
+                &gpu.views[key],
                 shadow,
                 prepass,
-                (&cache, &materials, &allocators, far_state.as_deref()),
+                &current_materials,
+                &cache,
+                far_state.as_deref(),
             );
             drop(readiness_span);
             let stamp = [

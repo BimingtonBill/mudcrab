@@ -81,6 +81,9 @@ struct Inputs {
     /// Ready object blocks whose root is not drawing this frame (spawned Hidden and not yet
     /// shown by the loader, or held). They cannot replace a drawing parent.
     hidden_roots: HashSet<BlockKey>,
+    /// `near`, `object_meshes` and `native` merged by entity, rebuilt when one of them changes,
+    /// so the filter's walk of each view's visible class looks every entity up once.
+    roles: HashMap<MainEntity, MeshRoles>,
     origin: IVec2,
     distances: crate::config::TerrainLodDistances,
     stream_radius: i32,
@@ -88,6 +91,14 @@ struct Inputs {
     /// inputs from a new one without comparing them.
     generation: u64,
 }
+/// What the filter reads of one mesh: its near cell, its object LOD block, its native LOD cell.
+#[derive(Clone, Copy, Default)]
+struct MeshRoles {
+    near: Option<NativeLodCell>,
+    block: Option<BlockKey>,
+    native: Option<NativeLodCell>,
+}
+
 #[derive(Resource, Default)]
 struct Filters {
     filters: HashMap<Entity, ClassFilter>,
@@ -402,8 +413,10 @@ fn extract(
     let counts = [changes.parented.iter().len(), changes.meshes.iter().len()];
     let hierarchy_moved = !changes.hierarchy.is_empty();
     let current = Some((counts, roots, resident));
+    let mut maps_changed = false;
     if hierarchy_moved || walks.key != current {
         moved = true;
+        maps_changed = true;
         perf_span!("native_lod::extract::walk");
         crate::work_counters::record("native_lod/descendant_walk");
         out.object_meshes.clear();
@@ -463,6 +476,20 @@ fn extract(
         out.native = native.iter().map(|(e, c)| (e.into(), *c)).collect();
         walks.native_count = native_count;
         moved = true;
+        maps_changed = true;
+    }
+    if maps_changed {
+        let mut roles = HashMap::<MainEntity, MeshRoles>::new();
+        for (main, cell) in &out.near {
+            roles.entry(*main).or_default().near = Some(*cell);
+        }
+        for (main, key) in &out.object_meshes {
+            roles.entry(*main).or_default().block = Some(*key);
+        }
+        for (main, cell) in &out.native {
+            roles.entry(*main).or_default().native = Some(*cell);
+        }
+        out.roles = roles;
     }
     let previous_ready = std::mem::take(&mut out.ready);
     // Which near cells are drawn whole is read only by `filter`, and only when it has object LOD
@@ -561,14 +588,17 @@ fn filter(
         let mut block_visible = Vec::new();
         let mut native_visible = Vec::new();
         for (_, main) in class.iter_visible() {
-            if let Some(cell) = inputs.near.get(main) {
-                near_visible.push((*main, *cell));
+            let Some(roles) = inputs.roles.get(main) else {
+                continue;
+            };
+            if let Some(cell) = roles.near {
+                near_visible.push((*main, cell));
             }
-            if let Some(key) = inputs.object_meshes.get(main) {
-                block_visible.push((*main, *key));
+            if let Some(key) = roles.block {
+                block_visible.push((*main, key));
             }
-            if let Some(cell) = inputs.native.get(main) {
-                native_visible.push((*main, *cell));
+            if let Some(cell) = roles.native {
+                native_visible.push((*main, cell));
             }
         }
         let mut readiness: HashMap<NativeLodCell, Vec<bool>> = HashMap::new();
