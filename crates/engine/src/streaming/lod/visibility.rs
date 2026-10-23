@@ -45,8 +45,8 @@ use super::super::{
 };
 use super::{
     LodChunkRoot, LodDemandViews, LodStreaming, chebyshev_grid_distance,
-    record_terrain_batch_progress, select_ready_terrain_lod_tier, terrain_batch_budget_available,
-    terrain_batching,
+    record_terrain_batch_progress, select_ready_terrain_lod_tier, terrain_batching,
+    terrain_handover_budget_available,
 };
 use crate::{
     config::{EngineConfig, TerrainLodDistances},
@@ -1517,7 +1517,7 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     if let Some(budget) = budget.as_deref_mut() {
         let mut state = streaming.p1();
         if !state.terrain_batch_commit_used
-            && terrain_batch_budget_available(budget, config.max_commit_micros_per_frame)
+            && terrain_handover_budget_available(budget, config.max_commit_micros_per_frame)
         {
             if batches.finalize_one(&mut state.replaced_source_quadrants) {
                 state.terrain_batch_commit_used = true;

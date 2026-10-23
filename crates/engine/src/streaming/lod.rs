@@ -1928,8 +1928,21 @@ fn record_terrain_batch_progress(
     }
 }
 
+/// Whether a CPU batching commit may run this frame: a commit slot is left and the frame's
+/// commit time is not spent. A conversion can take milliseconds, so a late frame holds it.
 fn terrain_batch_budget_available(budget: &StreamingCommitBudget, max_micros: u64) -> bool {
     budget.remaining != 0 && budget.frame_started.elapsed().as_micros() < u128::from(max_micros)
+}
+
+/// Whether a source hand-over may run this frame: a commit slot is left and, once anything has
+/// committed this frame, its time budget is too. Like cells and distant LOD requests, the first
+/// one of a frame is never held by time. The hand-over of offscreen batches runs in `Last`, long
+/// after the commit window opened; on a frame slower than the budget a time check alone would
+/// hold it forever, and the source hierarchies it keeps would keep the frames slow.
+fn terrain_handover_budget_available(budget: &StreamingCommitBudget, max_micros: u64) -> bool {
+    budget.remaining != 0
+        && !(budget.commits > 0
+            && budget.frame_started.elapsed().as_micros() >= u128::from(max_micros))
 }
 
 fn fail_chunk(
@@ -2472,6 +2485,33 @@ fn update_counts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_terrain_handover_of_a_frame_is_never_held_by_time() {
+        let mut budget = crate::streaming::StreamingCommitBudget {
+            remaining: 1,
+            ..Default::default()
+        };
+        // A late frame (the hand-over runs in `Last`) with nothing committed yet still moves.
+        budget.frame_started = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert!(terrain_handover_budget_available(&budget, 4_000));
+        assert!(
+            !terrain_batch_budget_available(&budget, 4_000),
+            "a late frame still holds a CPU batching commit"
+        );
+        budget.commits = 1;
+        assert!(
+            !terrain_handover_budget_available(&budget, 4_000),
+            "after a commit, the spent time budget holds the next step"
+        );
+        budget.frame_started = std::time::Instant::now();
+        assert!(terrain_handover_budget_available(&budget, 4_000));
+        budget.remaining = 0;
+        assert!(
+            !terrain_handover_budget_available(&budget, 4_000),
+            "no slot left"
+        );
+    }
 
     fn fixture_chunk_owner(world: &mut World, tier: LodTier, grid: IVec2) -> Entity {
         let worldspace_id = world.resource::<EngineConfig>().worldspace_id;

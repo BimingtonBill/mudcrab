@@ -720,6 +720,8 @@ struct RetireBlockers {
     /// The batches counted in `owned_undrawn_batch_viewed`, with the mesh they must draw, for the
     /// per-batch probe in the stall log.
     viewed_undrawn: Vec<(Entity, AssetId<Mesh>)>,
+    /// The first few batches counted in `owned_undrawn_not_prepared`, with their mesh and material.
+    not_prepared: Vec<(Entity, AssetId<Mesh>, bevy::asset::UntypedAssetId)>,
 }
 
 #[derive(SystemParam)]
@@ -845,6 +847,13 @@ impl LodBatchVisibility<'_, '_> {
                         out.owned_undrawn_region_observed += 1;
                     } else {
                         out.owned_undrawn_not_prepared += 1;
+                        if out.not_prepared.len() < 4 {
+                            out.not_prepared.push((
+                                batch.entity,
+                                batch.mesh.id(),
+                                batch.state.material.id().untyped(),
+                            ));
+                        }
                     }
                     stopped = true;
                     break;
@@ -1297,7 +1306,7 @@ pub(in crate::streaming) fn finalize_unviewed_lod_batches(
     if !config.cluster_terrain
         || config.clusters.is_none()
         || streaming.terrain_batch_commit_used
-        || !super::terrain_batch_budget_available(&budget, config.max_commit_micros_per_frame)
+        || !super::terrain_handover_budget_available(&budget, config.max_commit_micros_per_frame)
     {
         return;
     }
@@ -1343,6 +1352,17 @@ pub(crate) struct RetireReport<'w, 's> {
             Option<&'static ViewVisibility>,
         ),
     >,
+    prepared_probe: Query<
+        'w,
+        's,
+        (
+            Has<crate::swap_bridge::SwapWaiting>,
+            Has<crate::swap_bridge::SwapPrepared>,
+            Option<&'static Mesh3d>,
+            Option<&'static crate::swap_bridge::SwapSurface>,
+            Option<&'static Visibility>,
+        ),
+    >,
 }
 
 impl RetireReport<'_, '_> {
@@ -1378,6 +1398,29 @@ impl RetireReport<'_, '_> {
                 inherited = inherited.map(|v| v.get()),
                 view = view.map(|v| v.get()),
                 "viewed undrawn terrain batch"
+            );
+        }
+        // Why an offscreen batch has no matching prepared marker: the bridge's markers on it and
+        // whether the prepared one names the batch's current mesh and material.
+        for (entity, mesh, material) in &blockers.not_prepared {
+            info!(
+                ?entity,
+                waiting = self.prepared_probe.get(*entity).is_ok_and(|p| p.0),
+                prepared_marker = self.prepared_probe.get(*entity).is_ok_and(|p| p.1),
+                mesh_current = self
+                    .prepared_probe
+                    .get(*entity)
+                    .ok()
+                    .and_then(|p| p.2)
+                    .map(|m| m.0.id() == *mesh),
+                surface_material_current = self
+                    .prepared_probe
+                    .get(*entity)
+                    .ok()
+                    .and_then(|p| p.3)
+                    .map(|s| s.material_id() == *material),
+                visibility = ?self.prepared_probe.get(*entity).ok().and_then(|p| p.4),
+                "offscreen terrain batch without a prepared marker"
             );
         }
         info!(?blockers, "terrain batches awaiting source retirement");
