@@ -729,9 +729,16 @@ fn observe_coverage_roots(
                 descendants.extend(children.iter());
             }
         }
-        world
-            .entity_mut(root)
-            .insert(SwapCoverageInCameraView(seen));
+        // Written only when the observation changes: an unchanged insert would still mark the
+        // root changed every frame for whatever watches it.
+        if world
+            .get::<SwapCoverageInCameraView>(root)
+            .is_none_or(|observed| observed.0 != seen)
+        {
+            world
+                .entity_mut(root)
+                .insert(SwapCoverageInCameraView(seen));
+        }
     }
     observed_roots
 }
@@ -1468,6 +1475,23 @@ mod tests {
         assert!(app.world().get::<SwapStandIn>(root).is_none());
         assert_eq!(observe_coverage_roots(app.world_mut(), |_| false), 1);
         assert!(!app.world().get::<SwapCoverageInCameraView>(root).unwrap().0);
+        // An unchanged observation is not written again, so the root is not marked changed.
+        let before = app
+            .world()
+            .entity(root)
+            .get_ref::<SwapCoverageInCameraView>()
+            .unwrap()
+            .last_changed();
+        app.world_mut().increment_change_tick();
+        assert_eq!(observe_coverage_roots(app.world_mut(), |_| false), 1);
+        assert_eq!(
+            app.world()
+                .entity(root)
+                .get_ref::<SwapCoverageInCameraView>()
+                .unwrap()
+                .last_changed(),
+            before
+        );
         app.update();
         assert!(
             alive(&app, root),

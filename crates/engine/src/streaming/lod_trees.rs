@@ -299,6 +299,10 @@ pub(super) struct TreeLodStreaming {
     /// `--lod-keep-hidden-in-interiors` is holding the ready blocks hidden and the catalog loaded
     /// for the return to the exterior; the return shows them again.
     held: bool,
+    /// The visibility every ready block carries (shown or hidden), so it is written only when it
+    /// changes: a write marks the block changed and Bevy then re-propagates visibility through
+    /// all its cells. New blocks spawn with the state the current demand asks for.
+    blocks_shown: Option<bool>,
 }
 
 impl TreeLodStreaming {
@@ -379,15 +383,12 @@ fn plan_tree_lod(
         streaming.plan_dirty = true;
     }
     streaming.demand = demand;
-    for status in streaming.blocks.values() {
-        if let TreeBlockStatus::Ready { root } = status {
-            commands.entity(*root).try_insert(
-                if demand.is_some_and(|d| d.role != LodDemandRole::Pinned) {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                },
-            );
+    let shown = demand.is_some_and(|d| d.role != LodDemandRole::Pinned);
+    if let Some(visibility) = block_visibility_to_write(&mut streaming, shown) {
+        for status in streaming.blocks.values() {
+            if let TreeBlockStatus::Ready { root } = status {
+                commands.entity(*root).try_insert(visibility);
+            }
         }
     }
     let Some((worldspace_id, world)) = world else {
@@ -406,6 +407,7 @@ fn plan_tree_lod(
                     commands.entity(*root).try_insert(Visibility::Hidden);
                 }
             }
+            streaming.blocks_shown = Some(false);
             streaming.held = true;
         } else {
             clear_blocks(&mut commands, &mut streaming);
@@ -427,6 +429,7 @@ fn plan_tree_lod(
                     commands.entity(*root).try_insert(Visibility::Inherited);
                 }
             }
+            streaming.blocks_shown = Some(true);
         }
     }
     if streaming.stopped {
@@ -601,6 +604,18 @@ fn plan_tree_lod(
 }
 
 /// Despawns every tree block and forgets the requests: a change of worldspace, or LOD stopping.
+/// The visibility to write on every ready block, or `None` while they already carry it.
+fn block_visibility_to_write(streaming: &mut TreeLodStreaming, shown: bool) -> Option<Visibility> {
+    (streaming.blocks_shown != Some(shown)).then(|| {
+        streaming.blocks_shown = Some(shown);
+        if shown {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        }
+    })
+}
+
 fn clear_blocks(commands: &mut Commands, streaming: &mut TreeLodStreaming) {
     for (_, status) in streaming.blocks.drain() {
         if let TreeBlockStatus::Ready { root } = status {
@@ -867,6 +882,27 @@ fn update_counts(streaming: &TreeLodStreaming, metrics: &mut StreamingMetrics) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_visibility_is_written_only_when_it_changes() {
+        let mut streaming = TreeLodStreaming::default();
+        assert_eq!(
+            block_visibility_to_write(&mut streaming, true),
+            Some(Visibility::Inherited)
+        );
+        assert_eq!(
+            block_visibility_to_write(&mut streaming, true),
+            None,
+            "a settled frame writes nothing, so no block is marked changed"
+        );
+        assert_eq!(
+            block_visibility_to_write(&mut streaming, false),
+            Some(Visibility::Hidden)
+        );
+        // Holding in an interior hides every block itself; the return shows them again.
+        streaming.blocks_shown = Some(true);
+        assert_eq!(block_visibility_to_write(&mut streaming, true), None);
+    }
 
     #[test]
     fn failed_tree_types_hold_only_blocks_that_demand_them() {
