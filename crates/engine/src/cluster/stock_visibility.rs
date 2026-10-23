@@ -171,6 +171,16 @@ pub fn visible_pairs<'a>(
         .collect()
 }
 
+/// Whether the view sees `main`: a binary search of the CPU-culled list, then the GPU map.
+pub fn sees(class: &RenderVisibleEntitiesClass, main: MainEntity) -> bool {
+    visible_pair(class, main).is_some()
+}
+
+/// How many entities the view sees, both lists.
+pub fn visible_len(class: &RenderVisibleEntitiesClass) -> usize {
+    class.entities_cpu_culling.len() + class.entities_gpu_culling.len()
+}
+
 /// The view's own pair for `main`, and whether it sits in the CPU-culled list.
 fn visible_pair(class: &RenderVisibleEntitiesClass, main: MainEntity) -> Option<(Pair, bool)> {
     if let Ok(index) = class

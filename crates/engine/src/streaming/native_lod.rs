@@ -554,20 +554,35 @@ fn filter(
             filters.audit_counts.remove(&entity);
             continue;
         }
-        let mut readiness: HashMap<NativeLodCell, Vec<bool>> = HashMap::new();
+        // One walk of the view's visible class collects every entity this filter reads: near
+        // cells, object block meshes and native LOD draws. The class holds every visible mesh of
+        // the view, so each further walk cost as much as this one.
+        let mut near_visible = Vec::new();
+        let mut block_visible = Vec::new();
+        let mut native_visible = Vec::new();
         for (_, main) in class.iter_visible() {
             if let Some(cell) = inputs.near.get(main) {
-                readiness.entry(*cell).or_default().push(
-                    stock.drawable(*main, view.retained_view_entity, StockPassFamily::Forward)
-                        && (!(depth || normal || motion)
-                            || !stock.prepass_required(*main)
-                            || stock.drawable(
-                                *main,
-                                view.retained_view_entity,
-                                StockPassFamily::Prepass,
-                            )),
-                );
+                near_visible.push((*main, *cell));
             }
+            if let Some(key) = inputs.object_meshes.get(main) {
+                block_visible.push((*main, *key));
+            }
+            if let Some(cell) = inputs.native.get(main) {
+                native_visible.push((*main, *cell));
+            }
+        }
+        let mut readiness: HashMap<NativeLodCell, Vec<bool>> = HashMap::new();
+        for (main, cell) in &near_visible {
+            readiness.entry(*cell).or_default().push(
+                stock.drawable(*main, view.retained_view_entity, StockPassFamily::Forward)
+                    && (!(depth || normal || motion)
+                        || !stock.prepass_required(*main)
+                        || stock.drawable(
+                            *main,
+                            view.retained_view_entity,
+                            StockPassFamily::Prepass,
+                        )),
+            );
         }
         let covered: HashSet<_> = inputs
             .ready
@@ -590,23 +605,16 @@ fn filter(
                     .map(|key| (*key, !inputs.hidden_roots.contains(key))),
             );
         }
-        for (_, main) in class.iter_visible() {
-            if let Some(key) = inputs.object_meshes.get(main) {
-                let ready =
-                    stock.drawable(*main, view.retained_view_entity, StockPassFamily::Forward)
-                        && (!(depth || normal || motion)
-                            || !stock.prepass_required(*main)
-                            || stock.drawable(
-                                *main,
-                                view.retained_view_entity,
-                                StockPassFamily::Prepass,
-                            ));
-                *block_readiness.entry(*key).or_insert(true) &= ready;
-                if !ready && stats.frames.is_multiple_of(120) {
-                    *missing_stages
-                        .entry(stock.missing_stage(*main, view.retained_view_entity))
-                        .or_default() += 1;
-                }
+        for (main, key) in &block_visible {
+            let ready = stock.drawable(*main, view.retained_view_entity, StockPassFamily::Forward)
+                && (!(depth || normal || motion)
+                    || !stock.prepass_required(*main)
+                    || stock.drawable(*main, view.retained_view_entity, StockPassFamily::Prepass));
+            *block_readiness.entry(*key).or_insert(true) &= ready;
+            if !ready && stats.frames.is_multiple_of(120) {
+                *missing_stages
+                    .entry(stock.missing_stage(*main, view.retained_view_entity))
+                    .or_default() += 1;
             }
         }
         if !missing_stages.is_empty() {
@@ -648,10 +656,7 @@ fn filter(
             .unwrap_or_default();
         // A retained ancestor that the current view does not select is not
         // an outstanding draw. Only requested visible block candidates hold proof.
-        let visible_blocks: HashSet<_> = class
-            .iter_visible()
-            .filter_map(|(_, main)| inputs.object_meshes.get(main).copied())
-            .collect();
+        let visible_blocks: HashSet<_> = block_visible.iter().map(|(_, key)| *key).collect();
         stats.awaiting += plan
             .needed
             .iter()
@@ -666,9 +671,8 @@ fn filter(
             filters.audit_counts.remove(&entity);
         }
 
-        if filters.shown.get(&entity) != Some(&shown)
-            || filters.audited_near.get(&entity) != Some(&covered)
-        {
+        let shown_changed = filters.shown.get(&entity) != Some(&shown);
+        if shown_changed || filters.audited_near.get(&entity) != Some(&covered) {
             let mut coverage = HashMap::<IVec2, usize>::new();
             for (level, block) in &shown {
                 for dx in 0..i32::from(*level) {
@@ -716,25 +720,21 @@ fn filter(
             .unwrap_or_default();
         stats.drawn_twice += twice;
         stats.drawn_by_nothing += missing;
-        filters.shown.insert(entity, shown.clone());
-        let mut hidden: bevy::platform::collections::HashSet<MainEntity> = class
-            .iter_visible()
-            .filter_map(|(_, main)| {
-                inputs
-                    .object_meshes
-                    .get(main)
-                    .filter(|key| !shown.contains(key))
-                    .map(|_| *main)
-            })
+        let mut hidden: bevy::platform::collections::HashSet<MainEntity> = block_visible
+            .iter()
+            .filter(|(_, key)| !shown.contains(key))
+            .map(|(main, _)| *main)
             .collect();
-        hidden.extend(class.iter_visible().filter_map(|(_, main)| {
-            let cell = inputs.native.get(main)?;
+        hidden.extend(native_visible.iter().filter_map(|(main, cell)| {
             qualified_cell(
                 covered.contains(cell),
                 readiness.get(cell).into_iter().flatten().copied(),
             )
             .then_some(*main)
         }));
+        if shown_changed {
+            filters.shown.insert(entity, shown);
+        }
         stats.hidden_segments += hidden
             .iter()
             .filter(|main| {

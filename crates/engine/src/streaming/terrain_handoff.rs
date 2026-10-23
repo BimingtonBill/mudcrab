@@ -944,14 +944,29 @@ fn filter(
                     .ok()
                     .and_then(|shadow| shadow.subviews.get(&key)),
             };
-            // Only terrain surfaces can be complemented, so only they are collected.
+            // Only terrain surfaces can be complemented, so only they are collected, walking
+            // the smaller side: each surface looked up in the view (a binary search), or every
+            // visible mesh looked up in the surfaces. The set is the same either way.
             let visible: HashSet<_> = visible
                 .and_then(|visible| visible.get::<Mesh3d>())
-                .into_iter()
-                .flat_map(|class| class.iter_visible())
-                .map(|(_, main)| *main)
-                .filter(|main| terrain.surfaces.contains_key(main))
-                .collect();
+                .map(|class| {
+                    use crate::cluster::stock_visibility::{sees, visible_len};
+                    if terrain.surfaces.len() * 16 < visible_len(class) {
+                        terrain
+                            .surfaces
+                            .keys()
+                            .copied()
+                            .filter(|main| sees(class, *main))
+                            .collect()
+                    } else {
+                        class
+                            .iter_visible()
+                            .map(|(_, main)| *main)
+                            .filter(|main| terrain.surfaces.contains_key(main))
+                            .collect()
+                    }
+                })
+                .unwrap_or_default();
             let forward = queued.forward(&key);
             let prepass = queued.prepass(&key);
             let shadow = queued.shadow(&key);

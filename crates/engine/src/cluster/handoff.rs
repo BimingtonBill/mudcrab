@@ -1234,8 +1234,13 @@ fn extract_sources(
             identity_changed = true;
         }
     }
-    let other_changed = queries.fact_changes.iter().next().is_some();
-    changed.extend(queries.fact_changes.iter());
+    // One walk: the filter is an Or of change filters over every source-domain row, so asking
+    // "any?" first and then collecting walked the whole domain twice on an unchanged frame.
+    let mut other_changed = false;
+    for entity in &queries.fact_changes {
+        other_changed = true;
+        changed.insert(entity);
+    }
     let mut hot_changed = false;
     for entity in &queries.hot_changes {
         if queries.cache.index.contains_node(entity)
