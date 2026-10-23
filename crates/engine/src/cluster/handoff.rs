@@ -91,6 +91,8 @@ pub(super) struct Sources {
     lazy_layout_scope: Option<u64>,
     /// `LazyBatches::source_scenes_key` when the template inputs were last compared.
     lazy_scenes_key: Option<(u64, u64)>,
+    /// `LazyBatches::failed_key` when failed batches were last turned into fallback rows.
+    lazy_failed_key: Option<(u64, u64)>,
     fixture_layout_scope: bool,
     /// Definitive global template/material refusal, separate from loading false values.
     source_fallback_batches: BTreeSet<u32>,
@@ -1819,7 +1821,12 @@ fn extract_sources(
     redo.extend(dropped_fixture_rows);
     // A batch the loader gave up on (its source or material failed for good) draws stock: its row
     // is decided once, as a fallback, so the references it decides are decided too.
-    if let Some(lazy) = lazy.as_ref().filter(|lazy| lazy.is_changed()) {
+    let lazy_failed_key = lazy.as_deref().map(LazyBatches::failed_key);
+    if let Some(lazy) = lazy
+        .as_deref()
+        .filter(|_| lazy_failed_key != out.lazy_failed_key)
+    {
+        out.lazy_failed_key = lazy_failed_key;
         redo.extend(lazy.failed_batches().iter().filter_map(|&index| {
             let index = u32::try_from(index).ok()?;
             ((index as usize) < batches && !out.source_fallback_batches.contains(&index))

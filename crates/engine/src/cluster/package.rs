@@ -961,6 +961,7 @@ fn load_cluster_package(
         pending_snow: Vec::new(),
         demanded: default(),
         scenes_revision: 0,
+        failed_revision: 0,
     });
     info!(
         meshes = scene_meshes.len(),
@@ -1371,6 +1372,8 @@ pub(super) struct LazyBatches {
     /// an unchanged map without looking every batch up (the loader touches this resource every
     /// frame, so its change tick says nothing).
     scenes_revision: u64,
+    /// Bumped whenever a batch joins `failed`, for the same reason.
+    failed_revision: u64,
 }
 
 /// What [`LazyBatches::demand`] found for one batch.
@@ -1424,6 +1427,7 @@ impl LazyBatches {
             pending_snow: Vec::new(),
             demanded: default(),
             scenes_revision: 0,
+            failed_revision: 0,
         }
     }
 
@@ -1468,6 +1472,7 @@ impl LazyBatches {
             pending_snow: Vec::new(),
             demanded: default(),
             scenes_revision: 0,
+            failed_revision: 0,
         }
     }
 
@@ -1525,9 +1530,15 @@ impl LazyBatches {
         &self.failed
     }
 
+    /// Changes whenever `failed_batches` gains a batch within one batch layout.
+    pub(super) fn failed_key(&self) -> (u64, u64) {
+        (self.layout_scope, self.failed_revision)
+    }
+
     #[cfg(test)]
     pub(crate) fn mark_failed_for_test(&mut self, batch: usize) {
         self.failed.push(batch);
+        self.failed_revision += 1;
     }
 
     pub(super) fn is_failed(&self, batch: u32) -> bool {
@@ -1696,6 +1707,7 @@ fn load_batches_in_view(
                 warn!(model = %batch.key.model_path, "cluster source scene failed; stock replacement remains disabled");
                 batch.scene = None;
                 lazy.failed.push(index);
+                lazy.failed_revision += 1;
                 failed += 1;
                 continue;
             }
@@ -1740,6 +1752,7 @@ fn load_batches_in_view(
                 // replacement must be coordinated for each view).
                 if load_failed {
                     lazy.failed.push(index);
+                    lazy.failed_revision += 1;
                     failed += 1;
                     warn!(
                         model = %batch.key.model_path,

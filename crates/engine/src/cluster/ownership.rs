@@ -49,7 +49,7 @@ type OwnershipPrimitiveQuery<'w, 's> = Query<
 >;
 
 #[derive(Component)]
-struct OwnershipDeferred;
+pub(super) struct OwnershipDeferred;
 
 /// Only unresolved, uninstantiated models are polled. Holding the existing pending
 /// model/profile markers keeps cell readiness honest, and prevents a stock draw
@@ -221,12 +221,15 @@ pub(super) fn demand_owned_batches(
     mut lazy: ResMut<LazyBatches>,
     facts: Option<Res<OwnershipFacts>>,
     scene: Option<Res<ClusterScene>>,
+    held: Query<&OwnershipReference, With<OwnershipDeferred>>,
     mut index: Local<Option<RecordBatches>>,
 ) {
     let demand = &mut *demand;
     if demand.layout_scope != Some(lazy.layout_scope) {
-        // A new batch layout lost every earlier request: demand the held references again.
+        // A new batch layout lost every earlier request: demand again the references still held,
+        // not every one ever held (a released reference needs no batch).
         if demand.layout_scope.is_some() {
+            demand.demanded = held.iter().map(|reference| reference.0).collect();
             demand.pending = demand.demanded.iter().copied().collect();
         }
         demand.layout_scope = Some(lazy.layout_scope);
@@ -1050,7 +1053,7 @@ mod batch_demand_tests {
     }
 
     #[test]
-    fn new_batch_layout_demands_every_held_reference_again() {
+    fn new_batch_layout_demands_only_the_references_still_held() {
         let fixture = fixture();
         let mut world = world(&fixture, Some(0));
         world
@@ -1064,6 +1067,12 @@ mod batch_demand_tests {
             !world.run_system_once(batch_demand_pending).unwrap(),
             "a reference that comes back with its cell is not demanded twice"
         );
+        // A reference demanded once and since released (its model spawned or dropped) holds no
+        // `OwnershipDeferred` marker; only the one still held is demanded again.
+        let released = fixture.reference.wrapping_add(1);
+        world.resource_mut::<OwnershipBatchDemand>().push(released);
+        resolve(&mut world);
+        world.spawn((OwnershipReference(fixture.reference), OwnershipDeferred));
         world.insert_resource(LazyBatches::unrequested_for_test(3, Vec3::ZERO));
         resolve(&mut world);
         assert_eq!(
@@ -1071,6 +1080,10 @@ mod batch_demand_tests {
             Some(BatchDemand::Underway)
         );
         assert_eq!(world.resource::<OwnershipBatchDemand>().queued_batches, 2);
+        assert_eq!(
+            world.resource::<OwnershipBatchDemand>().demanded,
+            HashSet::from([fixture.reference])
+        );
     }
 
     #[test]
