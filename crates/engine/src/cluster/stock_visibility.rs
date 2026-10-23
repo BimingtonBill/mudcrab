@@ -48,6 +48,7 @@ impl ClassFilter {
         // the cost follows the hidden sets, not everything the view sees.
         // The CPU-list slots of the hidden entities, found by the same lookup, so taking them out
         // is one compaction pass rather than a hash lookup per entity the view sees.
+        let search_span = ::bevy::log::info_span!("stock_visibility::apply::search").entered();
         let mut cpu_slots = Vec::new();
         for main in hidden {
             if let Some((pair, slot)) = visible_pair(class, *main) {
@@ -68,6 +69,8 @@ impl ClassFilter {
             }
         }
 
+        drop(search_span);
+        let _rest_span = ::bevy::log::info_span!("stock_visibility::apply::compact").entered();
         class.added_entities.extend(
             saved
                 .added
@@ -121,6 +124,7 @@ impl ClassFilter {
         let Some(mut saved) = self.saved.take() else {
             return;
         };
+        let _restore_span = ::bevy::log::info_span!("stock_visibility::restore").entered();
         let saved_cpu = std::mem::take(&mut saved.cpu);
         if saved_cpu.is_empty() {
             Self::restore_gpu_and_events(class, saved);

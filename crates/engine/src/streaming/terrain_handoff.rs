@@ -841,6 +841,7 @@ fn gate(
     let filters = &mut filters.0;
     assert!(filters.active.is_empty(), "terrain gate was not restored");
     owned_by_view.retain(|key, _| clusters.views.contains_key(key));
+    let owned_span = ::bevy::log::info_span!("terrain_handoff::gate::owned").entered();
     let empty = bevy::platform::collections::HashSet::default();
     let mut wanted: HashMap<
         Domain,
@@ -888,6 +889,8 @@ fn gate(
             .and_modify(|joint| joint.to_mut().retain(|main| owned.contains(main)))
             .or_insert(std::borrow::Cow::Borrowed(owned));
     }
+    drop(owned_span);
+    let _apply_span = ::bevy::log::info_span!("terrain_handoff::gate::apply").entered();
     filters
         .saved
         .retain(|domain, _| wanted.contains_key(domain));
