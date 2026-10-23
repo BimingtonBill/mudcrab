@@ -616,19 +616,23 @@ impl LodBatchActivation<'_, '_> {
     pub(super) fn pending_count(&self) -> usize {
         self.chunks
             .iter()
-            .filter(|chunk| {
-                chunk.source_children.is_some()
-                    && chunk.batches.iter().any(|batch| {
-                        batch.selected != 0
-                            && batch.pending_upload
-                            && !self
-                                .readiness
-                                .as_deref()
-                                .is_some_and(|readiness| readiness.is_ready(batch.mesh.id()))
-                    })
-            })
+            .filter(|chunk| awaits_initial_upload(chunk, self.readiness.as_deref()))
             .count()
     }
+}
+
+/// Whether a chunk still holding its source hierarchy has a selected batch whose upload is not on
+/// the GPU yet: the one definition of a chunk the world-ready check waits for.
+fn awaits_initial_upload(
+    chunk: &LodTerrainBatches,
+    readiness: Option<&TerrainMeshUploadReadiness>,
+) -> bool {
+    chunk.source_children.is_some()
+        && chunk.batches.iter().any(|batch| {
+            batch.selected != 0
+                && batch.pending_upload
+                && !readiness.is_some_and(|readiness| readiness.is_ready(batch.mesh.id()))
+        })
 }
 
 /// Counts of chunks by the first reason their source hierarchy cannot retire.
@@ -805,10 +809,19 @@ impl LodBatchVisibility<'_, '_> {
         out
     }
 
-    pub(super) fn pending_count(&self) -> usize {
+    /// Chunks still holding their source hierarchy, uploaded or not.
+    pub(super) fn holding_source_count(&self) -> usize {
         self.chunks
             .iter()
             .filter(|(_, chunk, _)| chunk.source_children.is_some())
+            .count()
+    }
+
+    /// Chunks the world-ready check waits for (see [`awaits_initial_upload`]).
+    pub(super) fn pending_count(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|(_, chunk, _)| awaits_initial_upload(chunk, self.readiness.as_deref()))
             .count()
     }
 
@@ -1276,7 +1289,7 @@ pub(in crate::streaming) fn log_terrain_retire_blockers(
     mut frames: Local<u32>,
 ) {
     *frames = frames.wrapping_add(1);
-    if (*frames).is_multiple_of(300) && batches.pending_count() != 0 {
+    if (*frames).is_multiple_of(300) && batches.holding_source_count() != 0 {
         let blockers = batches.retire_blockers(&current);
         // Why a batch a camera sees has no draw receipt for its current mesh: the bridge's
         // markers and the batch's own visibility, one line per batch.
@@ -1311,6 +1324,29 @@ pub(in crate::streaming) fn log_terrain_retire_blockers(
             );
         }
         info!(?blockers, "terrain batches awaiting source retirement");
+        // Selected batches whose upload never arrived hold the world-ready check.
+        let readiness = batches.readiness.as_deref();
+        for (root, chunk, _) in batches.chunks.iter() {
+            if chunk.source_children.is_none() {
+                continue;
+            }
+            for batch in &chunk.batches {
+                let id = batch.mesh.id();
+                if batch.selected != 0
+                    && batch.pending_upload
+                    && !readiness.is_some_and(|r| r.is_ready(id))
+                {
+                    info!(
+                        ?root,
+                        batch = ?batch.entity,
+                        selected = batch.selected,
+                        requested = readiness.is_some_and(|r| r.is_requested(id)),
+                        mesh_asset_exists = batches.meshes.as_deref().is_some_and(|m| m.contains(id)),
+                        "selected terrain batch waiting for its upload"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -2871,6 +2907,16 @@ mod tests {
             0,
             "an uploaded chunk waiting only for its draw is not loading"
         );
+        // Both progress writers agree; the visibility pass records after the batching queue.
+        assert_eq!(
+            app.world_mut()
+                .run_system_once(|batches: LodBatchVisibility| (
+                    batches.pending_count(),
+                    batches.holding_source_count()
+                ))
+                .unwrap(),
+            (0, 1)
+        );
         // A finalize pass that activates nothing must not mark the batches changed.
         let before = app
             .world()
@@ -3565,7 +3611,10 @@ mod tests {
         let pending_uploads = app
             .world_mut()
             .run_system_once(|batches: LodBatchVisibility| {
-                (batches.pending_count(), batches.pending_selection_uploads())
+                (
+                    batches.holding_source_count(),
+                    batches.pending_selection_uploads(),
+                )
             })
             .unwrap();
         assert_eq!(pending_uploads, (0, 0));
@@ -4043,7 +4092,10 @@ mod tests {
         let pending = |app: &mut App| {
             app.world_mut()
                 .run_system_once(|batches: LodBatchVisibility| {
-                    (batches.pending_count(), batches.pending_selection_uploads())
+                    (
+                        batches.holding_source_count(),
+                        batches.pending_selection_uploads(),
+                    )
                 })
                 .unwrap()
         };

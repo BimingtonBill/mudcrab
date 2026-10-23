@@ -70,6 +70,11 @@ impl TerrainMeshUploadReadiness {
         self.state().ready.contains(&id)
     }
 
+    /// Whether a request for this ID is waiting for the render world, for stall diagnostics.
+    pub(crate) fn is_requested(&self, id: AssetId<Mesh>) -> bool {
+        self.state().pending.contains(&id)
+    }
+
     pub(crate) fn has_render_backend(&self) -> bool {
         self.state().render_backend
     }
