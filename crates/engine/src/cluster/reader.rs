@@ -2053,6 +2053,34 @@ pub(crate) mod producer_fixture_tests {
     }
 
     #[test]
+    fn cluster_sources_certify_without_baked_tables_and_reject_missing_payloads() {
+        let directory = published_for_loader();
+        let root = directory.path();
+        let db = crate::cluster::overlay_fixture::base_db(root);
+        // lod_build retains the shared core identity; it is not a baked geometry product.
+        db.execute_batch(
+            "DROP TABLE lod_chunks_spatial; DROP TABLE lod_chunks;
+            DROP TABLE lod; DROP TABLE lod_grid; DROP TABLE lod_block;
+            DROP TABLE lod_tree_instance; DROP TABLE lod_tree_type;",
+        )
+        .unwrap();
+        drop(db);
+        let package = crate::cluster::overlay_fixture::open_fixture(root, false).unwrap();
+        assert_eq!(package.records().count(), 2);
+        let overlay = crate::cluster::overlay_fixture::overlay_path(root);
+        let payload: String = crate::cluster::overlay_fixture::overlay_db(root)
+            .query_row(
+                "SELECT payload_path FROM cluster_chunks LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(package);
+        fs::remove_file(overlay.join(&payload)).unwrap();
+        assert!(crate::cluster::overlay_fixture::open_fixture(root, false).is_err());
+    }
+
+    #[test]
     fn real_producer_records_retain_child_placement_and_partial_primitive_identity() {
         let directory = published();
         let root = directory.path();

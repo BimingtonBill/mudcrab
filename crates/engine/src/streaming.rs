@@ -1560,8 +1560,8 @@ pub(crate) fn sync_active_space(active: Res<ActiveCell>, mut space: ResMut<Activ
 /// exterior fog has to reach for the LOD beyond the full-detail ring to be seen, and not fade to
 /// sky colour at the ring's edge.
 ///
-/// Set by [`lod::collect_lod_chunks`] on the first current answer that holds chunks, so a world
-/// converted without LOD data never sets it and its fog stays the ring's. It is per worldspace and
+/// Set from certified cluster terrain, or by [`lod::collect_lod_chunks`] on the first current
+/// native answer that holds chunks. A world without distant terrain keeps ring fog. It is per worldspace and
 /// is kept through an interior: the player coming back out of a house finds the same horizon the
 /// moment the exterior returns, with no frame of ring fog while the first query is answered again.
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq)]
@@ -1586,6 +1586,21 @@ impl LodHorizon {
         if *self != wanted {
             *self = wanted;
         }
+    }
+}
+
+/// Distant geometry availability comes from the selected source, never from the other mode's
+/// inventory. Cluster metadata is available only after its package has been certified and loaded.
+pub(crate) fn has_distant_terrain(
+    config: &EngineConfig,
+    database: Option<&WorldDatabase>,
+    terrain: Option<&crate::cluster::terrain::ClusterTerrain>,
+    world: u32,
+) -> bool {
+    if config.clusters.is_some() {
+        config.cluster_terrain && terrain.is_some_and(|terrain| terrain.has_world(world))
+    } else {
+        database.is_some_and(|database| database.has_lod_for(world))
     }
 }
 
@@ -1699,8 +1714,12 @@ fn plan_cells(
     let center = camera_grid(camera.translation, origin.0);
     // Vanilla LOD worlds keep their ordinary empty ring. Only cluster-owned cells need
     // extra LAND allocations available when current render-view coverage withdraws.
-    let terrain_radius =
-        config.effective_terrain_radius(database.has_lod_for(active.worldspace_id));
+    let terrain_radius = config.effective_terrain_radius(has_distant_terrain(
+        &config,
+        Some(&database),
+        cluster_terrain.as_deref(),
+        active.worldspace_id,
+    ));
     let cluster_standins = cluster_terrain_standins(
         &config,
         active.worldspace_id,
@@ -8360,9 +8379,12 @@ fn validate_streaming_lifecycle(
         // stopped wanting (`EngineConfig::effective_terrain_radius`).
         camera.single().map_or(0, |camera| {
             let center = camera_grid(camera.translation, origin.0);
-            let has_lod = database
-                .as_ref()
-                .is_some_and(|database| database.has_lod_for(active.worldspace_id));
+            let has_lod = has_distant_terrain(
+                &config,
+                database.as_deref(),
+                cluster_terrain.as_deref(),
+                active.worldspace_id,
+            );
             let terrain_radius = config.effective_terrain_radius(has_lod);
             let cluster_standins = cluster_terrain_standins(
                 &config,
@@ -8765,8 +8787,27 @@ mod tests {
             clusters: Some(String::new()),
             ..EngineConfig::default()
         };
+        assert!(!has_distant_terrain(&config, None, Some(&terrain), world));
         assert!(cluster_terrain_standins(&config, world, IVec2::ZERO, Some(&terrain)).is_empty());
         config.cluster_terrain = true;
+        assert!(has_distant_terrain(&config, None, Some(&terrain), world));
+        assert!(!has_distant_terrain(
+            &config,
+            None,
+            Some(&terrain),
+            world + 1
+        ));
+        assert!(!has_distant_terrain(&config, None, None, world));
+        assert_eq!(
+            config.effective_terrain_radius(has_distant_terrain(
+                &config,
+                None,
+                Some(&terrain),
+                world
+            )),
+            config.stream_radius,
+            "certified cluster terrain keeps the empty native ring plus inventory-bounded stand-ins"
+        );
         let expected = CellKey::Exterior {
             worldspace_id: world,
             grid_x: grid.x,

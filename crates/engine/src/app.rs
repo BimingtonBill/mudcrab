@@ -183,6 +183,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             )
         })?;
     }
+    // Geometry selection precedes database opens and plugin construction: cluster-only
+    // conversions intentionally have no baked inventory or compiled terrain products.
+    let cluster_overlay =
+        if reads_asset_tree && (!config.streaming_fixture || config.clusters.is_some()) {
+            crate::geometry::prepare(&mut config)?
+        } else {
+            None
+        };
     // The terrain heights along a route are read here, before the window opens, so that following
     // the ground costs nothing while the run is measured.
     let mut route_ground = None;
@@ -194,7 +202,11 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             read_data_extensions(&config.assets_dir)?,
         )?;
         Some((
-            WorldDatabase::open_with(&database_path, features.world_database())?,
+            WorldDatabase::open_with_lod(
+                &database_path,
+                features.world_database(),
+                config.clusters.is_none(),
+            )?,
             AssetCatalog::open(&database_path)?,
             features,
             CellCache::open(&config.assets_dir.join("cell_cache.rkyv"))?,
@@ -239,7 +251,11 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             read_data_extensions(&config.assets_dir)?,
         )?;
         Some((
-            WorldDatabase::open_with(&database_path, features.world_database())?,
+            WorldDatabase::open_with_lod(
+                &database_path,
+                features.world_database(),
+                config.clusters.is_none(),
+            )?,
             AssetCatalog::open(&database_path)?,
             features,
             cache,
@@ -569,16 +585,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // and a capture run install nothing.
         app.add_plugins(crate::pacing::startup::StartupLoadPlugin);
         // Register launch-time ownership only when a cluster overlay is selected.
-        let (selector, base) = {
+        let base = {
             let config = app.world().resource::<EngineConfig>();
-            (config.clusters.clone(), config.assets_dir.clone())
+            config.assets_dir.clone()
         };
-        if let Some(selector) = selector {
-            // Resolve the overlay among the base's own (`<assets>/derived`). Asynchronous
-            // certification checks its binding once under reader locks before any overlay read;
-            // a missing, ambiguous or foreign overlay stops the requested cluster run.
-            let overlay = shared::cluster_overlay::resolve_overlay(&base, &selector)
-                .wrap_err("--clusters")?;
+        if let Some(overlay) = cluster_overlay {
+            // Selection was checked before opening runtime sources. Asynchronous certification
+            // checks the exact binding under reader locks before any overlay payload read.
             let (min_instance_pixels, prepass, terrain) = {
                 let config = app.world().resource::<EngineConfig>();
                 (
@@ -2342,10 +2355,7 @@ pub(crate) fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
     // without --clusters: the message names the rebuild command.
     shared::cluster_overlay::refuse_full_copy(&config.assets_dir)?;
     if config.allow_incomplete_assets {
-        crate::world::database::validate_lod_build_contract(
-            &config.assets_dir,
-            converter_schema_version(),
-        )?;
+        validate_runtime_database(config)?;
         return Ok(());
     }
     let manifest_path = config.assets_dir.join("conversion-manifest.json");
@@ -2416,16 +2426,26 @@ pub(crate) fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
             AssetSetRejection::IntegrationReportFailed
         )
     );
-    let database_schema = crate::world::database::validate_lod_build_contract(
-        &config.assets_dir,
-        converter_schema_version(),
-    )?;
+    let database_schema = validate_runtime_database(config)?;
     color_eyre::eyre::ensure!(
         database_schema == report.schema_version,
         "world database schema {database_schema} does not match integration report schema {}",
         report.schema_version
     );
     Ok(())
+}
+
+/// Cluster certification owns distant geometry integrity. Native LOD tables and manifests
+/// are outside that source contract, including on a legacy base with an explicit overlay.
+fn validate_runtime_database(config: &EngineConfig) -> Result<u32> {
+    if config.clusters.is_some() {
+        shared::world_assets::validate_world_database(&config.assets_dir.join("skyrim_world.db"))
+    } else {
+        crate::world::database::validate_lod_build_contract(
+            &config.assets_dir,
+            converter_schema_version(),
+        )
+    }
 }
 
 /// Why the runtime refused a converted asset set.
@@ -2786,14 +2806,18 @@ fn sun_rotation(config: &EngineConfig) -> Quat {
 /// camera, so the offsets live here rather than in two places.
 /// Whether the worldspace the run is configured with draws its own terrain LOD data, which decides
 /// the ring it starts with ([`EngineConfig::effective_terrain_radius`]). Read through the world
-/// database when the run opened one; a run that streams no world (a fixture, `--benchmark-only`)
-/// has none, and so does a database converted before LOD existed.
+/// database for baked runs, or the certified terrain world index for cluster runs. A run that
+/// streams no world (a fixture, `--benchmark-only`) has none.
 ///
 /// This is the configured worldspace and not the active one: it is what the camera is placed in
 /// before the first frame, and every later space change resolves its own
 /// ([`crate::streaming::plan_cells`], [`crate::atmosphere`]).
-fn has_lod_data(config: &EngineConfig, database: Option<&WorldDatabase>) -> bool {
-    database.is_some_and(|database| database.has_lod_for(config.worldspace_id))
+fn has_lod_data(
+    config: &EngineConfig,
+    database: Option<&WorldDatabase>,
+    terrain: Option<&crate::cluster::terrain::ClusterTerrain>,
+) -> bool {
+    crate::streaming::has_distant_terrain(config, database, terrain, config.worldspace_id)
 }
 
 fn camera_offset(config: &EngineConfig) -> Vec3 {
@@ -2821,6 +2845,7 @@ fn setup_world(
     start_pose: Option<Res<crate::portal::StartPose>>,
     tuning: Option<Res<MovementTuning>>,
     start_camera: Option<Res<InitialWorldCameraPose>>,
+    cluster_terrain: Option<Res<crate::cluster::terrain::ClusterTerrain>>,
 ) {
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
     let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
@@ -2833,7 +2858,11 @@ fn setup_world(
     let camera_position = target + camera_offset;
     let far = camera_far_plane(
         config.stream_radius,
-        config.effective_terrain_radius(has_lod_data(&config, database.as_deref())),
+        config.effective_terrain_radius(has_lod_data(
+            &config,
+            database.as_deref(),
+            cluster_terrain.as_deref(),
+        )),
     );
     let mut camera_transform = if config.interactive_world_physics() {
         Transform::from_translation(camera_position)
@@ -5933,6 +5962,47 @@ mod tests {
         ] {
             assert_ne!(left, right);
         }
+    }
+
+    #[test]
+    fn cluster_mode_runtime_gate_accepts_no_baked_lod_tables_or_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        Connection::open(root.join("skyrim_world.db"))
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER); INSERT INTO schema_info VALUES({});",
+                shared::WORLD_DATABASE_SCHEMA_VERSION,
+            ))
+            .unwrap();
+        fs::write(root.join("cell_cache.rkyv"), []).unwrap();
+        fs::write(
+            root.join("conversion-manifest.json"),
+            serde_json::json!({
+                "schema_version": converter_schema_version(), "complete": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("integration-report.json"),
+            serde_json::json!({
+                "schema_version": shared::WORLD_DATABASE_SCHEMA_VERSION, "passed": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut config = EngineConfig {
+            assets_dir: root.into(),
+            clusters: Some("fixture".into()),
+            ..default()
+        };
+        validate_runtime_assets(&config).unwrap();
+        config.clusters = None;
+        assert!(
+            validate_runtime_assets(&config).is_err(),
+            "baked mode retains its LOD contract"
+        );
     }
 
     /// Current, complete assets load, and an integration report newer than the engine is rejected.

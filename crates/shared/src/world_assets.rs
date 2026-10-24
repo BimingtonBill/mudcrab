@@ -26,6 +26,19 @@ pub fn validate_world_database(path: &Path) -> Result<u32> {
     Ok(version)
 }
 
+/// Runtime geometry admission. Cluster packages have no baked LOD dependency;
+/// their overlay binding and certificates are validated by the cluster resolver.
+pub fn validate_geometry_build_contract(assets_dir: &Path, converter_schema: u32) -> Result<u32> {
+    match crate::geometry::GeometryManifest::load(assets_dir)?.geometry_mode {
+        crate::geometry::GeometryMode::Baked => {
+            validate_lod_build_contract(assets_dir, converter_schema)
+        }
+        crate::geometry::GeometryMode::Cluster => {
+            validate_world_database(&assets_dir.join("skyrim_world.db"))
+        }
+    }
+}
+
 pub fn validate_lod_build_contract(assets_dir: &Path, converter_schema: u32) -> Result<u32> {
     let database_path = assets_dir.join("skyrim_world.db");
     let version = validate_world_database(&database_path)?;

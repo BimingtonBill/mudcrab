@@ -226,6 +226,7 @@ impl CanonicalTerrainHeights {
 #[derive(Resource)]
 pub struct ClusterTerrain {
     pub blocks: Vec<TerrainBlock>,
+    worldspaces: HashSet<u32>,
     heights: CanonicalTerrainHeights,
     by_mesh: HashMap<String, Vec<(u32, usize)>>,
     build: TerrainBuild,
@@ -312,6 +313,7 @@ impl ClusterTerrain {
                 .push((block.primitive_index, index));
         }
         Ok(Self {
+            worldspaces: blocks.iter().map(|block| block.worldspace_id).collect(),
             blocks,
             heights: CanonicalTerrainHeights(Arc::new(metadata.heights)),
             by_mesh,
@@ -380,6 +382,11 @@ impl ClusterTerrain {
         self.heights.clone()
     }
 
+    /// Source availability is indexed once, including constant-time negative lookups.
+    pub(crate) fn has_world(&self, world: u32) -> bool {
+        self.worldspaces.contains(&world)
+    }
+
     /// Sets what each block clips.
     ///
     /// * `world` is the worldspace the engine draws terrain for. Blocks of any other worldspace,
@@ -446,6 +453,11 @@ impl ClusterTerrain {
     /// the readers of `blocks` in other modules.
     pub(crate) fn for_blocks_test(blocks: Vec<TerrainBlock>) -> Self {
         Self {
+            worldspaces: blocks
+                .iter()
+                .filter(|block| !block.cells.is_empty())
+                .map(|block| block.worldspace_id)
+                .collect(),
             blocks,
             heights: CanonicalTerrainHeights(Arc::new(HashMap::new())),
             by_mesh: HashMap::new(),
@@ -1350,6 +1362,7 @@ mod tests {
         let readiness = TerrainDrawReadiness::default();
         readiness.mark(0);
         let mut terrain = ClusterTerrain {
+            worldspaces: HashSet::from([block.worldspace_id]),
             blocks: vec![block],
             heights: CanonicalTerrainHeights(Arc::new(HashMap::new())),
             by_mesh: HashMap::new(),
@@ -1410,6 +1423,7 @@ mod tests {
         block.material = handle.clone();
         block.batch = Some(3);
         let mut terrain = ClusterTerrain {
+            worldspaces: HashSet::from([block.worldspace_id]),
             blocks: vec![block],
             heights: CanonicalTerrainHeights(Arc::new(HashMap::new())),
             by_mesh: HashMap::new(),
@@ -1566,6 +1580,60 @@ mod tests {
     }
 
     #[test]
+    fn cluster_sources_load_terrain_without_baked_sources_and_reject_missing_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(
+            root.join("OWNER.txt"),
+            "engine cluster terrain source fixture",
+        )
+        .unwrap();
+        let path = fixture(root, |connection| {
+            connection
+                .execute("UPDATE cluster_terrain SET atlas_path='atlas.ktx2'", [])
+                .unwrap();
+        });
+        // Use the real producer: Bevy treats a one-pixel uncompressed KTX2 as a 1D image.
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::X8R8G8B8, 4, 4)
+                .with_mip_levels(3),
+            &mut dummy_content::rng::Rng::new(0),
+        )
+        .unwrap();
+        let atlas = converter::texture::TextureConverter::convert(
+            &dds,
+            converter::texture::TextureEncoding::ColorSrgb,
+        )
+        .unwrap();
+        std::fs::write(root.join("atlas.ktx2"), atlas).unwrap();
+        let load = || {
+            ClusterTerrain::load_connection(
+                root,
+                Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap(),
+                &mut Assets::default(),
+                &mut Assets::default(),
+            )
+        };
+        let terrain = load().unwrap();
+        assert_eq!(terrain.blocks.len(), 1);
+        assert!(terrain.has_world(7));
+        assert!(!terrain.has_world(8));
+        assert_eq!(
+            terrain.canonical_heights(7, IVec2::new(-1, -1)),
+            Some(&[0.0; 33 * 33][..])
+        );
+        std::fs::remove_file(root.join("atlas.ktx2")).unwrap();
+        let error = load().err().unwrap();
+        assert!(error.contains("atlas.ktx2"), "{error}");
+        Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM cluster_terrain_heights WHERE grid_x=0", [])
+            .unwrap();
+        let error = load().err().unwrap();
+        assert!(error.contains("height"), "{error}");
+    }
+
+    #[test]
     fn inconsistent_metadata_is_refused_with_a_reason() {
         let cases: [(&str, &str); 9] = [
             (
@@ -1671,6 +1739,7 @@ mod tests {
         std::fs::write(dataset.path().join(CELL_CACHE_FILE), b"cell cache bytes").unwrap();
         let digest: [u8; 32] = Sha256::digest(b"cell cache bytes").into();
         let mut terrain = ClusterTerrain {
+            worldspaces: HashSet::new(),
             blocks: Vec::new(),
             heights: CanonicalTerrainHeights(Arc::new(HashMap::new())),
             by_mesh: HashMap::new(),
@@ -1693,6 +1762,7 @@ mod tests {
         blocks[0].mesh_hash = "cafe".into();
         blocks[0].primitive_index = 2;
         let mut terrain = ClusterTerrain {
+            worldspaces: blocks.iter().map(|block| block.worldspace_id).collect(),
             by_mesh: HashMap::from([("cafe".to_owned(), vec![(2, 0)])]),
             blocks,
             heights: CanonicalTerrainHeights(Arc::new(HashMap::from([(

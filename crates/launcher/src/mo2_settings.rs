@@ -21,6 +21,29 @@ pub struct SourceSettings {
 }
 
 impl SourceSettings {
+    /// Restores the exact saved profile. Missing profiles require an explicit new choice.
+    pub fn restore_selection(&mut self, selection: Option<mo2::Selection>) -> Result<(), String> {
+        self.selection = selection;
+        self.profiles.clear();
+        self.error.clear();
+        self.dropdown = false;
+        let Some(selection) = &self.selection else {
+            return Ok(());
+        };
+        let restored = mo2::Instance::open(&selection.instance_path).and_then(|instance| {
+            self.profiles = instance.profiles.clone();
+            instance.profile_dir(&selection.profile).map(|_| ())
+        });
+        if let Err(error) = restored {
+            self.error = format!(
+                "Saved MO2 selection is unavailable: {error:#}. Choose a profile before converting."
+            );
+            self.open = self.use_mo2;
+            return Err(self.error.clone());
+        }
+        Ok(())
+    }
+
     /// Loads an MO2 instance and its profiles, retaining the selected profile when still valid.
     ///
     /// Otherwise prefers the INI's active profile, then the first sorted profile.
@@ -364,6 +387,18 @@ mod tests {
         settings.selection.as_mut().unwrap().profile = "Alpha".into();
         settings.set_instance(root);
         assert_eq!(settings.selection.as_ref().unwrap().profile, "Alpha");
+        settings.use_mo2 = true;
+        let restored = settings.restore_selection(Some(mo2::Selection {
+            instance_path: root.to_path_buf(),
+            profile: "Deleted profile".into(),
+        }));
+        assert!(restored.is_err());
+        assert_eq!(
+            settings.selection.as_ref().unwrap().profile,
+            "Deleted profile"
+        );
+        assert!(settings.apply(&mut config).is_err());
+        assert!(settings.open);
         settings.selection.as_mut().unwrap().profile = "Zed".into();
         settings.apply(&mut config).unwrap();
         assert_eq!(config.mo2.as_ref().unwrap().profile, "Zed");

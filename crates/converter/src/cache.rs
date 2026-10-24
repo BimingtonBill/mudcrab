@@ -214,6 +214,10 @@ pub enum IngestionSelection {
     RuntimeEnglishV2,
     /// All-language converter inputs plus native LOD meshes and tree inventory inputs.
     ConverterInputsV2,
+    /// Runtime inputs without native baked geometry or LOD texture namespaces.
+    ClusterEnglishV1,
+    /// All-language inputs without native baked geometry or LOD texture namespaces.
+    ClusterInputsV1,
 }
 
 impl IngestionSelection {
@@ -227,6 +231,12 @@ impl IngestionSelection {
                     Self::RuntimeEnglishV2 | Self::ConverterInputsV1 | Self::RuntimeEnglishV1
                 ))
             || (self == Self::RuntimeEnglishV2 && requested == Self::RuntimeEnglishV1)
+            || (matches!(self, Self::ConverterInputsV1 | Self::ConverterInputsV2)
+                && matches!(requested, Self::ClusterInputsV1 | Self::ClusterEnglishV1))
+            || (matches!(
+                self,
+                Self::RuntimeEnglishV1 | Self::RuntimeEnglishV2 | Self::ClusterInputsV1
+            ) && requested == Self::ClusterEnglishV1)
     }
 }
 
@@ -314,6 +324,8 @@ impl IngestionJournal {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversionManifest {
+    #[serde(flatten)]
+    pub geometry: shared::geometry::GeometryManifest,
     pub schema_version: u32,
     /// Metadata-only rebuilds do not upgrade the retained mesh cache contract.
     /// Absent means the meshes follow `schema_version`.

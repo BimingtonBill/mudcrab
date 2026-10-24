@@ -30,6 +30,7 @@ pub mod far_terrain_shadows;
 pub mod field_notes;
 pub mod fingerprint;
 pub mod frame_budget;
+mod geometry;
 pub mod graphics_panel;
 pub mod graphics_settings;
 pub mod hud;

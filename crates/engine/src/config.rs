@@ -164,7 +164,8 @@ pub struct EngineConfig {
     /// Remove certified owned exterior render bodies before instance spawn.
     /// Always enabled when a cluster overlay is selected.
     pub cluster_own_statics: bool,
-    /// Draw packaged terrain clusters, clipping against ready near terrain.
+    /// Draw packaged terrain clusters, clipping against ready near terrain. Startup enables
+    /// this for every selected overlay, which must include terrain and trees.
     pub cluster_terrain: bool,
     /// `--cluster-preload-batches`: request every cluster batch's material during the startup
     /// load, nearest first, instead of as each comes into view. The startup cover then waits for
@@ -806,7 +807,7 @@ Streaming:
   --clusters [label|settings-id|path]   draw this cluster overlay of --assets (built by converter
                                         derive-clusters under <assets>/derived) as GPU-selected
                                         clusters in place of the stock models it owns (ADR-0013)
-  --cluster-terrain                     draw terrain included in the cluster overlay
+  --cluster-terrain                     compatibility alias; selected overlays require terrain and trees
   --cluster-own-statics                 compatibility no-op alias (requires --clusters)
                                         --clusters always enables static ownership
   --cluster-preload-batches             load every cluster batch during the startup load instead
@@ -1147,9 +1148,8 @@ impl EngineConfig {
     /// 3. Otherwise - no LOD data, so nothing would draw beyond the full-detail grid -
     ///    [`DEFAULT_TERRAIN_RADIUS`] keeps the world from ending in a cliff.
     ///
-    /// `has_lod` is the caller's answer for the worldspace it is asking about
-    /// ([`WorldDatabase::has_lod_for`](crate::world::database::WorldDatabase::has_lod_for)), so the
-    /// answer is per worldspace and follows a door into another one.
+    /// `has_lod` comes from the selected source's world inventory (native database or certified
+    /// cluster terrain), so the answer is per worldspace and follows a door into another one.
     pub fn effective_terrain_radius(&self, has_lod: bool) -> i32 {
         if self.terrain_radius_given || !has_lod {
             self.terrain_radius

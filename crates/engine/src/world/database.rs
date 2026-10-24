@@ -505,6 +505,15 @@ impl WorldDatabase {
     /// Opens a world database and reads the extensions in `features`. A listed extension whose table
     /// is missing is an error here, at open, not a cell that fails later.
     pub fn open_with(path: &Path, features: WorldDatabaseFeatures) -> Result<Self> {
+        Self::open_with_lod(path, features, true)
+    }
+
+    /// Cluster runs retain core LAND and reference sources without inspecting baked LOD.
+    pub(crate) fn open_with_lod(
+        path: &Path,
+        features: WorldDatabaseFeatures,
+        baked_lod: bool,
+    ) -> Result<Self> {
         validate(path)?;
         if features.door_links == DoorLinksAccess::LegacyExtension {
             require_table(path, "door_links", crate::extensions::Feature::DoorLinks)?;
@@ -513,7 +522,11 @@ impl WorldDatabase {
         // Before the worker takes the file: which worldspaces draw their own terrain LOD. Read here
         // rather than in the worker because a run resolves the ring on the frame the space changes
         // and cannot wait for a query to come back (`EngineConfig::effective_terrain_radius`).
-        let lod_worldspaces = lod_worldspaces(&path);
+        let lod_worldspaces = if baked_lod {
+            lod_worldspaces(&path)
+        } else {
+            HashSet::new()
+        };
         let terrain_cells = Some(read_terrain_cells(&path)?);
         let (request_tx, request_rx) = bounded(128);
         // Responses must not block shutdown if the main world stops polling.
@@ -2022,6 +2035,25 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<(ReferenceRow, Ini
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_mode_database_ignores_populated_baked_inventory() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER); INSERT INTO schema_info VALUES({});
+             CREATE TABLE lod_chunks(worldspace_id INTEGER); INSERT INTO lod_chunks VALUES(7);",
+                shared::WORLD_DATABASE_SCHEMA_VERSION,
+            ))
+            .unwrap();
+        let cluster =
+            WorldDatabase::open_with_lod(&path, WorldDatabaseFeatures::default(), false).unwrap();
+        assert!(!cluster.has_lod_for(7));
+        let baked = WorldDatabase::open(&path).unwrap();
+        assert!(baked.has_lod_for(7));
+    }
 
     #[test]
     fn terrain_requirements_ignore_empty_cells_and_preserve_world_identity() {

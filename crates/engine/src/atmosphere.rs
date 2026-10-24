@@ -684,16 +684,12 @@ pub(crate) fn ring_radius(
     cluster_terrain: Option<&crate::cluster::terrain::ClusterTerrain>,
     worldspace_id: u32,
 ) -> i32 {
-    let has_lod = database.is_some_and(|database| database.has_lod_for(worldspace_id));
+    let has_lod =
+        crate::streaming::has_distant_terrain(config, database, cluster_terrain, worldspace_id);
     let radius = config.effective_terrain_radius(has_lod);
     let owned = config.cluster_terrain
         && config.clusters.is_some()
-        && cluster_terrain.is_some_and(|terrain| {
-            terrain
-                .blocks
-                .iter()
-                .any(|block| block.worldspace_id == worldspace_id && !block.cells.is_empty())
-        });
+        && cluster_terrain.is_some_and(|terrain| terrain.has_world(worldspace_id));
     if owned {
         radius.max(config.terrain_radius)
     } else {
@@ -1922,8 +1918,8 @@ mod tests {
         app.update();
         assert_eq!(camera_far(&app), lod_far);
 
-        // Cluster ownership adds reversible stand-ins only in its own world. Removing that
-        // inventory restores the ordinary plane without needing a space change.
+        // Cluster ownership adds reversible stand-ins only in its own world. Losing that
+        // source cannot make native inventory authoritative in a cluster run.
         {
             let mut config = app.world_mut().resource_mut::<EngineConfig>();
             config.clusters = Some(String::new());
@@ -1948,12 +1944,18 @@ mod tests {
         app.world_mut()
             .remove_resource::<crate::cluster::terrain::ClusterTerrain>();
         app.update();
-        assert_eq!(camera_far(&app), lod_far);
+        assert_eq!(camera_far(&app), ring_far);
         {
             let mut config = app.world_mut().resource_mut::<EngineConfig>();
             config.clusters = None;
             config.cluster_terrain = false;
         }
+        app.update();
+        assert_eq!(
+            camera_far(&app),
+            lod_far,
+            "baked mode retains its own inventory policy"
+        );
 
         // And what the LOD extended it to survives the frame the horizon becomes known: that frame
         // rewrites the fog (the system above is listening for the horizon) and must not pull the
