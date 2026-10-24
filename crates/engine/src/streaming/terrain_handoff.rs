@@ -54,6 +54,7 @@ enum Kind {
     Source,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Surface {
     pub keys: Vec<SurfaceKey>,
     pub(crate) mesh: bevy::asset::AssetId<Mesh>,
@@ -65,17 +66,17 @@ pub(crate) struct Surface {
 #[derive(Resource, Default)]
 pub(crate) struct RenderTerrain {
     pub surfaces: HashMap<MainEntity, Surface>,
-    /// Bumped whenever `surfaces` is rebuilt, so a consumer can keep what it derived from them.
+    /// Bumped once per changed surface map or full recovery, invalidating derived ownership.
     revision: u64,
     origin: IVec2,
     radius: i32,
     explicit: bool,
 }
 
-/// Written ONLY by current cluster selection in Render, cleared before every
-/// selection invocation. Not extracted from TerrainDrawReadiness and never retained
-/// as evidence across frames. The plan's selected blocks already include its exact
-/// current compute/material/forward/prepass/shadow qualification.
+/// Written ONLY by cluster selection in Render, with exact current compute/material/
+/// forward/prepass/shadow qualification. Entries are reused only while selection and
+/// generation/layout/plan remain current; absent views or GPU state withdraw them.
+/// This is selection qualification, not an executed-draw receipt or main-world readiness.
 #[derive(Resource, Default)]
 pub(crate) struct ClusterCoverage {
     pub views: HashMap<RetainedViewEntity, ClusterViewCoverage>,
@@ -364,19 +365,17 @@ struct TerrainInputs<'w, 's> {
             &'static TerrainWorldspace,
         ),
     >,
-    batches: Query<'w, 's, (&'static LodChunkRoot, &'static LodTerrainBatches)>,
+    batches: Query<'w, 's, (Entity, &'static LodChunkRoot, &'static LodTerrainBatches)>,
     surfaces: SurfaceObligations<'w, 's>,
     holds: Query<'w, 's, (), With<SwapStandIn>>,
     origin: Res<'w, RenderOrigin>,
     config: Res<'w, crate::config::EngineConfig>,
+    active: Option<Res<'w, super::ActiveCell>>,
+    scene: Option<Res<'w, crate::cluster::render::ClusterScene>>,
 }
 
-/// What can change the fallback surface map. Visibility, mesh and swap state are tracked on every
-/// streamed mesh, so Bevy's change filters list the entities that changed this frame and only a
-/// terrain entity among them counts; a swap wait removed from one counts too. Terrain coverage,
-/// batches and named holds count wherever they change, and a smaller count of them is a removal.
-/// Read every extraction, so a frame in which none of it moved keeps last frame's map instead of
-/// rebuilding it from every terrain identity.
+/// Changes are consumed in full, including removals and the shared terrain journal. The
+/// identity owner supplies exact ancestry-derived primitive deltas; batch roots own their draws.
 #[allow(clippy::type_complexity)]
 #[derive(SystemParam)]
 struct TerrainChanges<'w, 's> {
@@ -392,13 +391,11 @@ struct TerrainChanges<'w, 's> {
             Added<SwapWaiting>,
         )>,
     >,
-    unwaited: RemovedComponents<'w, 's, SwapWaiting>,
     terrain: Query<
         'w,
         's,
-        (),
+        Entity,
         Or<(
-            Added<SwapStandIn>,
             Changed<MergedTerrainCoverage>,
             Changed<TerrainWorldspace>,
             Changed<LodTerrainBatches>,
@@ -406,192 +403,159 @@ struct TerrainChanges<'w, 's> {
             Added<RingTerrain>,
         )>,
     >,
-    holds: Query<'w, 's, (), With<SwapStandIn>>,
-    merged: Query<'w, 's, (), With<MergedTerrainCoverage>>,
-    batches: Query<'w, 's, (), With<LodTerrainBatches>>,
-    rings: Query<'w, 's, (), With<RingTerrain>>,
+    holds: Query<'w, 's, Entity, Added<SwapStandIn>>,
+    events: Option<Res<'w, Messages<super::identity_changes::TerrainNodeChanged>>>,
+    removed: TerrainRemovals<'w, 's>,
+}
+
+#[derive(SystemParam)]
+struct TerrainRemovals<'w, 's> {
+    visibility: RemovedComponents<'w, 's, InheritedVisibility>,
+    meshes: RemovedComponents<'w, 's, Mesh3d>,
+    swaps: RemovedComponents<'w, 's, SwapSurface>,
+    receipts: RemovedComponents<'w, 's, SwapDrawReceipt>,
+    waits: RemovedComponents<'w, 's, SwapWaiting>,
+    merged: RemovedComponents<'w, 's, MergedTerrainCoverage>,
+    worlds: RemovedComponents<'w, 's, TerrainWorldspace>,
+    batches: RemovedComponents<'w, 's, LodTerrainBatches>,
+    chunks: RemovedComponents<'w, 's, LodChunkRoot>,
+    rings: RemovedComponents<'w, 's, RingTerrain>,
+    holds: RemovedComponents<'w, 's, SwapStandIn>,
+}
+
+fn drain_removed<T: Component>(
+    removed: &mut RemovedComponents<T>,
+    dirty: &mut HashSet<Entity>,
+) -> bool {
+    let missed = removed
+        .messages()
+        .is_some_and(|messages| removed.reader().missed_messages(messages) != 0);
+    dirty.extend(removed.read());
+    missed
 }
 
 impl TerrainChanges<'_, '_> {
-    /// Whether a terrain entity's visibility, mesh or swap state changed, or lost its swap wait.
-    fn surfaces_moved(&mut self, terrain: impl Fn(Entity) -> bool) -> bool {
-        // Every removal is read, so none is left over for a later frame.
-        let unwaited = self
-            .unwaited
-            .read()
-            .fold(false, |moved, entity| moved | terrain(entity));
-        unwaited
-            || self.visibility.iter().any(&terrain)
-            || self.meshes.iter().any(&terrain)
-            || self.swaps.iter().any(&terrain)
-    }
-
-    /// How many named holds, merged LAND, batch roots and ring surfaces exist.
-    fn counts(&self) -> [usize; 4] {
-        [
-            self.holds.iter().len(),
-            self.merged.iter().len(),
-            self.batches.iter().len(),
-            self.rings.iter().len(),
-        ]
+    fn collect(&mut self, built: &mut BuiltFrom, dirty: &mut HashSet<Entity>) -> bool {
+        dirty.extend(self.visibility.iter());
+        dirty.extend(self.meshes.iter());
+        dirty.extend(self.swaps.iter());
+        dirty.extend(self.terrain.iter());
+        let mut recover = false;
+        if let Some(events) = &self.events {
+            recover |= built.cursor.missed_messages(events) != 0;
+            dirty.extend(built.cursor.read(events).map(|event| event.0));
+        }
+        let removed = &mut self.removed;
+        // Do not short-circuit: each stream must advance even during full recovery.
+        recover |= drain_removed(&mut removed.visibility, dirty);
+        recover |= drain_removed(&mut removed.meshes, dirty);
+        recover |= drain_removed(&mut removed.swaps, dirty);
+        recover |= drain_removed(&mut removed.receipts, dirty);
+        recover |= drain_removed(&mut removed.waits, dirty);
+        recover |= drain_removed(&mut removed.merged, dirty);
+        recover |= drain_removed(&mut removed.worlds, dirty);
+        recover |= drain_removed(&mut removed.batches, dirty);
+        recover |= drain_removed(&mut removed.chunks, dirty);
+        recover |= drain_removed(&mut removed.rings, dirty);
+        let mut holds: HashSet<_> = self.holds.iter().collect();
+        // A default disabler changes query membership without adding/removing SwapStandIn.
+        // Journaled hold entities must therefore invalidate their named dependents too.
+        holds.extend(
+            dirty
+                .iter()
+                .copied()
+                .filter(|entity| built.held.contains_key(entity)),
+        );
+        recover |= drain_removed(&mut removed.holds, &mut holds);
+        for hold in holds {
+            if let Some(surfaces) = built.held.get(&hold) {
+                dirty.extend(surfaces);
+            }
+        }
+        recover
     }
 }
 
-/// The identity snapshot, batch draws and input counts the current surface map was built from.
+/// Package identity and active streaming world are global boundaries. Ordinary terrain changes
+/// in other views/worldspaces remain entity-local and retain their exact world keys.
+struct ExtractionScope {
+    assets: std::path::PathBuf,
+    clusters: Option<String>,
+    world: u32,
+    active: Option<super::ActiveCell>,
+    has_scene: bool,
+    certificate: Option<std::sync::Arc<crate::cluster::reader::CertifiedPackage>>,
+}
+
+impl ExtractionScope {
+    fn new(inputs: &TerrainInputs) -> Self {
+        Self {
+            assets: inputs.config.assets_dir.clone(),
+            clusters: inputs.config.clusters.clone(),
+            world: inputs.config.worldspace_id,
+            active: inputs.active.as_deref().copied(),
+            has_scene: inputs.scene.is_some(),
+            certificate: inputs
+                .scene
+                .as_ref()
+                .and_then(|scene| scene.certificate.clone()),
+        }
+    }
+
+    fn matches(&self, inputs: &TerrainInputs) -> bool {
+        self.assets == inputs.config.assets_dir
+            && self.clusters == inputs.config.clusters
+            && self.world == inputs.config.worldspace_id
+            && self.active == inputs.active.as_deref().copied()
+            && self.has_scene == inputs.scene.is_some()
+            && match (
+                self.certificate.as_ref(),
+                inputs
+                    .scene
+                    .as_ref()
+                    .and_then(|scene| scene.certificate.as_ref()),
+            ) {
+                (None, None) => true,
+                (Some(previous), Some(current)) => std::sync::Arc::ptr_eq(previous, current),
+                _ => false,
+            }
+    }
+}
+
+/// Batch descriptors include invisible draws: visibility/mesh changes can refresh a single draw
+/// without walking the chunk again. Named holds retain reverse dependencies for exact withdrawal.
 #[derive(Default)]
 struct BuiltFrom {
-    identities: Option<std::sync::Arc<HashMap<MainEntity, super::TerrainPrimitiveIdentity>>>,
-    batch_entities: HashSet<Entity>,
-    counts: [usize; 4],
-    frames: u32,
-    rebuilds: [u32; 4],
+    scope: Option<ExtractionScope>,
+    batch_roots: HashMap<Entity, Vec<Entity>>,
+    batch_surfaces: HashMap<Entity, Surface>,
+    stand_ins: HashMap<Entity, Entity>,
+    held: HashMap<Entity, HashSet<Entity>>,
+    cursor: bevy::ecs::message::MessageCursor<super::identity_changes::TerrainNodeChanged>,
 }
 
-fn extract(
-    mut out: ResMut<RenderTerrain>,
-    mut identities: Extract<TerrainIdentityAccess>,
-    inputs: Extract<TerrainInputs>,
-    mut changes: Extract<TerrainChanges>,
-    mut built: Local<BuiltFrom>,
-) {
-    let TerrainInputs {
-        visibility,
-        meshes,
-        rings,
-        merged,
-        batches,
-        surfaces,
-        holds,
-        origin,
-        config,
-    } = &*inputs;
-    out.origin = origin.0;
-    out.radius = config.stream_radius;
-    out.explicit = config.terrain_radius_given;
-    // The identity index keeps its snapshot while nothing changed; holding the previous one here
-    // makes a new snapshot a new allocation, so pointer identity says whether it moved.
-    let snapshot = identities.identities_shared();
-    let watch_span = ::bevy::log::info_span!(
-        "terrain_handoff::extract::watch",
-        identities = snapshot.len(),
-        batch_draws = built.batch_entities.len()
-    )
-    .entered();
-    // A terrain entity: an identity primitive, merged LAND or a batch draw. One that has just
-    // become terrain arrives with a new snapshot, a merged-coverage change or a batch change.
-    let is_terrain = |entity: Entity| {
-        snapshot.contains_key(&MainEntity::from(entity))
-            || merged.contains(entity)
-            || built.batch_entities.contains(&entity)
-    };
-    let surfaces_moved = changes.surfaces_moved(is_terrain);
-    let counts = changes.counts();
-    drop(watch_span);
-    let reasons = [
-        !built
-            .identities
-            .as_ref()
-            .is_some_and(|previous| std::sync::Arc::ptr_eq(previous, &snapshot)),
-        built.counts != counts,
-        surfaces_moved,
-        !changes.terrain.is_empty(),
-    ];
-    built.identities = Some(std::sync::Arc::clone(&snapshot));
-    built.counts = counts;
-    // Rebuilds per trigger, reported every 600 extractions: a settled scene must show none.
-    built.frames += 1;
-    for (count, fired) in built.rebuilds.iter_mut().zip(reasons) {
-        *count += u32::from(fired);
-    }
-    if built.frames == 600 {
-        info!(
-            rebuilds_by_trigger = ?built.rebuilds,
-            triggers = "identity snapshot, input counts, terrain surface change, coverage/batch change",
-            "terrain surface map rebuilds over 600 extractions"
-        );
-        built.frames = 0;
-        built.rebuilds = [0; 4];
-    }
-    if !reasons.contains(&true) {
-        return;
-    }
-    perf_span!("terrain_handoff::extract::rebuild");
-    crate::work_counters::record("terrain_handoff/surface_map");
-    out.revision = out.revision.wrapping_add(1);
-    out.surfaces.clear();
-    // Reuse the journaled exact identity index, including its ancestry validation.
-    // InheritedVisibility is refreshed by Bevy for primitive/root/intermediate
-    // in-place changes; a change to it on any mesh rebuilds the map.
-    for (main, identity) in snapshot.iter() {
-        if !visibility.get(main.id()).is_ok_and(|visible| visible.get()) {
-            continue;
-        }
-        let Ok(mesh) = meshes.get(main.id()) else {
-            continue;
-        };
-        out.surfaces.insert(
-            *main,
-            Surface {
-                mesh: mesh.0.id(),
-                keys: vec![SurfaceKey {
-                    world: identity.worldspace_id,
-                    grid: identity.grid,
-                    quadrant: identity.quadrant,
-                }],
-                kind: if identity.tier.is_some() {
-                    Kind::Native
-                } else if rings.contains(main.id()) {
-                    Kind::Ring
-                } else {
-                    Kind::Detail
-                },
-                protected: protected(main.id(), mesh.0.id(), surfaces, holds),
-            },
-        );
-    }
-    // Merged LAND is one draw, therefore all four exact quadrants must agree.
-    for (entity, coverage, world) in merged {
-        if !visibility.get(entity).is_ok_and(|visible| visible.get()) {
-            continue;
-        }
-        let Ok(mesh) = meshes.get(entity) else {
-            continue;
-        };
-        out.surfaces.insert(
-            entity.into(),
-            Surface {
-                mesh: mesh.0.id(),
-                keys: (0..4)
-                    .map(|quadrant| SurfaceKey {
-                        world: world.0,
-                        grid: coverage.grid,
-                        quadrant,
-                    })
-                    .collect(),
-                kind: if rings.contains(entity) {
-                    Kind::Ring
-                } else {
-                    Kind::Detail
-                },
-                protected: protected(entity, mesh.0.id(), surfaces, holds),
-            },
-        );
-    }
-    built.batch_entities.clear();
-    for (root, chunk) in batches {
-        for (entity, mesh, coverage, source) in chunk.render_surfaces() {
-            built.batch_entities.insert(entity);
-            if !visibility.get(entity).is_ok_and(|visible| visible.get()) {
-                continue;
+impl BuiltFrom {
+    fn refresh_batch(
+        &mut self,
+        entity: Entity,
+        inputs: &TerrainInputs,
+        dirty: &mut HashSet<Entity>,
+    ) {
+        if let Some(previous) = self.batch_roots.remove(&entity) {
+            for draw in previous {
+                self.batch_surfaces.remove(&draw);
+                dirty.insert(draw);
             }
-            if !meshes
-                .get(entity)
-                .is_ok_and(|actual| actual.0.id() == mesh.id())
-            {
-                continue;
-            }
-            out.surfaces.insert(
-                entity.into(),
+        }
+        let Ok((_, root, chunk)) = inputs.batches.get(entity) else {
+            return;
+        };
+        let mut members = Vec::new();
+        for (draw, mesh, coverage, source) in chunk.render_surfaces() {
+            members.push(draw);
+            dirty.insert(draw);
+            self.batch_surfaces.insert(
+                draw,
                 Surface {
                     mesh: mesh.id(),
                     keys: coverage
@@ -603,11 +567,189 @@ fn extract(
                         })
                         .collect(),
                     kind: if source { Kind::Source } else { Kind::Batch },
-                    protected: protected(entity, mesh.id(), surfaces, holds),
+                    protected: false,
                 },
             );
         }
+        self.batch_roots.insert(entity, members);
     }
+
+    fn refresh_hold(&mut self, entity: Entity, inputs: &TerrainInputs, candidate: bool) {
+        if let Some(previous) = self.stand_ins.remove(&entity)
+            && let Some(dependents) = self.held.get_mut(&previous)
+        {
+            dependents.remove(&entity);
+            if dependents.is_empty() {
+                self.held.remove(&previous);
+            }
+        }
+        if candidate
+            && let Ok((surface, ..)) = inputs.surfaces.get(entity)
+            && let Some(hold) = surface.stand_in()
+        {
+            self.stand_ins.insert(entity, hold);
+            self.held.entry(hold).or_default().insert(entity);
+        }
+    }
+}
+
+impl TerrainInputs<'_, '_> {
+    fn surface(
+        &self,
+        entity: Entity,
+        identity: Option<&super::TerrainPrimitiveIdentity>,
+        batch: Option<&Surface>,
+    ) -> Option<Surface> {
+        if !self
+            .visibility
+            .get(entity)
+            .is_ok_and(|visible| visible.get())
+        {
+            return None;
+        }
+        let mesh = self.meshes.get(entity).ok()?.0.id();
+        // Reuse the journaled exact identity index, including its ancestry validation.
+        // InheritedVisibility is refreshed by Bevy for primitive/root/intermediate in-place changes.
+        let mut surface = identity.map(|identity| Surface {
+            mesh,
+            keys: vec![SurfaceKey {
+                world: identity.worldspace_id,
+                grid: identity.grid,
+                quadrant: identity.quadrant,
+            }],
+            kind: if identity.tier.is_some() {
+                Kind::Native
+            } else if self.rings.contains(entity) {
+                Kind::Ring
+            } else {
+                Kind::Detail
+            },
+            protected: false,
+        });
+        // Merged LAND is one draw, therefore all four exact quadrants must agree.
+        if let Ok((_, coverage, world)) = self.merged.get(entity) {
+            surface = Some(Surface {
+                mesh,
+                keys: (0..4)
+                    .map(|quadrant| SurfaceKey {
+                        world: world.0,
+                        grid: coverage.grid,
+                        quadrant,
+                    })
+                    .collect(),
+                kind: if self.rings.contains(entity) {
+                    Kind::Ring
+                } else {
+                    Kind::Detail
+                },
+                protected: false,
+            });
+        }
+        // Preserve full-build precedence: a valid batch/source overrides a merged or exact draw.
+        if let Some(batch) = batch.filter(|batch| batch.mesh == mesh) {
+            surface = Some(Surface {
+                mesh,
+                keys: batch.keys.clone(),
+                kind: batch.kind,
+                protected: false,
+            });
+        }
+        if let Some(surface) = &mut surface {
+            surface.protected = protected(entity, mesh, &self.surfaces, &self.holds);
+        }
+        surface
+    }
+}
+
+fn extract(
+    mut out: ResMut<RenderTerrain>,
+    mut identities: Extract<TerrainIdentityAccess>,
+    inputs: Extract<TerrainInputs>,
+    mut changes: Extract<TerrainChanges>,
+    mut built: Local<BuiltFrom>,
+) {
+    out.origin = inputs.origin.0;
+    out.radius = inputs.config.stream_radius;
+    out.explicit = inputs.config.terrain_radius_given;
+    // Keep no previous Arc: the identity owner already knows its exact delta. Retaining one
+    // here would force a copy of the complete identity map on every terrain arrival.
+    let snapshot = identities.identities_shared_with_changes();
+    let mut dirty: HashSet<_> = identities
+        .changed_identities()
+        .iter()
+        .map(|main| main.id())
+        .collect();
+    let recover = changes.collect(&mut built, &mut dirty);
+    let full = recover
+        || identities.recovered()
+        || built
+            .scope
+            .as_ref()
+            .is_none_or(|scope| !scope.matches(&inputs));
+    #[cfg(feature = "tracy")]
+    let _work_span = if full {
+        bevy::log::info_span!("terrain_handoff::extract::rebuild").entered()
+    } else {
+        bevy::log::info_span!("terrain_handoff::extract::incremental").entered()
+    };
+    if full {
+        crate::work_counters::record("terrain_handoff/extract_full_rebuild");
+        built.scope = Some(ExtractionScope::new(&inputs));
+        built.batch_roots.clear();
+        built.batch_surfaces.clear();
+        built.stand_ins.clear();
+        built.held.clear();
+        out.surfaces.clear();
+        dirty.extend(snapshot.keys().map(|main| main.id()));
+        dirty.extend(inputs.merged.iter().map(|(entity, ..)| entity));
+        for (entity, ..) in &inputs.batches {
+            built.refresh_batch(entity, &inputs, &mut dirty);
+        }
+    } else {
+        let roots: Vec<_> = dirty
+            .iter()
+            .copied()
+            .filter(|entity| {
+                built.batch_roots.contains_key(entity) || inputs.batches.contains(*entity)
+            })
+            .collect();
+        for entity in roots {
+            built.refresh_batch(entity, &inputs, &mut dirty);
+        }
+    }
+    let mut moved = full;
+    for entity in dirty {
+        let main = MainEntity::from(entity);
+        let identity = snapshot.get(&main);
+        let batch = built.batch_surfaces.get(&entity);
+        let candidate = identity.is_some() || batch.is_some() || inputs.merged.contains(entity);
+        let current = inputs.surface(entity, identity, batch);
+        built.refresh_hold(entity, &inputs, candidate);
+        match current {
+            Some(surface) if out.surfaces.get(&main) != Some(&surface) => {
+                out.surfaces.insert(main, surface);
+                moved = true;
+            }
+            None => {
+                moved |= out.surfaces.remove(&main).is_some();
+            }
+            _ => {}
+        }
+    }
+    if moved {
+        crate::work_counters::record("terrain_handoff/surface_map");
+        if !full {
+            crate::work_counters::record("terrain_handoff/extract_incremental");
+        }
+        out.revision = out.revision.wrapping_add(1);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn extraction_schedule_for_test() -> Schedule {
+    let mut schedule = Schedule::new(ExtractSchedule);
+    schedule.add_systems(extract);
+    schedule
 }
 
 fn domain(entity: Entity, key: RetainedViewEntity, light: Option<&LightEntity>) -> Domain {
@@ -1311,6 +1453,318 @@ mod tests {
             9.0
         );
         assert_eq!(cpu_spans["gauges"]["lod/extracted_terrain_items"], 7.0);
+    }
+
+    struct ExtractionFixture {
+        main: World,
+        render: World,
+        schedule: Schedule,
+    }
+
+    impl ExtractionFixture {
+        fn new() -> Self {
+            Self::with_world(World::new())
+        }
+
+        fn with_world(mut main: World) -> Self {
+            main.init_resource::<crate::config::EngineConfig>();
+            main.insert_resource(RenderOrigin(IVec2::ZERO));
+            super::super::identity_changes::install_terrain(&mut main);
+            let mut render = World::new();
+            render.init_resource::<RenderTerrain>();
+            let mut schedule = Schedule::new(ExtractSchedule);
+            schedule.add_systems(extract);
+            Self {
+                main,
+                render,
+                schedule,
+            }
+        }
+
+        fn step(&mut self) {
+            Self::run(&mut self.main, &mut self.render, &mut self.schedule);
+        }
+
+        fn run(main: &mut World, render: &mut World, schedule: &mut Schedule) {
+            let mut extracted = MainWorld::default();
+            std::mem::swap(main, &mut *extracted);
+            render.insert_resource(extracted);
+            schedule.run(render);
+            let mut extracted = render.remove_resource::<MainWorld>().unwrap();
+            std::mem::swap(main, &mut *extracted);
+        }
+
+        fn compare_full(&mut self) {
+            let mut fresh = World::new();
+            fresh.init_resource::<RenderTerrain>();
+            let mut schedule = Schedule::new(ExtractSchedule);
+            schedule.add_systems(extract);
+            Self::run(&mut self.main, &mut fresh, &mut schedule);
+            let actual = self.render.resource::<RenderTerrain>();
+            let expected = fresh.resource::<RenderTerrain>();
+            assert_eq!(actual.surfaces.len(), expected.surfaces.len());
+            for (main, surface) in &expected.surfaces {
+                let current = &actual.surfaces[main];
+                assert_eq!(
+                    (&current.keys, current.mesh, current.kind, current.protected),
+                    (&surface.keys, surface.mesh, surface.kind, surface.protected)
+                );
+            }
+        }
+
+        fn native(&mut self, world: u32, grid: IVec2, quadrant: u8) -> (Entity, Entity) {
+            self.main.init_resource::<super::super::lod::LodStreaming>();
+            let origin = shared::lod::LodOrigin::new(13, -7);
+            let tier = shared::lod::LodTier::Tier16;
+            let anchor = origin.chunk_for_cell(tier, grid.x, grid.y);
+            let root = super::super::lod::LodStreaming::spawn_ready_chunk_for_test(
+                &mut self.main,
+                world,
+                anchor,
+                origin,
+            );
+            let patch = self
+                .main
+                .spawn((
+                    super::super::TerrainCoverage {
+                        grid,
+                        quadrant,
+                        tier: Some(tier),
+                    },
+                    ChildOf(root),
+                ))
+                .id();
+            let primitive = self
+                .main
+                .spawn((
+                    Mesh3d::default(),
+                    InheritedVisibility::VISIBLE,
+                    ChildOf(patch),
+                ))
+                .id();
+            (patch, primitive)
+        }
+
+        fn merged(&mut self, world: u32, grid: IVec2) -> Entity {
+            self.main
+                .spawn((
+                    Mesh3d::default(),
+                    InheritedVisibility::VISIBLE,
+                    MergedTerrainCoverage { grid },
+                    TerrainWorldspace(world),
+                ))
+                .id()
+        }
+    }
+
+    #[test]
+    fn incremental_extraction_matches_full_build_and_preserves_unaffected_surfaces() {
+        let mut fixture = ExtractionFixture::new();
+        let fixed = fixture.merged(7, IVec2::ZERO);
+        fixture.step();
+        fixture.compare_full();
+        // A full rebuild discards this allocation. An unrelated arrival must retain it.
+        fixture
+            .render
+            .resource_mut::<RenderTerrain>()
+            .surfaces
+            .get_mut(&fixed.into())
+            .unwrap()
+            .keys
+            .reserve(20);
+        let capacity = fixture.render.resource::<RenderTerrain>().surfaces[&fixed.into()]
+            .keys
+            .capacity();
+        let revision = fixture.render.resource::<RenderTerrain>().revision;
+        let arriving = fixture.merged(7, IVec2::new(-3, 2));
+        fixture.step();
+        fixture.compare_full();
+        assert_eq!(
+            fixture.render.resource::<RenderTerrain>().revision,
+            revision + 1
+        );
+        assert_eq!(
+            fixture.render.resource::<RenderTerrain>().surfaces[&fixed.into()]
+                .keys
+                .capacity(),
+            capacity
+        );
+        fixture
+            .main
+            .entity_mut(arriving)
+            .insert(InheritedVisibility::HIDDEN);
+        fixture.step();
+        fixture.compare_full();
+        fixture
+            .main
+            .entity_mut(arriving)
+            .insert((InheritedVisibility::VISIBLE, TerrainWorldspace(8)));
+        fixture.step();
+        fixture.compare_full();
+        fixture
+            .main
+            .entity_mut(arriving)
+            .remove::<MergedTerrainCoverage>();
+        fixture.step();
+        fixture.compare_full();
+        fixture.main.entity_mut(fixed).despawn();
+        fixture.step();
+        fixture.compare_full();
+        let revision = fixture.render.resource::<RenderTerrain>().revision;
+        fixture.step();
+        assert_eq!(
+            fixture.render.resource::<RenderTerrain>().revision,
+            revision
+        );
+    }
+
+    #[test]
+    fn incremental_extraction_tracks_identity_and_named_hold_withdrawal() {
+        let mut fixture = ExtractionFixture::new();
+        let (patch, primitive) = fixture.native(7, IVec2::new(-19, 37), 2);
+        fixture.step();
+        fixture.compare_full();
+        assert_eq!(
+            fixture.render.resource::<RenderTerrain>().surfaces[&primitive.into()].kind,
+            Kind::Native
+        );
+        fixture
+            .main
+            .get_mut::<super::super::TerrainCoverage>(patch)
+            .unwrap()
+            .quadrant = 3;
+        fixture.step();
+        fixture.compare_full();
+        assert_eq!(
+            fixture.render.resource::<RenderTerrain>().surfaces[&primitive.into()].keys[0].quadrant,
+            3
+        );
+        let hold = fixture.main.spawn(SwapStandIn::default()).id();
+        fixture.main.entity_mut(primitive).insert(
+            SwapSurface::new(Handle::<StandardMaterial>::default().id().untyped(), [])
+                .with_stand_in(hold),
+        );
+        fixture.step();
+        fixture.compare_full();
+        assert!(fixture.render.resource::<RenderTerrain>().surfaces[&primitive.into()].protected);
+        // No component on the protected primitive changes when the named hold disappears.
+        fixture.main.entity_mut(hold).despawn();
+        fixture.step();
+        fixture.compare_full();
+        assert!(!fixture.render.resource::<RenderTerrain>().surfaces[&primitive.into()].protected);
+        fixture.main.entity_mut(primitive).remove::<Mesh3d>();
+        fixture.step();
+        fixture.compare_full();
+        fixture.main.entity_mut(primitive).insert(Mesh3d::default());
+        fixture.step();
+        fixture.compare_full();
+        fixture
+            .main
+            .entity_mut(patch)
+            .remove::<super::super::TerrainCoverage>();
+        fixture.step();
+        fixture.compare_full();
+        assert!(
+            fixture
+                .render
+                .resource::<RenderTerrain>()
+                .surfaces
+                .is_empty()
+        );
+    }
+
+    fn named_hold_disabling<D: Component>(disabled: impl Fn() -> D) {
+        let mut main = World::new();
+        main.register_disabling_component::<D>();
+        let mut fixture = ExtractionFixture::with_world(main);
+        let (_, source) = fixture.native(7, IVec2::ZERO, 0);
+        let hold = fixture
+            .main
+            .spawn((SwapStandIn::default(), disabled()))
+            .id();
+        fixture.main.entity_mut(source).insert(
+            SwapSurface::new(Handle::<StandardMaterial>::default().id().untyped(), [])
+                .with_stand_in(hold),
+        );
+        fixture.step();
+        assert!(!fixture.render.resource::<RenderTerrain>().surfaces[&source.into()].protected);
+        let revision = fixture.render.resource::<RenderTerrain>().revision;
+        fixture.main.entity_mut(hold).remove::<D>();
+        fixture.step();
+        fixture.compare_full();
+        assert!(fixture.render.resource::<RenderTerrain>().surfaces[&source.into()].protected);
+        assert_eq!(
+            fixture.render.resource::<RenderTerrain>().revision,
+            revision + 1
+        );
+        fixture.main.entity_mut(hold).insert(disabled());
+        fixture.step();
+        fixture.compare_full();
+        assert!(!fixture.render.resource::<RenderTerrain>().surfaces[&source.into()].protected);
+        assert_eq!(
+            fixture.render.resource::<RenderTerrain>().revision,
+            revision + 2
+        );
+    }
+
+    #[test]
+    fn incremental_extraction_tracks_disabled_named_hold_query_membership() {
+        named_hold_disabling(|| bevy::ecs::entity_disabling::Disabled);
+    }
+
+    #[test]
+    fn incremental_extraction_tracks_custom_disabled_named_hold_query_membership() {
+        #[derive(Component)]
+        struct CustomDisabled;
+        named_hold_disabling(|| CustomDisabled);
+    }
+
+    fn work_count(name: &str) -> u64 {
+        let counts = crate::work_counters::snapshot();
+        counts.before_ready.get(name).copied().unwrap_or_default()
+            + counts.after_ready.get(name).copied().unwrap_or_default()
+    }
+
+    #[test]
+    fn extraction_full_rebuild_counter_only_counts_recovery_and_scope_changes() {
+        let mut fixture = ExtractionFixture::new();
+        fixture.merged(7, IVec2::ZERO);
+        let initial = work_count("terrain_handoff/extract_full_rebuild");
+        fixture.step();
+        assert_eq!(
+            work_count("terrain_handoff/extract_full_rebuild"),
+            initial + 1
+        );
+        fixture.merged(7, IVec2::ONE);
+        fixture.step();
+        assert_eq!(
+            work_count("terrain_handoff/extract_full_rebuild"),
+            initial + 1
+        );
+        let revision = fixture.render.resource::<RenderTerrain>().revision;
+        fixture.step();
+        assert_eq!(
+            fixture.render.resource::<RenderTerrain>().revision,
+            revision
+        );
+        fixture
+            .main
+            .resource_mut::<crate::config::EngineConfig>()
+            .worldspace_id = 8;
+        fixture.step();
+        assert_eq!(
+            work_count("terrain_handoff/extract_full_rebuild"),
+            initial + 2
+        );
+        fixture
+            .main
+            .resource_mut::<crate::config::EngineConfig>()
+            .assets_dir = "replacement-fixture".into();
+        fixture.step();
+        assert_eq!(
+            work_count("terrain_handoff/extract_full_rebuild"),
+            initial + 3
+        );
     }
 
     fn main(id: u32) -> MainEntity {

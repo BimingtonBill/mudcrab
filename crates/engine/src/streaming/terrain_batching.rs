@@ -2141,6 +2141,133 @@ mod tests {
     }
 
     #[test]
+    fn handoff_incremental_batch_masks_sources_and_removal_match_fresh_extraction() {
+        use crate::streaming::terrain_handoff::{RenderTerrain, extraction_schedule_for_test};
+        use bevy::render::MainWorld;
+
+        fn run(main: &mut World, render: &mut World, schedule: &mut Schedule) {
+            let mut extracted = MainWorld::default();
+            std::mem::swap(main, &mut *extracted);
+            render.insert_resource(extracted);
+            schedule.run(render);
+            let mut extracted = render.remove_resource::<MainWorld>().unwrap();
+            std::mem::swap(main, &mut *extracted);
+        }
+        fn compare(main: &mut World, render: &mut World, schedule: &mut Schedule) {
+            run(main, render, schedule);
+            let mut fresh = World::new();
+            fresh.init_resource::<RenderTerrain>();
+            run(main, &mut fresh, &mut extraction_schedule_for_test());
+            assert_eq!(
+                render.resource::<RenderTerrain>().surfaces,
+                fresh.resource::<RenderTerrain>().surfaces
+            );
+        }
+        let mut app = test_app();
+        app.init_resource::<EngineConfig>();
+        app.insert_resource(RenderOrigin(IVec2::ZERO));
+        crate::streaming::identity_changes::install_terrain(app.world_mut());
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        ready_source(&mut app, &fixture);
+        queue_source(&mut app, &fixture);
+        let prepared = prepare(&mut app, &fixture).unwrap();
+        install_fixture(&mut app, &fixture, prepared);
+        app.world_mut()
+            .get_mut::<LodTerrainBatches>(fixture.root)
+            .unwrap()
+            .batches[0]
+            .selected = 0b1111;
+        let mut render = World::new();
+        render.init_resource::<RenderTerrain>();
+        let mut schedule = extraction_schedule_for_test();
+        // This fixture supplies extraction facts only, not executed rendering or GPU coverage.
+        let entities: Vec<_> = app
+            .world_mut()
+            .query_filtered::<Entity, With<Mesh3d>>()
+            .iter(app.world())
+            .collect();
+        for entity in entities {
+            app.world_mut()
+                .entity_mut(entity)
+                .insert(InheritedVisibility::VISIBLE);
+        }
+        compare(app.world_mut(), &mut render, &mut schedule);
+        let (batch, sources) = {
+            let chunk = app.world().get::<LodTerrainBatches>(fixture.root).unwrap();
+            let batch = &chunk.batches[0];
+            (
+                batch.entity,
+                batch
+                    .members
+                    .iter()
+                    .skip(2)
+                    .map(|member| member.source.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let fallbacks: Vec<_> = sources
+            .into_iter()
+            .map(|mesh| {
+                app.world_mut()
+                    .spawn((Mesh3d(mesh), InheritedVisibility::VISIBLE))
+                    .id()
+            })
+            .collect();
+        {
+            let mut chunk = app
+                .world_mut()
+                .get_mut::<LodTerrainBatches>(fixture.root)
+                .unwrap();
+            chunk.batches[0].selected = 0b0011;
+            chunk.batches[0].fallback_selected = 0b1100;
+            chunk.batches[0].fallback_entities = fallbacks.clone();
+        }
+        compare(app.world_mut(), &mut render, &mut schedule);
+        assert_eq!(
+            render.resource::<RenderTerrain>().surfaces[&batch.into()]
+                .keys
+                .len(),
+            2
+        );
+        for entity in fallbacks {
+            assert_eq!(
+                render.resource::<RenderTerrain>().surfaces[&entity.into()]
+                    .keys
+                    .len(),
+                1
+            );
+        }
+        app.world_mut()
+            .get_mut::<super::super::LodChunkRoot>(fixture.root)
+            .unwrap()
+            .key =
+            shared::lod::ChunkKey::new(8, LodTier::Tier4, shared::lod::ChunkAnchor::new(0, 0));
+        compare(app.world_mut(), &mut render, &mut schedule);
+        assert_eq!(
+            render.resource::<RenderTerrain>().surfaces[&batch.into()].keys[0].world,
+            8
+        );
+        app.world_mut()
+            .entity_mut(batch)
+            .insert(InheritedVisibility::HIDDEN);
+        compare(app.world_mut(), &mut render, &mut schedule);
+        app.world_mut()
+            .entity_mut(batch)
+            .insert(InheritedVisibility::VISIBLE);
+        compare(app.world_mut(), &mut render, &mut schedule);
+        app.world_mut()
+            .entity_mut(fixture.root)
+            .remove::<LodTerrainBatches>();
+        compare(app.world_mut(), &mut render, &mut schedule);
+        assert!(
+            !render
+                .resource::<RenderTerrain>()
+                .surfaces
+                .contains_key(&batch.into())
+        );
+    }
+
+    #[test]
     fn selection_upload_gauge_separates_initial_chunks_and_tracks_activation() {
         let mut app = selection_app();
         let fixture = fixture(&mut app, &[IVec2::ZERO, IVec2::new(3, 0)], LodTier::Tier4);

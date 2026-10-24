@@ -306,6 +306,8 @@ pub(super) fn validate_relationships(world: &World) {
 #[derive(Default)]
 struct TerrainIdentityCache {
     evaluated: Option<Tick>,
+    changed: Vec<MainEntity>,
+    recovered: bool,
     entities: Vec<Entity>,
     next_entities: Vec<Entity>,
     identities: std::sync::Arc<HashMap<MainEntity, TerrainPrimitiveIdentity>>,
@@ -406,7 +408,7 @@ impl TerrainIdentityAccess<'_, '_> {
             .collect()
     }
 
-    /// The production extractor calls this unconditionally on each parameter fetch. Change
+    /// Snapshot consumers call this unconditionally on each parameter fetch. Change
     /// filters advance on fetch, so a fetch-only gap also forces a rebuild. This uses Bevy's
     /// ordinary change-tick window, not an unlimited-history proof across arbitrary tick wraps.
     /// The cache always retains its own Arc clone. Pointer equality indicates freshness only
@@ -415,11 +417,27 @@ impl TerrainIdentityAccess<'_, '_> {
     pub(crate) fn identities_shared(
         &mut self,
     ) -> std::sync::Arc<HashMap<MainEntity, TerrainPrimitiveIdentity>> {
+        self.identities_snapshot(false)
+    }
+
+    /// Terrain handoff opts into exact deltas; ordinary identity consumers do no extra delta work.
+    pub(crate) fn identities_shared_with_changes(
+        &mut self,
+    ) -> std::sync::Arc<HashMap<MainEntity, TerrainPrimitiveIdentity>> {
+        self.identities_snapshot(true)
+    }
+
+    fn identities_snapshot(
+        &mut self,
+        track_changes: bool,
+    ) -> std::sync::Arc<HashMap<MainEntity, TerrainPrimitiveIdentity>> {
         perf_span!("streaming::terrain_identity::identities");
         let started = std::time::Instant::now();
+        self.cache.changed.clear();
+        self.cache.recovered = false;
         validate_relationships(self.world);
         if self.events.is_some() && self.tracking.is_some() {
-            self.update_incremental();
+            self.update_incremental(track_changes);
             self.audit_identities();
             let identities = std::sync::Arc::clone(&self.cache.identities);
             self.cache
@@ -456,6 +474,20 @@ impl TerrainIdentityAccess<'_, '_> {
         if dirty {
             perf_span!("streaming::terrain_identity::rebuild");
             let identities = self.uncached_identities();
+            self.cache.recovered = true;
+            if track_changes {
+                self.cache.changed = self
+                    .cache
+                    .identities
+                    .keys()
+                    .filter(|entity| !identities.contains_key(&entity.id()))
+                    .copied()
+                    .chain(identities.iter().filter_map(|(entity, identity)| {
+                        let main = MainEntity::from(*entity);
+                        (self.cache.identities.get(&main) != Some(identity)).then_some(main)
+                    }))
+                    .collect();
+            }
             let cache = &mut *self.cache;
             cache.identities = std::sync::Arc::new(
                 identities
@@ -479,6 +511,17 @@ impl TerrainIdentityAccess<'_, '_> {
             .timing
             .record("streaming::terrain_identity::identities", started.elapsed());
         identities
+    }
+
+    /// Exact identity additions, changes and removals from the last delta-enabled snapshot.
+    /// Consumers need not retain and diff the full snapshot to refresh their own derived rows.
+    pub(crate) fn changed_identities(&self) -> &[MainEntity] {
+        &self.cache.changed
+    }
+
+    /// Query-domain or journal recovery requires consumers with additional inputs to recover too.
+    pub(crate) fn recovered(&self) -> bool {
+        self.cache.recovered
     }
 
     fn facts(&self, entity: Entity) -> Option<TerrainNodeFacts> {
@@ -564,7 +607,7 @@ impl TerrainIdentityAccess<'_, '_> {
         }
     }
 
-    fn update_incremental(&mut self) {
+    fn update_incremental(&mut self, track_changes: bool) {
         perf_span!("streaming::terrain_identity::incremental");
         let Some(events) = self.events.as_ref() else {
             return;
@@ -602,6 +645,7 @@ impl TerrainIdentityAccess<'_, '_> {
                 .relationships
                 .as_ref()
                 .is_some_and(|checks| checks.has_missing());
+        self.cache.recovered = full;
         let mut dirty = bevy::ecs::entity::EntityHashSet::default();
         let mut rebuilt = None;
         if full {
@@ -750,6 +794,11 @@ impl TerrainIdentityAccess<'_, '_> {
         // Unrelated object streaming preserves the exact snapshot. Copy-on-write happens once
         // only when a terrain identity changes while an earlier snapshot is still borrowed.
         if !updates.is_empty() {
+            if track_changes {
+                self.cache
+                    .changed
+                    .extend(updates.iter().map(|(entity, _)| MainEntity::from(*entity)));
+            }
             let identities = std::sync::Arc::make_mut(&mut self.cache.identities);
             for (mesh, identity) in updates {
                 match identity {
