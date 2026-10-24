@@ -67,7 +67,13 @@ struct FarStockMeasurements {
     total_request_micros: u64,
     committed_cells: u64,
     spawned_references: u64,
-    stop_no_budget_slot: u64,
+    requests_submitted: u64,
+    dispatch_refusals: u64,
+    publication_attempts: u64,
+    apply_micros: u64,
+    max_apply_micros: u64,
+    stop_admission_pressure: u64,
+    stop_admission_time: u64,
     stop_time_budget: u64,
     stop_nothing_ready: u64,
 }
@@ -96,7 +102,7 @@ pub(crate) struct FarStock {
     near_roots: HashMap<CellKey, Entity>,
     near_roles: HashMap<Entity, CellRole>,
     fallback_revision: Option<u64>,
-    terminal_revision: Option<u64>,
+    refusal_revision: Option<u64>,
     fallback_references: BTreeSet<u32>,
     counted_worlds: HashSet<u32>,
     qualification_pending: bool,
@@ -134,6 +140,25 @@ fn cell_world(key: CellKey) -> Option<u32> {
     match key {
         CellKey::Exterior { worldspace_id, .. } => Some(worldspace_id),
         _ => None,
+    }
+}
+
+// Identical near-first order for sparse request planning and ready publication.
+fn sparse_cell_order(key: CellKey, center: IVec2) -> (i64, u32, i32, i32) {
+    match key {
+        CellKey::Exterior {
+            worldspace_id,
+            grid_x,
+            grid_y,
+        } => (
+            (i64::from(grid_x) - i64::from(center.x))
+                .abs()
+                .max((i64::from(grid_y) - i64::from(center.y)).abs()),
+            worldspace_id,
+            grid_x,
+            grid_y,
+        ),
+        CellKey::Interior(_) => unreachable!("sparse sources require exterior position grids"),
     }
 }
 
@@ -326,7 +351,7 @@ fn plan(
             far.submission_failure = None;
             far.demand = None;
             far.fallback_revision = None;
-            far.terminal_revision = None;
+            far.refusal_revision = None;
             far.fallback_references.clear();
             far.counted_worlds.clear();
             far.qualification_pending = false;
@@ -342,12 +367,12 @@ fn plan(
         far.fallback_references.clear();
         far.counted_worlds.clear();
     }
-    let terminal_revision = ownership
+    let refusal_revision = ownership
         .as_deref()
         .filter(|facts| facts.package_matches(&package.0))
-        .map(|facts| facts.terminal_revision());
-    let mut fallback_changed = changed_package || far.terminal_revision != terminal_revision;
-    far.terminal_revision = terminal_revision;
+        .map(|facts| facts.refusal_revision());
+    let mut fallback_changed = changed_package || far.refusal_revision != refusal_revision;
+    far.refusal_revision = refusal_revision;
     far.qualification_pending = true;
     if let Some((revision, references)) = fallback
         .as_mut()
@@ -561,21 +586,7 @@ fn plan(
     }
     let center = demand.map_or(IVec2::ZERO, |d| d.center);
     let mut wanted: Vec<_> = wanted.into_iter().collect();
-    wanted.sort_by_key(|(key, _)| match *key {
-        CellKey::Exterior {
-            worldspace_id,
-            grid_x,
-            grid_y,
-        } => (
-            (i64::from(grid_x) - i64::from(center.x))
-                .abs()
-                .max((i64::from(grid_y) - i64::from(center.y)).abs()),
-            worldspace_id,
-            grid_x,
-            grid_y,
-        ),
-        _ => unreachable!(),
-    });
+    wanted.sort_by_key(|(key, _)| sparse_cell_order(*key, center));
     far.set_queued(wanted.into());
     commands.queue(|world: &mut World| with_far(world, refresh_holders));
     info!(
@@ -588,24 +599,30 @@ fn plan(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(bevy::ecs::system::SystemParam)]
+pub(super) struct CollectParams<'w, 's> {
+    commands: Commands<'w, 's>,
+    config: Res<'w, EngineConfig>,
+    ownership: Option<Res<'w, crate::cluster::ownership::OwnershipFacts>>,
+    database: Res<'w, WorldDatabase>,
+    asset_server: Res<'w, AssetServer>,
+    snow: Res<'w, DirectionalSnowCatalog>,
+    origin: Res<'w, RenderOrigin>,
+    stamps: Option<Res<'w, crate::portal::StreamedCellLayerStamps>>,
+    far: ResMut<'w, FarStock>,
+    streaming: ResMut<'w, StreamingWorld>,
+    budget: ResMut<'w, StreamingCommitBudget>,
+    profiler: ResMut<'w, ProfilingState>,
+    runtime: Option<Res<'w, super::runtime::StreamingRuntime>>,
+}
+
+/// IO responses are polled independently of publication. Publication applies one
+/// exact response before admitting the next, so the shared clock includes hooks
+/// and command application as well as validation and command construction.
 pub(super) fn collect(
-    mut commands: Commands,
-    config: Res<EngineConfig>,
-    ownership: Option<Res<crate::cluster::ownership::OwnershipFacts>>,
-    database: Res<WorldDatabase>,
-    asset_server: Res<AssetServer>,
-    snow: Res<DirectionalSnowCatalog>,
-    origin: Res<RenderOrigin>,
-    stamps: Option<Res<crate::portal::StreamedCellLayerStamps>>,
-    mut far: ResMut<FarStock>,
-    mut streaming: ResMut<StreamingWorld>,
-    mut budget: ResMut<StreamingCommitBudget>,
-    mut profiler: ResMut<ProfilingState>,
+    world: &mut World,
+    state: &mut bevy::ecs::system::SystemState<CollectParams>,
 ) {
-    if far.package.is_none() {
-        return;
-    }
     let mut received = 0_u64;
     let mut received_rows = 0_u64;
     let mut query_micros = 0_u64;
@@ -613,208 +630,319 @@ pub(super) fn collect(
     let mut total_request_micros = 0_u64;
     let mut committed_cells = 0_u64;
     let mut spawned_references = 0_u64;
-    let mut stop_no_budget_slot = false;
+    let mut publication_attempts = 0_u64;
+    let mut requests_submitted = 0_u64;
+    let mut dispatch_refusals = 0_u64;
+    let mut apply_micros = 0_u64;
+    let mut max_apply_micros = 0_u64;
     let mut stop_time_budget = false;
-    let keys: Vec<_> = far.pending.keys().copied().collect();
-    for key in keys {
-        let pending = far.pending.get_mut(&key).unwrap();
-        if pending.ready.is_none() {
-            match pending.receiver.try_recv() {
-                Ok(response) => {
-                    received += 1;
-                    received_rows += response.result.as_ref().map_or(0, Vec::len) as u64;
-                    query_micros = query_micros.saturating_add(response.query_micros);
-                    queue_wait_micros =
-                        queue_wait_micros.saturating_add(response.queue_wait_micros);
-                    total_request_micros =
-                        total_request_micros.saturating_add(response.total_request_micros);
-                    profiler.set_gauge(
-                        "lod/exact_stock_query_ms",
-                        response.query_micros as f64 / 1_000.0,
-                    );
-                    profiler.set_gauge(
-                        "lod/exact_stock_queue_wait_ms",
-                        response.queue_wait_micros as f64 / 1_000.0,
-                    );
-                    profiler.set_gauge(
-                        "lod/exact_stock_total_request_ms",
-                        response.total_request_micros as f64 / 1_000.0,
-                    );
-                    pending.ready = Some(response);
-                }
-                Err(TryRecvError::Empty) => continue,
-                Err(TryRecvError::Disconnected) => {
-                    far.pending.remove(&key);
-                    far.failed
-                        .insert(key, "sparse database response disconnected".into());
-                    continue;
+    let mut stop_admission_pressure = false;
+    let mut stop_admission_time = false;
+    let ready_keys = {
+        let CollectParams {
+            mut far,
+            mut profiler,
+            ..
+        } = state
+            .get_mut(world)
+            .expect("sparse collector resources must remain present");
+        if far.package.is_none() {
+            return;
+        }
+        let generation = far.generation;
+        let mut ready = Vec::new();
+        for (&key, pending) in &mut far.pending {
+            if pending.ready.is_none() {
+                match pending.receiver.try_recv() {
+                    Ok(response) => {
+                        received += 1;
+                        received_rows += response.result.as_ref().map_or(0, Vec::len) as u64;
+                        query_micros = query_micros.saturating_add(response.query_micros);
+                        queue_wait_micros =
+                            queue_wait_micros.saturating_add(response.queue_wait_micros);
+                        total_request_micros =
+                            total_request_micros.saturating_add(response.total_request_micros);
+                        profiler.set_gauge(
+                            "lod/exact_stock_query_ms",
+                            response.query_micros as f64 / 1_000.0,
+                        );
+                        profiler.set_gauge(
+                            "lod/exact_stock_queue_wait_ms",
+                            response.queue_wait_micros as f64 / 1_000.0,
+                        );
+                        profiler.set_gauge(
+                            "lod/exact_stock_total_request_ms",
+                            response.total_request_micros as f64 / 1_000.0,
+                        );
+                        pending.ready = Some(response);
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        // Service a disconnected request as failed work under
+                        // the same publication budget, without losing its key.
+                        pending.ready = Some(ReferenceResponse {
+                            generation,
+                            key,
+                            result: Err("sparse database response disconnected".into()),
+                            query_micros: 0,
+                            queue_wait_micros: 0,
+                            total_request_micros: 0,
+                        });
+                    }
                 }
             }
+            if pending.ready.is_some() {
+                ready.push(key);
+            }
         }
-        if budget.remaining == 0 {
-            stop_no_budget_slot = true;
-            break;
-        }
-        if config.max_commit_micros_per_frame > 0
-            && budget.commits > 0
-            && budget.frame_started.elapsed().as_micros()
-                > u128::from(config.max_commit_micros_per_frame)
+        let center = far.demand.map_or(IVec2::ZERO, |demand| demand.center);
+        ready.sort_by_key(|key| sparse_cell_order(*key, center));
+        ready
+    };
+    for key in ready_keys {
         {
-            stop_time_budget = true;
-            break;
-        }
-        let pending = far.pending.remove(&key).unwrap();
-        let response = pending.ready.unwrap();
-        if response.generation != far.generation || response.key != key {
-            far.failed.insert(
-                key,
-                "sparse response generation or cell differs from request".into(),
-            );
-            continue;
-        }
-        let rows = match response.result {
-            Ok(rows) => rows,
-            Err(reason) => {
-                error!(?key,%reason,"exact distant source query failed");
-                far.failed.insert(key, reason);
+            let CollectParams {
+                mut commands,
+                config,
+                ownership,
+                asset_server,
+                snow,
+                origin,
+                stamps,
+                mut far,
+                mut streaming,
+                mut budget,
+                mut profiler,
+                runtime,
+                ..
+            } = state
+                .get_mut(world)
+                .expect("sparse collector resources must remain present");
+            if !far
+                .pending
+                .get(&key)
+                .is_some_and(|pending| pending.ready.is_some())
+            {
                 continue;
             }
-        };
-        let ids: BTreeSet<_> = rows.iter().map(|r| r.form_id).collect();
-        if ids != pending.ids || rows.len() != ids.len() {
-            far.failed
-                .insert(key, "sparse response identities differ from request".into());
-            continue;
-        }
-        let package = far.package.as_ref().unwrap().clone();
-        let verified = rows.iter().all(|row| row_matches(&package, row));
-        if !verified {
-            far.failed.insert(
-                key,
-                "sparse response disagrees with retained authoritative placement".into(),
-            );
-            continue;
-        }
-        let current_role = role(far.demand);
-        let holder = *far.holders.entry(key).or_insert_with(|| {
-            let CellKey::Exterior { grid_x, grid_y, .. } = key else {
-                unreachable!()
-            };
-            commands
-                .spawn((
-                    Name::new(format!("Exact distant sources {key:?}")),
-                    DistantRoleRoot,
-                    StreamedCellKey(key),
-                    ExteriorCellGrid(IVec2::new(grid_x, grid_y)),
-                    Transform::from_translation(super::grid_translation(
-                        IVec2::new(grid_x, grid_y),
-                        origin.0,
-                    )),
-                    holder_visibility(current_role),
-                ))
-                .id()
-        });
-        commands.queue(move |world: &mut World| {
-            if let Err(reason) = sync_holder_role(world, holder, current_role) {
-                fatal(world, reason);
+            if (budget.commits > 0
+                && config.max_commit_micros_per_frame > 0
+                && budget.frame_started.elapsed().as_micros()
+                    >= u128::from(config.max_commit_micros_per_frame))
+                || budget.elapsed_limit_reached(runtime.as_deref())
+            {
+                stop_time_budget = true;
+                break;
             }
-        });
-        // Use the ordinary spawner's placed-object source unless portal isolation owns stamps.
-        let layers = stamps.as_ref().map(|_| match current_role {
-            CellRole::Active => crate::render::reflectable_world_layers(),
-            CellRole::Destination => {
-                bevy::camera::visibility::RenderLayers::layer(crate::portal::DESTINATION_LAYER)
+            // Invalid and failed responses cost real work too. Full-cell slots
+            // belong only to full-cell commits and are not spent here.
+            budget.commits = budget.commits.saturating_add(1);
+            publication_attempts += 1;
+            let pending = far.pending.remove(&key).unwrap();
+            let response = pending.ready.unwrap();
+            if response.generation != far.generation || response.key != key {
+                far.failed.insert(
+                    key,
+                    "sparse response generation or cell differs from request".into(),
+                );
+                continue;
             }
-            CellRole::Hidden => bevy::camera::visibility::RenderLayers::none(),
-        });
-        let mut spawned = Vec::new();
-        let mut missing_models = Vec::new();
-        commands.entity(holder).with_children(|parent| {
-            let mut context = ReferenceSpawnContext {
-                key,
-                stamp: layers.as_ref(),
-                snow: &snow,
-                model_sequence: &mut streaming.next_model_sequence,
-                asset_server: &asset_server,
-                profiler: &mut profiler,
-                world_physics: false,
-                lights: config.lights,
-                schedule_scenes: super::requests::enabled(&config),
-            };
-            for row in rows {
-                let id = (cell_world(key).unwrap(), row.form_id);
-                if far.owners.contains_key(&id) || !far.desired.contains_key(&id) {
+            let rows = match response.result {
+                Ok(rows) => rows,
+                Err(reason) => {
+                    error!(?key,%reason,"exact distant source query failed");
+                    far.failed.insert(key, reason);
                     continue;
                 }
-                let Some((entity, requested)) = spawn_reference(parent, row.clone(), &mut context)
-                else {
-                    continue;
+            };
+            let ids: BTreeSet<_> = rows.iter().map(|r| r.form_id).collect();
+            if ids != pending.ids || rows.len() != ids.len() {
+                far.failed
+                    .insert(key, "sparse response identities differ from request".into());
+                continue;
+            }
+            let package = far.package.as_ref().unwrap().clone();
+            let verified = rows.iter().all(|row| row_matches(&package, row));
+            if !verified {
+                far.failed.insert(
+                    key,
+                    "sparse response disagrees with retained authoritative placement".into(),
+                );
+                continue;
+            }
+            let current_role = role(far.demand);
+            let holder = *far.holders.entry(key).or_insert_with(|| {
+                let CellKey::Exterior { grid_x, grid_y, .. } = key else {
+                    unreachable!()
                 };
-                let beyond_grid = far.demand.is_some_and(|demand| {
-                    let CellKey::Exterior { grid_x, grid_y, .. } = key else {
-                        return false;
+                commands
+                    .spawn((
+                        Name::new(format!("Exact distant sources {key:?}")),
+                        DistantRoleRoot,
+                        StreamedCellKey(key),
+                        ExteriorCellGrid(IVec2::new(grid_x, grid_y)),
+                        Transform::from_translation(super::grid_translation(
+                            IVec2::new(grid_x, grid_y),
+                            origin.0,
+                        )),
+                        holder_visibility(current_role),
+                    ))
+                    .id()
+            });
+            commands.queue(move |world: &mut World| {
+                if let Err(reason) = sync_holder_role(world, holder, current_role) {
+                    fatal(world, reason);
+                }
+            });
+            // Use the ordinary spawner's placed-object source unless portal isolation owns stamps.
+            let layers = stamps.as_ref().map(|_| match current_role {
+                CellRole::Active => crate::render::reflectable_world_layers(),
+                CellRole::Destination => {
+                    bevy::camera::visibility::RenderLayers::layer(crate::portal::DESTINATION_LAYER)
+                }
+                CellRole::Hidden => bevy::camera::visibility::RenderLayers::none(),
+            });
+            let mut spawned = Vec::new();
+            let mut missing_models = Vec::new();
+            commands.entity(holder).with_children(|parent| {
+                let mut context = ReferenceSpawnContext {
+                    key,
+                    stamp: layers.as_ref(),
+                    snow: &snow,
+                    model_sequence: &mut streaming.next_model_sequence,
+                    asset_server: &asset_server,
+                    profiler: &mut profiler,
+                    world_physics: false,
+                    lights: config.lights,
+                    schedule_scenes: super::requests::enabled(&config),
+                };
+                for row in rows {
+                    let id = (cell_world(key).unwrap(), row.form_id);
+                    if far.owners.contains_key(&id) || !far.desired.contains_key(&id) {
+                        continue;
+                    }
+                    let Some((entity, requested)) =
+                        spawn_reference(parent, row.clone(), &mut context)
+                    else {
+                        continue;
                     };
-                    !demand.contains_cell(
-                        demand.world,
-                        IVec2::new(grid_x, grid_y),
-                        far.stream_radius,
-                    )
-                });
-                if let Some(partial) = super::partial_stock::PartialStock::for_demand(
-                    &package,
-                    &row,
-                    config.cluster_own_statics,
-                    beyond_grid,
-                    ownership.as_deref(),
-                ) {
-                    parent.commands().entity(entity).insert(partial);
+                    let beyond_grid = far.demand.is_some_and(|demand| {
+                        let CellKey::Exterior { grid_x, grid_y, .. } = key else {
+                            return false;
+                        };
+                        !demand.contains_cell(
+                            demand.world,
+                            IVec2::new(grid_x, grid_y),
+                            far.stream_radius,
+                        )
+                    });
+                    if let Some(partial) = super::partial_stock::PartialStock::for_demand(
+                        &package,
+                        &row,
+                        config.cluster_own_statics,
+                        beyond_grid,
+                        ownership.as_deref(),
+                    ) {
+                        parent.commands().entity(entity).insert(partial);
+                    }
+                    if !requested {
+                        warn!(
+                            reference = row.form_id,
+                            ?key,
+                            "distant stock source has no ordinary model request"
+                        );
+                        missing_models.push(entity);
+                        far.failed.insert(
+                            key,
+                            format!(
+                                "reference {:08X} has no ordinary model request",
+                                row.form_id
+                            ),
+                        );
+                    }
+                    spawned.push((
+                        id,
+                        Owner {
+                            entity,
+                            parent: holder,
+                            key,
+                            near_key: None,
+                            near_root: None,
+                            far: true,
+                            row: Some(row),
+                            physics_requested: false,
+                        },
+                    ));
                 }
-                if !requested {
-                    warn!(
-                        reference = row.form_id,
-                        ?key,
-                        "distant stock source has no ordinary model request"
-                    );
-                    missing_models.push(entity);
-                    far.failed.insert(
-                        key,
-                        format!(
-                            "reference {:08X} has no ordinary model request",
-                            row.form_id
-                        ),
-                    );
-                }
-                spawned.push((
-                    id,
-                    Owner {
-                        entity,
-                        parent: holder,
-                        key,
-                        near_key: None,
-                        near_root: None,
-                        far: true,
-                        row: Some(row),
-                        physics_requested: false,
-                    },
-                ));
+            });
+            for entity in missing_models {
+                commands.entity(entity).insert(super::AssetFailed);
             }
-        });
-        for entity in missing_models {
-            commands.entity(entity).insert(super::AssetFailed);
+            spawned_references += spawned.len() as u64;
+            for (id, owner) in spawned {
+                far.put_owner(id, owner);
+            }
+            committed_cells += 1;
+            profiler.increment("lod/exact_stock_cells_committed", 1);
         }
-        spawned_references += spawned.len() as u64;
-        for (id, owner) in spawned {
-            far.put_owner(id, owner);
-        }
-        budget.remaining = budget.remaining.saturating_sub(1);
-        budget.commits += 1;
-        committed_cells += 1;
-        profiler.increment("lod/exact_stock_cells_committed", 1);
+        // All SystemState borrows end above. Every resource, including FarStock
+        // and StreamingCommitBudget, stays installed while commands and observers
+        // run. Reacquire the live clock only after this response has applied.
+        let apply_started = Instant::now();
+        state.apply(world);
+        let elapsed = apply_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        apply_micros = apply_micros.saturating_add(elapsed);
+        max_apply_micros = max_apply_micros.max(elapsed);
     }
-    for _ in 0..config.max_cell_commits_per_frame.max(1) {
+    let CollectParams {
+        config,
+        database,
+        mut far,
+        streaming,
+        mut profiler,
+        runtime,
+        ..
+    } = state
+        .get_mut(world)
+        .expect("sparse collector resources must remain present");
+    let dispatch_started = Instant::now();
+    let mut dispatch_considered = 0_u64;
+    while !far.queued.is_empty() {
+        // Reuse existing controlled admission and backlog policy. Ready replies
+        // retain their outstanding place until publication, not just worker IO.
+        let backlog_limit = config.streaming_backlog_limit();
+        if runtime
+            .as_deref()
+            .is_some_and(|runtime| !runtime.cell_requests_allowed())
+            || (backlog_limit != 0
+                && far
+                    .pending
+                    .len()
+                    .saturating_add(streaming.outstanding_cells.len())
+                    >= backlog_limit)
+        {
+            stop_admission_pressure = true;
+            break;
+        }
+        if dispatch_considered > 0
+            && runtime
+                .as_deref()
+                .and_then(|runtime| runtime.decision)
+                .is_some_and(|decision| {
+                    dispatch_started.elapsed().as_micros()
+                        >= u128::from(decision.budgets.max_admission_micros)
+                })
+        {
+            stop_admission_time = true;
+            break;
+        }
         let Some((key, mut ids)) = far.pop_queued() else {
             break;
         };
+        dispatch_considered += 1;
         let placing_world = cell_world(key).unwrap();
         ids.retain(|id| !far.owners.contains_key(&(placing_world, *id)));
         if ids.is_empty() {
@@ -831,8 +959,10 @@ pub(super) fn collect(
                     },
                 );
                 far.submission_failure = None;
+                requests_submitted += 1;
             }
             Err(error) => {
+                dispatch_refusals += 1;
                 let reason = format!("{error:#}");
                 if far.submission_failure.as_ref() != Some(&reason) {
                     warn!(%reason,"exact distant source request remains pending");
@@ -843,34 +973,69 @@ pub(super) fn collect(
             }
         }
     }
+    let queued_cells = far.queued.len();
+    let pending_cells = far.pending.len();
+    let ready_cells = far
+        .pending
+        .values()
+        .filter(|pending| pending.ready.is_some())
+        .count();
+    let awaiting_response_cells = pending_cells - ready_cells;
+    let failed_cells = far.failed.len();
+    let stop_nothing_ready = !stop_time_budget && ready_cells == 0;
+    profiler.increment("lod/exact_stock_requests_submitted", requests_submitted);
+    profiler.increment("lod/exact_stock_dispatch_refusals", dispatch_refusals);
+    profiler.increment("lod/exact_stock_publication_attempts", publication_attempts);
     profiler.increment("lod/exact_stock_responses_received", received);
     profiler.increment("lod/exact_stock_response_rows", received_rows);
     profiler.increment("lod/exact_stock_spawned_references", spawned_references);
     profiler.increment(
-        "lod/exact_stock_stop_no_budget_slot",
-        u64::from(stop_no_budget_slot),
-    );
-    profiler.increment(
         "lod/exact_stock_stop_time_budget",
         u64::from(stop_time_budget),
     );
-    // Natural exhaustion: no further ready response was available, including after committing
-    // the last ready cell. Queue/pending gauges distinguish backlog from idle frames.
+    profiler.increment(
+        "lod/exact_stock_stop_admission_pressure",
+        u64::from(stop_admission_pressure),
+    );
+    profiler.increment(
+        "lod/exact_stock_stop_admission_time",
+        u64::from(stop_admission_time),
+    );
     profiler.increment(
         "lod/exact_stock_stop_nothing_ready",
-        u64::from(!stop_no_budget_slot && !stop_time_budget),
+        u64::from(stop_nothing_ready),
     );
-    profiler.set_gauge("lod/exact_stock_queued_cells", far.queued.len() as f64);
-    profiler.set_gauge("lod/exact_stock_pending_cells", far.pending.len() as f64);
-    profiler.set_gauge("lod/exact_stock_failed_cells", far.failed.len() as f64);
+    profiler.set_gauge("lod/exact_stock_queued_cells", queued_cells as f64);
+    profiler.set_gauge("lod/exact_stock_pending_cells", pending_cells as f64);
+    profiler.set_gauge("lod/exact_stock_ready_cells", ready_cells as f64);
+    profiler.set_gauge(
+        "lod/exact_stock_awaiting_response_cells",
+        awaiting_response_cells as f64,
+    );
+    profiler.set_gauge("lod/exact_stock_failed_cells", failed_cells as f64);
+    if committed_cells != 0 {
+        profiler.record_micros("lod/exact_stock_apply", apply_micros);
+        profiler.set_gauge(
+            "lod/exact_stock_max_apply_ms",
+            max_apply_micros as f64 / 1_000.0,
+        );
+    }
     let now = Instant::now();
-    let queued_cells = far.queued.len();
-    let pending_cells = far.pending.len();
-    let failed_cells = far.failed.len();
     let generation = far.generation;
     let measurements = &mut far.measurements;
     let started = *measurements.started.get_or_insert(now);
     measurements.collect_frames += 1;
+    measurements.requests_submitted = measurements
+        .requests_submitted
+        .saturating_add(requests_submitted);
+    measurements.dispatch_refusals = measurements
+        .dispatch_refusals
+        .saturating_add(dispatch_refusals);
+    measurements.publication_attempts = measurements
+        .publication_attempts
+        .saturating_add(publication_attempts);
+    measurements.apply_micros = measurements.apply_micros.saturating_add(apply_micros);
+    measurements.max_apply_micros = measurements.max_apply_micros.max(max_apply_micros);
     measurements.responses = measurements.responses.saturating_add(received);
     measurements.response_rows = measurements.response_rows.saturating_add(received_rows);
     measurements.query_micros = measurements.query_micros.saturating_add(query_micros);
@@ -884,9 +1049,10 @@ pub(super) fn collect(
     measurements.spawned_references = measurements
         .spawned_references
         .saturating_add(spawned_references);
-    measurements.stop_no_budget_slot += u64::from(stop_no_budget_slot);
     measurements.stop_time_budget += u64::from(stop_time_budget);
-    measurements.stop_nothing_ready += u64::from(!stop_no_budget_slot && !stop_time_budget);
+    measurements.stop_admission_pressure += u64::from(stop_admission_pressure);
+    measurements.stop_admission_time += u64::from(stop_admission_time);
+    measurements.stop_nothing_ready += u64::from(stop_nothing_ready);
     if measurements
         .last_log
         .is_none_or(|last| now.duration_since(last).as_secs() >= 5)
@@ -896,6 +1062,11 @@ pub(super) fn collect(
             generation,
             elapsed_ms = now.duration_since(started).as_millis() as u64,
             collect_frames = measurements.collect_frames,
+            requests_submitted = measurements.requests_submitted,
+            dispatch_refusals = measurements.dispatch_refusals,
+            publication_attempts = measurements.publication_attempts,
+            apply_micros = measurements.apply_micros,
+            max_apply_micros = measurements.max_apply_micros,
             responses = measurements.responses,
             response_rows = measurements.response_rows,
             query_micros = measurements.query_micros,
@@ -903,11 +1074,14 @@ pub(super) fn collect(
             total_request_micros = measurements.total_request_micros,
             committed_cells = measurements.committed_cells,
             spawned_references = measurements.spawned_references,
-            stop_no_budget_slot = measurements.stop_no_budget_slot,
             stop_time_budget = measurements.stop_time_budget,
+            stop_admission_pressure = measurements.stop_admission_pressure,
+            stop_admission_time = measurements.stop_admission_time,
             stop_nothing_ready = measurements.stop_nothing_ready,
             queued_cells,
             pending_cells,
+            ready_cells,
+            awaiting_response_cells,
             failed_cells,
             "exact distant source measurements (cumulative)"
         );

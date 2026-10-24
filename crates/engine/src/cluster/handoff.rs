@@ -58,7 +58,7 @@ pub(super) struct Sources {
     certificate: Option<Arc<super::super::reader::CertifiedPackage>>,
     /// Initial terminal material refusals, never transient render failures.
     permanently_refused_records: BTreeSet<RecordKey>,
-    terminal_revision: Option<u64>,
+    refusal_revision: Option<u64>,
     present: BTreeSet<u32>,
     /// Complete, unchanged stock sources hidden ONLY by their owning cell's
     /// streaming retirement. History/bindings remain for material proof/revival.
@@ -112,7 +112,7 @@ pub(super) struct Sources {
     light_dependencies: HashMap<MainEntity, Option<HashSet<MainEntity>>>,
     invalid_meshes: HashSet<AssetId<Mesh>>,
     record_lookup: HashMap<(u32, u32), RecordKey>,
-    template_cache: HashMap<AssetId<WorldAsset>, bool>,
+    template_cache: HashMap<AssetId<WorldAsset>, HashSet<u32>>,
     invalid_templates: HashSet<AssetId<WorldAsset>>,
     geometry_cache:
         HashMap<bevy::asset::UntypedAssetId, super::super::material_geometry::GeometryRequirements>,
@@ -142,9 +142,9 @@ impl TemplateMeshDependencies {
         let mut meshes = HashSet::new();
         let mut bindings = HashMap::new();
         let mut duplicate = false;
-        // Exactly template_valid's mesh domain and identity readability. Making
+        // Exactly the qualification mesh domain and identity readability. Making
         // SourcePrimitive a required query input could admit a disabled entity
-        // that template_valid never inspected.
+        // that qualification never inspected.
         if let Some(mut query) = asset.world.try_query::<(Entity, &Mesh3d)>() {
             for (entity, mesh) in query.iter(&asset.world) {
                 meshes.insert(mesh.0.id());
@@ -199,6 +199,14 @@ struct SourceExtractionWork {
     journal_entities: u64,
     journal_events: u64,
     journal_complete: bool,
+    // Partition the deduplicated changed set by prior index membership and
+    // current unfiltered liveness. Unseen does not establish an entity's birth.
+    changed_entities: u64,
+    changed_unseen_live: u64,
+    changed_indexed_live: u64,
+    changed_indexed_gone: u64,
+    changed_unseen_gone: u64,
+    changed_indexed_live_roots: u64,
     retired_proof_keys_visited: u64,
     subjects_updated: u64,
     ancestry_edges: u64,
@@ -299,7 +307,7 @@ struct TemplateCaches<'a> {
         bevy::asset::UntypedAssetId,
         super::super::material_geometry::GeometryRequirements,
     >,
-    templates: &'a mut HashMap<AssetId<WorldAsset>, bool>,
+    templates: &'a mut HashMap<AssetId<WorldAsset>, HashSet<u32>>,
     template_meshes: &'a mut TemplateMeshDependencies,
     invalid_templates: &'a HashSet<AssetId<WorldAsset>>,
     invalid_meshes: &'a HashSet<AssetId<Mesh>>,
@@ -420,34 +428,45 @@ fn template_row(
         row.fallback = true;
         return row;
     }
-    let valid = match caches.templates.get(&source.id()).copied() {
-        Some(valid) => valid,
-        None => {
-            let asset = assets.and_then(|assets| assets.get(source));
-            let valid = asset.is_some_and(|asset| template_valid(asset, caches.invalid_meshes));
-            // An absent/loading template must be retried; only a loaded
-            // asset has an event-scoped result that can be retained.
-            if let Some(asset) = asset {
-                caches.template_meshes.register(source.id(), asset);
-                caches.templates.insert(source.id(), valid);
-            } else {
-                row.pending = true;
+    if let std::collections::hash_map::Entry::Vacant(entry) = caches.templates.entry(source.id()) {
+        // An absent/loading template must be retried; only a loaded
+        // asset has an event-scoped result that can be retained.
+        let Some(asset) = assets.and_then(|assets| assets.get(source)) else {
+            row.pending = true;
+            return row;
+        };
+        caches.template_meshes.register(source.id(), asset);
+        let bindings = &caches.template_meshes.by_ordinal[&source.id()];
+        let mut valid_ordinals = HashSet::new();
+        if let Some(mut meshes) = asset.world.try_query::<(Entity, &Mesh3d)>() {
+            for (entity, mesh) in meshes.iter(&asset.world) {
+                let Some(tag) = asset.world.get::<SourcePrimitive>(entity) else {
+                    continue;
+                };
+                // Duplicate ordinals clear the entire binding domain. Refused
+                // siblings retain their reverse mesh dependencies but cannot
+                // disqualify an independently certified occurrence.
+                if bindings.get(&tag.ordinal) == Some(&mesh.0.id())
+                    && template_primitive_valid(&asset.world, entity, mesh, caches.invalid_meshes)
+                {
+                    valid_ordinals.insert(tag.ordinal);
+                }
             }
-            valid
         }
-    };
+        entry.insert(valid_ordinals);
+    }
+    let ordinal = lazy.and_then(|lazy| lazy.source_primitive(index));
+    let valid = ordinal.is_some_and(|ordinal| caches.templates[&source.id()].contains(&ordinal));
     row.template = valid;
     if valid {
         // Validation and ordinal binding share the same event-scoped graph.
-        let mesh = lazy
-            .and_then(|lazy| lazy.source_primitive(index))
-            .and_then(|ordinal| {
-                caches
-                    .template_meshes
-                    .by_ordinal
-                    .get(&source.id())?
-                    .get(&ordinal)
-            });
+        let mesh = ordinal.and_then(|ordinal| {
+            caches
+                .template_meshes
+                .by_ordinal
+                .get(&source.id())?
+                .get(&ordinal)
+        });
         row.stock_tangents = mesh
             .and_then(|id| inputs.meshes.get(*id))
             .map(|mesh| mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT));
@@ -462,7 +481,7 @@ fn template_row(
         }
     }
     row.normal_map |= row.stock_tangents == Some(true);
-    if !valid && caches.templates.get(&source.id()) == Some(&false) {
+    if !valid {
         row.fallback = true;
     }
     row
@@ -1081,6 +1100,64 @@ fn model_matrix(entity: Entity, root: Entity, nodes: &Query<NodeState>) -> Optio
     matrix.is_finite().then_some(matrix)
 }
 
+fn template_primitive_valid(
+    world: &World,
+    entity: Entity,
+    mesh: &Mesh3d,
+    invalid: &HashSet<AssetId<Mesh>>,
+) -> bool {
+    let (Some(tag), Some(source_mesh), Some(source_transform), Some(static_model)) = (
+        world.get::<SourcePrimitive>(entity),
+        world.get::<SourcePrimitiveMesh>(entity),
+        world.get::<SourcePrimitiveTransform>(entity),
+        world.get::<SourceStaticModel>(entity),
+    ) else {
+        return false;
+    };
+    if !tag.matches_default_scene
+        || !static_model.0
+        || source_mesh.0 != mesh.0
+        || invalid.contains(&mesh.0.id())
+    {
+        return false;
+    }
+    let mut at = entity;
+    let mut matrix = Mat4::IDENTITY;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(at) {
+            return false;
+        }
+        let Some(pose) = world.get::<Transform>(at) else {
+            return false;
+        };
+        if world
+            .get::<SourceNodePose>(at)
+            .is_none_or(|baseline| baseline.0 != *pose)
+            || world.get::<crate::billboard::Billboard>(at).is_some()
+            || world.get::<bevy::mesh::skinning::SkinnedMesh>(at).is_some()
+            || world.get::<bevy::mesh::morph::MorphWeights>(at).is_some()
+            || world
+                .get::<bevy::mesh::morph::MeshMorphWeights>(at)
+                .is_some()
+            || world
+                .get::<bevy::gltf::GltfExtras>(at)
+                .is_some_and(|extras| {
+                    crate::billboard::BillboardMode::from_extras(&extras.value).is_some()
+                })
+        {
+            return false;
+        }
+        matrix = pose.to_matrix() * matrix;
+        match world.get::<ChildOf>(at) {
+            Some(parent) => at = parent.parent(),
+            None => break,
+        }
+    }
+    matrix == source_transform.0
+}
+
+#[cfg(test)]
 fn template_valid(asset: &WorldAsset, invalid: &HashSet<AssetId<Mesh>>) -> bool {
     let world = &asset.world;
     let Some(mut meshes) = world.try_query::<(Entity, &Mesh3d)>() else {
@@ -1089,55 +1166,7 @@ fn template_valid(asset: &WorldAsset, invalid: &HashSet<AssetId<Mesh>>) -> bool 
     let mut count = 0;
     for (entity, mesh) in meshes.iter(world) {
         count += 1;
-        let (Some(tag), Some(source_mesh), Some(source_transform), Some(static_model)) = (
-            world.get::<SourcePrimitive>(entity),
-            world.get::<SourcePrimitiveMesh>(entity),
-            world.get::<SourcePrimitiveTransform>(entity),
-            world.get::<SourceStaticModel>(entity),
-        ) else {
-            return false;
-        };
-        if !tag.matches_default_scene
-            || !static_model.0
-            || source_mesh.0 != mesh.0
-            || invalid.contains(&mesh.0.id())
-        {
-            return false;
-        }
-        let mut at = entity;
-        let mut matrix = Mat4::IDENTITY;
-        let mut seen = HashSet::new();
-        loop {
-            if !seen.insert(at) {
-                return false;
-            }
-            let Some(pose) = world.get::<Transform>(at) else {
-                return false;
-            };
-            if world
-                .get::<SourceNodePose>(at)
-                .is_none_or(|baseline| baseline.0 != *pose)
-                || world.get::<crate::billboard::Billboard>(at).is_some()
-                || world.get::<bevy::mesh::skinning::SkinnedMesh>(at).is_some()
-                || world.get::<bevy::mesh::morph::MorphWeights>(at).is_some()
-                || world
-                    .get::<bevy::mesh::morph::MeshMorphWeights>(at)
-                    .is_some()
-                || world
-                    .get::<bevy::gltf::GltfExtras>(at)
-                    .is_some_and(|extras| {
-                        crate::billboard::BillboardMode::from_extras(&extras.value).is_some()
-                    })
-            {
-                return false;
-            }
-            matrix = pose.to_matrix() * matrix;
-            match world.get::<ChildOf>(at) {
-                Some(parent) => at = parent.parent(),
-                None => break,
-            }
-        }
-        if matrix != source_transform.0 {
+        if !template_primitive_valid(world, entity, mesh, invalid) {
             return false;
         }
     }
@@ -1272,8 +1301,8 @@ fn extract_sources(
             .as_ref()
             .is_some_and(|package| facts.package_matches(package))
     });
-    let terminal_revision = facts.map(|facts| facts.terminal_revision());
-    let permanent_changed = terminal_revision != out.terminal_revision
+    let refusal_revision = facts.map(|facts| facts.refusal_revision());
+    let permanent_changed = refusal_revision != out.refusal_revision
         || certificate
             .as_ref()
             .zip(out.certificate.as_ref())
@@ -1282,7 +1311,7 @@ fn extract_sources(
         out.permanently_refused_records = facts
             .map(|facts| facts.permanent_refused_records())
             .unwrap_or_default();
-        out.terminal_revision = terminal_revision;
+        out.refusal_revision = refusal_revision;
     }
     let same = match (&certificate, &out.certificate) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -1409,6 +1438,23 @@ fn extract_sources(
     }
     if !same {
         out.seen_roots.clear();
+    }
+    // Read retained membership before update removes and rebuilds index edges.
+    // Gone nodes can include ancestors removed by ordinary stock flattening;
+    // these counts alone do not establish an erroneous replacement loop.
+    work.changed_entities = changed.len() as u64;
+    for &entity in &changed {
+        let indexed = queries.cache.index.contains_node(entity);
+        let live = queries.entities.contains_spawned(entity);
+        match (indexed, live) {
+            (false, true) => work.changed_unseen_live += 1,
+            (true, true) => {
+                work.changed_indexed_live += 1;
+                work.changed_indexed_live_roots += u64::from(queries.roots.contains(entity));
+            }
+            (true, false) => work.changed_indexed_gone += 1,
+            (false, false) => work.changed_unseen_gone += 1,
+        }
     }
     let mut index = std::mem::take(&mut queries.cache.index);
     let affected = index.update(
@@ -2127,6 +2173,23 @@ fn extract_sources(
             }
         }
     }
+    if out.expected_cameras != expected_cameras {
+        for (entity, camera, graphics, streaming, is_portal, clusters, _) in &queries.cameras {
+            if let Some(world) = expected_cameras.get(&MainEntity::from(entity)) {
+                info!(
+                    ?entity,
+                    world,
+                    ?graphics,
+                    streaming,
+                    is_portal,
+                    clusters = clusters.is_some(),
+                    target_size = ?camera.physical_target_size(),
+                    viewport_size = ?camera.physical_viewport_size(),
+                    "cluster loading expected camera"
+                );
+            }
+        }
+    }
     for (entity, parent) in &queries.light_parents {
         let mut at = parent.map(ChildOf::parent);
         let mut seen = HashSet::new();
@@ -2355,6 +2418,12 @@ fn extract_sources(
             journal_entities = work.journal_entities,
             journal_events = work.journal_events,
             journal_complete = work.journal_complete,
+            changed_entities = work.changed_entities,
+            changed_unseen_live = work.changed_unseen_live,
+            changed_indexed_live = work.changed_indexed_live,
+            changed_indexed_gone = work.changed_indexed_gone,
+            changed_unseen_gone = work.changed_unseen_gone,
+            changed_indexed_live_roots = work.changed_indexed_live_roots,
             retired_proof_keys_visited = work.retired_proof_keys_visited,
             subjects_updated = work.subjects_updated,
             ancestry_edges = work.ancestry_edges,
@@ -4830,6 +4899,114 @@ mod extract_source_tests {
     }
 
     include!("flat_source_handoff_tests.rs");
+
+    fn assert_source_change_partition(work: SourceExtractionWork) {
+        assert_eq!(
+            work.changed_entities,
+            work.changed_unseen_live
+                + work.changed_indexed_live
+                + work.changed_indexed_gone
+                + work.changed_unseen_gone,
+            "each deduplicated changed entity belongs to exactly one category"
+        );
+        assert!(work.changed_indexed_live_roots <= work.changed_indexed_live);
+    }
+
+    #[test]
+    fn source_change_counts_distinguish_loading_from_same_root_scene_replacement() {
+        let mut input = Fixture::pending();
+        // Retain the pending reference before its first scene instance arrives.
+        input.extract();
+        let mut primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        let loading = input.sources().last_work;
+        assert_source_change_partition(loading);
+        assert!(loading.changed_unseen_live > 0);
+        assert_eq!(loading.changed_indexed_gone, 0);
+        assert_eq!(loading.changed_unseen_gone, 0);
+
+        let root = input.root;
+        let scene = input
+            .app
+            .world()
+            .get::<WorldAssetRoot>(root)
+            .unwrap()
+            .0
+            .clone();
+        for _ in 0..2 {
+            // Bevy replaces the instance even when the root's handle is unchanged.
+            input
+                .app
+                .world_mut()
+                .entity_mut(root)
+                .insert(WorldAssetRoot(scene.clone()));
+            let replacement = input.spawn_stock();
+            assert_ne!(replacement, primitive);
+            assert!(!input.app.world().entities().contains_spawned(primitive));
+            assert!(input.app.world().entities().contains_spawned(root));
+            input.assert_bound(replacement);
+            assert_delta_only(&input);
+            let work = input.sources().last_work;
+            assert_source_change_partition(work);
+            assert!(work.changed_unseen_live > 0);
+            assert!(work.changed_indexed_gone > 0);
+            assert!(work.changed_indexed_live_roots > 0);
+            primitive = replacement;
+        }
+        // This pattern proves replacement activity, not an erroneous loop:
+        // ordinary partial-stock flattening can also remove indexed ancestors.
+    }
+
+    #[test]
+    fn source_change_counts_classify_surviving_component_removal_as_existing() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .remove::<SourceNodePose>();
+        assert!(input.app.world().entities().contains_spawned(primitive));
+        input.assert_blocked();
+        assert_delta_only(&input);
+        let work = input.sources().last_work;
+        assert_source_change_partition(work);
+        assert_eq!(work.changed_entities, 1);
+        assert_eq!(work.changed_indexed_live, 1);
+        assert_eq!(work.changed_unseen_live, 0);
+        assert_eq!(work.changed_indexed_gone, 0);
+        assert_eq!(work.changed_unseen_gone, 0);
+        assert_eq!(work.changed_indexed_live_roots, 0);
+    }
+
+    #[test]
+    fn source_change_counts_partition_transient_entities_and_settle_to_zero() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        let transient = input.app.world_mut().spawn(Transform::IDENTITY).id();
+        input.app.world_mut().despawn(transient);
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        let work = input.sources().last_work;
+        assert_source_change_partition(work);
+        assert_eq!(work.changed_entities, 1);
+        assert_eq!(work.changed_unseen_gone, 1);
+        assert_eq!(work.changed_unseen_live, 0);
+        assert_eq!(work.changed_indexed_live, 0);
+        assert_eq!(work.changed_indexed_gone, 0);
+        assert_eq!(work.changed_indexed_live_roots, 0);
+
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        let settled = input.sources().last_work;
+        assert_source_change_partition(settled);
+        assert_eq!(settled.changed_entities, 0);
+        assert_eq!(settled.changed_indexed_live_roots, 0);
+        assert_eq!(settled.subjects_updated, 0);
+    }
 
     fn duplicate_primitive(input: &mut Fixture, primitive: Entity) -> Entity {
         let world = input.app.world();

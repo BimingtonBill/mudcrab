@@ -20,7 +20,7 @@ struct Projection {
     pending_tangents: BTreeMap<u32, BTreeSet<u32>>,
     failure: Option<&'static str>,
     source_revision: Option<(u64, u64)>,
-    terminal_revision: Option<u64>,
+    refusal_revision: Option<u64>,
 }
 
 struct Projected {
@@ -345,8 +345,8 @@ fn publish(sources: Res<Sources>, mut main: ResMut<MainWorld>, mut previous: Loc
         let revision = main
             .get_resource::<OwnershipFacts>()
             .filter(|facts| facts.package_matches(&certificate))
-            .map(|facts| facts.terminal_revision());
-        if revision != previous.terminal_revision || update.reset {
+            .map(|facts| facts.refusal_revision());
+        if revision != previous.refusal_revision || update.reset {
             let refused = main
                 .get_resource::<OwnershipFacts>()
                 .filter(|facts| facts.package_matches(&certificate))
@@ -356,7 +356,7 @@ fn publish(sources: Res<Sources>, mut main: ResMut<MainWorld>, mut previous: Loc
             {
                 demand.update(Some(&certificate), refused);
             }
-            previous.terminal_revision = revision;
+            previous.refusal_revision = revision;
         } else if let Some(mut demand) = main.get_resource_mut::<SourceFallbackDemand>() {
             demand.refresh_for_package(&certificate);
         }

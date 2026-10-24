@@ -13,6 +13,9 @@ use bevy::{app::Propagate, camera::visibility::RenderLayers};
 use bevy_rapier3d::prelude::{Collider, ColliderDisabled};
 use std::time::Duration;
 
+#[path = "far_stock_pipeline_tests.rs"]
+mod sparse_pipeline;
+
 struct Fixture {
     directory: tempfile::TempDir,
     package: Arc<CertifiedPackage>,
@@ -591,7 +594,12 @@ fn assert_bookkeeping(far: &FarStock) {
     assert_eq!(far.queued.len(), queued_keys.len());
 }
 
-fn assert_placement(world: &World, entity: Entity, pose: ReferencePose, key: CellKey) {
+fn assert_placement_transform(
+    world: &World,
+    entity: Entity,
+    pose: ReferencePose,
+    key: CellKey,
+) -> Transform {
     let expected = reference_placement(pose.position, pose.rotation, pose.scale, key).1;
     let actual = world.get::<Transform>(entity).unwrap();
     assert_eq!(
@@ -615,6 +623,11 @@ fn assert_placement(world: &World, entity: Entity, pose: ReferencePose, key: Cel
             .map(f32::to_bits),
         expected.to_matrix().to_cols_array().map(f32::to_bits)
     );
+    expected
+}
+
+fn assert_placement(world: &World, entity: Entity, pose: ReferencePose, key: CellKey) {
+    let expected = assert_placement_transform(world, entity, pose, key);
     let bounds = world.get::<ExpectedModelBounds>(entity).unwrap();
     let expected_bounds = InstanceBounds::transformed(bounds.min, bounds.max, expected.to_matrix());
     let actual_bounds = world.get::<InstanceBounds>(entity).unwrap();

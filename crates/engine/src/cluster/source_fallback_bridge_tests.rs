@@ -17,6 +17,9 @@ use bevy::{
 };
 use std::fs;
 
+#[path = "template_qualification_tests.rs"]
+mod template_qualification_tests;
+
 struct Fixture {
     app: App,
     render: World,
@@ -38,6 +41,10 @@ impl Fixture {
         } else {
             published_for_loader()
         };
+        Self::from_directory(directory, true, normal_map)
+    }
+
+    fn from_directory(directory: tempfile::TempDir, complete: bool, normal_map: bool) -> Self {
         let certificate = Arc::new(
             crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
         );
@@ -56,7 +63,7 @@ impl Fixture {
             "the producer fixture covers parent and placed child worlds"
         );
         for reference in &refs {
-            assert!(certificate.reference_complete(*reference));
+            assert_eq!(certificate.reference_complete(*reference), complete);
         }
         let model_path = certificate
             .reference_model_path(*refs.first().unwrap())

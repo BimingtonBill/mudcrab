@@ -40,6 +40,9 @@ pub(crate) struct OwnershipFacts {
     /// Runtime withdrawal and failed resources cannot change ownership.
     terminal: BTreeMap<RecordKey, bool>,
     terminal_revision: u64,
+    refused_records: BTreeSet<RecordKey>,
+    refused_references: BTreeSet<u32>,
+    refusal_revision: u64,
 }
 
 /// Runtime reference identity, attached only to exterior static candidates.
@@ -341,6 +344,9 @@ impl OwnershipFacts {
         {
             self.source_fallback.clear();
             self.terminal.clear();
+            self.refused_records.clear();
+            self.refused_references.clear();
+            self.refusal_revision = self.refusal_revision.wrapping_add(1);
             self.terminal_revision = self.terminal_revision.wrapping_add(1);
             self.lookup.clear();
             self.references.clear();
@@ -358,17 +364,28 @@ impl OwnershipFacts {
             self.source_fallback.clear();
         }
         let mut added_terminal = false;
+        let mut added_refusal = false;
         for (key, value) in records {
             if let Some(value) = value {
                 if let std::collections::btree_map::Entry::Vacant(entry) = self.terminal.entry(key)
                 {
                     entry.insert(value);
                     added_terminal = true;
+                    if value {
+                        self.refused_records.insert(key);
+                        if let Some(identity) = package.record(&key) {
+                            self.refused_references.insert(identity.reference);
+                        }
+                        added_refusal = true;
+                    }
                 }
                 self.source_fallback.insert(key, value);
             } else {
                 self.source_fallback.remove(&key);
             }
+        }
+        if added_refusal {
+            self.refusal_revision = self.refusal_revision.wrapping_add(1);
         }
         if added_terminal {
             self.terminal_revision = self.terminal_revision.wrapping_add(1);
@@ -387,24 +404,23 @@ impl OwnershipFacts {
             .is_some_and(|current| Arc::ptr_eq(current, package))
     }
 
+    #[cfg(test)]
     pub(crate) fn terminal_revision(&self) -> u64 {
         self.terminal_revision
     }
 
+    /// Changes only when permanent stock permission changes, or the certificate is replaced.
+    /// New owned facts do not invalidate refusal-only projections.
+    pub(crate) fn refusal_revision(&self) -> u64 {
+        self.refusal_revision
+    }
+
     pub(crate) fn permanent_refused_records(&self) -> BTreeSet<RecordKey> {
-        self.terminal
-            .iter()
-            .filter_map(|(key, refused)| refused.then_some(*key))
-            .collect()
+        self.refused_records.clone()
     }
 
     pub(crate) fn permanent_refused_references(&self) -> BTreeSet<u32> {
-        self.lookup
-            .iter()
-            .filter_map(|((reference, _), key)| {
-                (self.terminal.get(key) == Some(&true)).then_some(*reference)
-            })
-            .collect()
+        self.refused_references.clone()
     }
 
     pub(crate) fn permanent_refused_ordinals(&self, reference: u32) -> BTreeSet<u32> {
@@ -593,6 +609,51 @@ mod tests {
             facts.decision(reference, Some(&tag)),
             super::Decision::NotOwned
         );
+    }
+
+    #[test]
+    fn refusal_revision_ignores_new_owned_facts_and_preserves_fixed_refusals() {
+        let (directory, package, _, _, key) = fixture();
+        let other = *package
+            .records()
+            .find(|(candidate, _)| **candidate != key)
+            .unwrap()
+            .0;
+        let mut facts = super::OwnershipFacts::default();
+        facts.publish_updates(&package, true, std::iter::empty());
+        let initial = facts.refusal_revision();
+        let terminal = facts.terminal_revision();
+        facts.publish_updates(&package, false, [(key, Some(false))]);
+        assert!(facts.terminal_revision() > terminal);
+        assert_eq!(facts.refusal_revision(), initial);
+        assert!(facts.permanent_refused_records().is_empty());
+        assert!(facts.permanent_refused_references().is_empty());
+        facts.publish_updates(&package, false, [(other, Some(true))]);
+        let refused = facts.refusal_revision();
+        assert!(refused > initial);
+        assert_eq!(
+            facts.permanent_refused_records(),
+            std::collections::BTreeSet::from([other])
+        );
+        let refused_reference = package.record(&other).unwrap().reference;
+        assert_eq!(
+            facts.permanent_refused_references(),
+            std::collections::BTreeSet::from([refused_reference])
+        );
+        facts.revoke();
+        facts.publish_updates(&package, true, [(other, Some(false)), (key, Some(true))]);
+        assert_eq!(facts.refusal_revision(), refused);
+        assert_eq!(
+            facts.permanent_refused_records(),
+            std::collections::BTreeSet::from([other])
+        );
+        let replacement = Arc::new(
+            crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
+        );
+        facts.publish_updates(&replacement, true, std::iter::empty());
+        assert!(facts.refusal_revision() > refused);
+        assert!(facts.permanent_refused_records().is_empty());
+        assert!(facts.permanent_refused_references().is_empty());
     }
 
     #[test]

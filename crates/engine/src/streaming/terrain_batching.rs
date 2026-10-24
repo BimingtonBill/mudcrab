@@ -1516,6 +1516,17 @@ pub(in crate::streaming) fn report_terrain_stall(
     }
 }
 
+/// Report terrain hand-over blockers while startup admission is still pending, including
+/// when unrelated streaming progress keeps the no-progress stall timer from firing.
+pub(in crate::streaming) fn report_terrain_blocked(
+    _blocked: On<crate::pacing::startup::StartupLoadBlocked>,
+    report: RetireReport,
+) {
+    if report.batches.holding_source_count() != 0 {
+        report.log();
+    }
+}
+
 fn owned_source_mask(
     batch: &TerrainBatch,
     world: Option<u32>,

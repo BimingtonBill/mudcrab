@@ -57,6 +57,31 @@ pub(crate) struct ClusterLoadingGate {
     loading_pose: Option<LoadingPose>,
 }
 
+/// A borrowed diagnostic view of the cached scope and one world's aggregate.
+/// Formatting visits no batches, views, or pipelines.
+pub(crate) struct ClusterLoadingDiagnostics<'a> {
+    gate: &'a ClusterLoadingGate,
+    world: u32,
+}
+
+impl std::fmt::Debug for ClusterLoadingDiagnostics<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClusterLoadingDiagnostics")
+            .field("world", &self.world)
+            .field(
+                "package_scope",
+                &self.gate.package.as_ref().map(Arc::as_ptr),
+            )
+            .field("layout", &self.gate.layout)
+            .field("generation", &self.gate.generation)
+            .field("snapshot_generation", &self.gate.snapshot_generation)
+            .field("render_frame", &self.gate.render_frame)
+            .field("counts", &self.gate.worlds.get(&self.world))
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct LoadingPose {
     camera: Transform,
@@ -82,6 +107,10 @@ impl Default for ClusterLoadingGate {
 impl ClusterLoadingGate {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn diagnostics(&self, world: u32) -> ClusterLoadingDiagnostics<'_> {
+        ClusterLoadingDiagnostics { gate: self, world }
     }
 
     /// The renderer captures this generation before planning the new view pose.

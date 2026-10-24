@@ -16,6 +16,9 @@
 //!   those sets, so the unmarked time — from the start of the render frame to the first lap and
 //!   between laps — belongs to no phase, and their sum is at most `render_thread`. The swapchain
 //!   wait sits inside `render/prepare`.
+//!   The prepare/graph boundary brackets `render_system` inside `RenderSystems::Render`.
+//!   Readiness systems ordered before that set belong to preparation. Older captures used an
+//!   unordered mark before the set and could attribute their work to graph/present instead.
 //! * `render/swapchain_acquire`: from just before `prepare_windows` to just after it, an upper
 //!   bound on the wait for a swapchain image (where a GPU-bound frame shows up on the CPU).
 //!
@@ -435,10 +438,14 @@ fn add_render_marks(render_app: &mut SubApp, samples_pipelines: bool) {
                 .after(Set::PrepareViews)
                 .before(Set::Queue),
             lap(QUEUE).after(Set::PhaseSort).before(Set::Prepare),
-            lap(PREPARE).after(Set::Prepare).before(Set::Render),
+            // Mark inside the set: readiness observers ordered before Render must finish before
+            // this boundary, regardless of their executor order relative to ordinary lap systems.
+            lap(PREPARE)
+                .in_set(Set::Render)
+                .before(bevy::render::renderer::render_system),
             lap(GRAPH_AND_PRESENT)
-                .after(Set::Render)
-                .before(Set::Cleanup),
+                .in_set(Set::Render)
+                .after(bevy::render::renderer::render_system),
             (
                 lap(CLEANUP),
                 sample_pipelines.run_if(move || samples_pipelines),

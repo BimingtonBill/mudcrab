@@ -368,7 +368,8 @@ impl Plugin for StreamingPlugin {
         {
             let profiling = config.profile_output_dir.is_some();
             app.add_systems(Last, lod::terrain_batching::finalize_unviewed_lod_batches)
-                .add_observer(lod::terrain_batching::report_terrain_stall);
+                .add_observer(lod::terrain_batching::report_terrain_stall)
+                .add_observer(lod::terrain_batching::report_terrain_blocked);
             if profiling {
                 app.add_systems(
                     Last,
@@ -821,7 +822,7 @@ impl PrestreamCells {
 #[derive(Resource)]
 struct StreamingCommitBudget {
     frame_started: Instant,
-    /// Full-cell commits left this frame (far stock commits from these too).
+    /// Full-cell commits left this frame. Sparse sources share time, not these slots.
     remaining: usize,
     /// Distant LOD requests left this frame ([`EngineConfig::max_lod_requests_per_frame`]).
     lod_remaining: usize,
@@ -3266,8 +3267,8 @@ fn collect_cells(
             continuity.edges.remove(&response.key);
         }
         commits_started += 1;
-        // A full cell takes one of the frame's full-cell slots, which far stock also commits
-        // from; distant LOD requests have their own ([`EngineConfig::max_lod_requests_per_frame`]). A terrain-only
+        // A full cell takes one of the frame's full-cell slots. Sparse sources share the elapsed
+        // time budget; distant LOD requests have their own ([`EngineConfig::max_lod_requests_per_frame`]). A terrain-only
         // ring cell is a fraction of a full commit's work and
         // keeps its own, larger count ([`MAX_TERRAIN_CELL_COMMITS_PER_FRAME`]) and the frame's time
         // budget instead, so the ring still fills at the pace it was tuned to. Every commit is

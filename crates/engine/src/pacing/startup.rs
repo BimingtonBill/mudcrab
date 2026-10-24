@@ -31,6 +31,9 @@ use bevy::{prelude::*, render::render_asset::RenderAssetBytesPerFrame};
 /// until readiness is proved, even after this timeout.
 pub const STARTUP_LIFT_TIMEOUT_SECONDS: f32 = 60.0;
 
+/// Blocked admission is reported on the real clock even while loading makes progress.
+const STARTUP_BLOCKED_REPORT_INTERVAL_SECONDS: f64 = 60.0;
+
 /// The full-screen black cover the first load happens behind: spawned full black on the first frame
 /// and faded out (over [`FADE_SECONDS`], the crossing's own fade) once admission succeeds. A
 /// non-cluster run also retains the existing timeout recovery.
@@ -57,6 +60,11 @@ struct ConfiguredPacing {
 #[derive(Event, Debug, Clone, Copy)]
 pub struct StartupLoadStalled;
 
+/// Diagnostic-only notification for each periodic blocked-admission report.
+/// Observers can explain their cached blockers without changing loading recovery.
+#[derive(Event, Debug, Clone, Copy)]
+pub struct StartupLoadBlocked;
+
 #[derive(Resource, Default)]
 pub(crate) struct StartupLoad {
     /// Cluster mode always covers its initial load. Other modes use the optional cover policy
@@ -72,6 +80,10 @@ pub(crate) struct StartupLoad {
     elapsed: f32,
     /// Monotonic first-load measurement; virtual time clamps long loading frames.
     wall_started: Option<std::time::Instant>,
+    /// Unclamped real seconds since startup, independent of loading progress.
+    real_elapsed: f64,
+    /// Real elapsed time of the last periodic blocked-admission report.
+    last_blocked_report: f64,
     /// What the world-ready predicate read last frame, to tell a moving load from a stopped one.
     last_inputs: Option<crate::pacing::WorldReadyInputs>,
     /// Seconds since the load last made progress, for [`STARTUP_LIFT_TIMEOUT_SECONDS`].
@@ -215,6 +227,7 @@ fn restore_startup_pacing(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn drive_startup_load(
     time: Res<Time>,
+    real_time: Res<Time<Real>>,
     mut config: ResMut<EngineConfig>,
     origin: Res<RenderOrigin>,
     streaming: Res<StreamingWorld>,
@@ -239,6 +252,7 @@ fn drive_startup_load(
     }
     let delta = time.delta_secs();
     load.elapsed += delta;
+    load.real_elapsed += real_time.delta_secs_f64();
     if config.clusters.is_some()
         && load.cover_pending()
         && let (Ok(camera), Some(gate)) = (camera.single(), gate.as_deref_mut())
@@ -304,6 +318,29 @@ fn drive_startup_load(
     let moved = certifying || inputs != load.last_inputs;
     load.last_inputs = inputs;
     load.stalled = if moved { 0.0 } else { load.stalled + delta };
+    if !latched
+        && load.real_elapsed - load.last_blocked_report >= STARTUP_BLOCKED_REPORT_INTERVAL_SECONDS
+    {
+        load.last_blocked_report = load.real_elapsed;
+        commands.trigger(StartupLoadBlocked);
+        warn!(
+            wall_seconds = load.real_elapsed,
+            stalled_seconds = load.stalled,
+            physics_ready,
+            clusters_ready,
+            certification = ?validation.as_deref(),
+            camera_available = inputs.is_some(),
+            cover_pending = load.cover_pending(),
+            active_space = ?*space,
+            render_origin = ?origin.0,
+            inputs = ?inputs,
+            pending_lod_chunk_parts = ?metrics.pending_lod_chunk_parts,
+            cluster_gate = ?gate.as_deref().map(|gate| {
+                gate.diagnostics(space.exterior_worldspace(config.worldspace_id))
+            }),
+            "startup load: admission remains blocked"
+        );
+    }
     if !latched && load.stalled < STARTUP_LIFT_TIMEOUT_SECONDS {
         return;
     }
@@ -348,8 +385,20 @@ fn drive_startup_load(
 mod tests {
     use super::*;
     use crate::world::database::CellKey;
-    use bevy::time::TimeUpdateStrategy;
-    use std::time::Duration;
+    use bevy::{
+        ecs::schedule::SingleThreadedExecutor,
+        log::tracing_subscriber::{Layer, Registry, layer::Context, prelude::*},
+        time::TimeUpdateStrategy,
+    };
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tracing::{
+        Event as TracingEvent, Subscriber,
+        field::{Field, Visit},
+    };
 
     const DT: f32 = 0.05;
 
@@ -691,6 +740,281 @@ mod tests {
                 .resource::<EngineConfig>()
                 .max_model_spawns_per_frame,
             7
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct BlockedLogs(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+    #[derive(Default)]
+    struct LogFields(BTreeMap<String, String>);
+
+    impl Visit for LogFields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for BlockedLogs {
+        fn on_event(&self, event: &TracingEvent<'_>, _: Context<'_, S>) {
+            if event.metadata().target() != "engine::pacing::startup" {
+                return;
+            }
+            let mut fields = LogFields::default();
+            event.record(&mut fields);
+            if fields
+                .0
+                .get("message")
+                .is_some_and(|message| message.contains("admission remains blocked"))
+            {
+                self.0.lock().unwrap().push(fields.0);
+            }
+        }
+    }
+
+    impl BlockedLogs {
+        fn capture(&self, run: impl FnOnce()) {
+            tracing::subscriber::with_default(Registry::default().with(self.clone()), run);
+        }
+
+        fn snapshot(&self) -> Vec<BTreeMap<String, String>> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[derive(Resource, Default)]
+    struct StallReports(usize);
+
+    #[derive(Resource, Default)]
+    struct BlockedReports(usize);
+
+    fn blocked_startup_app() -> App {
+        let mut config = configured_pacing();
+        config.clusters = Some("selected".into());
+        config.worldspace_id = 60;
+        let mut app = startup_app(config);
+        // Keep the real PostUpdate system on the scoped subscriber's thread.
+        app.edit_schedule(PostUpdate, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(1)))
+            .init_resource::<crate::cluster::loading::ClusterLoadingGate>()
+            .insert_resource(crate::physics::MoveMode::Walk)
+            .init_resource::<StallReports>()
+            .init_resource::<BlockedReports>()
+            .add_observer(
+                |_: On<StartupLoadBlocked>, mut reports: ResMut<BlockedReports>| {
+                    reports.0 += 1;
+                },
+            )
+            .add_observer(
+                |_: On<StartupLoadStalled>, mut reports: ResMut<StallReports>| {
+                    reports.0 += 1;
+                },
+            );
+        app
+    }
+
+    #[test]
+    fn blocked_report_uses_real_seconds_even_while_loading_inputs_change() {
+        let mut app = blocked_startup_app();
+        {
+            let mut metrics = app.world_mut().resource_mut::<StreamingMetrics>();
+            metrics.pending_asset_instances = 7;
+            metrics.pending_lod_chunks = 163;
+            metrics.pending_lod_chunk_parts = [0, 17, 146];
+            metrics.pending_far_stock_queries = 1;
+        }
+        let logs = BlockedLogs::default();
+        logs.capture(|| {
+            app.update(); // The first real-time update has zero delta.
+            for second in 1..=120 {
+                app.world_mut()
+                    .resource_mut::<StreamingMetrics>()
+                    .queued_far_stock_queries = 2451 + second % 2;
+                app.update();
+                assert_eq!(
+                    logs.snapshot().len(),
+                    second / 60,
+                    "a blocked admission reports every 60 real seconds despite progress; second={second}"
+                );
+                assert_eq!(app.world().resource::<BlockedReports>().0, second / 60);
+            }
+        });
+        let reports = logs.snapshot();
+        assert_eq!(reports[0]["physics_ready"], "false");
+        assert_eq!(reports[0]["clusters_ready"], "false");
+        assert_eq!(reports[0]["certification"], "None");
+        assert_eq!(reports[0]["pending_lod_chunk_parts"], "[0, 17, 146]");
+        assert!(reports[0]["inputs"].contains("pending_asset_instances: 7"));
+        assert!(reports[0]["inputs"].contains("pending_lod_chunks: 163"));
+        assert!(reports[0]["inputs"].contains("queued_far_stock_queries: 2451"));
+        assert!(reports[0]["inputs"].contains("pending_far_stock_queries: 1"));
+        assert!(reports[0].contains_key("active_space"));
+        assert!(reports[0].contains_key("render_origin"));
+        assert!(reports[0].contains_key("wall_seconds"));
+        assert_eq!(cover_alpha(&mut app), Some(1.0));
+        assert_eq!(app.world().resource::<StallReports>().0, 0);
+        assert_eq!(
+            app.world()
+                .resource::<EngineConfig>()
+                .max_model_spawns_per_frame,
+            0,
+            "periodic diagnostics must not restore pacing"
+        );
+    }
+
+    #[test]
+    fn blocked_report_continues_during_pending_certification() {
+        let mut app = blocked_startup_app();
+        app.insert_resource(crate::cluster::package::PackageValidationStatus::Pending);
+        let logs = BlockedLogs::default();
+        logs.capture(|| {
+            app.update();
+            for _ in 0..120 {
+                app.update();
+            }
+        });
+        let reports = logs.snapshot();
+        assert_eq!(
+            reports.len(),
+            2,
+            "Pending certification must not reset the blocked-report clock"
+        );
+        assert_eq!(reports[0]["certification"], "Some(Pending)");
+        assert_eq!(reports[1]["certification"], "Some(Pending)");
+        assert_eq!(app.world().resource::<BlockedReports>().0, 2);
+        assert_eq!(app.world().resource::<StallReports>().0, 0);
+        assert_eq!(cover_alpha(&mut app), Some(1.0));
+        assert_eq!(
+            app.world()
+                .resource::<EngineConfig>()
+                .max_model_spawns_per_frame,
+            0
+        );
+    }
+
+    #[test]
+    fn blocked_report_exposes_cached_gate_scope_and_withdrawal_without_releasing_cover() {
+        use crate::cluster::loading::{ClusterLoadingGate, ClusterWorldReadiness};
+        let directory = crate::cluster::reader::producer_fixture_tests::published_for_loader();
+        let package = Arc::new(
+            crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
+        );
+        let mut gate = ClusterLoadingGate::default();
+        for _ in 0..6 {
+            gate.invalidate();
+        }
+        assert!(gate.publish(
+            &package,
+            9,
+            7,
+            31,
+            std::collections::HashMap::from([(
+                60,
+                ClusterWorldReadiness {
+                    applicable_cameras: 2,
+                    missing_views: 3,
+                    needed_batches: 11,
+                    pending_materials: 5,
+                    pending_templates: 7,
+                    pending_compute: 13,
+                    pending_pipelines: 17,
+                    failed_batches: 19,
+                },
+            )]),
+        ));
+        let mut app = blocked_startup_app();
+        app.insert_resource(gate);
+        let logs = BlockedLogs::default();
+        logs.capture(|| {
+            app.update();
+            for _ in 0..60 {
+                app.update();
+            }
+            let reports = logs.snapshot();
+            assert_eq!(reports.len(), 1, "the current cached gate must be reported");
+            let current = &reports[0]["cluster_gate"];
+            for expected in [
+                "world: 60",
+                "package_scope: Some(",
+                "layout: 9",
+                "generation: 7",
+                "snapshot_generation: Some(7)",
+                "render_frame: Some(31)",
+                "applicable_cameras: 2",
+                "missing_views: 3",
+                "needed_batches: 11",
+                "pending_materials: 5",
+                "pending_templates: 7",
+                "pending_compute: 13",
+                "pending_pipelines: 17",
+                "failed_batches: 19",
+            ] {
+                assert!(current.contains(expected), "missing {expected}: {current}");
+            }
+            app.world_mut()
+                .resource_mut::<ClusterLoadingGate>()
+                .invalidate();
+            for _ in 0..180 {
+                app.update();
+            }
+        });
+        let reports = logs.snapshot();
+        assert_eq!(
+            reports.len(),
+            4,
+            "blocked reports continue after the stall timeout"
+        );
+        let withdrawn = &reports[1]["cluster_gate"];
+        assert!(withdrawn.contains("generation: 8"));
+        assert!(withdrawn.contains("snapshot_generation: None"));
+        assert!(withdrawn.contains("counts: None"));
+        assert!(!withdrawn.contains("pending_pipelines: 17"));
+        assert_eq!(app.world().resource::<BlockedReports>().0, 4);
+        assert_eq!(app.world().resource::<StallReports>().0, 1);
+        assert_eq!(cover_alpha(&mut app), Some(1.0));
+        assert_eq!(
+            app.world()
+                .resource::<EngineConfig>()
+                .max_model_spawns_per_frame,
+            7,
+            "the existing 60-virtual-second stall still restores pacing"
+        );
+    }
+
+    #[test]
+    fn blocked_report_stops_after_startup_admission_finishes() {
+        let mut app = startup_app(configured_pacing());
+        app.edit_schedule(PostUpdate, |schedule| {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(1)))
+            .init_resource::<BlockedReports>()
+            .add_observer(
+                |_: On<StartupLoadBlocked>, mut reports: ResMut<BlockedReports>| {
+                    reports.0 += 1;
+                },
+            );
+        set_interior(&mut app, 77, false);
+        let logs = BlockedLogs::default();
+        logs.capture(|| {
+            app.update();
+            for _ in 0..60 {
+                app.update();
+            }
+            assert_eq!(logs.snapshot().len(), 1);
+            set_interior(&mut app, 77, true);
+            for _ in 0..120 {
+                app.update();
+            }
+        });
+        assert!(app.world().resource::<StartupLoad>().finished);
+        assert_eq!(app.world().resource::<BlockedReports>().0, 1);
+        assert_eq!(
+            logs.snapshot().len(),
+            1,
+            "a finished startup must stop reporting"
         );
     }
 
