@@ -16,15 +16,54 @@ pub struct ClassFilter {
     saved: Option<Saved>,
     #[cfg(test)]
     replays: usize,
+    #[cfg(test)]
+    incrementals: usize,
+    #[cfg(test)]
+    general_paths: usize,
 }
 
 struct Saved {
     raw_cpu_len: usize,
     raw_gpu_len: usize,
+    // Requests can name entities absent from this class. Keep them separate from
+    // previous_hidden, which records effective membership for stock event semantics.
+    requested_hidden: HashSet<MainEntity>,
+    // CPU and GPU events share vectors. Old membership disambiguates removals and
+    // validates both lengths without walking the raw class again on moving frames.
+    raw_cpu_members: HashSet<MainEntity>,
+    raw_gpu_members: HashSet<MainEntity>,
     cpu: Vec<(usize, Pair)>,
     gpu: Vec<Pair>,
     added: Vec<Pair>,
     removed: Vec<Pair>,
+}
+
+impl Saved {
+    fn matches(&self, class: &RenderVisibleEntitiesClass) -> bool {
+        class.entities_cpu_culling.len() == self.raw_cpu_len
+            && class.entities_gpu_culling.len() == self.raw_gpu_len
+            && self
+                .cpu
+                .iter()
+                .all(|(slot, pair)| class.entities_cpu_culling.get(*slot) == Some(pair))
+            && self
+                .gpu
+                .iter()
+                .all(|(render, main)| class.entities_gpu_culling.get(main) == Some(render))
+    }
+}
+
+struct Selection {
+    saved: Saved,
+    now_hidden: HashSet<MainEntity>,
+    newly_hidden: Vec<Pair>,
+    newly_stock: Vec<Pair>,
+}
+
+struct MembershipChange {
+    main: MainEntity,
+    cpu: Option<(usize, Pair)>,
+    gpu: Option<Entity>,
 }
 
 impl ClassFilter {
@@ -41,20 +80,14 @@ impl ClassFilter {
 
         // Events and lengths reject changed classes cheaply. Slot/key pairs also catch renderer
         // replacements that the raw visibility collector did not report as membership events.
-        if hidden == &self.previous_hidden
-            && class.added_entities.is_empty()
+        if class.added_entities.is_empty()
             && class.removed_entities.is_empty()
+            && hidden == &self.previous_hidden
             && let Some(saved) = &self.saved
-            && class.entities_cpu_culling.len() == saved.raw_cpu_len
-            && class.entities_gpu_culling.len() == saved.raw_gpu_len
-            && saved
-                .cpu
-                .iter()
-                .all(|(slot, pair)| class.entities_cpu_culling.get(*slot) == Some(pair))
-            && saved
-                .gpu
-                .iter()
-                .all(|(render, main)| class.entities_gpu_culling.get(main) == Some(render))
+            // Effective hidden keys are a subset of the previous request. Equal
+            // lengths ensure replay also leaves the requested-set cache unchanged.
+            && saved.requested_hidden.len() == hidden.len()
+            && saved.matches(class)
         {
             Self::hide(class, saved);
             #[cfg(test)]
@@ -64,13 +97,42 @@ impl ClassFilter {
             return;
         }
 
+        let selection = if let Some(selection) = self.incremental_selection(class, hidden) {
+            #[cfg(test)]
+            {
+                self.incrementals += 1;
+            }
+            selection
+        } else {
+            crate::work_counters::record("stock_visibility/general_path");
+            #[cfg(test)]
+            {
+                self.general_paths += 1;
+            }
+            self.general_selection(class, hidden)
+        };
+        self.apply_selection(class, hidden, selection);
+    }
+
+    fn general_selection(
+        &self,
+        class: &RenderVisibleEntitiesClass,
+        hidden: &HashSet<MainEntity>,
+    ) -> Selection {
         let mut saved = Saved {
             raw_cpu_len: class.entities_cpu_culling.len(),
             raw_gpu_len: class.entities_gpu_culling.len(),
+            requested_hidden: hidden.clone(),
+            raw_cpu_members: class
+                .entities_cpu_culling
+                .iter()
+                .map(|(_, main)| *main)
+                .collect(),
+            raw_gpu_members: class.entities_gpu_culling.keys().copied().collect(),
             cpu: Vec::new(),
             gpu: Vec::new(),
-            added: std::mem::take(&mut class.added_entities),
-            removed: std::mem::take(&mut class.removed_entities),
+            added: Vec::new(),
+            removed: Vec::new(),
         };
         let mut now_hidden = HashSet::default();
         let mut newly_hidden = Vec::new();
@@ -102,6 +164,228 @@ impl ClassFilter {
         }
 
         drop(search_span);
+        cpu_slots.sort_unstable_by_key(|(slot, _)| *slot);
+        saved.cpu = cpu_slots;
+        for main in &now_hidden {
+            if let Some(render) = class.entities_gpu_culling.get(main) {
+                saved.gpu.push((*render, *main));
+            }
+        }
+        Selection {
+            saved,
+            now_hidden,
+            newly_hidden,
+            newly_stock,
+        }
+    }
+
+    fn incremental_selection(
+        &mut self,
+        class: &RenderVisibleEntitiesClass,
+        hidden: &HashSet<MainEntity>,
+    ) -> Option<Selection> {
+        let previous = self.saved.as_ref()?;
+        // A set cannot represent duplicate CPU keys. Keep the general path's exact
+        // binary-search behavior for such classes rather than inferring multiplicities.
+        if previous.raw_cpu_members.len() != previous.raw_cpu_len {
+            return None;
+        }
+        // Reuse at least half the hidden set; otherwise a fresh search is simpler.
+        let budget = hidden.len().max(previous.requested_hidden.len()) / 2;
+        let hidden_changes = if hidden == &previous.requested_hidden {
+            Vec::new()
+        } else {
+            hidden
+                .symmetric_difference(&previous.requested_hidden)
+                .take(budget + 1)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        if hidden_changes.len() > budget {
+            return None;
+        }
+        let _span = ::bevy::log::info_span!("stock_visibility::apply::incremental").entered();
+        // GPU removals append after CPU removals, and migrations can name a key in
+        // both vectors. Normalize scratch keys only; restore must retain raw events.
+        let affected = class
+            .added_entities
+            .iter()
+            .chain(&class.removed_entities)
+            .map(|(_, main)| *main)
+            .chain(hidden_changes.iter().copied())
+            .collect::<HashSet<_>>();
+        let mut keys = affected.iter().copied().collect::<Vec<_>>();
+        keys.sort_unstable();
+        let mut changes = Vec::with_capacity(keys.len());
+        let mut removed_cpu = Vec::new();
+        let mut added_cpu = Vec::new();
+        let mut newly_stock = Vec::new();
+        let mut cpu_len = previous.raw_cpu_len;
+        let mut gpu_len = previous.raw_gpu_len;
+        for main in keys {
+            // One binary search per changed key, including hidden-set changes.
+            // Read canonical pairs, never the possibly stale event renderer IDs.
+            let current = visible_pair(class, main);
+            let cpu = current.and_then(|(pair, slot)| slot.map(|slot| (slot, pair)));
+            let gpu = class.entities_gpu_culling.get(&main).copied();
+            if let Some((slot, _)) = cpu
+                && ((slot > 0 && class.entities_cpu_culling[slot - 1].1 == main)
+                    || class
+                        .entities_cpu_culling
+                        .get(slot + 1)
+                        .is_some_and(|pair| pair.1 == main))
+            {
+                return None;
+            }
+            let was_cpu = previous.raw_cpu_members.contains(&main);
+            let was_gpu = previous.raw_gpu_members.contains(&main);
+            cpu_len = cpu_len
+                .checked_sub(usize::from(was_cpu))?
+                .checked_add(usize::from(cpu.is_some()))?;
+            gpu_len = gpu_len
+                .checked_sub(usize::from(was_gpu))?
+                .checked_add(usize::from(gpu.is_some()))?;
+            if was_cpu && cpu.is_none() {
+                removed_cpu.push(main);
+            } else if !was_cpu && let Some(pair) = cpu {
+                added_cpu.push(pair);
+            }
+            if self.previous_hidden.contains(&main)
+                && !hidden.contains(&main)
+                && let Some((pair, _)) = current
+            {
+                newly_stock.push(pair);
+            }
+            changes.push(MembershipChange { main, cpu, gpu });
+        }
+        if cpu_len != class.entities_cpu_culling.len()
+            || gpu_len != class.entities_gpu_culling.len()
+        {
+            return None;
+        }
+
+        let mut shifted = Vec::with_capacity(previous.cpu.len());
+        let (mut removed_before, mut added_before) = (0, 0);
+        for &(slot, pair) in &previous.cpu {
+            if affected.contains(&pair.1) || !hidden.contains(&pair.1) {
+                continue;
+            }
+            // Compare keys in the same ordering, not old slots with new slots.
+            while removed_cpu
+                .get(removed_before)
+                .is_some_and(|main| *main < pair.1)
+            {
+                removed_before += 1;
+            }
+            while added_cpu
+                .get(added_before)
+                .is_some_and(|(_, added)| added.1 < pair.1)
+            {
+                added_before += 1;
+            }
+            shifted.push((
+                slot.checked_sub(removed_before)?
+                    .checked_add(added_before)?,
+                pair,
+            ));
+        }
+        let mut saved = Saved {
+            raw_cpu_len: cpu_len,
+            raw_gpu_len: gpu_len,
+            requested_hidden: HashSet::default(),
+            raw_cpu_members: HashSet::default(),
+            raw_gpu_members: HashSet::default(),
+            cpu: Vec::with_capacity(shifted.len() + changes.len()),
+            gpu: previous
+                .gpu
+                .iter()
+                .copied()
+                .filter(|(_, main)| hidden.contains(main) && !affected.contains(main))
+                .collect(),
+            added: Vec::new(),
+            removed: Vec::new(),
+        };
+        // Both sequences are sorted. Merge rather than sorting every hidden slot again.
+        let mut shifted = shifted.into_iter().peekable();
+        for change in &changes {
+            if !hidden.contains(&change.main) {
+                continue;
+            }
+            if let Some(pair) = change.cpu {
+                while let Some(kept) = shifted.next_if(|(slot, _)| *slot < pair.0) {
+                    saved.cpu.push(kept);
+                }
+                saved.cpu.push(pair);
+            }
+            if let Some(render) = change.gpu {
+                saved.gpu.push((render, change.main));
+            }
+        }
+        saved.cpu.extend(shifted);
+        if !saved.matches(class) {
+            return None;
+        }
+
+        // Commit cache updates only after validation. Move the full membership sets;
+        // copying or rebuilding them here would make moving frames scale with the view.
+        let previous = self.saved.as_mut()?;
+        saved.requested_hidden = std::mem::take(&mut previous.requested_hidden);
+        saved.raw_cpu_members = std::mem::take(&mut previous.raw_cpu_members);
+        saved.raw_gpu_members = std::mem::take(&mut previous.raw_gpu_members);
+        for main in hidden_changes {
+            if hidden.contains(&main) {
+                saved.requested_hidden.insert(main);
+            } else {
+                saved.requested_hidden.remove(&main);
+            }
+        }
+        for change in changes {
+            if change.cpu.is_some() {
+                saved.raw_cpu_members.insert(change.main);
+            } else {
+                saved.raw_cpu_members.remove(&change.main);
+            }
+            if change.gpu.is_some() {
+                saved.raw_gpu_members.insert(change.main);
+            } else {
+                saved.raw_gpu_members.remove(&change.main);
+            }
+        }
+        let mut now_hidden = HashSet::default();
+        let mut newly_hidden = Vec::new();
+        // CPU pairs win synthetic events even when a key also has a GPU entry.
+        for pair in saved
+            .cpu
+            .iter()
+            .map(|(_, pair)| *pair)
+            .chain(saved.gpu.iter().copied())
+        {
+            if now_hidden.insert(pair.1) && !self.previous_hidden.contains(&pair.1) {
+                newly_hidden.push(pair);
+            }
+        }
+        Some(Selection {
+            saved,
+            now_hidden,
+            newly_hidden,
+            newly_stock,
+        })
+    }
+
+    fn apply_selection(
+        &mut self,
+        class: &mut RenderVisibleEntitiesClass,
+        hidden: &HashSet<MainEntity>,
+        selection: Selection,
+    ) {
+        let Selection {
+            mut saved,
+            now_hidden,
+            newly_hidden,
+            newly_stock,
+        } = selection;
+        saved.added = std::mem::take(&mut class.added_entities);
+        saved.removed = std::mem::take(&mut class.removed_entities);
         let _rest_span = ::bevy::log::info_span!("stock_visibility::apply::compact").entered();
         class.added_entities.extend(
             saved
@@ -124,13 +408,6 @@ impl ClassFilter {
         sorted_unique(&mut class.added_entities);
         sorted_unique(&mut class.removed_entities);
 
-        cpu_slots.sort_unstable_by_key(|(slot, _)| *slot);
-        saved.cpu = cpu_slots;
-        for main in &now_hidden {
-            if let Some(render) = class.entities_gpu_culling.get(main) {
-                saved.gpu.push((*render, *main));
-            }
-        }
         Self::hide(class, &saved);
         self.previous_hidden = now_hidden;
         self.saved = Some(saved);
@@ -288,6 +565,215 @@ mod tests {
     }
 
     #[test]
+    fn moving_membership_and_small_hidden_changes_use_incremental_path() {
+        let mut class = RenderVisibleEntitiesClass::default();
+        let mut filter = ClassFilter::default();
+        cpu_frame(&mut class, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        filter.apply(&mut class, &hidden(&[2, 3, 4, 5, 6, 7]));
+        filter.restore(&mut class);
+        for (ids, hides) in [
+            (&[2, 3, 4, 5, 6, 7, 8, 9][..], &[2, 3, 4, 5, 6, 7][..]),
+            (&[2, 3, 4, 5, 6, 7, 8, 9][..], &[2, 3, 4, 5, 6][..]),
+        ] {
+            cpu_frame(&mut class, ids);
+            let raw = class.clone();
+            filter.apply(&mut class, &hidden(hides));
+            filter.restore(&mut class);
+            assert_class_eq(&class, &raw);
+        }
+        assert_eq!(filter.general_paths, 1);
+        assert_eq!(filter.incrementals, 2);
+    }
+
+    #[test]
+    fn absent_requested_keys_do_not_force_general_search_on_moving_frames() {
+        let mut class = RenderVisibleEntitiesClass::default();
+        let mut filter = ClassFilter::default();
+        cpu_frame(&mut class, &[1, 2, 3, 4]);
+        filter.apply(&mut class, &hidden(&[1, 2, 50, 51, 52]));
+        filter.restore(&mut class);
+        for (ids, hides) in [
+            (&[1, 2, 4, 5][..], &[1, 2, 50, 51, 52][..]),
+            (&[1, 2, 5, 6][..], &[1, 2, 50, 51, 52][..]),
+            (&[1, 2, 6, 7][..], &[1, 2, 50, 51, 53][..]),
+            (&[1, 2, 7, 53][..], &[1, 2, 50, 51, 53][..]),
+        ] {
+            cpu_frame(&mut class, ids);
+            let raw = class.clone();
+            let mut reference = raw.clone();
+            let mut general = ClassFilter {
+                previous_hidden: filter.previous_hidden.clone(),
+                ..Default::default()
+            };
+            general.apply(&mut reference, &hidden(hides));
+            filter.apply(&mut class, &hidden(hides));
+            assert_class_eq(&class, &reference);
+            assert_eq!(filter.previous_hidden, general.previous_hidden);
+            filter.restore(&mut class);
+            general.restore(&mut reference);
+            assert_class_eq(&class, &raw);
+        }
+        assert_eq!(filter.general_paths, 1);
+        assert_eq!(filter.incrementals, 4);
+    }
+
+    #[test]
+    fn randomized_frame_sequences_match_general_path_and_exact_restore() {
+        // 256 reproducible cases, 64 frames each. No new test dependency is needed.
+        for seed in 1..=256_u64 {
+            let mut rng = seed;
+            let mut random = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let mut class = RenderVisibleEntitiesClass::default();
+            let mut filter = ClassFilter::default();
+            let mut general = ClassFilter::default();
+            let mut modes = [0_u8; 48];
+            let mut hides = HashSet::default();
+            for frame in 0..64 {
+                class.prepare_for_new_frame();
+                // Include absent, CPU, GPU, and overlapping membership; churn can move
+                // a MainEntity between lists in the same frame.
+                for _ in 0..(random() % 7) {
+                    let id = (random() % 48) as usize;
+                    modes[id] = (random() % 4) as u8;
+                }
+                let cpu = (0..48)
+                    .filter(|id| modes[*id] & 1 != 0)
+                    .map(|id| id as u32)
+                    .collect::<Vec<_>>();
+                class.update_cpu_culled_entities(&ordered(&cpu));
+                if frame % 17 == 0 && !class.entities_cpu_culling.is_empty() {
+                    // The collector sorts CPU entries but does not deduplicate them.
+                    class
+                        .entities_cpu_culling
+                        .push(class.entities_cpu_culling[0]);
+                    class.entities_cpu_culling.sort_by_key(|(_, main)| *main);
+                }
+                for (id, mode) in modes.iter().enumerate() {
+                    let (render, main) = pair(id as u32);
+                    if mode & 2 != 0 {
+                        if class.entities_gpu_culling.insert(main, render).is_none() {
+                            class.added_entities.push((render, main));
+                        }
+                    } else if class.entities_gpu_culling.remove(&main).is_some() {
+                        // Bevy appends GPU removals after the sorted CPU removals.
+                        class.removed_entities.push((Entity::PLACEHOLDER, main));
+                    }
+                }
+                class.sort_added_entities();
+                if frame % 8 != 0 {
+                    for _ in 0..(random() % 4) {
+                        let main = pair((random() % 56) as u32).1;
+                        if !hides.remove(&main) {
+                            hides.insert(main);
+                        }
+                    }
+                }
+                // Occasionally replace render entities without a membership event.
+                if frame % 13 == 0 {
+                    for (render, _) in &mut class.entities_cpu_culling {
+                        *render = pair((random() % 48 + 1000) as u32).0;
+                    }
+                    for render in class.entities_gpu_culling.values_mut() {
+                        *render = pair((random() % 48 + 2000) as u32).0;
+                    }
+                }
+                let raw = class.clone();
+                let mut reference = raw.clone();
+                general.saved = None; // Force the unchanged full-search oracle every frame.
+                general.apply(&mut reference, &hides);
+                filter.apply(&mut class, &hides);
+                assert_class_eq(&class, &reference);
+                assert_eq!(
+                    filter.previous_hidden, general.previous_hidden,
+                    "seed {seed}, frame {frame}"
+                );
+                filter.restore(&mut class);
+                general.restore(&mut reference);
+                assert_class_eq(&class, &raw);
+                assert_class_eq(&reference, &raw);
+            }
+        }
+    }
+
+    #[test]
+    fn moving_gpu_overlap_and_duplicate_events_match_general_path() {
+        let mut class = RenderVisibleEntitiesClass::default();
+        let mut filter = ClassFilter::default();
+        let hides = hidden(&[2, 3, 4, 5, 6, 7]);
+        cpu_frame(&mut class, &[1, 2, 3, 4, 5, 6, 7]);
+        class.entities_gpu_culling.insert(pair(3).1, pair(30).0);
+        class.entities_gpu_culling.insert(pair(8).1, pair(8).0);
+        filter.apply(&mut class, &hides);
+        filter.restore(&mut class);
+        cpu_frame(&mut class, &[2, 3, 4, 5, 6, 7, 9]);
+        class.entities_gpu_culling.remove(&pair(8).1);
+        class.entities_gpu_culling.insert(pair(2).1, pair(20).0);
+        class.added_entities.extend([pair(2), pair(2)]);
+        class.removed_entities.extend([pair(8), pair(8), pair(1)]);
+        let raw = class.clone();
+        let mut reference = raw.clone();
+        let mut general = ClassFilter {
+            previous_hidden: filter.previous_hidden.clone(),
+            ..Default::default()
+        };
+        general.apply(&mut reference, &hides);
+        filter.apply(&mut class, &hides);
+        assert_class_eq(&class, &reference);
+        assert_eq!(filter.incrementals, 1);
+        filter.restore(&mut class);
+        general.restore(&mut reference);
+        assert_class_eq(&class, &raw);
+        assert_class_eq(&reference, &raw);
+    }
+
+    #[test]
+    fn large_hidden_difference_uses_general_path() {
+        let mut class = RenderVisibleEntitiesClass::default();
+        let mut filter = ClassFilter::default();
+        cpu_frame(&mut class, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        filter.apply(&mut class, &hidden(&[1, 2, 3, 4]));
+        filter.restore(&mut class);
+        class.prepare_for_new_frame();
+        filter.apply(&mut class, &hidden(&[5, 6, 7, 8]));
+        assert_eq!(filter.general_paths, 2);
+        assert_eq!(filter.incrementals, 0);
+        assert_eq!(class.added_entities, ordered(&[1, 2, 3, 4]));
+        assert_eq!(class.removed_entities, ordered(&[5, 6, 7, 8]));
+        filter.restore(&mut class);
+    }
+
+    #[test]
+    fn empty_hidden_frames_invalidate_membership_cache() {
+        let mut class = RenderVisibleEntitiesClass::default();
+        let mut filter = ClassFilter::default();
+        for (ids, hides) in [
+            (&[1, 2, 3][..], &[2][..]),
+            (&[1, 2, 3][..], &[][..]),
+            (&[3, 4, 5][..], &[][..]),
+            (&[3, 4, 5][..], &[4][..]),
+        ] {
+            cpu_frame(&mut class, ids);
+            let raw = class.clone();
+            let mut reference = raw.clone();
+            let mut general = ClassFilter {
+                previous_hidden: filter.previous_hidden.clone(),
+                ..Default::default()
+            };
+            general.apply(&mut reference, &hidden(hides));
+            filter.apply(&mut class, &hidden(hides));
+            assert_class_eq(&class, &reference);
+            filter.restore(&mut class);
+            general.restore(&mut reference);
+            assert_class_eq(&class, &raw);
+        }
+    }
+
+    #[test]
     fn settled_replay_preserves_cpu_gpu_events_and_exact_restore() {
         let mut class = RenderVisibleEntitiesClass::default();
         cpu_frame(&mut class, &[1, 2, 3]);
@@ -309,6 +795,8 @@ mod tests {
             filter.restore(&mut class);
             assert_class_eq(&class, &raw);
         }
+        assert_eq!(filter.general_paths, 1);
+        assert_eq!(filter.incrementals, 0);
     }
 
     #[test]
@@ -362,6 +850,9 @@ mod tests {
             general.apply(&mut general_class, &hidden);
             filter.apply(&mut class, &hidden);
             assert_eq!(filter.replays, 0, "change {change}");
+            if change >= 2 {
+                assert_eq!(filter.general_paths, 2, "change {change}");
+            }
             assert_class_eq(&class, &general_class);
             assert_eq!(filter.previous_hidden, general.previous_hidden);
             filter.restore(&mut class);
