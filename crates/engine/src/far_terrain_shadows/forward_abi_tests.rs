@@ -69,6 +69,52 @@ fn compose(
         .unwrap_or_else(|error| panic!("{error:?}"));
     (module, info)
 }
+
+#[test]
+fn indexed_cluster_vertex_entries_validate_for_camera_and_shadow_variants() {
+    let sources = source_map(false);
+    for source in [
+        ORDINARY_VERTEX,
+        include_str!("../cluster/shaders/cluster_prepass.wgsl"),
+        include_str!("../cluster/shaders/cluster_shadow_mask.wgsl"),
+        include_str!("../cluster/shaders/cluster_shadow.wgsl"),
+    ] {
+        for emulated_depth in [false, true] {
+            let mut defs = definitions(
+                false,
+                false,
+                &[
+                    "VERTEX_UVS_A",
+                    "VERTEX_UVS_B",
+                    "VERTEX_COLORS",
+                    "VERTEX_TANGENTS",
+                    "NORMAL_PREPASS",
+                    "NORMAL_PREPASS_OR_DEFERRED_PREPASS",
+                    "MOTION_VECTOR_PREPASS",
+                ],
+            );
+            if emulated_depth {
+                defs.insert(
+                    "UNCLIPPED_DEPTH_ORTHO_EMULATION".into(),
+                    ShaderDefValue::Bool(true),
+                );
+            }
+            let (module, _) = compose(source, &sources, defs);
+            assert!(
+                module
+                    .entry_points
+                    .iter()
+                    .any(|entry| entry.stage == naga::ShaderStage::Vertex)
+            );
+            assert!(
+                module
+                    .global_variables
+                    .iter()
+                    .all(|(_, global)| global.name.as_deref() != Some("cluster_triangles"))
+            );
+        }
+    }
+}
 #[derive(Debug, PartialEq)]
 enum Shape {
     Scalar(naga::Scalar),
@@ -346,7 +392,16 @@ fn ordinary_entry_assets_have_no_optional_bevy_shader_dependencies() {
             ShaderImport::Custom(path) | ShaderImport::AssetPath(path) =>
                 !path.starts_with("far_terrain_shadows::"),
         }));
-        assert_eq!(source.replace("\r\n", "\n"), baseline.replace("\r\n", "\n"));
+        // Indexed vertex fetching changes the entry body, while its imports and stock IO
+        // stay unchanged. Keep exact source parity for the untouched fragment entry.
+        if source == ORDINARY_VERTEX {
+            assert_eq!(
+                shader.imports,
+                Shader::from_wgsl(baseline, "baseline.wgsl").imports
+            );
+        } else {
+            assert_eq!(source.replace("\r\n", "\n"), baseline.replace("\r\n", "\n"));
+        }
     }
     // Demonstrate that the optional entry really has dependencies that require
     // registration; disabling the definition does not make those imports vanish.

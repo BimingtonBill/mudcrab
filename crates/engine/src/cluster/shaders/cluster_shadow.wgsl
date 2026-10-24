@@ -3,7 +3,7 @@
 // Group 0 is Bevy's prepass view bind group (the light's `View` uniform at binding 0), the one a
 // stock shadow draw binds, so the cascade or cube face is rendered with the light's own matrices.
 // Group 1 holds the pooled payload sections, the instance transforms and the light's own list of
-// selected clusters; there is no vertex or index buffer and no fragment stage (opaque casters
+// selected clusters; a shared index buffer supplies local indices, with no fragment stage (opaque casters
 // write depth only).
 
 #import bevy_render::view::View
@@ -12,7 +12,7 @@ struct MeshInfo {
     vertex_base: u32,
     cluster_base: u32,
     vertex_ref_base: u32,
-    triangle_base: u32,
+    index_base: u32,
     group_base: u32,
     cluster_count: u32,
     pad0: u32,
@@ -36,14 +36,9 @@ struct Instance {
 @group(1) @binding(0) var<storage, read> positions: array<f32>;
 @group(1) @binding(1) var<storage, read> clusters: array<u32>;
 @group(1) @binding(2) var<storage, read> cluster_vertices: array<u32>;
-@group(1) @binding(3) var<storage, read> cluster_triangles: array<u32>;
 @group(1) @binding(4) var<storage, read> instances: array<Instance>;
 @group(1) @binding(5) var<storage, read> meshes: array<MeshInfo>;
 @group(1) @binding(6) var<storage, read> visible: array<vec4<u32>>;
-
-fn triangle_byte(index: u32) -> u32 {
-    return (cluster_triangles[index >> 2u] >> ((index & 3u) * 8u)) & 0xffu;
-}
 
 // Where the adapter cannot leave depth unclipped, a sun cascade clamps the caster's depth to the far
 // side of the clip range and a fragment stage writes the depth it had, as the stock shadow pass
@@ -64,10 +59,7 @@ fn vertex(
     let mesh = meshes[draw.y];
     let base = (mesh.cluster_base + draw.z) * 12u;
     let vertex_offset = clusters[base + 6u];
-    let triangle_offset = clusters[base + 7u];
-    let local = triangle_byte(
-        mesh.triangle_base + (triangle_offset + vertex_index / 3u) * 3u + vertex_index % 3u,
-    );
+    let local = vertex_index;
     let source = mesh.vertex_base + cluster_vertices[mesh.vertex_ref_base + vertex_offset + local];
     let position = vec3<f32>(
         positions[source * 3u],

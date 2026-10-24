@@ -5,9 +5,10 @@
 // Camera forward/prepass, every shadow view and terrain consume the same final lists.
 
 struct DrawArgs {
-    vertex_count: u32,
+    index_count: u32,
     instance_count: u32,
-    first_vertex: u32,
+    first_index: u32,
+    base_vertex: i32,
     first_instance: u32,
 }
 
@@ -35,7 +36,7 @@ struct MeshInfo {
     vertex_base: u32,
     cluster_base: u32,
     vertex_ref_base: u32,
-    triangle_base: u32,
+    index_base: u32,
     group_base: u32,
     cluster_count: u32,
     // 1 when only terrain instances draw the mesh: it is selected against terrain_error_pixels.
@@ -132,9 +133,10 @@ fn sphere_in_view(center: vec3<f32>, radius: f32) -> bool {
 
 
 // Scratch is indexed by immutable source slots. Zero rejects a cluster; otherwise its
-// triangle count plus one is kept (including valid zero-triangle clusters). Rejected instances need no scratch clear: their count is zero.
+// x keeps triangle count plus one (including valid zero-triangle clusters); y keeps first_index.
+// Rejected instances need no scratch clear: their count is zero.
 @group(0) @binding(11) var<storage, read_write> prefixes: array<vec2<u32>>;
-@group(0) @binding(12) var<storage, read_write> selected_clusters: array<u32>;
+@group(0) @binding(12) var<storage, read_write> selected_clusters: array<vec2<u32>>;
 @group(0) @binding(13) var<storage, read> source_order: array<u32>;
 
 // prefixes[0].x is the current survivor count. Other entries are (tile sum, tile prefix).
@@ -291,7 +293,11 @@ fn cull(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     var count = 0u;
     for (var cluster = lane; cluster < mesh.cluster_count; cluster += 64u) {
         let selection = selected_cluster(instance, mesh, cluster, scale);
-        selected_clusters[instance.region_start + cluster] = selection;
+        // Carry the index range from the stage that already binds cluster records. The
+        // scatter stages stay within eight storage bindings, including on Metal.
+        let triangle_offset = clusters[(mesh.cluster_base + cluster) * 12u + 7u];
+        selected_clusters[instance.region_start + cluster] = vec2<u32>(
+            selection, mesh.index_base + triangle_offset * 3u);
         count += select(0u, 1u, selection != 0u);
     }
     // This atomic is a commutative workgroup reduction, never an append or ordering decision.
@@ -363,10 +369,11 @@ fn scatter_clusters(@builtin(global_invocation_id) id: vec3<u32>) {
     let base = draw_base(instance_id);
     var written = 0u;
     for (var cluster = 0u; cluster < mesh.cluster_count; cluster += 1u) {
-        let selection = selected_clusters[instance.region_start + cluster];
+        let selected = selected_clusters[instance.region_start + cluster];
+        let selection = selected.x;
         if selection != 0u {
             let slot = base + written;
-            args[slot] = DrawArgs((selection - 1u) * 3u, 1u, 0u, slot);
+            args[slot] = DrawArgs((selection - 1u) * 3u, 1u, selected.y, 0, slot);
             visible[slot] = vec4<u32>(instance_id, instance.mesh, cluster, 0u);
             written += 1u;
         }
@@ -396,7 +403,7 @@ fn scatter_large_clusters(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_i
             let cluster = first_cluster + lane * 4u + i;
             // Reset every element on every chunk, including its out-of-range tail.
             selections[i] = 0u;
-            if cluster < mesh.cluster_count { selections[i] = selected_clusters[instance.region_start + cluster]; }
+            if cluster < mesh.cluster_count { selections[i] = selected_clusters[instance.region_start + cluster].x; }
             total += select(0u, 1u, selections[i] != 0u);
         }
         let scan = scan64(total, lane);
@@ -405,7 +412,9 @@ fn scatter_large_clusters(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_i
             let selection = selections[i];
             if selection != 0u {
                 let slot = base + prefix;
-                args[slot] = DrawArgs((selection - 1u) * 3u, 1u, 0u, slot);
+                let cluster = first_cluster + lane * 4u + i;
+                let first_index = selected_clusters[instance.region_start + cluster].y;
+                args[slot] = DrawArgs((selection - 1u) * 3u, 1u, first_index, 0, slot);
                 visible[slot] = vec4<u32>(instance_id, instance.mesh, first_cluster + lane * 4u + i, 0u);
                 prefix += 1u;
             }

@@ -14,7 +14,7 @@ use bevy::{
     tasks::block_on,
 };
 use bytemuck::Zeroable;
-use gpu_contract::{CullParams, STAGES};
+use gpu_contract::{CullParams, DRAW_INDEXED_INDIRECT_BYTES, SELECTED_CLUSTER_BYTES, STAGES};
 use std::{borrow::Cow, sync::mpsc, time::Duration};
 use wgpu::{util::DeviceExt, *};
 
@@ -31,8 +31,14 @@ const POISON: u32 = 0xa5a5_a5a5;
 const SENTINEL: u32 = 0xfeed_beef;
 const NO_GROUP: u32 = 0xffff;
 
-/// A selected draw as read back: (instance, mesh, cluster, 0) and the vertex count argument.
-type Draw = ([u32; 4], u32);
+const INDEXED_ARG_WORDS: usize = (DRAW_INDEXED_INDIRECT_BYTES / 4) as usize;
+const LEGACY_ARG_WORDS: usize = 4;
+
+/// A selected draw: (instance, mesh, cluster, 0) and all five indexed argument words.
+/// The signed base_vertex word is compared by its exact bits (zero for pooled indices).
+type Draw = ([u32; 4], [u32; 5]);
+/// The common selection semantics of indexed production and non-indexed legacy draws.
+type Selection = ([u32; 4], u32);
 
 #[test]
 fn shader_has_valid_stable_compaction_stages() {
@@ -209,14 +215,16 @@ fn mesh_words(
     group_base: u32,
     cluster_count: u32,
     terrain: u32,
+    index_base: u32,
     bounds: [f32; 4],
 ) -> [u32; 16] {
     let [x, y, z, radius] = bounds.map(f32::to_bits);
     [
-        0,
+        // Nonzero vertex bases must not leak into indexed arguments: indices are pooled.
+        index_base + 31,
         cluster_base,
         0,
-        0,
+        index_base,
         group_base,
         cluster_count,
         terrain,
@@ -232,7 +240,13 @@ fn mesh_words(
     ]
 }
 
-fn cluster_words(bounds: [f32; 4], triangles: u32, group: u32, refined: u32) -> [u32; 12] {
+fn cluster_words(
+    bounds: [f32; 4],
+    triangles: u32,
+    group: u32,
+    refined: u32,
+    triangle_offset: u32,
+) -> [u32; 12] {
     let [x, y, z, radius] = bounds.map(f32::to_bits);
     [
         x,
@@ -242,7 +256,7 @@ fn cluster_words(bounds: [f32; 4], triangles: u32, group: u32, refined: u32) -> 
         0,
         0,
         0,
-        0,
+        triangle_offset,
         3 | (triangles << 8) | (group << 16),
         refined,
         0,
@@ -408,16 +422,25 @@ fn boundary_scene(n: u32, full: bool, batches: u32) -> Scene {
         scene
             .instances
             .extend(instance_words(Mat4::IDENTITY, id, batch, slots));
-        scene
-            .meshes
-            .extend(mesh_words(slots, 0, count, 0, [10.0, 0.0, 0.0, 1.0]));
+        scene.meshes.extend(mesh_words(
+            slots,
+            0,
+            count,
+            0,
+            17 + slots * 3,
+            [10.0, 0.0, 0.0, 1.0],
+        ));
         for cluster in 0..count {
             let inside = full || (id + cluster) % 5 != 0;
             let triangles = u32::from(full || cluster % 11 != 0);
             let x = if inside { 10.0 } else { -10.0 };
-            scene
-                .clusters
-                .extend(cluster_words([x, 0.0, 0.0, 0.0], triangles, 0, NO_GROUP));
+            scene.clusters.extend(cluster_words(
+                [x, 0.0, 0.0, 0.0],
+                triangles,
+                0,
+                NO_GROUP,
+                5 + cluster * 2,
+            ));
         }
         scene.counts.push(count);
         scene.starts.push(slots);
@@ -431,17 +454,24 @@ fn boundary_scene(n: u32, full: bool, batches: u32) -> Scene {
 fn boundary_expected(scene: &Scene, plan: &Plan, visible: impl Fn(u32) -> bool) -> Vec<Vec<Draw>> {
     plan.group_ids
         .iter()
-        .map(|ids| {
+        .enumerate()
+        .map(|(group, ids)| {
             let mut draws = Vec::new();
             for &id in ids.iter().filter(|&&id| visible(id)) {
                 for cluster in 0..scene.counts[id as usize] {
                     if scene.full || (id + cluster) % 5 != 0 {
-                        let vertices = if scene.full || cluster % 11 != 0 {
+                        let indices = if scene.full || cluster % 11 != 0 {
                             3
                         } else {
                             0
                         };
-                        draws.push(([id, id, cluster, 0], vertices));
+                        let slot = plan.bases[group] + draws.len() as u32;
+                        draws.push(expected_indexed_draw(
+                            scene,
+                            [id, id, cluster, 0],
+                            indices,
+                            slot,
+                        ));
                     }
                 }
             }
@@ -459,18 +489,24 @@ fn lod_scene(cases: &[LodCase]) -> Scene {
     for error in LOD_ERRORS {
         scene.groups.extend(group_words([0.0; 4], error));
     }
-    for case in cases {
+    for (cluster, case) in cases.iter().enumerate() {
         scene.clusters.extend(cluster_words(
             [case.x, 0.0, 0.0, 1.0],
             case.triangles,
             case.group,
             case.refined,
+            7 + cluster as u32 * 11,
         ));
     }
     for terrain in 0..2 {
-        scene
-            .meshes
-            .extend(mesh_words(0, 0, count, terrain, [0.0, 0.0, 0.0, 1.0]));
+        scene.meshes.extend(mesh_words(
+            0,
+            0,
+            count,
+            terrain,
+            23 + terrain * 101,
+            [0.0, 0.0, 0.0, 1.0],
+        ));
     }
     for (id, (x, mesh)) in [(16.0, 0), (16.0, 1), (1000.0, 0), (16.0, 0)]
         .into_iter()
@@ -487,15 +523,36 @@ fn lod_scene(cases: &[LodCase]) -> Scene {
     scene
 }
 
+/// Expected indexed arguments from the fixture's pooled element and triangle offsets.
+fn expected_indexed_draw(scene: &Scene, tuple: [u32; 4], indices: u32, slot: u32) -> Draw {
+    let mesh = tuple[1] as usize * 16;
+    let cluster = (scene.meshes[mesh + 1] + tuple[2]) as usize * 12;
+    let first_index = scene.meshes[mesh + 3] + scene.clusters[cluster + 7] * 3;
+    (tuple, [indices, 1, first_index, 0, slot])
+}
+
 /// Expected LOD draws per group. A perspective view drops instance 2 (too small on screen);
 /// an orthographic one has no such test.
-fn lod_expected(cases: &[LodCase], orthographic: bool) -> Vec<Vec<Draw>> {
+fn lod_expected(
+    scene: &Scene,
+    cases: &[LodCase],
+    orthographic: bool,
+    bases: &[u32],
+) -> Vec<Vec<Draw>> {
     let draws = |instance: u32, mesh: u32, terrain: bool| -> Vec<Draw> {
         cases
             .iter()
             .enumerate()
             .filter(|(_, case)| if terrain { case.terrain } else { case.object })
-            .map(|(cluster, case)| ([instance, mesh, cluster as u32, 0], case.triangles * 3))
+            .enumerate()
+            .map(|(rank, (cluster, case))| {
+                expected_indexed_draw(
+                    scene,
+                    [instance, mesh, cluster as u32, 0],
+                    case.triangles * 3,
+                    bases[instance as usize] + rank as u32,
+                )
+            })
             .collect()
     };
     vec![
@@ -531,6 +588,7 @@ struct ViewBuffers {
     selected: Buffer,
     order: Buffer,
     slots: u32,
+    args_words: usize,
     groups: usize,
 }
 
@@ -580,6 +638,7 @@ struct Job {
 struct Output {
     counts: Vec<u32>,
     args: Vec<u32>,
+    args_words: usize,
     visible: Vec<u32>,
     list: Vec<u32>,
     dispatch: Vec<u32>,
@@ -588,6 +647,7 @@ struct Output {
 impl Output {
     /// The draws of every group, in slot order.
     fn draws(&self, bases: &[u32]) -> Vec<Vec<Draw>> {
+        assert_eq!(self.args_words, INDEXED_ARG_WORDS);
         bases
             .iter()
             .zip(&self.counts)
@@ -596,7 +656,31 @@ impl Output {
                     .map(|slot| {
                         let at = slot as usize * 4;
                         let tuple: [u32; 4] = self.visible[at..at + 4].try_into().unwrap();
-                        (tuple, self.args[at])
+                        let args_at = slot as usize * self.args_words;
+                        let args = self.args[args_at..args_at + self.args_words]
+                            .try_into()
+                            .unwrap();
+                        (tuple, args)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Compare the legacy shader's selection while checking its complete four-word arguments.
+    fn legacy_selections(&self, bases: &[u32]) -> Vec<Vec<Selection>> {
+        assert_eq!(self.args_words, LEGACY_ARG_WORDS);
+        bases
+            .iter()
+            .zip(&self.counts)
+            .map(|(&base, &count)| {
+                (base..base + count)
+                    .map(|slot| {
+                        let at = slot as usize * LEGACY_ARG_WORDS;
+                        let tuple = self.visible[at..at + 4].try_into().unwrap();
+                        let args = &self.args[at..at + LEGACY_ARG_WORDS];
+                        assert_eq!(&args[1..], &[1, 0, slot], "legacy slot {slot} arguments");
+                        (tuple, args[0])
                     })
                     .collect()
             })
@@ -604,7 +688,19 @@ impl Output {
     }
 }
 
-fn sorted(mut draws: Vec<Vec<Draw>>) -> Vec<Vec<Draw>> {
+fn selections(draws: Vec<Vec<Draw>>) -> Vec<Vec<Selection>> {
+    draws
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|(tuple, args)| (tuple, args[0]))
+                .collect()
+        })
+        .collect()
+}
+
+fn sorted<T: Ord>(mut draws: Vec<Vec<T>>) -> Vec<Vec<T>> {
     for group in &mut draws {
         group.sort_unstable();
     }
@@ -621,7 +717,16 @@ fn assert_exact(
     count_mode: bool,
     poisoned: bool,
 ) {
-    let slots = out.args.len() / 4;
+    assert_eq!(
+        out.args_words, INDEXED_ARG_WORDS,
+        "{label}: argument stride"
+    );
+    assert_eq!(
+        out.args.len() % INDEXED_ARG_WORDS,
+        0,
+        "{label}: partial argument"
+    );
+    let slots = out.args.len() / INDEXED_ARG_WORDS;
     assert_eq!(out.counts.len(), expected.len(), "{label}: group count");
     let mut used = vec![false; slots];
     for (group, draws) in expected.iter().enumerate() {
@@ -630,7 +735,7 @@ fn assert_exact(
             draws.len(),
             "{label} group {group}"
         );
-        for (rank, (tuple, vertices)) in draws.iter().enumerate() {
+        for (rank, (tuple, args)) in draws.iter().enumerate() {
             let slot = bases[group] as usize + rank;
             assert_eq!(
                 &out.visible[slot * 4..slot * 4 + 4],
@@ -638,19 +743,19 @@ fn assert_exact(
                 "{label} group {group} rank {rank}"
             );
             assert_eq!(
-                &out.args[slot * 4..slot * 4 + 4],
-                &[*vertices, 1, 0, slot as u32],
+                &out.args[slot * INDEXED_ARG_WORDS..(slot + 1) * INDEXED_ARG_WORDS],
+                args,
                 "{label} group {group} rank {rank} arguments"
             );
             used[slot] = true;
         }
     }
     for slot in (0..slots).filter(|&slot| !used[slot]) {
-        let args = &out.args[slot * 4..slot * 4 + 4];
+        let args = &out.args[slot * INDEXED_ARG_WORDS..(slot + 1) * INDEXED_ARG_WORDS];
         if !count_mode {
-            assert_eq!(args, &[0; 4], "{label}: unused argument slot {slot}");
+            assert_eq!(args, &[0; 5], "{label}: unused argument slot {slot}");
         } else if poisoned {
-            assert_eq!(args, &[POISON; 4], "{label}: stray argument at slot {slot}");
+            assert_eq!(args, &[POISON; 5], "{label}: stray argument at slot {slot}");
         }
         if poisoned {
             assert_eq!(
@@ -665,6 +770,68 @@ fn assert_exact(
         &[SENTINEL; 4],
         "{label}: terrain tail"
     );
+}
+
+/// CPU proof of fixture encoding and readback strides, including holes and zero-index draws.
+#[test]
+fn indexed_readback_keeps_five_argument_words_and_four_visible_words() {
+    assert_eq!(DRAW_INDEXED_INDIRECT_BYTES, 20);
+    assert_eq!(INDEXED_ARG_WORDS, 5);
+    let mut scene = Scene::empty(false);
+    scene.meshes.extend(mesh_words(1, 0, 1, 0, 101, [0.0; 4]));
+    scene.meshes.extend(mesh_words(3, 0, 2, 0, 1009, [0.0; 4]));
+    for offset in [2, 7, 11, 13, 19] {
+        scene
+            .clusters
+            .extend(cluster_words([0.0; 4], 2, 0, NO_GROUP, offset));
+    }
+    let first = expected_indexed_draw(&scene, [7, 1, 1, 0], 6, 1);
+    let second = expected_indexed_draw(&scene, [9, 0, 0, 0], 0, 3);
+    assert_eq!(first, ([7, 1, 1, 0], [6, 1, 1066, 0, 1]));
+    assert_eq!(second, ([9, 0, 0, 0], [0, 1, 122, 0, 3]));
+    let bases = [1, 3];
+    let expected = vec![vec![first], vec![second]];
+    let slots = 5;
+    for count_mode in [false, true] {
+        let mut out = Output {
+            counts: vec![1, 1],
+            args: vec![if count_mode { POISON } else { 0 }; slots * INDEXED_ARG_WORDS],
+            args_words: INDEXED_ARG_WORDS,
+            visible: vec![POISON; (slots + 1) * 4],
+            list: Vec::new(),
+            dispatch: Vec::new(),
+        };
+        for (slot, (tuple, args)) in [(1, first), (3, second)] {
+            out.args[slot * INDEXED_ARG_WORDS..(slot + 1) * INDEXED_ARG_WORDS]
+                .copy_from_slice(&args);
+            out.visible[slot * 4..(slot + 1) * 4].copy_from_slice(&tuple);
+        }
+        out.visible[slots * 4..].copy_from_slice(&[SENTINEL; 4]);
+        assert_eq!(out.draws(&bases), expected);
+        assert_exact(
+            "CPU indexed layout",
+            &out,
+            &bases,
+            &expected,
+            count_mode,
+            true,
+        );
+
+        let mut legacy = Output {
+            counts: out.counts.clone(),
+            args: vec![0; slots * LEGACY_ARG_WORDS],
+            args_words: LEGACY_ARG_WORDS,
+            visible: out.visible.clone(),
+            list: Vec::new(),
+            dispatch: Vec::new(),
+        };
+        legacy.args[4..8].copy_from_slice(&[6, 1, 0, 1]);
+        legacy.args[12..16].copy_from_slice(&[0, 1, 0, 3]);
+        assert_eq!(
+            legacy.legacy_selections(&bases),
+            selections(expected.clone())
+        );
+    }
 }
 
 /// The surviving instances in source order, the survivor count in the dispatch arguments, and
@@ -848,7 +1015,14 @@ impl Gpu {
         }
     }
 
-    fn view(&self, slots: u32, groups: usize, entries: usize, instances: u32) -> ViewBuffers {
+    fn view(
+        &self,
+        slots: u32,
+        groups: usize,
+        entries: usize,
+        instances: u32,
+        args_words: usize,
+    ) -> ViewBuffers {
         let storage = BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
         let make = |size: u64, usage| {
             self.device.create_buffer(&BufferDescriptor {
@@ -863,7 +1037,10 @@ impl Gpu {
                 std::mem::size_of::<CullParams>() as u64,
                 BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             ),
-            args: make(u64::from(slots) * 16, storage | BufferUsages::INDIRECT),
+            args: make(
+                u64::from(slots.max(1)) * args_words as u64 * 4,
+                storage | BufferUsages::INDIRECT,
+            ),
             counts: make(groups as u64 * 4, storage | BufferUsages::INDIRECT),
             // The terrain tail sentinel follows the last draw slot.
             visible: make((u64::from(slots) + 1) * 16, storage),
@@ -874,9 +1051,10 @@ impl Gpu {
                 storage,
             ),
             prefixes: make(stable_order::prefix_capacity(instances, groups), storage),
-            selected: make(u64::from(slots) * 4, storage),
+            selected: make(u64::from(slots) * SELECTED_CLUSTER_BYTES, storage),
             order: make(stable_order::order_capacity(instances, groups), storage),
             slots,
+            args_words,
             groups,
         }
     }
@@ -946,6 +1124,7 @@ impl Gpu {
             self.queue
                 .write_buffer(&view.visible, 0, bytemuck::cast_slice(&poison));
             if job.count_mode {
+                let poison = vec![POISON; view.slots as usize * view.args_words];
                 self.queue
                     .write_buffer(&view.args, 0, bytemuck::cast_slice(&poison));
             }
@@ -1039,7 +1218,13 @@ impl Gpu {
             let view = &bound.view;
             let slots = view.slots as usize;
             let n = job.params.instance_count as usize;
-            let words = [view.groups, slots * 4, (slots + 1) * 4, n * 4, 4];
+            let words = [
+                view.groups,
+                slots * view.args_words,
+                (slots + 1) * 4,
+                n * 4,
+                4,
+            ];
             parts.extend([
                 (&view.counts, words[0] as u64 * 4),
                 (&view.args, words[1] as u64 * 4),
@@ -1047,12 +1232,12 @@ impl Gpu {
                 (&view.list, words[3] as u64 * 4),
                 (&view.dispatch, words[4] as u64 * 4),
             ]);
-            lens.push(words);
+            lens.push((words, view.args_words));
         }
         let words = self.read_words(encoder, &parts);
         let mut at = 0;
         let mut outputs = Vec::new();
-        for lens in lens {
+        for (lens, args_words) in lens {
             let mut take = lens.map(|len| {
                 let part = words[at..at + len].to_vec();
                 at += len;
@@ -1066,6 +1251,7 @@ impl Gpu {
             outputs.push(Output {
                 counts,
                 args,
+                args_words,
                 visible,
                 list,
                 dispatch,
@@ -1129,7 +1315,10 @@ impl Gpu {
         let plan = scene.plan(n, groups, |id| scene.batch(id));
         let order = plan.order(n);
         let shared = self.shared(&scene);
-        let bound = self.bind_stable(&shared, self.view(scene.slots_before(n), groups, groups, n));
+        let bound = self.bind_stable(
+            &shared,
+            self.view(scene.slots_before(n), groups, groups, n, INDEXED_ARG_WORDS),
+        );
         for epoch in 1..=6u32 {
             let enabled = |id: u32| full || (epoch != 3 && !(id + epoch % 2).is_multiple_of(7));
             let job = Job {
@@ -1180,7 +1369,13 @@ fn stable_order_ignores_instances_appended_after_planning() {
     let shared = gpu.shared_zeroed(&scene);
     let bound = gpu.bind_stable(
         &shared,
-        gpu.view(scene.slots_before(capacity), groups, groups, capacity),
+        gpu.view(
+            scene.slots_before(capacity),
+            groups,
+            groups,
+            capacity,
+            INDEXED_ARG_WORDS,
+        ),
     );
     // (instances the order was planned for, instances the GPU has).
     let steps = [
@@ -1242,8 +1437,9 @@ fn lod_view(gpu: &Gpu, orthographic: bool, with_legacy: bool) {
     let plan = scene.plan(n, 4, |id| id);
     let shared = gpu.shared(&scene);
     let slots = scene.slots_before(n);
-    let stable = gpu.bind_stable(&shared, gpu.view(slots, 4, 4, n));
-    let legacy = with_legacy.then(|| gpu.bind_legacy(&shared, gpu.view(slots, 4, 4, n)));
+    let stable = gpu.bind_stable(&shared, gpu.view(slots, 4, 4, n, INDEXED_ARG_WORDS));
+    let legacy =
+        with_legacy.then(|| gpu.bind_legacy(&shared, gpu.view(slots, 4, 4, n, LEGACY_ARG_WORDS)));
     // Batch 3 is not ready in this view.
     let entries: Vec<[u32; 4]> = plan
         .group_entries()
@@ -1255,7 +1451,7 @@ fn lod_view(gpu: &Gpu, orthographic: bool, with_legacy: bool) {
     params.error_pixels = OBJECT_PIXELS;
     params.terrain_error_pixels = TERRAIN_PIXELS;
     params.min_instance_pixels = 1.0;
-    let expected = lod_expected(&cases, orthographic);
+    let expected = lod_expected(&scene, &cases, orthographic, &plan.bases);
     let survivors: &[u32] = if orthographic { &[0, 1, 2] } else { &[0, 1] };
     let name = if orthographic {
         "orthographic"
@@ -1280,8 +1476,8 @@ fn lod_view(gpu: &Gpu, orthographic: bool, with_legacy: bool) {
             let label = format!("lod {name} legacy");
             assert_eq!(old.counts, out.counts, "{label}: counts");
             assert_eq!(
-                sorted(old.draws(&plan.bases)),
-                sorted(expected.clone()),
+                sorted(old.legacy_selections(&plan.bases)),
+                sorted(selections(expected.clone())),
                 "{label}: draws"
             );
             assert_eq!(
@@ -1316,8 +1512,14 @@ fn stable_visible_set_matches_frozen_atomic_cull() {
     let plan = scene.plan(n, groups, |id| scene.batch(id));
     let shared = gpu.shared(&scene);
     let slots = scene.slots_before(n);
-    let stable = gpu.bind_stable(&shared, gpu.view(slots, groups, groups, n));
-    let legacy = gpu.bind_legacy(&shared, gpu.view(slots, groups, groups, n));
+    let stable = gpu.bind_stable(
+        &shared,
+        gpu.view(slots, groups, groups, n, INDEXED_ARG_WORDS),
+    );
+    let legacy = gpu.bind_legacy(
+        &shared,
+        gpu.view(slots, groups, groups, n, LEGACY_ARG_WORDS),
+    );
     let visible = |id: u32| id % 7 != 3;
     let job = Job {
         params: view_params(n, groups as u32, 1, true),
@@ -1345,8 +1547,8 @@ fn stable_visible_set_matches_frozen_atomic_cull() {
     old_ids.sort_unstable();
     assert_eq!(old_ids, survivors, "boundary: legacy survivor set");
     let (old_draws, stable_draws) = (
-        sorted(old.draws(&plan.bases)),
-        sorted(out.draws(&plan.bases)),
+        sorted(old.legacy_selections(&plan.bases)),
+        sorted(selections(out.draws(&plan.bases))),
     );
     for (group, (old_group, stable_group)) in old_draws.iter().zip(&stable_draws).enumerate() {
         assert!(
@@ -1445,7 +1647,10 @@ fn stable_views_share_instances_with_independent_scratch() {
                 boundary_expected(&scene, &plan, drawn)
             };
             Prepared {
-                bound: gpu.bind_stable(&shared, gpu.view(slots, spec.groups, entries.len(), n)),
+                bound: gpu.bind_stable(
+                    &shared,
+                    gpu.view(slots, spec.groups, entries.len(), n, INDEXED_ARG_WORDS),
+                ),
                 job: Job {
                     params,
                     table: batch_table(&entries, n, drawn),

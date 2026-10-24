@@ -21,7 +21,7 @@ struct MeshInfo {
     vertex_base: u32,
     cluster_base: u32,
     vertex_ref_base: u32,
-    triangle_base: u32,
+    index_base: u32,
     group_base: u32,
     cluster_count: u32,
     pad0: u32,
@@ -38,13 +38,8 @@ struct MeshInfo {
 @group(4) @binding(1) var<storage, read> attributes: array<u32>;
 @group(4) @binding(2) var<storage, read> clusters: array<u32>;
 @group(4) @binding(3) var<storage, read> cluster_vertices: array<u32>;
-@group(4) @binding(4) var<storage, read> cluster_triangles: array<u32>;
 @group(4) @binding(5) var<storage, read> meshes: array<MeshInfo>;
 @group(4) @binding(6) var<storage, read> visible: array<vec4<u32>>;
-
-fn triangle_byte(index: u32) -> u32 {
-    return (cluster_triangles[index >> 2u] >> ((index & 3u) * 8u)) & 0xffu;
-}
 
 // Octahedral decode of two snorm16 values (ADR-0013 section 4, Cigolle et al. 2014).
 fn decode_normal(packed: u32) -> vec3<f32> {
@@ -67,10 +62,7 @@ fn vertex(
     let mesh = meshes[draw.y];
     let base = (mesh.cluster_base + draw.z) * 12u;
     let vertex_offset = clusters[base + 6u];
-    let triangle_offset = clusters[base + 7u];
-    let local = triangle_byte(
-        mesh.triangle_base + (triangle_offset + vertex_index / 3u) * 3u + vertex_index % 3u,
-    );
+    let local = vertex_index;
     let source = mesh.vertex_base + cluster_vertices[mesh.vertex_ref_base + vertex_offset + local];
 
     let position = vec3<f32>(

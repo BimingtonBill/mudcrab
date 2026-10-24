@@ -6,7 +6,7 @@ use std::sync::Arc;
 pub(super) struct Binding {
     pub(super) key: RetainedViewEntity,
     pub(super) prepared: Arc<Prepared>,
-    buffers: [BufferId; 7],
+    buffers: [BufferId; 6],
     /// Diagnostic only: distinguishes an append after this frame's queue.
     queued_epoch: u64,
     pub(super) layout: BindGroupLayoutDescriptor,
@@ -25,7 +25,7 @@ pub(super) fn current(gpu: &ClusterGpu, view: &ViewGpu, state: Option<&State>) -
             .and_then(|state| state.active.get(&binding.key))
             .is_some_and(|prepared| Arc::ptr_eq(prepared, &binding.prepared))
 }
-fn geometry_buffers(gpu: &ClusterGpu, view: &ViewGpu) -> [BufferId; 7] {
+fn geometry_buffers(gpu: &ClusterGpu, view: &ViewGpu) -> [BufferId; 6] {
     // These allocations are sized for the entire scene. Appends change their
     // contents and the selection layout, not the objects a bind group owns.
     // An actual allocation replacement still revokes the binding immediately.
@@ -34,7 +34,6 @@ fn geometry_buffers(gpu: &ClusterGpu, view: &ViewGpu) -> [BufferId; 7] {
         gpu.attributes.id(),
         gpu.clusters.id(),
         gpu.cluster_vertices.id(),
-        gpu.cluster_triangles.id(),
         gpu.meshes.id(),
         view.visible.id(),
     ]
@@ -83,7 +82,6 @@ pub(super) fn refresh(
             entry(1, &gpu.attributes),
             entry(2, &gpu.clusters),
             entry(3, &gpu.cluster_vertices),
-            entry(4, &gpu.cluster_triangles),
             entry(5, &gpu.meshes),
             entry(6, &view.visible),
             entry(7, &prepared.gpu.header),

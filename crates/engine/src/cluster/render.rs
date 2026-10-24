@@ -6,7 +6,7 @@
 //! custom `Opaque3d` item that binds Bevy's own view groups and the stock `StandardMaterial` bind
 //! group of a dummy `Mesh3d` entity, and runs Bevy's own PBR fragment shader. The vertex stage
 //! fetches positions, octahedral normals and quantised UVs from the payload sections in storage
-//! buffers: there is no vertex or index buffer.
+//! buffers. A pooled 16-bit index buffer supplies cluster-local vertex indices.
 
 #[path = "far.rs"]
 mod far;
@@ -14,7 +14,7 @@ mod far;
 mod gpu_contract;
 #[path = "handoff.rs"]
 mod handoff;
-use gpu_contract::{CullParams, STAGES};
+use gpu_contract::{CullParams, DRAW_INDEXED_INDIRECT_BYTES, SELECTED_CLUSTER_BYTES, STAGES};
 
 #[path = "stable_order.rs"]
 mod stable_order;
@@ -90,7 +90,7 @@ use bevy::{
             BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntries, Buffer,
             BufferUsages, CachedComputePipelineId, CachedPipelineState, CachedRenderPipelineId,
             CompareFunction, ComputePassDescriptor, ComputePipelineDescriptor, DepthBiasState,
-            DepthStencilState, FragmentState, PipelineCache, PrimitiveState,
+            DepthStencilState, FragmentState, IndexFormat, PipelineCache, PrimitiveState,
             RenderPipelineDescriptor, ShaderStages, SpecializedMeshPipeline, StencilFaceState,
             StencilState, VertexState,
             binding_types::{
@@ -745,8 +745,8 @@ pub struct ClusterSettings {
     /// in pixels. Terrain is broad and low in relief, so it can take a coarser threshold than
     /// objects without visible change; the same idea as a landscape LOD bias.
     pub terrain_error_pixels: f32,
-    /// Draw the whole argument list with `multi_draw_indirect` even where the adapter could read
-    /// the draw count on the GPU: the path Metal, GL and DX12 take, kept testable on Vulkan.
+    /// Draw the whole argument list with `multi_draw_indexed_indirect` even where the adapter can
+    /// read the count on the GPU: keeps the fallback used by Metal testable on count-capable GPUs.
     pub fixed_count_draw: bool,
     /// Draw the cluster batches into the camera's prepass (depth, normals, motion vectors) where
     /// the camera has one. Off leaves them out of it, as before the prepass existed: what ambient
@@ -1055,7 +1055,7 @@ impl DrawGroups {
             region_starts.push(next);
             draws.push(GroupDraw {
                 representative: *representative,
-                args_offset: u64::from(next) * 16,
+                args_offset: u64::from(next) * DRAW_INDEXED_INDIRECT_BYTES,
                 count_offset: group as u64 * 4,
                 max_count: *slots,
                 far: false,
@@ -1279,9 +1279,9 @@ fn append_block(
             &sections.cluster_vertices,
         );
         queue.write_buffer(
-            &gpu.cluster_triangles,
-            at.cluster_triangles,
-            &sections.cluster_triangles,
+            &gpu.cluster_indices,
+            at.cluster_indices,
+            &sections.cluster_indices,
         );
         queue.write_buffer(&gpu.groups, at.groups, &sections.groups);
         queue.write_buffer(
@@ -1294,14 +1294,14 @@ fn append_block(
             attributes: sections.attributes.len() as u64,
             clusters: sections.clusters.len() as u64,
             cluster_vertices: sections.cluster_vertices.len() as u64,
-            cluster_triangles: sections.cluster_triangles.len() as u64,
+            cluster_indices: sections.cluster_indices.len() as u64,
             groups: sections.groups.len() as u64,
         };
         written += sizes.positions
             + sizes.attributes
             + sizes.clusters
             + sizes.cluster_vertices
-            + sizes.cluster_triangles
+            + sizes.cluster_indices
             + sizes.groups;
         gpu.cursors.advance(&sizes);
     }
@@ -1420,7 +1420,7 @@ struct ClusterGpu {
     attributes: Buffer,
     clusters: Buffer,
     cluster_vertices: Buffer,
-    cluster_triangles: Buffer,
+    cluster_indices: Buffer,
     groups: Buffer,
     meshes: Buffer,
     instances: Buffer,
@@ -1472,7 +1472,7 @@ struct ClusterGpu {
     next_slot: u32,
     /// Immutable scheduling metadata; large meshes retain cooperative cluster scatter.
     large_instances: Vec<u32>,
-    /// Whether the adapter can read the draw count on the GPU (`multi_draw_indirect_count`); when
+    /// Whether the adapter can read the draw count on the GPU (`multi_draw_indexed_indirect_count`); when
     /// it cannot, the draw covers the whole list and the cull pass leaves unused entries empty.
     use_count: bool,
     /// The source orders the views hold, shared between views with the same draw groups.
@@ -1594,7 +1594,7 @@ struct PooledMeshes {
     attributes: Vec<u8>,
     clusters: Vec<u8>,
     cluster_vertices: Vec<u8>,
-    cluster_triangles: Vec<u8>,
+    cluster_indices: Vec<u8>,
     groups: Vec<u8>,
     /// `MeshInfo` rows: eight words of bases and counts, uv_min and uv_scale, then the bounding
     /// sphere.
@@ -1610,7 +1610,7 @@ struct PoolCursors {
     attributes: u64,
     clusters: u64,
     cluster_vertices: u64,
-    cluster_triangles: u64,
+    cluster_indices: u64,
     groups: u64,
 }
 
@@ -1620,7 +1620,7 @@ impl PoolCursors {
         self.attributes += sizes.attributes;
         self.clusters += sizes.clusters;
         self.cluster_vertices += sizes.cluster_vertices;
-        self.cluster_triangles += sizes.cluster_triangles;
+        self.cluster_indices += sizes.cluster_indices;
         self.groups += sizes.groups;
     }
 }
@@ -1635,13 +1635,14 @@ fn mesh_pool_sizes(mesh: &ClusterMeshAsset) -> PoolCursors {
         attributes: u64::from(mesh.vertex_count) * 16,
         clusters: padded_len(MclSection::Clusters),
         cluster_vertices: padded_len(MclSection::ClusterVertices),
-        cluster_triangles: padded_len(MclSection::ClusterTriangles),
+        cluster_indices: (mesh.section(MclSection::ClusterTriangles).len() as u64 * 2)
+            .next_multiple_of(4),
         groups: padded_len(MclSection::Groups),
     }
 }
 
 /// One mesh's `MeshInfo` row: where its sections start (positions and cluster records in elements,
-/// triangles in bytes), its counts, whether only terrain draws it, uv_min and uv_scale, then its
+/// indices in u16 elements), its counts, whether only terrain draws it, uv_min and uv_scale, then its
 /// bounding sphere.
 fn mesh_info_row(at: &PoolCursors, mesh: &ClusterMeshAsset, terrain: bool) -> Vec<u8> {
     let mut row = Vec::with_capacity(64);
@@ -1651,7 +1652,7 @@ fn mesh_info_row(at: &PoolCursors, mesh: &ClusterMeshAsset, terrain: bool) -> Ve
             (at.positions / 12) as u32,
             (at.clusters / 48) as u32,
             (at.cluster_vertices / 4) as u32,
-            at.cluster_triangles as u32,
+            (at.cluster_indices / 2) as u32,
             (at.groups / 32) as u32,
             mesh.cluster_count,
             u32::from(terrain),
@@ -1677,8 +1678,21 @@ struct MeshSections {
     attributes: Vec<u8>,
     clusters: Vec<u8>,
     cluster_vertices: Vec<u8>,
-    cluster_triangles: Vec<u8>,
+    cluster_indices: Vec<u8>,
     groups: Vec<u8>,
+}
+
+/// Widen the payload's byte-sized local vertex indices once at upload. Uint16 is the
+/// smallest portable index format; first_index addresses the pool while base_vertex stays
+/// zero, so every vertex stage receives the original cluster-local index. Queue writes and
+/// subsequent mesh starts remain four-byte aligned, including odd index counts.
+fn cluster_index_bytes(triangles: &[u8]) -> Vec<u8> {
+    let mut indices = Vec::with_capacity((triangles.len() * 2).next_multiple_of(4));
+    for &index in triangles {
+        indices.extend_from_slice(&u16::from(index).to_le_bytes());
+    }
+    indices.resize(indices.len().next_multiple_of(4), 0);
+    indices
 }
 
 /// Builds the pooled form of one mesh: the per-vertex interleave, the tangent words and the
@@ -1706,7 +1720,7 @@ fn mesh_sections(mesh: &ClusterMeshAsset) -> MeshSections {
         attributes,
         clusters: padded(mesh.section(MclSection::Clusters)),
         cluster_vertices: padded(mesh.section(MclSection::ClusterVertices)),
-        cluster_triangles: padded(mesh.section(MclSection::ClusterTriangles)),
+        cluster_indices: cluster_index_bytes(mesh.section(MclSection::ClusterTriangles)),
         groups: padded(mesh.section(MclSection::Groups)),
     }
 }
@@ -1718,7 +1732,7 @@ fn pool_meshes(meshes: &[ClusterMeshAsset]) -> PooledMeshes {
         attributes: Vec::new(),
         clusters: Vec::new(),
         cluster_vertices: Vec::new(),
-        cluster_triangles: Vec::new(),
+        cluster_indices: Vec::new(),
         groups: Vec::new(),
         infos: Vec::new(),
         cluster_counts: Vec::new(),
@@ -1734,7 +1748,7 @@ fn pool_meshes(meshes: &[ClusterMeshAsset]) -> PooledMeshes {
             attributes: sections.attributes.len() as u64,
             clusters: sections.clusters.len() as u64,
             cluster_vertices: sections.cluster_vertices.len() as u64,
-            cluster_triangles: sections.cluster_triangles.len() as u64,
+            cluster_indices: sections.cluster_indices.len() as u64,
             groups: sections.groups.len() as u64,
         });
         pool.positions.extend_from_slice(&sections.positions);
@@ -1742,15 +1756,16 @@ fn pool_meshes(meshes: &[ClusterMeshAsset]) -> PooledMeshes {
         pool.clusters.extend_from_slice(&sections.clusters);
         pool.cluster_vertices
             .extend_from_slice(&sections.cluster_vertices);
-        pool.cluster_triangles
-            .extend_from_slice(&sections.cluster_triangles);
+        pool.cluster_indices
+            .extend_from_slice(&sections.cluster_indices);
         pool.groups.extend_from_slice(&sections.groups);
     }
     pool
 }
 
 /// Whether the scene fits what the adapter binds and allocates: every pooled section, the instance
-/// tables and the per-view lists (16 bytes per slot) in one storage binding each, and the slot and
+/// tables and per-view lists (20-byte arguments, 16-byte visible records) in one storage binding
+/// each, the index pool as an index buffer, and the slot and
 /// instance totals in the 32-bit indices the shaders use. The sizes are summed in 64 bits, so
 /// nothing wraps before it is compared.
 fn check_scene_limits(
@@ -1796,7 +1811,10 @@ fn check_scene_limits(
         ("vertex attributes", totals.attributes),
         ("cluster records", totals.clusters),
         ("cluster vertex references", totals.cluster_vertices),
-        ("cluster triangles", totals.cluster_triangles),
+        (
+            "per-view indexed draw arguments",
+            slots.max(1) * DRAW_INDEXED_INDIRECT_BYTES,
+        ),
         ("groups", totals.groups),
         ("instance table", instances * 80),
         ("mesh uniforms", instances * MESH_UNIFORM_BYTES as u64),
@@ -1809,12 +1827,27 @@ fn check_scene_limits(
             ));
         }
     }
+    if totals.cluster_indices > limits.max_buffer_size
+        || totals.cluster_indices / 2 > u64::from(u32::MAX)
+    {
+        return Err(format!(
+            "the cluster index pool needs {} bytes, exceeding the adapter buffer size or 32-bit index addressing",
+            totals.cluster_indices
+        ));
+    }
     info!(
         instances,
         slots,
         view_list_mib = view_words * 16 / (1 << 20),
-        pooled_mib = sizes[..6].iter().map(|(_, bytes)| bytes).sum::<u64>() / (1 << 20),
-        "cluster scene sizes (each view holds two lists of `slots` x 16 bytes)"
+        pooled_mib = (totals.positions
+            + totals.attributes
+            + totals.clusters
+            + totals.cluster_vertices
+            + totals.cluster_indices
+            + totals.groups)
+            / (1 << 20),
+        index_pool_mib = totals.cluster_indices / (1 << 20),
+        "cluster scene sizes (each view holds 20-byte arguments and 16-byte visible records per slot)"
     );
     Ok(())
 }
@@ -1879,7 +1912,12 @@ fn prepare_cluster_gpu(
     let attributes = make("cluster attributes", totals.attributes);
     let clusters = make("cluster records", totals.clusters);
     let cluster_vertices = make("cluster vertex references", totals.cluster_vertices);
-    let cluster_triangles = make("cluster local triangles", totals.cluster_triangles);
+    let cluster_indices = device.create_buffer(&bevy::render::render_resource::BufferDescriptor {
+        label: Some("cluster local indices"),
+        size: totals.cluster_indices.max(4),
+        usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let groups = make("cluster groups", totals.groups);
     let meshes = make("cluster mesh table", scene.meshes.len() as u64 * 64);
     let batch_total = scene
@@ -1984,32 +2022,30 @@ fn prepare_cluster_gpu(
     ];
     let mut draw_layout = BindGroupLayoutDescriptor::new(
         "cluster draw layout",
-        &BindGroupLayoutEntries::sequential(
+        &BindGroupLayoutEntries::with_indices(
             ShaderStages::VERTEX,
             (
-                read_only(),
-                read_only(),
-                read_only(),
-                read_only(),
-                read_only(),
-                read_only(),
-                read_only(),
+                (0, read_only()),
+                (1, read_only()),
+                (2, read_only()),
+                (3, read_only()),
+                (5, read_only()),
+                (6, read_only()),
             ),
         ),
     );
-    draw_layout.entries[6].visibility = ShaderStages::VERTEX_FRAGMENT;
+    draw_layout.entries[5].visibility = ShaderStages::VERTEX_FRAGMENT;
     let shadow_layout = BindGroupLayoutDescriptor::new(
         "cluster shadow layout",
-        &BindGroupLayoutEntries::sequential(
+        &BindGroupLayoutEntries::with_indices(
             ShaderStages::VERTEX,
             (
-                read_only(),
-                read_only(),
-                read_only(),
-                read_only(),
-                read_only(),
-                read_only(),
-                read_only(),
+                (0, read_only()),
+                (1, read_only()),
+                (2, read_only()),
+                (4, read_only()),
+                (5, read_only()),
+                (6, read_only()),
             ),
         ),
     );
@@ -2074,7 +2110,7 @@ fn prepare_cluster_gpu(
             + totals.attributes
             + totals.clusters
             + totals.cluster_vertices
-            + totals.cluster_triangles
+            + totals.cluster_indices
             + totals.groups,
         "cluster buffers created (empty: blocks are appended as they become ready)"
     );
@@ -2086,7 +2122,7 @@ fn prepare_cluster_gpu(
         attributes,
         clusters,
         cluster_vertices,
-        cluster_triangles,
+        cluster_indices,
         groups,
         meshes,
         instances,
@@ -3360,7 +3396,7 @@ fn new_view_gpu(
     let slots = u64::from(gpu.total_slots.max(1));
     let args = make(
         "cluster draw arguments",
-        slots * 16,
+        slots * DRAW_INDEXED_INDIRECT_BYTES,
         BufferUsages::STORAGE | BufferUsages::INDIRECT | BufferUsages::COPY_DST,
     );
     let counts = make(
@@ -3401,7 +3437,7 @@ fn new_view_gpu(
     );
     let selected_clusters = make(
         "cluster selected source slots",
-        slots * 4,
+        slots * SELECTED_CLUSTER_BYTES,
         BufferUsages::STORAGE,
     );
     let source_order = make(
@@ -3481,7 +3517,6 @@ fn new_view_gpu(
             entry(1, &gpu.attributes),
             entry(2, &gpu.clusters),
             entry(3, &gpu.cluster_vertices),
-            entry(4, &gpu.cluster_triangles),
             entry(5, &gpu.meshes),
             entry(6, &visible),
         ],
@@ -3493,7 +3528,6 @@ fn new_view_gpu(
             entry(0, &gpu.positions),
             entry(1, &gpu.clusters),
             entry(2, &gpu.cluster_vertices),
-            entry(3, &gpu.cluster_triangles),
             entry(4, &gpu.instances),
             entry(5, &gpu.meshes),
             entry(6, &visible),
@@ -3780,8 +3814,9 @@ impl<P: PhaseItem, const FORWARD: bool, const ONCE: bool> RenderCommand<P>
         {
             return RenderCommandResult::Success;
         }
+        pass.set_index_buffer(gpu.cluster_indices.slice(..), IndexFormat::Uint16);
         if gpu.use_count {
-            pass.multi_draw_indirect_count(
+            pass.multi_draw_indexed_indirect_count(
                 &view_gpu.args,
                 draw.args_offset,
                 &view_gpu.counts,
@@ -3790,8 +3825,8 @@ impl<P: PhaseItem, const FORWARD: bool, const ONCE: bool> RenderCommand<P>
             );
         } else {
             // No count on the GPU: draw the whole slice; the cull pass left the unused entries as
-            // zero vertices, so they cost a skipped draw each and nothing else.
-            pass.multi_draw_indirect(&view_gpu.args, draw.args_offset, draw.max_count);
+            // zero indices, so they cost a skipped draw each and nothing else.
+            pass.multi_draw_indexed_indirect(&view_gpu.args, draw.args_offset, draw.max_count);
         }
         if FORWARD && draw.far {
             far::note_encoded_draw(gpu, view_gpu);
@@ -5001,6 +5036,71 @@ mod tests {
     }
 
     #[test]
+    fn local_indices_widen_losslessly_and_keep_uploads_word_aligned() {
+        assert!(cluster_index_bytes(&[]).is_empty());
+        assert_eq!(
+            cluster_index_bytes(&[0, 255, 1]),
+            [0, 0, 255, 0, 1, 0, 0, 0]
+        );
+        assert_eq!(cluster_index_bytes(&[255, 0]), [255, 0, 0, 0]);
+    }
+
+    #[test]
+    fn indexed_fixture_expands_to_the_original_triangle_list_in_every_pooled_mesh() {
+        let mesh = ClusterMeshAsset::from_bytes(MCL.to_vec()).expect("fixture is valid");
+        let pool = pool_meshes(&[mesh.clone(), mesh.clone()]);
+        let mut triangle_count = 0;
+        for row in [0, 16] {
+            let vertex_base = word(&pool.infos, row);
+            let vertex_ref_base = word(&pool.infos, row + 2);
+            let index_base = word(&pool.infos, row + 3);
+            let view = mesh.view();
+            for id in 0..mesh.cluster_count as usize {
+                let cluster = view.cluster(id);
+                let count = usize::from(cluster.triangle_count) * 3;
+                let first_index = index_base as usize + cluster.triangle_offset as usize * 3;
+                let original = (0..count)
+                    .map(|vertex_index| {
+                        // The former vertex shader decoded triangle/corner from vertex_index.
+                        let byte = (cluster.triangle_offset as usize + vertex_index / 3) * 3
+                            + vertex_index % 3;
+                        let local = mesh.section(MclSection::ClusterTriangles)[byte];
+                        vertex_base
+                            + word(
+                                &pool.cluster_vertices,
+                                vertex_ref_base as usize
+                                    + cluster.vertex_offset as usize
+                                    + usize::from(local),
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                let indexed = (first_index..first_index + count)
+                    .map(|index| {
+                        let local = u16::from_le_bytes(
+                            pool.cluster_indices[index * 2..index * 2 + 2]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        vertex_base
+                            + word(
+                                &pool.cluster_vertices,
+                                vertex_ref_base as usize
+                                    + cluster.vertex_offset as usize
+                                    + usize::from(local),
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    indexed, original,
+                    "mesh row {row}, cluster {id}: order and winding"
+                );
+                triangle_count += count / 3;
+            }
+        }
+        assert!(triangle_count > 0, "fixture must exercise actual triangles");
+    }
+
+    #[test]
     fn streamed_meshes_land_where_the_whole_scene_pool_puts_them() {
         let mesh = ClusterMeshAsset::from_bytes(MCL.to_vec()).expect("fixture is valid");
         let meshes = [mesh.clone(), mesh.clone(), mesh];
@@ -5020,10 +5120,7 @@ mod tests {
                 sizes.cluster_vertices,
                 sections.cluster_vertices.len() as u64
             );
-            assert_eq!(
-                sizes.cluster_triangles,
-                sections.cluster_triangles.len() as u64
-            );
+            assert_eq!(sizes.cluster_indices, sections.cluster_indices.len() as u64);
             assert_eq!(sizes.groups, sections.groups.len() as u64);
             at.advance(&sizes);
         }
@@ -5032,7 +5129,7 @@ mod tests {
         assert_eq!(at.attributes, pool.attributes.len() as u64);
         assert_eq!(at.clusters, pool.clusters.len() as u64);
         assert_eq!(at.cluster_vertices, pool.cluster_vertices.len() as u64);
-        assert_eq!(at.cluster_triangles, pool.cluster_triangles.len() as u64);
+        assert_eq!(at.cluster_indices, pool.cluster_indices.len() as u64);
         assert_eq!(at.groups, pool.groups.len() as u64);
     }
 
@@ -5111,7 +5208,7 @@ mod tests {
                 draws[1].max_count,
                 draws[1].count_offset
             ),
-            (17 * 16, 5, 4)
+            (17 * DRAW_INDEXED_INDIRECT_BYTES, 5, 4)
         );
         let entry = |batch: usize| -> [u32; 4] {
             std::array::from_fn(|index| word(&table, batch * 4 + index))
