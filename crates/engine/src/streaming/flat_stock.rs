@@ -62,7 +62,9 @@ pub(super) fn queue(world: &mut World, root: Entity) {
 fn flatten_ready(world: &mut World) {
     let roots = std::mem::take(&mut world.resource_mut::<PendingFlat>().0);
     for root in roots {
-        if world.get::<PartialStock>(root).is_none()
+        if world
+            .get::<PartialStock>(root)
+            .is_none_or(|partial| partial.preserve_hierarchy)
             || world.get::<super::AssetFailed>(root).is_some()
             || world.get::<super::PendingAssetProfile>(root).is_some()
         {

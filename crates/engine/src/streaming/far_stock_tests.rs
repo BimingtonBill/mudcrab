@@ -1852,6 +1852,167 @@ fn owned_statics_keep_unclassified_runtime_fallback_within_stream_radius() {
 }
 
 #[test]
+fn owned_statics_desire_complete_initial_material_refusal_beyond_grid_with_exact_partial_selection()
+{
+    use crate::cluster::{
+        ownership::OwnershipFacts,
+        source_identity::{SourcePrimitive, SourcePrimitiveTransform},
+    };
+    use bevy::{
+        asset::AssetPlugin,
+        camera::visibility::VisibilityClass,
+        transform::components::TransformTreeChanged,
+        world_serialization::{WorldAssetRoot, WorldSerializationPlugin},
+    };
+    let fixture = Fixture::from_directory(published_for_loader());
+    let (key, row) = fixture
+        .rows
+        .iter()
+        .find(|(_, row)| {
+            fixture
+                .package
+                .placed_reference(row.form_id)
+                .is_some_and(|reference| {
+                    reference.coverage == CoverageState::Complete
+                        && reference.is_static_scenery
+                        && reference.model_path.is_some()
+                        && reference
+                            .stock_primitives
+                            .as_ref()
+                            .is_some_and(BTreeSet::is_empty)
+                })
+        })
+        .expect("loader fixture has a complete static reference without convert refusals");
+    let (record, occurrence) = fixture
+        .package
+        .records()
+        .find(|(_, occurrence)| occurrence.reference == row.form_id)
+        .unwrap();
+    let refused_ordinal = occurrence.primitive;
+    let mut facts = OwnershipFacts::default();
+    facts.publish(
+        &fixture.package,
+        std::collections::BTreeMap::from([(*record, true)]),
+    );
+    let mut app = complete_plan_app(&fixture, *key);
+    {
+        let mut config = app.world_mut().resource_mut::<EngineConfig>();
+        config.cluster_own_statics = true;
+        config.stream_radius = 0;
+    }
+    app.world_mut().resource_mut::<RenderOrigin>().0 = grid(*key) + IVec2::new(200, 0);
+    app.world_mut()
+        .resource_mut::<SourceFallbackDemand>()
+        .update(Some(&fixture.package), facts.permanent_refused_references());
+    app.insert_resource(facts);
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<FarStock>()
+            .desired
+            .get(&(cell_world(*key).unwrap(), row.form_id)),
+        Some(key),
+        "certified initial material refusal must inherit owned scenery reach"
+    );
+
+    // Exercise the actual pre-instancing subset selector. A same-bounds new
+    // source occurrence is not permission to render anything outside the mask.
+    app.add_plugins((AssetPlugin::default(), WorldSerializationPlugin))
+        .init_asset::<Mesh>()
+        .register_type::<Transform>()
+        .register_type::<GlobalTransform>()
+        .register_type::<TransformTreeChanged>()
+        .register_type::<ChildOf>()
+        .register_type::<Children>()
+        .register_type::<Visibility>()
+        .register_type::<InheritedVisibility>()
+        .register_type::<ViewVisibility>()
+        .register_type::<VisibilityClass>()
+        .register_type::<Mesh3d>()
+        .register_type::<MeshMaterial3d<StandardMaterial>>()
+        .register_type::<SourcePrimitive>()
+        .register_type::<SourcePrimitiveTransform>();
+    super::super::partial_stock::install(&mut app);
+    let mesh = app
+        .world_mut()
+        .resource_mut::<Assets<Mesh>>()
+        .add(Cuboid::new(2.0, 2.0, 2.0));
+    let mut scene = World::new();
+    for ordinal in [refused_ordinal, u32::MAX] {
+        scene.spawn((
+            Transform::IDENTITY,
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d::<StandardMaterial>::default(),
+            SourcePrimitive {
+                scene_index: 0,
+                ordinal,
+                mesh_index: 0,
+                primitive_index: ordinal,
+                matches_default_scene: true,
+            },
+            SourcePrimitiveTransform(Mat4::IDENTITY),
+        ));
+    }
+    let source = app
+        .world_mut()
+        .resource_mut::<Assets<WorldAsset>>()
+        .add(WorldAsset::new(scene));
+    let partial = super::super::partial_stock::PartialStock::for_demand(
+        &fixture.package,
+        row,
+        true,
+        true,
+        Some(app.world().resource::<OwnershipFacts>()),
+    )
+    .unwrap();
+    let root = app
+        .world_mut()
+        .spawn((
+            Transform::IDENTITY,
+            partial,
+            ExpectedModelBounds::new(Vec3::splat(-1.0), Vec3::ONE).unwrap(),
+        ))
+        .id();
+    super::super::partial_stock::arm(app.world_mut(), root, source.clone());
+    let selected = &app.world().get::<WorldAssetRoot>(root).unwrap().0;
+    assert_ne!(selected, &source);
+    let selected_ordinals: BTreeSet<_> = app
+        .world()
+        .resource::<Assets<WorldAsset>>()
+        .get(selected)
+        .unwrap()
+        .world
+        .iter_entities()
+        .filter(|node| node.contains::<Mesh3d>())
+        .map(|node| node.get::<SourcePrimitive>().unwrap().ordinal)
+        .collect();
+    assert_eq!(selected_ordinals, BTreeSet::from([refused_ordinal]));
+
+    // Runtime feedback withdrawal does not replace the certificate's fixed
+    // refusal. A later camera demand must still include this distant source.
+    app.world_mut()
+        .resource_mut::<SourceFallbackDemand>()
+        .update(None, BTreeSet::new());
+    app.world_mut().resource_mut::<RenderOrigin>().0 = grid(*key) + IVec2::new(201, 0);
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<FarStock>()
+            .desired
+            .get(&(cell_world(*key).unwrap(), row.form_id)),
+        Some(key),
+        "feedback withdrawal cannot revoke fixed refusal reach on camera movement"
+    );
+    let generation = app.world().resource::<FarStock>().generation;
+    app.update();
+    assert_eq!(
+        app.world().resource::<FarStock>().generation,
+        generation,
+        "settled fixed-refusal demand must not replan"
+    );
+}
+
+#[test]
 fn owned_statics_keep_runtime_state_refusals_within_stream_radius() {
     let fixture = Fixture::from_directory(published_for_runtime_inventory());
     let (key, row) = fixture

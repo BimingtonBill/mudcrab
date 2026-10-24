@@ -79,6 +79,33 @@ impl CachedPipelineState {
     }
 }
 
+/// Tracks availability edges, rather than queue processing or nonready retries.
+#[derive(Default)]
+struct PipelineReadinessRevision(u64);
+
+impl PipelineReadinessRevision {
+    fn record_transition(&mut self, was_ready: bool, is_ready: bool) {
+        if was_ready != is_ready {
+            self.0 = self
+                .0
+                .checked_add(1)
+                .expect("Pipeline readiness revision exhausted");
+        }
+    }
+}
+
+fn set_pipeline_state(
+    state: &mut CachedPipelineState,
+    new_state: CachedPipelineState,
+    readiness_revision: &mut PipelineReadinessRevision,
+) {
+    readiness_revision.record_transition(
+        matches!(state, CachedPipelineState::Ok(_)),
+        matches!(new_state, CachedPipelineState::Ok(_)),
+    );
+    *state = new_state;
+}
+
 type ImmediateSize = u32;
 type LayoutCacheKey = (Vec<BindGroupLayoutId>, ImmediateSize);
 #[derive(Default)]
@@ -206,6 +233,7 @@ pub struct PipelineCache {
     shader_cache: Arc<Mutex<ShaderCache<WgpuWrapper<ShaderModule>, RenderDevice>>>,
     device: RenderDevice,
     pipelines: Vec<CachedPipeline>,
+    readiness_revision: PipelineReadinessRevision,
     waiting_pipelines: HashSet<CachedPipelineId>,
     new_pipelines: Mutex<Vec<CachedPipeline>>,
     global_shader_defs: Vec<ShaderDefVal>,
@@ -217,6 +245,18 @@ pub struct PipelineCache {
 }
 
 impl PipelineCache {
+    /// Returns the monotonic revision of cached pipeline availability.
+    ///
+    /// The revision advances whenever a pipeline becomes ready or ceases to be
+    /// ready, including shader invalidation. Nonready retries, queuing new pipelines,
+    /// and unchanged queue processing do not advance it. Consumers must also track
+    /// changes to their required pipeline IDs. It starts at zero and is scoped to
+    /// this cache's lifetime. Reading it does not scan the pipelines.
+    #[inline]
+    pub fn readiness_revision(&self) -> u64 {
+        self.readiness_revision.0
+    }
+
     /// Returns an iterator over the pipelines in the pipeline cache.
     pub fn pipelines(&self) -> impl Iterator<Item = &CachedPipeline> {
         self.pipelines.iter()
@@ -263,6 +303,7 @@ impl PipelineCache {
             waiting_pipelines: default(),
             new_pipelines: default(),
             pipelines: default(),
+            readiness_revision: default(),
             global_shader_defs,
             synchronous_pipeline_compilation,
             needs_shader_reload: true,
@@ -352,10 +393,11 @@ impl PipelineCache {
 
         let state = &mut self.pipelines[id.id()].state;
         if let CachedPipelineState::Creating(task) = state {
-            *state = match bevy_tasks::block_on(task) {
+            let new_state = match bevy_tasks::block_on(task) {
                 Ok(p) => CachedPipelineState::Ok(p),
                 Err(e) => CachedPipelineState::Err(e),
             };
+            set_pipeline_state(state, new_state, &mut self.readiness_revision);
         }
     }
 
@@ -450,7 +492,11 @@ impl PipelineCache {
         let mut shader_cache = self.shader_cache.lock().unwrap();
         let pipelines_to_queue = shader_cache.set_shader(id, shader);
         for cached_pipeline in pipelines_to_queue {
-            self.pipelines[cached_pipeline].state = CachedPipelineState::Queued;
+            set_pipeline_state(
+                &mut self.pipelines[cached_pipeline].state,
+                CachedPipelineState::Queued,
+                &mut self.readiness_revision,
+            );
             self.waiting_pipelines.insert(cached_pipeline);
         }
     }
@@ -460,7 +506,11 @@ impl PipelineCache {
         let mut shader_cache = self.shader_cache.lock().unwrap();
         let pipelines_to_queue = shader_cache.remove(shader);
         for cached_pipeline in pipelines_to_queue {
-            self.pipelines[cached_pipeline].state = CachedPipelineState::Queued;
+            set_pipeline_state(
+                &mut self.pipelines[cached_pipeline].state,
+                CachedPipelineState::Queued,
+                &mut self.readiness_revision,
+            );
             self.waiting_pipelines.insert(cached_pipeline);
         }
     }
@@ -663,7 +713,7 @@ impl PipelineCache {
     fn process_pipeline(&mut self, cached_pipeline: &mut CachedPipeline, id: usize) {
         match &mut cached_pipeline.state {
             CachedPipelineState::Queued => {
-                cached_pipeline.state = match &cached_pipeline.descriptor {
+                let new_state = match &cached_pipeline.descriptor {
                     PipelineDescriptor::RenderPipelineDescriptor(descriptor) => {
                         self.start_create_render_pipeline(id, *descriptor.clone())
                     }
@@ -671,14 +721,27 @@ impl PipelineCache {
                         self.start_create_compute_pipeline(id, *descriptor.clone())
                     }
                 };
+                set_pipeline_state(
+                    &mut cached_pipeline.state,
+                    new_state,
+                    &mut self.readiness_revision,
+                );
             }
 
             CachedPipelineState::Creating(task) => match bevy_tasks::futures::check_ready(task) {
                 Some(Ok(pipeline)) => {
-                    cached_pipeline.state = CachedPipelineState::Ok(pipeline);
+                    set_pipeline_state(
+                        &mut cached_pipeline.state,
+                        CachedPipelineState::Ok(pipeline),
+                        &mut self.readiness_revision,
+                    );
                     return;
                 }
-                Some(Err(err)) => cached_pipeline.state = CachedPipelineState::Err(err),
+                Some(Err(err)) => set_pipeline_state(
+                    &mut cached_pipeline.state,
+                    CachedPipelineState::Err(err),
+                    &mut self.readiness_revision,
+                ),
                 _ => (),
             },
 
@@ -686,7 +749,11 @@ impl PipelineCache {
                 // Retry
                 ShaderCacheError::ShaderNotLoaded(_)
                 | ShaderCacheError::ShaderImportNotYetAvailable => {
-                    cached_pipeline.state = CachedPipelineState::Queued;
+                    set_pipeline_state(
+                        &mut cached_pipeline.state,
+                        CachedPipelineState::Queued,
+                        &mut self.readiness_revision,
+                    );
                 }
 
                 // Shader could not be processed ... retrying won't help
@@ -833,5 +900,39 @@ fn create_pipeline_task(
     match bevy_tasks::block_on(task) {
         Ok(pipeline) => CachedPipelineState::Ok(pipeline),
         Err(err) => CachedPipelineState::Err(err),
+    }
+}
+
+#[cfg(test)]
+mod readiness_revision_tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_readiness_revision_tracks_availability_edges() {
+        let mut revision = PipelineReadinessRevision::default();
+        revision.record_transition(false, true);
+        assert_eq!(revision.0, 1);
+        revision.record_transition(true, true);
+        assert_eq!(revision.0, 1);
+        revision.record_transition(true, false);
+        assert_eq!(revision.0, 2);
+        revision.record_transition(false, false);
+        assert_eq!(revision.0, 2);
+        revision.record_transition(false, true);
+        assert_eq!(revision.0, 3);
+    }
+
+    #[test]
+    fn pipeline_readiness_revision_ignores_nonready_retries() {
+        let mut revision = PipelineReadinessRevision::default();
+        let mut state = CachedPipelineState::Queued;
+        set_pipeline_state(
+            &mut state,
+            CachedPipelineState::Err(ShaderCacheError::ShaderImportNotYetAvailable),
+            &mut revision,
+        );
+        set_pipeline_state(&mut state, CachedPipelineState::Queued, &mut revision);
+        assert_eq!(revision.0, 0);
+        assert!(matches!(state, CachedPipelineState::Queued));
     }
 }

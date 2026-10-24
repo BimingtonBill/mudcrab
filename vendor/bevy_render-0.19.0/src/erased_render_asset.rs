@@ -194,29 +194,58 @@ impl<A: ErasedRenderAsset> Default for ExtractedAssets<A> {
 /// Stores all GPU representations ([`ErasedRenderAsset`])
 /// of [`ErasedRenderAsset::SourceAsset`] as long as they exist.
 #[derive(Resource)]
-pub struct ErasedRenderAssets<ERA>(HashMap<UntypedAssetId, ERA>);
+pub struct ErasedRenderAssets<ERA>(HashMap<UntypedAssetId, ERA>, u64);
 
 impl<ERA> Default for ErasedRenderAssets<ERA> {
     fn default() -> Self {
-        Self(Default::default())
+        Self(Default::default(), 0)
     }
 }
 
 impl<ERA> ErasedRenderAssets<ERA> {
+    /// Returns the monotonic change revision of this collection.
+    ///
+    /// Insertions, replacements, removals, and mutable access advance the revision.
+    /// Immutable access and missing-entry lookups or removals do not. Mutable access
+    /// is conservative: a returned mutable reference may change an asset even when
+    /// the collection cannot observe the write. The revision starts at zero and is
+    /// scoped to this collection's lifetime. Reading it does not scan the assets.
+    #[inline]
+    pub fn revision(&self) -> u64 {
+        self.1
+    }
+
+    fn advance_revision(&mut self) {
+        self.1 = self
+            .1
+            .checked_add(1)
+            .expect("Render asset revision exhausted");
+    }
+
     pub fn get(&self, id: impl Into<UntypedAssetId>) -> Option<&ERA> {
         self.0.get(&id.into())
     }
 
     pub fn get_mut(&mut self, id: impl Into<UntypedAssetId>) -> Option<&mut ERA> {
-        self.0.get_mut(&id.into())
+        let asset = self.0.get_mut(&id.into())?;
+        self.1 = self
+            .1
+            .checked_add(1)
+            .expect("Render asset revision exhausted");
+        Some(asset)
     }
 
     pub fn insert(&mut self, id: impl Into<UntypedAssetId>, value: ERA) -> Option<ERA> {
+        self.advance_revision();
         self.0.insert(id.into(), value)
     }
 
     pub fn remove(&mut self, id: impl Into<UntypedAssetId>) -> Option<ERA> {
-        self.0.remove(&id.into())
+        let removed = self.0.remove(&id.into());
+        if removed.is_some() {
+            self.advance_revision();
+        }
+        removed
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (UntypedAssetId, &ERA)> {
@@ -224,6 +253,9 @@ impl<ERA> ErasedRenderAssets<ERA> {
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (UntypedAssetId, &mut ERA)> {
+        if !self.0.is_empty() {
+            self.advance_revision();
+        }
         self.0.iter_mut().map(|(k, v)| (*k, v))
     }
 }
@@ -271,6 +303,7 @@ fn collect_erased_render_assets_to_reextract<A: ErasedRenderAsset>(
     });
     prepare_next_frame.assets.clear();
     if !ids.is_empty() {
+        render_assets.advance_revision();
         commands.insert_resource(ErasedRenderAssetsToReExtract::<A> { ids });
     }
 }
@@ -464,5 +497,85 @@ pub fn prepare_erased_assets<A: ErasedRenderAsset>(
             prepare_next_frame.assets.len(),
             wrote_asset_count
         );
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+    use bevy_ecs::{system::RunSystemOnce, world::World};
+    use bevy_shader::Shader;
+
+    #[test]
+    fn erased_assets_revision_tracks_insert_replace_and_remove() {
+        let mut assets = ErasedRenderAssets::<u32>::default();
+        let id = AssetId::<Shader>::default();
+        assert_eq!(assets.revision(), 0);
+        assert_eq!(assets.insert(id, 1), None);
+        assert_eq!(assets.revision(), 1);
+        assert_eq!(assets.insert(id, 2), Some(1));
+        assert_eq!(assets.revision(), 2);
+        assert_eq!(assets.remove(id), Some(2));
+        assert_eq!(assets.revision(), 3);
+        assert_eq!(assets.remove(id), None);
+        assert_eq!(assets.revision(), 3);
+    }
+
+    #[test]
+    fn erased_assets_revision_tracks_mutable_access_but_not_reads_or_misses() {
+        let mut assets = ErasedRenderAssets::<u32>::default();
+        let id = AssetId::<Shader>::default();
+        assets.insert(id, 1);
+        assert_eq!(assets.get(id), Some(&1));
+        assert_eq!(assets.iter().count(), 1);
+        assert_eq!(assets.get_mut(AssetId::<Shader>::invalid()), None);
+        assert_eq!(assets.revision(), 1);
+        *assets.get_mut(id).unwrap() = 2;
+        assert_eq!(assets.revision(), 2);
+        for (_, value) in assets.iter_mut() {
+            *value += 1;
+        }
+        assert_eq!(assets.get(id), Some(&3));
+        assert_eq!(assets.revision(), 3);
+    }
+
+    struct RecoveryAsset;
+
+    impl ErasedRenderAsset for RecoveryAsset {
+        type SourceAsset = Shader;
+        type ErasedAsset = u32;
+        type Param = ();
+
+        fn prepare_asset(
+            _: Shader,
+            _: AssetId<Shader>,
+            _: &mut SystemParamItem<Self::Param>,
+        ) -> Result<u32, PrepareAssetError<Shader>> {
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn erased_assets_revision_tracks_device_recovery_removals_only() {
+        let mut assets = ErasedRenderAssets::<u32>::default();
+        assets.insert(AssetId::<Shader>::default(), 1);
+        assets.insert(AssetId::<bevy_image::Image>::default(), 2);
+        let mut world = World::new();
+        world.insert_resource(assets);
+        world.init_resource::<PrepareNextFrameAssets<RecoveryAsset>>();
+        world
+            .run_system_once(collect_erased_render_assets_to_reextract::<RecoveryAsset>)
+            .unwrap();
+        let assets = world.resource::<ErasedRenderAssets<u32>>();
+        assert_eq!(assets.revision(), 3);
+        assert_eq!(assets.get(AssetId::<Shader>::default()), None);
+        assert_eq!(
+            assets.get(AssetId::<bevy_image::Image>::default()),
+            Some(&2)
+        );
+        world
+            .run_system_once(collect_erased_render_assets_to_reextract::<RecoveryAsset>)
+            .unwrap();
+        assert_eq!(world.resource::<ErasedRenderAssets<u32>>().revision(), 3);
     }
 }

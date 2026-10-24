@@ -568,8 +568,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // world is first ready (`crate::pacing::startup::StartupLoadPlugin`); `--paced-startup`
         // and a capture run install nothing.
         app.add_plugins(crate::pacing::startup::StartupLoadPlugin);
-        // Register the cluster path only when requested. Certified per-view replacement
-        // determines which stock primitives it may replace.
+        // Register launch-time ownership only when a cluster overlay is selected.
         let (selector, base) = {
             let config = app.world().resource::<EngineConfig>();
             (config.clusters.clone(), config.assets_dir.clone())
@@ -588,21 +587,17 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                     config.cluster_terrain,
                 )
             };
-            if app
-                .world()
-                .resource::<EngineConfig>()
-                .cluster_preload_batches
-            {
-                app.insert_resource(crate::cluster::package::ClusterBatchPreload);
+            // Owned primitives have no stock render body. Prepare every material before play.
+            app.insert_resource(crate::cluster::package::ClusterBatchPreload);
+            if !prepass {
+                color_eyre::eyre::bail!("cluster ownership requires the camera prepass");
             }
-            let own_statics = app.world().resource::<EngineConfig>().cluster_own_statics;
             // The error thresholds follow the graphics settings
             // (`crate::cluster::render::follow_graphics_quality`).
             let defaults = crate::cluster::render::ClusterSettings::default();
             app.insert_resource(crate::cluster::render::ClusterSettings {
                 min_instance_pixels: min_instance_pixels.unwrap_or(defaults.min_instance_pixels),
                 prepass,
-                own_statics,
                 ..defaults
             });
             // The blocks reach the GPU nearest the start position first. A block's bounds are in

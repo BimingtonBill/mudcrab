@@ -4,7 +4,6 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InstanceMask {
     capacity: u32,
-    enabled: u32,
     vectors: Vec<[u32; 4]>,
 }
 
@@ -31,7 +30,6 @@ impl InstanceMask {
     pub(crate) fn new(capacity: u32) -> Self {
         Self {
             capacity,
-            enabled: 0,
             vectors: vec![[0; 4]; capacity.div_ceil(128) as usize],
         }
     }
@@ -40,8 +38,13 @@ impl InstanceMask {
         self.capacity
     }
 
-    pub(crate) fn enabled_count(&self) -> u32 {
-        self.enabled
+    #[cfg(test)]
+    fn enabled_count(&self) -> u32 {
+        self.vectors
+            .iter()
+            .flatten()
+            .map(|word| word.count_ones())
+            .sum()
     }
 
     pub(crate) fn set(&mut self, index: u32, enabled: bool) -> Result<(), InstanceMaskOutOfRange> {
@@ -55,16 +58,10 @@ impl InstanceMask {
         let lane = ((index >> 5) & 3) as usize;
         let bit = 1u32 << (index & 31);
         let word = &mut self.vectors[vector][lane];
-        let previous = *word & bit != 0;
         if enabled {
             *word |= bit;
         } else {
             *word &= !bit;
-        }
-        match (previous, enabled) {
-            (false, true) => self.enabled += 1,
-            (true, false) => self.enabled -= 1,
-            _ => {}
         }
         Ok(())
     }

@@ -1600,15 +1600,19 @@ fn run_demo_tour(
     active: Option<Res<ActiveCell>>,
     origin: Option<Res<RenderOrigin>>,
     // Grouped: a system takes at most sixteen parameters.
-    (real_time, mut open_door, prewarm, waiting, validation, scene): (
+    (real_time, mut open_door, prewarm, waiting, validation, scene, startup): (
         Res<Time<Real>>,
         MessageWriter<OpenDoor>,
         Option<Res<crate::portal::PortalPrewarm>>,
         WaitingVisibility,
         Option<Res<PackageValidationStatus>>,
         Option<Res<crate::cluster::render::ClusterScene>>,
+        Option<Res<crate::pacing::startup::StartupLoad>>,
     ),
 ) {
+    if startup.as_ref().is_some_and(|load| load.cover_pending()) {
+        return;
+    }
     let doors = &targeting.doors;
     match tour.advance_automation(
         time.delta_secs(),

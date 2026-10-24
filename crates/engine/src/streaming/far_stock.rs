@@ -96,6 +96,7 @@ pub(crate) struct FarStock {
     near_roots: HashMap<CellKey, Entity>,
     near_roles: HashMap<Entity, CellRole>,
     fallback_revision: Option<u64>,
+    terminal_revision: Option<u64>,
     fallback_references: BTreeSet<u32>,
     counted_worlds: HashSet<u32>,
     qualification_pending: bool,
@@ -267,6 +268,7 @@ fn plan(
     mut lod: ResMut<LodStreaming>,
     package: Option<Res<ValidatedPackage>>,
     mut fallback: Option<ResMut<SourceFallbackDemand>>,
+    ownership: Option<Res<crate::cluster::ownership::OwnershipFacts>>,
     mut far: ResMut<FarStock>,
     references: ExistingReferences,
     parents: Query<
@@ -324,6 +326,7 @@ fn plan(
             far.submission_failure = None;
             far.demand = None;
             far.fallback_revision = None;
+            far.terminal_revision = None;
             far.fallback_references.clear();
             far.counted_worlds.clear();
             far.qualification_pending = false;
@@ -339,8 +342,13 @@ fn plan(
         far.fallback_references.clear();
         far.counted_worlds.clear();
     }
+    let terminal_revision = ownership
+        .as_deref()
+        .filter(|facts| facts.package_matches(&package.0))
+        .map(|facts| facts.terminal_revision());
+    let mut fallback_changed = changed_package || far.terminal_revision != terminal_revision;
+    far.terminal_revision = terminal_revision;
     far.qualification_pending = true;
-    let mut fallback_changed = false;
     if let Some((revision, references)) = fallback
         .as_mut()
         .and_then(|feedback| feedback.consume_for_package(&package.0))
@@ -355,7 +363,8 @@ fn plan(
     let actual = views.current(&config, origin.0, portal.as_deref());
     let demand = views.residency_demand(&config, actual, portal.as_deref(), &mut lod);
     // Owned clusters have no distance cutoff. Only recorded look-only STAT/TREE refusals
-    // inherit that reach; runtime-state, unknown and unclassified fallbacks keep the grid.
+    // and fixed material refusals inherit that reach. Runtime-state and unknown
+    // source feedback keep the grid.
     // Native LOD stays disabled in owned mode, including for grid-bound references.
     let stream_radius = config.stream_radius.max(0);
     let reach = (!config.cluster_own_statics).then_some(stream_radius);
@@ -392,6 +401,7 @@ fn plan(
             other_refused_beyond = counts.other_refused.beyond,
             distant_look_stock = if config.cluster_own_statics { counts.look_refused.beyond } else { 0 },
             distant_runtime_stock = 0usize,
+            distant_material_stock = if config.cluster_own_statics { counts.fallback.beyond } else { 0 },
             fallback_inside = counts.fallback.inside,
             fallback_beyond = counts.fallback.beyond,
             total_inside = counts.total.inside,
@@ -399,6 +409,14 @@ fn plan(
             "stock candidate inventory and classified distant demand at first qualification (once per package/worldspace)"
         );
     }
+    // Only frozen material refusals inherit unbounded static-scenery reach.
+    // Unclassified runtime source feedback has no authority to extend the grid.
+    // This projection runs only after a changed demand/qualification, never settled frames.
+    let permanent_refusals = ownership
+        .as_deref()
+        .filter(|facts| facts.package_matches(&package.0))
+        .map(|facts| facts.permanent_refused_references())
+        .unwrap_or_default();
     let mut desired = HashMap::new();
     if let Some(demand) = demand {
         for (grid, ids) in package
@@ -414,9 +432,14 @@ fn plan(
             for id in ids {
                 if package.0.placed_reference(*id).is_some_and(|reference| {
                     reference.model_path.is_some()
-                        && (inside || (config.cluster_own_statics && full_stock_reach(reference)))
+                        && (inside
+                            || (config.cluster_own_statics
+                                && (full_stock_reach(reference)
+                                    || (reference.is_static_scenery
+                                        && permanent_refusals.contains(id)))))
                         && (needs_stock(reference)
                             || far.fallback_references.contains(id)
+                            || permanent_refusals.contains(id)
                             || (!changed_package && far.owners.contains_key(&(demand.world, *id))))
                 }) {
                     desired.insert((demand.world, *id), key);
@@ -569,6 +592,7 @@ fn plan(
 pub(super) fn collect(
     mut commands: Commands,
     config: Res<EngineConfig>,
+    ownership: Option<Res<crate::cluster::ownership::OwnershipFacts>>,
     database: Res<WorldDatabase>,
     asset_server: Res<AssetServer>,
     snow: Res<DirectionalSnowCatalog>,
@@ -741,6 +765,7 @@ pub(super) fn collect(
                     &row,
                     config.cluster_own_statics,
                     beyond_grid,
+                    ownership.as_deref(),
                 ) {
                     parent.commands().entity(entity).insert(partial);
                 }

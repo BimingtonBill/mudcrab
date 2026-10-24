@@ -4735,17 +4735,55 @@ pub(crate) fn pending_marker_for_test() -> impl Bundle {
     }
 }
 
-type RenderPrimitiveQuery<'world, 'state> = Query<
-    'world,
-    'state,
-    (
-        &'static Mesh3d,
-        Option<&'static MeshMaterial3d<StandardMaterial>>,
-        Option<&'static GltfMaterialName>,
-        Option<&'static GltfExtras>,
-        Option<&'static NifDepthMaterialSource>,
-    ),
->;
+type RenderPrimitive<'a> = (
+    &'a Mesh3d,
+    Option<&'a MeshMaterial3d<StandardMaterial>>,
+    Option<&'a GltfMaterialName>,
+    Option<&'a GltfExtras>,
+    Option<&'a NifDepthMaterialSource>,
+);
+
+/// Readiness and physics consume source geometry even where ownership removed
+/// its render body. Embedded source data never becomes a Mesh3d component.
+#[derive(SystemParam)]
+#[allow(clippy::type_complexity)]
+struct RenderPrimitiveQuery<'w, 's> {
+    rendered: Query<
+        'w,
+        's,
+        (
+            &'static Mesh3d,
+            Option<&'static MeshMaterial3d<StandardMaterial>>,
+            Option<&'static GltfMaterialName>,
+            Option<&'static GltfExtras>,
+            Option<&'static NifDepthMaterialSource>,
+        ),
+    >,
+    owned: Query<
+        'w,
+        's,
+        (
+            &'static crate::cluster::ownership::OwnedPrimitiveSource,
+            Option<&'static GltfMaterialName>,
+            Option<&'static GltfExtras>,
+            Option<&'static NifDepthMaterialSource>,
+        ),
+        Without<Mesh3d>,
+    >,
+}
+
+impl RenderPrimitiveQuery<'_, '_> {
+    fn get(
+        &self,
+        entity: Entity,
+    ) -> Result<RenderPrimitive<'_>, bevy::ecs::query::QueryEntityError> {
+        if let Ok(primitive) = self.rendered.get(entity) {
+            return Ok(primitive);
+        }
+        let (source, name, extras, native) = self.owned.get(entity)?;
+        Ok((&source.mesh, source.material.as_ref(), name, extras, native))
+    }
+}
 
 /// A spawned model's hierarchy nodes as the strict bounds check reads them. `Billboard` marks the
 /// camera-facing nodes, whose authored rotation stands in for their camera-dependent one;
@@ -5007,10 +5045,9 @@ fn arm_pending_models(
         if partials.contains(entity) {
             commands.queue(move |world: &mut World| partial_stock::arm(world, entity, handle));
         } else {
-            commands
-                .entity(entity)
-                .insert(WorldAssetRoot(handle))
-                .remove::<PendingModel>();
+            commands.queue(move |world: &mut World| {
+                crate::cluster::ownership::arm(world, entity, handle)
+            });
         }
         actually_armed += 1;
         choices = choices.saturating_add(1);
@@ -6371,7 +6408,10 @@ impl ConvertedSceneContents {
 fn converted_scene_contents(scene: &WorldAsset) -> ConvertedSceneContents {
     let mut contents = ConvertedSceneContents::default();
     for entity in scene.world.iter_entities() {
-        contents.meshes += usize::from(entity.contains::<Mesh3d>());
+        contents.meshes += usize::from(
+            entity.contains::<Mesh3d>()
+                || entity.contains::<crate::cluster::ownership::OwnedPrimitiveSource>(),
+        );
         contents.nodes += usize::from(entity.contains::<ChildOf>());
     }
     contents

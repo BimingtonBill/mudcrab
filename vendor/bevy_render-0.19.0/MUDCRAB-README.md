@@ -33,7 +33,7 @@ and `trace-1125-render-flush-2026-10-09.md`.
 
 - Commit 1 (this folder as first added): the pristine published crate plus this README. Everything else is
   byte-identical to the registry copy (`.cargo-ok`, a cargo bookkeeping marker, is not copied).
-- The patch touches exactly three files:
+- The original patch touches three files:
   - `src/renderer/render_context.rs`: an ordered list of finished buffers and unfinished encoders in
     `PendingCommandBuffers` and `RenderContextState`, the public `set_parallel_finish(bool)` / `parallel_finish()`
     switch (off by default), `last_parallel_finish_count()` (how many encoders the last take finished through the
@@ -42,15 +42,32 @@ and `trace-1125-render-flush-2026-10-09.md`.
   - `src/renderer/mod.rs`: a 3-line change to the existing `pub use render_context::{...}`, re-exporting those items.
   - `src/render_phase/mod.rs`: a read-only `RenderMultidrawableBatchSet::entities()` iterator, so the destination readiness proof (`crates/engine/src/swap_bridge/systems.rs`) can ask whether an entity is queued in a multidrawable set. No behaviour change.
 
-To verify the rest is untouched:
-`diff -r <cargo registry>/bevy_render-0.19.0 vendor/bevy_render-0.19.0` lists only this README, the three patched
-files above and the missing `.cargo-ok`.
+- Task #2143 adds owner-maintained change revisions in two more files:
+  - `src/render_resource/pipeline_cache.rs`: `PipelineCache::readiness_revision()` changes when a cached
+    pipeline becomes available or unavailable. Shader replacement/removal, synchronous creation, asynchronous
+    completion, and blocking completion use the same state transition accounting. Nonready retries and
+    unchanged queue processing do not advance the revision. Queuing a new, unavailable pipeline does not
+    advance it either; consumers must also track changes to their required pipeline IDs.
+  - `src/erased_render_asset.rs`: `ErasedRenderAssets::revision()` changes on insertion/replacement, removal
+    of an existing entry, mutable access to an existing entry, mutable iteration, and device-recovery
+    removals. Immutable reads and missing-entry lookups/removals do not advance it. Mutable access is
+    conservative because the collection cannot observe writes through a returned mutable reference.
+
+Both revisions start at zero and remain monotonic for the lifetime of their owning collection. Reading a
+revision takes constant time and does not scan pipelines or assets. These APIs let cluster readiness cache
+its material/pipeline proof between owner events. GPU-free tests cover the availability transition helper,
+actual asset mutation APIs, and the device-recovery removal system. Live rendering and performance checks
+belong to the engine integration.
+
+To verify the remaining source is untouched, compare this directory with the registry copy, allowing the
+five source files listed above, this README, and the missing `.cargo-ok`.
 
 ## How to drop it
 
 Remove the `[patch.crates-io]` `bevy_render` line from the workspace `Cargo.toml`, delete this folder, and
 `cargo update -p bevy_render` (or any build) restores the registry source and checksum in `Cargo.lock`. The
-engine's `--render-parallel-finish` flag and its call to `set_parallel_finish` must then be removed too.
+engine's `--render-parallel-finish` flag, its call to `set_parallel_finish`, and consumers of the additional
+phase iterator and revision APIs must then be removed or migrated too.
 
 ## Plan
 

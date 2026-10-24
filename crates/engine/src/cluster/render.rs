@@ -22,6 +22,9 @@ mod stable_order;
 #[path = "pipeline_diagnostics.rs"]
 mod pipeline_diagnostics;
 
+#[path = "shadow_warmup.rs"]
+mod shadow_warmup;
+
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SourceExtraction;
 
@@ -752,10 +755,6 @@ pub struct ClusterSettings {
     /// the camera has one. Off leaves them out of it, as before the prepass existed: what ambient
     /// occlusion, temporal anti-aliasing and the water's reflections read then has no clusters.
     pub prepass: bool,
-    /// `--cluster-own-statics`: owned stock primitives are hidden once at spawn
-    /// (`super::ownership`), so a view draws its selection base as it is, with no per-reference
-    /// stock overlay and no stock material comparison.
-    pub own_statics: bool,
 }
 
 impl Default for ClusterSettings {
@@ -766,7 +765,6 @@ impl Default for ClusterSettings {
             terrain_error_pixels: 1.0,
             fixed_count_draw: false,
             prepass: true,
-            own_statics: false,
         }
     }
 }
@@ -807,6 +805,7 @@ pub struct ClusterRenderPlugin;
 impl Plugin for ClusterRenderPlugin {
     fn build(&self, app: &mut App) {
         super::runtime_state::install(app);
+        super::loading::install(app);
         handoff::install(app);
         embedded_asset!(app, "shaders/cluster_cull.wgsl");
         embedded_asset!(app, "shaders/cluster_draw.wgsl");
@@ -984,6 +983,7 @@ struct ViewGpu {
     pub(super) readiness_revision: u64,
     /// The view's readiness from the last frame it was computed, with the key it was computed for.
     pub(super) readiness_cache: Option<(handoff::ReadinessKey, Arc<Vec<bool>>)>,
+    queued_proof_cache: handoff::queued_proof::QueuedProofCache,
     /// The `plan_epoch` the prepass phases were last filled for, the items it queued, and which
     /// of the two phases they went to.
     prepass_epoch: Option<u64>,
@@ -1499,6 +1499,8 @@ struct ClusterPipelines {
     /// Shadow pipelines of alpha-masked materials: the stock prepass fragment stage of the
     /// material behind the cluster vertex stage, keyed as the stock shadow queue keys it.
     shadow_mask: HashMap<ClusterMaterialPipelineKey, CachedRenderPipelineId>,
+    /// Compile both light projection families before any local-light view appears.
+    shadow_warmup: shadow_warmup::ShadowWarmup,
     /// The camera prepass pipelines (depth, normals, motion vectors), by the same key; `None`
     /// where the material has no prepass pipeline to build.
     prepass: HashMap<ClusterMaterialPipelineKey, Option<CachedClusterPrepass>>,
@@ -3575,6 +3577,7 @@ fn new_view_gpu(
         plan_epoch: 0,
         readiness_revision: 0,
         readiness_cache: None,
+        queued_proof_cache: default(),
         prepass_epoch: None,
         prepass_items: Vec::new(),
         prepass_groups: std::collections::HashSet::new(),
@@ -4253,6 +4256,63 @@ fn build_shadow_mask_descriptor(
     Some(descriptor)
 }
 
+fn shadow_batch_tangent_layout(
+    batch: &BatchGpu,
+    index: usize,
+    batch_materials: &ClusterBatchMaterials,
+    sources: &handoff::Sources,
+) -> Option<bool> {
+    let asset = batch
+        .material
+        .filter(|asset| batch_materials.ids.get(index) == Some(&Some(*asset)))?;
+    let geometry = batch_materials.geometry.get(&asset).copied()?;
+    batch_tangent_layout(batch, index, asset, geometry, sources)
+        .filter(|layout| batch.tangents == Some(*layout))
+}
+
+/// The same specialization serves load-time warmup and actual shadow views.
+#[allow(clippy::too_many_arguments)]
+fn cutout_shadow_pipeline(
+    shadow_mask: &mut HashMap<ClusterMaterialPipelineKey, CachedRenderPipelineId>,
+    cutout: &CutoutShadow,
+    tangents: bool,
+    unclipped: bool,
+    render_mesh: &RenderMesh,
+    materials: &ErasedRenderAssets<PreparedMaterial>,
+    prepass: &PrepassPipeline,
+    draw_layout: &BindGroupLayoutDescriptor,
+    asset_server: &AssetServer,
+    pipeline_cache: &PipelineCache,
+) -> Option<CachedRenderPipelineId> {
+    let material = materials.get(cutout.asset)?;
+    let mesh_key = shadow_mesh_key(
+        unclipped,
+        MeshPipelineKey::from_bits_retain(render_mesh.key_bits.bits()),
+    );
+    let key = ClusterMaterialPipelineKey {
+        material: ErasedMaterialPipelineKey {
+            type_id: cutout.type_id,
+            mesh_key: ErasedMeshPipelineKey::new(mesh_key),
+            material_key: cutout.material_key.clone(),
+        },
+        tangents,
+    };
+    if let Some(id) = shadow_mask.get(&key) {
+        return Some(*id);
+    }
+    let descriptor = build_shadow_mask_descriptor(
+        prepass,
+        key.clone(),
+        &render_mesh.layout,
+        material,
+        draw_layout,
+        asset_server,
+    )?;
+    let id = pipeline_cache.queue_render_pipeline(descriptor);
+    shadow_mask.insert(key, id);
+    Some(id)
+}
+
 /// One group of a shadow view's draw: its pipeline, the material bind group (alpha-masked groups
 /// only), and the batch whose phase item issues the draw.
 struct ShadowGroup {
@@ -4309,6 +4369,81 @@ fn queue_cluster_shadows(
         render_meshes.get(dummy.plain.id()).is_some()
             && render_meshes.get(dummy.tangent.id()).is_some()
     });
+    // Local-light shadow views may first appear after the loading cover leaves.
+    // Queue their pipelines alongside the directional family, independently of
+    // the actual light/view list. A settled exact stamp does no batch walk.
+    {
+        let stamp = shadow_warmup::ShadowPlanStamp {
+            gpu: gpu.identity,
+            generation: gpu.generation,
+            layout_epoch: gpu.layout_epoch,
+            batch_material_version: batch_materials.version,
+            source_layout: sources.layout_version,
+            batch_count: gpu.batches.len(),
+            layouts_ready,
+        };
+        let ClusterPipelines {
+            shadow,
+            shadow_mask,
+            shadow_warmup,
+            ..
+        } = &mut *pipelines;
+        shadow_warmup.prepare(stamp, |unclipped, required| {
+            let opaque_pipeline = *shadow.entry(unclipped).or_insert_with(|| {
+                pipeline_cache.queue_render_pipeline(build_shadow_descriptor(
+                    &prepass,
+                    &gpu.shadow_layout,
+                    unclipped,
+                    &asset_server,
+                ))
+            });
+            required.push(opaque_pipeline);
+            let mut complete = layouts_ready;
+            for (index, batch) in gpu.batches.iter().enumerate() {
+                // Unprepared/refused batches remain the ordinary per-view
+                // readiness gate's responsibility. Every prepared cutout needs
+                // both projection specializations, even without a shadow view.
+                if batch.material.is_none() {
+                    continue;
+                }
+                let Some(cutout) = &batch.cutout else {
+                    continue;
+                };
+                let Some(tangents) =
+                    shadow_batch_tangent_layout(batch, index, &batch_materials, &sources)
+                else {
+                    complete = false;
+                    continue;
+                };
+                let pipeline = dummy_mesh
+                    .as_ref()
+                    .and_then(|dummy| render_meshes.get(dummy.asset(tangents)))
+                    .and_then(|render_mesh| {
+                        cutout_shadow_pipeline(
+                            shadow_mask,
+                            cutout,
+                            tangents,
+                            unclipped,
+                            render_mesh,
+                            &materials,
+                            &prepass,
+                            &gpu.draw_layout,
+                            &asset_server,
+                            &pipeline_cache,
+                        )
+                    });
+                if let Some(pipeline) = pipeline {
+                    required.push(pipeline);
+                } else {
+                    complete = false;
+                }
+            }
+            complete
+        });
+        shadow_warmup.refresh(pipeline_cache.readiness_revision(), |id| {
+            pipeline_cache.get_render_pipeline(id).is_some()
+        });
+    }
     let opaque_draw = draw_functions.read().id::<DrawClusterShadow>();
     let mask_draw = draw_functions.read().id::<DrawClusterShadowMask>();
     for (light, view) in &lights {
@@ -4358,14 +4493,8 @@ fn queue_cluster_shadows(
             if batch.slots == 0 || batch.material.is_none() {
                 continue;
             }
-            let Some(tangents) = batch
-                .material
-                .filter(|asset| batch_materials.ids.get(index) == Some(&Some(*asset)))
-                .and_then(|asset| batch_materials.geometry.get(&asset).copied())
-                .and_then(|geometry| {
-                    batch_tangent_layout(batch, index, batch.material?, geometry, &sources)
-                })
-                .filter(|layout| batch.tangents == Some(*layout))
+            let Some(tangents) =
+                shadow_batch_tangent_layout(batch, index, &batch_materials, &sources)
             else {
                 complete = false;
                 continue;
@@ -4373,43 +4502,21 @@ fn queue_cluster_shadows(
             let render_mesh = dummy_mesh
                 .as_ref()
                 .and_then(|dummy| render_meshes.get(dummy.asset(tangents)));
-            let mesh_key = render_mesh.map(|mesh| {
-                shadow_mesh_key(
-                    unclipped,
-                    MeshPipelineKey::from_bits_retain(mesh.key_bits.bits()),
-                )
-            });
             let slots = batch.slots;
-            let (pipeline, material_group) = match (&batch.cutout, mesh_key, render_mesh) {
-                (Some(cutout), Some(mesh_key), Some(render_mesh)) => {
-                    let key = ClusterMaterialPipelineKey {
-                        material: ErasedMaterialPipelineKey {
-                            type_id: cutout.type_id,
-                            mesh_key: ErasedMeshPipelineKey::new(mesh_key),
-                            material_key: cutout.material_key.clone(),
-                        },
+            let (pipeline, material_group) = match (&batch.cutout, render_mesh) {
+                (Some(cutout), Some(render_mesh)) => {
+                    let pipeline = cutout_shadow_pipeline(
+                        &mut pipelines.shadow_mask,
+                        cutout,
                         tangents,
-                    };
-                    let pipeline = match pipelines.shadow_mask.get(&key) {
-                        Some(id) => Some(*id),
-                        None => materials
-                            .get(cutout.asset)
-                            .and_then(|material| {
-                                build_shadow_mask_descriptor(
-                                    &prepass,
-                                    key.clone(),
-                                    &render_mesh.layout,
-                                    material,
-                                    &gpu.draw_layout,
-                                    &asset_server,
-                                )
-                            })
-                            .map(|descriptor| {
-                                let id = pipeline_cache.queue_render_pipeline(descriptor);
-                                pipelines.shadow_mask.insert(key, id);
-                                id
-                            }),
-                    };
+                        unclipped,
+                        render_mesh,
+                        &materials,
+                        &prepass,
+                        &gpu.draw_layout,
+                        &asset_server,
+                        &pipeline_cache,
+                    );
                     // A cutout whose pipeline cannot be built yet casts nothing this frame
                     // rather than a solid shadow; the next frame retries.
                     let Some(pipeline) = pipeline else {

@@ -467,6 +467,10 @@ fn world_id(space: &ActiveSpace, configured_worldspace: u32) -> WorldId {
 /// Switches the world to `landing` in one step. Runs as a command, so it applies before the next
 /// system that reads the cells and the old space is gone the same frame.
 fn switch_space(world: &mut World, landing: Landing) {
+    if let Some(mut gate) = world.get_resource_mut::<crate::cluster::loading::ClusterLoadingGate>()
+    {
+        gate.invalidate();
+    }
     unload_all_cells_now(world);
     let left = *world.resource::<ActiveSpace>();
     *world.resource_mut::<ActiveSpace>() = landing.space;
@@ -701,13 +705,26 @@ fn drive_door_crossing(
     mut target_door: ResMut<DoorTarget>,
     mut crossing: ResMut<DoorCrossing>,
     mut overlay: Query<&mut BackgroundColor, With<FadeOverlay>>,
-    (mut budget, landing_assets, pending_under, mut requests, mut reports, generations): (
+    (
+        mut budget,
+        landing_assets,
+        pending_under,
+        mut requests,
+        mut reports,
+        generations,
+        mut gate,
+        mode,
+        hold,
+    ): (
         Option<ResMut<RenderAssetBytesPerFrame>>,
         LandingAssets,
         PendingUnder,
         ResMut<DestinationRequests>,
         ResMut<DestinationReports>,
         Res<Generations>,
+        Option<ResMut<crate::cluster::loading::ClusterLoadingGate>>,
+        Option<Res<crate::physics::MoveMode>>,
+        Option<Res<crate::physics::WalkSpawnHold>>,
     ),
     mut commands: Commands,
 ) {
@@ -787,6 +804,19 @@ fn drive_door_crossing(
         return;
     };
     active.since_press += delta;
+    let cluster_admitted = if config.clusters.is_some()
+        && matches!(active.stage, Stage::Landing { .. } | Stage::FadeIn { .. })
+    {
+        let pose = camera.single().ok();
+        if let (Some(camera), Some(gate)) = (pose, gate.as_deref_mut()) {
+            gate.observe_loading_pose(camera, origin.0, *space);
+        }
+        pose.is_some()
+            && crate::cluster::loading::physics_settled(mode.as_deref(), hold.as_deref())
+            && crate::cluster::loading::ready_for_active(&config, &space, gate.as_deref())
+    } else {
+        true
+    };
     match active.stage {
         Stage::FadeOut { elapsed } => {
             let elapsed = elapsed + delta;
@@ -822,11 +852,12 @@ fn drive_door_crossing(
             // in would show an unproved landing. A crossing that fails or times out puts the player
             // back instead; a restore that fails or times out keeps waiting, black, and says why
             // every timeout interval.
-            let handoff_required = active.request.is_some_and(|(id, _)| {
-                requests
-                    .iter()
-                    .any(|(held, request)| held == id && request.handoff == Handoff::Required)
-            });
+            let handoff_required = config.clusters.is_some()
+                || active.request.is_some_and(|(id, _)| {
+                    requests
+                        .iter()
+                        .any(|(held, request)| held == id && request.handoff == Handoff::Required)
+                });
             if streaming.is_failed(landing.key) {
                 if restoring && handoff_required {
                     let interval = LANDING_TIMEOUT_SECONDS;
@@ -896,7 +927,8 @@ fn drive_door_crossing(
             let key = active
                 .request
                 .and_then(|(id, _)| requests.rebase(id, &generations));
-            let loaded = key.is_some_and(|key| reports.is_ready(&key, &generations));
+            let loaded =
+                key.is_some_and(|key| reports.is_ready(&key, &generations)) && cluster_admitted;
             // Once loaded, a few more frames let extraction and preparation upload with the budget
             // still lifted: the fade-in starts on the SETTLE_FRAMES-th loaded frame.
             let ready_frames = if loaded { ready_frames + 1 } else { 0 };
@@ -980,7 +1012,11 @@ fn drive_door_crossing(
                     }
                 );
                 set_upload_budget(&mut budget, config.max_upload_bytes_per_frame());
-                place_again(&mut commands, &landing);
+                if config.clusters.is_none() {
+                    // Cluster mode has already proved the grounded final pose.
+                    // Reapplying the authored teleport would revoke that placement.
+                    place_again(&mut commands, &landing);
+                }
                 if let Some((id, key)) = active.request.take() {
                     requests.withdraw(id);
                     reports.remove(&key);
@@ -1009,6 +1045,27 @@ fn drive_door_crossing(
             }
         }
         Stage::FadeIn { elapsed, recovery } => {
+            if !cluster_admitted {
+                // A dependency can be withdrawn while the cover is fading.
+                // Reopen the existing destination protocol, retaining full black.
+                set_alpha(&mut overlay, 1.0);
+                let restoring = space.interior != active.target.space.interior
+                    || space.worldspace_id != active.target.space.worldspace_id;
+                let landing = if restoring {
+                    active.restore.landing()
+                } else {
+                    active.target
+                };
+                let left = *space;
+                commands
+                    .queue(move |world: &mut World| request_destination(world, &left, &landing));
+                active.stage = Stage::Landing {
+                    waited: 0.0,
+                    restoring,
+                    ready_frames: 0,
+                };
+                return;
+            }
             let elapsed = elapsed + delta;
             set_alpha(&mut overlay, 1.0 - elapsed / FADE_SECONDS);
             if elapsed >= FADE_SECONDS {
@@ -1385,6 +1442,108 @@ mod tests {
             teleports[0].position,
             creation_to_bevy(Vec3::new(100.0, 100.0, 50.0))
         );
+    }
+
+    #[test]
+    fn exterior_fade_waits_for_cluster_views_and_recovers_if_proof_is_withdrawn() {
+        use crate::cluster::loading::{ClusterLoadingGate, ClusterWorldReadiness};
+        let directory = crate::cluster::reader::producer_fixture_tests::published_for_loader();
+        let package = std::sync::Arc::new(
+            crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
+        );
+        let (mut app, _) = app_with(exterior_door());
+        app.world_mut()
+            .resource_mut::<crate::config::EngineConfig>()
+            .clusters = Some("selected".into());
+        app.init_resource::<ClusterLoadingGate>();
+        press_e(&mut app);
+        run_until_black(&mut app);
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_resident_for_test(
+                CellKey::Exterior {
+                    worldspace_id: 60,
+                    grid_x: 3,
+                    grid_y: -2,
+                },
+                root,
+            );
+        for _ in 0..6 {
+            app.update();
+        }
+        assert_eq!(
+            alpha(&mut app),
+            1.0,
+            "resident landing lacks current cluster proof"
+        );
+        let current = app.world().resource::<ClusterLoadingGate>().generation();
+        app.world_mut()
+            .resource_mut::<ClusterLoadingGate>()
+            .publish(
+                &package,
+                7,
+                current,
+                1,
+                std::collections::HashMap::from([(
+                    60,
+                    ClusterWorldReadiness {
+                        applicable_cameras: 1,
+                        needed_batches: 1,
+                        ..default()
+                    },
+                )]),
+            );
+        let mut camera = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<StreamingCamera>>();
+        camera.single_mut(app.world_mut()).unwrap().translation.y += 10.0;
+        app.update();
+        assert_eq!(
+            alpha(&mut app),
+            1.0,
+            "landing pose change must invalidate admission before fade"
+        );
+        let grounded = app.world().resource::<ClusterLoadingGate>().generation();
+        assert_ne!(grounded, current);
+        app.world_mut()
+            .resource_mut::<ClusterLoadingGate>()
+            .publish(
+                &package,
+                7,
+                grounded,
+                2,
+                std::collections::HashMap::from([(
+                    60,
+                    ClusterWorldReadiness {
+                        applicable_cameras: 1,
+                        needed_batches: 1,
+                        ..default()
+                    },
+                )]),
+            );
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(
+            alpha(&mut app) < 1.0,
+            "current drawable views release the fade"
+        );
+        assert_eq!(
+            app.world().resource::<Teleports>().0.len(),
+            1,
+            "cluster fade must not re-teleport and rearm physics after final-pose proof"
+        );
+        app.world_mut()
+            .resource_mut::<ClusterLoadingGate>()
+            .withdraw();
+        app.update();
+        assert_eq!(
+            alpha(&mut app),
+            1.0,
+            "withdrawal during fade holds black again"
+        );
+        assert!(app.world().resource::<DoorCrossing>().is_active());
     }
 
     #[test]

@@ -3,7 +3,6 @@ mod partial_stock_readiness {
     use super::*;
     use crate::{
         cluster::{
-            batch_drawability::BatchDrawability,
             flat_source::{FlatSourceOwner, FlatSourcePrimitive, FlatSourcePrimitives},
             source_identity::{
                 SourceNodePose, SourcePrimitive, SourcePrimitiveMesh, SourcePrimitiveTransform,
@@ -165,7 +164,6 @@ mod partial_stock_readiness {
         }
         let bounds = ExpectedModelBounds::new(min, max).unwrap();
         let source = add_converted_model(&mut app, scene);
-        let scope = 7;
         let full = spawn_pending_reference(&mut app, source.clone(), 0);
         let partial = spawn_pending_reference(&mut app, source.clone(), 1);
         let placement = Transform::from_xyz(17.0, 23.0, -9.0)
@@ -211,7 +209,10 @@ mod partial_stock_readiness {
         let metrics = settle_readiness(&mut app);
         assert_eq!(metrics.assets_ready, 2);
         assert_eq!(metrics.bounds_validated, 2);
-        assert_eq!(metrics.meshes_validated, 2 * ordinals.len() as u64);
+        assert_eq!(
+            metrics.meshes_validated,
+            (ordinals.len() + refused.len()) as u64
+        );
         assert_eq!(metrics.asset_load_failures, 0);
         assert_eq!(metrics.material_validation_failures, 0);
         assert_eq!(metrics.transform_bounds_validation_failures, 0);
@@ -250,7 +251,7 @@ mod partial_stock_readiness {
             .unwrap()
             .iter()
             .collect();
-        assert_eq!(flattened.len(), ordinals.len());
+        assert_eq!(flattened.len(), refused.len());
         for entity in &flattened {
             let draw = app.world().entity(*entity);
             let identity = *draw.get::<SourcePrimitive>().unwrap();
@@ -292,12 +293,11 @@ mod partial_stock_readiness {
         }
         assert_eq!(
             app.world().resource::<BeforeFlatten>().0.len(),
-            2 * ordinals.len()
+            ordinals.len() + refused.len()
         );
 
-        app.world_mut()
-            .resource_mut::<BatchDrawability>()
-            .publish(&package, scope, [(0, true)]);
+        // Refused bodies keep their exact converted material and affine while
+        // owned bodies were never instantiated in the distant scene.
         for _ in 0..8 {
             app.update();
         }
@@ -308,76 +308,58 @@ mod partial_stock_readiness {
             .iter()
             .map(|entity| app.world().get::<SourcePrimitive>(entity).unwrap().ordinal)
             .collect();
-        assert_eq!(
-            remaining, ordinals,
-            "positive demand observations must preserve every live fallback binding"
-        );
+        assert_eq!(remaining, refused);
         for entity in flattened {
-            let ordinal = app.world().resource::<BeforeFlatten>().0[&entity].0.ordinal;
-            assert_eq!(
-                app.world().get_entity(entity).is_ok(),
-                ordinals.contains(&ordinal)
-            );
+            assert!(app.world().get_entity(entity).is_ok());
+            assert!(app.world().get::<Transform>(entity).is_none());
+            assert!(app.world().get::<ChildOf>(entity).is_none());
         }
-        assert_eq!(
-            app.world_mut()
-                .query::<&AssetFailed>()
-                .iter(app.world())
-                .count(),
-            0
-        );
-        app.world_mut()
-            .resource_mut::<BatchDrawability>()
-            .publish(&package, scope, [(0, false)]);
-        for _ in 0..8 {
+        {
+            let mut assets = app.world_mut().resource_mut::<Assets<WorldAsset>>();
+            let mut original = assets.get_mut(&source).unwrap();
+            let nodes: Vec<_> = original
+                .world
+                .iter_entities()
+                .filter(|node| node.contains::<Mesh3d>())
+                .map(|node| node.id())
+                .collect();
+            for node in nodes {
+                original
+                    .world
+                    .entity_mut(node)
+                    .insert(Name::new("edited source primitive"));
+            }
+        }
+        for _ in 0..12 {
             app.update();
         }
-        let restored: Vec<_> = app
+        assert!(app.world().get::<PartialStock>(partial).is_some());
+        assert!(app.world().get::<PendingAssetProfile>(partial).is_none());
+        let refreshed: Vec<_> = app
             .world()
             .get::<FlatSourcePrimitives>(partial)
             .unwrap()
             .iter()
             .collect();
-        assert_eq!(restored.len(), ordinals.len());
-        for entity in restored {
-            let draw = app.world().entity(entity);
-            let identity = *draw.get::<SourcePrimitive>().unwrap();
-            let material = draw
-                .get::<MeshMaterial3d<SnowMaterial>>()
-                .unwrap()
-                .0
-                .clone();
-            let global = *draw.get::<GlobalTransform>().unwrap();
-            assert_eq!((identity, material, global), full_draws[&identity.ordinal]);
-            assert!(draw.get::<Transform>().is_none());
-            assert!(draw.get::<ChildOf>().is_none());
+        assert_eq!(refreshed.len(), refused.len());
+        for entity in refreshed {
+            let node = app.world().entity(entity);
+            let identity = node.get::<SourcePrimitive>().unwrap();
+            assert!(refused.contains(&identity.ordinal));
+            assert_eq!(
+                node.get::<Name>().unwrap().as_str(),
+                "edited source primitive"
+            );
+            assert_eq!(
+                node.get::<MeshMaterial3d<SnowMaterial>>().unwrap().0,
+                full_draws[&identity.ordinal].1
+            );
+            assert_eq!(
+                *node.get::<GlobalTransform>().unwrap(),
+                full_draws[&identity.ordinal].2
+            );
+            assert!(node.get::<Transform>().is_none());
         }
         assert!(app.world().get::<AssetFailed>(partial).is_none());
-        let after_drop: BTreeSet<_> = app
-            .world()
-            .get::<FlatSourcePrimitives>(partial)
-            .unwrap()
-            .iter()
-            .collect();
-        assert_eq!(
-            after_drop,
-            app.world()
-                .resource::<BeforeFlatten>()
-                .0
-                .keys()
-                .filter(|entity| app.world().get::<FlatSourceOwner>(**entity).is_some())
-                .copied()
-                .collect()
-        );
-        let counters = crate::work_counters::snapshot();
-        for recorded in [&counters.before_ready, &counters.after_ready] {
-            assert_eq!(
-                recorded
-                    .get("far_stock/fallback_respawn_after_drop")
-                    .copied()
-                    .unwrap_or(0),
-                0
-            );
-        }
     }
 }

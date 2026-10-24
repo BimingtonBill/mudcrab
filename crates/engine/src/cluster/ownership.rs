@@ -1,18 +1,26 @@
 //! Launch-time primitive ownership; no mesh handles or paths participate in matching.
 
+#[cfg(test)]
+use super::source_identity::SourcePrimitive;
 use super::{
     instance_identity::ClusterInstanceIdentity,
     package::{BatchDemand, LazyBatches},
     reader::{CertifiedPackage, RecordKey},
     render::ClusterScene,
-    source_identity::SourcePrimitive,
 };
-use bevy::{ecs::system::SystemParam, prelude::*, world_serialization::WorldInstanceReady};
+use bevy::{ecs::system::SystemParam, prelude::*};
+
+#[path = "ownership_template.rs"]
+mod template;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
+pub(crate) use template::{
+    OwnedPrimitiveSource, arm, clone_with_stock_ordinals, fail_closed, filtered_scene,
+};
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum Decision {
     Owned,
@@ -28,6 +36,10 @@ pub(crate) struct OwnershipFacts {
     lookup: HashMap<(u32, u32), RecordKey>,
     references: HashMap<u32, Vec<RecordKey>>,
     source_fallback: BTreeMap<RecordKey, bool>,
+    /// First terminal material/template qualification for this certificate.
+    /// Runtime withdrawal and failed resources cannot change ownership.
+    terminal: BTreeMap<RecordKey, bool>,
+    terminal_revision: u64,
 }
 
 /// Runtime reference identity, attached only to exterior static candidates.
@@ -35,29 +47,14 @@ pub(crate) struct OwnershipFacts {
 pub(crate) struct OwnershipReference(pub(crate) u32);
 
 #[derive(Component)]
-struct OwnershipApplied(Option<Visibility>);
-
-type OwnershipPrimitiveQuery<'w, 's> = Query<
-    'w,
-    's,
-    (
-        Option<&'static SourcePrimitive>,
-        &'static mut Visibility,
-        Has<OwnershipApplied>,
-    ),
-    With<Mesh3d>,
->;
-
-#[derive(Component)]
 pub(super) struct OwnershipDeferred;
 
 /// Only unresolved, uninstantiated models are polled. Holding the existing pending
 /// model/profile markers keeps cell readiness honest, and prevents a stock draw
-/// before the ready observer has enough facts to make its one-time decision.
+/// before pre-instancing filtering has enough facts to make its one-time decision.
 #[derive(SystemParam)]
 pub(crate) struct OwnershipGate<'w, 's> {
     facts: Option<Res<'w, OwnershipFacts>>,
-    runtime_state: Option<Res<'w, super::runtime_state::RuntimeReferenceState>>,
     counters: Option<ResMut<'w, OwnershipCounters>>,
     demand: Option<ResMut<'w, OwnershipBatchDemand>>,
     references: Query<'w, 's, &'static OwnershipReference>,
@@ -84,12 +81,7 @@ impl OwnershipGate<'_, '_> {
         let Ok(reference) = self.references.get(entity) else {
             return true;
         };
-        if self
-            .runtime_state
-            .as_ref()
-            .is_some_and(|state| state.contains(reference.0))
-            || facts.can_spawn(reference.0)
-        {
+        if facts.can_spawn(reference.0) {
             return true;
         }
         // An asset load failure must still reach the ordinary readiness/error
@@ -301,11 +293,10 @@ pub(super) fn demand_owned_batches(
 
 #[derive(Resource, Default)]
 struct OwnershipCounters {
-    owned_hidden: u64,
+    owned_bodies_removed: u64,
     /// Candidate primitive decisions deferred once before instantiation, including
     /// candidates later proved not owned when the certificate arrives.
     owned_deferred: u64,
-    not_owned: u64,
     waiting_certificate: u64,
     waiting_batches: u64,
     defer_logged: bool,
@@ -316,16 +307,9 @@ pub(crate) fn install(app: &mut App) {
     app.init_resource::<OwnershipFacts>()
         .init_resource::<OwnershipCounters>()
         .init_resource::<OwnershipBatchDemand>()
-        .add_observer(hide_owned_instance)
-        .add_observer(revoke_owned_reference)
-        .add_systems(
-            PostUpdate,
-            restore_changed_owned_references
-                .after(super::runtime_state::RuntimeStateSystems::Observe)
-                .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
-        )
         .add_systems(Last, report);
-    info!("cluster static ownership experiment enabled");
+    template::install(app);
+    info!("cluster static ownership enabled; owned render bodies are removed before instancing");
 }
 
 impl OwnershipFacts {
@@ -342,8 +326,8 @@ impl OwnershipFacts {
         );
     }
 
-    /// Change only the affected instance decisions, retaining this live
-    /// certificate's occurrence lookup. `None` withdraws a terminal decision.
+    /// Update the live projection while freezing each record's first terminal
+    /// qualification. Only replacing the certificate replaces ownership.
     pub(crate) fn publish_updates(
         &mut self,
         package: &Arc<CertifiedPackage>,
@@ -356,6 +340,8 @@ impl OwnershipFacts {
             .is_some_and(|old| Arc::ptr_eq(old, package))
         {
             self.source_fallback.clear();
+            self.terminal.clear();
+            self.terminal_revision = self.terminal_revision.wrapping_add(1);
             self.lookup.clear();
             self.references.clear();
             for (key, identity) in package.records() {
@@ -371,19 +357,87 @@ impl OwnershipFacts {
         if reset {
             self.source_fallback.clear();
         }
+        let mut added_terminal = false;
         for (key, value) in records {
             if let Some(value) = value {
+                if let std::collections::btree_map::Entry::Vacant(entry) = self.terminal.entry(key)
+                {
+                    entry.insert(value);
+                    added_terminal = true;
+                }
                 self.source_fallback.insert(key, value);
             } else {
                 self.source_fallback.remove(&key);
             }
         }
+        if added_terminal {
+            self.terminal_revision = self.terminal_revision.wrapping_add(1);
+        }
     }
 
     pub(crate) fn revoke(&mut self) {
-        *self = Self::default();
+        // Losing runtime qualification is not a new certificate and cannot
+        // restore stock bodies. Preserve the occurrence index and frozen facts.
+        self.source_fallback.clear();
     }
 
+    pub(crate) fn package_matches(&self, package: &Arc<CertifiedPackage>) -> bool {
+        self.certificate
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, package))
+    }
+
+    pub(crate) fn terminal_revision(&self) -> u64 {
+        self.terminal_revision
+    }
+
+    pub(crate) fn permanent_refused_records(&self) -> BTreeSet<RecordKey> {
+        self.terminal
+            .iter()
+            .filter_map(|(key, refused)| refused.then_some(*key))
+            .collect()
+    }
+
+    pub(crate) fn permanent_refused_references(&self) -> BTreeSet<u32> {
+        self.lookup
+            .iter()
+            .filter_map(|((reference, _), key)| {
+                (self.terminal.get(key) == Some(&true)).then_some(*reference)
+            })
+            .collect()
+    }
+
+    pub(crate) fn permanent_refused_ordinals(&self, reference: u32) -> BTreeSet<u32> {
+        self.ordinals_with_decision(reference, true)
+    }
+
+    fn ordinals_with_decision(&self, reference: u32, refused: bool) -> BTreeSet<u32> {
+        let Some(package) = self.certificate.as_ref() else {
+            return BTreeSet::new();
+        };
+        self.references
+            .get(&reference)
+            .into_iter()
+            .flatten()
+            .filter(|key| self.terminal.get(key) == Some(&refused))
+            .filter_map(|key| package.record(key).map(|identity| identity.primitive))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_has_owned(&self, reference: u32) -> bool {
+        self.references
+            .get(&reference)
+            .into_iter()
+            .flatten()
+            .any(|key| self.terminal.get(key) == Some(&false))
+    }
+
+    pub(crate) fn owned_ordinals(&self, reference: u32) -> BTreeSet<u32> {
+        self.ordinals_with_decision(reference, false)
+    }
+
+    #[cfg(test)]
     fn decision(&self, reference: u32, tag: Option<&SourcePrimitive>) -> Decision {
         if self.certificate.is_none() {
             return Decision::Deferred;
@@ -394,7 +448,7 @@ impl OwnershipFacts {
         let Some(key) = self.lookup.get(&(reference, tag.ordinal)) else {
             return Decision::NotOwned;
         };
-        match self.source_fallback.get(key) {
+        match self.terminal.get(key) {
             Some(false) => Decision::Owned,
             Some(true) => Decision::NotOwned,
             None => Decision::Deferred,
@@ -408,121 +462,13 @@ impl OwnershipFacts {
                 .get(&reference)
                 .into_iter()
                 .flatten()
-                .all(|key| self.source_fallback.contains_key(key))
+                .all(|key| self.terminal.contains_key(key))
     }
 
     #[cfg(test)]
     pub(crate) fn projected_records(&self) -> &BTreeMap<RecordKey, bool> {
         &self.source_fallback
     }
-}
-
-fn hide_owned_instance(
-    ready: On<WorldInstanceReady>,
-    mut commands: Commands,
-    (facts, runtime_state): (
-        Res<OwnershipFacts>,
-        Option<Res<super::runtime_state::RuntimeReferenceState>>,
-    ),
-    mut counters: ResMut<OwnershipCounters>,
-    references: Query<&OwnershipReference>,
-    children: Query<&Children>,
-    mut primitives: OwnershipPrimitiveQuery,
-) {
-    let Ok(reference) = references.get(ready.entity) else {
-        return;
-    };
-    if runtime_state
-        .as_ref()
-        .is_some_and(|state| state.contains(reference.0))
-    {
-        return;
-    }
-    // WorldInstanceReady is flushed in SpawnScene, before PostUpdate visibility
-    // propagation and render extraction. Write Visibility directly here, on the
-    // cloned primitive only; no root, mesh, material or template is changed.
-    for entity in children.iter_descendants(ready.entity) {
-        let Ok((tag, mut visibility, applied)) = primitives.get_mut(entity) else {
-            continue;
-        };
-        if applied {
-            continue;
-        }
-        let original = *visibility;
-        match facts.decision(reference.0, tag) {
-            Decision::Owned => {
-                *visibility = Visibility::Hidden;
-                counters.owned_hidden = counters.owned_hidden.saturating_add(1);
-            }
-            Decision::NotOwned => counters.not_owned = counters.not_owned.saturating_add(1),
-            Decision::Deferred => {
-                // The ordinary streamer holds such models before instantiation.
-                // An external spawner must not turn missing authority into a hide.
-                counters.owned_deferred = counters.owned_deferred.saturating_add(1);
-                continue;
-            }
-        }
-        commands.entity(entity).try_insert(OwnershipApplied(
-            (*visibility == Visibility::Hidden && original != Visibility::Hidden)
-                .then_some(original),
-        ));
-    }
-    counters.log_deferral();
-}
-
-/// Restore only visibility this ownership experiment changed, before propagation.
-/// The runtime state survives streaming, so a later ready observer cannot hide it again.
-type IncludeDisabled = bevy::ecs::query::Allow<bevy::ecs::entity_disabling::Disabled>;
-
-#[derive(SystemParam)]
-struct RestoreOwnership<'w, 's> {
-    commands: Commands<'w, 's>,
-    references: Query<'w, 's, (Entity, &'static OwnershipReference), IncludeDisabled>,
-    children: Query<'w, 's, &'static Children, IncludeDisabled>,
-    primitives:
-        Query<'w, 's, (&'static mut Visibility, &'static mut OwnershipApplied), IncludeDisabled>,
-}
-
-impl RestoreOwnership<'_, '_> {
-    fn matching(&mut self, matches: impl Fn(u32) -> bool) {
-        for (root, reference) in &self.references {
-            if !matches(reference.0) {
-                continue;
-            }
-            for entity in self.children.iter_descendants(root) {
-                if let Ok((mut visibility, mut applied)) = self.primitives.get_mut(entity) {
-                    // Consume the permission immediately, even before deferred removal.
-                    // A state writer may set a new hide after triggering revocation.
-                    if let Some(original) = applied.0.take() {
-                        *visibility = original;
-                    }
-                    self.commands.entity(entity).remove::<OwnershipApplied>();
-                }
-            }
-        }
-    }
-}
-
-fn revoke_owned_reference(
-    event: On<super::runtime_state::ReferenceStateChanged>,
-    mut restore: RestoreOwnership,
-) {
-    restore.matching(|reference| reference == event.reference);
-}
-
-fn restore_changed_owned_references(
-    state: Option<Res<super::runtime_state::RuntimeReferenceState>>,
-    mut previous: Local<u64>,
-    mut restore: RestoreOwnership,
-) {
-    let Some(state) = state else {
-        return;
-    };
-    if *previous == state.revision {
-        return;
-    }
-    *previous = state.revision;
-    restore.matching(|reference| state.contains(reference));
 }
 
 impl OwnershipCounters {
@@ -544,9 +490,8 @@ fn report(mut counters: ResMut<OwnershipCounters>, demand: Option<Res<OwnershipB
     if counters.frames.is_multiple_of(600) {
         let demand = demand.as_deref();
         info!(
-            owned_hidden = counters.owned_hidden,
+            owned_bodies_removed = counters.owned_bodies_removed,
             owned_deferred = counters.owned_deferred,
-            not_owned = counters.not_owned,
             waiting_certificate = counters.waiting_certificate,
             waiting_batches = counters.waiting_batches,
             demanded_references = demand.map_or(0, |demand| demand.demanded.len()),
@@ -568,7 +513,7 @@ mod tests {
 
     // The production matcher must use occurrence identity, retain refused batches,
     // and distinguish unavailable authority from a certified negative.
-    fn fixture() -> (
+    pub(super) fn fixture() -> (
         tempfile::TempDir,
         Arc<CertifiedPackage>,
         u32,
@@ -618,6 +563,77 @@ mod tests {
     }
 
     #[test]
+    fn terminal_ownership_survives_runtime_failure_and_withdrawal() {
+        let (_directory, package, reference, tag, key) = fixture();
+        let mut facts = super::OwnershipFacts::default();
+        facts.publish(
+            &package,
+            package.records().map(|(key, _)| (*key, false)).collect(),
+        );
+        facts.publish(&package, BTreeMap::from([(key, true)]));
+        assert_eq!(
+            facts.decision(reference, Some(&tag)),
+            super::Decision::Owned
+        );
+        facts.publish(&package, BTreeMap::new());
+        assert_eq!(
+            facts.decision(reference, Some(&tag)),
+            super::Decision::Owned
+        );
+        assert!(facts.can_spawn(reference));
+    }
+
+    #[test]
+    fn initial_material_refusal_survives_later_qualification() {
+        let (_directory, package, reference, tag, key) = fixture();
+        let mut facts = super::OwnershipFacts::default();
+        facts.publish(&package, BTreeMap::from([(key, true)]));
+        facts.publish(&package, BTreeMap::from([(key, false)]));
+        assert_eq!(
+            facts.decision(reference, Some(&tag)),
+            super::Decision::NotOwned
+        );
+    }
+
+    #[test]
+    fn frozen_refusal_apis_and_revision_follow_terminal_changes_only() {
+        let (directory, package, reference, tag, key) = fixture();
+        let mut facts = super::OwnershipFacts::default();
+        facts.publish(&package, BTreeMap::from([(key, true)]));
+        let revision = facts.terminal_revision();
+        assert_eq!(
+            facts.permanent_refused_records(),
+            std::collections::BTreeSet::from([key])
+        );
+        assert_eq!(
+            facts.permanent_refused_references(),
+            std::collections::BTreeSet::from([reference])
+        );
+        assert_eq!(
+            facts.permanent_refused_ordinals(reference),
+            std::collections::BTreeSet::from([tag.ordinal])
+        );
+        assert!(!facts.reference_has_owned(reference));
+        facts.revoke();
+        facts.publish(&package, BTreeMap::new());
+        facts.publish(&package, BTreeMap::from([(key, false)]));
+        assert_eq!(facts.terminal_revision(), revision);
+        assert_eq!(
+            facts.permanent_refused_records(),
+            std::collections::BTreeSet::from([key])
+        );
+        assert_eq!(facts.projected_records(), &BTreeMap::from([(key, false)]));
+        let replacement = Arc::new(
+            crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
+        );
+        facts.publish(&replacement, BTreeMap::new());
+        assert!(facts.package_matches(&replacement));
+        assert!(!facts.package_matches(&package));
+        assert!(facts.terminal_revision() > revision);
+        assert!(facts.permanent_refused_records().is_empty());
+    }
+
+    #[test]
     fn refused_batch_and_nondefault_scene_stay_stock() {
         let (_directory, package, reference, tag, key) = fixture();
         let mut facts = super::OwnershipFacts::default();
@@ -657,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn withdrawn_qualification_does_not_reuse_a_previous_owned_decision() {
+    fn withdrawn_qualification_keeps_owned_until_certificate_replacement() {
         let (directory, package, reference, tag, key) = fixture();
         let mut facts = super::OwnershipFacts::default();
         facts.publish(&package, BTreeMap::from([(key, false)]));
@@ -668,9 +684,9 @@ mod tests {
         facts.publish(&package, BTreeMap::new());
         assert_eq!(
             facts.decision(reference, Some(&tag)),
-            super::Decision::Deferred
+            super::Decision::Owned
         );
-        assert!(!facts.can_spawn(reference));
+        assert!(facts.reference_has_owned(reference));
         facts.publish(&package, BTreeMap::from([(key, false)]));
         let replacement = Arc::new(
             crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
@@ -683,11 +699,11 @@ mod tests {
     }
 
     #[test]
-    fn real_instance_is_hidden_before_its_first_visibility_pass_and_keeps_meshes() {
+    fn actual_loader_owned_instances_have_no_render_body_before_visibility() {
         use super::super::source_identity::actual_loader_tests::{
             loader_app_with, wait_for_loaded,
         };
-        use bevy::{camera::visibility::VisibilitySystems, prelude::*};
+        use bevy::prelude::*;
         let (directory, package, reference, _tag, _key) = fixture();
         let path = package.reference_model_path(reference).unwrap();
         let mut app = loader_app_with(directory.path(), |app| {
@@ -702,97 +718,51 @@ mod tests {
             );
         let handle: Handle<Gltf> = app.world().resource::<AssetServer>().load(path.to_owned());
         wait_for_loaded(&mut app, &handle);
-        let scene = app
+        let source = app
             .world()
             .resource::<Assets<Gltf>>()
             .get(&handle)
             .unwrap()
             .scenes[0]
             .clone();
-        // The loader's primitive template may lack Visibility: the destination
-        // world's VisibilityPlugin supplies it as a Mesh3d required component.
-        let template_visibility_before = {
-            let template = &app
-                .world()
-                .resource::<Assets<WorldAsset>>()
-                .get(&scene)
-                .unwrap()
-                .world;
-            let mut meshes = template
-                .try_query::<(Entity, &Mesh3d, Option<&Visibility>)>()
-                .unwrap();
-            meshes
-                .iter(template)
-                .map(|(entity, _, visibility)| (entity, visibility.copied()))
-                .collect::<BTreeMap<_, _>>()
-        };
+        let original_count = app
+            .world()
+            .resource::<Assets<WorldAsset>>()
+            .get(&source)
+            .unwrap()
+            .world
+            .iter_entities()
+            .filter(|node| node.contains::<Mesh3d>())
+            .count();
         let root = app
             .world_mut()
             .spawn((
                 super::OwnershipReference(reference),
-                WorldAssetRoot(scene.clone()),
                 Transform::IDENTITY,
                 Visibility::Inherited,
             ))
             .id();
-        app.add_systems(
-            PostUpdate,
-            (move |children: Query<&Children>, meshes: Query<&Visibility, With<Mesh3d>>| {
-                for child in children.iter_descendants(root) {
-                    if let Ok(visibility) = meshes.get(child) {
-                        assert_eq!(
-                            *visibility,
-                            Visibility::Hidden,
-                            "first visibility pass saw an owned stock mesh"
-                        );
-                    }
-                }
-            })
-            .before(VisibilitySystems::VisibilityPropagate),
-        );
+        super::arm(app.world_mut(), root, source.clone());
         app.update();
-        let world = app.world();
-        let mut meshes = world.try_query::<(&Mesh3d, &Visibility)>().unwrap();
-        assert!(
-            meshes
+        let world = app.world_mut();
+        assert_eq!(world.query::<&Mesh3d>().iter(world).count(), 0);
+        assert_eq!(
+            world
+                .query::<&super::OwnedPrimitiveSource>()
                 .iter(world)
-                .any(|(_, visibility)| *visibility == Visibility::Hidden)
+                .count(),
+            original_count
         );
-        assert_eq!(world.get::<Visibility>(root), Some(&Visibility::Inherited));
-        let template = &world
-            .resource::<Assets<WorldAsset>>()
-            .get(&scene)
-            .unwrap()
-            .world;
-        let mut template_meshes = template
-            .try_query::<(Entity, &Mesh3d, Option<&Visibility>)>()
-            .unwrap();
-        let template_visibility_after = template_meshes
-            .iter(template)
-            .map(|(entity, _, visibility)| (entity, visibility.copied()))
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(template_visibility_after, template_visibility_before);
-        let template_count = template_visibility_before.len() as u64;
-        assert_eq!(meshes.iter(world).count() as u64, template_count);
         assert_eq!(
-            world.resource::<super::OwnershipCounters>().owned_hidden,
-            template_count
-        );
-        // A duplicate ready notification must not reapply ownership or count it twice.
-        let instance_id = **world
-            .get::<bevy::world_serialization::WorldInstance>(root)
-            .unwrap();
-        app.world_mut()
-            .trigger(bevy::world_serialization::WorldInstanceReady {
-                entity: root,
-                instance_id,
-            });
-        app.world_mut().flush();
-        assert_eq!(
-            app.world()
-                .resource::<super::OwnershipCounters>()
-                .owned_hidden,
-            template_count
+            world
+                .resource::<Assets<WorldAsset>>()
+                .get(&source)
+                .unwrap()
+                .world
+                .iter_entities()
+                .filter(|node| node.contains::<Mesh3d>())
+                .count(),
+            original_count
         );
     }
 }
@@ -800,116 +770,19 @@ mod tests {
 #[cfg(test)]
 mod runtime_revocation_tests {
     use super::*;
-    use crate::cluster::runtime_state::{ReferenceStateChanged, RuntimeReferenceState};
 
     #[test]
-    fn revocation_restores_owned_visibility_but_preserves_authored_hides() {
-        let mut app = App::new();
-        crate::cluster::runtime_state::install(&mut app);
-        install(&mut app);
-        let root = app.world_mut().spawn(OwnershipReference(7)).id();
-        let owned = app
-            .world_mut()
-            .spawn((
-                ChildOf(root),
-                Visibility::Hidden,
-                OwnershipApplied(Some(Visibility::Inherited)),
-            ))
-            .id();
-        let authored = app
-            .world_mut()
-            .spawn((ChildOf(root), Visibility::Hidden, OwnershipApplied(None)))
-            .id();
-        let other_root = app.world_mut().spawn(OwnershipReference(8)).id();
-        let other = app
-            .world_mut()
-            .spawn((
-                ChildOf(other_root),
-                Visibility::Hidden,
-                OwnershipApplied(Some(Visibility::Inherited)),
-            ))
-            .id();
-        app.world_mut()
-            .trigger(ReferenceStateChanged { reference: 7 });
-        app.update();
-        assert_eq!(
-            app.world().get::<Visibility>(owned),
-            Some(&Visibility::Inherited)
-        );
-        assert_eq!(
-            app.world().get::<Visibility>(authored),
-            Some(&Visibility::Hidden)
-        );
-        assert_eq!(
-            app.world().get::<Visibility>(other),
-            Some(&Visibility::Hidden)
-        );
-        assert!(app.world().get::<OwnershipApplied>(owned).is_none());
-        assert!(app.world().resource::<RuntimeReferenceState>().contains(7));
-    }
-
-    #[test]
-    fn synchronous_revocation_preserves_a_later_gameplay_hide() {
-        let mut app = App::new();
-        crate::cluster::runtime_state::install(&mut app);
-        install(&mut app);
-        let root = app.world_mut().spawn(OwnershipReference(7)).id();
-        let child = app
-            .world_mut()
-            .spawn((
-                ChildOf(root),
-                Visibility::Hidden,
-                OwnershipApplied(Some(Visibility::Inherited)),
-            ))
-            .id();
-        app.world_mut()
-            .trigger(ReferenceStateChanged { reference: 7 });
-        assert_eq!(
-            app.world().get::<Visibility>(child),
-            Some(&Visibility::Inherited)
-        );
-        *app.world_mut().get_mut::<Visibility>(child).unwrap() = Visibility::Hidden;
-        app.update();
-        assert_eq!(
-            app.world().get::<Visibility>(child),
-            Some(&Visibility::Hidden)
-        );
-    }
-
-    #[test]
-    fn disabled_reference_restores_its_stock_before_reenable() {
-        use crate::cluster::runtime_state::RestingReferencePose;
-        use bevy::ecs::entity_disabling::Disabled;
-        let mut app = App::new();
-        crate::cluster::runtime_state::install(&mut app);
-        install(&mut app);
-        let root = app
-            .world_mut()
-            .spawn((
-                OwnershipReference(7),
-                crate::world::components::FormId(7),
-                RestingReferencePose(Transform::default()),
-                Transform::default(),
-            ))
-            .id();
-        let child = app
-            .world_mut()
-            .spawn((
-                ChildOf(root),
-                Visibility::Hidden,
-                OwnershipApplied(Some(Visibility::Inherited)),
-            ))
-            .id();
-        app.world_mut().entity_mut(root).insert(Disabled);
-        app.update();
-        app.world_mut().entity_mut(root).remove::<Disabled>();
-        app.update();
-        assert_eq!(
-            app.world().get::<Visibility>(child),
-            Some(&Visibility::Inherited)
-        );
-        assert!(app.world().get::<OwnershipApplied>(child).is_none());
-        assert!(app.world().resource::<RuntimeReferenceState>().contains(7));
+    fn runtime_state_cannot_change_frozen_ownership() {
+        let (_directory, package, reference, tag, key) = super::tests::fixture();
+        let mut facts = OwnershipFacts::default();
+        facts.publish(&package, BTreeMap::from([(key, false)]));
+        let revision = facts.terminal_revision();
+        facts.revoke();
+        facts.publish(&package, BTreeMap::from([(key, true)]));
+        assert_eq!(facts.decision(reference, Some(&tag)), Decision::Owned);
+        assert!(facts.reference_has_owned(reference));
+        assert!(facts.permanent_refused_records().is_empty());
+        assert_eq!(facts.terminal_revision(), revision);
     }
 }
 

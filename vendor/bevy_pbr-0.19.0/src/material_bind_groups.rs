@@ -36,6 +36,21 @@ use tracing::{error, trace};
 #[derive(Resource, Deref, DerefMut, Default)]
 pub struct MaterialBindGroupAllocators(TypeIdMap<MaterialBindGroupAllocator>);
 
+/// Tracks writes that add, remove, or replace an available bind group.
+#[derive(Default)]
+struct BindGroupReadinessRevision(u64);
+
+impl BindGroupReadinessRevision {
+    fn record_change(&mut self, was_ready: bool, is_ready: bool) {
+        if was_ready || is_ready {
+            self.0 = self
+                .0
+                .checked_add(1)
+                .expect("Material bind group readiness revision exhausted");
+        }
+    }
+}
+
 /// A resource that places materials into bind groups and tracks their
 /// resources.
 ///
@@ -52,6 +67,7 @@ pub enum MaterialBindGroupAllocator {
 /// The allocator that places bindless materials into bind groups and tracks
 /// their resources.
 pub struct MaterialBindGroupBindlessAllocator {
+    readiness_revision: BindGroupReadinessRevision,
     /// The label of the bind group allocator to use for allocated buffers.
     label: &'static str,
     /// The slabs, each of which contains a bind group.
@@ -176,6 +192,7 @@ where
 
 /// The allocator that stores bind groups for non-bindless materials.
 pub struct MaterialBindGroupNonBindlessAllocator {
+    readiness_revision: BindGroupReadinessRevision,
     /// The label of the bind group allocator to use for allocated buffers.
     label: &'static str,
     /// A mapping from [`MaterialBindGroupIndex`] to the bind group allocated in
@@ -459,6 +476,20 @@ impl GetBindingResourceId for TextureView {
 }
 
 impl MaterialBindGroupAllocator {
+    /// Returns the monotonic revision of available material bind groups.
+    ///
+    /// Creation, invalidation, removal, and replacement of an available bind group
+    /// advance the revision. Unprepared non-bindless allocation/free, unchanged
+    /// preparation, and buffer writes do not. It starts at zero and is scoped to
+    /// this allocator's lifetime. Reading it does not scan the slabs.
+    #[inline]
+    pub fn readiness_revision(&self) -> u64 {
+        match self {
+            Self::Bindless(allocator) => allocator.readiness_revision.0,
+            Self::NonBindless(allocator) => allocator.readiness_revision.0,
+        }
+    }
+
     /// Creates a new [`MaterialBindGroupAllocator`] managing the data for a
     /// single material.
     pub fn new(
@@ -800,6 +831,7 @@ impl MaterialBindGroupBindlessAllocator {
             .collect();
 
         MaterialBindGroupBindlessAllocator {
+            readiness_revision: default(),
             label,
             slabs: vec![],
             bind_group_layout,
@@ -825,7 +857,11 @@ impl MaterialBindGroupBindlessAllocator {
     ) -> MaterialBindingId {
         for (slab_index, slab) in self.slabs.iter_mut().enumerate() {
             trace!("Trying to allocate in slab {}", slab_index);
-            match slab.try_allocate(unprepared_bind_group, self.slab_capacity) {
+            match slab.try_allocate(
+                unprepared_bind_group,
+                self.slab_capacity,
+                &mut self.readiness_revision,
+            ) {
                 Ok(slot) => {
                     return MaterialBindingId {
                         group: MaterialBindGroupIndex(slab_index as u32),
@@ -845,7 +881,11 @@ impl MaterialBindGroupBindlessAllocator {
             .slabs
             .last_mut()
             .expect("We just pushed a slab")
-            .try_allocate(unprepared_bind_group, self.slab_capacity)
+            .try_allocate(
+                unprepared_bind_group,
+                self.slab_capacity,
+                &mut self.readiness_revision,
+            )
         else {
             panic!("An allocation into an empty slab should always succeed")
         };
@@ -860,7 +900,11 @@ impl MaterialBindGroupBindlessAllocator {
         self.slabs
             .get_mut(material_binding_id.group.0 as usize)
             .expect("Slab should exist")
-            .free(material_binding_id.slot, &self.bindless_descriptor);
+            .free(
+                material_binding_id.slot,
+                &self.bindless_descriptor,
+                &mut self.readiness_revision,
+            );
     }
 
     /// Returns the slab with the given bind group index.
@@ -892,6 +936,7 @@ impl MaterialBindGroupBindlessAllocator {
                 fallback_image,
                 &self.bindless_descriptor,
                 self.slab_capacity,
+                &mut self.readiness_revision,
             );
         }
     }
@@ -907,6 +952,15 @@ impl MaterialBindGroupBindlessAllocator {
 }
 
 impl MaterialBindlessSlab {
+    fn set_bind_group(
+        &mut self,
+        bind_group: Option<BindGroup>,
+        readiness_revision: &mut BindGroupReadinessRevision,
+    ) {
+        readiness_revision.record_change(self.bind_group.is_some(), bind_group.is_some());
+        self.bind_group = bind_group;
+    }
+
     /// Attempts to allocate the given unprepared bind group in this slab.
     ///
     /// If the allocation succeeds, this method returns the slot that the
@@ -917,6 +971,7 @@ impl MaterialBindlessSlab {
         &mut self,
         unprepared_bind_group: UnpreparedBindGroup,
         slot_capacity: u32,
+        readiness_revision: &mut BindGroupReadinessRevision,
     ) -> Result<MaterialBindGroupSlot, UnpreparedBindGroup> {
         // Locate pre-existing resources, and determine how many free slots we need.
         let Some(allocation_candidate) = self.check_allocation(&unprepared_bind_group) else {
@@ -966,7 +1021,7 @@ impl MaterialBindlessSlab {
         }
 
         // Invalidate the cached bind group.
-        self.bind_group = None;
+        self.set_bind_group(None, readiness_revision);
 
         Ok(slot)
     }
@@ -1149,7 +1204,12 @@ impl MaterialBindlessSlab {
 
     /// Removes the material allocated in the given slot, with the given
     /// descriptor, from this slab.
-    fn free(&mut self, slot: MaterialBindGroupSlot, bindless_descriptor: &BindlessDescriptor) {
+    fn free(
+        &mut self,
+        slot: MaterialBindGroupSlot,
+        bindless_descriptor: &BindlessDescriptor,
+        readiness_revision: &mut BindGroupReadinessRevision,
+    ) {
         // Loop through each binding.
         for (bindless_index, bindless_resource_type) in
             bindless_descriptor.resources.iter().enumerate()
@@ -1207,7 +1267,7 @@ impl MaterialBindlessSlab {
         }
 
         // Invalidate the cached bind group.
-        self.bind_group = None;
+        self.set_bind_group(None, readiness_revision);
 
         // Release the slot ID.
         self.free_slots.push(slot);
@@ -1226,6 +1286,7 @@ impl MaterialBindlessSlab {
         fallback_image: &FallbackImage,
         bindless_descriptor: &BindlessDescriptor,
         slab_capacity: u32,
+        readiness_revision: &mut BindGroupReadinessRevision,
     ) {
         // Create the bindless index table buffers if needed.
         for bindless_index_table in &mut self.bindless_index_tables {
@@ -1248,6 +1309,7 @@ impl MaterialBindlessSlab {
             fallback_image,
             bindless_descriptor,
             slab_capacity,
+            readiness_revision,
         );
     }
 
@@ -1264,6 +1326,7 @@ impl MaterialBindlessSlab {
         fallback_image: &FallbackImage,
         bindless_descriptor: &BindlessDescriptor,
         slab_capacity: u32,
+        readiness_revision: &mut BindGroupReadinessRevision,
     ) {
         // If the bind group is clean, then do nothing.
         if self.bind_group.is_some() {
@@ -1324,11 +1387,12 @@ impl MaterialBindlessSlab {
             });
         }
 
-        self.bind_group = Some(render_device.create_bind_group(
+        let bind_group = render_device.create_bind_group(
             Some(label),
             &pipeline_cache.get_bind_group_layout(bind_group_layout),
             &bind_group_entries,
-        ));
+        );
+        self.set_bind_group(Some(bind_group), readiness_revision);
     }
 
     /// Writes any buffers that we're managing to the GPU.
@@ -1853,6 +1917,7 @@ impl MaterialBindGroupNonBindlessAllocator {
     /// bind groups for a single non-bindless material.
     fn new(label: &'static str) -> MaterialBindGroupNonBindlessAllocator {
         MaterialBindGroupNonBindlessAllocator {
+            readiness_revision: default(),
             label,
             bind_groups: vec![],
             to_prepare: HashSet::default(),
@@ -1882,7 +1947,7 @@ impl MaterialBindGroupNonBindlessAllocator {
             self.to_prepare.insert(group_id);
         }
 
-        self.bind_groups[*group_id as usize] = Some(bind_group);
+        self.set_bind_group(group_id, Some(bind_group));
 
         MaterialBindingId {
             group: group_id,
@@ -1916,9 +1981,28 @@ impl MaterialBindGroupNonBindlessAllocator {
     fn free(&mut self, binding_id: MaterialBindingId) {
         debug_assert_eq!(binding_id.slot, MaterialBindGroupSlot(0));
         debug_assert!(self.bind_groups[*binding_id.group as usize].is_some());
-        self.bind_groups[*binding_id.group as usize] = None;
+        self.set_bind_group(binding_id.group, None);
         self.to_prepare.remove(&binding_id.group);
         self.free_indices.push(binding_id.group);
+    }
+
+    fn set_bind_group(
+        &mut self,
+        index: MaterialBindGroupIndex,
+        bind_group: Option<MaterialNonBindlessAllocatedBindGroup>,
+    ) {
+        let slot = &mut self.bind_groups[*index as usize];
+        self.readiness_revision.record_change(
+            matches!(
+                slot,
+                Some(MaterialNonBindlessAllocatedBindGroup::Prepared { .. })
+            ),
+            matches!(
+                bind_group,
+                Some(MaterialNonBindlessAllocatedBindGroup::Prepared { .. })
+            ),
+        );
+        *slot = bind_group;
     }
 
     /// Returns a wrapper around the bind group with the given index.
@@ -1998,14 +2082,16 @@ impl MaterialBindGroupNonBindlessAllocator {
                 &bind_group_entries,
             );
 
-            self.bind_groups[*bind_group_index as usize] =
+            self.set_bind_group(
+                bind_group_index,
                 Some(MaterialNonBindlessAllocatedBindGroup::Prepared {
                     bind_group: PreparedBindGroup {
                         bindings: unprepared_bind_group.bindings,
                         bind_group,
                     },
                     uniform_buffers,
-                });
+                }),
+            );
         }
     }
 }
@@ -2081,5 +2167,43 @@ impl MaterialDataBuffer {
     fn remove(&mut self, slot: u32) {
         self.free_slots.push(slot);
         self.len -= 1;
+    }
+}
+
+#[cfg(test)]
+mod readiness_revision_tests {
+    use super::*;
+
+    #[test]
+    fn material_readiness_revision_tracks_available_bind_group_changes() {
+        let mut revision = BindGroupReadinessRevision::default();
+        revision.record_change(false, false);
+        assert_eq!(revision.0, 0);
+        revision.record_change(false, true);
+        assert_eq!(revision.0, 1);
+        revision.record_change(true, false);
+        assert_eq!(revision.0, 2);
+        revision.record_change(false, false);
+        assert_eq!(revision.0, 2);
+        revision.record_change(false, true);
+        revision.record_change(true, true);
+        assert_eq!(revision.0, 4);
+    }
+
+    #[test]
+    fn material_readiness_revision_ignores_unprepared_allocation_and_free() {
+        let mut allocator = MaterialBindGroupAllocator::NonBindless(Box::new(
+            MaterialBindGroupNonBindlessAllocator::new("revision test"),
+        ));
+        let id = allocator.allocate_unprepared(
+            UnpreparedBindGroup {
+                bindings: BindingResources(vec![]),
+            },
+            &BindGroupLayoutDescriptor::default(),
+        );
+        assert_eq!(allocator.readiness_revision(), 0);
+        assert!(allocator.get(id.group).unwrap().bind_group().is_none());
+        allocator.free(id);
+        assert_eq!(allocator.readiness_revision(), 0);
     }
 }

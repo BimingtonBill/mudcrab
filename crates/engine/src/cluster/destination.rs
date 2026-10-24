@@ -495,65 +495,6 @@ fn replacement_coverage_ready(
                 }))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ObjectPass {
-    RetainedStock,
-    ClusterRequired,
-    OutsideDomain,
-}
-
-fn object_pass(
-    stock_exists: bool,
-    streaming_retired: bool,
-    qualified_retired_domain: Option<bool>,
-    cluster_selected: bool,
-) -> ObjectPass {
-    if streaming_retired {
-        if qualified_retired_domain == Some(false) {
-            ObjectPass::OutsideDomain
-        } else {
-            ObjectPass::ClusterRequired
-        }
-    } else if stock_exists && !cluster_selected {
-        ObjectPass::RetainedStock
-    } else {
-        ObjectPass::ClusterRequired
-    }
-}
-
-/// Only qualified current sources with matching actual material and a current
-/// per-consumer selection can prove exclusion by layers/caster properties.
-fn retired_domain(
-    proof: &DrawProof,
-    sources: &Sources,
-    view: &ViewGpu,
-    record: &super::super::super::reader::RecordKey,
-    reference: u32,
-    index: Option<u32>,
-) -> Option<bool> {
-    if !sources.retired_refs.contains(&reference) {
-        return None;
-    }
-    let main = sources.bound.get(record)?;
-    let actual = sources.retired_materials.get(main).copied().flatten()?;
-    let expected = proof
-        .gpu
-        .batches
-        .get(proof.gpu.placed.get(index? as usize)?.batch as usize)?
-        .material?;
-    if actual != expected {
-        return None;
-    }
-    let selection = view.selection.as_ref()?;
-    if selection.stamp[0] != sources.version
-        || selection.stamp[1] != proof.gpu.layout_epoch
-        || selection.stamp[2] != proof.gpu.generation
-    {
-        return None;
-    }
-    Some(selection.visible.contains(main))
-}
-
 fn destination_ready(
     proof: &DrawProof,
     sources: &Sources,
@@ -652,95 +593,55 @@ fn destination_ready(
         }
         let grid = IVec2::new(grid_x, grid_y);
         for (record, identity) in certificate.records_in_placed_cell(world, grid) {
-            let index = proof.gpu.object_indices.get(record).copied();
-            let streaming_retired = sources.retired_present.contains(&identity.reference);
-            let stock_exists = sources.present.contains(&identity.reference) && !streaming_retired;
-            // An invalid retired source cannot inherit an empty generic stock
-            // proof. It waits until it qualifies again or truly despawns.
-            if streaming_retired && !sources.retired_refs.contains(&identity.reference) {
+            // Refused primitives are permanent stock coverage. A stock sibling
+            // cannot stand in for this accepted record's missing cluster draw.
+            if sources.permanently_refused_records.contains(record) {
+                continue;
+            }
+            if view
+                .selection
+                .as_ref()
+                .is_some_and(|selection| !ViewDomain::new(&selection.layers, false).objects)
+            {
+                continue;
+            }
+            let stock_exists = sources.present.contains(&identity.reference)
+                && !sources.retired_present.contains(&identity.reference);
+            if !replacement_coverage_ready(certificate, sources, identity.reference, stock_exists) {
                 return false;
             }
-            // Stock is pinned whenever a runtime candidate is ineligible. The
-            // generic bridge proves every visible retained stock mesh and pass.
-            if object_pass(
-                stock_exists,
-                streaming_retired,
-                retired_domain(proof, sources, view, record, identity.reference, index),
-                index.is_some_and(|index| selected(view, index)),
-            ) == ObjectPass::ClusterRequired
-            {
-                if !replacement_coverage_ready(
-                    certificate,
-                    sources,
-                    identity.reference,
-                    stock_exists,
-                ) {
-                    return false;
-                }
-                let Some(index) = index else {
-                    return false;
-                };
-                if !selected(view, index) {
-                    return false;
-                }
-                let batch = proof.gpu.placed[index as usize].batch as usize;
-                if !proof.batch(&key, batch, false, prepass, &members) {
-                    return false;
-                }
+            let Some(index) = proof.gpu.object_indices.get(record).copied() else {
+                return false;
+            };
+            let batch = proof.gpu.placed[index as usize].batch as usize;
+            if !selected(view, index) || !proof.batch(&key, batch, false, prepass, &members) {
+                return false;
             }
             if request.passes.contains(PassFamily::Shadow) {
+                let material = proof
+                    .gpu
+                    .batches
+                    .get(batch)
+                    .and_then(|batch| batch.material)
+                    .and_then(|id| proof.materials.get(id));
+                if material.is_some_and(|material| !material.properties.shadows_enabled) {
+                    continue;
+                }
                 for (shadow_key, shadow_members) in &shadows {
                     let Some(shadow_view) = proof.gpu.views.get(shadow_key) else {
                         return false;
                     };
-                    let material = index
-                        .and_then(|index| {
-                            proof
-                                .gpu
-                                .batches
-                                .get(proof.gpu.placed[index as usize].batch as usize)
-                        })
-                        .and_then(|batch| batch.material)
-                        .and_then(|id| proof.materials.get(id));
-                    if material.is_some_and(|material| !material.properties.shadows_enabled) {
+                    if shadow_view
+                        .selection
+                        .as_ref()
+                        .is_some_and(|selection| !ViewDomain::new(&selection.layers, true).objects)
+                    {
                         continue;
                     }
-                    if object_pass(
-                        stock_exists,
-                        streaming_retired,
-                        retired_domain(
-                            proof,
-                            sources,
-                            shadow_view,
-                            record,
-                            identity.reference,
-                            index,
-                        ),
-                        index.is_some_and(|index| selected(shadow_view, index)),
-                    ) == ObjectPass::ClusterRequired
+                    if !selected(shadow_view, index)
+                        || !proof.batch(shadow_key, batch, true, false, shadow_members)
                     {
-                        if !replacement_coverage_ready(
-                            certificate,
-                            sources,
-                            identity.reference,
-                            stock_exists,
-                        ) {
-                            return false;
-                        }
-                        let Some(index) = index else {
-                            return false;
-                        };
-                        if !selected(shadow_view, index)
-                            || !proof.batch(
-                                shadow_key,
-                                proof.gpu.placed[index as usize].batch as usize,
-                                true,
-                                false,
-                                shadow_members,
-                            )
-                        {
-                            return false;
-                        }
+                        return false;
                     }
                 }
             }
@@ -943,40 +844,6 @@ mod tests {
         inputs.depth_covered.remove(&(grid, 2));
         inputs.depth_covered.insert((grid + IVec2::X, 2));
         assert!(!terrain_pass_ready(&inputs, grid, 4, true, false, false));
-    }
-}
-
-#[cfg(test)]
-mod retired_pass_regressions {
-    use super::*;
-
-    #[test]
-    fn retirement_never_inherits_empty_stock_proof() {
-        assert_eq!(
-            object_pass(true, false, None, false),
-            ObjectPass::RetainedStock
-        );
-        assert_eq!(
-            object_pass(false, true, None, false),
-            ObjectPass::ClusterRequired
-        );
-        assert_eq!(
-            object_pass(false, true, Some(true), false),
-            ObjectPass::ClusterRequired
-        );
-        assert_eq!(
-            object_pass(false, true, Some(true), true),
-            ObjectPass::ClusterRequired
-        );
-        // A qualified per-view layer/caster exclusion needs neither draw.
-        assert_eq!(
-            object_pass(false, true, Some(false), false),
-            ObjectPass::OutsideDomain
-        );
-        assert_eq!(
-            object_pass(false, false, None, false),
-            ObjectPass::ClusterRequired
-        );
     }
 }
 

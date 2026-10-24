@@ -10,6 +10,7 @@ struct Projection {
     certificate: Option<Weak<crate::cluster::reader::CertifiedPackage>>,
     scene_change: Option<Tick>,
     batches: BTreeSet<u32>,
+    material_refusals: BTreeSet<u32>,
     normal_maps: Vec<bool>,
     templates: Vec<bool>,
     ownership_enabled: bool,
@@ -18,6 +19,8 @@ struct Projection {
     reference_counts: BTreeMap<u32, usize>,
     pending_tangents: BTreeMap<u32, BTreeSet<u32>>,
     failure: Option<&'static str>,
+    source_revision: Option<(u64, u64)>,
+    terminal_revision: Option<u64>,
 }
 
 struct Projected {
@@ -31,6 +34,7 @@ fn references_requiring_source(
     certificate: &crate::cluster::reader::CertifiedPackage,
     scene: &ClusterScene,
     batches: &BTreeSet<u32>,
+    material_refusals: &BTreeSet<u32>,
     normal_maps: &[bool],
     ownership_templates: Option<&[bool]>,
 ) -> Result<Projected, &'static str> {
@@ -39,6 +43,7 @@ fn references_requiring_source(
         scene,
         &scene.instances,
         batches,
+        material_refusals,
         normal_maps,
         ownership_templates,
     )
@@ -49,6 +54,7 @@ fn project_instances<'a>(
     scene: &ClusterScene,
     instances: impl IntoIterator<Item = &'a super::super::ClusterInstance>,
     batches: &BTreeSet<u32>,
+    material_refusals: &BTreeSet<u32>,
     normal_maps: &[bool],
     ownership_templates: Option<&[bool]>,
 ) -> Result<Projected, &'static str> {
@@ -60,6 +66,7 @@ fn project_instances<'a>(
             continue;
         };
         let mut requires_source = batches.contains(&instance.batch);
+        let mut material_refusal = material_refusals.contains(&instance.batch);
         let mut pending = false;
         if !requires_source
             && normal_maps
@@ -76,7 +83,10 @@ fn project_instances<'a>(
                     pending_tangents.insert(instance.mesh);
                     pending = true;
                 }
-                Some(false) => requires_source = true,
+                Some(false) => {
+                    requires_source = true;
+                    material_refusal = true;
+                }
                 Some(true) => {}
             }
         }
@@ -91,7 +101,7 @@ fn project_instances<'a>(
         // qualification, even though it is absent from the definitive refusal set.
         if let Some(templates) = ownership_templates
             && !pending
-            && (requires_source || templates.get(instance.batch as usize) == Some(&true))
+            && (material_refusal || templates.get(instance.batch as usize) == Some(&true))
         {
             ownership.insert(key, requires_source);
         }
@@ -129,6 +139,20 @@ impl Projection {
         let reset = !same_certificate
             || self.scene_change != Some(changed)
             || self.ownership_enabled != ownership_enabled;
+        let source_revision = (sources.version, sources.template_revision);
+        if !reset
+            && self.source_revision == Some(source_revision)
+            && self.pending_tangents.is_empty()
+        {
+            return Ok(ProjectionUpdate {
+                reset: false,
+                ownership: BTreeMap::new(),
+                added: BTreeSet::new(),
+                removed: BTreeSet::new(),
+                #[cfg(test)]
+                visited: 0,
+            });
+        }
         let mut affected = BTreeSet::new();
         if reset {
             *self = Self::default();
@@ -145,6 +169,11 @@ impl Projection {
             affected.extend(
                 self.batches
                     .symmetric_difference(&sources.source_fallback_batches)
+                    .copied(),
+            );
+            affected.extend(
+                self.material_refusals
+                    .symmetric_difference(&sources.material_refused_batches)
                     .copied(),
             );
             for index in 0..self.normal_maps.len().max(sources.normal_maps.len()) {
@@ -190,6 +219,7 @@ impl Projection {
                 scene,
                 indices.iter().map(|index| &scene.instances[*index]),
                 &sources.source_fallback_batches,
+                &sources.material_refused_batches,
                 &sources.normal_maps,
                 ownership_enabled.then_some(sources.templates.as_slice()),
             )?;
@@ -253,10 +283,13 @@ impl Projection {
         self.certificate = Some(Arc::downgrade(certificate));
         self.scene_change = Some(changed);
         self.batches.clone_from(&sources.source_fallback_batches);
+        self.material_refusals
+            .clone_from(&sources.material_refused_batches);
         self.normal_maps.clone_from(&sources.normal_maps);
         self.templates.clone_from(&sources.templates);
         self.ownership_enabled = ownership_enabled;
         self.failure = None;
+        self.source_revision = Some(source_revision);
         Ok(update)
     }
 }
@@ -305,6 +338,29 @@ fn publish(sources: Res<Sources>, mut main: ResMut<MainWorld>, mut previous: Loc
         && (update.reset || !update.ownership.is_empty())
     {
         facts.publish_updates(&certificate, update.reset, update.ownership);
+    }
+    if ownership_enabled {
+        // Runtime failures never demand stock for accepted records. Only the
+        // certificate's fixed terminal material refusals can add source draws.
+        let revision = main
+            .get_resource::<OwnershipFacts>()
+            .filter(|facts| facts.package_matches(&certificate))
+            .map(|facts| facts.terminal_revision());
+        if revision != previous.terminal_revision || update.reset {
+            let refused = main
+                .get_resource::<OwnershipFacts>()
+                .filter(|facts| facts.package_matches(&certificate))
+                .map(|facts| facts.permanent_refused_references());
+            if let Some(refused) = refused
+                && let Some(mut demand) = main.get_resource_mut::<SourceFallbackDemand>()
+            {
+                demand.update(Some(&certificate), refused);
+            }
+            previous.terminal_revision = revision;
+        } else if let Some(mut demand) = main.get_resource_mut::<SourceFallbackDemand>() {
+            demand.refresh_for_package(&certificate);
+        }
+        return;
     }
     if let Some(mut demand) = main.get_resource_mut::<SourceFallbackDemand>() {
         if previous.pending_tangents.is_empty() {

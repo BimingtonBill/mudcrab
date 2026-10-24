@@ -106,11 +106,11 @@ mod tests {
 }
 
 pub mod assets;
-pub(crate) mod batch_drawability;
 pub mod envelope;
 pub(crate) mod flat_source;
 mod instance_identity;
 mod instance_mask;
+pub(crate) mod loading;
 mod mesh_payload;
 #[cfg(test)]
 pub(crate) mod overlay_fixture;

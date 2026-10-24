@@ -161,7 +161,7 @@ pub struct EngineConfig {
     /// settings-id | path]`: the text names one overlay of `--assets`, empty for the only one.
     /// Unset draws nothing extra.
     pub clusters: Option<String>,
-    /// Hide certified owned exterior primitives once at instance spawn.
+    /// Remove certified owned exterior render bodies before instance spawn.
     /// Always enabled when a cluster overlay is selected.
     pub cluster_own_statics: bool,
     /// Draw packaged terrain clusters, clipping against ready near terrain.
@@ -175,7 +175,7 @@ pub struct EngineConfig {
     /// `--cluster-min-instance-pixels`: instances whose bounding sphere spans fewer pixels than
     /// this across are not drawn (default 0: every instance).
     pub cluster_min_instance_pixels: Option<f32>,
-    /// `--no-cluster-prepass`: leave the cluster batches out of the camera's prepass.
+    /// Camera prepass support; required when a cluster overlay is selected.
     pub cluster_prepass: bool,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
@@ -812,7 +812,7 @@ Streaming:
   --cluster-preload-batches             load every cluster batch during the startup load instead
                                         of as it comes into view (requires --clusters)
   --cluster-min-instance-pixels <px>    skip instances whose bounding sphere spans fewer pixels (default: 0, none)
-  --no-cluster-prepass                  leave cluster batches out of the camera's depth/normal/motion prepass
+  --no-cluster-prepass                  disable cluster prepass (incompatible with --clusters)
   --route <file>                        follow a route file's waypoints at its speed (a JSON file; see scripts/routes)
 
 Benchmark and profiling:
@@ -2073,6 +2073,13 @@ impl EngineConfig {
             ));
         }
         config.cluster_own_statics = config.clusters.is_some();
+        if config.clusters.is_some() && !config.cluster_prepass {
+            return Err(ConfigError::invalid_value(
+                "--no-cluster-prepass",
+                None,
+                "the cluster prepass enabled for owned primitives",
+            ));
+        }
         if config.cluster_preload_batches && config.clusters.is_none() {
             return Err(ConfigError::invalid_value(
                 "--cluster-preload-batches",
@@ -2080,6 +2087,7 @@ impl EngineConfig {
                 "--clusters",
             ));
         }
+        config.cluster_preload_batches |= config.clusters.is_some();
         if config.cluster_terrain && config.clusters.is_none() {
             return Err(ConfigError::invalid_value(
                 "--cluster-terrain",
@@ -3275,6 +3283,24 @@ mod tests {
     fn cluster_ownership_is_always_on_with_clusters() {
         assert!(run_config(&["--clusters", "fixture"]).cluster_own_statics);
         assert!(run_config(&["--clusters"]).cluster_own_statics);
+    }
+
+    #[test]
+    fn clusters_preload_materials_before_play_and_require_their_prepass() {
+        for arguments in [
+            ["--clusters", "fixture"].as_slice(),
+            ["--clusters"].as_slice(),
+        ] {
+            assert!(run_config(arguments).cluster_preload_batches);
+        }
+        assert!(
+            EngineConfig::from_args([
+                "--clusters".to_owned(),
+                "fixture".to_owned(),
+                "--no-cluster-prepass".to_owned(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

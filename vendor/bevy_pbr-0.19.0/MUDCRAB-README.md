@@ -1,7 +1,8 @@
-# bevy_pbr 0.19.0: shadow render diagnostics
+# bevy_pbr 0.19.0: shadow render diagnostics and material readiness revisions
 
 This is the complete published bevy_pbr 0.19.0 crate, used by the root
-`[patch.crates-io]` entry. Only `src/render/light.rs` differs from upstream source.
+`[patch.crates-io]` entry. `src/render/light.rs` and `src/material_bind_groups.rs`
+differ from upstream source.
 The full crate is 4.19 MB. Cargo cannot replace its private light module with a
 standalone file; preserving the module tree also preserves embedded shader and
 LUT asset paths. No dependency version or engine feature is changed.
@@ -37,6 +38,20 @@ Names may aggregate cameras; samples are pass observations, not per-frame totals
 The engine adds `gpu_passes.pipeline_statistics` and
 `scene.fragment_shader_invocations`; `gpu_passes.passes` remains elapsed-GPU-only.
 
+## Material readiness revisions (#2143)
+
+Task #2143 adds `MaterialBindGroupAllocator::readiness_revision()`, an owner-local
+monotonic revision for available material bind groups. Both allocator variants
+record available bind-group creation, invalidation, removal, and replacement.
+Bindless allocation/free includes the slab's otherwise silent cached-bind-group
+clearing. Unprepared non-bindless allocation/free, unchanged preparation, and
+buffer writes do not advance the revision. Reading it takes constant time;
+tracking changes adds no slab scan. The public allocator enum remains unchanged.
+
+GPU-free tests cover the availability accounting and actual non-bindless
+unprepared allocation/free. They do not establish GPU correctness or timing.
+The cluster readiness consumer and live acceptance belong to engine integration.
+
 ## Workspace and removal
 
 PBR stays an excluded dependency, so workspace `--all-features` does not activate
@@ -45,6 +60,7 @@ this patch, and dependency `opt-level = 3` remains in force.
 
 To restore the registry crate, remove only the root PBR patch and workspace exclusion
 and this vendor directory, then regenerate the lockfile through the build gate.
-The report fields remain useful for other instrumented passes. Re-evaluate or retire
+Migrate callers of `readiness_revision()` when removing this patch. The report
+fields remain useful for other instrumented passes. Re-evaluate or retire
 the patch on the next Bevy upgrade. Runtime GPU and performance acceptance belongs
 to the lead's subsequent timing run.

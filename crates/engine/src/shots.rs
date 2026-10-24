@@ -1905,7 +1905,7 @@ struct CaptureWorld<'w> {
     frame: Res<'w, bevy::diagnostic::FrameCount>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_shots(
     mut commands: Commands,
     time: Res<Time<Real>>,
@@ -1924,9 +1924,10 @@ fn run_shots(
     waiting: Query<Has<SwapInCameraView>, With<SwapWaiting>>,
     mut exit: MessageWriter<AppExit>,
     mut world: DoorWorld,
-    (validation, scene): (
+    (validation, scene, startup): (
         Option<Res<PackageValidationStatus>>,
         Option<Res<crate::cluster::render::ClusterScene>>,
+        Option<Res<crate::pacing::startup::StartupLoad>>,
     ),
 ) {
     if run.phase == Phase::Done {
@@ -1952,6 +1953,13 @@ fn run_shots(
         return;
     };
     run.frames_without_camera = 0;
+    if run.phase != Phase::Move && startup.as_ref().is_some_and(|load| load.cover_pending()) {
+        // The first pose must still be installed so the renderer can prove it.
+        // Capture/door deadlines start only after the mandatory cover has faded.
+        run.timer = 0.0;
+        run.quiet_frames = 0;
+        return;
+    }
     // Automation deadlines measure real waits, including slow/loading frames, independent of
     // the virtual clock's maximum delta, pause and speed. Startup holds remain explicit below.
     let delta = time.delta_secs();

@@ -108,7 +108,15 @@ mod partial_stock_load_failure {
                 assert!(app.world().get::<PendingModel>(root).is_none());
                 assert!(app.world().get::<PendingAssetProfile>(root).is_none());
                 assert!(app.world().get::<PartialStock>(root).is_none());
-                assert_eq!(app.world().get::<WorldAssetRoot>(root).unwrap().0, source);
+                if root == full {
+                    assert_eq!(app.world().get::<WorldAssetRoot>(root).unwrap().0, source);
+                } else {
+                    assert_ne!(app.world().get::<WorldAssetRoot>(root).unwrap().0, source);
+                    assert_eq!(
+                        app.world().get::<OriginalStockScene>(root).unwrap().0,
+                        source
+                    );
+                }
                 let mut fallbacks =
                     app.world_mut()
                         .query::<(&ChildOf, &Name, &Mesh3d, &MeshMaterial3d<StandardMaterial>)>();

@@ -612,6 +612,33 @@ mod tests {
     }
 
     #[test]
+    fn coc_and_coe_use_the_common_cluster_teleport_admission() {
+        let directory = database();
+        let mut app = streaming_command_app(&directory, true);
+        app.init_resource::<crate::cluster::loading::ClusterLoadingGate>();
+        for command in ["coe 5 -12", "coc riverwood"] {
+            let before = app
+                .world()
+                .resource::<crate::cluster::loading::ClusterLoadingGate>()
+                .generation();
+            execute_line(app.world_mut(), command);
+            app.update();
+            let gate = app
+                .world()
+                .resource::<crate::cluster::loading::ClusterLoadingGate>();
+            assert!(
+                gate.teleport_pending(),
+                "{command} bypassed common admission"
+            );
+            assert_ne!(
+                gate.generation(),
+                before,
+                "{command} reused its old pose proof"
+            );
+        }
+    }
+
+    #[test]
     fn console_teleport_keeps_the_requested_world_cell_when_the_origin_rebases() {
         let directory = database();
         let mut app = streaming_command_app(&directory, true);

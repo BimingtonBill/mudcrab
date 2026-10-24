@@ -5,11 +5,12 @@
 //! requested cluster package certified and loaded) the streaming pacing budgets are lifted: the
 //! render-asset upload budget, the model spawn cap and the unload budgets. The configured values
 //! come back on the ready frame (or once the load has made no progress for
-//! [`STARTUP_LIFT_TIMEOUT_SECONDS`]). The world shows while it loads; with `--startup-cover` the load
-//! is hidden behind a black cover that fades out on the restore, the trade a door crossing makes
-//! behind its fade ([`crate::door_crossing`], whose upload-budget and overlay helpers it reuses).
-//! The lift is on by default; `--paced-startup` installs nothing. A capture run (`--shots`,
-//! `--demo-tour`) is lifted but never covered.
+//! [`STARTUP_LIFT_TIMEOUT_SECONDS`]). Cluster mode always holds a black cover until the required
+//! batches and views are drawable; restoring pacing after a stall never releases that cover.
+//! Other modes retain the optional `--startup-cover` behavior. The cover shares the door
+//! crossing's upload-budget and overlay helpers ([`crate::door_crossing`]).
+//! The lift is on by default. `--paced-startup` preserves configured pacing; cluster admission
+//! still runs. Capture automation waits until the mandatory cluster cover has faded.
 
 use super::{READY_FRAMES_REQUIRED, world_ready_inputs_at_frame_end};
 use crate::{
@@ -26,11 +27,13 @@ use bevy::{prelude::*, render::render_asset::RenderAssetBytesPerFrame};
 /// is ready in about 5-7 s, but a run that certifies a cluster package and loads every cluster
 /// batch behind the cover (`--cluster-preload-batches`) takes about two minutes, all of it moving.
 /// Progress is any change in what the world-ready predicate reads, or a cluster package still
-/// certifying. A run that trips this continues exactly as it did before the lift existed.
+/// certifying. A run that trips this restores configured pacing. Cluster mode keeps its cover
+/// until readiness is proved, even after this timeout.
 pub const STARTUP_LIFT_TIMEOUT_SECONDS: f32 = 60.0;
 
 /// The full-screen black cover the first load happens behind: spawned full black on the first frame
-/// and faded out (over [`FADE_SECONDS`], the crossing's own fade) once the pacing budgets are back.
+/// and faded out (over [`FADE_SECONDS`], the crossing's own fade) once admission succeeds. A
+/// non-cluster run also retains the existing timeout recovery.
 ///
 /// Its own node, not the crossing's [`FadeOverlay`]: that overlay is the crossing's (and this build
 /// does not register the crossing), and two writers on one node would fight over its alpha.
@@ -55,10 +58,9 @@ struct ConfiguredPacing {
 pub struct StartupLoadStalled;
 
 #[derive(Resource, Default)]
-struct StartupLoad {
-    /// Whether this run hides the load behind the cover
-    /// ([`EngineConfig::covers_startup_load`]): false for a capture run, whose frames are the
-    /// deliverable and whose own settle gate already holds it past the load.
+pub(crate) struct StartupLoad {
+    /// Cluster mode always covers its initial load. Other modes use the optional cover policy
+    /// ([`EngineConfig::covers_startup_load`]).
     covers: bool,
     /// `Some` while the lift is in force, holding the configured values to restore.
     configured: Option<ConfiguredPacing>,
@@ -80,10 +82,18 @@ struct StartupLoad {
     cover: Option<Entity>,
     /// The cover has faded out and gone: the lift is over for the rest of the run.
     finished: bool,
+    /// A timed-out lift is restored once; cluster admission still holds its cover.
+    stall_reported: bool,
 }
 
-/// Lifts the streaming pacing for the first load and, unless this is a capture run, holds a black
-/// cover over it. On by default; `--paced-startup` installs nothing
+impl StartupLoad {
+    pub(crate) fn cover_pending(&self) -> bool {
+        self.covers && !self.finished
+    }
+}
+
+/// Lifts streaming pacing for the first load when configured. Cluster mode always holds a black
+/// cover, including paced and capture runs. Other modes retain their optional cover policy
 /// ([`EngineConfig::unpaced_startup`] / [`EngineConfig::covers_startup_load`]).
 ///
 /// The lift is the crossing's own kind of trade - behind black a stutter is invisible, so the load
@@ -97,20 +107,25 @@ struct StartupLoad {
 ///
 /// All three are restored to the configured values on the frame the world-ready latch fires (two
 /// consecutive ready frames, the pacing report's own predicate and rule, plus the cluster load) or
-/// once the load has stalled for [`STARTUP_LIFT_TIMEOUT_SECONDS`], whichever comes first; the cover
-/// then fades and is despawned.
+/// once the load has stalled for [`STARTUP_LIFT_TIMEOUT_SECONDS`], whichever comes first. Cluster
+/// mode fades and despawns its cover only after admission; other modes retain timeout recovery.
 /// The latch happens once: a later loss of ready never lifts again.
 pub struct StartupLoadPlugin;
 
 impl Plugin for StartupLoadPlugin {
     fn build(&self, app: &mut App) {
-        let (lifts, covers) = app
-            .world()
-            .get_resource::<EngineConfig>()
-            .map_or((false, false), |config| {
-                (config.unpaced_startup(), config.covers_startup_load())
-            });
-        if !lifts {
+        let (lifts, covers, clusters) =
+            app.world()
+                .get_resource::<EngineConfig>()
+                .map_or((false, false, false), |config| {
+                    let clusters = config.clusters.is_some();
+                    (
+                        config.unpaced_startup(),
+                        config.covers_startup_load() || clusters,
+                        clusters,
+                    )
+                });
+        if !lifts && !clusters {
             return;
         }
         app.insert_resource(StartupLoad {
@@ -137,11 +152,14 @@ fn begin_startup_load(
         unloads_per_frame: config.max_cell_unloads_per_frame,
         upload_bytes_per_frame: config.max_upload_bytes_per_frame(),
     };
-    config.max_model_spawns_per_frame = 0;
-    config.max_lod_requests_per_frame = 0;
-    config.max_unload_ms_per_frame = 0.0;
-    config.max_cell_unloads_per_frame = 0;
-    set_upload_budget(&mut budget, None);
+    if config.unpaced_startup() {
+        config.max_model_spawns_per_frame = 0;
+        config.max_lod_requests_per_frame = 0;
+        config.max_unload_ms_per_frame = 0.0;
+        config.max_cell_unloads_per_frame = 0;
+        set_upload_budget(&mut budget, None);
+        load.configured = Some(configured);
+    }
     if load.covers {
         load.cover = Some(
             commands
@@ -161,15 +179,18 @@ fn begin_startup_load(
                 .id(),
         );
     }
-    load.configured = Some(configured);
-    info!(
+    if load.configured.is_some() {
+        info!(
         spawns_per_frame = configured.spawns_per_frame,
         lod_requests_per_frame = configured.lod_requests_per_frame,
         unload_ms_per_frame = configured.unload_ms_per_frame,
         unloads_per_frame = configured.unloads_per_frame,
         upload_bytes_per_frame = ?configured.upload_bytes_per_frame,
         "startup load: streaming pacing lifted until the world is first ready"
-    );
+        );
+    } else {
+        info!("startup load: cluster admission holds the cover with configured pacing");
+    }
 }
 
 /// Puts the configured pacing back, as one: the two streaming budgets and the upload budget.
@@ -191,7 +212,7 @@ fn restore_startup_pacing(
 /// The predicate is read at frame end, through [`world_ready_at_frame_end`] - the same function
 /// [`crate::pacing::track_world_ready`] reads it through a moment earlier in the frame's `Update`,
 /// so the two latch on the same frame.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn drive_startup_load(
     time: Res<Time>,
     mut config: ResMut<EngineConfig>,
@@ -205,9 +226,12 @@ fn drive_startup_load(
     mut budget: Option<ResMut<RenderAssetBytesPerFrame>>,
     mut commands: Commands,
     mut load: ResMut<StartupLoad>,
-    (validation, scene): (
+    (validation, scene, mut gate, mode, hold): (
         Option<Res<crate::cluster::package::PackageValidationStatus>>,
         Option<Res<crate::cluster::render::ClusterScene>>,
+        Option<ResMut<crate::cluster::loading::ClusterLoadingGate>>,
+        Option<Res<crate::physics::MoveMode>>,
+        Option<Res<crate::physics::WalkSpawnHold>>,
     ),
 ) {
     if load.finished {
@@ -215,6 +239,21 @@ fn drive_startup_load(
     }
     let delta = time.delta_secs();
     load.elapsed += delta;
+    if config.clusters.is_some()
+        && load.cover_pending()
+        && let (Ok(camera), Some(gate)) = (camera.single(), gate.as_deref_mut())
+    {
+        gate.observe_loading_pose(camera, origin.0, *space);
+    }
+    let physics_ready = config.clusters.is_none()
+        || crate::cluster::loading::physics_settled(mode.as_deref(), hold.as_deref());
+    if !physics_ready
+        || !crate::cluster::loading::ready_for_active(&config, &space, gate.as_deref())
+    {
+        // A dependency withdrawn during the fade cannot expose an unproved view.
+        load.fade = None;
+        set_alpha(&mut overlay, 1.0);
+    }
 
     // The lift is over; the cover is on its way out.
     if let Some(fade) = load.fade {
@@ -232,9 +271,6 @@ fn drive_startup_load(
     }
 
     // Loading: full black over the burst frames the lift is paying for.
-    let Some(configured) = load.configured else {
-        return;
-    };
     set_alpha(&mut overlay, 1.0);
     let inputs = camera.single().ok().map(|camera| {
         world_ready_inputs_at_frame_end(
@@ -245,6 +281,7 @@ fn drive_startup_load(
             &metrics,
             camera.translation,
             pending_drawn(&waiting),
+            gate.as_deref(),
         )
     });
     // A requested cluster package is part of the first load: the world is not ready while it is
@@ -254,11 +291,14 @@ fn drive_startup_load(
         .as_deref()
         .is_some_and(|status| *status == crate::cluster::package::PackageValidationStatus::Pending);
     let clusters_ready = match validation.as_deref() {
-        None => true,
-        Some(crate::cluster::package::PackageValidationStatus::Failed(_)) => true,
+        None => config.clusters.is_none(),
+        Some(crate::cluster::package::PackageValidationStatus::Failed(_)) => false,
         Some(_) => crate::shots::initial_cluster_load_ready(scene.as_deref(), Some(&metrics)),
     };
-    let ready = clusters_ready && !certifying && inputs.is_some_and(|inputs| inputs.is_ready());
+    let ready = physics_ready
+        && clusters_ready
+        && !certifying
+        && inputs.is_some_and(|inputs| inputs.is_ready());
     load.ready_frames = if ready { load.ready_frames + 1 } else { 0 };
     let latched = load.ready_frames >= READY_FRAMES_REQUIRED;
     let moved = certifying || inputs != load.last_inputs;
@@ -267,12 +307,17 @@ fn drive_startup_load(
     if !latched && load.stalled < STARTUP_LIFT_TIMEOUT_SECONDS {
         return;
     }
-    restore_startup_pacing(&mut config, &mut budget, configured);
-    load.configured = None;
-    if load.covers {
-        load.fade = Some(0.0);
-    } else {
-        load.finished = true;
+    if let Some(configured) = load.configured.take() {
+        restore_startup_pacing(&mut config, &mut budget, configured);
+    }
+    // A timeout restores pacing, never cluster readiness. Non-cluster runs retain
+    // their existing recovery policy; a requested cluster run remains covered.
+    if latched || config.clusters.is_none() {
+        if load.covers {
+            load.fade = Some(0.0);
+        } else {
+            load.finished = true;
+        }
     }
     if latched {
         crate::work_counters::mark_world_ready();
@@ -282,7 +327,8 @@ fn drive_startup_load(
             wall_seconds = load.wall_started.map(|start| start.elapsed().as_secs_f64()),
             "startup load: the world is ready; the configured streaming pacing is back"
         );
-    } else {
+    } else if !load.stall_reported {
+        load.stall_reported = true;
         // What held the world back, so a stall names its cause. Systems with more detail (the
         // terrain hand-over) report it once through the event.
         commands.trigger(StartupLoadStalled);
@@ -569,6 +615,54 @@ mod tests {
                 .max_model_spawns_per_frame,
             7,
             "a load that stops moving for the timeout gets its pacing back"
+        );
+    }
+
+    #[test]
+    fn selected_clusters_cover_paced_startup_without_the_optional_cover_flag() {
+        let config = EngineConfig {
+            clusters: Some("selected".into()),
+            cluster_own_statics: true,
+            paced_startup: true,
+            startup_cover: false,
+            ..configured_pacing()
+        };
+        let mut app = startup_app(config);
+        set_interior(&mut app, 77, false);
+        app.update();
+        assert_eq!(cover_alpha(&mut app), Some(1.0));
+        assert_eq!(
+            app.world()
+                .resource::<EngineConfig>()
+                .max_model_spawns_per_frame,
+            7
+        );
+        assert_eq!(
+            app.world().resource::<RenderAssetBytesPerFrame>().max_bytes,
+            Some(16 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn a_failed_cluster_load_never_uncovers_an_otherwise_resident_world() {
+        let mut config = configured_pacing();
+        config.clusters = Some("selected".into());
+        config.cluster_own_statics = true;
+        let mut app = startup_app(config);
+        set_interior(&mut app, 77, true);
+        app.insert_resource(crate::cluster::package::PackageValidationStatus::Failed(
+            "requested package failed".into(),
+        ));
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+            0.25,
+        )));
+        for _ in 0..(STARTUP_LIFT_TIMEOUT_SECONDS / 0.25).ceil() as usize + 10 {
+            app.update();
+        }
+        assert_eq!(
+            cover_alpha(&mut app),
+            Some(1.0),
+            "a failed requested cluster package cannot be replaced by a timeout"
         );
     }
 

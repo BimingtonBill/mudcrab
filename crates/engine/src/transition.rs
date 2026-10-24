@@ -1465,12 +1465,13 @@ fn apply_door_crossings(
     mut profiler: ResMut<ProfilingState>,
     // With a replacement policy the crossing also waits for the portal's own view of this door to be
     // proved ready by a current ready report for the exact key; see `PortalPrewarm::is_proved`.
-    (policy, prewarm, generations, reports, mut proof_diagnostic): (
+    (policy, prewarm, generations, reports, mut proof_diagnostic, loading): (
         Option<Res<crate::swap_bridge::destination::RequiredHandoff>>,
         Option<Res<crate::portal::PortalPrewarm>>,
         Option<Res<crate::swap_bridge::destination::Generations>>,
         Option<Res<crate::swap_bridge::destination::DestinationReports>>,
         Local<Option<String>>,
+        Option<Res<crate::cluster::loading::ClusterLoadingGate>>,
     ),
 ) {
     // One crossing at a time. A frame can carry a walk through one doorway and a marker firing
@@ -1631,6 +1632,16 @@ fn apply_door_crossings(
     }
     if proof_diagnostic.is_some() {
         *proof_diagnostic = None;
+    }
+    if let SpaceTarget::Exterior(world) = target
+        && loading
+            .as_ref()
+            .is_some_and(|loading| !loading.world_ready(world))
+    {
+        // Keep rendering the portal/prewarm consumer whose proof is required.
+        // CrossingHeld would shut that view and prevent it from becoming ready.
+        commands.entity(request.door).try_remove::<CrossingHeld>();
+        return;
     }
     // Read now, not when the request arrived: a crossing held for its destination can be let go in
     // a frame the door is already open in, and it is the landing at the swap that has to match the

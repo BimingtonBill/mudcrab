@@ -1,4 +1,4 @@
-//! Current-frame source and visibility facts for complementary cluster selection.
+//! Source qualification and exact per-view drawability for permanently owned clusters.
 //! Certification stays at package open; this module never hashes source files per view.
 use super::*;
 use crate::{
@@ -10,7 +10,6 @@ use crate::{
             SourceNodePose, SourcePrimitive, SourcePrimitiveMesh, SourcePrimitiveTransform,
             SourceStaticModel,
         },
-        stock_visibility::ClassFilter,
     },
     portal::{PortalCamera, PortalPrewarm, PortalState, StreamedCellKey},
     streaming::{ActiveCell, RenderOrigin},
@@ -25,8 +24,8 @@ use bevy::{
         entity::{EntityHashMap, EntityHashSet},
         system::SystemParam,
     },
-    pbr::{MaterialBindGroupAllocators, RenderMaterialInstances},
-    render::view::{RenderShadowMapVisibleEntities, RenderVisibleEntitiesClass},
+    pbr::MaterialBindGroupAllocators,
+    render::view::RenderShadowMapVisibleEntities,
 };
 use std::collections::{BTreeSet, HashSet};
 
@@ -38,6 +37,10 @@ mod source_fallback_bridge;
 
 #[path = "candidate_worlds.rs"]
 mod candidate_worlds;
+#[path = "queued_proof.rs"]
+pub(super) mod queued_proof;
+#[path = "readiness_bridge.rs"]
+mod readiness_bridge;
 #[path = "source_index.rs"]
 mod source_index;
 use candidate_worlds::{CandidateInputs, CandidateWorlds, candidate_worlds};
@@ -53,6 +56,9 @@ pub(super) struct Sources {
     candidate_version: u64,
     candidate_worlds: CandidateWorlds,
     certificate: Option<Arc<super::super::reader::CertifiedPackage>>,
+    /// Initial terminal material refusals, never transient render failures.
+    permanently_refused_records: BTreeSet<RecordKey>,
+    terminal_revision: Option<u64>,
     present: BTreeSet<u32>,
     /// Complete, unchanged stock sources hidden ONLY by their owning cell's
     /// streaming retirement. History/bindings remain for material proof/revival.
@@ -97,7 +103,11 @@ pub(super) struct Sources {
     fixture_layout_scope: bool,
     /// Definitive global template/material refusal, separate from loading false values.
     source_fallback_batches: BTreeSet<u32>,
+    /// Unsupported material features, excluding failed or invalid source resources.
+    material_refused_batches: BTreeSet<u32>,
+    template_revision: u64,
     pub(super) worlds: HashMap<MainEntity, Option<u32>>,
+    expected_cameras: HashMap<MainEntity, u32>,
     /// None is an unknown local-light dependency domain, distinct from proven empty.
     light_dependencies: HashMap<MainEntity, Option<HashSet<MainEntity>>>,
     invalid_meshes: HashSet<AssetId<Mesh>>,
@@ -279,6 +289,7 @@ struct TemplateRow {
     stock_tangents: Option<bool>,
     template: bool,
     fallback: bool,
+    material_refused: bool,
     pending: bool,
 }
 
@@ -305,8 +316,8 @@ struct TemplateAssets<'a> {
     fixtures: Option<&'a ClusterBatchStockMeshes>,
 }
 
-/// One batch's row: a stock fallback once the loader gave up on the batch (its source or material
-/// failed for good), nothing yet without a material handle, else the template decision.
+/// Keep resource failures distinct from unsupported material features. A failed
+/// owned batch must block loading, never establish stock ownership.
 fn batch_row(
     index: u32,
     handle: Option<&bevy::asset::UntypedHandle>,
@@ -361,6 +372,7 @@ fn template_row(
     if !geometry.supported {
         return TemplateRow {
             fallback: true,
+            material_refused: true,
             ..default()
         };
     }
@@ -387,10 +399,10 @@ fn template_row(
                 .get(mesh)
                 .map(|mesh| mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT));
             row.pending = row.stock_tangents.is_none();
-            row.fallback = caches.invalid_meshes.contains(&mesh.id())
-                || row
-                    .stock_tangents
-                    .is_some_and(|present| geometry.tangents && !present);
+            row.material_refused = row
+                .stock_tangents
+                .is_some_and(|present| geometry.tangents && !present);
+            row.fallback = caches.invalid_meshes.contains(&mesh.id()) || row.material_refused;
             if row.fallback {
                 row.stock_tangents = None;
             }
@@ -440,10 +452,10 @@ fn template_row(
             .and_then(|id| inputs.meshes.get(*id))
             .map(|mesh| mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT));
         row.pending |= mesh.is_some() && row.stock_tangents.is_none();
-        row.fallback |= mesh.is_none()
-            || row
-                .stock_tangents
-                .is_some_and(|present| geometry.tangents && !present);
+        row.material_refused = row
+            .stock_tangents
+            .is_some_and(|present| geometry.tangents && !present);
+        row.fallback |= mesh.is_none() || row.material_refused;
         if row.fallback || row.pending {
             row.template = false;
             row.stock_tangents = None;
@@ -493,6 +505,36 @@ fn terrain_visibility_change(
 ) -> (bool, bool) {
     let changed = previous != current;
     (changed, changed && !previous.is_subset(current))
+}
+
+/// Local shadow views have no camera auxiliary entity. An unparented light
+/// can inherit a world only when all dependent camera roles agree. Explicit
+/// authored light/cell ownership remains authoritative; ambiguity stays missing.
+fn complete_light_worlds(
+    worlds: &mut HashMap<MainEntity, Option<u32>>,
+    dependencies: &HashMap<MainEntity, Option<HashSet<MainEntity>>>,
+) {
+    let mut inferred: HashMap<MainEntity, HashSet<Option<u32>>> = HashMap::new();
+    for (camera, lights) in dependencies {
+        let (Some(world), Some(lights)) = (worlds.get(camera), lights) else {
+            continue;
+        };
+        for light in lights {
+            if !worlds.contains_key(light) {
+                inferred.entry(*light).or_default().insert(*world);
+            }
+        }
+    }
+    for (light, candidates) in inferred {
+        worlds.insert(
+            light,
+            if candidates.len() == 1 {
+                candidates.into_iter().next().flatten()
+            } else {
+                None
+            },
+        );
+    }
 }
 
 fn collect_terrain_visibility(
@@ -600,20 +642,6 @@ struct RetiredEligibility {
     casts_shadows: bool,
 }
 
-fn retired_allowed_for_view(
-    sources: &HashMap<MainEntity, RetiredEligibility>,
-    view_layers: &RenderLayers,
-    shadow: bool,
-) -> bevy::platform::collections::HashSet<MainEntity> {
-    sources
-        .iter()
-        .filter_map(|(main, source)| {
-            (source.layers.intersects(view_layers) && (!shadow || source.casts_shadows))
-                .then_some(*main)
-        })
-        .collect()
-}
-
 type NodeState = (
     &'static Transform,
     Option<&'static SourceNodePose>,
@@ -662,11 +690,21 @@ type SourceMaterialState = (
     Has<bevy::light::NotShadowCaster>,
 );
 
+type RequiredPrepassViews<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    Or<(
+        With<bevy::core_pipeline::prepass::DepthPrepass>,
+        With<bevy::core_pipeline::prepass::NormalPrepass>,
+        With<bevy::core_pipeline::prepass::MotionVectorPrepass>,
+    )>,
+>;
+
 type SelectionViewState = (
     Entity,
     &'static ExtractedView,
     Option<&'static LightEntity>,
-    Option<&'static mut RenderVisibleEntities>,
     Option<&'static RenderLayers>,
 );
 
@@ -1134,10 +1172,13 @@ type SourceGeometryAssets<'w> = (
     Option<Res<'w, ClusterBatchStockMeshes>>,
 );
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn extract_sources(
     mut out: ResMut<Sources>,
-    package: Extract<Option<Res<ValidatedPackage>>>,
+    (package, ownership): (
+        Extract<Option<Res<ValidatedPackage>>>,
+        Extract<Option<Res<crate::cluster::ownership::OwnershipFacts>>>,
+    ),
     scene: Extract<Option<Res<ClusterScene>>>,
     lazy: Extract<Option<Res<LazyBatches>>>,
     geometry_assets: Extract<SourceGeometryAssets>,
@@ -1151,12 +1192,11 @@ fn extract_sources(
     origin: Extract<Option<Res<RenderOrigin>>>,
     mut events: Extract<SourceEvents>,
     asset_server: Extract<Option<Res<AssetServer>>>,
-    (mut timing, settings): (Local<SourceExtractionTiming>, Option<Res<ClusterSettings>>),
+    mut timing: Local<SourceExtractionTiming>,
 ) {
     perf_span!("cluster::handoff::extract_sources");
     // PI1 suppression is independent of extraction. Lifecycle and hot changes
     // invalidate stock proof in either ownership mode.
-    let own_statics = settings.is_some_and(|settings| settings.own_statics);
     let (assets, stock_meshes, fixture_meshes) = &*geometry_assets;
     let out = &mut *out;
     let queries = &mut *queries;
@@ -1227,6 +1267,23 @@ fn extract_sources(
         }
     }
     let certificate = package.as_ref().map(|package| package.0.clone());
+    let facts = ownership.as_deref().filter(|facts| {
+        certificate
+            .as_ref()
+            .is_some_and(|package| facts.package_matches(package))
+    });
+    let terminal_revision = facts.map(|facts| facts.terminal_revision());
+    let permanent_changed = terminal_revision != out.terminal_revision
+        || certificate
+            .as_ref()
+            .zip(out.certificate.as_ref())
+            .is_some_and(|(a, b)| !Arc::ptr_eq(a, b));
+    if permanent_changed {
+        out.permanently_refused_records = facts
+            .map(|facts| facts.permanent_refused_records())
+            .unwrap_or_default();
+        out.terminal_revision = terminal_revision;
+    }
     let same = match (&certificate, &out.certificate) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,
@@ -1872,8 +1929,7 @@ fn extract_sources(
     };
     out.lazy_scenes_key = lazy_scenes_key;
     redo.extend(dropped_fixture_rows);
-    // A batch the loader gave up on (its source or material failed for good) draws stock: its row
-    // is decided once, as a fallback, so the references it decides are decided too.
+    // Resource failures invalidate drawability but cannot change primitive ownership.
     let lazy_failed_key = lazy.as_deref().map(LazyBatches::failed_key);
     if let Some(lazy) = lazy
         .as_deref()
@@ -1901,6 +1957,7 @@ fn extract_sources(
             .is_none_or(|last| (*last as usize) < batches);
     let mut layout_changed = false;
     let rebuilt = (!unchanged).then(|| {
+        out.template_revision = out.template_revision.wrapping_add(1);
         let (mut templates, mut normal_maps, mut source_fallback_batches) = if full {
             (vec![false; batches], vec![false; batches], BTreeSet::new())
         } else {
@@ -1926,6 +1983,11 @@ fn extract_sources(
             meshes: stock_meshes,
             fixtures: fixture_meshes.as_deref(),
         };
+        if full {
+            out.material_refused_batches.clear();
+        }
+        out.material_refused_batches
+            .retain(|index| (*index as usize) < batches);
         source_fallback_batches.retain(|index| (*index as usize) < batches);
         out.template_inputs.truncate(batches);
         for index in std::mem::take(&mut redo) {
@@ -1965,6 +2027,11 @@ fn extract_sources(
             templates[index as usize] = row.template;
             normal_maps[index as usize] = row.normal_map;
             stock_tangents[index as usize] = row.stock_tangents;
+            if row.material_refused {
+                out.material_refused_batches.insert(index);
+            } else {
+                out.material_refused_batches.remove(&index);
+            }
             if row.fallback {
                 source_fallback_batches.insert(index);
             } else {
@@ -2035,6 +2102,7 @@ fn extract_sources(
         });
     let lights_span = ::bevy::log::info_span!("cluster::sources::lights_worlds").entered();
     let mut light_dependencies = HashMap::new();
+    let mut expected_cameras = HashMap::new();
     for (entity, camera, graphics, streaming, is_portal, clusters, visible) in &queries.cameras {
         if !camera.is_active {
             continue;
@@ -2047,10 +2115,16 @@ fn extract_sources(
         );
         if is_portal {
             worlds.insert(entity.into(), portal_world);
+            if let Some(world) = portal_world {
+                expected_cameras.insert(entity.into(), world);
+            }
         } else if streaming
             || graphics == Some(&crate::graphics_settings::GraphicsCamera::WaterReflection)
         {
             worlds.insert(entity.into(), active_world);
+            if let Some(world) = active_world {
+                expected_cameras.insert(entity.into(), world);
+            }
         }
     }
     for (entity, parent) in &queries.light_parents {
@@ -2071,6 +2145,7 @@ fn extract_sources(
             at = queries.parents.get(ancestor).ok().map(ChildOf::parent);
         }
     }
+    complete_light_worlds(&mut worlds, &light_dependencies);
     drop(lights_span);
     let compare_span = ::bevy::log::info_span!("cluster::sources::compare").entered();
     let certificate_changed = !same;
@@ -2118,7 +2193,7 @@ fn extract_sources(
     let normal_maps_changed = rebuilt
         .as_ref()
         .is_some_and(|(_, normal_maps)| out.normal_maps != *normal_maps);
-    let worlds_changed = out.worlds != worlds;
+    let worlds_changed = out.worlds != worlds || out.expected_cameras != expected_cameras;
     let light_dependencies_changed = out.light_dependencies != light_dependencies;
     let terrain_change = fresh_terrain
         .as_ref()
@@ -2130,7 +2205,8 @@ fn extract_sources(
         .map_or((false, false), |visible| {
             terrain_visibility_change(&out.terrain_visible, visible)
         });
-    let candidate_changed = certificate_changed
+    let candidate_changed = permanent_changed
+        || certificate_changed
         || present_changed
         || retired_refs_changed
         || retired_present_changed
@@ -2150,6 +2226,12 @@ fn extract_sources(
         || terrain_visible_changed
     {
         let delta = candidate_changed.then(|| {
+            if permanent_changed {
+                return CandidateWorlds {
+                    all: true,
+                    ..default()
+                };
+            }
             candidate_worlds(
                 &out.candidate_inputs(),
                 &CandidateInputs {
@@ -2219,6 +2301,7 @@ fn extract_sources(
             out.normal_maps = normal_maps;
         }
         out.worlds = worlds;
+        out.expected_cameras = expected_cameras;
         out.light_dependencies = light_dependencies;
         if let Some(terrain) = fresh_terrain {
             out.terrain = terrain;
@@ -2283,7 +2366,6 @@ fn extract_sources(
             template_full = full,
             template_stale,
             handles_changed = handles.is_changed(),
-            own_statics,
             query_filters_changed = queries.query_filters.is_changed(),
             structural_changed,
             fetch_gap,
@@ -2341,89 +2423,36 @@ enum Domain {
     Shadow(Entity, RetainedViewEntity),
 }
 
-#[derive(Default)]
-struct DomainFacts {
-    consumers: Vec<RetainedViewEntity>,
-    visible: bevy::platform::collections::HashSet<MainEntity>,
-    /// Whether `visible` was read this frame (one visibility class serves the whole domain).
-    collected: bool,
-    /// Whether `visible`, or the stock material of a mesh in it, may differ from last frame's.
-    changed: bool,
+/// Cluster instances belong to a world role, not the carrier's render layer.
+/// Portal isolation uses the destination role. Shadow views inherit the light's
+/// world already resolved in `Sources`, often without their own render layers.
+struct ViewDomain {
+    terrain: bool,
+    objects: bool,
 }
 
-/// A domain's visible stock meshes, kept between frames and moved by the visibility class's own
-/// added and removed lists, so a frame in which nothing came into or left view reads nothing.
-#[derive(Default)]
-struct DomainVisible {
-    set: bevy::platform::collections::HashSet<MainEntity>,
-    /// The `Filters::frames` it was last updated in: a delta applies to last frame's set only.
-    frame: u64,
-}
-
-/// Brings `previous` (last frame's visible set of a domain) to this frame's `class`, and says
-/// whether it changed. The class's added and removed lists are the change since last frame,
-/// including what the stock visibility filters ahead of the selection hid or gave back (see
-/// [`ClassFilter::apply`]), so they apply only to the set of the frame just before; anything else
-/// is read in full.
-fn update_domain_visible(
-    previous: Option<DomainVisible>,
-    class: Option<&RenderVisibleEntitiesClass>,
-    frame: u64,
-) -> (DomainVisible, bool) {
-    let consecutive = previous
-        .as_ref()
-        .is_some_and(|previous| previous.frame.wrapping_add(1) == frame);
-    let mut visible = previous.unwrap_or_default();
-    visible.frame = frame;
-    let changed = match class {
-        Some(class) if consecutive => {
-            for (_, main) in &class.removed_entities {
-                visible.set.remove(main);
-            }
-            for (_, main) in &class.added_entities {
-                visible.set.insert(*main);
-            }
-            !class.removed_entities.is_empty() || !class.added_entities.is_empty()
+impl ViewDomain {
+    fn new(layers: &RenderLayers, shadow: bool) -> Self {
+        let world_layers =
+            crate::render::reflectable_world_layers().with(crate::portal::DESTINATION_LAYER);
+        let terrain = shadow || layers.intersects(&world_layers);
+        Self {
+            terrain,
+            objects: terrain || layers.intersects(&crate::render::PLACED_OBJECT_RENDER_LAYERS),
         }
-        Some(class) => {
-            visible.set.clear();
-            visible
-                .set
-                .extend(class.iter_visible().map(|(_, main)| *main));
-            true
-        }
-        None => {
-            let changed = !consecutive || !visible.set.is_empty();
-            visible.set.clear();
-            changed
-        }
-    };
-    (visible, changed)
+    }
 }
 
 #[derive(Resource, Default)]
 struct Filters {
     frames: u64,
-    /// `BatchMaterialNow::fingerprint` of every batch, as of the last frame, and a count of the
-    /// frames on which it changed.
-    material_frame: Vec<usize>,
+    /// Exact mutation revisions for prepared assets and the small material-type allocator set.
+    material_inputs: Option<(u64, Vec<(std::any::TypeId, u64)>)>,
     materials_revision: u64,
     /// One [`SelectionIndex`] per worldspace a view has selected in.
     indexes: HashMap<Option<u32>, SelectionIndex>,
     /// The current [`SelectionBase`]s, shared by views with the same inputs.
     bases: Vec<Arc<SelectionBase>>,
-    saved: HashMap<Domain, ClassFilter>,
-    active: HashSet<Domain>,
-    /// Each domain's visible stock meshes, as of the frame it was last selected in.
-    visible: HashMap<Domain, DomainVisible>,
-    /// Each domain's stock hide decision (what every consumer chose), as last applied.
-    joints: HashMap<
-        Domain,
-        (
-            Vec<RetainedViewEntity>,
-            bevy::platform::collections::HashSet<MainEntity>,
-        ),
-    >,
     /// Selections reused unchanged, and rebuilt, since the last report.
     reused: u64,
     rebuilt: u64,
@@ -2433,15 +2462,10 @@ pub(super) struct Selection {
     stamp: [u64; 7],
     /// The view's render layers the retired sources were filtered by.
     layers: RenderLayers,
-    visible: bevy::platform::collections::HashSet<MainEntity>,
     /// Shared with the view's readiness cache, so an unchanged readiness compares by pointer.
     readiness: Arc<Vec<bool>>,
-    stock_materials: HashMap<MainEntity, Option<bevy::asset::UntypedAssetId>>,
     mask: super::super::instance_mask::InstanceMask,
-    hidden: bevy::platform::collections::HashSet<MainEntity>,
     terrain_blocks: HashSet<u32>,
-    suppressed_contributors: usize,
-    suppressed_trees: usize,
 }
 
 /// Exact late-evaluation inputs for immutable terrain geometry in one ViewGpu.
@@ -2491,6 +2515,7 @@ pub(super) fn install(app: &mut App) {
     crate::streaming::identity_changes::install(app.world_mut());
     destination::install(app);
     source_fallback_bridge::install(app);
+    readiness_bridge::install(app);
     let Some(render) = app.get_sub_app_mut(RenderApp) else {
         return;
     };
@@ -2524,13 +2549,6 @@ pub(super) fn install(app: &mut App) {
                 .after(RenderSystems::PrepareBindGroups)
                 .before(crate::swap_bridge::systems::DestinationSystems::Evaluate)
                 .before(RenderSystems::Render),
-        )
-        .add_systems(
-            Render,
-            restore_stock
-                .in_set(crate::streaming::terrain_handoff::TerrainHandoffSystems::ClusterRestore)
-                .in_set(RenderSystems::Cleanup)
-                .before(crate::streaming::native_lod::NativeLodSystems::Restore),
         );
 }
 
@@ -2713,18 +2731,8 @@ fn finalize_terrain_clips(
                 .collect();
             forward.sort_unstable();
             depth.sort_unstable();
-            let mut hidden_stock: Vec<_> = sources
-                .stock_primitives
-                .iter()
-                .filter(|(_, main)| selection.hidden.contains(*main))
-                .map(|(identity, _)| *identity)
-                .collect();
-            hidden_stock.sort_unstable();
-            let mut hash = std::hash::DefaultHasher::new();
-            hidden_stock.hash(&mut hash);
             debug!(?key, ?world, origin=?inputs.origin, camera=?view.world_from_view.to_matrix(),
                 projection=?view.clip_from_view, ?selected, ?forward, ?depth,
-                hidden_stock_count=hidden_stock.len(), hidden_stock_hash=hash.finish(),
                 clip_hash={let mut h=std::hash::DefaultHasher::new(); bytes.hash(&mut h); h.finish()},
                 ?far_revision, "cluster terrain representation inputs changed");
         }
@@ -2793,21 +2801,10 @@ struct BatchMaterialNow<'a> {
     shadow_ok: bool,
 }
 
-impl BatchMaterialNow<'_> {
-    /// The material's identity and the shadow check in one word (prepared materials are at least
-    /// 2-aligned, so the low bit is free); 0 for a batch with no current material.
-    fn fingerprint(this: Option<Self>) -> usize {
-        this.map_or(0, |now| {
-            std::ptr::from_ref(now.material) as usize | usize::from(now.shadow_ok)
-        })
-    }
-}
-
 /// The inputs a view's batch readiness was computed from. Equal keys mean an equal result: every
 /// view fact `batch_ready_with` reads moves `ViewGpu::readiness_revision`, every batch fact moves
-/// `materials` (this frame's material table differs from the last) or the batch materials'
-/// asset-event version, shader invalidations advance an epoch, and pipeline compilation is
-/// counted per view.
+/// mutation-owned material/allocator revisions or the batch materials' asset-event
+/// version. Shader invalidation and compiled pipeline availability have exact epochs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ReadinessKey {
     materials: u64,
@@ -2817,22 +2814,12 @@ pub(super) struct ReadinessKey {
     layout: u64,
     batches: usize,
     view: u64,
-    pipelines_ready: usize,
+    pipelines: u64,
+    queued: u64,
+    shadow_warmup: bool,
     far_current: bool,
     shadow: bool,
     prepass: bool,
-}
-
-/// How many of the pipelines a view's readiness can name are compiled. The set itself is part of
-/// `ViewGpu::readiness_revision`; this catches one finishing compilation.
-fn view_pipelines_ready(view: &ViewGpu, cache: &PipelineCache) -> usize {
-    view.plan_reps
-        .iter()
-        .map(|rep| rep.pipeline)
-        .chain(view.shadow_pipelines.values().copied())
-        .chain(view.prepass_pipelines.values().copied())
-        .filter(|pipeline| cache.get_render_pipeline(*pipeline).is_some())
-        .count()
 }
 
 fn batch_materials_now<'a>(
@@ -2848,6 +2835,7 @@ fn batch_materials_now<'a>(
 
 /// Evaluate every batch against this render invocation's exact view plan and
 /// resources. Successful readiness is revalidated too; it is not monotonic.
+#[allow(clippy::too_many_arguments)]
 fn views_batch_readiness(
     gpu: &ClusterGpu,
     view: &ViewGpu,
@@ -2856,18 +2844,23 @@ fn views_batch_readiness(
     current: &[Option<BatchMaterialNow>],
     cache: &PipelineCache,
     far_current: bool,
+    queued: &queued_proof::QueuedBatchProof,
 ) -> Vec<bool> {
     par_batches(gpu.batches.len(), |batch| {
-        batch_ready_with(
-            gpu,
-            view,
-            batch,
-            current[batch],
-            || far_current,
-            shadow,
-            prepass,
-            cache,
-        )
+        queued.main.get(batch) == Some(&true)
+            && (!prepass
+                || current[batch].is_some_and(|now| !now.material.properties.prepass_enabled)
+                || queued.prepass.get(batch) == Some(&true))
+            && batch_ready_with(
+                gpu,
+                view,
+                batch,
+                current[batch],
+                || far_current,
+                shadow,
+                prepass,
+                cache,
+            )
     })
 }
 
@@ -3626,191 +3619,131 @@ fn select_instances(
     queue: Res<RenderQueue>,
     materials: Res<ErasedRenderAssets<PreparedMaterial>>,
     allocators: Res<MaterialBindGroupAllocators>,
-    stock_materials: Res<RenderMaterialInstances>,
-    prepass_phases: Res<ViewBinnedRenderPhases<Opaque3dPrepass>>,
-    mut views: Query<SelectionViewState>,
-    mut shadows: Query<&mut RenderShadowMapVisibleEntities>,
+    required_prepasses: RequiredPrepassViews,
+    queued_phases: queued_proof::QueuedPhases,
+    views: Query<SelectionViewState>,
     scene: Option<Res<ClusterScene>>,
     mut filters: ResMut<Filters>,
-    (native, settings, batch_materials, runtime_state, mut terrain_coverage, dirty, shaders): (
+    (native, batch_materials, runtime_state, mut terrain_coverage, shaders): (
         Option<Res<crate::streaming::native_lod::FarNativePolicy>>,
-        Option<Res<ClusterSettings>>,
         Option<Res<super::ClusterBatchMaterials>>,
         Option<Res<super::super::runtime_state::RuntimeReferenceState>>,
         ResMut<crate::streaming::terrain_handoff::ClusterCoverage>,
-        Option<Res<bevy::render::camera::DirtySpecializations>>,
         Option<Res<ShaderInvalidations>>,
     ),
 ) {
     let Some(mut gpu) = gpu else {
-        // Clear even if a withdrawn GPU/package means this frame has no selection.
         terrain_coverage.views.clear();
         return;
     };
     perf_span!("cluster::select::total");
-    let own_statics = settings
-        .as_ref()
-        .is_some_and(|settings| settings.own_statics);
     filters.frames = filters.frames.wrapping_add(1);
-    // Bases no view holds any more are dropped; the views keep theirs alive.
     filters.bases.retain(|base| Arc::strong_count(base) > 1);
-    let mut domains: HashMap<Domain, DomainFacts> = HashMap::new();
-    let mut layers_by_view = HashMap::new();
-    let mut previous_visible = std::mem::take(&mut filters.visible);
-    for (entity, view, light, visible, layers) in &views {
-        let key = view.retained_view_entity;
-        if !gpu.views.contains_key(&key) {
-            continue;
-        }
-        layers_by_view.insert(key, layers.cloned().unwrap_or_default());
-        let domain = light.map_or(Domain::Camera(entity), |light| shadow_domain(light, key));
-        let visible = match domain {
-            Domain::Camera(_) => visible,
-            Domain::Shadow(light, key) => shadows
-                .get(light)
-                .ok()
-                .and_then(|shadow| shadow.subviews.get(&key)),
-        };
-        let facts = domains.entry(domain).or_default();
-        facts.consumers.push(key);
-        // With owned statics no selection reads the visible set (see `selection_inputs`).
-        if own_statics || facts.collected {
-            continue;
-        }
-        facts.collected = true;
-        let (domain_visible, changed) = update_domain_visible(
-            previous_visible.remove(&domain),
-            visible.and_then(|visible| visible.get::<Mesh3d>()),
-            filters.frames,
-        );
-        facts.visible = domain_visible.set;
-        facts.changed = changed;
-    }
-    drop(previous_visible);
-    // A stock mesh whose material changed (or went) changes what its view's selection binds,
-    // even when nothing came into or left view.
-    for facts in domains.values_mut() {
-        if facts.changed || !facts.collected {
-            continue;
-        }
-        facts.changed = dirty.as_deref().is_none_or(|dirty| {
-            dirty
-                .changed_renderables
-                .iter()
-                .chain(&dirty.removed_renderables)
-                .any(|main| facts.visible.contains(main))
-        });
-    }
     let compute_ready = prepared_cluster_cull(&gpu, &frame, &pipelines, &cache).is_some();
     let same_certificate = match (&gpu.certificate, &sources.certificate) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,
         _ => false,
     };
-    let current_materials = {
-        perf_span!("cluster::select::materials");
-        batch_materials_now(&gpu, &materials, &allocators)
-    };
-    // The table is rebuilt every frame (a bindless slab can lose its bind group with no event of
-    // its own); the views' cached readiness only needs to know whether it differs from the last.
-    if current_materials.len() != filters.material_frame.len()
-        || current_materials
-            .iter()
-            .zip(&filters.material_frame)
-            .any(|(now, last)| BatchMaterialNow::fingerprint(*now) != *last)
-    {
-        filters.material_frame = current_materials
-            .iter()
-            .map(|now| BatchMaterialNow::fingerprint(*now))
-            .collect();
-        filters.materials_revision += 1;
+    let mut allocator_revisions: Vec<_> = allocators
+        .iter()
+        .map(|(kind, allocator)| (*kind, allocator.readiness_revision()))
+        .collect();
+    allocator_revisions.sort_unstable_by_key(|(kind, _)| *kind);
+    let material_inputs = (materials.revision(), allocator_revisions);
+    if filters.material_inputs.as_ref() != Some(&material_inputs) {
+        filters.material_inputs = Some(material_inputs);
+        filters.materials_revision = filters.materials_revision.wrapping_add(1);
     }
-    // The views whose selection this frame rebuilt; only their masks can have changed.
-    let mut rebuilt = HashSet::new();
+    // Hold no per-batch table on a settled frame. Multiple changed views share one build.
+    let mut current_materials = None;
     let mut covered_views = HashSet::new();
-    for (domain, facts) in &domains {
-        perf_span!("cluster::select::domain");
-        let shadow = matches!(domain, Domain::Shadow(..));
-        for key in &facts.consumers {
-            let world = sources
-                .worlds
-                .get(&key.main_entity)
-                .or_else(|| sources.worlds.get(&key.auxiliary_entity))
-                .copied()
-                .flatten();
-            // A batch needs a prepass draw only where the cluster path draws into the prepass at
-            // all (`--no-cluster-prepass` leaves the camera's prepass to the stock meshes).
-            let prepass = prepass_phases.contains_key(key)
-                && settings.as_ref().is_none_or(|settings| settings.prepass);
-            let layers: &RenderLayers = &layers_by_view[key];
-            let readiness_span = ::bevy::log::info_span!("cluster::select::readiness").entered();
-            let view_gpu = &gpu.views[key];
-            // Whether the view's far binding is current is one fact per view, not per batch.
-            let far_current = !shadow && super::far::current(&gpu, view_gpu, far_state.as_deref());
-            let readiness_key = ReadinessKey {
-                materials: filters.materials_revision,
-                material_events: batch_materials
-                    .as_ref()
-                    .map_or(0, |materials| materials.version),
-                shader_invalidations: shaders.as_ref().map_or(0, |shaders| shaders.version),
-                generation: gpu.generation,
-                layout: gpu.layout_epoch,
-                batches: gpu.batches.len(),
-                view: view_gpu.readiness_revision,
-                pipelines_ready: view_pipelines_ready(view_gpu, &cache),
-                far_current,
-                shadow,
-                prepass,
-            };
-            let readiness = match &view_gpu.readiness_cache {
-                Some((cached, readiness)) if *cached == readiness_key => {
-                    // Every test run proves the key names every input.
-                    #[cfg(debug_assertions)]
-                    assert_eq!(
-                        **readiness,
-                        views_batch_readiness(
-                            &gpu,
-                            view_gpu,
-                            shadow,
-                            prepass,
-                            &current_materials,
-                            &cache,
-                            far_current,
-                        ),
-                        "cluster readiness changed under an unchanged key {readiness_key:?}"
-                    );
-                    readiness.clone()
-                }
-                _ => {
-                    crate::work_counters::record("cluster_select/readiness");
-                    let readiness = Arc::new(views_batch_readiness(
+    for (entity, extracted, light, layers) in &views {
+        let key = extracted.retained_view_entity;
+        if !gpu.views.contains_key(&key) {
+            continue;
+        }
+        let shadow = light.is_some();
+        let batch_count = gpu.batches.len();
+        let queued = queued_proof::queued_batch_proof(
+            gpu.views.get_mut(&key).unwrap(),
+            batch_count,
+            &key,
+            shadow,
+            &queued_phases,
+        );
+        let view_gpu = &gpu.views[&key];
+        let world = sources
+            .worlds
+            .get(&key.main_entity)
+            .or_else(|| sources.worlds.get(&key.auxiliary_entity))
+            .copied()
+            .flatten();
+        // Requirements come from the camera, even while a requested phase is absent.
+        let prepass = !shadow && required_prepasses.contains(entity);
+        let layers = layers.cloned().unwrap_or_default();
+        let far_current = !shadow && super::far::current(&gpu, view_gpu, far_state.as_deref());
+        let readiness_key = ReadinessKey {
+            materials: filters.materials_revision,
+            material_events: batch_materials
+                .as_ref()
+                .map_or(0, |materials| materials.version),
+            shader_invalidations: shaders.as_ref().map_or(0, |shaders| shaders.version),
+            generation: gpu.generation,
+            layout: gpu.layout_epoch,
+            batches: gpu.batches.len(),
+            view: view_gpu.readiness_revision,
+            pipelines: cache.readiness_revision(),
+            queued: queued.revision,
+            shadow_warmup: pipelines.shadow_warmup.is_ready(),
+            far_current,
+            shadow,
+            prepass,
+        };
+        let readiness = match &view_gpu.readiness_cache {
+            Some((cached, readiness)) if *cached == readiness_key => readiness.clone(),
+            _ => {
+                crate::work_counters::record("cluster_select/readiness");
+                let readiness = Arc::new(if readiness_key.shadow_warmup {
+                    views_batch_readiness(
                         &gpu,
                         view_gpu,
                         shadow,
                         prepass,
-                        &current_materials,
+                        current_materials.get_or_insert_with(|| {
+                            crate::work_counters::record("cluster_select/material_readiness");
+                            batch_materials_now(&gpu, &materials, &allocators)
+                        }),
                         &cache,
                         far_current,
-                    ));
-                    gpu.views.get_mut(key).unwrap().readiness_cache =
-                        Some((readiness_key, readiness.clone()));
-                    readiness
-                }
-            };
-            drop(readiness_span);
-            let stamp = [
-                sources.version,
-                gpu.layout_epoch,
-                gpu.generation,
-                world.map_or(0, |world| u64::from(world) + 1),
-                u64::from(compute_ready && same_certificate),
-                native.as_ref().map_or(0, |policy| policy.revision),
-                runtime_state.as_ref().map_or(0, |state| state.revision),
-            ];
-            // The visible set changes nearly every frame and the instantiated references change
-            // while cells load; neither touches most of the selection. The base pass reruns only
-            // when its own inputs change and is shared by views with the same inputs; per frame,
-            // only the instantiated references' instances are decided against the visible set.
+                        &queued,
+                    )
+                } else {
+                    vec![false; gpu.batches.len()]
+                });
+                gpu.views.get_mut(&key).unwrap().readiness_cache =
+                    Some((readiness_key, readiness.clone()));
+                readiness
+            }
+        };
+        let stamp = [
+            sources.version,
+            gpu.layout_epoch,
+            gpu.generation,
+            world.map_or(0, |world| u64::from(world) + 1),
+            u64::from(compute_ready && same_certificate),
+            native.as_ref().map_or(0, |policy| policy.revision),
+            runtime_state.as_ref().map_or(0, |state| state.revision),
+        ];
+        // Owned objects have no stock bodies. Only source/readiness/layer changes
+        // affect their masks; stock frustum membership cannot revoke ownership.
+        let stale = gpu.views[&key].selection.as_ref().is_none_or(|selection| {
+            selection.stamp != stamp
+                || selection.layers != layers
+                || !Arc::ptr_eq(&selection.readiness, &readiness)
+        });
+        if stale {
+            filters.rebuilt += 1;
             let data = SelectionData {
                 identity: gpu.identity,
                 placed: &gpu.placed,
@@ -3838,493 +3771,143 @@ fn select_instances(
                 drawable: compute_ready && same_certificate,
                 native_revision: native.as_ref().map_or(0, |policy| policy.revision),
             };
-            let filters_now = &mut *filters;
-            let index = &filters_now.indexes[&world];
-            let states_span = ::bevy::log::info_span!("cluster::select::states").entered();
             let states = SelectionBase::states(&sources, &readiness, index.batches.len());
-            let current = gpu.views[key].selection_base.clone();
-            let base_stale = current
-                .as_ref()
-                .is_none_or(|base| !base.matches(inputs, &states, index));
-            drop(states_span);
-            if base_stale {
-                perf_span!("cluster::select::base_update");
-                let base = match filters_now
-                    .bases
-                    .iter()
-                    .find(|base| base.matches(inputs, &states, index))
-                {
-                    Some(base) => base.clone(),
-                    None => {
-                        let base = Arc::new(match current.as_deref() {
-                            Some(previous) => {
-                                previous.update(&data, index, native.as_deref(), inputs, states)
-                            }
-                            None => SelectionBase::build(
-                                &data,
-                                index,
-                                native.as_deref(),
-                                inputs,
-                                states,
-                            ),
-                        });
-                        filters_now.bases.push(base.clone());
-                        base
-                    }
-                };
-                gpu.views.get_mut(key).unwrap().selection_base = Some(base);
-            }
-            let view = &gpu.views[key];
-            // Nothing the selection reads moved (no stock mesh came into or left view, no stock
-            // material changed, the stamp and readiness are the same): it stands as it is,
-            // without reading the visible set at all.
-            let reusable = !facts.changed
-                && view.selection.as_ref().is_some_and(|selection| {
-                    selection.stamp == stamp
-                        && selection.readiness == readiness
-                        && selection.layers == *layers
-                });
-            let mut current_inputs = None;
-            let stale = !reusable && {
-                let retired_allowed =
-                    retired_allowed_for_view(&sources.retired_eligibility, layers, shadow);
-                // With owned statics nothing in the selection depends on the visible set: owned
-                // stock is hidden at spawn and stock terrain under cluster terrain is hidden by
-                // cell below.
-                let mut selection_inputs = if own_statics {
-                    bevy::platform::collections::HashSet::default()
-                } else {
-                    perf_span!("cluster::select::inputs_clone");
-                    facts.visible.clone()
-                };
-                selection_inputs.extend(retired_allowed.iter().copied());
-                let stock_span = ::bevy::log::info_span!("cluster::select::stock_ids").entered();
-                let retired_bound = sources.retired_materials.keys();
-                let stock_ids: HashMap<_, _> = if own_statics {
-                    HashMap::new()
-                } else {
-                    facts
-                        .visible
-                        .iter()
-                        .chain(retired_bound)
-                        .map(|main| {
-                            (
-                                *main,
-                                match sources.retired_materials.get(main) {
-                                    Some(material) => *material,
-                                    None => stock_materials
-                                        .instances
-                                        .get(main)
-                                        .map(|instance| instance.asset_id),
-                                },
-                            )
-                        })
-                        .collect()
-                };
-                drop(stock_span);
-                let matches_span = ::bevy::log::info_span!("cluster::select::matches").entered();
-                let stale = view.selection.as_ref().is_none_or(|selection| {
-                    selection.layers != *layers
-                        || !selection.matches(stamp, &selection_inputs, &readiness, &stock_ids)
-                });
-                drop(matches_span);
-                current_inputs = Some((retired_allowed, selection_inputs, stock_ids));
-                stale
+            let current = gpu.views[&key].selection_base.clone();
+            let base = match filters
+                .bases
+                .iter()
+                .find(|base| base.matches(inputs, &states, &filters.indexes[&world]))
+            {
+                Some(base) => base.clone(),
+                None => {
+                    let index = &filters.indexes[&world];
+                    let base = Arc::new(match current.as_deref() {
+                        Some(previous) => {
+                            previous.update(&data, index, native.as_deref(), inputs, states)
+                        }
+                        None => {
+                            SelectionBase::build(&data, index, native.as_deref(), inputs, states)
+                        }
+                    });
+                    filters.bases.push(base.clone());
+                    base
+                }
             };
-            if stale {
-                filters.rebuilt += 1;
-            } else {
-                filters.reused += 1;
-            }
-            if let Some((retired_allowed, selection_inputs, stock_ids)) =
-                current_inputs.filter(|_| stale)
-            {
-                perf_span!("cluster::select::overlay");
-                rebuilt.insert(*key);
-                let base = view.selection_base.as_ref().unwrap();
-                let index = &filters.indexes[&world];
-                let mut mask = base.mask.clone();
-                let mut hidden = bevy::platform::collections::HashSet::default();
-                // With owned statics the stock copies are hidden at spawn: the base already is
-                // what the view draws for them, and there is no stock binding to decide.
-                let present: &BTreeSet<u32> = if own_statics {
-                    &BTreeSet::new()
-                } else {
-                    &sources.present
-                };
-                for reference in present {
-                    if runtime_state
-                        .as_ref()
-                        .is_some_and(|state| state.contains(*reference))
-                    {
-                        continue;
-                    }
-                    for &(batch, position) in
-                        index.by_reference.get(reference).into_iter().flatten()
-                    {
-                        let object = &index.batches[batch as usize].objects[position as usize];
-                        let Some((record, reference)) = object.object else {
-                            continue;
-                        };
-                        if !base.mask.get(object.index) {
-                            continue;
+            let mut mask = base.mask.clone();
+            if !sources.permanently_refused_records.is_empty() {
+                for batch in &filters.indexes[&world].batches {
+                    for object in &batch.objects {
+                        if object.object.is_some_and(|(record, _)| {
+                            sources.permanently_refused_records.contains(&record)
+                        }) {
+                            mask.set(object.index, false)
+                                .expect("GPU instance fits allocated capacity");
                         }
-                        mask.set(object.index, false)
-                            .expect("GPU instance fits allocated capacity");
-                        let retired = sources.retired_refs.contains(&reference);
-                        let Some(main) = sources.bound.get(&record).filter(|main| {
-                            if retired {
-                                retired_allowed.contains(*main)
-                            } else {
-                                facts.visible.contains(*main)
-                            }
-                        }) else {
-                            continue;
-                        };
-                        let material = if retired {
-                            sources.retired_materials.get(main).copied().flatten()
-                        } else {
-                            stock_materials
-                                .instances
-                                .get(main)
-                                .map(|instance| instance.asset_id)
-                        };
-                        if material != gpu.batches[batch as usize].material {
-                            continue;
-                        }
-                        if !retired {
-                            hidden.insert(*main);
-                        }
-                        mask.set(object.index, true)
-                            .expect("GPU instance fits allocated capacity");
                     }
                 }
-                // Revoke every occurrence of this reference, including unloaded sources,
-                // before publishing ANY view's stock-hide decision. Shared meshes are untouched.
-                for reference in runtime_state
-                    .as_ref()
+            }
+            let domain = ViewDomain::new(&layers, shadow);
+            let terrain_visible = domain.terrain;
+            let objects_visible = domain.objects;
+            if !terrain_visible || !objects_visible {
+                for batch in &filters.indexes[&world].batches {
+                    if !terrain_visible {
+                        for &(index, _) in &batch.terrain {
+                            mask.set(index, false)
+                                .expect("GPU instance fits allocated capacity");
+                        }
+                    }
+                    if !objects_visible {
+                        for object in &batch.objects {
+                            mask.set(object.index, false)
+                                .expect("GPU instance fits allocated capacity");
+                        }
+                    }
+                }
+            }
+            // Runtime state changes remain explicit invalidations. They never
+            // authorize reinstating stock render components for an owned record.
+            for reference in runtime_state
+                .as_ref()
+                .into_iter()
+                .flat_map(|state| state.references())
+            {
+                for &(batch, position) in filters.indexes[&world]
+                    .by_reference
+                    .get(&reference)
                     .into_iter()
-                    .flat_map(|state| state.references())
+                    .flatten()
                 {
-                    for &(batch, position) in
-                        index.by_reference.get(&reference).into_iter().flatten()
-                    {
-                        let object = &index.batches[batch as usize].objects[position as usize];
-                        mask.set(object.index, false)
-                            .expect("GPU instance fits allocated capacity");
-                    }
+                    let object =
+                        &filters.indexes[&world].batches[batch as usize].objects[position as usize];
+                    mask.set(object.index, false)
+                        .expect("GPU instance fits allocated capacity");
                 }
-                let terrain_blocks = base.terrain_blocks.clone();
-                let (suppressed_contributors, suppressed_trees) =
-                    (base.suppressed_contributors, base.suppressed_trees);
-                // Terrain is complemented by terrain_handoff after this selection.
-                // Never hide stock terrain from a global/main-world readiness set.
-                gpu.views.get_mut(key).unwrap().selection = Some(Selection {
-                    stamp,
-                    layers: layers.clone(),
-                    visible: selection_inputs,
-                    readiness,
-                    stock_materials: stock_ids,
-                    mask,
-                    hidden,
-                    terrain_blocks,
-                    suppressed_contributors,
-                    suppressed_trees,
-                });
             }
-            let selected = gpu.views[key].selection.as_ref().unwrap();
-            if filters.frames.is_multiple_of(120)
-                && (selected.suppressed_contributors + selected.suppressed_trees > 0)
-            {
-                info!(view=?key,contributor_data_missing=selected.suppressed_contributors,tree_relation_proof_missing=selected.suppressed_trees,
-                    "native far LOD retained; certified far clusters suppressed");
-            }
-            let view = &gpu.views[key];
-            // The coverage follows the selection and the plan; it is made again only when one
-            // of them moved.
-            let covered = terrain_coverage.views.get(key).is_some_and(|coverage| {
-                !stale
-                    && coverage.generation == gpu.generation
-                    && coverage.layout == gpu.layout_epoch
-                    && coverage.plan == view.plan_epoch
-            });
-            if !covered {
-                terrain_coverage.views.insert(
-                    *key,
-                    crate::streaming::terrain_handoff::ClusterViewCoverage {
-                        generation: gpu.generation,
-                        layout: gpu.layout_epoch,
-                        plan: view.plan_epoch,
-                        cells: selected
-                            .terrain_blocks
-                            .iter()
-                            .flat_map(|index| {
-                                let block = &gpu.terrain_blocks[*index as usize];
-                                block
-                                    .cells
-                                    .iter()
-                                    .copied()
-                                    .map(move |cell| (block.worldspace_id, cell))
-                            })
-                            .collect(),
-                    },
-                );
-            }
-            covered_views.insert(*key);
-        }
-        // No consumer's selection was rebuilt and the consumers are last frame's: the hide
-        // decision stands, and so does every consumer's uploaded mask.
-        let domain_unchanged = facts.consumers.iter().all(|key| !rebuilt.contains(key))
-            && filters
-                .joints
-                .get(domain)
-                .is_some_and(|(consumers, _)| *consumers == facts.consumers);
-        if domain_unchanged
-            && facts
-                .consumers
-                .iter()
-                .all(|key| !gpu.views[key].instance_mask_bytes.is_empty())
-        {
-            continue;
-        }
-        let joint = if domain_unchanged {
-            filters.joints[domain].1.clone()
+            let selected = Selection {
+                stamp,
+                layers,
+                readiness,
+                mask,
+                terrain_blocks: base.terrain_blocks.clone(),
+            };
+            let view = gpu.views.get_mut(&key).unwrap();
+            view.selection_base = Some(base);
+            view.selection = Some(selected);
         } else {
-            perf_span!("cluster::select::joint");
-            facts
-                .consumers
-                .iter()
-                .fold(None, |joint, key| {
-                    let selection = gpu.views[key].selection.as_ref().unwrap();
-                    Some(intersect_hidden(joint, &selection.hidden))
-                })
-                .unwrap_or_default()
-        };
-        // Several dependent views can share one point/spot visibility table.
-        // Suppress its stock primitive only when EVERY consumer independently chose it.
-        for key in &facts.consumers {
-            // With owned statics no stock copy is bound (the stock binding is not tracked), so
-            // a view's mask is its selection's mask, which changes only when it is rebuilt.
-            if own_statics
-                && !rebuilt.contains(key)
-                && !gpu.views[key].instance_mask_bytes.is_empty()
-            {
-                continue;
-            }
-            perf_span!("cluster::select::mask_upload");
-            let selection = gpu.views[key].selection.as_ref().unwrap();
-            let mask = complementary_mask(
-                selection,
-                &joint,
-                gpu.placed
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, instance)| {
-                        if let ClusterInstanceIdentity::Object(record) = instance.identity {
-                            if gpu
-                                .certificate
-                                .as_ref()
-                                .and_then(|package| package.record(&record))
-                                .is_some_and(|identity| {
-                                    sources.retired_refs.contains(&identity.reference)
-                                })
-                            {
-                                return None;
-                            }
-                            sources
-                                .bound
-                                .get(&record)
+            filters.reused += 1;
+        }
+        let view = &gpu.views[&key];
+        let selected = view.selection.as_ref().unwrap();
+        let covered = terrain_coverage.views.get(&key).is_some_and(|coverage| {
+            !stale
+                && coverage.generation == gpu.generation
+                && coverage.layout == gpu.layout_epoch
+                && coverage.plan == view.plan_epoch
+        });
+        if !covered {
+            terrain_coverage.views.insert(
+                key,
+                crate::streaming::terrain_handoff::ClusterViewCoverage {
+                    generation: gpu.generation,
+                    layout: gpu.layout_epoch,
+                    plan: view.plan_epoch,
+                    cells: selected
+                        .terrain_blocks
+                        .iter()
+                        .flat_map(|index| {
+                            let block = &gpu.terrain_blocks[*index as usize];
+                            block
+                                .cells
+                                .iter()
                                 .copied()
-                                .map(|main| (index as u32, main))
-                        } else {
-                            None
-                        }
-                    }),
+                                .map(move |cell| (block.worldspace_id, cell))
+                        })
+                        .collect(),
+                },
             );
+        }
+        covered_views.insert(key);
+        if stale || view.instance_mask_bytes.is_empty() {
             let mut bytes = Vec::new();
-            mask.append_le_bytes(&mut bytes);
-            debug_assert_eq!(mask.capacity(), gpu.capacity_instances);
-            debug_assert!(mask.enabled_count() <= gpu.total_instances);
+            selected.mask.append_le_bytes(&mut bytes);
             let offset = gpu.batches.len().max(1) as u64 * 16;
-            let view = gpu.views.get_mut(key).unwrap();
+            let view = gpu.views.get_mut(&key).unwrap();
             if bytes != view.instance_mask_bytes {
-                #[cfg(feature = "tracy")]
-                let _span =
-                    bevy::log::info_span!("cluster::upload::instance_mask", bytes = bytes.len())
-                        .entered();
                 queue.write_buffer(&view.batch_table, offset, &bytes);
                 view.instance_mask_bytes = bytes;
-                let world = sources
-                    .worlds
-                    .get(&key.main_entity)
-                    .or_else(|| sources.worlds.get(&key.auxiliary_entity))
-                    .copied()
-                    .flatten();
-                debug!(
-                    ?key,
-                    ?domain,
-                    ?world,
-                    eligible_instances = mask.enabled_count(),
-                    stock_hidden_joint = joint.len(),
-                    selected_terrain_blocks = view
-                        .selection
-                        .as_ref()
-                        .map_or(0, |selection| selection.terrain_blocks.len()),
-                    "cluster eligibility mask changed"
-                );
             }
         }
-        filters
-            .joints
-            .insert(*domain, (facts.consumers.clone(), joint));
     }
     terrain_coverage
         .views
         .retain(|key, _| covered_views.contains(key));
-    filters
-        .saved
-        .retain(|domain, _| domains.contains_key(domain));
-    filters
-        .joints
-        .retain(|domain, _| domains.contains_key(domain));
-    let frame = filters.frames;
-    filters.visible = domains
-        .iter_mut()
-        .filter(|(_, facts)| facts.collected)
-        .map(|(domain, facts)| {
-            (
-                *domain,
-                DomainVisible {
-                    set: std::mem::take(&mut facts.visible),
-                    frame,
-                },
-            )
-        })
-        .collect();
-    assert!(
-        filters.active.is_empty(),
-        "stock visibility was not restored after the previous frame"
-    );
-    let _apply_span = ::bevy::log::info_span!("cluster::select::apply").entered();
-    let joints = std::mem::take(&mut filters.joints);
-    for (domain, (_, hidden)) in &joints {
-        let domain = *domain;
-        let class = match domain {
-            Domain::Camera(entity) => views
-                .get_mut(entity)
-                .ok()
-                .and_then(|(_, _, _, visible, _)| visible)
-                .map(|visible| visible.into_inner()),
-            Domain::Shadow(light, key) => shadows
-                .get_mut(light)
-                .ok()
-                .and_then(|shadow| shadow.into_inner().subviews.get_mut(&key)),
-        }
-        .and_then(|visible| visible.classes.get_mut(&std::any::TypeId::of::<Mesh3d>()));
-        if let Some(class) = class {
-            filters.apply_class(domain, class, hidden);
-        }
-    }
-    filters.joints = joints;
     if filters.frames.is_multiple_of(600) {
         info!(
             reused = std::mem::take(&mut filters.reused),
             rebuilt = std::mem::take(&mut filters.rebuilt),
             "cluster view selections over 600 frames"
         );
-    }
-}
-
-fn restore_stock(
-    mut filters: ResMut<Filters>,
-    mut cameras: Query<&mut RenderVisibleEntities>,
-    mut shadows: Query<&mut RenderShadowMapVisibleEntities>,
-) {
-    let active = filters.take_active();
-    for domain in active {
-        let class = match domain {
-            Domain::Camera(entity) => cameras
-                .get_mut(entity)
-                .ok()
-                .map(|visible| visible.into_inner()),
-            Domain::Shadow(light, key) => shadows
-                .get_mut(light)
-                .ok()
-                .and_then(|shadow| shadow.into_inner().subviews.get_mut(&key)),
-        }
-        .and_then(|visible| visible.classes.get_mut(&std::any::TypeId::of::<Mesh3d>()));
-        filters.restore_class(domain, class);
-    }
-}
-
-impl Selection {
-    fn matches(
-        &self,
-        stamp: [u64; 7],
-        visible: &bevy::platform::collections::HashSet<MainEntity>,
-        readiness: &[bool],
-        stock_materials: &HashMap<MainEntity, Option<bevy::asset::UntypedAssetId>>,
-    ) -> bool {
-        self.stamp == stamp
-            && self.visible == *visible
-            // The view's cached readiness is shared, so an unchanged one is the same slice.
-            && (std::ptr::eq(self.readiness.as_slice(), readiness)
-                || self.readiness.as_slice() == readiness)
-            && self.stock_materials == *stock_materials
-    }
-}
-
-fn intersect_hidden(
-    previous: Option<bevy::platform::collections::HashSet<MainEntity>>,
-    current: &bevy::platform::collections::HashSet<MainEntity>,
-) -> bevy::platform::collections::HashSet<MainEntity> {
-    match previous {
-        None => current.clone(),
-        Some(previous) => previous.intersection(current).copied().collect(),
-    }
-}
-
-fn complementary_mask(
-    selection: &Selection,
-    joint: &bevy::platform::collections::HashSet<MainEntity>,
-    bound_instances: impl IntoIterator<Item = (u32, MainEntity)>,
-) -> super::super::instance_mask::InstanceMask {
-    let mut mask = selection.mask.clone();
-    if selection.hidden != *joint {
-        for (index, main) in bound_instances {
-            if selection.hidden.contains(&main) && !joint.contains(&main) {
-                mask.set(index, false)
-                    .expect("GPU instance fits allocated capacity");
-            }
-        }
-    }
-    mask
-}
-
-impl Filters {
-    fn apply_class(
-        &mut self,
-        domain: Domain,
-        class: &mut RenderVisibleEntitiesClass,
-        hidden: &bevy::platform::collections::HashSet<MainEntity>,
-    ) {
-        self.saved.entry(domain).or_default().apply(class, hidden);
-        assert!(self.active.insert(domain), "domain applied twice");
-    }
-
-    fn take_active(&mut self) -> HashSet<Domain> {
-        std::mem::take(&mut self.active)
-    }
-
-    fn restore_class(&mut self, domain: Domain, class: Option<&mut RenderVisibleEntitiesClass>) {
-        if let Some(class) = class {
-            self.saved
-                .get_mut(&domain)
-                .expect("applied filter exists")
-                .restore(class);
-        } else {
-            self.saved.remove(&domain);
-        }
     }
 }
 
@@ -4563,7 +4146,6 @@ mod reference_root_memo_tests {
 #[cfg(test)]
 mod selection_regressions {
     use super::*;
-    use bevy::platform::collections::HashSet as VisibleSet;
 
     #[test]
     fn shader_invalidation_changes_readiness_key_when_ready_pipeline_count_is_unchanged() {
@@ -4575,7 +4157,9 @@ mod selection_regressions {
             layout: 4,
             batches: 2,
             view: 5,
-            pipelines_ready: ready.into_iter().filter(|ready| *ready).count(),
+            pipelines: ready.into_iter().filter(|ready| *ready).count() as u64,
+            queued: 0,
+            shadow_warmup: true,
             far_current: false,
             shadow: false,
             prepass: true,
@@ -4584,9 +4168,16 @@ mod selection_regressions {
         // stays one, but the cached [true, false] batch readiness is now wrong.
         let before = key([true, false], 10);
         let after = key([false, true], 11);
-        assert_eq!(before.pipelines_ready, after.pipelines_ready);
+        assert_eq!(before.pipelines, after.pipelines);
         assert_ne!(before, after);
         assert_eq!(after, key([false, true], 11));
+        assert_ne!(
+            after,
+            ReadinessKey {
+                shadow_warmup: false,
+                ..after
+            }
+        );
     }
 
     #[test]
@@ -4646,278 +4237,6 @@ mod selection_regressions {
             schedule.run(&mut render);
             assert_eq!(render.resource::<ShaderInvalidations>().version, version);
         }
-    }
-
-    fn main(id: u32) -> MainEntity {
-        Entity::from_raw_u32(id).unwrap().into()
-    }
-
-    fn visible(ids: &[u32]) -> VisibleSet<MainEntity> {
-        ids.iter().map(|id| main(*id)).collect()
-    }
-
-    /// The visible set a domain keeps between frames, moved by the class's added and removed
-    /// lists after Bevy's own diff and a stock filter ahead of the selection, is at every frame
-    /// what reading the class in full gives; unchanged frames report no change and read nothing.
-    #[test]
-    fn domain_visible_follows_the_class_deltas_through_a_filter() {
-        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        let pair = |id: u32| (Entity::from_raw_u32(1000 + id).unwrap(), main(id));
-        let mut class = RenderVisibleEntitiesClass::default();
-        let mut filter = ClassFilter::default();
-        let mut kept: Option<DomainVisible> = None;
-        let mut raw: Vec<u32> = Vec::new();
-        let mut hidden = VisibleSet::default();
-        let mut changes = 0;
-        let mut expected_changes = 0;
-        let mut previous_filtered: Option<VisibleSet<MainEntity>> = None;
-        for frame in 1..=400_u64 {
-            // Long quiet runs between changes, as in a settled scene.
-            if frame % 25 == 0 {
-                raw = (0..40).filter(|_| next() % 3 != 0).collect();
-            }
-            if frame % 40 == 0 {
-                hidden = (0..40).filter(|_| next() % 4 == 0).map(main).collect();
-            }
-            class.prepare_for_new_frame();
-            let mut pairs: Vec<_> = raw.iter().map(|id| pair(*id)).collect();
-            // Sorted by main entity, as Bevy's extraction hands it over.
-            pairs.sort_by_key(|(_, main)| *main);
-            class.update_cpu_culled_entities(&pairs);
-            filter.apply(&mut class, &hidden);
-            let from_scratch: VisibleSet<MainEntity> =
-                class.iter_visible().map(|(_, main)| *main).collect();
-            let (visible, changed) = update_domain_visible(kept.take(), Some(&class), frame);
-            assert_eq!(visible.set, from_scratch, "frame {frame}");
-            if previous_filtered.as_ref() != Some(&from_scratch) {
-                expected_changes += 1;
-                assert!(changed, "frame {frame}: a change went unreported");
-            }
-            changes += u32::from(changed);
-            previous_filtered = Some(from_scratch);
-            kept = Some(visible);
-            filter.restore(&mut class);
-        }
-        // Reported changes are the real ones (the first frame counts as one).
-        assert_eq!(changes, expected_changes);
-        assert!(changes < 40, "{changes} changes in 400 frames");
-        // A skipped frame cannot take a delta: the set is read in full.
-        let skipped = kept.take().map(|mut visible| {
-            visible.set.insert(main(999));
-            visible
-        });
-        let (visible, changed) = update_domain_visible(skipped, Some(&class), 402);
-        assert!(changed);
-        assert_eq!(
-            visible.set,
-            class.iter_visible().map(|(_, main)| *main).collect()
-        );
-    }
-
-    #[test]
-    fn retired_view_domain_obeys_layers_caster_and_exact_selection_input() {
-        let eligible = main(41);
-        let other_layer = main(42);
-        let non_caster = main(43);
-        let sources = HashMap::from([
-            (
-                eligible,
-                RetiredEligibility {
-                    layers: RenderLayers::layer(2),
-                    casts_shadows: true,
-                },
-            ),
-            (
-                other_layer,
-                RetiredEligibility {
-                    layers: RenderLayers::layer(3),
-                    casts_shadows: true,
-                },
-            ),
-            (
-                non_caster,
-                RetiredEligibility {
-                    layers: RenderLayers::layer(2),
-                    casts_shadows: false,
-                },
-            ),
-        ]);
-        let camera = retired_allowed_for_view(&sources, &RenderLayers::layer(2), false);
-        assert_eq!(camera, visible(&[41, 43]));
-        let shadow = retired_allowed_for_view(&sources, &RenderLayers::layer(2), true);
-        assert_eq!(shadow, visible(&[41]));
-        assert_eq!(
-            retired_allowed_for_view(&sources, &RenderLayers::layer(3), true),
-            visible(&[42])
-        );
-        assert!(retired_allowed_for_view(&sources, &RenderLayers::default(), true).is_empty());
-        // Same count, different exact member is a different consumer input.
-        let mut cached = selection(&[], 1);
-        cached.visible = shadow.clone();
-        assert!(cached.matches(
-            cached.stamp,
-            &shadow,
-            &cached.readiness,
-            &cached.stock_materials
-        ));
-        assert!(!cached.matches(
-            cached.stamp,
-            &visible(&[42]),
-            &cached.readiness,
-            &cached.stock_materials
-        ));
-    }
-
-    fn selection(ids: &[u32], capacity: u32) -> Selection {
-        Selection {
-            stamp: [7, 11, 13, 17, 1, 0, 0],
-            layers: RenderLayers::default(),
-            visible: visible(ids),
-            readiness: Arc::new(vec![true]),
-            stock_materials: ids.iter().map(|id| (main(*id), None)).collect(),
-            mask: super::super::super::instance_mask::InstanceMask::new(capacity),
-            hidden: VisibleSet::default(),
-            terrain_blocks: HashSet::new(),
-            suppressed_contributors: 0,
-            suppressed_trees: 0,
-        }
-    }
-
-    #[test]
-    fn same_entity_with_replaced_material_invalidates_selection() {
-        let mut assets = Assets::<StandardMaterial>::default();
-        let first = assets.add(StandardMaterial::default());
-        let second = assets.add(StandardMaterial::default());
-        let mut cached = selection(&[1], 1);
-        cached
-            .stock_materials
-            .insert(main(1), Some(first.id().untyped()));
-        assert!(cached.matches(
-            cached.stamp,
-            &cached.visible,
-            &[true],
-            &cached.stock_materials
-        ));
-        let mut current = cached.stock_materials.clone();
-        current.insert(main(1), Some(second.id().untyped()));
-        assert!(!cached.matches(cached.stamp, &cached.visible, &[true], &current));
-        current.insert(main(1), None);
-        assert!(!cached.matches(cached.stamp, &cached.visible, &[true], &current));
-    }
-
-    #[test]
-    fn different_equal_sum_visibility_sets_do_not_reuse_selection() {
-        let cached = selection(&[1, 4], 2);
-        let replacement = visible(&[2, 3]);
-        // Establish the actual old-key collision without relying on numeric Entity ordering.
-        let old_fold = |set: &VisibleSet<MainEntity>| {
-            set.iter().fold(0u64, |hash, entity| {
-                hash.wrapping_add(entity.id().to_bits().wrapping_mul(0x9e3779b97f4a7c15))
-            })
-        };
-        assert_eq!(old_fold(&cached.visible), old_fold(&replacement));
-        // Hold every other cache input fixed to prove exact visibility is responsible.
-        assert!(!cached.matches(cached.stamp, &replacement, &[true], &cached.stock_materials));
-        assert!(!cached.matches(
-            cached.stamp,
-            &cached.visible,
-            &[false],
-            &cached.stock_materials
-        ));
-    }
-
-    #[test]
-    fn a_shared_shadow_class_keeps_stock_until_every_consumer_replaces_it() {
-        let mut first = selection(&[1, 2], 3);
-        first.hidden = visible(&[1, 2]);
-        // Index 2 represents a distant instance with no stock entity in this domain.
-        for index in 0..3 {
-            first.mask.set(index, true).unwrap();
-        }
-        let mut second = selection(&[1, 2], 3);
-        second.hidden = visible(&[2]);
-        second.mask.set(1, true).unwrap();
-        second.mask.set(2, true).unwrap();
-        let joint = intersect_hidden(Some(first.hidden.clone()), &second.hidden);
-        assert_eq!(joint, visible(&[2]));
-        let mut class = RenderVisibleEntitiesClass {
-            entities_cpu_culling: vec![
-                (Entity::from_raw_u32(101).unwrap(), main(1)),
-                (Entity::from_raw_u32(102).unwrap(), main(2)),
-            ],
-            ..default()
-        };
-        class.entities_cpu_culling.sort_by_key(|(_, main)| *main);
-        let original = class.entities_cpu_culling.clone();
-        let mut filter = ClassFilter::default();
-        filter.apply(&mut class, &joint);
-        assert_eq!(
-            class
-                .iter_visible()
-                .map(|(_, main)| *main)
-                .collect::<VisibleSet<_>>(),
-            visible(&[1])
-        );
-        for selection in [&first, &second] {
-            let mask = complementary_mask(selection, &joint, [(0, main(1)), (1, main(2))]);
-            let mut bytes = Vec::new();
-            mask.append_le_bytes(&mut bytes);
-            assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 0b110);
-        }
-        filter.restore(&mut class);
-        assert_eq!(class.entities_cpu_culling, original);
-        // A missing readiness report is an empty consumer, not vacuous agreement.
-        assert!(intersect_hidden(Some(joint), &VisibleSet::default()).is_empty());
-    }
-
-    #[test]
-    fn a_domain_without_apply_is_not_restored() {
-        let domain = Domain::Camera(Entity::from_raw_u32(10).unwrap());
-        let mut filters = Filters::default();
-        filters.saved.insert(domain, ClassFilter::default());
-        let mut class = RenderVisibleEntitiesClass::default();
-        for domain in filters.take_active() {
-            filters.restore_class(domain, Some(&mut class));
-        }
-        // Inactive saved state remains usable; an accidental restore would already panic.
-        filters.apply_class(domain, &mut class, &VisibleSet::default());
-        for domain in filters.take_active() {
-            filters.restore_class(domain, Some(&mut class));
-        }
-        assert!(filters.active.is_empty());
-    }
-
-    #[test]
-    fn disappearing_applied_class_does_not_leak_into_recreated_domain() {
-        let domain = Domain::Camera(Entity::from_raw_u32(10).unwrap());
-        let mut filters = Filters::default();
-        let mut old = RenderVisibleEntitiesClass::default();
-        old.entities_cpu_culling
-            .push((Entity::from_raw_u32(101).unwrap(), main(1)));
-        filters.apply_class(domain, &mut old, &visible(&[1]));
-        assert!(old.iter_visible().next().is_none());
-        for domain in filters.take_active() {
-            filters.restore_class(domain, None);
-        }
-        assert!(!filters.saved.contains_key(&domain));
-        let mut fresh = RenderVisibleEntitiesClass::default();
-        fresh
-            .entities_cpu_culling
-            .push((Entity::from_raw_u32(102).unwrap(), main(2)));
-        let original = fresh.entities_cpu_culling.clone();
-        filters.apply_class(domain, &mut fresh, &VisibleSet::default());
-        for domain in filters.take_active() {
-            filters.restore_class(domain, Some(&mut fresh));
-        }
-        assert_eq!(fresh.entities_cpu_culling, original);
-        assert!(fresh.added_entities.is_empty());
-        assert!(fresh.removed_entities.is_empty());
     }
 }
 
@@ -5540,59 +4859,54 @@ mod extract_source_tests {
 
     #[test]
     fn one_root_edit_never_visits_unrelated_stock_in_either_mode() {
-        for own_statics in [false, true] {
-            let mut input = Fixture::pending();
-            let primitive = input.spawn_stock();
-            input.render.insert_resource(ClusterSettings {
-                own_statics,
-                ..default()
-            });
-            let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().clone();
-            for ordinal in 0..256 {
-                let root = input
-                    .app
-                    .world_mut()
-                    .spawn((
-                        FormId(u32::MAX - ordinal),
-                        Transform::IDENTITY,
-                        ChildOf(input.cell),
-                    ))
-                    .id();
-                input
-                    .app
-                    .world_mut()
-                    .spawn((mesh.clone(), Transform::IDENTITY, ChildOf(root)));
-            }
-            input.assert_bound(primitive);
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.render.insert_resource(ClusterSettings::default());
+        let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().clone();
+        for ordinal in 0..256 {
+            let root = input
+                .app
+                .world_mut()
+                .spawn((
+                    FormId(u32::MAX - ordinal),
+                    Transform::IDENTITY,
+                    ChildOf(input.cell),
+                ))
+                .id();
             input
                 .app
                 .world_mut()
-                .get_mut::<Transform>(input.root)
-                .unwrap()
-                .translation
-                .x += 1.0;
-            input.assert_blocked();
-            assert_delta_only(&input);
-            let work = input.sources().last_work;
-            assert_eq!(
-                (
-                    work.roots_scanned,
-                    work.meshes_scanned,
-                    work.primitives_scanned
-                ),
-                (1, 1, 1)
-            );
-            assert_eq!(work.affected_references, 1);
-            assert_full_oracle(&mut input);
-            input
-                .app
-                .world_mut()
-                .entity_mut(input.root)
-                .insert(input.root_pose);
-            input.assert_bound(primitive);
-            assert_delta_only(&input);
-            assert_full_oracle(&mut input);
+                .spawn((mesh.clone(), Transform::IDENTITY, ChildOf(root)));
         }
+        input.assert_bound(primitive);
+        input
+            .app
+            .world_mut()
+            .get_mut::<Transform>(input.root)
+            .unwrap()
+            .translation
+            .x += 1.0;
+        input.assert_blocked();
+        assert_delta_only(&input);
+        let work = input.sources().last_work;
+        assert_eq!(
+            (
+                work.roots_scanned,
+                work.meshes_scanned,
+                work.primitives_scanned
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(work.affected_references, 1);
+        assert_full_oracle(&mut input);
+        input
+            .app
+            .world_mut()
+            .entity_mut(input.root)
+            .insert(input.root_pose);
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
     }
 
     #[test]
@@ -5775,120 +5089,113 @@ mod extract_source_tests {
 
     #[test]
     fn mixed_lifecycle_sequences_match_full_qualification_in_both_modes() {
-        for own_statics in [false, true] {
-            for seed in [1_u64, 17, 101, 4099] {
-                let mut input = Fixture::pending();
-                let primitive = input.spawn_stock();
-                input.render.insert_resource(ClusterSettings {
-                    own_statics,
-                    ..default()
-                });
-                input.assert_bound(primitive);
-                let baseline = *input.app.world().get::<SourceNodePose>(primitive).unwrap();
-                let tag = *input.app.world().get::<SourcePrimitive>(primitive).unwrap();
-                let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().clone();
-                let mut state = seed;
-                let mut duplicate = None;
-                for _ in 0..128 {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    match (state >> 32) % 12 {
-                        0 => {
-                            input
-                                .app
-                                .world_mut()
-                                .entity_mut(primitive)
-                                .insert(baseline.0);
-                        }
-                        1 => {
-                            let mut pose = baseline.0;
-                            pose.translation.x += 1.0;
-                            input.app.world_mut().entity_mut(primitive).insert(pose);
-                        }
-                        2 => {
-                            input
-                                .app
-                                .world_mut()
-                                .entity_mut(primitive)
-                                .remove::<SourceNodePose>();
-                        }
-                        3 => {
-                            input.app.world_mut().entity_mut(primitive).insert(baseline);
-                        }
-                        4 => {
-                            input
-                                .app
-                                .world_mut()
-                                .entity_mut(primitive)
-                                .remove::<SourcePrimitive>();
-                        }
-                        5 => {
-                            input.app.world_mut().entity_mut(primitive).insert(tag);
-                        }
-                        6 => {
-                            input
-                                .app
-                                .world_mut()
-                                .entity_mut(primitive)
-                                .remove::<Mesh3d>();
-                        }
-                        7 => {
-                            input
-                                .app
-                                .world_mut()
-                                .entity_mut(primitive)
-                                .insert(mesh.clone());
-                        }
-                        8 => {
-                            input
-                                .app
-                                .world_mut()
-                                .entity_mut(input.root)
-                                .insert(FormId(u32::MAX));
-                        }
-                        9 => {
-                            input
-                                .app
-                                .world_mut()
-                                .entity_mut(input.root)
-                                .insert(FormId(REFERENCE));
-                        }
-                        10 => {
-                            input
-                                .app
-                                .world_mut()
-                                .entity_mut(primitive)
-                                .insert(Visibility::Hidden);
-                        }
-                        _ => {
-                            input
-                                .app
-                                .world_mut()
-                                .entity_mut(primitive)
-                                .insert(Visibility::Inherited);
-                        }
+        for seed in [1_u64, 17, 101, 4099] {
+            let mut input = Fixture::pending();
+            let primitive = input.spawn_stock();
+            input
+                .render
+                .insert_resource(ClusterSettings { ..default() });
+            input.assert_bound(primitive);
+            let baseline = *input.app.world().get::<SourceNodePose>(primitive).unwrap();
+            let tag = *input.app.world().get::<SourcePrimitive>(primitive).unwrap();
+            let mesh = input.app.world().get::<Mesh3d>(primitive).unwrap().clone();
+            let mut state = seed;
+            let mut duplicate = None;
+            for _ in 0..128 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                match (state >> 32) % 12 {
+                    0 => {
+                        input
+                            .app
+                            .world_mut()
+                            .entity_mut(primitive)
+                            .insert(baseline.0);
                     }
-                    // Unrelated lifecycle interleaves with changed/refused stock facts.
-                    if state & 3 == 0 {
-                        if let Some(entity) = duplicate.take() {
-                            input.app.world_mut().despawn(entity);
-                        } else {
-                            duplicate = Some(
-                                input
-                                    .app
-                                    .world_mut()
-                                    .spawn((
-                                        FormId(REFERENCE),
-                                        input.root_pose,
-                                        ChildOf(input.cell),
-                                    ))
-                                    .id(),
-                            );
-                        }
+                    1 => {
+                        let mut pose = baseline.0;
+                        pose.translation.x += 1.0;
+                        input.app.world_mut().entity_mut(primitive).insert(pose);
                     }
-                    input.extract();
-                    assert_delta_only(&input);
-                    assert_full_oracle(&mut input);
+                    2 => {
+                        input
+                            .app
+                            .world_mut()
+                            .entity_mut(primitive)
+                            .remove::<SourceNodePose>();
+                    }
+                    3 => {
+                        input.app.world_mut().entity_mut(primitive).insert(baseline);
+                    }
+                    4 => {
+                        input
+                            .app
+                            .world_mut()
+                            .entity_mut(primitive)
+                            .remove::<SourcePrimitive>();
+                    }
+                    5 => {
+                        input.app.world_mut().entity_mut(primitive).insert(tag);
+                    }
+                    6 => {
+                        input
+                            .app
+                            .world_mut()
+                            .entity_mut(primitive)
+                            .remove::<Mesh3d>();
+                    }
+                    7 => {
+                        input
+                            .app
+                            .world_mut()
+                            .entity_mut(primitive)
+                            .insert(mesh.clone());
+                    }
+                    8 => {
+                        input
+                            .app
+                            .world_mut()
+                            .entity_mut(input.root)
+                            .insert(FormId(u32::MAX));
+                    }
+                    9 => {
+                        input
+                            .app
+                            .world_mut()
+                            .entity_mut(input.root)
+                            .insert(FormId(REFERENCE));
+                    }
+                    10 => {
+                        input
+                            .app
+                            .world_mut()
+                            .entity_mut(primitive)
+                            .insert(Visibility::Hidden);
+                    }
+                    _ => {
+                        input
+                            .app
+                            .world_mut()
+                            .entity_mut(primitive)
+                            .insert(Visibility::Inherited);
+                    }
                 }
+                // Unrelated lifecycle interleaves with changed/refused stock facts.
+                if state & 3 == 0 {
+                    if let Some(entity) = duplicate.take() {
+                        input.app.world_mut().despawn(entity);
+                    } else {
+                        duplicate = Some(
+                            input
+                                .app
+                                .world_mut()
+                                .spawn((FormId(REFERENCE), input.root_pose, ChildOf(input.cell)))
+                                .id(),
+                        );
+                    }
+                }
+                input.extract();
+                assert_delta_only(&input);
+                assert_full_oracle(&mut input);
             }
         }
     }
@@ -6080,254 +5387,233 @@ mod extract_source_tests {
     #[test]
     fn disabled_root_and_mesh_membership_changes_use_deltas() {
         use bevy::ecs::entity_disabling::Disabled;
-        for own_statics in [false, true] {
-            let mut input = Fixture::pending();
-            let primitive = input.spawn_stock();
-            input.render.insert_resource(ClusterSettings {
-                own_statics,
-                ..default()
-            });
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.render.insert_resource(ClusterSettings::default());
+        input.assert_bound(primitive);
+        for entity in [primitive, input.root] {
+            input.app.world_mut().entity_mut(entity).insert(Disabled);
+            input.extract();
+            assert!(!input.sources().bound.contains_key(&input.key));
+            assert_delta_only(&input);
+            assert_full_oracle(&mut input);
+            input
+                .app
+                .world_mut()
+                .entity_mut(entity)
+                .remove::<Disabled>();
             input.assert_bound(primitive);
-            for entity in [primitive, input.root] {
-                input.app.world_mut().entity_mut(entity).insert(Disabled);
-                input.extract();
-                assert!(!input.sources().bound.contains_key(&input.key));
-                assert_delta_only(&input);
-                assert_full_oracle(&mut input);
-                input
-                    .app
-                    .world_mut()
-                    .entity_mut(entity)
-                    .remove::<Disabled>();
-                input.assert_bound(primitive);
-                assert_delta_only(&input);
-                assert_full_oracle(&mut input);
-            }
+            assert_delta_only(&input);
+            assert_full_oracle(&mut input);
         }
     }
 
     #[test]
     fn form_id_disabler_preserves_root_domain_hot_observation_and_history() {
         use bevy::ecs::entity_disabling::Disabled;
-        for own_statics in [false, true] {
-            let mut input = Fixture::pending_with_disablers(|world| {
-                world.register_disabling_component::<FormId>();
-            });
-            let primitive = input.spawn_stock();
-            input.render.insert_resource(ClusterSettings {
-                own_statics,
-                ..default()
-            });
-            input.assert_bound(primitive);
-            let before = input.sources().last_work.indexed_subjects;
-            // Explicit required FormId admits this root while Query<Entity> does not.
-            let world = input.app.world_mut();
-            let mut generic = world.query::<Entity>();
-            assert!(generic.get(world, input.root).is_err());
-            assert!(world.entities().contains_spawned(input.root));
-            // Several ordinary deltas BEFORE the full oracle can repair the index.
-            let tag = *input.app.world().get::<SourcePrimitive>(primitive).unwrap();
-            input.app.world_mut().entity_mut(primitive).insert(tag);
-            input.assert_bound(primitive);
-            assert_delta_only(&input);
-            assert_eq!(input.sources().last_work.roots_scanned, 1);
-            assert_eq!(input.sources().last_work.indexed_subjects, before);
-            input
-                .app
-                .world_mut()
-                .get_mut::<Transform>(input.root)
-                .unwrap()
-                .translation
-                .x += 1.0;
-            input.assert_blocked();
-            assert_delta_only(&input);
-            assert_eq!(input.sources().last_work.roots_scanned, 1);
-            input
-                .app
-                .world_mut()
-                .entity_mut(input.root)
-                .insert(input.root_pose);
-            input.assert_bound(primitive);
-            assert_delta_only(&input);
-            // Same-value root writes remain semantically quiet after the aligned snapshot.
-            input
-                .app
-                .world_mut()
-                .entity_mut(input.root)
-                .insert(input.root_pose);
-            input.assert_bound(primitive);
-            assert_delta_only(&input);
-            assert_eq!(input.sources().last_work.roots_scanned, 0);
-            assert_full_oracle(&mut input);
-            input
-                .app
-                .world_mut()
-                .entity_mut(input.root)
-                .insert(Disabled);
-            input.extract();
-            assert_delta_only(&input);
-            assert!(!input.sources().bound.contains_key(&input.key));
-            assert!(input.sources().seen_roots[&input.root].contains(&REFERENCE));
-            assert!(input.sources().present.contains(&REFERENCE));
-            assert_full_oracle(&mut input);
-            input
-                .app
-                .world_mut()
-                .entity_mut(input.root)
-                .remove::<Disabled>();
-            input.assert_bound(primitive);
-            assert_delta_only(&input);
-            input.app.world_mut().despawn(input.root);
-            input.extract();
-            assert_delta_only(&input);
-            assert!(!input.sources().seen_roots.contains_key(&input.root));
-            assert_full_oracle(&mut input);
-        }
+        let mut input = Fixture::pending_with_disablers(|world| {
+            world.register_disabling_component::<FormId>();
+        });
+        let primitive = input.spawn_stock();
+        input.render.insert_resource(ClusterSettings::default());
+        input.assert_bound(primitive);
+        let before = input.sources().last_work.indexed_subjects;
+        // Explicit required FormId admits this root while Query<Entity> does not.
+        let world = input.app.world_mut();
+        let mut generic = world.query::<Entity>();
+        assert!(generic.get(world, input.root).is_err());
+        assert!(world.entities().contains_spawned(input.root));
+        // Several ordinary deltas BEFORE the full oracle can repair the index.
+        let tag = *input.app.world().get::<SourcePrimitive>(primitive).unwrap();
+        input.app.world_mut().entity_mut(primitive).insert(tag);
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        assert_eq!(input.sources().last_work.roots_scanned, 1);
+        assert_eq!(input.sources().last_work.indexed_subjects, before);
+        input
+            .app
+            .world_mut()
+            .get_mut::<Transform>(input.root)
+            .unwrap()
+            .translation
+            .x += 1.0;
+        input.assert_blocked();
+        assert_delta_only(&input);
+        assert_eq!(input.sources().last_work.roots_scanned, 1);
+        input
+            .app
+            .world_mut()
+            .entity_mut(input.root)
+            .insert(input.root_pose);
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        // Same-value root writes remain semantically quiet after the aligned snapshot.
+        input
+            .app
+            .world_mut()
+            .entity_mut(input.root)
+            .insert(input.root_pose);
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        assert_eq!(input.sources().last_work.roots_scanned, 0);
+        assert_full_oracle(&mut input);
+        input
+            .app
+            .world_mut()
+            .entity_mut(input.root)
+            .insert(Disabled);
+        input.extract();
+        assert_delta_only(&input);
+        assert!(!input.sources().bound.contains_key(&input.key));
+        assert!(input.sources().seen_roots[&input.root].contains(&REFERENCE));
+        assert!(input.sources().present.contains(&REFERENCE));
+        assert_full_oracle(&mut input);
+        input
+            .app
+            .world_mut()
+            .entity_mut(input.root)
+            .remove::<Disabled>();
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        input.app.world_mut().despawn(input.root);
+        input.extract();
+        assert_delta_only(&input);
+        assert!(!input.sources().seen_roots.contains_key(&input.root));
+        assert_full_oracle(&mut input);
     }
 
     #[test]
     fn mesh_disabler_indexes_mesh_role_without_broadening_parent_or_node_reads() {
-        for own_statics in [false, true] {
-            let mut input = Fixture::pending_with_disablers(|world| {
-                world.register_disabling_component::<Mesh3d>();
-            });
-            let primitive = input.spawn_stock();
-            input.render.insert_resource(ClusterSettings {
-                own_statics,
-                ..default()
-            });
-            input.extract();
-            // Mesh enumeration admits Mesh3d; dependency reads deliberately do not.
-            assert!(!input.sources().bound.contains_key(&input.key));
-            let before = input.sources().last_work.indexed_subjects;
-            let world = input.app.world_mut();
-            let mut meshes = world.query_filtered::<Entity, With<Mesh3d>>();
-            assert!(meshes.get(world, primitive).is_ok());
-            let mut generic = world.query::<Entity>();
-            assert!(generic.get(world, primitive).is_err());
-            let mut parents = world.query::<&ChildOf>();
-            assert!(parents.get(world, primitive).is_err());
-            let mesh = world.get::<Mesh3d>(primitive).unwrap().clone();
-            let added = world
-                .spawn((
-                    mesh,
-                    Transform::IDENTITY,
-                    SourceNodePose(Transform::IDENTITY),
-                    ChildOf(input.root),
-                ))
-                .id();
-            input.extract();
-            assert_delta_only(&input);
-            assert_eq!(input.sources().last_work.indexed_subjects, before + 1);
-            input.extract();
-            assert_delta_only(&input);
-            assert_eq!(input.sources().last_work.subjects_updated, 0);
-            *input.app.world_mut().get_mut::<Transform>(added).unwrap() = Transform::IDENTITY;
-            input.extract();
-            assert_delta_only(&input);
-            assert_eq!(input.sources().last_work.subjects_updated, 0);
-            // An in-place hot edit on an indexed Mesh3d must still be observed,
-            // even though no original dependency query can certify this primitive.
-            // The authored baseline makes this a semantic eligibility change;
-            // unbaselined poses are all the same refused proof.
-            input
-                .app
-                .world_mut()
-                .get_mut::<Transform>(added)
-                .unwrap()
-                .translation
-                .x += 1.0;
-            input.extract();
-            assert_delta_only(&input);
-            assert!(input.sources().last_work.subjects_updated > 0);
-            assert_full_oracle(&mut input);
-            input
-                .app
-                .world_mut()
-                .get_mut::<Transform>(added)
-                .unwrap()
-                .translation
-                .x += 1.0;
-            input.extract();
-            assert_delta_only(&input);
-            assert_eq!(input.sources().last_work.subjects_updated, 0);
-            *input.app.world_mut().get_mut::<Transform>(added).unwrap() = Transform::IDENTITY;
-            input.extract();
-            assert_delta_only(&input);
-            assert!(input.sources().last_work.subjects_updated > 0);
-            assert_full_oracle(&mut input);
-            let tag = *input.app.world().get::<SourcePrimitive>(primitive).unwrap();
-            input.app.world_mut().entity_mut(primitive).insert(tag);
-            input.extract();
-            assert_delta_only(&input);
-            assert!(input.sources().last_work.subjects_updated > 0);
-            assert!(!input.sources().bound.contains_key(&input.key));
-            assert_full_oracle(&mut input);
-            input.app.world_mut().entity_mut(added).remove::<Mesh3d>();
-            input.extract();
-            assert_delta_only(&input);
-            assert_eq!(input.sources().last_work.indexed_subjects, before);
-            input.app.world_mut().despawn(added);
-            input.extract();
-            assert_delta_only(&input);
-            assert_full_oracle(&mut input);
-        }
+        let mut input = Fixture::pending_with_disablers(|world| {
+            world.register_disabling_component::<Mesh3d>();
+        });
+        let primitive = input.spawn_stock();
+        input.render.insert_resource(ClusterSettings::default());
+        input.extract();
+        // Mesh enumeration admits Mesh3d; dependency reads deliberately do not.
+        assert!(!input.sources().bound.contains_key(&input.key));
+        let before = input.sources().last_work.indexed_subjects;
+        let world = input.app.world_mut();
+        let mut meshes = world.query_filtered::<Entity, With<Mesh3d>>();
+        assert!(meshes.get(world, primitive).is_ok());
+        let mut generic = world.query::<Entity>();
+        assert!(generic.get(world, primitive).is_err());
+        let mut parents = world.query::<&ChildOf>();
+        assert!(parents.get(world, primitive).is_err());
+        let mesh = world.get::<Mesh3d>(primitive).unwrap().clone();
+        let added = world
+            .spawn((
+                mesh,
+                Transform::IDENTITY,
+                SourceNodePose(Transform::IDENTITY),
+                ChildOf(input.root),
+            ))
+            .id();
+        input.extract();
+        assert_delta_only(&input);
+        assert_eq!(input.sources().last_work.indexed_subjects, before + 1);
+        input.extract();
+        assert_delta_only(&input);
+        assert_eq!(input.sources().last_work.subjects_updated, 0);
+        *input.app.world_mut().get_mut::<Transform>(added).unwrap() = Transform::IDENTITY;
+        input.extract();
+        assert_delta_only(&input);
+        assert_eq!(input.sources().last_work.subjects_updated, 0);
+        // An in-place hot edit on an indexed Mesh3d must still be observed,
+        // even though no original dependency query can certify this primitive.
+        // The authored baseline makes this a semantic eligibility change;
+        // unbaselined poses are all the same refused proof.
+        input
+            .app
+            .world_mut()
+            .get_mut::<Transform>(added)
+            .unwrap()
+            .translation
+            .x += 1.0;
+        input.extract();
+        assert_delta_only(&input);
+        assert!(input.sources().last_work.subjects_updated > 0);
+        assert_full_oracle(&mut input);
+        input
+            .app
+            .world_mut()
+            .get_mut::<Transform>(added)
+            .unwrap()
+            .translation
+            .x += 1.0;
+        input.extract();
+        assert_delta_only(&input);
+        assert_eq!(input.sources().last_work.subjects_updated, 0);
+        *input.app.world_mut().get_mut::<Transform>(added).unwrap() = Transform::IDENTITY;
+        input.extract();
+        assert_delta_only(&input);
+        assert!(input.sources().last_work.subjects_updated > 0);
+        assert_full_oracle(&mut input);
+        let tag = *input.app.world().get::<SourcePrimitive>(primitive).unwrap();
+        input.app.world_mut().entity_mut(primitive).insert(tag);
+        input.extract();
+        assert_delta_only(&input);
+        assert!(input.sources().last_work.subjects_updated > 0);
+        assert!(!input.sources().bound.contains_key(&input.key));
+        assert_full_oracle(&mut input);
+        input.app.world_mut().entity_mut(added).remove::<Mesh3d>();
+        input.extract();
+        assert_delta_only(&input);
+        assert_eq!(input.sources().last_work.indexed_subjects, before);
+        input.app.world_mut().despawn(added);
+        input.extract();
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
     }
 
     #[test]
     fn replacement_journal_with_unrelated_suffix_requires_full_epoch_coverage() {
         use crate::streaming::identity_changes::{SourceNodeChanged, StructureEpoch};
-        for own_statics in [false, true] {
-            let mut input = Fixture::pending();
-            let primitive = input.spawn_stock();
-            input.render.insert_resource(ClusterSettings {
-                own_statics,
-                ..default()
-            });
-            input.assert_bound(primitive);
-            let mut stale = input
-                .app
-                .world()
-                .resource::<Messages<SourceNodeChanged>>()
-                .get_cursor_current();
-            // Epoch count bounds the old cursor count even if older messages expired.
-            let unrelated = usize::try_from(input.app.world().resource::<StructureEpoch>().version)
-                .unwrap()
-                + 1;
-            input
-                .app
-                .world_mut()
-                .entity_mut(primitive)
-                .remove::<SourceNodePose>();
-            input
-                .app
-                .world_mut()
-                .insert_resource(Messages::<SourceNodeChanged>::default());
-            for _ in 0..unrelated {
-                input.app.world_mut().spawn(Transform::IDENTITY);
-            }
-            let journal = input.app.world().resource::<Messages<SourceNodeChanged>>();
-            assert_eq!(stale.missed_messages(journal), 0);
-            let surviving: Vec<_> = stale.read(journal).copied().collect();
-            assert!(!surviving.is_empty());
-            assert!(surviving.iter().all(|event| event.entity != primitive));
-            input.assert_blocked();
-            let work = input.sources().last_work;
-            assert!(work.qualification_full);
-            assert!(work.journal_events > 0);
-            assert!(!work.journal_complete);
-            // Resynchronization is checked immediately, without an intervening oracle.
-            let pose = *input.app.world().get::<Transform>(primitive).unwrap();
-            input
-                .app
-                .world_mut()
-                .entity_mut(primitive)
-                .insert(SourceNodePose(pose));
-            input.assert_bound(primitive);
-            assert_delta_only(&input);
-            assert!(input.sources().last_work.journal_complete);
-            assert_full_oracle(&mut input);
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.render.insert_resource(ClusterSettings::default());
+        input.assert_bound(primitive);
+        let mut stale = input
+            .app
+            .world()
+            .resource::<Messages<SourceNodeChanged>>()
+            .get_cursor_current();
+        // Epoch count bounds the old cursor count even if older messages expired.
+        let unrelated =
+            usize::try_from(input.app.world().resource::<StructureEpoch>().version).unwrap() + 1;
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .remove::<SourceNodePose>();
+        input
+            .app
+            .world_mut()
+            .insert_resource(Messages::<SourceNodeChanged>::default());
+        for _ in 0..unrelated {
+            input.app.world_mut().spawn(Transform::IDENTITY);
         }
+        let journal = input.app.world().resource::<Messages<SourceNodeChanged>>();
+        assert_eq!(stale.missed_messages(journal), 0);
+        let surviving: Vec<_> = stale.read(journal).copied().collect();
+        assert!(!surviving.is_empty());
+        assert!(surviving.iter().all(|event| event.entity != primitive));
+        input.assert_blocked();
+        let work = input.sources().last_work;
+        assert!(work.qualification_full);
+        assert!(work.journal_events > 0);
+        assert!(!work.journal_complete);
+        // Resynchronization is checked immediately, without an intervening oracle.
+        let pose = *input.app.world().get::<Transform>(primitive).unwrap();
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .insert(SourceNodePose(pose));
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        assert!(input.sources().last_work.journal_complete);
+        assert_full_oracle(&mut input);
     }
 
     #[test]
@@ -6583,119 +5869,114 @@ mod extract_source_tests {
     #[test]
     fn retained_generated_layout_survives_material_deltas_and_journal_recovery() {
         use crate::streaming::identity_changes::SourceNodeChanged;
-        for own_statics in [false, true] {
-            let mut input = Fixture::pending();
-            let primitive = input.spawn_stock();
-            let stock = input
-                .app
-                .world()
-                .get::<Mesh3d>(primitive)
-                .unwrap()
-                .0
-                .clone();
-            // Model the initial glTF-generated layout before certification. This is
-            // not runtime regeneration and does not claim a glTF loader E2E test.
-            {
-                let mut meshes = input.app.world_mut().resource_mut::<Assets<Mesh>>();
-                let mut mesh = meshes.get_mut(&stock).unwrap();
-                let vertices = mesh.count_vertices();
-                mesh.try_insert_attribute(
-                    Mesh::ATTRIBUTE_TANGENT,
-                    vec![[1.0_f32, 0.0, 0.0, 1.0]; vertices],
-                )
-                .unwrap();
-            }
-            source_template(&mut input);
-            input.render.insert_resource(ClusterSettings {
-                own_statics,
-                ..default()
-            });
-            input.assert_bound(primitive);
-            assert_eq!(input.sources().stock_tangents(0), Some(true));
-            let material = input.app.world().resource::<ClusterBatchHandles>().handles[0]
-                .as_ref()
-                .unwrap()
-                .id()
-                .typed::<StandardMaterial>();
-            // Keep an unaffected row to detect a competing whole-table invalidator.
-            let unrelated = input
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        let stock = input
+            .app
+            .world()
+            .get::<Mesh3d>(primitive)
+            .unwrap()
+            .0
+            .clone();
+        // Model the initial glTF-generated layout before certification. This is
+        // not runtime regeneration and does not claim a glTF loader E2E test.
+        {
+            let mut meshes = input.app.world_mut().resource_mut::<Assets<Mesh>>();
+            let mut mesh = meshes.get_mut(&stock).unwrap();
+            let vertices = mesh.count_vertices();
+            mesh.try_insert_attribute(
+                Mesh::ATTRIBUTE_TANGENT,
+                vec![[1.0_f32, 0.0, 0.0, 1.0]; vertices],
+            )
+            .unwrap();
+        }
+        source_template(&mut input);
+        input.render.insert_resource(ClusterSettings::default());
+        input.assert_bound(primitive);
+        assert_eq!(input.sources().stock_tangents(0), Some(true));
+        let material = input.app.world().resource::<ClusterBatchHandles>().handles[0]
+            .as_ref()
+            .unwrap()
+            .id()
+            .typed::<StandardMaterial>();
+        // Keep an unaffected row to detect a competing whole-table invalidator.
+        let unrelated = input
+            .app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        input
+            .app
+            .world_mut()
+            .resource_mut::<ClusterBatchHandles>()
+            .set(1, unrelated);
+        input.extract();
+        let version = input.sources().layout_version;
+        for normal_map in [Some(Handle::default()), None] {
+            input
                 .app
                 .world_mut()
                 .resource_mut::<Assets<StandardMaterial>>()
-                .add(StandardMaterial::default());
+                .get_mut(material)
+                .unwrap()
+                .normal_map_texture = normal_map;
             input
                 .app
                 .world_mut()
-                .resource_mut::<ClusterBatchHandles>()
-                .set(1, unrelated);
-            input.extract();
-            let version = input.sources().layout_version;
-            for normal_map in [Some(Handle::default()), None] {
-                input
-                    .app
-                    .world_mut()
-                    .resource_mut::<Assets<StandardMaterial>>()
-                    .get_mut(material)
-                    .unwrap()
-                    .normal_map_texture = normal_map;
-                input
-                    .app
-                    .world_mut()
-                    .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
-                    .write(AssetEvent::Modified { id: material });
-                input.assert_bound(primitive);
-                assert_eq!(input.sources().last_work.template_rows, 1);
-                assert_eq!(input.sources().last_work.primitives_scanned, 0);
-                assert_eq!(input.sources().stock_tangents(0), Some(true));
-                assert!(input.sources().normal_maps[0]);
-                assert!(!input.sources().source_fallback_batches.contains(&0));
-            }
-            // Layout stays stable while an uncovered identity interval revokes stock
-            // proof. Recover immediately, without a full oracle repairing the delta.
-            input
-                .app
-                .world_mut()
-                .remove_resource::<Messages<SourceNodeChanged>>();
-            input
-                .app
-                .world_mut()
-                .entity_mut(primitive)
-                .remove::<SourceNodePose>();
-            input
-                .app
-                .world_mut()
-                .insert_resource(Messages::<SourceNodeChanged>::default());
-            input.assert_blocked();
-            assert!(input.sources().last_work.qualification_full);
-            assert!(!input.sources().last_work.journal_complete);
-            assert_eq!(input.sources().stock_tangents(0), Some(true));
-            let pose = *input.app.world().get::<Transform>(primitive).unwrap();
-            input
-                .app
-                .world_mut()
-                .entity_mut(primitive)
-                .insert(SourceNodePose(pose));
+                .resource_mut::<Messages<AssetEvent<StandardMaterial>>>()
+                .write(AssetEvent::Modified { id: material });
             input.assert_bound(primitive);
-            assert_delta_only(&input);
-            assert!(input.sources().last_work.journal_complete);
-            assert_eq!(input.sources().last_work.template_rows, 0);
-            assert_eq!(input.sources().stock_tangents(0), Some(true));
-            assert_eq!(input.sources().layout_version, version);
-            input
-                .app
-                .world_mut()
-                .resource_mut::<Messages<AssetEvent<Mesh>>>()
-                .write(AssetEvent::Modified { id: stock.id() });
-            input.assert_blocked();
-            assert_eq!(input.sources().stock_tangents(0), None);
             assert_eq!(input.sources().last_work.template_rows, 1);
             assert_eq!(input.sources().last_work.primitives_scanned, 0);
-            assert!(input.sources().source_fallback_batches.contains(&0));
-            input.render.resource_mut::<Sources>().force_full = true;
-            input.extract();
-            assert_eq!(input.sources().stock_tangents(0), None);
-            assert!(input.sources().source_fallback_batches.contains(&0));
+            assert_eq!(input.sources().stock_tangents(0), Some(true));
+            assert!(input.sources().normal_maps[0]);
+            assert!(!input.sources().source_fallback_batches.contains(&0));
         }
+        // Layout stays stable while an uncovered identity interval revokes stock
+        // proof. Recover immediately, without a full oracle repairing the delta.
+        input
+            .app
+            .world_mut()
+            .remove_resource::<Messages<SourceNodeChanged>>();
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .remove::<SourceNodePose>();
+        input
+            .app
+            .world_mut()
+            .insert_resource(Messages::<SourceNodeChanged>::default());
+        input.assert_blocked();
+        assert!(input.sources().last_work.qualification_full);
+        assert!(!input.sources().last_work.journal_complete);
+        assert_eq!(input.sources().stock_tangents(0), Some(true));
+        let pose = *input.app.world().get::<Transform>(primitive).unwrap();
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .insert(SourceNodePose(pose));
+        input.assert_bound(primitive);
+        assert_delta_only(&input);
+        assert!(input.sources().last_work.journal_complete);
+        assert_eq!(input.sources().last_work.template_rows, 0);
+        assert_eq!(input.sources().stock_tangents(0), Some(true));
+        assert_eq!(input.sources().layout_version, version);
+        input
+            .app
+            .world_mut()
+            .resource_mut::<Messages<AssetEvent<Mesh>>>()
+            .write(AssetEvent::Modified { id: stock.id() });
+        input.assert_blocked();
+        assert_eq!(input.sources().stock_tangents(0), None);
+        assert_eq!(input.sources().last_work.template_rows, 1);
+        assert_eq!(input.sources().last_work.primitives_scanned, 0);
+        assert!(input.sources().source_fallback_batches.contains(&0));
+        input.render.resource_mut::<Sources>().force_full = true;
+        input.extract();
+        assert_eq!(input.sources().stock_tangents(0), None);
+        assert!(input.sources().source_fallback_batches.contains(&0));
     }
 
     #[test]
@@ -6784,48 +6065,43 @@ mod extract_source_tests {
 
     #[test]
     fn unrelated_mesh_events_do_no_qualification_work_in_either_ownership_mode() {
-        for own_statics in [false, true] {
-            let mut input = Fixture::pending();
-            let primitive = input.spawn_stock();
-            input.render.insert_resource(ClusterSettings {
-                own_statics,
-                ..default()
-            });
-            source_template(&mut input);
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.render.insert_resource(ClusterSettings::default());
+        source_template(&mut input);
+        input.assert_bound(primitive);
+        input.extract();
+        assert!(input.sources().templates[0]);
+        let version = input.sources().candidate_version;
+        let refreshes = input.sources().qualification_refreshes;
+        let mesh = Handle::<Mesh>::Uuid(
+            bevy::asset::uuid::Uuid::from_u128(0xabcdef),
+            std::marker::PhantomData,
+        );
+        for event in [
+            AssetEvent::Modified { id: mesh.id() },
+            AssetEvent::Removed { id: mesh.id() },
+        ] {
+            input
+                .app
+                .world_mut()
+                .resource_mut::<Messages<AssetEvent<Mesh>>>()
+                .write(event);
             input.assert_bound(primitive);
-            input.extract();
-            assert!(input.sources().templates[0]);
-            let version = input.sources().candidate_version;
-            let refreshes = input.sources().qualification_refreshes;
-            let mesh = Handle::<Mesh>::Uuid(
-                bevy::asset::uuid::Uuid::from_u128(0xabcdef),
-                std::marker::PhantomData,
+            let work = input.sources().last_work;
+            assert_eq!(
+                (
+                    work.roots_scanned,
+                    work.meshes_scanned,
+                    work.primitives_scanned,
+                    work.template_rows,
+                    work.stock_rows_revoked
+                ),
+                (0, 0, 0, 0, 0)
             );
-            for event in [
-                AssetEvent::Modified { id: mesh.id() },
-                AssetEvent::Removed { id: mesh.id() },
-            ] {
-                input
-                    .app
-                    .world_mut()
-                    .resource_mut::<Messages<AssetEvent<Mesh>>>()
-                    .write(event);
-                input.assert_bound(primitive);
-                let work = input.sources().last_work;
-                assert_eq!(
-                    (
-                        work.roots_scanned,
-                        work.meshes_scanned,
-                        work.primitives_scanned,
-                        work.template_rows,
-                        work.stock_rows_revoked
-                    ),
-                    (0, 0, 0, 0, 0)
-                );
-                assert_eq!(input.sources().qualification_refreshes, refreshes);
-                assert_eq!(input.sources().candidate_version, version);
-                assert!(input.sources().templates[0]);
-            }
+            assert_eq!(input.sources().qualification_refreshes, refreshes);
+            assert_eq!(input.sources().candidate_version, version);
+            assert!(input.sources().templates[0]);
         }
     }
 
