@@ -4072,8 +4072,10 @@ fn persist_ingestion_cache(staging_cache: &Path, cache_root: &Path) -> Result<()
 ///
 /// Settings resolution per worldspace: an explicit `lod_origins` entry wins
 /// (custom worlds), otherwise the `lodsettings/<WorldspaceEDID>.lod` sidecar
-/// supplies its origin and Skyrim grid metadata (installed worlds). Missing or invalid
-/// settings omit only that world's LOD; full-detail conversion remains usable.
+/// supplies its origin and Skyrim grid metadata (installed worlds). Forced cluster mode
+/// derives a missing origin from exterior cell minima, including cells without LAND.
+/// Baked/auto omit worlds with missing or invalid settings; forced cluster mode rejects
+/// invalid authored settings.
 ///
 /// The build identity is one hash over the ordered plugin bytes, every
 /// compiled chunk's content hash, the configuration hash, and the converter
@@ -4297,14 +4299,18 @@ async fn compile_lod_chunks_inline(
     }
     'world: for (index, (worldspace_id, editor_id)) in worlds.iter().enumerate() {
         interrupt(cancellation)?;
-        let settings = match resolve_lod_settings(config, &staging.join("vfs"), editor_id) {
+        let mut resolved = resolve_lod_settings(config, &staging.join("vfs"), editor_id);
+        let mut derived_origin = None;
+        if matches!(resolved, Ok(None)) && crate::cluster::cluster_only(config) {
+            derived_origin = exterior_cell_grid_origin(&connection, *worldspace_id)?;
+            resolved = Ok(derived_origin.map(|origin| ResolvedLodSettings {
+                origin,
+                sidecar: None,
+            }));
+        }
+        let settings = match resolved {
             Ok(Some(settings)) => settings,
             Ok(None) => {
-                ensure!(
-                    !crate::cluster::cluster_only(config)
-                        || exterior_terrain_cells(&connection, *worldspace_id)?.is_empty(),
-                    "cluster terrain requires a LOD origin for worldspace {editor_id} ({worldspace_id:08X})"
-                );
                 let message = format!(
                     "worldspace {editor_id} ({worldspace_id:08X}) has no LOD origin: no lod_origins entry and no lodsettings/{editor_id}.lod; its terrain LOD is skipped"
                 );
@@ -4352,7 +4358,7 @@ async fn compile_lod_chunks_inline(
             }
         };
         let origin = settings.origin;
-        world_settings.push(serde_json::json!({
+        let mut recorded_settings = serde_json::json!({
             "worldspace_id": worldspace_id,
             "editor_id": editor_id,
             "status": "ready",
@@ -4362,7 +4368,23 @@ async fn compile_lod_chunks_inline(
                 "min_level": sidecar.min_level,
                 "max_level": sidecar.max_level,
             })),
-        }));
+        });
+        if derived_origin.is_some() {
+            recorded_settings["origin_source"] = serde_json::json!("exterior_cell_minima");
+            let message = format!(
+                "worldspace {editor_id} ({worldspace_id:08X}) cluster grid origin ({}, {}) selected from exterior cell minima; no native LOD settings are present",
+                origin.grid_x, origin.grid_y
+            );
+            report.notices.push(message.clone());
+            let _ = progress_tx
+                .send(ProgressEvent::notice(
+                    ProgressStage::LodChunks,
+                    None,
+                    &message,
+                ))
+                .await;
+        }
+        world_settings.push(recorded_settings);
         connection.execute(
             "UPDATE worldspaces SET lod_origin_x = ?1, lod_origin_y = ?2 WHERE id = ?3",
             rusqlite::params![origin.grid_x, origin.grid_y, worldspace_id],
@@ -4736,7 +4758,15 @@ async fn compile_lod_chunks_inline(
             compiler_version: crate::lod::TERRAIN_COMPILER_VERSION,
             chunk_inputs,
         };
-        let bytes = serde_json::to_vec_pretty(&manifest)?;
+        let bytes = if crate::cluster::cluster_only(config) {
+            // Keep the declared cluster grid selection reviewable alongside the identity
+            // that already binds these settings. Baked/auto recipe bytes stay unchanged.
+            let mut recipe = serde_json::to_value(&manifest)?;
+            recipe["world_settings"] = serde_json::to_value(&world_settings)?;
+            serde_json::to_vec_pretty(&recipe)?
+        } else {
+            serde_json::to_vec_pretty(&manifest)?
+        };
         fs::write(staging.join("lod-manifest.json"), &bytes)?;
     }
     Ok(())
@@ -4821,6 +4851,21 @@ fn prune_stale_ingestion_blobs(cache_root: &Path, manifest: &ConversionManifest)
 struct ResolvedLodSettings {
     origin: LodOrigin,
     sidecar: Option<LodSettings>,
+}
+
+/// A cluster grid needs cell coordinates, not native LOD assets or LAND coverage.
+/// Both minima use the same set of complete coordinate pairs; empty worlds have no origin.
+fn exterior_cell_grid_origin(
+    connection: &Connection,
+    worldspace_id: u32,
+) -> Result<Option<LodOrigin>> {
+    let (x, y): (Option<i32>, Option<i32>) = connection.query_row(
+        "SELECT MIN(grid_x), MIN(grid_y) FROM cells WHERE worldspace_id = ?1
+         AND grid_x IS NOT NULL AND grid_y IS NOT NULL",
+        [worldspace_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(x.zip(y).map(|(x, y)| LodOrigin::new(x, y)))
 }
 
 /// Resolve against the effective staged VFS, after archive and loose overlays.

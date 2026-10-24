@@ -67,6 +67,26 @@ fn config(world: &World, mode: LodMode) -> PipelineConfig {
     config
 }
 
+fn use_tree_placements(world: &World) {
+    // Keep fixture model paths, placements and FormIDs; the classifier owns TREE rules.
+    let plugin_path = discover(&world.data)
+        .unwrap()
+        .into_iter()
+        .find(|path| extension(path, &["esm"]))
+        .unwrap();
+    let mut plugin = fs::read(&plugin_path).unwrap();
+    let signatures = plugin
+        .windows(4)
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == b"STAT").then_some(offset))
+        .collect::<Vec<_>>();
+    assert_eq!(signatures.len(), 1);
+    for offset in signatures {
+        plugin[offset..offset + 4].copy_from_slice(b"TREE");
+    }
+    fs::write(plugin_path, plugin).unwrap();
+}
+
 async fn convert(
     config: PipelineConfig,
     hooks: PostPublish,
@@ -199,29 +219,239 @@ async fn cluster_and_auto_conversions_publish_a_clusterless_base_and_one_accepte
     }
 }
 
+#[tokio::test]
+async fn cluster_without_native_lod_origin_derives_cell_minima_and_admits_terrain() {
+    let world = world(true);
+    use_tree_placements(&world);
+    fs::remove_file(world.data.join("Skyrim - Misc.bsa")).unwrap();
+    let report = convert(config(&world, LodMode::Cluster), PostPublish::FIXTURE)
+        .await
+        .unwrap();
+    assert!(report.complete, "{:?}", report.warnings);
+    assert_eq!(report.lod_chunks, 0);
+    assert!(report.cluster.as_ref().unwrap().counts.references_eligible > 0);
+    assert!(
+        report.notices.iter().any(|notice| {
+            notice.contains("GeneratedWorld") && notice.contains("exterior cell minima")
+        }),
+        "{:?}",
+        report.notices
+    );
+    assert_derived_cell_origin(&world.output, (-1, -1));
+    let geometry = shared::geometry::GeometryManifest::load(&world.output).unwrap();
+    assert_eq!(
+        geometry.geometry_mode,
+        shared::geometry::GeometryMode::Cluster
+    );
+    let overlay = fs::canonicalize(world.output.join(geometry.cluster_package.unwrap())).unwrap();
+    let metadata = shared::cluster_overlay::checked_overlay(
+        &fs::canonicalize(&world.output).unwrap(),
+        &overlay,
+    )
+    .unwrap();
+    assert!(metadata.build_settings.terrain);
+    assert!(metadata.build_settings.include_trees);
+    assert!(
+        metadata
+            .extensions
+            .iter()
+            .any(|entry| entry.id == shared::extensions::CLUSTER_TERRAIN)
+    );
+    let database = Connection::open(overlay.join("clusters.db")).unwrap();
+    let terrain_rows: i64 = database
+        .query_row("SELECT count(*) FROM cluster_terrain", [], |row| row.get(0))
+        .unwrap();
+    assert!(terrain_rows > 0);
+    assert_accepted_overlay(&world.output);
+}
+
+fn assert_derived_cell_origin(output: &Path, expected: (i32, i32)) {
+    let database = Connection::open(output.join("skyrim_world.db")).unwrap();
+    let (worldspace_id, x, y): (u32, i32, i32) = database
+        .query_row(
+            "SELECT id, lod_origin_x, lod_origin_y FROM worldspaces WHERE editor_id = ?1",
+            [layout::GENERATED_WORLDSPACE],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let minima: (i32, i32) = database
+        .query_row(
+            "SELECT MIN(grid_x), MIN(grid_y) FROM cells WHERE worldspace_id = ?1
+             AND grid_x IS NOT NULL AND grid_y IS NOT NULL",
+            [worldspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(minima, expected);
+    assert_eq!((x, y), minima);
+    let chunks: i64 = database
+        .query_row("SELECT count(*) FROM lod_chunks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(chunks, 0);
+    let recipe: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("lod-manifest.json")).unwrap()).unwrap();
+    let settings = recipe["world_settings"].as_array().unwrap();
+    let settings = settings
+        .iter()
+        .find(|settings| settings["worldspace_id"] == worldspace_id)
+        .unwrap();
+    assert_eq!(settings["origin"], serde_json::json!([x, y]));
+    assert_eq!(settings["origin_source"], "exterior_cell_minima");
+    assert!(settings["sidecar"].is_null());
+}
+
+#[tokio::test]
+async fn baked_and_auto_without_native_lod_origin_keep_missing_origin() {
+    for mode in [LodMode::Baked, LodMode::Auto] {
+        let world = world(true);
+        fs::remove_file(world.data.join("Skyrim - Misc.bsa")).unwrap();
+        let report = convert(config(&world, mode), PostPublish::FIXTURE)
+            .await
+            .unwrap();
+        assert_eq!(report.lod_chunks, 0);
+        assert!(
+            report
+                .lod_warnings
+                .iter()
+                .any(|warning| warning.contains("has no LOD origin"))
+        );
+        assert!(
+            !report
+                .notices
+                .iter()
+                .any(|notice| notice.contains("exterior cell minima"))
+        );
+        let database = Connection::open(world.output.join("skyrim_world.db")).unwrap();
+        let origin: (Option<i32>, Option<i32>) = database
+            .query_row(
+                "SELECT lod_origin_x, lod_origin_y FROM worldspaces WHERE editor_id = ?1",
+                [layout::GENERATED_WORLDSPACE],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(origin, (None, None));
+        assert!(!world.output.join("lod-manifest.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn cluster_without_native_lod_origin_clusters_object_only_world_at_nonzero_minima() {
+    let world = world(true);
+    fs::remove_file(world.data.join("Skyrim - Misc.bsa")).unwrap();
+    // Different cells supply each axis minimum; neither cell is the derived origin.
+    let cells = [
+        dummy_content::esm::Cell {
+            grid_x: -7,
+            grid_y: 18,
+        },
+        dummy_content::esm::Cell {
+            grid_x: 4,
+            grid_y: 11,
+        },
+    ];
+    let mut plugin = dummy_content::esm::plugin(&dummy_content::esm::Plugin {
+        author: layout::GENERATED_AUTHOR,
+        worldspace: layout::GENERATED_WORLDSPACE,
+        cells: &cells,
+        model_path: layout::GENERATED_MODEL_PATH,
+        diffuse: layout::GENERATED_DIFFUSE_PATH,
+        normal_texture: layout::GENERATED_NORMAL_PATH,
+    })
+    .unwrap();
+    let land_offsets: Vec<_> = plugin
+        .windows(4)
+        .enumerate()
+        .filter_map(|(offset, signature)| (signature == b"LAND").then_some(offset))
+        .collect();
+    assert_eq!(land_offsets.len(), cells.len());
+    for offset in land_offsets {
+        // The authored deleted flag removes LAND through the real plugin merger.
+        let flags = u32::from_le_bytes(plugin[offset + 8..offset + 12].try_into().unwrap());
+        plugin[offset + 8..offset + 12].copy_from_slice(&(flags | 0x20).to_le_bytes());
+    }
+    fs::write(world.data.join("Skyrim.esm"), plugin).unwrap();
+    let report = convert(config(&world, LodMode::Cluster), PostPublish::FIXTURE)
+        .await
+        .unwrap();
+    assert!(report.complete, "{:?}", report.warnings);
+    assert_eq!(
+        report.cluster.as_ref().unwrap().counts.references_eligible,
+        cells.len() as u64
+    );
+    assert_derived_cell_origin(&world.output, (-7, 11));
+    let database = Connection::open(world.output.join("skyrim_world.db")).unwrap();
+    let land_rows: i64 = database
+        .query_row("SELECT count(*) FROM land", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(land_rows, 0);
+    assert_accepted_overlay(&world.output);
+}
+
+#[tokio::test]
+async fn cluster_invalid_native_lod_settings_still_fail() {
+    let world = world(true);
+    fs::write(
+        world.data.join("Skyrim - Misc.bsa"),
+        bsa::v105(
+            &[Entry {
+                name: "LODSettings/GeneratedWorld.LOD",
+                data: b"invalid authored settings",
+            }],
+            bsa::Compression::None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let failure = convert(config(&world, LodMode::Cluster), PostPublish::FIXTURE)
+        .await
+        .unwrap_err();
+    assert!(format!("{failure:#}").contains("invalid cluster terrain settings for GeneratedWorld"));
+    assert!(!world.output.exists());
+}
+
+#[test]
+fn cluster_grid_origin_ignores_partial_coordinates_and_leaves_empty_worlds_missing() {
+    let world = world(true);
+    let database_path = world._directory.path().join("grid-origin.db");
+    EsmParser::convert_plugins_with_records(&[world.data.join("Skyrim.esm")], &database_path)
+        .unwrap();
+    let database = Connection::open(database_path).unwrap();
+    let worldspace_id: u32 = database
+        .query_row(
+            "SELECT id FROM worldspaces WHERE editor_id = ?1",
+            [layout::GENERATED_WORLDSPACE],
+            |row| row.get(0),
+        )
+        .unwrap();
+    database
+        .execute_batch(
+            "UPDATE cells SET grid_x = -99, grid_y = NULL WHERE id = (SELECT MIN(id) FROM cells);
+         UPDATE cells SET grid_x = NULL, grid_y = -99 WHERE id = (SELECT MAX(id) FROM cells);",
+        )
+        .unwrap();
+    assert_eq!(
+        exterior_cell_grid_origin(&database, worldspace_id).unwrap(),
+        Some(LodOrigin::new(-1, -1))
+    );
+    assert_eq!(
+        exterior_cell_grid_origin(&database, worldspace_id + 1).unwrap(),
+        None
+    );
+    database
+        .execute("UPDATE cells SET grid_x = NULL", [])
+        .unwrap();
+    assert_eq!(
+        exterior_cell_grid_origin(&database, worldspace_id).unwrap(),
+        None
+    );
+}
+
 /// CPU-only integration: native inputs are deliberately invalid. Reaching publication proves
 /// neither archive/loose inventory nor native mesh/billboard conversion consumed them.
 #[tokio::test]
 async fn cluster_conversion_omits_baked_products_and_binds_the_exact_tree_and_terrain_package() {
     let world = world(true);
-    // The synthetic plugin's one STAT becomes a TREE record without
-    // changing model paths, placements or FormIDs. The existing classifier owns TREE rules.
-    let plugin_path = discover(&world.data)
-        .unwrap()
-        .into_iter()
-        .find(|path| extension(path, &["esm"]))
-        .unwrap();
-    let mut plugin = fs::read(&plugin_path).unwrap();
-    let signatures = plugin
-        .windows(4)
-        .enumerate()
-        .filter_map(|(offset, bytes)| (bytes == b"STAT").then_some(offset))
-        .collect::<Vec<_>>();
-    assert_eq!(signatures.len(), 1);
-    for offset in signatures {
-        plugin[offset..offset + 4].copy_from_slice(b"TREE");
-    }
-    fs::write(plugin_path, plugin).unwrap();
+    use_tree_placements(&world);
     let native = [
         "meshes/terrain/generatedworld/objects/generatedworld.4.0.0.bto",
         "meshes/terrain/generatedworld/generatedworld.4.0.0.btr",
@@ -327,6 +557,18 @@ async fn cluster_conversion_omits_baked_products_and_binds_the_exact_tree_and_te
     let expected = derive_extensions::resolved_settings(&options);
     assert_eq!(metadata.build_settings, expected);
     let database = Connection::open(world.output.join("skyrim_world.db")).unwrap();
+    let origin: (i32, i32) = database
+        .query_row(
+            "SELECT lod_origin_x, lod_origin_y FROM worldspaces WHERE editor_id = ?1",
+            [layout::GENERATED_WORLDSPACE],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        origin,
+        (-4, -4),
+        "authored sidecar must precede cell minima"
+    );
     for table in [
         "lod_chunks",
         "lod_block",
