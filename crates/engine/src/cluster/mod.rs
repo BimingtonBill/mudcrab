@@ -107,6 +107,7 @@ mod tests {
 
 pub mod assets;
 pub mod envelope;
+pub(crate) mod flat_source;
 mod instance_identity;
 mod instance_mask;
 mod mesh_payload;

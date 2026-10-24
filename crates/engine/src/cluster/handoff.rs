@@ -3,6 +3,7 @@
 use super::*;
 use crate::{
     cluster::{
+        flat_source::{self, FlatSourceOwner, FlatSourcePrimitive, OriginalStockScene},
         package::{LazyBatches, ValidatedPackage},
         reader::RecordKey,
         source_identity::{
@@ -635,6 +636,12 @@ type RootState = (
     Option<&'static ChildOf>,
     Option<&'static InheritedVisibility>,
     Has<crate::streaming::AssetFailed>,
+    Option<&'static OriginalStockScene>,
+);
+type SourceIdentityState = (
+    Option<&'static FormId>,
+    Option<&'static ChildOf>,
+    Option<&'static FlatSourceOwner>,
 );
 type CameraState = (
     Entity,
@@ -733,6 +740,9 @@ struct QualifiedFacts {
 type SourceFactChanges = Or<(
     Changed<CellRef>,
     Changed<WorldAssetRoot>,
+    Changed<OriginalStockScene>,
+    Changed<FlatSourcePrimitive>,
+    (With<FlatSourcePrimitive>, Changed<GlobalTransform>),
     Changed<MeshHandle>,
     Changed<Mesh3d>,
     Changed<SourcePrimitive>,
@@ -747,7 +757,7 @@ type SourceFactChanges = Or<(
     )>,
 )>;
 
-type SourceIdentityChanges = Or<(Changed<FormId>, Changed<ChildOf>)>;
+type SourceIdentityChanges = Or<(Changed<FormId>, Changed<ChildOf>, Changed<FlatSourceOwner>)>;
 type SourceVisibilityChanges = Or<(Changed<Visibility>, Changed<InheritedVisibility>)>;
 type HotFactChanges = Or<(
     Changed<Transform>,
@@ -796,6 +806,10 @@ type SourceObservationDomain = (
         bevy::ecs::query::Allow<RenderLayers>,
         bevy::ecs::query::Allow<MeshMaterial3d<StandardMaterial>>,
         bevy::ecs::query::Allow<MeshMaterial3d<SnowMaterial>>,
+        bevy::ecs::query::Allow<OriginalStockScene>,
+        bevy::ecs::query::Allow<FlatSourcePrimitive>,
+        bevy::ecs::query::Allow<FlatSourceOwner>,
+        bevy::ecs::query::Allow<GlobalTransform>,
     ),
 );
 
@@ -808,8 +822,7 @@ struct SourceQueries<'w, 's> {
     hot_changes: Query<'w, 's, Entity, (SourceObservationDomain, HotFactChanges)>,
     hot_facts: Query<'w, 's, HotFactState<'static>, SourceObservationDomain>,
     identity_changes: Query<'w, 's, Entity, (SourceObservationDomain, SourceIdentityChanges)>,
-    identity_state:
-        Query<'w, 's, (Option<&'static FormId>, Option<&'static ChildOf>), SourceObservationDomain>,
+    identity_state: Query<'w, 's, SourceIdentityState, SourceObservationDomain>,
     terrain_visibility_changes: Query<'w, 's, Entity, SourceVisibilityChanges>,
     ticks: bevy::ecs::system::SystemChangeTick,
     cache: Local<'s, QualificationCache>,
@@ -837,6 +850,9 @@ struct SourceQueries<'w, 's> {
         ),
     >,
     nodes: Query<'w, 's, NodeState>,
+    flat_primitives:
+        Query<'w, 's, flat_source::FlatPrimitiveState<'static>, flat_source::FlatPrimitiveDomain>,
+    flat_owners: Query<'w, 's, &'static FlatSourceOwner>,
     cells: Query<
         'w,
         's,
@@ -952,6 +968,7 @@ impl ReferenceRootMemo {
 fn under_retired_cell(
     entity: Entity,
     parents: &Query<&ChildOf>,
+    owners: &Query<&FlatSourceOwner>,
     retired_cells: &crate::streaming::RetiredCellAccess,
 ) -> bool {
     let mut at = entity;
@@ -960,10 +977,10 @@ fn under_retired_cell(
         if retired_cells.contains(at) {
             return true;
         }
-        let Ok(parent) = parents.get(at) else {
+        let Some(parent) = flat_source::logical_parent(at, parents, owners) else {
             return false;
         };
-        at = parent.parent();
+        at = parent;
     }
     false
 }
@@ -974,6 +991,7 @@ fn explicitly_hidden_below_cell(
     entity: Entity,
     cell: Entity,
     parents: &Query<&ChildOf>,
+    owners: &Query<&FlatSourceOwner>,
     visibility: &Query<&Visibility>,
 ) -> bool {
     let mut at = entity;
@@ -986,10 +1004,10 @@ fn explicitly_hidden_below_cell(
         {
             return true;
         }
-        let Ok(parent) = parents.get(at) else {
+        let Some(parent) = flat_source::logical_parent(at, parents, owners) else {
             return true;
         };
-        at = parent.parent();
+        at = parent;
     }
     false
 }
@@ -1250,7 +1268,14 @@ fn extract_sources(
             .identity_state
             .get(entity)
             .ok()
-            .map(|(form, parent)| (form.map(|form| form.0), parent.map(ChildOf::parent)))
+            .map(|(form, parent, owner)| {
+                (
+                    form.map(|form| form.0),
+                    parent
+                        .map(ChildOf::parent)
+                        .or_else(|| owner.map(|owner| owner.0)),
+                )
+            })
             .unwrap_or_default();
         if queries.cache.identities.get(&entity) != Some(&identity) {
             changed.insert(entity);
@@ -1441,7 +1466,12 @@ fn extract_sources(
         for root in history {
             if let Some(references) = out.seen_roots.get(&root) {
                 present.extend(references.iter().copied());
-                if under_retired_cell(root, &queries.parents, &queries.retired_cells) {
+                if under_retired_cell(
+                    root,
+                    &queries.parents,
+                    &queries.flat_owners,
+                    &queries.retired_cells,
+                ) {
                     retired_present.extend(references.iter().copied());
                 }
             }
@@ -1468,8 +1498,18 @@ fn extract_sources(
             let mut retired_candidates = HashMap::new();
             let mut mesh_roots: HashMap<Entity, Vec<Entity>> = HashMap::new();
             for root in &affected.roots {
-                let Ok((entity, form, cell, asset, mesh_path, actual, parent, visible, failed)) =
-                    queries.roots.get(*root)
+                let Ok((
+                    entity,
+                    form,
+                    cell,
+                    asset,
+                    mesh_path,
+                    actual,
+                    parent,
+                    visible,
+                    failed,
+                    original,
+                )) = queries.roots.get(*root)
                 else {
                     continue;
                 };
@@ -1477,7 +1517,12 @@ fn extract_sources(
                 if certificate.reference(form.0).is_none() {
                     continue;
                 }
-                if under_retired_cell(entity, &queries.parents, &queries.retired_cells) {
+                if under_retired_cell(
+                    entity,
+                    &queries.parents,
+                    &queries.flat_owners,
+                    &queries.retired_cells,
+                ) {
                     retired_present.insert(form.0);
                 }
                 if roots.insert(form.0, entity).is_some() {
@@ -1493,11 +1538,7 @@ fn extract_sources(
                     if mesh_path?.0 != expected_path {
                         return None;
                     }
-                    if let Some(asset) = asset
-                        && asset.0.path().is_none_or(|path| {
-                            path.path().to_string_lossy().replace('\\', "/") != expected_path
-                        })
-                    {
+                    if !flat_source::scene_path_matches(asset, original, expected_path) {
                         return None;
                     }
                     let (cell_key, cell_pose, cell_parent) =
@@ -1546,7 +1587,7 @@ fn extract_sources(
                 let Some(root) = reference_roots.resolve(
                     entity,
                     |at| queries.roots.contains(at),
-                    |at| queries.parents.get(at).ok().map(ChildOf::parent),
+                    |at| flat_source::logical_parent(at, &queries.parents, &queries.flat_owners),
                 ) else {
                     continue;
                 };
@@ -1589,7 +1630,7 @@ fn extract_sources(
                 let Some(root) = reference_roots.resolve(
                     entity,
                     |at| queries.roots.contains(at),
-                    |at| queries.parents.get(at).ok().map(ChildOf::parent),
+                    |at| flat_source::logical_parent(at, &queries.parents, &queries.flat_owners),
                 ) else {
                     continue;
                 };
@@ -1607,7 +1648,11 @@ fn extract_sources(
                 }) {
                     continue;
                 }
-                if model_matrix(entity, root, &queries.nodes) != Some(source_transform.0) {
+                let matrix = match queries.flat_primitives.get(entity) {
+                    Ok(state) => flat_source::model_matrix(state, root),
+                    Err(_) => model_matrix(entity, root, &queries.nodes),
+                };
+                if matrix != Some(source_transform.0) {
                     continue;
                 }
                 let primitive = (*form, tag.ordinal);
@@ -1667,6 +1712,7 @@ fn extract_sources(
                                     *entity,
                                     cell,
                                     &queries.parents,
+                                    &queries.flat_owners,
                                     &queries.explicit_visibility,
                                 )
                         })
@@ -1725,7 +1771,14 @@ fn extract_sources(
                 .identity_state
                 .get(*entity)
                 .ok()
-                .map(|(form, parent)| (form.map(|form| form.0), parent.map(ChildOf::parent)))
+                .map(|(form, parent, owner)| {
+                    (
+                        form.map(|form| form.0),
+                        parent
+                            .map(ChildOf::parent)
+                            .or_else(|| owner.map(|owner| owner.0)),
+                    )
+                })
                 .unwrap_or_default();
             queries.cache.identities.insert(*entity, identity);
             let literal = queries.roots.contains(*entity) || queries.cells.contains(*entity);
@@ -5344,6 +5397,8 @@ mod extract_source_tests {
         assert!(!work.qualification_full);
         assert_eq!((work.discovery_roots, work.discovery_meshes), (0, 0));
     }
+
+    include!("flat_source_handoff_tests.rs");
 
     fn duplicate_primitive(input: &mut Fixture, primitive: Entity) -> Entity {
         let world = input.app.world();

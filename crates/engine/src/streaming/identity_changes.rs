@@ -154,12 +154,22 @@ pub(crate) fn install(world: &mut World) {
         return;
     }
     use crate::{
-        cluster::source_identity::*,
+        cluster::{
+            flat_source::{
+                FlatSourceOwner, FlatSourcePrimitive, FlatSourcePrimitives, OriginalStockScene,
+            },
+            source_identity::*,
+        },
         world::components::{CellRef, FormId, MeshHandle},
     };
     macro_rules! ids { ($($ty:ty),* $(,)?) => { vec![$(world.register_component::<$ty>()),*] }; }
     let mut components = ids![
         Transform,
+        GlobalTransform,
+        FlatSourceOwner,
+        FlatSourcePrimitive,
+        FlatSourcePrimitives,
+        OriginalStockScene,
         ChildOf,
         Mesh3d,
         FormId,

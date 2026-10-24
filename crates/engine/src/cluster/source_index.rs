@@ -135,11 +135,13 @@ impl SourceIndex {
                 {
                     nearest = Some(form.0);
                 }
-                let Ok(parent) = queries.parents.get(at) else {
+                let Some(parent) =
+                    flat_source::logical_parent(at, &queries.parents, &queries.flat_owners)
+                else {
                     break;
                 };
                 affected.ancestry_edges += 1;
-                at = parent.parent();
+                at = parent;
             }
             let mut references = HashSet::new();
             references.extend(nearest);
