@@ -678,6 +678,7 @@ impl AssetPipeline {
         };
         let mut ingestion_journal = IngestionJournal::open(staging)?;
         let mut manifest = ConversionManifest {
+            geometry: crate::cluster::geometry_manifest(config),
             schema_version: CONVERTER_SCHEMA_VERSION,
             retained_mesh_schema_version: None,
             retained_asset_configuration_hash: None,
@@ -892,6 +893,7 @@ impl AssetPipeline {
 
         let raw_ingestion_session =
             Arc::new(RawIngestionSession::new(&staging.join(".ingestion-cache")));
+        let mut extracted_archive_sources = Vec::new();
         for (index, archive) in enabled_archives.iter().enumerate() {
             interrupt(cancellation)?;
             send(
@@ -931,6 +933,12 @@ impl AssetPipeline {
             // that the in-house reader may select, so it extracts the converter-input superset.
             extraction_options.selection = if config.extract_all_archive_files {
                 IngestionSelection::All
+            } else if crate::cluster::cluster_only(config) {
+                if crate::esm::inhouse::is_english(&config.language) {
+                    IngestionSelection::ClusterEnglishV1
+                } else {
+                    IngestionSelection::ClusterInputsV1
+                }
             } else if crate::esm::inhouse::is_english(&config.language) {
                 IngestionSelection::RuntimeEnglishV2
             } else {
@@ -1030,6 +1038,8 @@ impl AssetPipeline {
 
             match result {
                 Ok(outcome) => {
+                    extracted_archive_sources
+                        .push((archive.clone(), outcome.cache_entry.source_hash.clone()));
                     report
                         .archive_timings
                         .insert(archive_key.clone(), outcome.timings);
@@ -1059,7 +1069,17 @@ impl AssetPipeline {
         }
 
         if config.mo2.is_none() {
-            overlay_loose_assets(&config.data_dir, &staging.join("vfs"), &files)?;
+            let loose_files: Vec<_> = files
+                .iter()
+                .filter(|path| {
+                    !crate::cluster::cluster_only(config)
+                        || !path
+                            .strip_prefix(&config.data_dir)
+                            .is_ok_and(portal_lod::is_baked_geometry_input)
+                })
+                .cloned()
+                .collect();
+            overlay_loose_assets(&config.data_dir, &staging.join("vfs"), &loose_files)?;
         }
         report.phase_elapsed_ms.insert(
             "archive_ingestion_and_loose_overlay".into(),
@@ -1344,7 +1364,11 @@ impl AssetPipeline {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if crate::asset_path::is_authoring_resource(&relative) {
+            if crate::cluster::cluster_only(config)
+                && portal_lod::is_baked_geometry_input(Path::new(&relative))
+            {
+                false
+            } else if crate::asset_path::is_authoring_resource(&relative) {
                 manifest.excluded_inputs.insert(
                     relative,
                     "BodySlide/Outfit Studio authoring resource, not runtime data".into(),
@@ -1354,8 +1378,8 @@ impl AssetPipeline {
                 true
             }
         });
-        let source_paths = vfs_files;
-        let vfs_files: Vec<_> = source_paths.keys().cloned().collect();
+        let mut source_paths = vfs_files;
+        let mut vfs_files: Vec<_> = source_paths.keys().cloned().collect();
         if config.mo2.is_some() {
             prune_removed_mo2_outputs(staging, &vfs_files)?;
             if plugins.is_empty() {
@@ -1371,9 +1395,40 @@ impl AssetPipeline {
                 }
             }
         }
+        if crate::cluster::cluster_only(config) {
+            // An old pruned GLB no longer names its missing DDS. Restore current sources
+            // named by its prune audit before reuse decides whether to reconvert that mesh.
+            let mut revived = BTreeSet::new();
+            for (key, entry) in &previous.entries {
+                if key.ends_with(".nif")
+                    && source_paths.contains_key(&vfs_root.join(key))
+                    && let Some(references) = previous.pruned_texture_references.get(&entry.output)
+                {
+                    revived.extend(
+                        references
+                            .iter()
+                            .filter_map(|reference| texture_reference_source_key(reference))
+                            .map(PathBuf::from)
+                            .filter(|path| portal_lod::is_baked_geometry_input(path)),
+                    );
+                }
+            }
+            for path in restore_shared_lod_textures(
+                config,
+                staging,
+                &extracted_archive_sources,
+                &resolved_files,
+                &files,
+                &revived,
+            )? {
+                if source_paths.insert(path.clone(), path.clone()).is_none() {
+                    vfs_files.push(path);
+                }
+            }
+        }
         // Canonical source texture keys, used to tell a failed publication from absent game data
         // and to detect a pruned texture whose source is back in the installed data.
-        let source_textures = texture_source_keys(staging, &vfs_files);
+        let mut source_textures = texture_source_keys(staging, &vfs_files);
         let restored_meshes = restored_mesh_outputs(previous, &source_textures);
         remove_orphan_staged_assets(staging, &vfs_files)?;
         report.phase_elapsed_ms.insert(
@@ -1418,7 +1473,11 @@ impl AssetPipeline {
         // block GLBs, and must run before the texture stage so the tree atlas
         // is encoded as a base colour texture and its sRGB alias is published
         // for the generated billboards.
-        let lod = portal_lod::record_lod_inventory(staging, &plugins)?;
+        let lod = if crate::cluster::cluster_only(config) {
+            portal_lod::LodInventoryReport::default()
+        } else {
+            portal_lod::record_lod_inventory(staging, &plugins)?
+        };
         report.artifacts.extend(lod.billboards.iter().cloned());
         // Only defects that leave the inventory incomplete fail the run; a
         // block without bounds or a stale instance is counted in the report.
@@ -1441,6 +1500,45 @@ impl AssetPipeline {
         }
         report.lod = Some(lod);
         let texture_semantics = collect_texture_semantics(staging, &source_textures)?;
+        if crate::cluster::cluster_only(config) {
+            // A mod can use a native LOD texture in a near mesh, TXST or LAND. Such a
+            // DDS is a shared source. Extract only those
+            // excluded texture paths that surviving runtime consumers actually name.
+            let mut shared_lod_textures: BTreeSet<PathBuf> = texture_semantics
+                .keys()
+                .filter_map(|key| texture_reference_source_key(key))
+                .map(PathBuf::from)
+                .filter(|path| portal_lod::is_baked_geometry_input(path))
+                .collect();
+            let database = staging.join("skyrim_world.db");
+            if database.is_file() {
+                shared_lod_textures.extend(
+                    crate::lod::albedo::terrain_diffuse_paths(&Connection::open(database)?)?
+                        .into_iter()
+                        .filter(|path| portal_lod::is_baked_geometry_input(path)),
+                );
+            }
+            shared_lod_textures.extend(
+                crate::terrain_pipeline::configured_default_sources(config)?
+                    .into_iter()
+                    .filter(|path| portal_lod::is_baked_geometry_input(path)),
+            );
+            if !shared_lod_textures.is_empty() {
+                for path in restore_shared_lod_textures(
+                    config,
+                    staging,
+                    &extracted_archive_sources,
+                    &resolved_files,
+                    &files,
+                    &shared_lod_textures,
+                )? {
+                    if source_paths.insert(path.clone(), path.clone()).is_none() {
+                        vfs_files.push(path);
+                    }
+                }
+                source_textures = texture_source_keys(staging, &vfs_files);
+            }
+        }
         report.phase_elapsed_ms.insert(
             "meshes_and_texture_semantics".into(),
             meshes_started.elapsed().as_millis(),
@@ -2706,6 +2804,22 @@ pub(crate) fn collect_texture_semantics(
         }
     }
 
+    for (path, uses) in collect_database_texture_semantics(staging)? {
+        semantics.entry(path).or_default().extend(uses);
+    }
+
+    for (path, texture_semantics) in &semantics {
+        TextureEncoding::from_semantics(texture_semantics)
+            .wrap_err_with(|| format!("incompatible texture uses for {path}"))?;
+    }
+    Ok(semantics)
+}
+
+/// Texture references authored in records, independent of generated geometry.
+pub(crate) fn collect_database_texture_semantics(
+    staging: &Path,
+) -> Result<BTreeMap<String, BTreeSet<TextureSemantic>>> {
+    let mut semantics = BTreeMap::<String, BTreeSet<TextureSemantic>>::new();
     let database = staging.join("skyrim_world.db");
     if database.is_file() {
         let connection =
@@ -2747,10 +2861,6 @@ pub(crate) fn collect_texture_semantics(
         }
     }
 
-    for (path, texture_semantics) in &semantics {
-        TextureEncoding::from_semantics(texture_semantics)
-            .wrap_err_with(|| format!("incompatible texture uses for {path}"))?;
-    }
     Ok(semantics)
 }
 
@@ -3218,6 +3328,68 @@ fn plugin_paths_with_diagnostics(
             .unwrap_or("empty selection"),
     );
     Ok(plugins)
+}
+
+/// Restores only candidate LOD textures needed by retained consumers, preserving archive
+/// priority and winning loose/MO2 overrides. Raw source presence feeds normal asset proofs.
+fn restore_shared_lod_textures(
+    config: &PipelineConfig,
+    staging: &Path,
+    archives: &[(PathBuf, String)],
+    resolved_files: &BTreeMap<String, PathBuf>,
+    files: &[PathBuf],
+    wanted: &BTreeSet<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let vfs = staging.join("vfs");
+    for (archive, expected_hash) in archives {
+        ArchiveExtractor::extract_paths(archive, &vfs, wanted)?;
+        ensure!(
+            hash_file(archive)? == *expected_hash,
+            "archive inputs changed while restoring shared LOD textures: {}",
+            archive.display()
+        );
+    }
+    if config.mo2.is_some() {
+        let winning = resolved_files
+            .iter()
+            .filter_map(|(key, path)| {
+                let key = canonical_asset_path(key, AssetKind::Texture, "dds").ok()?;
+                wanted
+                    .contains(Path::new(&key))
+                    .then(|| (key, path.clone()))
+            })
+            .collect();
+        stage_mo2_lod_inputs(&vfs, &winning)?;
+    } else {
+        let loose = files
+            .iter()
+            .filter(|path| {
+                extension(path, &["dds"])
+                    && path
+                        .strip_prefix(&config.data_dir)
+                        .ok()
+                        .and_then(|relative| {
+                            canonical_asset_path(
+                                &relative.to_string_lossy(),
+                                AssetKind::Texture,
+                                "dds",
+                            )
+                            .ok()
+                        })
+                        .is_some_and(|key| wanted.contains(Path::new(&key)))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        overlay_loose_assets(&config.data_dir, &vfs, &loose)?;
+    }
+    Ok(wanted
+        .iter()
+        .map(|relative| vfs.join(relative))
+        .filter(|path| path.is_file())
+        .collect())
 }
 
 /// Materializes winning loose LOD inputs for the compiler's filesystem-based VFS reads.
@@ -4071,7 +4243,8 @@ async fn compile_lod_chunks_inline(
     let prior_package = reuse_root.join("conversion-manifest.json").exists()
         || reuse_root.join("lod-manifest.json").exists()
         || reuse_root.join("skyrim_world.db").exists();
-    let reuse = if config.invalidate_cache || !prior_package {
+    let reuse = if crate::cluster::cluster_only(config) || config.invalidate_cache || !prior_package
+    {
         None
     } else {
         match LodReuse::open(reuse_root) {
@@ -4127,6 +4300,11 @@ async fn compile_lod_chunks_inline(
         let settings = match resolve_lod_settings(config, &staging.join("vfs"), editor_id) {
             Ok(Some(settings)) => settings,
             Ok(None) => {
+                ensure!(
+                    !crate::cluster::cluster_only(config)
+                        || exterior_terrain_cells(&connection, *worldspace_id)?.is_empty(),
+                    "cluster terrain requires a LOD origin for worldspace {editor_id} ({worldspace_id:08X})"
+                );
                 let message = format!(
                     "worldspace {editor_id} ({worldspace_id:08X}) has no LOD origin: no lod_origins entry and no lodsettings/{editor_id}.lod; its terrain LOD is skipped"
                 );
@@ -4148,6 +4326,11 @@ async fn compile_lod_chunks_inline(
                 continue;
             }
             Err(error) => {
+                if crate::cluster::cluster_only(config) {
+                    return Err(error).wrap_err_with(|| {
+                        format!("invalid cluster terrain settings for {editor_id}")
+                    });
+                }
                 report.lod_warnings.push(format!(
                     "worldspace {editor_id} ({worldspace_id:08X}) has invalid LOD settings: {error:#}; its terrain LOD is skipped"
                 ));
@@ -4210,6 +4393,11 @@ async fn compile_lod_chunks_inline(
         ) {
             Ok(textures) => textures,
             Err(error) => {
+                if crate::cluster::cluster_only(config) {
+                    return Err(error).wrap_err_with(|| {
+                        format!("invalid cluster terrain material inputs for {editor_id}")
+                    });
+                }
                 report.lod_warnings.push(format!("worldspace {editor_id} ({worldspace_id:08X}) terrain LOD skipped: invalid material inputs: {error:#}"));
                 if let Some(settings) = world_settings.last_mut() {
                     settings["status"] = serde_json::json!("invalid_material");
@@ -4227,6 +4415,14 @@ async fn compile_lod_chunks_inline(
                 continue;
             }
         };
+        if crate::cluster::cluster_only(config) {
+            // The cluster terrain producer needs the verified source recipe and canonical
+            // heights, never the baked chunk meshes, atlases or chunk-table rows.
+            textures.verify_sources(&staging.join("vfs"))?;
+            terrain_sources.extend(textures.source_hashes);
+            compiled_worlds += 1;
+            continue;
+        }
         let jobs = terrain_jobs(*worldspace_id, origin, &inputs);
         // Validate before fingerprinting: a cache hit cannot bypass source checks.
         let validation = jobs
@@ -4528,7 +4724,7 @@ async fn compile_lod_chunks_inline(
         "INSERT OR REPLACE INTO lod_build(id, build_identity) VALUES (1, ?1)",
         rusqlite::params![identity],
     )?;
-    if compiled_worlds > 0 {
+    if compiled_worlds > 0 || crate::cluster::cluster_only(config) {
         report.artifacts.push(PathBuf::from("lod-manifest.json"));
         let manifest = LodManifest {
             build_identity: identity,

@@ -328,7 +328,15 @@ pub(super) struct TreeLodPlugin;
 
 impl Plugin for TreeLodPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<TreeLodStreaming>().add_systems(
+        app.init_resource::<TreeLodStreaming>();
+        if app
+            .world()
+            .get_resource::<EngineConfig>()
+            .is_some_and(|config| config.clusters.is_some())
+        {
+            return;
+        }
+        app.add_systems(
             Update,
             (
                 plan_tree_lod
@@ -361,6 +369,9 @@ fn plan_tree_lod(
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
+    if config.clusters.is_some() {
+        return;
+    }
     let started = Instant::now();
     let Some(mut source) = source else {
         return;
@@ -882,6 +893,19 @@ fn update_counts(streaming: &TreeLodStreaming, metrics: &mut StreamingMetrics) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_mode_tree_plugin_schedules_no_native_inventory_readers() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            clusters: Some("fixture".into()),
+            ..default()
+        })
+        .add_plugins(TreeLodPlugin);
+        // Native systems require an AssetServer and inventory. A cluster app requires neither.
+        app.update();
+        assert!(app.world().contains_resource::<TreeLodStreaming>());
+    }
 
     #[test]
     fn block_visibility_is_written_only_when_it_changes() {

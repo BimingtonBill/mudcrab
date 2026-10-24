@@ -13,6 +13,7 @@
 
 pub mod panel;
 pub mod runner;
+pub mod settings;
 pub mod state;
 pub mod status;
 
@@ -166,6 +167,7 @@ impl Plugin for ConversionLogicPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ConversionStatus>()
             .init_resource::<GamePathConfig>()
+            .init_resource::<settings::ConversionSettings>()
             .init_resource::<crate::mo2_settings::SourceSettings>()
             .init_resource::<CurrentConversion>()
             .init_resource::<PendingInputs>()
@@ -188,6 +190,7 @@ pub struct ConversionPanelPlugin;
 impl Plugin for ConversionPanelPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ConversionLogicPlugin)
+            .add_observer(panel::change_cluster_geometry)
             .init_resource::<OutputReady>()
             .init_resource::<OutputHasManifest>()
             .add_systems(Startup, panel::detect_skyrim_at_start)
@@ -209,6 +212,7 @@ impl Plugin for ConversionPanelPlugin {
                     panel::draw_bar,
                     panel::draw_labels,
                     panel::draw_controls,
+                    panel::draw_cluster_geometry,
                 )
                     .in_set(LauncherSet::Draw),
             )
@@ -305,11 +309,13 @@ pub fn actuate_effects(
     mut status: ResMut<ConversionStatus>,
     mut handle: ResMut<RunHandle>,
     source: Res<crate::mo2_settings::SourceSettings>,
+    settings: Res<settings::ConversionSettings>,
 ) {
     for effect in effects.drain() {
         match effect {
             Effect::None => {}
             Effect::Begin(mut config) => {
+                settings.apply(&mut config);
                 let (tx, rx) = crossbeam_channel::unbounded();
                 match source.apply(&mut config) {
                     Ok(()) => handle.cancellation = Some(runner::spawn(*config, tx)),
@@ -402,6 +408,7 @@ pub fn output_is_complete(output: &Path) -> bool {
         .is_some_and(|manifest| {
             manifest.complete
                 && manifest.failures.is_empty()
+                && output_cluster_package(output).is_ok()
                 && (shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION
                     ..=converter::cache::CONVERTER_SCHEMA_VERSION)
                     .contains(&manifest.schema_version)
@@ -416,7 +423,7 @@ pub fn output_is_complete(output: &Path) -> bool {
                                 .and_then(serde_json::Value::as_u64)
                                 .and_then(|version| u32::try_from(version).ok())
                                 .is_some_and(|schema| {
-                                    shared::world_assets::validate_lod_build_contract(
+                                    shared::world_assets::validate_geometry_build_contract(
                                         output,
                                         shared::LOD_CONVERTER_SCHEMA_VERSION,
                                     )
@@ -424,6 +431,32 @@ pub fn output_is_complete(output: &Path) -> bool {
                                 })
                     })
         })
+}
+
+/// Validates the output's geometry selection without inspecting baked LOD inputs in cluster mode.
+pub fn output_cluster_package(output: &Path) -> Result<Option<PathBuf>, String> {
+    let geometry =
+        shared::geometry::GeometryManifest::load(output).map_err(|error| format!("{error:#}"))?;
+    let Some(package) = geometry.cluster_package else {
+        return Ok(None);
+    };
+    // A recorded package is an exact output-relative path, never a user label or CWD selector.
+    let overlay = output
+        .canonicalize()
+        .map_err(|error| error.to_string())?
+        .join(package);
+    let metadata =
+        shared::cluster_overlay::read_metadata(&overlay).map_err(|error| format!("{error:#}"))?;
+    if !metadata.build_settings.terrain
+        || !metadata.build_settings.include_trees
+        || !metadata
+            .extensions
+            .iter()
+            .any(|entry| entry.id == shared::extensions::CLUSTER_TERRAIN)
+    {
+        return Err("Cluster geometry requires a package built with trees and terrain; convert this output again.".into());
+    }
+    Ok(Some(overlay))
 }
 
 /// Keeps [`OutputReady`] and [`OutputHasManifest`] up to date. The check reads the output's

@@ -120,6 +120,12 @@ impl AssetPipeline {
         // Read the original version; normal cache loading deliberately invalidates
         // incompatible assets during migration, which this explicit route verifies instead.
         let mut manifest: ConversionManifest = serde_json::from_slice(&source_manifest)?;
+        manifest.geometry.validate()?;
+        ensure!(
+            manifest.geometry.geometry_mode != shared::geometry::GeometryMode::Cluster
+                || crate::cluster::cluster_only(&config),
+            "metadata rebuild cannot restore baked products omitted by cluster conversion; run normal conversion"
+        );
         let source_reader = source_reader_identity(&source)?;
         let retained_reader = retained_reader_identity(&source, &source_reader)?;
         let source_schemas = source_reader_schemas(&source, &source_reader)?;
@@ -467,31 +473,6 @@ async fn rebuild_into(
         retained_schemas,
     } = metadata;
     let (plugins, plugin_hashes) = matched;
-    progress_event(
-        progress,
-        ProgressStage::Validating,
-        "Verifying and copying retained assets",
-    )
-    .await;
-    let (retained, replay_verified_pruned_assets) =
-        copy_verified_assets(source, staging, manifest)?;
-    let provenance = MetadataProvenance {
-        record_reader: crate::esm::inhouse::configured_reader_identity(config)?,
-        retained_asset_record_reader: retained_reader.clone(),
-        retained_asset_schema_json: retained_schemas.addon_bytes().map(<[u8]>::to_vec).collect(),
-        source_converter_schema: manifest.schema_version,
-        source_retained_mesh_schema: manifest
-            .retained_mesh_schema_version
-            .unwrap_or(manifest.schema_version),
-        source_manifest_hash: hash_bytes(source_manifest),
-        source_configuration_hash: manifest.configuration_hash.clone(),
-        retained_asset_configuration_hash: manifest
-            .retained_asset_configuration_hash
-            .clone()
-            .unwrap_or_else(|| manifest.configuration_hash.clone()),
-        retained_asset_hashes: retained.clone(),
-        replay_verified_pruned_assets,
-    };
     let mut report = PipelineReport {
         load_order: plugins
             .iter()
@@ -502,20 +483,8 @@ async fn rebuild_into(
                     .into_owned()
             })
             .collect(),
-        cache_hits: retained.len() as u64,
-        pruned_texture_references: manifest
-            .pruned_texture_references
-            .values()
-            .map(|references| references.len() as u64)
-            .sum(),
-        artifacts: retained.keys().map(PathBuf::from).collect(),
         ..Default::default()
     };
-    if provenance.record_reader != provenance.retained_asset_record_reader {
-        let notice = "Metadata reader changed; retained models and textures keep their verified source producer bytes, including earlier texture-role encodings. Use normal conversion to regenerate those assets.";
-        eprintln!("note: {notice}");
-        report.notices.push(notice.to_owned());
-    }
     progress_event(
         progress,
         ProgressStage::Extracting,
@@ -601,6 +570,50 @@ async fn rebuild_into(
     let phases = conversion.phases;
     let merged = conversion.records;
     validate_database(&Connection::open(&database)?)?;
+    // Reader migrations can correct record texture paths. Classify retained assets only
+    // after rebuilding the current graph; source GLBs still own their retained dependencies.
+    progress_event(
+        progress,
+        ProgressStage::Validating,
+        "Verifying and copying retained assets",
+    )
+    .await;
+    let (retained, replay_verified_pruned_assets) = copy_verified_assets_for_geometry(
+        source,
+        staging,
+        manifest,
+        crate::cluster::cluster_only(config),
+        &crate::terrain_pipeline::configured_default_sources(config)?,
+    )?;
+    let provenance = MetadataProvenance {
+        record_reader: crate::esm::inhouse::configured_reader_identity(config)?,
+        retained_asset_record_reader: retained_reader.clone(),
+        retained_asset_schema_json: retained_schemas.addon_bytes().map(<[u8]>::to_vec).collect(),
+        source_converter_schema: manifest.schema_version,
+        source_retained_mesh_schema: manifest
+            .retained_mesh_schema_version
+            .unwrap_or(manifest.schema_version),
+        source_manifest_hash: hash_bytes(source_manifest),
+        source_configuration_hash: manifest.configuration_hash.clone(),
+        retained_asset_configuration_hash: manifest
+            .retained_asset_configuration_hash
+            .clone()
+            .unwrap_or_else(|| manifest.configuration_hash.clone()),
+        retained_asset_hashes: retained.clone(),
+        replay_verified_pruned_assets,
+    };
+    report.cache_hits += retained.len() as u64;
+    report.pruned_texture_references = manifest
+        .pruned_texture_references
+        .values()
+        .map(|references| references.len() as u64)
+        .sum();
+    report.artifacts.extend(retained.keys().map(PathBuf::from));
+    if provenance.record_reader != provenance.retained_asset_record_reader {
+        let notice = "Metadata reader changed; retained models and textures keep their verified source producer bytes, including earlier texture-role encodings. Use normal conversion to regenerate those assets.";
+        eprintln!("note: {notice}");
+        report.notices.push(notice.to_owned());
+    }
     if config.record_reader == crate::config::RecordReader::Inhouse {
         crate::esm::inhouse::write_database_profile(staging, &database, &phases)?;
         crate::esm::inhouse::write_terrain_caches(&merged, &database, staging)?;
@@ -685,19 +698,28 @@ async fn rebuild_into(
         "Recording distant LOD inventory",
     )
     .await;
-    for archive in &archives {
+    for archive in archives
+        .iter()
+        .filter(|_| !crate::cluster::cluster_only(config))
+    {
         ArchiveExtractor::extract_lod_inventory_inputs(archive, &vfs)?;
     }
     let loose_inventory: Vec<_> = files
         .iter()
         .filter(|path| {
-            path.strip_prefix(&config.data_dir)
-                .is_ok_and(portal_lod::is_inventory_input)
+            !crate::cluster::cluster_only(config)
+                && path
+                    .strip_prefix(&config.data_dir)
+                    .is_ok_and(portal_lod::is_inventory_input)
         })
         .cloned()
         .collect();
     overlay_loose_assets(&config.data_dir, &vfs, &loose_inventory)?;
-    let inventory = portal_lod::record_lod_inventory(staging, plugins)?;
+    let inventory = if crate::cluster::cluster_only(config) {
+        portal_lod::LodInventoryReport::default()
+    } else {
+        portal_lod::record_lod_inventory(staging, plugins)?
+    };
     report
         .artifacts
         .extend(inventory.billboards.iter().cloned());
@@ -750,6 +772,7 @@ async fn rebuild_into(
     // Retained assets keep their original producer provenance, while metadata
     // and the DDS source contract below describe this current-schema rebuild.
     manifest.schema_version = CONVERTER_SCHEMA_VERSION;
+    manifest.geometry = crate::cluster::geometry_manifest(config);
     manifest.retained_mesh_schema_version = Some(provenance.source_retained_mesh_schema);
     manifest.retained_asset_configuration_hash =
         Some(provenance.retained_asset_configuration_hash.clone());
@@ -821,11 +844,87 @@ async fn rebuild_into(
 
 /// Copies verified runtime bytes, reproducing historical pruning for stale output hashes.
 /// Repair presence bits come from the complete source manifest rather than current Data.
+#[cfg(test)]
 fn copy_verified_assets(
     source: &Path,
     staging: &Path,
     manifest: &mut ConversionManifest,
 ) -> Result<(BTreeMap<String, String>, BTreeSet<String>)> {
+    copy_verified_assets_for_geometry(source, staging, manifest, false, &[])
+}
+
+fn copy_verified_assets_for_geometry(
+    source: &Path,
+    staging: &Path,
+    manifest: &mut ConversionManifest,
+    cluster_only: bool,
+    additional_textures: &[PathBuf],
+) -> Result<(BTreeMap<String, String>, BTreeSet<String>)> {
+    let mut shared_lod_textures = BTreeSet::new();
+    if cluster_only {
+        shared_lod_textures.extend(
+            additional_textures
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned()),
+        );
+        for (key, entry) in &manifest.entries {
+            if !key.ends_with(".nif") {
+                continue;
+            }
+            let glb = source.join(&entry.output);
+            for dependency in MeshConverter::glb_texture_dependencies(&glb)? {
+                let resolved = resolve_asset_uri(source, &glb, &dependency.uri)?;
+                let relative = resolved
+                    .strip_prefix(source)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let runtime_source = crate::asset_path::runtime_texture_source(&relative)
+                    .ok_or_else(|| {
+                        color_eyre::eyre::eyre!(
+                            "unsupported retained texture dependency: {relative}"
+                        )
+                    })?;
+                shared_lod_textures.insert(canonical_asset_path(
+                    &runtime_source,
+                    AssetKind::Texture,
+                    "dds",
+                )?);
+            }
+        }
+        shared_lod_textures.extend(
+            crate::pipeline::collect_database_texture_semantics(staging)?
+                .keys()
+                .map(|key| canonical_asset_path(key, AssetKind::Texture, "dds"))
+                .collect::<Result<Vec<_>>>()?,
+        );
+        shared_lod_textures.extend(
+            terrain_diffuse_paths(&Connection::open_with_flags(
+                staging.join("skyrim_world.db"),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?)?
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned()),
+        );
+    }
+    let omitted: BTreeSet<_> = if cluster_only {
+        manifest
+            .entries
+            .iter()
+            .filter(|(key, _)| {
+                portal_lod::is_baked_geometry_input(Path::new(key))
+                    && !shared_lod_textures.contains(*key)
+            })
+            .map(|(_, entry)| entry.output.clone())
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    manifest
+        .entries
+        .retain(|_, entry| !omitted.contains(&entry.output));
+    manifest
+        .pruned_texture_references
+        .retain(|path, _| !omitted.contains(path));
     // Reuse requires a complete package with no failed assets. Its successful DDS entries
     // therefore preserve the producer's texture-source presence even without a raw VFS.
     let source_textures = manifest
@@ -908,6 +1007,9 @@ fn copy_verified_assets(
             } else {
                 relative.clone()
             };
+            if omitted.contains(&key) {
+                continue;
+            }
             let Some((hash, size)) = expected.get(&key) else {
                 // portal: tree billboards are generated by the distant-LOD inventory, never
                 // converted from a NIF, so no manifest records them. The rebuild regenerates

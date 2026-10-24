@@ -1585,7 +1585,8 @@ extend fields. The full batch is checked before conversion starts. Schema add-on
 cannot be combined with --record-reader legacy.
 
 Archive ingestion extracts the formats used by conversion and English string banks.
---extract-all-archive-files retains every archive entry for compatibility and comparisons.
+--extract-all-archive-files retains every archive entry for compatibility and comparisons;
+it cannot be combined with forced cluster mode, which omits baked-only sources.
 --ingestion-sync defaults to archive: sealed packs provide batch durability. per-file also
 flushes each unique derived payload; none skips extraction flushes for regenerable bytes
 and requires verified reuse. Runtime package publication keeps its durability contract.
@@ -1596,11 +1597,15 @@ A failed reconversion preserves the previous base and its overlays.
 terrain and ordinary assets remain available. Omit it on a later run to build LOD.
 
 --lod-mode chooses how distant opaque static objects are prepared (ADR-0013). `baked` (the
-default) adds nothing. `cluster` and `auto` publish the base first, then derive a cluster overlay
-under <base>/derived/. The adapter is probed once and recorded; offline derivation runs even
+default) preserves native object/tree LOD and baked terrain. `cluster` omits those baked products,
+always includes trees and terrain, and records its exact settings-addressed overlay in the base
+manifest before publication. `auto` preserves the historical baked base and optional overlay
+semantics; --cluster-terrain adds terrain to its overlay. Both publish the base first, then derive
+under <base>/derived/. --no-lod cannot be combined with forced cluster mode.
+The adapter is probed once and recorded; offline derivation runs even
 when an auto probe reports missing runtime features. A derivation error leaves the base valid
 and prints the command to retry just the overlay.
---cluster-terrain adds terrain clusters and their dependency metadata; requires cluster/auto LOD.
+--cluster-terrain adds terrain clusters and their dependency metadata in auto mode; requires cluster/auto LOD.
 --cluster-triangle-threshold sets the smallest primitive that gets clusters (default 1024).
 --cluster-bench-baked is refused in full conversions. Use standalone cluster-stage --bench-baked
 against the published base for the measurement-only baked comparison.

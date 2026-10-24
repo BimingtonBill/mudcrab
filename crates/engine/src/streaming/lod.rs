@@ -781,6 +781,8 @@ pub(super) fn plan_lod_chunks(
     profiler: ResMut<ProfilingState>,
     runtime: Option<Res<super::runtime::StreamingRuntime>>,
     mut previous_distances: Local<Option<crate::config::TerrainLodDistances>>,
+    mut horizon: Option<ResMut<LodHorizon>>,
+    terrain: Option<Res<crate::cluster::terrain::ClusterTerrain>>,
 ) {
     if requests::enabled(&config) {
         budget.reserve_for_lod(
@@ -797,6 +799,21 @@ pub(super) fn plan_lod_chunks(
     }
     let actual = views.current(&config, origin.0, portal.as_deref());
     let demand = views.residency_demand(&config, actual, portal.as_deref(), &mut streaming);
+    if config.clusters.is_some() {
+        streaming.demand = demand;
+        if let (Some(demand), Some(terrain), Some(horizon)) =
+            (demand, terrain.as_deref(), horizon.as_mut())
+        {
+            let reach = lod_horizon(&config.terrain_lod);
+            // The certified terrain source replaces the native query's availability signal.
+            // Once published, an unchanged world/reach needs no repeated block scan.
+            if horizon.reach_in(demand.world) != Some(reach) && terrain.has_world(demand.world) {
+                horizon.set(demand.world, reach);
+            }
+        }
+        budget.reserved_for_lod = false;
+        return;
+    }
     plan_lod_demand_controlled(
         demand,
         commands,
@@ -855,6 +872,8 @@ fn plan_lod_demand_controlled(
     runtime: Option<Res<super::runtime::StreamingRuntime>>,
     previous_distances: &mut Option<crate::config::TerrainLodDistances>,
 ) {
+    // No baked query may be scheduled even when an older base still advertises native LOD.
+    let demand = demand.filter(|_| config.clusters.is_none());
     let started = Instant::now();
     if streaming.demand != demand {
         streaming.visibility_dirty = true;
@@ -1123,6 +1142,31 @@ pub(super) fn lod_ring_layers() -> (RenderLayers, Propagate<RenderLayers>) {
     (layers.clone(), Propagate(layers))
 }
 
+fn widen_lod_cameras(
+    demand: Option<LodDemand>,
+    config: &EngineConfig,
+    horizon: &LodHorizon,
+    camera_projection: &mut Query<&mut Projection>,
+) {
+    if let Some(demand) = demand
+        && demand.role != LodDemandRole::Pinned
+        && horizon.reach_in(demand.world).is_some()
+    {
+        for camera in std::iter::once(demand.camera)
+            .chain(demand.main_camera.filter(|main| *main != demand.camera))
+        {
+            if let Ok(mut projection) = camera_projection.get_mut(camera) {
+                let required = lod_camera_far(config.terrain_lod.max_reach_cells());
+                if matches!(&*projection, Projection::Perspective(perspective) if perspective.far < required)
+                    && let Projection::Perspective(perspective) = &mut *projection
+                {
+                    perspective.far = required;
+                }
+            }
+        }
+    }
+}
+
 /// Collect LOD query results and request current chunks within the shared commit budget.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn collect_lod_chunks(
@@ -1140,6 +1184,10 @@ pub(super) fn collect_lod_chunks(
     mut profiler: ResMut<ProfilingState>,
     runtime: Option<Res<super::runtime::StreamingRuntime>>,
 ) {
+    if config.clusters.is_some() {
+        widen_lod_cameras(streaming.demand, &config, &horizon, &mut camera_projection);
+        return;
+    }
     let started = Instant::now();
     for _ in 0..LOD_RESPONSE_SCAN_LIMIT {
         let Some(response) = database.try_lod_response() else {
@@ -1196,23 +1244,7 @@ pub(super) fn collect_lod_chunks(
 
     // PortalFrame rebuilds its perspective from the main camera each frame.
     // Widen both named views only when necessary, preserving its doorway clip.
-    if let Some(demand) = streaming.demand
-        && demand.role != LodDemandRole::Pinned
-        && horizon.reach_in(demand.world).is_some()
-    {
-        for camera in std::iter::once(demand.camera)
-            .chain(demand.main_camera.filter(|main| *main != demand.camera))
-        {
-            if let Ok(mut projection) = camera_projection.get_mut(camera) {
-                let required = lod_camera_far(config.terrain_lod.max_reach_cells());
-                if matches!(&*projection, Projection::Perspective(perspective) if perspective.far < required)
-                    && let Projection::Perspective(perspective) = &mut *projection
-                {
-                    perspective.far = required;
-                }
-            }
-        }
-    }
+    widen_lod_cameras(streaming.demand, &config, &horizon, &mut camera_projection);
 
     if config.prioritize_streaming
         && let Some(center) = streaming.center
@@ -4387,6 +4419,121 @@ mod interior_portal_lod_tests {
         let mut state = SystemState::<(Res<PortalState>, Query<&ChildOf>)>::new(world);
         let (portal, parents) = state.get(world).unwrap();
         portal.is_in_active_space(entity, &parents)
+    }
+
+    #[test]
+    fn cluster_mode_uses_certified_terrain_for_horizon_and_camera_reach() {
+        use crate::cluster::terrain::{ClusterTerrain, TerrainBlock};
+
+        let config = EngineConfig {
+            clusters: Some("fixture".into()),
+            cluster_terrain: true,
+            ..default()
+        };
+        let worldspace = config.worldspace_id;
+        let required_far = lod_camera_far(config.terrain_lod.max_reach_cells());
+        let expected_reach = lod_horizon(&config.terrain_lod);
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(WorldDatabase::saturated_queue())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ClusterTerrain::for_blocks_test(vec![TerrainBlock {
+                mesh_hash: "fixture".into(),
+                primitive_index: 0,
+                worldspace_id: worldspace,
+                anchor: IVec2::ZERO,
+                side_cells: 1,
+                instance_path: "terrain/fixture.mci".into(),
+                cells: vec![IVec2::ZERO],
+                material: Handle::default(),
+                batch: None,
+            }]))
+            .init_resource::<LodStreaming>()
+            .init_resource::<LodHorizon>()
+            .init_resource::<StreamingCommitBudget>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, plan_lod_chunks);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                StreamingCamera,
+                Projection::Perspective(PerspectiveProjection {
+                    far: 10.0,
+                    ..default()
+                }),
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().resource::<LodHorizon>().reach_in(worldspace),
+            Some(expected_reach)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .lod_queries_submitted,
+            0
+        );
+        let demand = app.world().resource::<LodStreaming>().demand;
+        assert_eq!(demand.unwrap().camera, camera);
+        let config = app.world().resource::<EngineConfig>().clone();
+        let horizon = *app.world().resource::<LodHorizon>();
+        let mut state = SystemState::<Query<&mut Projection>>::new(app.world_mut());
+        widen_lod_cameras(
+            demand,
+            &config,
+            &horizon,
+            &mut state.get_mut(app.world_mut()).unwrap(),
+        );
+        let Projection::Perspective(projection) = app.world().get::<Projection>(camera).unwrap()
+        else {
+            panic!("fixture camera must remain perspective");
+        };
+        assert_eq!(projection.far, required_far);
+    }
+
+    #[test]
+    fn cluster_mode_submits_no_baked_terrain_queries_without_baked_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("skyrim_world.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER); INSERT INTO schema_info VALUES({});",
+                shared::WORLD_DATABASE_SCHEMA_VERSION,
+            ))
+            .unwrap();
+        drop(connection);
+        let mut world = World::new();
+        world.insert_resource(EngineConfig {
+            clusters: Some("fixture".into()),
+            cluster_terrain: true,
+            ..default()
+        });
+        world.insert_resource(
+            WorldDatabase::open_with_lod(&path, Default::default(), false).unwrap(),
+        );
+        world.init_resource::<LodStreaming>();
+        world.init_resource::<StreamingMetrics>();
+        world.init_resource::<ProfilingState>();
+        let camera = world.spawn_empty().id();
+        plan(
+            &mut world,
+            Some(LodDemand {
+                world: 77,
+                center: IVec2::ZERO,
+                role: LodDemandRole::Main,
+                camera,
+                main_camera: None,
+            }),
+        );
+        assert_eq!(
+            world.resource::<StreamingMetrics>().lod_queries_submitted,
+            0
+        );
+        assert!(world.resource::<LodStreaming>().pending_queries.is_empty());
     }
 
     #[test]

@@ -62,6 +62,8 @@ fn config(world: &World, mode: LodMode) -> PipelineConfig {
     let mut config = PipelineConfig::new(&world.data, &world.output);
     config.lod_mode = mode;
     config.cpu_jobs = 2;
+    config.texture_encoder = TextureEncoder::Cpu;
+    config.lod_texture_encoder = TextureEncoder::Cpu;
     config
 }
 
@@ -197,6 +199,449 @@ async fn cluster_and_auto_conversions_publish_a_clusterless_base_and_one_accepte
     }
 }
 
+/// CPU-only integration: native inputs are deliberately invalid. Reaching publication proves
+/// neither archive/loose inventory nor native mesh/billboard conversion consumed them.
+#[tokio::test]
+async fn cluster_conversion_omits_baked_products_and_binds_the_exact_tree_and_terrain_package() {
+    let world = world(true);
+    // The synthetic plugin's one STAT becomes a TREE record without
+    // changing model paths, placements or FormIDs. The existing classifier owns TREE rules.
+    let plugin_path = discover(&world.data)
+        .unwrap()
+        .into_iter()
+        .find(|path| extension(path, &["esm"]))
+        .unwrap();
+    let mut plugin = fs::read(&plugin_path).unwrap();
+    let signatures = plugin
+        .windows(4)
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == b"STAT").then_some(offset))
+        .collect::<Vec<_>>();
+    assert_eq!(signatures.len(), 1);
+    for offset in signatures {
+        plugin[offset..offset + 4].copy_from_slice(b"TREE");
+    }
+    fs::write(plugin_path, plugin).unwrap();
+    let native = [
+        "meshes/terrain/generatedworld/objects/generatedworld.4.0.0.bto",
+        "meshes/terrain/generatedworld/generatedworld.4.0.0.btr",
+        "meshes/terrain/generatedworld/trees/generatedworld.lst",
+        "meshes/terrain/generatedworld/trees/generatedworld.4.0.0.btt",
+        "textures/terrain/generatedworld/trees/generatedworldtreeatlas.dds",
+        "textures/terrain/generatedworld/objects/atlas.dds",
+        "textures/terrain/generatedworld/generatedworld.4.0.0.dds",
+        "textures/lod/generatedworld/atlas.dds",
+    ];
+    for relative in native {
+        let path = world.data.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"must not be read in cluster mode").unwrap();
+    }
+    let entries: Vec<_> = native
+        .iter()
+        .map(|name| Entry {
+            name,
+            data: b"must not be extracted in cluster mode",
+        })
+        .collect();
+    fs::write(
+        world.data.join("Skyrim - Meshes.bsa"),
+        bsa::v105(&entries, bsa::Compression::None).unwrap(),
+    )
+    .unwrap();
+    let mut settings = config(&world, LodMode::Cluster);
+    settings.cluster_triangle_threshold = 1;
+    assert!(
+        !settings.cluster_terrain,
+        "terrain must be forced by the mode"
+    );
+    let report = convert(settings, PostPublish::FIXTURE).await.unwrap();
+    assert!(report.complete, "{:?}", report.warnings);
+    assert_eq!(report.lod_chunks, 0);
+    assert!(
+        report.cluster.as_ref().unwrap().counts.references_eligible > 0,
+        "the TREE placements must enter the cluster package"
+    );
+    assert!(!world.output.join("lod").exists());
+    for relative in native {
+        assert!(!world.output.join(relative).exists());
+        assert!(!world.output.join(relative).with_extension("glb").exists());
+        assert!(!world.output.join(relative).with_extension("ktx2").exists());
+    }
+    assert!(
+        !world
+            .output
+            .join("meshes/terrain/generatedworld/trees")
+            .exists()
+    );
+    let manifest =
+        ConversionManifest::load(&world.output.join("conversion-manifest.json")).unwrap();
+    assert!(
+        manifest
+            .entries
+            .keys()
+            .all(|key| !portal_lod::is_baked_geometry_input(Path::new(key)))
+    );
+    assert!(
+        manifest
+            .archives
+            .values()
+            .flat_map(|archive| &archive.files)
+            .all(|file| !portal_lod::is_baked_geometry_input(Path::new(&file.path)))
+    );
+    let geometry = shared::geometry::GeometryManifest::load(&world.output).unwrap();
+    assert_eq!(
+        geometry.geometry_mode,
+        shared::geometry::GeometryMode::Cluster
+    );
+    let overlay = world
+        .output
+        .join(geometry.cluster_package.as_ref().unwrap());
+    assert_eq!(
+        fs::canonicalize(&overlay).unwrap(),
+        fs::canonicalize(sole_overlay(&world.output)).unwrap()
+    );
+    let options = DeriveOptions {
+        source: world.output.clone(),
+        label: "default".into(),
+        replace: false,
+        keep_failed_staging: false,
+        terrain: true,
+        terrain_sources: None,
+        jobs: 2,
+        triangle_threshold: 1,
+        include_trees: true,
+    };
+    assert_eq!(
+        geometry.cluster_package.unwrap(),
+        format!(
+            "derived/clusters-{}",
+            derive_extensions::settings_id(&options)
+        )
+    );
+    let metadata = shared::cluster_overlay::checked_overlay(
+        &fs::canonicalize(&world.output).unwrap(),
+        &fs::canonicalize(&overlay).unwrap(),
+    )
+    .unwrap();
+    let expected = derive_extensions::resolved_settings(&options);
+    assert_eq!(metadata.build_settings, expected);
+    let database = Connection::open(world.output.join("skyrim_world.db")).unwrap();
+    for table in [
+        "lod_chunks",
+        "lod_block",
+        "lod_grid",
+        "lod_tree_type",
+        "lod_tree_instance",
+    ] {
+        let rows: i64 = database
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0, "baked table {table}");
+    }
+    assert!(world.output.join("cell_cache.rkyv").is_file());
+    assert_eq!(
+        shared::world_assets::validate_lod_build_contract(&world.output, CONVERTER_SCHEMA_VERSION)
+            .unwrap(),
+        shared::WORLD_DATABASE_SCHEMA_VERSION
+    );
+    let recipe: LodManifest =
+        serde_json::from_slice(&fs::read(world.output.join("lod-manifest.json")).unwrap()).unwrap();
+    assert_eq!(recipe.chunks, 0);
+    assert!(recipe.chunk_inputs.is_empty());
+    assert!(!recipe.terrain_sources.is_empty());
+    assert_accepted_overlay(&world.output);
+    // Runtime admission must not read the bake recipe; derivation verified it above.
+    fs::write(
+        world.output.join("lod-manifest.json"),
+        b"not a runtime cluster dependency",
+    )
+    .unwrap();
+    assert_eq!(
+        shared::world_assets::validate_geometry_build_contract(
+            &world.output,
+            CONVERTER_SCHEMA_VERSION
+        )
+        .unwrap(),
+        shared::WORLD_DATABASE_SCHEMA_VERSION
+    );
+    assert!(
+        shared::world_assets::validate_lod_build_contract(&world.output, CONVERTER_SCHEMA_VERSION)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn conversion_mode_and_cluster_settings_changes_rebuild_generated_products_on_resume() {
+    let world = world(true);
+    let baked = convert(config(&world, LodMode::Baked), PostPublish::FIXTURE)
+        .await
+        .unwrap();
+    assert!(baked.lod_chunks > 0);
+    let baked_manifest = fs::read(world.output.join("conversion-manifest.json")).unwrap();
+    assert!(!String::from_utf8_lossy(&baked_manifest).contains("geometry_mode"));
+    let staging = world.output.with_file_name("assets.staging-mode-change");
+    fs::create_dir_all(staging.join("lod/stale")).unwrap();
+    fs::write(staging.join("lod/stale/chunk.glb"), b"old baked chunk").unwrap();
+    fs::create_dir_all(staging.join("meshes/terrain/generatedworld/trees")).unwrap();
+    fs::write(
+        staging.join("meshes/terrain/generatedworld/trees/generatedworld.tree.0.glb"),
+        b"old billboard",
+    )
+    .unwrap();
+    let mut cluster = config(&world, LodMode::Cluster);
+    cluster.resume_staging = Some(staging.clone());
+    let report = convert(cluster, PostPublish::FIXTURE).await.unwrap();
+    assert_eq!(report.lod_chunks, 0);
+    assert!(!world.output.join("lod").exists());
+    assert!(!world.output.join("meshes/terrain").exists());
+    let first = shared::geometry::GeometryManifest::load(&world.output).unwrap();
+    assert_accepted_overlay(&world.output);
+    let mut changed = config(&world, LodMode::Cluster);
+    changed.cluster_triangle_threshold += 1;
+    changed.discard_derived = true;
+    convert(changed, PostPublish::FIXTURE).await.unwrap();
+    let second = shared::geometry::GeometryManifest::load(&world.output).unwrap();
+    assert_ne!(first.cluster_package, second.cluster_package);
+    assert!(!world.output.join(first.cluster_package.unwrap()).exists());
+    assert_accepted_overlay(&world.output);
+    let mut baked = config(&world, LodMode::Baked);
+    baked.discard_derived = true;
+    let report = convert(baked, PostPublish::FIXTURE).await.unwrap();
+    assert!(report.lod_chunks > 0);
+    assert_eq!(
+        fs::read(world.output.join("conversion-manifest.json")).unwrap(),
+        baked_manifest,
+        "baked manifest bytes return unchanged after a cluster conversion"
+    );
+    assert!(!world.output.join("derived").exists());
+    assert!(!staging.exists());
+}
+
+#[tokio::test]
+async fn cluster_conversion_retains_a_billboard_atlas_used_by_a_near_mesh() {
+    let world = world(true);
+    let atlas = "textures/terrain/generatedworld/trees/shared.dds";
+    let atlas_path = world.data.join(atlas);
+    fs::create_dir_all(atlas_path.parent().unwrap()).unwrap();
+    fs::copy(world.data.join(layout::GENERATED_DIFFUSE_PATH), &atlas_path).unwrap();
+    let shape = dummy_content::nif::static_shape(&dummy_content::nif::StaticShape {
+        name: "NearMeshUsesSharedAtlas",
+        positions: &[[0., 0., 0.], [100., 0., 0.], [0., 100., 0.]],
+        normals: &[[0., 0., 1.]; 3],
+        uvs: &[[0., 0.], [1., 0.], [0., 1.]],
+        indices: &[[0, 1, 2]],
+        diffuse: atlas,
+        normal_texture: layout::GENERATED_NORMAL_PATH,
+    })
+    .unwrap();
+    fs::write(world.data.join(layout::GENERATED_MODEL_PATH), shape).unwrap();
+    convert(config(&world, LodMode::Cluster), PostPublish::FIXTURE)
+        .await
+        .unwrap();
+    let manifest =
+        ConversionManifest::load(&world.output.join("conversion-manifest.json")).unwrap();
+    let texture = &manifest.entries[atlas];
+    assert!(world.output.join(&texture.output).is_file());
+    assert!(
+        !manifest
+            .pruned_texture_references
+            .contains_key("meshes/generated.glb")
+    );
+    assert_accepted_overlay(&world.output);
+}
+
+#[tokio::test]
+async fn cluster_reuse_restores_a_previously_pruned_near_texture_from_a_lod_namespace_archive() {
+    let world = world(true);
+    let atlas = "textures/lod/shared.dds";
+    let shape = dummy_content::nif::static_shape(&dummy_content::nif::StaticShape {
+        name: "NearMeshUsesLodTexture",
+        positions: &[[0., 0., 0.], [100., 0., 0.], [0., 100., 0.]],
+        normals: &[[0., 0., 1.]; 3],
+        uvs: &[[0., 0.], [1., 0.], [0., 1.]],
+        indices: &[[0, 1, 2]],
+        diffuse: atlas,
+        normal_texture: layout::GENERATED_NORMAL_PATH,
+    })
+    .unwrap();
+    fs::write(world.data.join(layout::GENERATED_MODEL_PATH), shape).unwrap();
+    convert(config(&world, LodMode::Baked), PostPublish::FIXTURE)
+        .await
+        .unwrap();
+    let prior = ConversionManifest::load(&world.output.join("conversion-manifest.json")).unwrap();
+    assert!(
+        prior
+            .pruned_texture_references
+            .contains_key("meshes/generated.glb")
+    );
+    let bytes = fs::read(world.data.join(layout::GENERATED_DIFFUSE_PATH)).unwrap();
+    fs::write(
+        world.data.join("Skyrim - Textures.bsa"),
+        bsa::v105(
+            &[Entry {
+                name: atlas,
+                data: &bytes,
+            }],
+            bsa::Compression::None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    convert(config(&world, LodMode::Cluster), PostPublish::FIXTURE)
+        .await
+        .unwrap();
+    let manifest =
+        ConversionManifest::load(&world.output.join("conversion-manifest.json")).unwrap();
+    assert!(world.output.join(&manifest.entries[atlas].output).is_file());
+    assert!(
+        !manifest
+            .pruned_texture_references
+            .contains_key("meshes/generated.glb")
+    );
+    assert!(
+        MeshConverter::glb_texture_uris(&world.output.join("meshes/generated.glb"))
+            .unwrap()
+            .iter()
+            .any(|uri| uri.contains("/lod/shared.") && uri.ends_with(".ktx2"))
+    );
+    assert_accepted_overlay(&world.output);
+    let mut rebuild = config(&world, LodMode::Cluster);
+    rebuild.output_dir = world.output.with_file_name("rebuilt-shared");
+    let rebuilt = rebuild.output_dir.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+    let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+    AssetPipeline::rebuild_metadata_with_post_publish(
+        rebuild,
+        &world.output,
+        sender,
+        PostPublish::FIXTURE,
+    )
+    .await
+    .unwrap();
+    drain.await.unwrap();
+    let manifest = ConversionManifest::load(&rebuilt.join("conversion-manifest.json")).unwrap();
+    assert!(rebuilt.join(&manifest.entries[atlas].output).is_file());
+    assert_accepted_overlay(&rebuilt);
+}
+
+/// Reader migration must retain verified textures used only by the rebuilt record graph.
+#[tokio::test]
+async fn cluster_metadata_reader_migration_retains_current_record_lod_texture_and_alias() {
+    use crate::config::RecordReader;
+    use dummy_content::inhouse_perks as native;
+
+    const TEXTURE_SET_ID: u32 = 0x809;
+    const TEXTURE: &str = "textures/lod/café.dds";
+    const OUTPUT: &str = "textures/lod/café.ktx2";
+    const ALIAS: &str = "textures/lod/café.opensky-srgb.opensky-wrap0.ktx2";
+    const BAKED_ONLY: &str = "textures/lod/baked_only.dds";
+
+    let world = world(true);
+    let plugin = world.data.join("Skyrim.esm");
+    let mut bytes = fs::read(&plugin).unwrap();
+    let fields = [
+        native::subrecord(b"EDID", &native::text("ReaderMigrationTexture")),
+        native::subrecord(b"TX00", b"textures/lod/caf\xe9.dds\0"),
+    ]
+    .concat();
+    bytes.extend(native::record(b"TXST", TEXTURE_SET_ID, 0, &fields));
+    fs::write(&plugin, bytes).unwrap();
+    fs::create_dir_all(world.data.join("textures/lod")).unwrap();
+    for relative in [TEXTURE, BAKED_ONLY] {
+        fs::copy(
+            world.data.join(layout::GENERATED_DIFFUSE_PATH),
+            world.data.join(relative),
+        )
+        .unwrap();
+    }
+    let mut source_config = config(&world, LodMode::Baked);
+    source_config.record_reader = RecordReader::Legacy;
+    let source_report = convert(source_config, PostPublish::FIXTURE).await.unwrap();
+    assert!(source_report.complete, "{:?}", source_report.warnings);
+    assert!(source_report.lod_chunks > 0);
+    let texture_path = |root: &Path| -> String {
+        Connection::open_with_flags(
+            root.join("skyrim_world.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT diffuse_path FROM texture_sets WHERE id=?1",
+            [TEXTURE_SET_ID],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(texture_path(&world.output), "textures/lod/caf\u{fffd}.dds");
+    let source_manifest =
+        ConversionManifest::load(&world.output.join("conversion-manifest.json")).unwrap();
+    assert!(source_manifest.entries.contains_key(BAKED_ONLY));
+    let texture = &source_manifest.entries[TEXTURE];
+    assert_eq!(texture.output, OUTPUT);
+    let verified_bytes = fs::read(world.output.join(OUTPUT)).unwrap();
+    assert_eq!(hash_bytes(&verified_bytes), texture.output_hash);
+    // Sampler aliases share the manifest-backed texture's exact bytes and hash authority.
+    fs::write(world.output.join(ALIAS), &verified_bytes).unwrap();
+    let snapshot = || -> BTreeMap<PathBuf, String> {
+        discover(&world.output)
+            .unwrap()
+            .into_iter()
+            .map(|path| {
+                (
+                    path.strip_prefix(&world.output).unwrap().to_path_buf(),
+                    hash_file(&path).unwrap(),
+                )
+            })
+            .collect()
+    };
+    let source_before = snapshot();
+    let mut rebuild = config(&world, LodMode::Cluster);
+    rebuild.record_reader = RecordReader::Inhouse;
+    rebuild.output_dir = world.output.with_file_name("rebuilt-reader-migration");
+    let rebuilt = rebuild.output_dir.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+    let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+    let report = AssetPipeline::rebuild_metadata_with_post_publish(
+        rebuild,
+        &world.output,
+        sender,
+        PostPublish::FIXTURE,
+    )
+    .await
+    .unwrap();
+    drain.await.unwrap();
+
+    assert!(report.complete, "{:?}", report.warnings);
+    assert_eq!(texture_path(&rebuilt), TEXTURE);
+    let retained = ConversionManifest::load(&rebuilt.join("conversion-manifest.json")).unwrap();
+    assert_eq!(retained.entries[TEXTURE].output_hash, texture.output_hash);
+    let provenance: serde_json::Value =
+        serde_json::from_slice(&fs::read(rebuilt.join("metadata-rebuild.json")).unwrap()).unwrap();
+    for relative in [OUTPUT, ALIAS] {
+        assert_eq!(fs::read(rebuilt.join(relative)).unwrap(), verified_bytes);
+        assert!(report.artifacts.contains(&PathBuf::from(relative)));
+        assert_eq!(
+            provenance["retained_asset_hashes"][relative],
+            texture.output_hash
+        );
+    }
+    assert_eq!(provenance["record_reader"]["mode"], "inhouse");
+    assert_eq!(provenance["retained_asset_record_reader"]["mode"], "legacy");
+    assert_eq!(report.lod_chunks, 0);
+    assert!(!rebuilt.join("lod").exists());
+    assert!(!rebuilt.join("textures/lod/baked_only.ktx2").exists());
+    assert!(!retained.entries.contains_key(BAKED_ONLY));
+    assert_accepted_overlay(&rebuilt);
+    assert_eq!(
+        snapshot(),
+        source_before,
+        "metadata rebuild changed the source package"
+    );
+}
+
 static PROBES: AtomicUsize = AtomicUsize::new(0);
 static DERIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DERIVE_SAW_FAILED_PROBE: AtomicBool = AtomicBool::new(false);
@@ -260,7 +705,7 @@ async fn baked_and_no_lod_do_no_cluster_work() {
         probe: crate::cluster::fixture_probe,
         derive: |_, _| panic!("a baked or --no-lod conversion must not derive"),
     };
-    for (mode, no_lod) in [(LodMode::Baked, false), (LodMode::Cluster, true)] {
+    for (mode, no_lod) in [(LodMode::Baked, false), (LodMode::Auto, true)] {
         let world = world(true);
         let mut config = config(&world, mode);
         config.no_lod = no_lod;
@@ -275,7 +720,7 @@ async fn baked_and_no_lod_do_no_cluster_work() {
 #[tokio::test]
 async fn derive_failure_keeps_the_published_base_and_names_the_exact_retry() {
     let world = world(true);
-    let config = config(&world, LodMode::Cluster);
+    let config = config(&world, LodMode::Auto);
     let jobs = config.cpu_jobs;
     let failure = convert(config, FAILING).await.unwrap_err();
     let text = format!("{:#}", failure.error);
@@ -392,8 +837,7 @@ async fn terrain_derive_failure_keeps_only_the_raw_vfs_in_a_folder_a_resume_cann
 
 static TERRAIN_SOURCES_SEEN: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Checks the raw root is present while deriving, then derives a plain overlay: the fixture
-/// world has no terrain recipe, so only the terrain request is dropped.
+/// Checks the raw root is present while deriving, then derives the actual requested package.
 fn terrain_sources_checking_derive(
     options: &DeriveOptions,
     probe: Option<(ProbeResult, f64)>,
@@ -403,20 +847,7 @@ fn terrain_sources_checking_derive(
     assert!(sources.is_dir(), "the raw root is gone before the derive");
     assert!(sources.read_dir().unwrap().next().is_some());
     *TERRAIN_SOURCES_SEEN.lock().unwrap() = Some(sources);
-    derive_extensions::run_fixture_with_probe(
-        &DeriveOptions {
-            source: options.source.clone(),
-            label: options.label.clone(),
-            replace: false,
-            keep_failed_staging: false,
-            terrain: false,
-            terrain_sources: None,
-            jobs: options.jobs,
-            triangle_threshold: options.triangle_threshold,
-            include_trees: false,
-        },
-        probe,
-    )
+    derive_extensions::run_fixture_with_probe(options, probe)
 }
 
 #[tokio::test]
@@ -450,7 +881,7 @@ async fn successful_terrain_derive_consumes_the_raw_sources_and_the_staging() {
 #[tokio::test]
 async fn a_non_terrain_derive_failure_leaves_no_raw_sources_folder() {
     let world = world(true);
-    convert(config(&world, LodMode::Cluster), FAILING)
+    convert(config(&world, LodMode::Auto), FAILING)
         .await
         .unwrap_err();
     assert!(terrain_source_folders_beside(&world.output).is_empty());
@@ -474,6 +905,24 @@ async fn unsupported_cluster_requests_fail_before_any_work() {
         .unwrap_err();
     assert!(
         failure.to_string().contains("--cluster-terrain requires"),
+        "{failure}"
+    );
+    let mut no_lod = config(&world, LodMode::Cluster);
+    no_lod.no_lod = true;
+    let failure = convert(no_lod, PostPublish::FIXTURE).await.unwrap_err();
+    assert!(
+        failure.to_string().contains("--no-lod contradicts"),
+        "{failure}"
+    );
+    let mut extract_all = config(&world, LodMode::Cluster);
+    extract_all.extract_all_archive_files = true;
+    let failure = convert(extract_all, PostPublish::FIXTURE)
+        .await
+        .unwrap_err();
+    assert!(
+        failure
+            .to_string()
+            .contains("--extract-all-archive-files contradicts"),
         "{failure}"
     );
     assert!(!world.output.exists());

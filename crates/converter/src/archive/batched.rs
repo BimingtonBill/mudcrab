@@ -828,6 +828,8 @@ fn pack_directory(cache: &Path, source_hash: &str, recipe: &str) -> Result<PathB
                 | "runtime-english-v1"
                 | "converter-inputs-v2"
                 | "runtime-english-v2"
+                | "cluster-english-v1"
+                | "cluster-inputs-v1"
         ),
         "unknown ingestion recipe"
     );
@@ -1155,6 +1157,8 @@ pub(crate) fn prune_stale_reader_packs(
             ArchiveSelection::ConverterInputsV1.recipe(),
             ArchiveSelection::RuntimeEnglishV2.recipe(),
             ArchiveSelection::ConverterInputsV2.recipe(),
+            ArchiveSelection::ClusterEnglishV1.recipe(),
+            ArchiveSelection::ClusterInputsV1.recipe(),
             ArchiveSelection::All.recipe(),
         ] {
             let recipe_dir = source_dir.join(recipe);
@@ -1234,6 +1238,8 @@ fn restore_pack_inventory(
             ArchiveSelection::RuntimeEnglishV2.recipe(),
             ArchiveSelection::ConverterInputsV2.recipe(),
             ArchiveSelection::ConverterInputsV1.recipe(),
+            ArchiveSelection::ClusterEnglishV1.recipe(),
+            ArchiveSelection::ClusterInputsV1.recipe(),
             ArchiveSelection::All.recipe(),
         ]) {
             if !selection.accepts_recipe(recipe) {

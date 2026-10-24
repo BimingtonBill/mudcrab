@@ -15,8 +15,10 @@ use crate::{engine_process::EngineProcess, game_detection, handlers};
 /// hours-long run would fail at its last step.
 pub const GAME_RUNNING_NOTICE: &str =
     "Close the running game first: publishing replaces files the game has open.";
+use super::settings::ConversionSettings;
 use bevy::prelude::*;
-use bevy::ui_widgets::ScrollArea;
+use bevy::ui::{Checked, InteractionDisabled};
+use bevy::ui_widgets::{Checkbox, ScrollArea, ValueChange};
 use converter::CheckMode;
 
 /// A button. The panel's controls are one family so one system can read them all, and so the
@@ -121,6 +123,12 @@ pub struct DataPathText;
 #[derive(Component, Default, Clone)]
 pub struct OutputPathText;
 
+#[derive(Component, Default, Clone)]
+pub struct ClusterGeometryCheckbox;
+
+#[derive(Component, Default, Clone)]
+pub struct ClusterGeometryLabel;
+
 /// The fill inside the progress bar's track.
 #[derive(Component, Default, Clone)]
 pub struct BarFill;
@@ -166,6 +174,7 @@ const SCROLL_TO_END: f32 = 1.0e6;
 pub fn conversion_panel() -> impl Scene {
     bsn! {
         #ConversionPanel
+        bevy::input_focus::tab_navigation::TabGroup::default()
         Node {
             width: Val::Percent(100.0),
             flex_grow: 1.0,
@@ -181,6 +190,7 @@ pub fn conversion_panel() -> impl Scene {
             crate::mo2_settings::source_row(),
             ui_data_row(),
             ui_output_row(),
+            ui_cluster_geometry(),
             ui_progress_row(),
             ui_stage_line(),
             ui_clock_line(),
@@ -196,6 +206,109 @@ fn ui_title() -> impl Scene {
         Text::new("Convert Skyrim assets")
         TextFont { font_size: FontSize::Px(16.0) }
         TextColor(TITLE_COLOR)
+    }
+}
+
+fn ui_cluster_geometry() -> impl Scene {
+    bsn! {
+        Node { flex_direction: FlexDirection::Column, row_gap: Val::Px(2.0) }
+        Children [
+            (
+                ClusterGeometryCheckbox
+                Checkbox
+                AccessibleLabel::new("Clustered geometry")
+                bevy::input_focus::tab_navigation::TabIndex(0)
+                Node { padding: UiRect::all(Val::Px(4.0)), border: UiRect::all(Val::Px(1.0)), align_self: AlignSelf::Start }
+                BackgroundColor(BUTTON_OFF)
+                BorderColor::all(BORDER)
+                Children [(
+                    ClusterGeometryLabel
+                    Text::new("[ ] Clustered geometry")
+                    TextFont { font_size: FontSize::Px(14.0) }
+                    TextColor(TEXT_COLOR)
+                )]
+            ),
+            (
+                Text::new("Build clusters for objects, trees and terrain instead of baked LOD.")
+                TextFont { font_size: FontSize::Px(12.0) }
+                TextColor(LABEL_COLOR)
+            ),
+        ]
+    }
+}
+
+/// The checkbox widget supplies pointer and keyboard activation and its accessibility role.
+pub fn change_cluster_geometry(
+    event: On<ValueChange<bool>>,
+    boxes: Query<(), With<ClusterGeometryCheckbox>>,
+    state: Res<CurrentConversion>,
+    mut settings: ResMut<ConversionSettings>,
+) {
+    if boxes.contains(event.source) && state::controls(&state.0).paths {
+        settings.clustered_geometry = event.value;
+    }
+}
+
+#[expect(
+    clippy::type_complexity,
+    reason = "The Bevy checkbox query reads its checked/disabled state and both visual styles together."
+)]
+pub fn draw_cluster_geometry(
+    mut commands: Commands,
+    state: Res<CurrentConversion>,
+    settings: Res<ConversionSettings>,
+    focus: Option<Res<bevy::input_focus::InputFocus>>,
+    focus_visible: Option<Res<bevy::input_focus::InputFocusVisible>>,
+    mut boxes: Query<
+        (
+            Entity,
+            Has<Checked>,
+            Has<InteractionDisabled>,
+            &mut BackgroundColor,
+            &mut BorderColor,
+        ),
+        With<ClusterGeometryCheckbox>,
+    >,
+    mut labels: Query<(&mut Text, &mut TextColor), With<ClusterGeometryLabel>>,
+) {
+    let enabled = state::controls(&state.0).paths;
+    for (entity, checked, disabled, mut background, mut border) in &mut boxes {
+        if checked != settings.clustered_geometry {
+            if settings.clustered_geometry {
+                commands.entity(entity).insert(Checked);
+            } else {
+                commands.entity(entity).remove::<Checked>();
+            }
+        }
+        if disabled == enabled {
+            if enabled {
+                commands.entity(entity).remove::<InteractionDisabled>();
+            } else {
+                commands.entity(entity).insert(InteractionDisabled);
+            }
+        }
+        background.0 = if enabled && settings.clustered_geometry {
+            BUTTON_ON
+        } else {
+            BUTTON_OFF
+        };
+        let focused = enabled
+            && focus
+                .as_ref()
+                .is_some_and(|focus| focus.get() == Some(entity))
+            && focus_visible.as_ref().is_some_and(|visible| visible.0);
+        *border = BorderColor::all(if focused { TITLE_COLOR } else { BORDER });
+    }
+    for (mut text, mut color) in &mut labels {
+        let wanted = if settings.clustered_geometry {
+            "[x] Clustered geometry"
+        } else {
+            "[ ] Clustered geometry"
+        };
+        if text.0 != wanted {
+            text.0 = wanted.to_owned();
+        }
+        color.0 = if enabled { TEXT_COLOR } else { BUTTON_OFF_TEXT };
     }
 }
 
@@ -737,6 +850,87 @@ pub fn clamp_notice_scroll(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cluster_checkbox_is_tabbable_and_shows_keyboard_focus() {
+        use bevy::{
+            ecs::system::SystemState,
+            input_focus::{
+                InputFocus, InputFocusVisible,
+                tab_navigation::{NavAction, TabNavigation},
+            },
+        };
+        let mut app = panel_app(Path::new("fixture"));
+        app.init_resource::<ConversionSettings>()
+            .add_systems(Update, draw_cluster_geometry);
+        let checkbox = app
+            .world_mut()
+            .query_filtered::<Entity, With<ClusterGeometryCheckbox>>()
+            .single(app.world())
+            .unwrap();
+        let mut navigation: SystemState<TabNavigation> = SystemState::new(app.world_mut());
+        assert_eq!(
+            navigation
+                .get(app.world())
+                .unwrap()
+                .navigate(&InputFocus::default(), NavAction::First),
+            Ok(checkbox)
+        );
+        app.insert_resource(InputFocus::from_entity(checkbox))
+            .insert_resource(InputFocusVisible(true));
+        app.update();
+        assert_eq!(
+            *app.world().entity(checkbox).get::<BorderColor>().unwrap(),
+            BorderColor::all(TITLE_COLOR)
+        );
+    }
+
+    #[test]
+    fn cluster_checkbox_changes_conversion_choice_and_locks_while_running() {
+        use super::*;
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<CurrentConversion>()
+            .init_resource::<ConversionSettings>()
+            .add_observer(change_cluster_geometry)
+            .add_systems(Update, draw_cluster_geometry);
+        let checkbox = app
+            .world_mut()
+            .spawn((
+                ClusterGeometryCheckbox,
+                BackgroundColor(BUTTON_OFF),
+                BorderColor::all(BORDER),
+            ))
+            .id();
+        app.world_mut().trigger(ValueChange {
+            source: checkbox,
+            value: true,
+            is_final: true,
+        });
+        app.update();
+        assert!(
+            app.world()
+                .resource::<ConversionSettings>()
+                .clustered_geometry
+        );
+        assert!(app.world().entity(checkbox).contains::<Checked>());
+        app.world_mut().resource_mut::<CurrentConversion>().0 = state::ConversionState::Running;
+        app.update();
+        assert!(
+            app.world()
+                .entity(checkbox)
+                .contains::<InteractionDisabled>()
+        );
+        app.world_mut().trigger(ValueChange {
+            source: checkbox,
+            value: false,
+            is_final: true,
+        });
+        assert!(
+            app.world()
+                .resource::<ConversionSettings>()
+                .clustered_geometry
+        );
+    }
     use super::*;
     use crate::conversion::tests::temp_dir;
     use std::path::{Path, PathBuf};

@@ -469,6 +469,8 @@ impl IngestionSelection {
             Self::RuntimeEnglishV1 => "runtime-english-v1",
             Self::ConverterInputsV2 => "converter-inputs-v2",
             Self::RuntimeEnglishV2 => "runtime-english-v2",
+            Self::ClusterEnglishV1 => "cluster-english-v1",
+            Self::ClusterInputsV1 => "cluster-inputs-v1",
         }
     }
 
@@ -483,6 +485,8 @@ impl IngestionSelection {
             "runtime-english-v1" => Self::RuntimeEnglishV1,
             "converter-inputs-v2" => Self::ConverterInputsV2,
             "runtime-english-v2" => Self::RuntimeEnglishV2,
+            "cluster-english-v1" => Self::ClusterEnglishV1,
+            "cluster-inputs-v1" => Self::ClusterInputsV1,
             _ => return false,
         };
         proven.can_satisfy(self)
@@ -920,6 +924,15 @@ fn selection_includes(selection: IngestionSelection, path: &Path) -> bool {
     // Keep V1's meaning immutable: old filtered inventories do not prove native LOD coverage.
     // The inventory consumer owns the added namespace; extensions elsewhere stay unselected.
     match selection {
+        IngestionSelection::ClusterEnglishV1 | IngestionSelection::ClusterInputsV1 => {
+            let base = if selection == IngestionSelection::ClusterEnglishV1 {
+                IngestionSelection::RuntimeEnglishV1
+            } else {
+                IngestionSelection::ConverterInputsV1
+            };
+            return selection_includes(base, path)
+                && !crate::portal_lod::is_baked_geometry_input(path);
+        }
         IngestionSelection::ConverterInputsV2 => {
             return selection_includes(IngestionSelection::ConverterInputsV1, path)
                 || crate::portal_lod::is_inventory_input(path);
@@ -962,6 +975,52 @@ fn selection_includes(selection: IngestionSelection, path: &Path) -> bool {
             .file_stem()
             .and_then(|stem| stem.to_str())
             .is_some_and(|stem| stem.ends_with("_english"))
+}
+
+#[cfg(test)]
+mod cluster_selection_tests {
+    use super::*;
+
+    #[test]
+    fn cluster_cache_coverage_never_proves_baked_inventory_on_mode_change() {
+        for cluster in [
+            IngestionSelection::ClusterEnglishV1,
+            IngestionSelection::ClusterInputsV1,
+        ] {
+            for baked in [
+                IngestionSelection::RuntimeEnglishV2,
+                IngestionSelection::ConverterInputsV2,
+            ] {
+                assert!(!cluster.can_satisfy(baked));
+                assert!(!baked.accepts_recipe(cluster.recipe()));
+            }
+            for path in [
+                "meshes/world/object.nif",
+                "textures/landscape/ground.dds",
+                "LODSettings/Custom.LOD",
+            ] {
+                assert!(selection_includes(cluster, Path::new(path)), "{path}");
+            }
+            for path in [
+                "meshes/terrain/custom/custom.4.0.0.btr",
+                "meshes/terrain/custom/objects/custom.4.0.0.bto",
+                "meshes/terrain/custom/trees/custom.lst",
+                "meshes/terrain/custom/trees/custom.4.0.0.btt",
+                "textures/terrain/custom/trees/atlas.dds",
+                "textures/terrain/custom/objects/atlas.dds",
+                "textures/terrain/custom/custom.4.0.0.dds",
+                "textures/lod/atlas.dds",
+            ] {
+                assert!(!selection_includes(cluster, Path::new(path)), "{path}");
+            }
+        }
+        assert!(
+            IngestionSelection::ConverterInputsV2.can_satisfy(IngestionSelection::ClusterInputsV1)
+        );
+        assert!(
+            IngestionSelection::RuntimeEnglishV2.can_satisfy(IngestionSelection::ClusterEnglishV1)
+        );
+    }
 }
 
 fn is_lod_setting(path: &Path) -> bool {

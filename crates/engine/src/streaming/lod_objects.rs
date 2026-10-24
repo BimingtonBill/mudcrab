@@ -564,8 +564,15 @@ pub struct ObjectLodPlugin;
 
 impl Plugin for ObjectLodPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ObjectLodStreaming>()
-            .add_observer(mark_object_instance_ready)
+        app.init_resource::<ObjectLodStreaming>();
+        if app
+            .world()
+            .get_resource::<EngineConfig>()
+            .is_some_and(|config| config.clusters.is_some())
+        {
+            return;
+        }
+        app.add_observer(mark_object_instance_ready)
             .add_systems(Startup, open_object_lod_source)
             .add_systems(
                 Update,
@@ -601,7 +608,7 @@ fn open_object_lod_source(
     mut metrics: ResMut<StreamingMetrics>,
     mut state: ResMut<ObjectLodStreaming>,
 ) {
-    if !config.assets_dir.join("skyrim_world.db").is_file() {
+    if config.clusters.is_some() || !config.assets_dir.join("skyrim_world.db").is_file() {
         return;
     }
     let Some(data) = extensions.as_ref().map(|extensions| extensions.data()) else {
@@ -727,6 +734,9 @@ fn plan_object_lod(
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
+    if config.clusters.is_some() {
+        return;
+    }
     let started = Instant::now();
     let Some(mut source) = source else {
         return;
@@ -1661,6 +1671,72 @@ mod tests {
         let ready = all_blocks(&world);
         let plan = select(&world, IVec2::new(0, 200), 0, &ready);
         assert!(plan.shown.is_empty() && plan.needed.is_empty());
+    }
+
+    #[test]
+    fn cluster_mode_never_opens_native_inventory_without_baked_tables_or_files() {
+        use bevy::ecs::system::RunSystemOnce;
+        use shared::extensions::{DataExtensions, ExtensionEntry, ExtensionOwns};
+
+        let directory = tempfile::tempdir().unwrap();
+        rusqlite::Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        // Even a declared native inventory must not schedule its reads in cluster mode.
+        let entry = ExtensionEntry {
+            id: shared::extensions::LOD_INVENTORY.into(),
+            version: 1,
+            owns: ExtensionOwns {
+                tables: [
+                    "lod_block",
+                    "lod_grid",
+                    "lod_tree_instance",
+                    "lod_tree_type",
+                ]
+                .map(str::to_owned)
+                .into(),
+                files: vec!["missing-billboards/".into()],
+                ..default()
+            },
+            sha256: "ab".repeat(32),
+            built_from: "core".into(),
+            stats: default(),
+        };
+        let data = DataExtensions::from_manifest_json(
+            &serde_json::json!({"extensions": [entry]}).to_string(),
+            Some("core".into()),
+        )
+        .unwrap();
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(EngineConfig {
+                assets_dir: directory.path().into(),
+                clusters: Some("fixture".into()),
+                ..default()
+            })
+            .insert_resource(crate::extensions::DataSetExtensions::new(data))
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ObjectLodStreaming>();
+        app.world_mut()
+            .run_system_once(open_object_lod_source)
+            .unwrap();
+        assert!(!app.world().contains_resource::<OpeningObjectSource>());
+        assert!(!app.world().contains_resource::<ObjectLodSource>());
+        assert!(
+            !app.world()
+                .resource::<ObjectLodStreaming>()
+                .inventory_expected
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .pending_lod_object_blocks,
+            0
+        );
+        // Exercise the plugin's real Startup registration as well as its source entry point.
+        app.init_schedule(Startup);
+        app.add_plugins(ObjectLodPlugin);
+        app.world_mut().run_schedule(Startup);
+        app.update();
+        assert!(!app.world().contains_resource::<OpeningObjectSource>());
     }
 
     /// A package with one level-4 object block at cell 0,0 of `worldspace_id`.

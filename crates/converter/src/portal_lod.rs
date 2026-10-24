@@ -773,6 +773,22 @@ pub fn is_inventory_input(relative: &Path) -> bool {
     }
 }
 
+/// Candidate baked sources, including native mesh containers outside the inventory
+/// namespace and native terrain/object texture namespaces. DDS named by surviving
+/// near models, records or LAND are shared sources and are restored by their consumers.
+pub(crate) fn is_baked_geometry_input(relative: &Path) -> bool {
+    let lowered = relative
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let path = Path::new(&lowered);
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    matches!(extension, Some("btr" | "bto"))
+        || (extension == Some("dds")
+            && (lowered.starts_with("textures/terrain/") || lowered.starts_with("textures/lod/")))
+        || is_inventory_input(path)
+}
+
 /// Records the distant-LOD inventory of one converted asset set.
 ///
 /// Reads `lodsettings/<worldspace>.lod`, the block meshes under

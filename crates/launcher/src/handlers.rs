@@ -164,8 +164,13 @@ pub fn launch_engine(
         .converted_assets_path
         .canonicalize()
         .unwrap_or_else(|_| config.converted_assets_path.clone());
-    let mut command = std::process::Command::new(&executable);
-    command.arg("--assets").arg(&assets);
+    let command = match engine_command(&executable, &assets) {
+        Ok(command) => command,
+        Err(error) => {
+            status.push_notice(&format!("Cannot play this conversion: {error}"));
+            return;
+        }
+    };
     match EngineProcess::spawn(command, &stderr_log_path()) {
         Ok(engine) => {
             status.push_notice(&format!(
@@ -181,6 +186,19 @@ pub fn launch_engine(
             ));
         }
     }
+}
+
+/// The output manifest selects runtime geometry, independently of the next conversion's checkbox.
+fn engine_command(executable: &Path, assets: &Path) -> Result<std::process::Command, String> {
+    let mut command = std::process::Command::new(executable);
+    command.arg("--assets").arg(assets);
+    if let Some(overlay) = crate::conversion::output_cluster_package(assets)? {
+        command
+            .arg("--clusters")
+            .arg(overlay)
+            .arg("--cluster-terrain");
+    }
+    Ok(command)
 }
 
 /// Watches the engine started by Play and, once it exits, says how: closed normally, or stopped
@@ -204,6 +222,151 @@ mod tests {
     use crate::conversion::state::RunReport;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn play_uses_the_recorded_package_and_never_the_next_conversion_choice() {
+        use shared::cluster_overlay::{OverlayMetadata, ResolvedBuildSettings};
+        let folder = tempfile::tempdir().unwrap();
+        let base = folder.path();
+        std::fs::write(
+            base.join("OWNER.txt"),
+            "Owner: #2144 launcher cluster fixture; lifetime: test.\n",
+        )
+        .unwrap();
+        let database = rusqlite::Connection::open(base.join("skyrim_world.db")).unwrap();
+        database
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER); INSERT INTO schema_info VALUES({});",
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+        drop(database);
+        let settings = ResolvedBuildSettings::new("fixture", "ab".repeat(32), 1024, true, true);
+        let package = format!("derived/clusters-{}", settings.settings_id());
+        let overlay = base.join(&package);
+        std::fs::create_dir_all(&overlay).unwrap();
+        std::fs::write(
+            base.join("derived/OWNER.txt"),
+            "Owner: #2144 launcher fixture; lifetime: test.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            overlay.join("OWNER.txt"),
+            "Owner: #2144 launcher package fixture; lifetime: test.\n",
+        )
+        .unwrap();
+        let metadata = OverlayMetadata {
+            schema_version: shared::cluster_overlay::OVERLAY_SCHEMA_VERSION,
+            kind: shared::cluster_overlay::OVERLAY_KIND.into(),
+            label: "fixture".into(),
+            settings_id: settings.settings_id(),
+            builder_identity: settings.builder_identity.clone(),
+            build_settings: settings,
+            terrain_sources: None,
+            base_core_identity: "cd".repeat(32),
+            base_fingerprint: "ef".repeat(32),
+            base_failure_count: 0,
+            created: "fixture".into(),
+            owner: "launcher fixture".into(),
+            extensions: vec![shared::extensions::ExtensionEntry {
+                id: shared::extensions::CLUSTER_TERRAIN.into(),
+                version: 1,
+                owns: Default::default(),
+                sha256: "ab".repeat(32),
+                built_from: "cd".repeat(32),
+                stats: Default::default(),
+            }],
+        };
+        std::fs::write(
+            overlay.join("overlay.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        // A label matching a recorded relative selector must never redirect Play.
+        let mut distracting = metadata.clone();
+        distracting.build_settings.triangle_threshold += 1;
+        distracting.settings_id = distracting.build_settings.settings_id();
+        distracting.label = package.clone();
+        let other = shared::cluster_overlay::overlay_dir(base, &distracting.settings_id);
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(
+            other.join("OWNER.txt"),
+            "Owner: #2144 distracting overlay fixture; lifetime: test.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            other.join("overlay.json"),
+            serde_json::to_vec(&distracting).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("conversion-manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": converter::cache::CONVERTER_SCHEMA_VERSION,
+                "complete": true, "entries": {},
+                "geometry_mode": "cluster", "cluster_package": package
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(base.join("cell_cache.rkyv"), b"fixture").unwrap();
+        std::fs::write(
+            base.join("integration-report.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "passed": true, "schema_version": shared::WORLD_DATABASE_SCHEMA_VERSION
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(crate::conversion::output_is_complete(base));
+        assert!(!base.join("lod-manifest.json").exists());
+        let command = engine_command(Path::new("engine"), base).unwrap();
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|argument| argument.to_os_string())
+            .collect();
+        assert_eq!(
+            arguments,
+            vec![
+                "--assets".into(),
+                base.as_os_str().to_owned(),
+                "--clusters".into(),
+                overlay.canonicalize().unwrap().into_os_string(),
+                "--cluster-terrain".into()
+            ]
+        );
+        assert!(!crate::conversion::settings::ConversionSettings::default().clustered_geometry);
+    }
+
+    #[test]
+    fn play_preserves_legacy_baked_flags_and_rejects_missing_cluster_packages() {
+        let folder = tempfile::tempdir().unwrap();
+        let base = folder.path();
+        std::fs::write(
+            base.join("OWNER.txt"),
+            "Owner: #2144 launcher baked fixture; lifetime: test.\n",
+        )
+        .unwrap();
+        let manifest = base.join("conversion-manifest.json");
+        std::fs::write(&manifest, b"{}").unwrap();
+        let command = engine_command(Path::new("engine"), base).unwrap();
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("--assets"), base.as_os_str()]
+        );
+        std::fs::write(&manifest, br#"{"geometry_mode":"cluster"}"#).unwrap();
+        assert!(
+            engine_command(Path::new("engine"), base)
+                .unwrap_err()
+                .contains("requires a cluster package")
+        );
+        std::fs::write(
+            &manifest,
+            br#"{"geometry_mode":"cluster","cluster_package":"derived/clusters-abc"}"#,
+        )
+        .unwrap();
+        assert!(engine_command(Path::new("engine"), base).is_err());
+    }
 
     #[test]
     fn mod_files_are_known_by_their_extension() {

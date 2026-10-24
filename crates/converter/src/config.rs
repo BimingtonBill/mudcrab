@@ -91,7 +91,8 @@ pub struct PipelineConfig {
     pub discard_derived: bool,
     /// How distant opaque static objects are prepared (ADR-0013). `baked`, the default, adds
     /// nothing to the output. Not part of the asset configuration hash: it selects regenerated
-    /// outputs only.
+    /// outputs only. Forced `cluster` omits baked products, includes trees and always
+    /// derives terrain. `auto` keeps a baked base and derives the historical optional overlay.
     #[serde(default)]
     pub lod_mode: crate::cluster::LodMode,
     /// Smallest primitive, in triangles, that gets cluster LOD payloads.
@@ -100,7 +101,7 @@ pub struct PipelineConfig {
     /// Build the stand-in baked object chunks beside the cluster stage, for timing only.
     #[serde(default)]
     pub cluster_bench_baked: bool,
-    /// Add clustered terrain beside the core terrain and baked LOD outputs.
+    /// Add clustered terrain in auto mode; forced cluster mode always includes it.
     #[serde(default)]
     pub cluster_terrain: bool,
     /// Build the merged-terrain outputs (#215) after the world database and the land textures:

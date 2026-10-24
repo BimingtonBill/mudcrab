@@ -90,8 +90,54 @@ pub(crate) fn derive_requested(config: &PipelineConfig) -> bool {
     !config.no_lod && config.lod_mode != LodMode::Baked
 }
 
+/// Forced cluster conversions omit native products and require trees and canonical terrain.
+/// Auto retains the historical baked base with an optional cluster overlay.
+pub(crate) fn cluster_only(config: &PipelineConfig) -> bool {
+    config.lod_mode == LodMode::Cluster
+}
+
+pub(crate) fn terrain_requested(config: &PipelineConfig) -> bool {
+    cluster_only(config) || config.cluster_terrain
+}
+
+fn conversion_options(config: &PipelineConfig, base: &Path) -> DeriveOptions {
+    DeriveOptions {
+        source: base.to_path_buf(),
+        label: "default".into(),
+        replace: false,
+        keep_failed_staging: false,
+        terrain: terrain_requested(config),
+        terrain_sources: None,
+        jobs: config.cpu_jobs,
+        triangle_threshold: config.cluster_triangle_threshold,
+        include_trees: cluster_only(config),
+    }
+}
+
+pub(crate) fn geometry_manifest(config: &PipelineConfig) -> shared::geometry::GeometryManifest {
+    if !cluster_only(config) {
+        return shared::geometry::GeometryManifest::default();
+    }
+    let options = conversion_options(config, &config.output_dir);
+    shared::geometry::GeometryManifest {
+        geometry_mode: shared::geometry::GeometryMode::Cluster,
+        cluster_package: Some(format!(
+            "derived/clusters-{}",
+            derive_extensions::settings_id(&options)
+        )),
+    }
+}
+
 /// Refuses cluster requests a conversion cannot honour, before any work starts.
 pub(crate) fn validate_request(config: &PipelineConfig) -> Result<()> {
+    ensure!(
+        !cluster_only(config) || !config.no_lod,
+        "--lod-mode cluster requires LOD enabled; --no-lod contradicts cluster geometry"
+    );
+    ensure!(
+        !cluster_only(config) || !config.extract_all_archive_files,
+        "--extract-all-archive-files contradicts cluster-only geometry; use baked/auto for complete raw archive extraction"
+    );
     ensure!(
         !config.cluster_terrain || derive_requested(config),
         "--cluster-terrain requires cluster/auto LOD with LOD enabled"
@@ -192,7 +238,7 @@ fn retry_terrain_sources(
     base: &Path,
     staged_vfs: Option<&Path>,
 ) -> Result<Option<std::path::PathBuf>> {
-    if !config.cluster_terrain || base.join("vfs").try_exists()? {
+    if !terrain_requested(config) || base.join("vfs").try_exists()? {
         return Ok(None);
     }
     Ok(staged_vfs.map(Path::to_path_buf))
@@ -335,7 +381,7 @@ fn retry_command(config: &PipelineConfig, base: &Path, terrain_sources: Option<&
         config.cluster_triangle_threshold,
         config.cpu_jobs
     );
-    if config.cluster_terrain {
+    if terrain_requested(config) {
         command.push_str(" --terrain");
     }
     if let Some(sources) = terrain_sources {
@@ -343,6 +389,9 @@ fn retry_command(config: &PipelineConfig, base: &Path, terrain_sources: Option<&
             " --terrain-sources {}",
             shared::cluster_overlay::quote_argument(&sources.display().to_string())
         ));
+    }
+    if cluster_only(config) {
+        command.push_str(" --include-trees");
     }
     command.push_str(" --label default --replace");
     command
@@ -391,17 +440,8 @@ pub(crate) fn derive_after_publish(
     if !derive_requested(config) {
         return Ok(Overlay::NotRequested);
     }
-    let options = DeriveOptions {
-        source: base.to_path_buf(),
-        label: "default".into(),
-        replace: false,
-        keep_failed_staging: false,
-        terrain: config.cluster_terrain,
-        terrain_sources: retry_terrain_sources(config, base, staged_vfs)?,
-        jobs: config.cpu_jobs,
-        triangle_threshold: config.cluster_triangle_threshold,
-        include_trees: false,
-    };
+    let mut options = conversion_options(config, base);
+    options.terrain_sources = retry_terrain_sources(config, base, staged_vfs)?;
     (hooks.derive)(&options, early_probe)
         .map(|derived| Overlay::Derived(Box::new(derived)))
         .map_err(|error| error.wrap_err(overlay_failure_context(config, base, staged_vfs)))
@@ -518,6 +558,7 @@ mod detach_tests {
         fs::create_dir_all(staging.join("vfs")).unwrap();
 
         let mut no_terrain = terrain_config(&data, &output);
+        no_terrain.lod_mode = LodMode::Auto;
         no_terrain.cluster_terrain = false;
         assert!(
             detach_terrain_sources(&no_terrain, &output, &staging)
