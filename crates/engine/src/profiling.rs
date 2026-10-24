@@ -272,8 +272,8 @@ const NO_RENDERER: &str = "no renderer in this run";
 const TIMESTAMP_QUERIES_UNAVAILABLE: &str =
     "the graphics backend does not support timestamp queries, so Bevy records no per-pass GPU time";
 
-/// Why the report has no per-pass shader-invocation counters: DX12 does not offer pipeline
-/// statistics.
+/// Why the report has no per-pass shader-invocation counters on a device without pipeline
+/// statistics support.
 const PIPELINE_STATISTICS_UNAVAILABLE: &str =
     "the graphics backend does not support pipeline statistics queries";
 
@@ -1124,7 +1124,7 @@ impl ProfilingState {
         csv
     }
 
-    /// The per-pass GPU times, summarised over the measured window (see [`GpuPassReport`]).
+    /// Per-pass GPU times and pipeline counters over the measured window (see [`GpuPassReport`]).
     ///
     /// `renderer` is the run's renderer fingerprint, or `None` for a run that had no renderer; it
     /// is where the device's capabilities come from, so a renderer-less run says so rather than
@@ -1145,6 +1145,14 @@ impl ProfilingState {
         } else {
             BTreeMap::new()
         };
+        let pipeline_statistics = self.pipeline_counter_summaries(
+            &[
+                "/vertex_shader_invocations",
+                "/fragment_shader_invocations",
+                "/clipper_primitives_out",
+            ],
+            pipeline_statistics_supported,
+        );
         let mut unavailable = BTreeMap::new();
         if renderer.is_none() {
             unavailable.insert("elapsed_gpu".to_owned(), NO_RENDERER.to_owned());
@@ -1173,8 +1181,26 @@ impl ProfilingState {
             pipeline_statistics_supported,
             measured_frames: self.measured_frames,
             passes,
+            pipeline_statistics,
             unavailable,
         }
+    }
+
+    /// Summarises only requested pipeline counters from a device that can measure them.
+    /// Both report sections use the same collection and capability gate.
+    fn pipeline_counter_summaries(
+        &self,
+        suffixes: &[&str],
+        supported: bool,
+    ) -> BTreeMap<String, MetricSummary> {
+        if !supported {
+            return BTreeMap::new();
+        }
+        self.render_metrics
+            .iter()
+            .filter(|(path, _)| suffixes.iter().any(|suffix| path.ends_with(*suffix)))
+            .map(|(path, samples)| (path.clone(), summarize(samples)))
+            .collect()
     }
 
     /// What the rendered scene contained: the entity counts and the per-pass counters the graphics
@@ -1216,17 +1242,11 @@ impl ProfilingState {
         }
         // Without pipeline statistics no such counter can be real, so a stray sample (a diagnostic
         // left over from another device, say) is dropped rather than reported as a count.
-        let counters = |suffix: &str| -> BTreeMap<String, MetricSummary> {
-            if !pipeline_statistics_supported {
-                return BTreeMap::new();
-            }
-            self.render_metrics
-                .iter()
-                .filter(|(path, _)| path.ends_with(suffix))
-                .map(|(path, samples)| (path.clone(), summarize(samples)))
-                .collect()
+        let counters = |suffix: &str| {
+            self.pipeline_counter_summaries(&[suffix], pipeline_statistics_supported)
         };
         let vertex_shader_invocations = counters("/vertex_shader_invocations");
+        let fragment_shader_invocations = counters("/fragment_shader_invocations");
         let clipper_primitives_out = counters("/clipper_primitives_out");
         if renderer.is_none() {
             unavailable.insert("pipeline_statistics".to_owned(), NO_RENDERER.to_owned());
@@ -1235,7 +1255,10 @@ impl ProfilingState {
                 "pipeline_statistics".to_owned(),
                 PIPELINE_STATISTICS_UNAVAILABLE.to_owned(),
             );
-        } else if vertex_shader_invocations.is_empty() && clipper_primitives_out.is_empty() {
+        } else if vertex_shader_invocations.is_empty()
+            && fragment_shader_invocations.is_empty()
+            && clipper_primitives_out.is_empty()
+        {
             unavailable.insert(
                 "pipeline_statistics".to_owned(),
                 NO_PIPELINE_STATISTICS.to_owned(),
@@ -1250,6 +1273,7 @@ impl ProfilingState {
             pipeline_statistics_supported,
             measured_frames: self.measured_frames,
             vertex_shader_invocations,
+            fragment_shader_invocations,
             clipper_primitives_out,
             draw_calls: None,
             unavailable,
@@ -1756,16 +1780,16 @@ pub struct MetricSummary {
     pub minimum: f64,
 }
 
-/// The report's per-pass GPU times: one summary per Bevy render-diagnostic path, plus what the
-/// device could not measure.
+/// The report's per-pass GPU times and pipeline counters: one summary per Bevy render-diagnostic
+/// path, plus what the device could not measure. Timing and counter maps have independent gates.
 ///
-/// The paths are Bevy's own: `render/<pass>/elapsed_gpu`, where `<pass>` is the label the render
-/// pass was created with (`main_opaque_pass_3d`, `tonemapping`, `shadow_directional_light_0_cascade_1`,
+/// Timing paths are `render/<pass>/elapsed_gpu`, where `<pass>` is the diagnostic span label
+/// (`main_opaque_pass_3d`, `tonemapping`, `shadow_directional_light_0_cascade_1_early`,
 /// …). Several cameras that run the same pass write the same path and Bevy records no camera with a
 /// measurement, so a summary covers every camera that ran it and its samples mix them; compare
 /// cameras by running them separately. Every sample is taken once from Bevy's own history, not
-/// resampled from its latest value, so `count` is the number of pass observations kept — never more
-/// than the frames they were read in. When the device cannot time GPU work the passes are left
+/// resampled from its latest value, so `count` is the number of pass observations kept, including
+/// several cameras in one readback. When the device cannot time GPU work the passes are left
 /// empty and `unavailable` says why, rather than reporting zeros.
 #[derive(Debug, Clone, Serialize)]
 pub struct GpuPassReport {
@@ -1775,7 +1799,11 @@ pub struct GpuPassReport {
     /// numbers. A pass's own `count` can be smaller — its GPU readback lags — and larger — several
     /// cameras ran it.
     pub measured_frames: u64,
+    /// Per-pass GPU elapsed time only, in milliseconds.
     pub passes: BTreeMap<String, MetricSummary>,
+    /// Per-pass vertex/fragment shader invocations and clipped primitive counts.
+    /// Independent of timestamp support; empty without pipeline statistics support.
+    pub pipeline_statistics: BTreeMap<String, MetricSummary>,
     pub unavailable: BTreeMap<String, String>,
 }
 
@@ -1827,9 +1855,10 @@ pub struct GpuMemoryReport {
 /// What the run's scene contained: the entity counts, and the per-pass pipeline-statistics
 /// counters the graphics backend can report.
 ///
-/// The counters are Bevy's own render diagnostics, `render/<pass>/vertex_shader_invocations` and
-/// `render/<pass>/clipper_primitives_out`. Only Vulkan offers pipeline statistics, so on DX12 (and
-/// on every backend without them) both maps are empty and `unavailable` says why; the counts are
+/// The counters are Bevy's own render diagnostics, `render/<pass>/vertex_shader_invocations`,
+/// `render/<pass>/fragment_shader_invocations` and `render/<pass>/clipper_primitives_out`.
+/// On backends without pipeline statistics all three maps are empty and `unavailable` says why;
+/// the device's feature flag decides availability independently of timestamp support. The counts are
 /// per pass, and several cameras that run the same pass write the same path.
 ///
 /// `draw_calls` is always `null`: Bevy 0.19 exposes no draw-call count. It is spelled out rather
@@ -1844,8 +1873,10 @@ pub struct SceneReport {
     /// The frames of the measured window the counters were sampled over: the frame count behind
     /// their per-pass `count`s.
     pub measured_frames: u64,
-    /// Per pass: shader invocations, over the measured frames, as `mean`/`p95`/`worst` and friends.
+    /// Per pass: vertex invocations, over the measured frames, as `mean`/`p95`/`worst` and friends.
     pub vertex_shader_invocations: BTreeMap<String, MetricSummary>,
+    /// Per pass: fragment invocations, over the measured frames; a measured zero is valid.
+    pub fragment_shader_invocations: BTreeMap<String, MetricSummary>,
     /// Per pass: primitives that survived clipping, over the measured frames.
     pub clipper_primitives_out: BTreeMap<String, MetricSummary>,
     /// Always `null`; see `unavailable["draw_calls"]` for why.
@@ -2385,6 +2416,11 @@ mod tests {
                 "render/main_opaque_pass_3d/vertex_shader_invocations",
                 100.0,
             );
+            feed(
+                &mut diagnostics,
+                "render/main_opaque_pass_3d/fragment_shader_invocations",
+                200.0,
+            );
             profiler.sample_frame(&diagnostics, None, true, true);
         }
         let report = profiler.gpu_passes(Some(&renderer(true, true)));
@@ -2404,6 +2440,17 @@ mod tests {
                 .passes
                 .contains_key("render/main_opaque_pass_3d/vertex_shader_invocations"),
             "a pipeline-statistics counter is not a pass time"
+        );
+        assert_eq!(
+            report.passes.len(),
+            2,
+            "only elapsed_gpu paths are pass times"
+        );
+        assert_eq!(report.pipeline_statistics.len(), 2);
+        assert_eq!(
+            report.pipeline_statistics["render/main_opaque_pass_3d/fragment_shader_invocations"]
+                .mean,
+            200.0
         );
     }
 
@@ -2966,6 +3013,11 @@ mod tests {
                 "render/main_opaque_pass_3d/clipper_primitives_out",
                 value / 2.0,
             );
+            feed(
+                &mut diagnostics,
+                "render/main_opaque_pass_3d/fragment_shader_invocations",
+                value * 2.0,
+            );
             profiler.sample_frame(&diagnostics, None, true, true);
         }
         let scene = profiler.scene_report(Some(42), Some(&renderer(true, true)));
@@ -2984,6 +3036,12 @@ mod tests {
             scene.clipper_primitives_out["render/main_opaque_pass_3d/clipper_primitives_out"].mean,
             75.0
         );
+        assert_eq!(
+            scene.fragment_shader_invocations["render/main_opaque_pass_3d/fragment_shader_invocations"]
+                .mean,
+            300.0
+        );
+        assert!(!scene.unavailable.contains_key("pipeline_statistics"));
         assert_eq!(scene.draw_calls, None, "Bevy exposes no draw-call count");
         assert_eq!(
             scene.unavailable["draw_calls"],
@@ -2995,7 +3053,7 @@ mod tests {
         );
     }
 
-    /// A backend without pipeline statistics reports neither counter, and says why — even when a
+    /// A backend without pipeline statistics reports no counters, and says why — even when a
     /// stray diagnostic holds samples. A scene the inventory never sampled is `null` with a reason,
     /// not a zero.
     #[test]
@@ -3012,6 +3070,7 @@ mod tests {
         assert!(!scene.pipeline_statistics_supported);
         assert!(scene.vertex_shader_invocations.is_empty());
         assert!(scene.clipper_primitives_out.is_empty());
+        assert!(scene.fragment_shader_invocations.is_empty());
         assert_eq!(
             scene.unavailable["pipeline_statistics"],
             PIPELINE_STATISTICS_UNAVAILABLE
@@ -3026,9 +3085,278 @@ mod tests {
         let unsampled =
             ProfilingState::default().scene_report(Some(1), Some(&renderer(true, true)));
         assert!(unsampled.vertex_shader_invocations.is_empty());
+        assert!(unsampled.fragment_shader_invocations.is_empty());
+        assert!(unsampled.clipper_primitives_out.is_empty());
         assert_eq!(
             unsampled.unavailable["pipeline_statistics"],
             NO_PIPELINE_STATISTICS
+        );
+    }
+
+    #[test]
+    fn a_fragment_only_counter_is_available_without_vertex_or_clipper_samples() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        let path = "render/shadow_spot_light_0_early/fragment_shader_invocations";
+        for value in [12.0, 24.0] {
+            feed(&mut diagnostics, path, value);
+            profiler.sample_frame(&diagnostics, None, true, true);
+        }
+        let scene = profiler.scene_report(None, Some(&renderer(true, true)));
+        assert!(scene.vertex_shader_invocations.is_empty());
+        assert!(scene.clipper_primitives_out.is_empty());
+        assert_eq!(scene.fragment_shader_invocations.len(), 1);
+        let counter = &scene.fragment_shader_invocations[path];
+        assert_eq!(counter.count, 2);
+        assert_eq!(counter.mean, 18.0);
+        assert_eq!(counter.total, 36.0);
+        assert_eq!(counter.p95, 24.0);
+        assert!(!scene.unavailable.contains_key("pipeline_statistics"));
+    }
+
+    #[test]
+    fn a_fragment_only_zero_is_a_valid_counter() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        let path = "render/shadow_spot_light_0_early/fragment_shader_invocations";
+        feed(&mut diagnostics, path, 0.0);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let scene = profiler.scene_report(None, Some(&renderer(true, true)));
+        assert_eq!(scene.fragment_shader_invocations[path].count, 1);
+        assert_eq!(scene.fragment_shader_invocations[path].mean, 0.0);
+        assert!(!scene.unavailable.contains_key("pipeline_statistics"));
+        let gpu = profiler.gpu_passes(Some(&renderer(true, true)));
+        assert_eq!(gpu.pipeline_statistics[path].count, 1);
+        assert_eq!(gpu.pipeline_statistics[path].mean, 0.0);
+        assert!(gpu.passes.is_empty());
+    }
+
+    #[test]
+    fn a_fragment_only_counter_is_dropped_without_pipeline_statistics_support() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        feed(
+            &mut diagnostics,
+            "render/shadow_spot_light_0_early/fragment_shader_invocations",
+            12.0,
+        );
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let scene = profiler.scene_report(None, Some(&renderer(true, false)));
+        assert!(scene.fragment_shader_invocations.is_empty());
+        assert_eq!(
+            scene.unavailable["pipeline_statistics"],
+            PIPELINE_STATISTICS_UNAVAILABLE
+        );
+        let gpu = profiler.gpu_passes(Some(&renderer(true, false)));
+        assert!(gpu.pipeline_statistics.is_empty());
+        assert_eq!(
+            gpu.unavailable["pipeline_statistics"],
+            PIPELINE_STATISTICS_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn a_fragment_only_counter_is_dropped_without_a_renderer() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        feed(
+            &mut diagnostics,
+            "render/shadow_spot_light_0_early/fragment_shader_invocations",
+            12.0,
+        );
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let scene = profiler.scene_report(None, None);
+        assert!(scene.fragment_shader_invocations.is_empty());
+        assert_eq!(scene.unavailable["pipeline_statistics"], NO_RENDERER);
+        let gpu = profiler.gpu_passes(None);
+        assert!(gpu.pipeline_statistics.is_empty());
+        assert_eq!(gpu.unavailable["pipeline_statistics"], NO_RENDERER);
+    }
+
+    #[test]
+    fn fragment_only_json_keeps_counters_separate_from_pass_times() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        let path = "render/shadow_spot_light_0_early/fragment_shader_invocations";
+        feed(&mut diagnostics, path, 0.0);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let device = renderer(true, true);
+        let report = serde_json::json!({
+            "scene": profiler.scene_report(None, Some(&device)),
+            "gpu_passes": profiler.gpu_passes(Some(&device)),
+        });
+        assert_eq!(
+            report["scene"]["fragment_shader_invocations"][path]["count"],
+            1
+        );
+        assert_eq!(
+            report["scene"]["fragment_shader_invocations"][path]["mean"],
+            0.0
+        );
+        assert_eq!(
+            report["scene"]["vertex_shader_invocations"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            report["scene"]["clipper_primitives_out"],
+            serde_json::json!({})
+        );
+        assert!(
+            report["scene"]["unavailable"]
+                .get("pipeline_statistics")
+                .is_none()
+        );
+        assert_eq!(
+            report["gpu_passes"]["pipeline_statistics"][path]["mean"],
+            0.0
+        );
+        assert_eq!(report["gpu_passes"]["passes"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn gpu_pass_json_contains_shadow_vertex_fragment_and_clipper_statistics() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        let pass = "render/shadow_directional_light_0_cascade_1_early";
+        for (suffix, value) in [
+            ("vertex_shader_invocations", 120.0),
+            ("fragment_shader_invocations", 40.0),
+            ("clipper_primitives_out", 60.0),
+            ("elapsed_gpu", 0.5),
+            ("elapsed_cpu", 1.0),
+            ("compute_shader_invocations", 7.0),
+        ] {
+            feed(&mut diagnostics, &format!("{pass}/{suffix}"), value);
+        }
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let report = serde_json::json!({
+            "gpu_passes": profiler.gpu_passes(Some(&renderer(true, true))),
+        });
+        let gpu = &report["gpu_passes"];
+        let statistics = gpu["pipeline_statistics"].as_object().unwrap();
+        assert_eq!(statistics.len(), 3);
+        for (suffix, value) in [
+            ("vertex_shader_invocations", 120.0),
+            ("fragment_shader_invocations", 40.0),
+            ("clipper_primitives_out", 60.0),
+        ] {
+            let path = format!("{pass}/{suffix}");
+            assert_eq!(statistics[&path]["count"], 1);
+            assert_eq!(statistics[&path]["mean"], value);
+            assert!(gpu["passes"].get(&path).is_none());
+        }
+        assert_eq!(gpu["passes"].as_object().unwrap().len(), 1);
+        assert_eq!(gpu["passes"][format!("{pass}/elapsed_gpu")]["mean"], 0.5);
+    }
+
+    #[test]
+    fn pipeline_statistics_and_timestamps_have_independent_capability_gates() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        let pass = "render/shadow_spot_light_0_late";
+        let vertex = format!("{pass}/vertex_shader_invocations");
+        let fragment = format!("{pass}/fragment_shader_invocations");
+        let clipper = format!("{pass}/clipper_primitives_out");
+        let elapsed = format!("{pass}/elapsed_gpu");
+        for (path, value) in [
+            (&vertex, 12.0),
+            (&fragment, 0.0),
+            (&clipper, 6.0),
+            (&elapsed, 0.5),
+        ] {
+            feed(&mut diagnostics, path, value);
+        }
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let statistics_only = profiler.gpu_passes(Some(&renderer(false, true)));
+        assert!(statistics_only.passes.is_empty());
+        assert_eq!(statistics_only.pipeline_statistics.len(), 3);
+        assert_eq!(statistics_only.pipeline_statistics[&vertex].mean, 12.0);
+        assert_eq!(statistics_only.pipeline_statistics[&fragment].count, 1);
+        assert_eq!(statistics_only.pipeline_statistics[&clipper].mean, 6.0);
+        assert_eq!(
+            statistics_only.unavailable["elapsed_gpu"],
+            TIMESTAMP_QUERIES_UNAVAILABLE
+        );
+        assert!(
+            !statistics_only
+                .unavailable
+                .contains_key("pipeline_statistics")
+        );
+        let scene = profiler.scene_report(None, Some(&renderer(false, true)));
+        assert_eq!(scene.fragment_shader_invocations[&fragment].mean, 0.0);
+        assert!(!scene.unavailable.contains_key("pipeline_statistics"));
+
+        let timestamps_only = profiler.gpu_passes(Some(&renderer(true, false)));
+        assert_eq!(timestamps_only.passes[&elapsed].mean, 0.5);
+        assert!(timestamps_only.pipeline_statistics.is_empty());
+        assert!(!timestamps_only.unavailable.contains_key("elapsed_gpu"));
+        assert_eq!(
+            timestamps_only.unavailable["pipeline_statistics"],
+            PIPELINE_STATISTICS_UNAVAILABLE
+        );
+
+        let absent = profiler.gpu_passes(None);
+        assert!(absent.passes.is_empty());
+        assert!(absent.pipeline_statistics.is_empty());
+        assert_eq!(absent.unavailable["pipeline_statistics"], NO_RENDERER);
+        assert_eq!(absent.unavailable["elapsed_gpu"], NO_RENDERER);
+    }
+
+    /// Shadow paths follow the production early/late span labels and use the existing
+    /// history cursor: warm-up is consumed, and unchanged readbacks are never counted twice.
+    #[test]
+    fn shadow_elapsed_gpu_reaches_the_report_only_from_the_measured_window() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        let early = "render/shadow_directional_light_0_cascade_1_early/elapsed_gpu";
+        let late = "render/shadow_directional_light_0_cascade_1_late/elapsed_gpu";
+        let vertex = "render/shadow_directional_light_0_cascade_1_early/vertex_shader_invocations";
+        let fragment =
+            "render/shadow_directional_light_0_cascade_1_early/fragment_shader_invocations";
+        let batch = Instant::now();
+        for path in [early, late, vertex, fragment] {
+            feed_at(&mut diagnostics, path, 100.0, batch);
+        }
+        profiler.sample_frame(&diagnostics, None, false, true);
+        let warm = profiler.gpu_passes(Some(&renderer(true, true)));
+        assert!(warm.passes.is_empty());
+        assert!(warm.pipeline_statistics.is_empty());
+        assert_eq!(warm.measured_frames, 0);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let unchanged = profiler.gpu_passes(Some(&renderer(true, true)));
+        assert!(unchanged.passes.is_empty());
+        assert!(unchanged.pipeline_statistics.is_empty());
+
+        let measured_batch = batch + Duration::from_millis(16);
+        feed_at(&mut diagnostics, early, 2.0, measured_batch);
+        feed_at(&mut diagnostics, early, 4.0, measured_batch);
+        feed_at(&mut diagnostics, late, 1.0, measured_batch);
+        feed_at(&mut diagnostics, vertex, 12.0, measured_batch);
+        feed_at(&mut diagnostics, fragment, 0.0, measured_batch);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let report = serde_json::json!({
+            "gpu_passes": profiler.gpu_passes(Some(&renderer(true, true))),
+            "scene": profiler.scene_report(None, Some(&renderer(true, true))),
+        });
+        assert_eq!(report["gpu_passes"]["measured_frames"], 3);
+        assert_eq!(report["gpu_passes"]["passes"].as_object().unwrap().len(), 2);
+        assert_eq!(report["gpu_passes"]["passes"][early]["count"], 2);
+        assert_eq!(report["gpu_passes"]["passes"][early]["mean"], 3.0);
+        assert_eq!(report["gpu_passes"]["passes"][early]["total"], 6.0);
+        assert_eq!(report["gpu_passes"]["passes"][late]["count"], 1);
+        assert_eq!(report["gpu_passes"]["passes"][late]["mean"], 1.0);
+        assert_eq!(
+            report["gpu_passes"]["pipeline_statistics"][vertex]["mean"],
+            12.0
+        );
+        assert_eq!(
+            report["scene"]["fragment_shader_invocations"][fragment]["count"],
+            1
+        );
+        assert_eq!(
+            report["scene"]["fragment_shader_invocations"][fragment]["mean"],
+            0.0
         );
     }
 

@@ -1,5 +1,7 @@
 [workspace]
 resolver = "2"
+# Keep the patched PBR dependency on the engine's feature set; do not enable its optional processors.
+exclude = ["vendor/bevy_pbr-0.19.0"]
 members = [
     "crates/converter",
     "crates/dummy-content",
@@ -61,6 +63,8 @@ project-wormhole-esm = "0.1.0"
 # folder to go back to the crates.io crate.
 [patch.crates-io]
 bevy_render = { path = "vendor/bevy_render-0.19.0" }
+# Shadow pass diagnostics; see vendor/bevy_pbr-0.19.0/MUDCRAB-README.md.
+bevy_pbr = { path = "vendor/bevy_pbr-0.19.0" }
 
 # Workspace profile optimization
 [profile.dev]
