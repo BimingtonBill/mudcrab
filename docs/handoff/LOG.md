@@ -1,3 +1,9 @@
+## 2026-10-24, #2136 shader invalidation preserves readiness-cache identity
+
+- Add an event-driven shader-invalidation epoch to ReadinessKey, retaining the existing per-view compiled-pipeline count. An independent extraction message reader drains Added/Modified/Removed shader events and advances the epoch once per changed extraction. Unused/dependency notifications and settled extraction do not advance it. No new pipeline identity scan or ownership/draw behavior change.
+- Observed regression red: equal-count ready-state swap produced identical keys; native session 13549 exited 100, one expected failure. Green: both swap and persistent extraction-message regressions passed. Frozen-source gated fmt/workspace Clippy passed; engine all-target nextest 3,101 passed/13 skipped; converter nextest 1,793 passed/45 skipped. handoff.rs SHA-256 96087954ee962a25194667753e1f008e98c62fbd49dc6acf6be1e3360c1a4d9f; full receipt under the owned target's shader-key-receipt.log. Parent full-diff review found no actionable blockers.
+- Separate readiness/complement fix and #2139 BatchDrawability producer follow next. No engine/GPU launch, derive, push or PR.
+
 ## 2026-10-24, #2139 distant partial stock: resident affine draws
 
 - Worktree `D:/Mudcrab/worktrees/partial-spawn`, branch `phase2/distant-partial-spawn`, base `dd15ef33f`. Source identity seam is isolated in `08493faca`: logical ownership, exact affine qualification and incremental index invalidation for unparented draws. No ownership hide, readiness or complement code is edited. No engine launch, push, PR or merge.

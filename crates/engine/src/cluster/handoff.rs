@@ -2464,6 +2464,29 @@ impl TerrainClipInputs {
     }
 }
 
+#[derive(Resource, Default)]
+struct ShaderInvalidations {
+    version: u64,
+}
+
+fn extract_shader_invalidations(
+    mut invalidations: ResMut<ShaderInvalidations>,
+    mut events: Extract<MessageReader<AssetEvent<bevy::shader::Shader>>>,
+) {
+    let mut invalidated = false;
+    // Match PipelineCache::extract_shaders, with an independent reader. Drain
+    // every event so one extraction's reloads invalidate readiness only once.
+    for event in events.read() {
+        invalidated |= matches!(
+            event,
+            AssetEvent::Added { .. } | AssetEvent::Modified { .. } | AssetEvent::Removed { .. }
+        );
+    }
+    if invalidated {
+        invalidations.version = invalidations.version.wrapping_add(1);
+    }
+}
+
 pub(super) fn install(app: &mut App) {
     crate::streaming::identity_changes::install(app.world_mut());
     destination::install(app);
@@ -2474,6 +2497,7 @@ pub(super) fn install(app: &mut App) {
     render
         .init_resource::<Sources>()
         .init_resource::<Filters>()
+        .init_resource::<ShaderInvalidations>()
         // Standalone cluster fixtures have no streaming plugin to populate terrain.
         .init_resource::<crate::streaming::terrain_handoff::RenderTerrain>()
         .init_resource::<crate::streaming::terrain_handoff::ClusterCoverage>()
@@ -2481,6 +2505,7 @@ pub(super) fn install(app: &mut App) {
             ExtractSchedule,
             extract_sources.in_set(super::SourceExtraction),
         )
+        .add_systems(ExtractSchedule, extract_shader_invalidations)
         .add_systems(
             Render,
             select_instances
@@ -2781,11 +2806,13 @@ impl BatchMaterialNow<'_> {
 /// The inputs a view's batch readiness was computed from. Equal keys mean an equal result: every
 /// view fact `batch_ready_with` reads moves `ViewGpu::readiness_revision`, every batch fact moves
 /// `materials` (this frame's material table differs from the last) or the batch materials'
-/// asset-event version, and pipeline compilation is counted per view.
+/// asset-event version, shader invalidations advance an epoch, and pipeline compilation is
+/// counted per view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ReadinessKey {
     materials: u64,
     material_events: u64,
+    shader_invalidations: u64,
     generation: u64,
     layout: u64,
     batches: usize,
@@ -3605,13 +3632,14 @@ fn select_instances(
     mut shadows: Query<&mut RenderShadowMapVisibleEntities>,
     scene: Option<Res<ClusterScene>>,
     mut filters: ResMut<Filters>,
-    (native, settings, batch_materials, runtime_state, mut terrain_coverage, dirty): (
+    (native, settings, batch_materials, runtime_state, mut terrain_coverage, dirty, shaders): (
         Option<Res<crate::streaming::native_lod::FarNativePolicy>>,
         Option<Res<ClusterSettings>>,
         Option<Res<super::ClusterBatchMaterials>>,
         Option<Res<super::super::runtime_state::RuntimeReferenceState>>,
         ResMut<crate::streaming::terrain_handoff::ClusterCoverage>,
         Option<Res<bevy::render::camera::DirtySpecializations>>,
+        Option<Res<ShaderInvalidations>>,
     ),
 ) {
     let Some(mut gpu) = gpu else {
@@ -3724,6 +3752,7 @@ fn select_instances(
                 material_events: batch_materials
                     .as_ref()
                     .map_or(0, |materials| materials.version),
+                shader_invalidations: shaders.as_ref().map_or(0, |shaders| shaders.version),
                 generation: gpu.generation,
                 layout: gpu.layout_epoch,
                 batches: gpu.batches.len(),
@@ -4535,6 +4564,89 @@ mod reference_root_memo_tests {
 mod selection_regressions {
     use super::*;
     use bevy::platform::collections::HashSet as VisibleSet;
+
+    #[test]
+    fn shader_invalidation_changes_readiness_key_when_ready_pipeline_count_is_unchanged() {
+        let key = |ready: [bool; 2], shader_invalidations: u64| ReadinessKey {
+            materials: 1,
+            material_events: 2,
+            shader_invalidations,
+            generation: 3,
+            layout: 4,
+            batches: 2,
+            view: 5,
+            pipelines_ready: ready.into_iter().filter(|ready| *ready).count(),
+            far_current: false,
+            shadow: false,
+            prepass: true,
+        };
+        // Shader reload queues A while previously queued B finishes. The count
+        // stays one, but the cached [true, false] batch readiness is now wrong.
+        let before = key([true, false], 10);
+        let after = key([false, true], 11);
+        assert_eq!(before.pipelines_ready, after.pipelines_ready);
+        assert_ne!(before, after);
+        assert_eq!(after, key([false, true], 11));
+    }
+
+    #[test]
+    fn shader_invalidations_follow_persistent_extract_messages() {
+        use bevy::{ecs::message::Messages, render::MainWorld, shader::Shader};
+
+        let mut main = MainWorld::default();
+        main.init_resource::<Messages<AssetEvent<Shader>>>();
+        let mut render = World::new();
+        render.insert_resource(main);
+        render.init_resource::<ShaderInvalidations>();
+        let mut schedule = Schedule::new(ExtractSchedule);
+        schedule.add_systems(extract_shader_invalidations);
+
+        schedule.run(&mut render);
+        assert_eq!(render.resource::<ShaderInvalidations>().version, 0);
+
+        let id = AssetId::<Shader>::default();
+        render
+            .resource_mut::<MainWorld>()
+            .resource_mut::<Messages<AssetEvent<Shader>>>()
+            .write_batch([
+                AssetEvent::Unused { id },
+                AssetEvent::LoadedWithDependencies { id },
+            ]);
+        schedule.run(&mut render);
+        assert_eq!(render.resource::<ShaderInvalidations>().version, 0);
+
+        render
+            .resource_mut::<MainWorld>()
+            .resource_mut::<Messages<AssetEvent<Shader>>>()
+            .write_batch([
+                AssetEvent::Added { id },
+                AssetEvent::Modified { id },
+                AssetEvent::Removed { id },
+                AssetEvent::Unused { id },
+                AssetEvent::LoadedWithDependencies { id },
+            ]);
+        schedule.run(&mut render);
+        assert_eq!(render.resource::<ShaderInvalidations>().version, 1);
+        // Keep the same schedule and message buffers: the reader must have
+        // consumed every invalidation, rather than stopping at the first one.
+        schedule.run(&mut render);
+        assert_eq!(render.resource::<ShaderInvalidations>().version, 1);
+
+        for (event, version) in [
+            (AssetEvent::Modified { id }, 2),
+            (AssetEvent::Removed { id }, 3),
+            (AssetEvent::Added { id }, 4),
+        ] {
+            render
+                .resource_mut::<MainWorld>()
+                .resource_mut::<Messages<AssetEvent<Shader>>>()
+                .write(event);
+            schedule.run(&mut render);
+            assert_eq!(render.resource::<ShaderInvalidations>().version, version);
+            schedule.run(&mut render);
+            assert_eq!(render.resource::<ShaderInvalidations>().version, version);
+        }
+    }
 
     fn main(id: u32) -> MainEntity {
         Entity::from_raw_u32(id).unwrap().into()
