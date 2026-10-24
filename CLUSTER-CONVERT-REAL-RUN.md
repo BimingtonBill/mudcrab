@@ -59,6 +59,68 @@ Clippy, converter nextest **1,801 passed / 45 skipped**, workspace nextest **5,4
 The coordinator rechecked the current source and all seven log hashes/exit receipts.
 The full receipt is target-local `2144-1-verification-summary.json`.
 
-The resume result, package proof, size and diagnostics will be recorded after they are
-available. Main28 already has three reader warnings and an incomplete manifest; an
-exit code of 1 alone cannot establish a new conversion defect.
+## Published result
+
+The fixed release converter was built from commit
+`874c080b03c417953e35d617e7a2fba1bd10088a`; its SHA-256 is
+`56c67200594b27e4cb19006d17d65ea2897525834124f7aa84ddf92a8aac0f18`.
+One visible titled console resumed the retained staging through ordinary build-gate
+admission. No conversion hold was set. The converter published the new destination
+and its manifest-selected package, `derived/clusters-8d3ebd4db45517df`.
+
+- Resume wall time: **993.1436008 seconds (16 minutes 33 seconds)**, including gate
+  admission. The log shows immediate admission; converter report time is 988.943 seconds.
+- Attempt 1 plus resume: **1912.7079377 seconds (31 minutes 53 seconds)** of execution,
+  excluding rebuilds and the gap between attempts. This is a resumed run with reused
+  assets, not a clean timing comparison against main28.
+- Requested `dust -d 1 -r` result: **19Gi**, including the derived package. A separate
+  file scan found **57,102 files / 21,185,882,513 logical bytes**. The derived directory
+  accounts for approximately 3.3 GiB in dust output.
+- The manifest records `geometry_mode: "cluster"`; its exact package settings enable
+  terrain and trees at the default triangle threshold of 1024. The package has 1,547
+  mesh payloads, 51,277 cluster instances (19,512 tree instances), 121 object blocks,
+  301 terrain blocks, 52,181 height rows and 176 unique terrain atlas files. All 2,145
+  referenced package files are present; all terrain atlas hashes match.
+- No native BTO/BTR products, generated billboard GLBs or compiled baked terrain GLBs
+  exist. Native inventory and chunk tables have zero rows. All 199 retained textures
+  in the LOD candidate namespaces have surviving dependencies; no alias hash mismatch
+  or unjustified retained texture was found. All 37 derived origins match actual cell
+  minima.
+- Load order, archive source hashes, plugins, localization and reader settings match
+  main28. DDS and PEX configuration hashes match. The NIF hash differs because the
+  current producer adds `authored_transform_animation: 1`; both configuration hashes
+  were reproduced from their respective producer contracts. This predates the origin fix.
+
+The resumed conversion exited **1** with exactly the same three reader warnings as
+main28, zero skipped inputs and **zero asset failures**. Its `complete` and
+`record_data_complete` flags remain false, matching that baseline limitation. It has no
+new top-level warning/error log lines. The existing cluster prototype notice about
+unassigned `stable_id` remains; no shipping or engine acceptance is implied.
+
+Integration validation passes. Read-only review explains every changed count through
+upstream commit `9e406da49`, which adds TACT, ADDN, APPA and ARTO to the statics
+projection. Those four types add 487 rows: 258 bounded, 172 with already-empty GLBs,
+11 with source models unavailable in both datasets, and 46 without a model. This
+exactly explains the increases in models, bounds, unavailable sources and unbounded
+models. All 28,325 existing static rows retain identical paths and bounds across their
+common columns; the current schema also has an additive display-name column.
+
+The four additional room overlap rows belong to existing references whose two TACT
+bases now enter that projection; neither reference transforms nor room geometry changed.
+The first-100 diagnostic samples were reconstructed exactly: the new scope inserts
+21 distinct messages and displaces 21 older messages without fixing or newly breaking
+those older models. All 405 available unique models behind the added rows match
+baseline source hashes and actual GLB bytes (810 file hashes checked). The NIF cache
+identity change explains none of these integration deltas. No additional cluster
+conversion regression was found. Full proof is target-local
+`2144-1-integration-diagnostic-review.json`.
+
+Proof is retained in target-local `2144-1-resume-validation.json`,
+`2144-1-resume-audit.json`, `2144-1-resume-shared-textures.json` and `2144-1-dust.txt`.
+The requested console log and exit receipt are
+`D:/Mudcrab/SkyrimConverted-cluster1-convert.log` and
+`D:/Mudcrab/SkyrimConverted-cluster1-convert.exit`. Original attempt 1 evidence is
+archived under `2144-1-attempt1-*` in the target. The coordinator verified every proof
+hash, independently scanned the output for omitted products and confirmed zero native
+inventory/chunk rows, then independently compared all common columns of the 28,325
+existing statics. Baseline evidence hashes remain unchanged. No engine was run.
