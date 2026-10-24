@@ -55,7 +55,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub(crate) mod far_stock;
+mod flat_stock;
 pub(crate) mod lod;
+pub(crate) mod partial_stock;
+mod partial_stock_template;
 mod reference_spawn;
 pub(crate) use reference_spawn::{ReferenceSpawnContext, reference_placement, spawn_reference};
 pub(crate) mod identity_changes;
@@ -4820,6 +4823,7 @@ type PendingAssetQuery<'world, 'state> = Query<
         &'static GlobalTransform,
         &'static WorldTransform,
         Option<&'static ExpectedModelBounds>,
+        Option<&'static partial_stock::OriginalStockScene>,
     ),
 >;
 
@@ -4890,6 +4894,7 @@ fn arm_pending_models(
     mut profiler: ResMut<ProfilingState>,
     mut runtime: Option<ResMut<runtime::StreamingRuntime>>,
     mut ownership: crate::cluster::ownership::OwnershipGate,
+    partials: Query<(), With<partial_stock::PartialStock>>,
 ) {
     use bevy::math::DVec3;
     let started = Instant::now();
@@ -4999,10 +5004,14 @@ fn arm_pending_models(
                 continue;
             }
         }
-        commands
-            .entity(entity)
-            .insert(WorldAssetRoot(handle))
-            .remove::<PendingModel>();
+        if partials.contains(entity) {
+            commands.queue(move |world: &mut World| partial_stock::arm(world, entity, handle));
+        } else {
+            commands
+                .entity(entity)
+                .insert(WorldAssetRoot(handle))
+                .remove::<PendingModel>();
+        }
         actually_armed += 1;
         choices = choices.saturating_add(1);
     }
@@ -5158,7 +5167,9 @@ fn track_asset_readiness(
     // Live dynamic clutter bodies, including the ones this scan spawns (their commands are
     // deferred, so the query cannot see them yet). The cap bounds what a cell arrival can create.
     let mut live_clutter = clutter.iter().count();
-    for (entity, root, pending, local, global, world_transform, expected_bounds) in &pending {
+    for (entity, root, pending, local, global, world_transform, expected_bounds, partial) in
+        &pending
+    {
         if completed_this_scan != 0
             && runtime
                 .as_ref()
@@ -5173,14 +5184,16 @@ fn track_asset_readiness(
         let static_candidate = pending.static_physics
             && (fixed_collision_record_eligible(pending.base_record_type.as_deref())
                 || pending.base_record_type.as_deref() == Some("ACTI"));
-        let load_failure =
-            asset_server
-                .get_load_states(root.0.id())
-                .and_then(|(load, _, recursive)| match (load, recursive) {
-                    (LoadState::Failed(error), _) => Some(error),
-                    (_, RecursiveDependencyLoadState::Failed(error)) => Some(error),
-                    _ => None,
-                });
+        // Runtime-derived subset scenes share the original loaded scene's dependency
+        // lifetime. AssetServer has no load-state record for a generated WorldAsset.
+        let loaded_source = partial.map(|partial| &partial.0).unwrap_or(&root.0);
+        let load_failure = asset_server.get_load_states(loaded_source.id()).and_then(
+            |(load, _, recursive)| match (load, recursive) {
+                (LoadState::Failed(error), _) => Some(error),
+                (_, RecursiveDependencyLoadState::Failed(error)) => Some(error),
+                _ => None,
+            },
+        );
         if let Some(error) = load_failure {
             let chain = error_chain(error.as_ref());
             record_asset_failure(&mut metrics, &mut profiler, pending, chain, false);
@@ -5201,7 +5214,9 @@ fn track_asset_readiness(
             }
             commands.entity(entity).try_remove::<PendingAssetProfile>();
             completed_this_scan += 1;
-        } else if pending.scene_spawned && asset_server.is_loaded_with_dependencies(root.0.id()) {
+        } else if pending.scene_spawned
+            && asset_server.is_loaded_with_dependencies(loaded_source.id())
+        {
             let transform_validation = validate_spawned_transforms_and_bounds(
                 entity,
                 local,
@@ -16395,7 +16410,7 @@ mod tests {
     }
 
     /// Runs the readiness scan to completion and reads the metrics back.
-    fn settle_readiness(app: &mut App) -> StreamingMetrics {
+    pub(super) fn settle_readiness(app: &mut App) -> StreamingMetrics {
         for _ in 0..8 {
             app.update();
         }
@@ -16525,7 +16540,7 @@ mod tests {
         assert!(!door_entity.contains::<Collider>());
     }
 
-    fn model_app() -> App {
+    pub(super) fn model_app() -> App {
         let mut app = App::new();
         app.add_plugins((
             MinimalPlugins,
@@ -16579,7 +16594,7 @@ mod tests {
     /// Adds `scene` to the asset server as the converted model a reference points at, and runs the
     /// frame the asset system needs to publish it, so `is_loaded_with_dependencies` is true for it
     /// exactly as it is for a loaded glb.
-    fn add_converted_model(app: &mut App, scene: World) -> Handle<WorldAsset> {
+    pub(super) fn add_converted_model(app: &mut App, scene: World) -> Handle<WorldAsset> {
         let handle = app
             .world()
             .resource::<AssetServer>()
@@ -16638,7 +16653,11 @@ mod tests {
     /// path assigns that sequence from [`StreamingWorld::next_model_sequence`] as it walks the
     /// cell's references, so handing the sequence in is what a test does instead of committing a
     /// cell.
-    fn spawn_pending_reference(app: &mut App, handle: Handle<WorldAsset>, sequence: u64) -> Entity {
+    pub(super) fn spawn_pending_reference(
+        app: &mut App,
+        handle: Handle<WorldAsset>,
+        sequence: u64,
+    ) -> Entity {
         spawn_pending_reference_with(
             app,
             handle,

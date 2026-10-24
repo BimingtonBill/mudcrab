@@ -105,6 +105,7 @@ pub(crate) struct FarStock {
 pub(crate) struct FarStockPlugin;
 impl Plugin for FarStockPlugin {
     fn build(&self, app: &mut App) {
+        super::partial_stock::install(app);
         app.init_resource::<FarStock>()
             .init_resource::<SourceFallbackDemand>()
             .add_systems(
@@ -565,7 +566,7 @@ fn plan(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect(
+pub(super) fn collect(
     mut commands: Commands,
     config: Res<EngineConfig>,
     database: Res<WorldDatabase>,
@@ -725,6 +726,24 @@ fn collect(
                 else {
                     continue;
                 };
+                let beyond_grid = far.demand.is_some_and(|demand| {
+                    let CellKey::Exterior { grid_x, grid_y, .. } = key else {
+                        return false;
+                    };
+                    !demand.contains_cell(
+                        demand.world,
+                        IVec2::new(grid_x, grid_y),
+                        far.stream_radius,
+                    )
+                });
+                if let Some(partial) = super::partial_stock::PartialStock::for_demand(
+                    &package,
+                    &row,
+                    config.cluster_own_statics,
+                    beyond_grid,
+                ) {
+                    parent.commands().entity(entity).insert(partial);
+                }
                 if !requested {
                     warn!(
                         reference = row.form_id,
@@ -870,7 +889,7 @@ fn collect(
     }
 }
 
-fn publish_work(
+pub(super) fn publish_work(
     mut far: ResMut<FarStock>,
     mut metrics: ResMut<super::StreamingMetrics>,
     failures: Query<(Entity, &FormId), With<super::AssetFailed>>,
@@ -1181,6 +1200,9 @@ fn move_owner(
     let target_role =
         crate::portal::owned_root_role(world, to).ok_or("new source owner has no proved role")?;
     crate::portal::rebind_reference_layers(world, owner.entity, owner.parent, to, target_role)?;
+    if !far {
+        super::partial_stock::promote(world, owner.entity);
+    }
     let expected = world.get::<ExpectedModelBounds>(owner.entity).copied();
     let matrix = pose.to_matrix();
     world
