@@ -122,11 +122,23 @@ pub struct ReferencePose {
     pub scale: f32,
 }
 
+/// Stock refusal category projected only from validated package coverage reasons.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StockRefusalClass {
+    #[default]
+    None,
+    Look,
+    Runtime,
+    Other,
+}
+
 /// One examined reference's authoritative placement, including references with no mapped record.
 /// Inventory membership and a known source path do not certify drawable or replacement coverage.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlacedReference {
     pub is_tree: bool,
+    /// Authoritative base record type is STAT or TREE, regardless of refusal reason.
+    pub is_static_scenery: bool,
     /// None is missing base flag data. True still needs per-level MNAM paths.
     pub base_has_distant_lod: Option<bool>,
     /// The REFR record header's Visible When Distant flag (bit 15). Native object LOD holds a
@@ -136,6 +148,7 @@ pub struct PlacedReference {
     pub pose: ReferencePose,
     pub model_path: Option<String>,
     pub coverage: CoverageState,
+    pub refusal_class: StockRefusalClass,
     /// Exact rejected source ordinals for expanded Complete/Partial references. Unknown and
     /// NotEligible references have no certified expected primitive set, represented by None.
     pub stock_primitives: Option<BTreeSet<u32>>,
@@ -413,6 +426,7 @@ impl CertifiedPackage {
             .is_none()
             .then(|| read_coverage_states(&connection))
             .transpose()?;
+        let refusal_classes = read_stock_refusal_classes(&connection)?;
         for reference in authority.examined_references() {
             let resolved = core_authority
                 .preloaded_reference(reference)
@@ -468,7 +482,12 @@ impl CertifiedPackage {
                     pose,
                     model_path,
                     coverage,
+                    refusal_class: refusal_classes
+                        .get(&reference)
+                        .copied()
+                        .unwrap_or(StockRefusalClass::Other),
                     is_tree: resolved.is_tree,
+                    is_static_scenery: matches!(resolved.record_type.as_str(), "STAT" | "TREE"),
                     base_has_distant_lod: resolved.base_has_distant_lod,
                     stock_primitives,
                 },
@@ -783,6 +802,39 @@ fn read_coverage_states(connection: &Connection) -> rusqlite::Result<BTreeMap<u3
     Ok(states)
 }
 
+/// Evaluate all reference and rejected-primitive reasons once, after coverage validation.
+/// Numeric ranks are local to this query: Runtime > Other > Look > None. In particular,
+/// missing refusal reasons never grant the reach reserved for known look-only refusals.
+fn read_stock_refusal_classes(
+    connection: &Connection,
+) -> rusqlite::Result<BTreeMap<u32, StockRefusalClass>> {
+    let mut statement = connection.prepare(
+        "SELECT reference_id, MAX(CASE
+             WHEN reason IN ('state_change_writer_unavailable', 'scripted', 'enable_parent',
+                             'initially_disabled') THEN 3
+             WHEN reason IN ('not_opaque', 'unsupported_material_feature',
+                             'unresolved_reference_override:XEMI',
+                             'unresolved_reference_override:XALP', 'missing_attributes',
+                             'effect_shader', 'non_rendering') THEN 1
+             WHEN status = 'expanded' AND (reason IS NULL OR reason = '') THEN 0
+             ELSE 2 END)
+         FROM cluster_reference_coverage
+         WHERE scope = 'reference' OR (scope = 'primitive' AND status = 'rejected')
+         GROUP BY reference_id",
+    )?;
+    statement
+        .query_map([], |row| {
+            let class = match row.get::<_, u8>(1)? {
+                0 => StockRefusalClass::None,
+                1 => StockRefusalClass::Look,
+                3 => StockRefusalClass::Runtime,
+                _ => StockRefusalClass::Other,
+            };
+            Ok((row.get(0)?, class))
+        })?
+        .collect()
+}
+
 // EXPLAIN never executes the source scan. Diagnostics cannot replace its authoritative reads.
 fn log_scoped_id_query_plan(connection: &Connection, scope: &Scope) {
     let plan = (|| -> color_eyre::Result<Vec<String>> {
@@ -926,6 +978,109 @@ mod tests {
         assert_eq!(states[&4], CoverageState::Unknown);
         assert_eq!(states[&5], CoverageState::NotEligible);
     }
+
+    fn refusal_db() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE cluster_reference_coverage(
+                 reference_id INTEGER, scope TEXT, status TEXT, reason TEXT)",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn stock_refusal_projection_recognizes_every_exact_reason_in_both_scopes() {
+        use StockRefusalClass::{Look, Other, Runtime};
+        let db = refusal_db();
+        for (reason, expected) in [
+            ("not_opaque", Look),
+            ("unsupported_material_feature", Look),
+            ("unresolved_reference_override:XEMI", Look),
+            ("unresolved_reference_override:XALP", Look),
+            ("missing_attributes", Look),
+            ("effect_shader", Look),
+            ("non_rendering", Look),
+            ("state_change_writer_unavailable", Runtime),
+            ("scripted", Runtime),
+            ("enable_parent", Runtime),
+            ("initially_disabled", Runtime),
+            ("unresolved_reference_override:OTHER", Other),
+            ("not_opaque:detail", Other),
+            ("NOT_OPAQUE", Other),
+            ("future_reason", Other),
+        ] {
+            for (scope, status) in [("reference", "not_eligible"), ("primitive", "rejected")] {
+                db.execute("DELETE FROM cluster_reference_coverage", [])
+                    .unwrap();
+                db.execute(
+                    "INSERT INTO cluster_reference_coverage VALUES(1,?1,?2,?3)",
+                    rusqlite::params![scope, status, reason],
+                )
+                .unwrap();
+                assert_eq!(
+                    read_stock_refusal_classes(&db).unwrap()[&1],
+                    expected,
+                    "{scope}: {reason}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stock_refusal_projection_prioritizes_runtime_then_other_independent_of_row_order() {
+        use StockRefusalClass::{Other, Runtime};
+        let db = refusal_db();
+        for (first, second, expected) in [
+            ("initially_disabled", "not_opaque", Runtime),
+            ("not_opaque", "initially_disabled", Runtime),
+            ("future_reason", "not_opaque", Other),
+            ("not_opaque", "future_reason", Other),
+            ("scripted", "future_reason", Runtime),
+            ("future_reason", "scripted", Runtime),
+        ] {
+            db.execute("DELETE FROM cluster_reference_coverage", [])
+                .unwrap();
+            db.execute(
+                "INSERT INTO cluster_reference_coverage VALUES
+                 (1,'reference','not_eligible',?1),(1,'primitive','rejected',?2)",
+                [first, second],
+            )
+            .unwrap();
+            assert_eq!(read_stock_refusal_classes(&db).unwrap()[&1], expected);
+        }
+    }
+
+    #[test]
+    fn stock_refusal_projection_treats_missing_refusal_reasons_as_other_but_success_as_none() {
+        use StockRefusalClass::{Look, None, Other};
+        let db = refusal_db();
+        db.execute_batch(
+            "INSERT INTO cluster_reference_coverage VALUES
+             (1,'reference','not_eligible',NULL),
+             (2,'reference','unknown',NULL),
+             (3,'reference','expanded',NULL),(3,'primitive','rejected',NULL),
+             (4,'reference','expanded',NULL),(4,'primitive','clustered',NULL),
+             (5,'reference','expanded',''),(5,'primitive','clustered',''),
+             (6,'reference','expanded',NULL),(6,'primitive','rejected','not_opaque'),
+             (7,'reference','not_eligible',''),(8,'reference','unknown',''),
+             (9,'reference','expanded',''),(9,'primitive','rejected',''),
+             (10,'reference','expanded',NULL),(10,'primitive','clustered','scripted'),
+             (11,'reference','not_eligible',NULL),(11,'primitive','rejected','not_opaque');",
+        )
+        .unwrap();
+        let classes = read_stock_refusal_classes(&db).unwrap();
+        for reference in [1, 2, 3, 7, 8, 9, 11] {
+            assert_eq!(classes[&reference], Other, "{reference}");
+        }
+        for reference in [4, 5, 10] {
+            assert_eq!(classes[&reference], None, "{reference}");
+        }
+        assert_eq!(classes[&6], Look);
+        assert!(!classes.contains_key(&12));
+        assert_eq!(StockRefusalClass::default(), None);
+    }
+
     use serde_json::json;
     use shared::cluster_mapping::{Eligibility, FixedAuthority, MaterialSource};
 
@@ -1176,6 +1331,7 @@ pub(crate) mod producer_fixture_tests {
     const TREE_REF: u32 = 0x106;
     const INTERIOR_REF: u32 = 0x107;
     const NO_MODEL_REF: u32 = 0x108;
+    const RUNTIME_REF: u32 = 0x109;
     const INTERIOR_CELL: u32 = 0x32;
     const BLEND_MODEL: &str = "meshes/arch/blend.glb";
     const MISSING_MODEL: &str = "meshes/arch/missing.glb";
@@ -1383,11 +1539,27 @@ pub(crate) mod producer_fixture_tests {
             triangle_threshold: 1,
             single_triangle: false,
             billboard: true,
+            runtime_inventory: false,
+            base_record_type: "STAT",
         })
     }
 
     pub(crate) fn published_for_inventory() -> tempfile::TempDir {
         published_inputs_with_inventory(true, true)
+    }
+
+    /// Inventory plus initially-disabled STAT reference 0x109, in WORLD at (-2, 1),
+    /// with the same model path and pose as the other refused inventory references.
+    pub(crate) fn published_for_runtime_inventory() -> tempfile::TempDir {
+        published_options(FixtureOptions {
+            with_texture_and_rejected_primitive: true,
+            inventory: true,
+            triangle_threshold: 1,
+            single_triangle: false,
+            billboard: false,
+            runtime_inventory: true,
+            base_record_type: "STAT",
+        })
     }
 
     fn published_inputs(with_texture_and_rejected_primitive: bool) -> tempfile::TempDir {
@@ -1404,6 +1576,8 @@ pub(crate) mod producer_fixture_tests {
             triangle_threshold: 1,
             single_triangle: false,
             billboard: false,
+            runtime_inventory: false,
+            base_record_type: "STAT",
         })
     }
 
@@ -1413,6 +1587,8 @@ pub(crate) mod producer_fixture_tests {
         triangle_threshold: u32,
         single_triangle: bool,
         billboard: bool,
+        runtime_inventory: bool,
+        base_record_type: &'static str,
     }
 
     fn published_options(options: FixtureOptions) -> tempfile::TempDir {
@@ -1422,6 +1598,8 @@ pub(crate) mod producer_fixture_tests {
             triangle_threshold,
             single_triangle,
             billboard,
+            runtime_inventory,
+            base_record_type,
         } = options;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
@@ -1478,8 +1656,8 @@ pub(crate) mod producer_fixture_tests {
             .unwrap();
         }
         db.execute(
-            "INSERT INTO records(form_id,record_type,load_order,data) VALUES(0x11,'STAT',0,?1)",
-            [clear()],
+            "INSERT INTO records(form_id,record_type,load_order,data) VALUES(0x11,?1,0,?2)",
+            params![base_record_type, clear()],
         )
         .unwrap();
         db.execute("INSERT INTO statics(id,editor_id,model_path,flags) VALUES(0x11,'Invented','Arch\\Rock.nif',0)",[]).unwrap();
@@ -1554,6 +1732,28 @@ pub(crate) mod producer_fixture_tests {
                 .unwrap();
             }
         }
+        if runtime_inventory {
+            let pose = inventory_pose();
+            db.execute(
+                "INSERT INTO \"references\"(id,cell_id,worldspace_id,base_form_id,is_exterior,
+                     pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,scale,header_flags,data)
+                 VALUES(?1,?2,?3,0x11,1,?4,?5,?6,?7,?8,?9,?10,2048,?11)",
+                params![
+                    RUNTIME_REF,
+                    PARENT_CELL,
+                    WORLD,
+                    pose.position[0],
+                    pose.position[1],
+                    pose.position[2],
+                    pose.rotation[0],
+                    pose.rotation[1],
+                    pose.rotation[2],
+                    pose.scale,
+                    clear()
+                ],
+            )
+            .unwrap();
+        }
         drop(db);
         let settings = StageSettings {
             mode: LodMode::Cluster,
@@ -1565,7 +1765,7 @@ pub(crate) mod producer_fixture_tests {
             read_database: None,
             area: None,
             child_worldspaces: vec![CHILD],
-            include_trees: false,
+            include_trees: base_record_type == "TREE",
             run_artifacts: None,
             map_references: true,
         };
@@ -1712,6 +1912,8 @@ pub(crate) mod producer_fixture_tests {
                 triangle_threshold,
                 single_triangle,
                 billboard: false,
+                runtime_inventory: false,
+                base_record_type: "STAT",
             })
         };
         let high = fixture(1024);
@@ -2039,6 +2241,127 @@ pub(crate) mod producer_fixture_tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn real_producer_inventory_retains_recorded_look_and_runtime_refusal_classes() {
+        let directory = published_for_runtime_inventory();
+        let root = directory.path();
+        let package = crate::cluster::overlay_fixture::open_fixture(root, false).unwrap();
+        let db = crate::cluster::overlay_fixture::read_db(root);
+        for (reference, scope, reason, expected) in [
+            (
+                PARENT_REF,
+                "primitive",
+                "not_indexed_triangles",
+                StockRefusalClass::Other,
+            ),
+            (
+                CHILD_REF,
+                "primitive",
+                "not_indexed_triangles",
+                StockRefusalClass::Other,
+            ),
+            (
+                BLEND_REF,
+                "primitive",
+                "not_opaque",
+                StockRefusalClass::Look,
+            ),
+            (
+                GUARDED_REF,
+                "reference",
+                "unresolved_reference_override:XALP",
+                StockRefusalClass::Look,
+            ),
+            (
+                MISSING_MODEL_REF,
+                "reference",
+                "model_not_converted",
+                StockRefusalClass::Other,
+            ),
+            (
+                UNPARSED_REF,
+                "reference",
+                "unparsed_base_record",
+                StockRefusalClass::Other,
+            ),
+            (
+                NO_MODEL_REF,
+                "reference",
+                "no_model",
+                StockRefusalClass::Other,
+            ),
+            (
+                RUNTIME_REF,
+                "reference",
+                "initially_disabled",
+                StockRefusalClass::Runtime,
+            ),
+        ] {
+            let recorded: String = db
+                .query_row(
+                    "SELECT reason FROM cluster_reference_coverage
+                 WHERE reference_id=?1 AND scope=?2 AND status <> 'clustered'",
+                    params![reference, scope],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(recorded, reason);
+            let placed = package.placed_reference(reference).unwrap();
+            assert_eq!(placed.refusal_class, expected, "{reference:#x}");
+            assert!(placed.is_static_scenery);
+        }
+        for reference in [PARENT_REF, CHILD_REF, BLEND_REF] {
+            assert_eq!(
+                package.placed_reference(reference).unwrap().coverage,
+                CoverageState::Partial
+            );
+        }
+        let runtime = package.placed_reference(RUNTIME_REF).unwrap();
+        assert_eq!(runtime.coverage, CoverageState::NotEligible);
+        assert_eq!(
+            runtime.snapshot.eligibility,
+            Eligibility::NotEligible("initially_disabled".into())
+        );
+        assert_eq!(runtime.snapshot.placed_worldspace_id, WORLD);
+        assert_eq!(runtime.snapshot.cell, (INVENTORY_GRID.x, INVENTORY_GRID.y));
+        assert_eq!(runtime.model_path.as_deref(), Some(MODEL));
+        assert_eq!(runtime.pose, inventory_pose());
+        assert!(package.reference(RUNTIME_REF).is_none());
+    }
+
+    #[test]
+    fn real_producer_inventory_uses_authoritative_base_type_for_static_scenery() {
+        for base_record_type in ["STAT", "TREE", "MSTT", "ACTI"] {
+            let directory = published_options(FixtureOptions {
+                with_texture_and_rejected_primitive: false,
+                inventory: false,
+                triangle_threshold: 1,
+                single_triangle: false,
+                billboard: false,
+                runtime_inventory: false,
+                base_record_type,
+            });
+            let package =
+                crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap();
+            for reference in [PARENT_REF, CHILD_REF] {
+                let placed = package.placed_reference(reference).unwrap();
+                let is_static = matches!(base_record_type, "STAT" | "TREE");
+                assert_eq!(placed.is_static_scenery, is_static, "{base_record_type}");
+                assert_eq!(placed.is_tree, base_record_type == "TREE");
+                if is_static {
+                    assert_eq!(placed.refusal_class, StockRefusalClass::None);
+                    assert_eq!(placed.coverage, CoverageState::Complete);
+                } else {
+                    assert_eq!(placed.refusal_class, StockRefusalClass::Runtime);
+                    assert_eq!(
+                        placed.snapshot.eligibility,
+                        Eligibility::NotEligible("state_change_writer_unavailable".into())
+                    );
+                }
+            }
+        }
     }
 
     #[test]

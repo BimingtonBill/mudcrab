@@ -6,7 +6,7 @@ use super::{
     lod::{LodDemand, LodDemandRole, LodDemandViews, LodStreaming},
     reference_spawn::{ReferenceSpawnContext, spawn_reference},
 };
-use crate::cluster::source_fallback::SourceFallbackDemand;
+use crate::cluster::{reader::StockRefusalClass, source_fallback::SourceFallbackDemand};
 use crate::{
     cluster::{package::ValidatedPackage, reader::CertifiedPackage},
     config::EngineConfig,
@@ -76,8 +76,9 @@ struct FarStockMeasurements {
 pub(crate) struct FarStock {
     package: Option<Arc<CertifiedPackage>>,
     demand: Option<LodDemand>,
-    /// None matches owned clusters: every indexed placement in the demanded worldspace.
+    /// None scans the whole worldspace; only look-refused scenery may use that reach.
     reach: Option<i32>,
+    stream_radius: i32,
     generation: u64,
     desired: HashMap<Identity, CellKey>,
     owners: HashMap<Identity, Owner>,
@@ -150,6 +151,12 @@ fn needs_stock(reference: &crate::cluster::reader::PlacedReference) -> bool {
     reference.coverage != CoverageState::Complete && reference.model_path.is_some()
 }
 
+fn full_stock_reach(reference: &crate::cluster::reader::PlacedReference) -> bool {
+    needs_stock(reference)
+        && reference.is_static_scenery
+        && reference.refusal_class == StockRefusalClass::Look
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RadiusCounts {
     inside: usize,
@@ -169,6 +176,9 @@ impl RadiusCounts {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct StockReferenceCounts {
     refused: RadiusCounts,
+    look_refused: RadiusCounts,
+    runtime_refused: RadiusCounts,
+    other_refused: RadiusCounts,
     fallback: RadiusCounts,
     /// Union of refused and runtime fallback references; overlaps count only once.
     total: RadiusCounts,
@@ -195,6 +205,13 @@ fn stock_reference_counts(
             let fallback = fallback_references.contains(id);
             if refused {
                 counts.refused.add(inside);
+                match reference.refusal_class {
+                    StockRefusalClass::Runtime => counts.runtime_refused.add(inside),
+                    StockRefusalClass::Look if reference.is_static_scenery => {
+                        counts.look_refused.add(inside);
+                    }
+                    _ => counts.other_refused.add(inside),
+                }
             }
             if fallback {
                 counts.fallback.add(inside);
@@ -210,7 +227,7 @@ fn stock_reference_counts(
 fn complete_source_key(
     package: &CertifiedPackage,
     demand: LodDemand,
-    reach: Option<i32>,
+    stream_radius: i32,
     reference_id: u32,
     source_cell: u32,
 ) -> Option<CellKey> {
@@ -220,13 +237,11 @@ fn complete_source_key(
         && reference.model_path.is_some()
         && snapshot.source_cell_id == source_cell
         && snapshot.placed_worldspace_id == demand.world
-        && reach.is_none_or(|radius| {
-            demand.contains_cell(
-                snapshot.placed_worldspace_id,
-                IVec2::new(snapshot.cell.0, snapshot.cell.1),
-                radius,
-            )
-        }))
+        && demand.contains_cell(
+            snapshot.placed_worldspace_id,
+            IVec2::new(snapshot.cell.0, snapshot.cell.1),
+            stream_radius,
+        ))
     .then_some(CellKey::Exterior {
         worldspace_id: demand.world,
         grid_x: snapshot.cell.0,
@@ -338,12 +353,17 @@ fn plan(
     }
     let actual = views.current(&config, origin.0, portal.as_deref());
     let demand = views.residency_demand(&config, actual, portal.as_deref(), &mut lod);
-    // Owned object selection has no distance cutoff: FarNativePolicy admits the whole world,
-    // lazy admission ignores the far plane, and the GPU cull uses only side and near planes.
-    // Terrain and native object LOD reaches therefore cannot bound its exact stock fallback.
-    // Without owned statics, keep loaded-grid stock demand and native BTO/BTT distant parity.
-    let reach = (!config.cluster_own_statics).then_some(config.stream_radius.max(0));
-    if !changed_package && !fallback_changed && far.demand == demand && far.reach == reach {
+    // Owned clusters have no distance cutoff. Only recorded look-only STAT/TREE refusals
+    // inherit that reach; runtime-state, unknown and unclassified fallbacks keep the grid.
+    // Native LOD stays disabled in owned mode, including for grid-bound references.
+    let stream_radius = config.stream_radius.max(0);
+    let reach = (!config.cluster_own_statics).then_some(stream_radius);
+    if !changed_package
+        && !fallback_changed
+        && far.demand == demand
+        && far.reach == reach
+        && far.stream_radius == stream_radius
+    {
         return;
     }
     if let Some(demand) = demand
@@ -363,11 +383,19 @@ fn plan(
             ?reach,
             refused_inside = counts.refused.inside,
             refused_beyond = counts.refused.beyond,
+            look_refused_inside = counts.look_refused.inside,
+            look_refused_beyond = counts.look_refused.beyond,
+            runtime_refused_inside = counts.runtime_refused.inside,
+            runtime_refused_beyond = counts.runtime_refused.beyond,
+            other_refused_inside = counts.other_refused.inside,
+            other_refused_beyond = counts.other_refused.beyond,
+            distant_look_stock = if config.cluster_own_statics { counts.look_refused.beyond } else { 0 },
+            distant_runtime_stock = 0usize,
             fallback_inside = counts.fallback.inside,
             fallback_beyond = counts.fallback.beyond,
             total_inside = counts.total.inside,
             total_beyond = counts.total.beyond,
-            "exact stock demand candidates at first qualification (once per package/worldspace)"
+            "stock candidate inventory and classified distant demand at first qualification (once per package/worldspace)"
         );
     }
     let mut desired = HashMap::new();
@@ -376,6 +404,7 @@ fn plan(
             .0
             .placed_cells_in_window(demand.world, demand.center, reach)
         {
+            let inside = demand.contains_cell(demand.world, grid, stream_radius);
             let key = CellKey::Exterior {
                 worldspace_id: demand.world,
                 grid_x: grid.x,
@@ -384,6 +413,7 @@ fn plan(
             for id in ids {
                 if package.0.placed_reference(*id).is_some_and(|reference| {
                     reference.model_path.is_some()
+                        && (inside || (config.cluster_own_statics && full_stock_reach(reference)))
                         && (needs_stock(reference)
                             || far.fallback_references.contains(id)
                             || (!changed_package && far.owners.contains_key(&(demand.world, *id))))
@@ -401,13 +431,20 @@ fn plan(
             if cell_world(parent_key.0) != Some(demand.world) {
                 continue;
             }
-            if let Some(key) = complete_source_key(&package.0, demand, reach, form.0, cell.0) {
+            if let Some(key) =
+                complete_source_key(&package.0, demand, stream_radius, form.0, cell.0)
+            {
                 desired.insert((demand.world, form.0), key);
             }
         }
     }
     // Another world's negative template arrival must not cancel current exact-ID work.
-    if !changed_package && far.demand == demand && far.reach == reach && far.desired == desired {
+    if !changed_package
+        && far.demand == demand
+        && far.reach == reach
+        && far.stream_radius == stream_radius
+        && far.desired == desired
+    {
         return;
     }
     far.generation = far.generation.wrapping_add(1);
@@ -426,6 +463,7 @@ fn plan(
     }
     far.demand = demand;
     far.reach = reach;
+    far.stream_radius = stream_radius;
     far.near_roles.clear();
     let retired: HashMap<_, _> = far
         .retain_owners(|id, _| desired.contains_key(id))
@@ -1298,7 +1336,8 @@ fn register_near(world: &mut World, far: &mut FarStock, root: Entity, key: CellK
             && let (Some(package), Some(demand), Some(cell)) =
                 (&far.package, far.demand, world.get::<CellRef>(entity))
             && placing_world == demand.world
-            && let Some(key) = complete_source_key(package, demand, far.reach, form.0, cell.0)
+            && let Some(key) =
+                complete_source_key(package, demand, far.stream_radius, form.0, cell.0)
         {
             far.desired.insert(id, key);
         }

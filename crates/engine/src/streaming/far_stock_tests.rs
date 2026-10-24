@@ -1,8 +1,10 @@
 use super::*;
 use crate::{
     cluster::reader::{
-        ReferencePose,
-        producer_fixture_tests::{published_for_inventory, published_for_loader},
+        ReferencePose, StockRefusalClass,
+        producer_fixture_tests::{
+            published_for_inventory, published_for_loader, published_for_runtime_inventory,
+        },
     },
     streaming::{PendingModel, despawn_subtree, grid_translation, reference_placement},
     world::components::StreamedCellRoot,
@@ -1815,7 +1817,7 @@ fn owned_statics_do_not_request_complete_models_without_fallback() {
 }
 
 #[test]
-fn owned_statics_desire_runtime_fallback_beyond_stream_radius() {
+fn owned_statics_keep_unclassified_runtime_fallback_within_stream_radius() {
     let fixture = Fixture::from_directory(published_for_loader());
     let (key, row) = fixture.rows.first().unwrap();
     let mut app = complete_plan_app(&fixture, *key);
@@ -1832,10 +1834,62 @@ fn owned_statics_desire_runtime_fallback_beyond_stream_radius() {
     let far = app.world().resource::<FarStock>();
     assert_eq!(
         far.desired.get(&(cell_world(*key).unwrap(), row.form_id)),
-        Some(key)
+        None
     );
     assert_eq!(far.counted_worlds.len(), 1);
     let generation = far.generation;
+    app.update();
+    assert_eq!(app.world().resource::<FarStock>().generation, generation);
+    app.world_mut().resource_mut::<RenderOrigin>().0 = grid(*key);
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<FarStock>()
+            .desired
+            .get(&(cell_world(*key).unwrap(), row.form_id)),
+        Some(key)
+    );
+}
+
+#[test]
+fn owned_statics_keep_runtime_state_refusals_within_stream_radius() {
+    let fixture = Fixture::from_directory(published_for_runtime_inventory());
+    let (key, row) = fixture
+        .rows
+        .iter()
+        .find(|(_, row)| {
+            fixture
+                .package
+                .placed_reference(row.form_id)
+                .unwrap()
+                .refusal_class
+                == StockRefusalClass::Runtime
+        })
+        .unwrap();
+    let mut app = complete_plan_app(&fixture, *key);
+    {
+        let mut config = app.world_mut().resource_mut::<EngineConfig>();
+        config.cluster_own_statics = true;
+        config.stream_radius = 0;
+    }
+    app.world_mut().resource_mut::<RenderOrigin>().0 = grid(*key) + IVec2::new(200, 0);
+    app.update();
+    assert!(
+        !app.world()
+            .resource::<FarStock>()
+            .desired
+            .contains_key(&(cell_world(*key).unwrap(), row.form_id))
+    );
+    app.world_mut().resource_mut::<EngineConfig>().stream_radius = 200;
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<FarStock>()
+            .desired
+            .get(&(cell_world(*key).unwrap(), row.form_id)),
+        Some(key)
+    );
+    let generation = app.world().resource::<FarStock>().generation;
     app.update();
     assert_eq!(app.world().resource::<FarStock>().generation, generation);
 }
@@ -1864,6 +1918,15 @@ fn stock_candidate_counts_split_world_exact_demand_and_deduplicate_fallback() {
             refused: RadiusCounts {
                 inside: 1,
                 beyond: 2
+            },
+            look_refused: RadiusCounts {
+                inside: 0,
+                beyond: 1
+            },
+            runtime_refused: RadiusCounts::default(),
+            other_refused: RadiusCounts {
+                inside: 1,
+                beyond: 1
             },
             fallback: RadiusCounts {
                 inside: 1,
@@ -1905,7 +1968,122 @@ fn complete_runtime_fallback_counts_as_one_distant_candidate() {
                 inside: 0,
                 beyond: 1
             },
+            ..default()
         }
+    );
+}
+
+#[test]
+fn only_model_bearing_look_refused_static_scenery_has_full_stock_reach() {
+    let fixture = Fixture::new();
+    let (_, row, _) = fixture.selected();
+    let mut reference = fixture
+        .package
+        .placed_reference(row.form_id)
+        .unwrap()
+        .clone();
+    for (class, is_static, expected) in [
+        (StockRefusalClass::Look, true, true),
+        (StockRefusalClass::Look, false, false),
+        // The reader projects mixed runtime/look reasons to Runtime as well.
+        (StockRefusalClass::Runtime, true, false),
+        (StockRefusalClass::Runtime, false, false),
+        (StockRefusalClass::Other, true, false),
+        (StockRefusalClass::None, true, false),
+    ] {
+        reference.refusal_class = class;
+        reference.is_static_scenery = is_static;
+        assert_eq!(
+            full_stock_reach(&reference),
+            expected,
+            "{class:?}, static={is_static}"
+        );
+    }
+    reference.refusal_class = StockRefusalClass::Look;
+    reference.coverage = CoverageState::Complete;
+    assert!(!full_stock_reach(&reference));
+    reference.coverage = CoverageState::Partial;
+    reference.model_path = None;
+    assert!(!full_stock_reach(&reference));
+}
+
+#[test]
+fn stock_inventory_counts_look_runtime_and_other_refusals_separately() {
+    let fixture = Fixture::from_directory(published_for_runtime_inventory());
+    let counts = stock_reference_counts(
+        &fixture.package,
+        LodDemand {
+            world: 0x70,
+            center: IVec2::ZERO,
+            role: LodDemandRole::Main,
+            camera: Entity::PLACEHOLDER,
+            main_camera: None,
+        },
+        0,
+        &BTreeSet::new(),
+    );
+    assert_eq!(
+        counts.look_refused,
+        RadiusCounts {
+            inside: 0,
+            beyond: 1
+        }
+    );
+    assert_eq!(
+        counts.runtime_refused,
+        RadiusCounts {
+            inside: 0,
+            beyond: 1
+        }
+    );
+    assert_eq!(
+        counts.other_refused,
+        RadiusCounts {
+            inside: 1,
+            beyond: 1
+        }
+    );
+    assert_eq!(
+        counts.total,
+        RadiusCounts {
+            inside: 1,
+            beyond: 3
+        }
+    );
+}
+
+#[test]
+fn complete_sources_cannot_bypass_grid_reach_via_near_admission() {
+    let fixture = Fixture::from_directory(published_for_loader());
+    let (key, row) = fixture.rows.first().unwrap();
+    let reference = fixture.package.placed_reference(row.form_id).unwrap();
+    let mut demand = LodDemand {
+        world: cell_world(*key).unwrap(),
+        center: grid(*key) + IVec2::X,
+        role: LodDemandRole::Main,
+        camera: Entity::PLACEHOLDER,
+        main_camera: None,
+    };
+    assert_eq!(
+        complete_source_key(
+            &fixture.package,
+            demand,
+            0,
+            row.form_id,
+            reference.snapshot.source_cell_id
+        ),
+        None
+    );
+    demand.center = grid(*key);
+    assert_eq!(
+        complete_source_key(
+            &fixture.package,
+            demand,
+            0,
+            row.form_id,
+            reference.snapshot.source_cell_id
+        ),
+        Some(*key)
     );
 }
 
