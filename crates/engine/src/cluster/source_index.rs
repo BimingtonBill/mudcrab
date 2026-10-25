@@ -12,7 +12,6 @@ pub(super) struct SourceIndex {
 }
 
 struct Subject {
-    root: bool,
     path: Vec<Entity>,
     references: HashSet<u32>,
 }
@@ -53,12 +52,6 @@ impl SourceIndex {
                 }
             }
         }
-    }
-
-    pub(super) fn roots(&self) -> impl Iterator<Item = Entity> + '_ {
-        self.subjects
-            .iter()
-            .filter_map(|(&entity, subject)| subject.root.then_some(entity))
     }
 
     pub(super) fn sizes(&self) -> (usize, usize, usize) {
@@ -158,14 +151,7 @@ impl SourceIndex {
                     .or_default()
                     .insert(entity);
             }
-            self.subjects.insert(
-                entity,
-                Subject {
-                    root: queries.roots.contains(entity),
-                    path,
-                    references,
-                },
-            );
+            self.subjects.insert(entity, Subject { path, references });
         }
         // Close over ALL roots with the affected reference, not only the edited root.
         // This preserves duplicate-root refusal and survivor promotion on removal.

@@ -5323,7 +5323,9 @@ mod tests {
     #[test]
     fn an_interior_destination_is_one_cell_and_the_gate_reads_it() {
         let directory = tempfile::tempdir().unwrap();
-        let (mut app, _camera) = crossing_fixture(directory.path(), Vec3::new(8.0, 50.0, -288.0));
+        // Start outside prestream reach so the negative residency check does not
+        // race the database worker while fixture_door waits for the source door.
+        let (mut app, camera) = crossing_fixture(directory.path(), Vec3::new(8.0, 50.0, -1088.0));
         let (_door, load_door) = fixture_door(&mut app);
         assert_eq!(
             destination_keys(&load_door.destination, None),
@@ -5338,6 +5340,7 @@ mod tests {
             ),
             "and it is not streamed in from here"
         );
+        move_camera(&mut app, camera, Vec3::new(8.0, 50.0, -288.0));
         run_until(
             &mut app,
             "the interior destination to become resident",

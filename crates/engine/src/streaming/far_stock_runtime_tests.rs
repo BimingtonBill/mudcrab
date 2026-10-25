@@ -41,6 +41,167 @@ fn set(app: &mut App, reference: u32, enabled: bool) {
 }
 
 #[test]
+fn crossings_reuse_unbounded_desired_candidates() {
+    let fixture = fixture();
+    let mut app = app(&fixture);
+    let candidates = |app: &App| {
+        reported_undrawn_paths(app, fixture.directory.path());
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.directory.path().join("cpu-spans.json")).unwrap(),
+        )
+        .unwrap();
+        report["counters"]["cluster/stock_desired_candidates"]
+            .as_u64()
+            .expect("desired planning must report candidate visits")
+    };
+    app.update();
+    let desired = app.world().resource::<FarStock>().desired.clone();
+    assert!(
+        !desired.is_empty(),
+        "the fixture must demand distant sources"
+    );
+    let initial_visits = candidates(&app);
+    assert!(
+        initial_visits > 0,
+        "initial qualification must visit candidates"
+    );
+    let initial_center = app.world().resource::<RenderOrigin>().0;
+    for offset in 0..=3 {
+        let center = initial_center + IVec2::X * offset;
+        assert!(
+            fixture
+                .package
+                .placed_cells_in_window(0x70, center, Some(0))
+                .next()
+                .is_none(),
+            "the crossing must not change the bounded source overlay"
+        );
+        if offset == 0 {
+            continue;
+        }
+        app.world_mut().resource_mut::<RenderOrigin>().0 = center;
+        app.update();
+        assert_eq!(
+            app.world().resource::<FarStock>().desired,
+            desired,
+            "an empty neighboring cell must retain the exact desired identities and cells"
+        );
+    }
+    assert_eq!(
+        candidates(&app) - initial_visits,
+        0,
+        "empty-cell crossings must reuse the unbounded desired candidates"
+    );
+}
+
+#[test]
+fn pending_response_survives_demand_only_crossing_without_duplicate_admission() {
+    let fixture = fixture();
+    let mut app = app(&fixture);
+    app.update();
+    let desired = app.world().resource::<FarStock>().desired.clone();
+    let (responses, receiver) = crossbeam_channel::bounded(1);
+    let (key, ids, generation) = {
+        let mut far = app.world_mut().resource_mut::<FarStock>();
+        let (key, ids) = far.pop_queued().expect("distant sources must be queued");
+        far.pending.insert(
+            key,
+            Pending {
+                ids: ids.clone(),
+                receiver,
+                ready: None,
+            },
+        );
+        (key, ids, far.generation)
+    };
+    let rows: Vec<_> = fixture
+        .rows
+        .iter()
+        .filter(|(cell, row)| *cell == key && ids.contains(&row.form_id))
+        .map(|(_, row)| row.clone())
+        .collect();
+    assert_eq!(rows.len(), ids.len());
+    app.world_mut().resource_mut::<RenderOrigin>().0.x += 1;
+    app.update();
+    let far = app.world().resource::<FarStock>();
+    assert_eq!(
+        far.desired, desired,
+        "the exact target set must be unchanged"
+    );
+    responses
+        .try_send(ReferenceResponse {
+            generation,
+            key,
+            result: Ok(rows),
+            query_micros: 0,
+            queue_wait_micros: 0,
+            total_request_micros: 0,
+        })
+        .expect("an identical target set must retain the original in-flight receiver");
+    assert_eq!(far.pending.len(), 1);
+    assert_eq!(far.pending[&key].ids, ids);
+    assert!(
+        !far.queued_keys.contains(&key) && far.queued.iter().all(|(cell, _)| *cell != key),
+        "the surviving request must not be admitted to the sparse queue a second time"
+    );
+    let response = far.pending[&key].receiver.try_recv().unwrap();
+    assert_eq!(
+        response.generation, far.generation,
+        "the retained response must remain valid for publication"
+    );
+    assert_eq!(response.key, key);
+    assert_eq!(
+        response
+            .result
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|row| row.form_id)
+            .collect::<BTreeSet<_>>(),
+        ids
+    );
+    app.world_mut()
+        .resource_mut::<FarStock>()
+        .pending
+        .get_mut(&key)
+        .unwrap()
+        .ready = Some(response);
+    app.world_mut().resource_mut::<RenderOrigin>().0.x += 1;
+    app.update();
+    let far = app.world().resource::<FarStock>();
+    let ready = far.pending[&key]
+        .ready
+        .as_ref()
+        .expect("a held ready response must survive another demand-only crossing");
+    assert_eq!(ready.generation, generation);
+    assert_eq!(far.generation, generation);
+    assert_eq!(ready.key, key);
+    assert!(!far.queued_keys.contains(&key));
+    assert_no_exit(app.world());
+}
+
+#[test]
+fn desired_union_preserves_overlaps_and_tracks_exact_cell_changes() {
+    let mut far = FarStock::default();
+    let id = (17, 42);
+    let key = exterior(id.0, IVec2::ZERO);
+    let contribution = HashMap::from([(id, key)]);
+    assert!(far.update_desired(Some(contribution.clone()), contribution.clone()));
+    assert!(!far.update_desired(None, HashMap::new()));
+    assert_eq!(far.desired, contribution);
+
+    // Near enrollment must remain tracked when the cached unbounded projection is invalidated.
+    far.enroll_bounded(id, key);
+    assert!(!far.update_desired(Some(HashMap::new()), contribution.clone()));
+    assert_eq!(far.desired, contribution);
+    let moved = exterior(id.0, IVec2::X);
+    assert!(far.update_desired(None, HashMap::from([(id, moved)])));
+    assert_eq!(far.desired.get(&id), Some(&moved));
+    assert!(far.update_desired(None, HashMap::new()));
+    assert!(far.desired.is_empty());
+}
+
+#[test]
 fn demand_only_changes_do_no_inventory_walks_after_first_qualification() {
     let fixture = fixture();
     let mut app = app(&fixture);
@@ -57,11 +218,14 @@ fn demand_only_changes_do_no_inventory_walks_after_first_qualification() {
     app.update();
     assert_eq!(walks(&app), 1);
     let generation = app.world().resource::<FarStock>().generation;
+    let center = app.world().resource::<FarStock>().demand.unwrap().center;
     for _ in 0..3 {
         app.world_mut().resource_mut::<RenderOrigin>().0.x += 1;
         app.update();
     }
-    assert!(app.world().resource::<FarStock>().generation > generation);
+    let far = app.world().resource::<FarStock>();
+    assert_eq!(far.generation, generation);
+    assert_eq!(far.demand.unwrap().center, center + IVec2::X * 3);
     assert_eq!(
         walks(&app),
         1,
@@ -75,6 +239,41 @@ fn demand_only_changes_do_no_inventory_walks_after_first_qualification() {
     );
     app.update();
     assert_eq!(walks(&app), 2);
+}
+
+#[test]
+fn bounded_overlap_keeps_unbounded_demand_until_its_enable_state_changes() {
+    let fixture = fixture();
+    let mut app = app(&fixture);
+    let reference = fixture.package.placed_reference(0x111).unwrap();
+    assert!(full_stock_reach(reference));
+    let key = exterior(
+        0x70,
+        IVec2::new(reference.snapshot.cell.0, reference.snapshot.cell.1),
+    );
+    let id = (0x70, 0x111);
+    app.world_mut().resource_mut::<RenderOrigin>().0 = grid(key);
+    app.update();
+    let far = app.world().resource::<FarStock>();
+    assert_eq!(far.unbounded_desired.get(&id), Some(&key));
+    assert_eq!(far.bounded_desired.get(&id), Some(&key));
+
+    app.world_mut().resource_mut::<RenderOrigin>().0 = IVec2::new(200, 0);
+    app.update();
+    let far = app.world().resource::<FarStock>();
+    assert!(!far.bounded_desired.contains_key(&id));
+    assert_eq!(far.desired.get(&id), Some(&key));
+    let generation = far.generation;
+    set(&mut app, 0x110, false);
+    let far = app.world().resource::<FarStock>();
+    assert!(!far.unbounded_desired.contains_key(&id));
+    assert!(!far.desired.contains_key(&id));
+    assert_ne!(far.generation, generation);
+    set(&mut app, 0x110, true);
+    assert_eq!(
+        app.world().resource::<FarStock>().desired.get(&id),
+        Some(&key)
+    );
 }
 
 #[test]

@@ -54,6 +54,14 @@ struct Pending {
     ready: Option<ReferenceResponse>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct UnboundedDemandKey {
+    world: Option<u32>,
+    owned: bool,
+    enable_revision: Option<u64>,
+    refusal_revision: Option<u64>,
+}
+
 /// Run-lifetime totals, independent of demand generations. Periodic snapshots allow rates to be
 /// computed even when a ready response is held by another streaming system's commit budget.
 #[derive(Default)]
@@ -88,6 +96,10 @@ pub(crate) struct FarStock {
     stream_radius: i32,
     generation: u64,
     desired: HashMap<Identity, CellKey>,
+    /// Package allocation is checked separately; camera demand never invalidates this projection.
+    unbounded_key: Option<UnboundedDemandKey>,
+    unbounded_desired: HashMap<Identity, CellKey>,
+    bounded_desired: HashMap<Identity, CellKey>,
     owners: HashMap<Identity, Owner>,
     /// Parent and remembered near-root associations, including borrowed far owners.
     by_root: HashMap<Entity, HashSet<Identity>>,
@@ -104,6 +116,7 @@ pub(crate) struct FarStock {
     near_roles: HashMap<Entity, CellRole>,
     fallback_revision: Option<u64>,
     refusal_revision: Option<u64>,
+    permanent_refusals: BTreeSet<u32>,
     enable_revision: Option<u64>,
     fallback_references: BTreeSet<u32>,
     counted_worlds: HashSet<u32>,
@@ -431,6 +444,9 @@ fn plan(
             far.near_roots.clear();
             far.near_roles.clear();
             far.desired.clear();
+            far.unbounded_key = None;
+            far.unbounded_desired.clear();
+            far.bounded_desired.clear();
             far.pending.clear();
             far.clear_queued();
             far.failed.clear();
@@ -438,6 +454,7 @@ fn plan(
             far.demand = None;
             far.fallback_revision = None;
             far.refusal_revision = None;
+            far.permanent_refusals.clear();
             far.enable_revision = None;
             far.fallback_references.clear();
             far.counted_worlds.clear();
@@ -474,8 +491,16 @@ fn plan(
         .as_deref()
         .filter(|facts| facts.package_matches(&package.0))
         .map(|facts| facts.refusal_revision());
-    let mut fallback_changed = changed_package || far.refusal_revision != refusal_revision;
+    let refusal_changed = changed_package || far.refusal_revision != refusal_revision;
+    let mut fallback_changed = refusal_changed;
     far.refusal_revision = refusal_revision;
+    if refusal_changed {
+        far.permanent_refusals = ownership
+            .as_deref()
+            .filter(|facts| facts.package_matches(&package.0))
+            .map(|facts| facts.permanent_refused_references())
+            .unwrap_or_default();
+    }
     far.qualification_pending = true;
     if let Some((revision, references)) = fallback
         .as_mut()
@@ -504,21 +529,56 @@ fn plan(
     {
         return;
     }
-    // Frozen material refusals supplement the unbounded look/runtime static-scenery routes.
-    // Unclassified runtime source feedback has no authority to extend the grid.
-    // This projection runs only after a changed demand/qualification, never settled frames.
-    let permanent_refusals = ownership
-        .as_deref()
-        .filter(|facts| facts.package_matches(&package.0))
-        .map(|facts| facts.permanent_refused_references())
-        .unwrap_or_default();
-    let mut desired = HashMap::new();
-    if let Some(demand) = demand {
-        for (grid, ids) in package
-            .0
-            .placed_cells_in_window(demand.world, demand.center, reach)
+    let desired_span = bevy::log::info_span!("far_stock::desired").entered();
+    let mut examined = 0_u64;
+    let unbounded_key = UnboundedDemandKey {
+        world: demand.map(|d| d.world),
+        owned: config.cluster_own_statics,
+        enable_revision,
+        refusal_revision,
+    };
+    let unbounded = if changed_package || far.unbounded_key != Some(unbounded_key) {
+        let mut desired = HashMap::new();
+        // Only owned mode grants whole-world reach, and ownership alone never grants it.
+        if config.cluster_own_statics
+            && let Some(demand) = demand
         {
-            let inside = demand.contains_cell(demand.world, grid, stream_radius);
+            for (grid, ids) in package
+                .0
+                .placed_cells_in_window(demand.world, demand.center, None)
+            {
+                examined += ids.len() as u64;
+                let key = CellKey::Exterior {
+                    worldspace_id: demand.world,
+                    grid_x: grid.x,
+                    grid_y: grid.y,
+                };
+                for id in ids {
+                    if package.0.placed_reference(*id).is_some_and(|reference| {
+                        reference.is_static_scenery
+                            && reference.model_path.is_some()
+                            && (full_stock_reach(reference) || far.permanent_refusals.contains(id))
+                            && reference_enabled(&package.0, *id, enable.state.as_deref())
+                                == Some(true)
+                    }) {
+                        desired.insert((demand.world, *id), key);
+                    }
+                }
+            }
+        }
+        far.unbounded_key = Some(unbounded_key);
+        Some(desired)
+    } else {
+        None
+    };
+    let mut bounded = HashMap::new();
+    if let Some(demand) = demand {
+        for (grid, ids) in
+            package
+                .0
+                .placed_cells_in_window(demand.world, demand.center, Some(stream_radius))
+        {
+            examined += ids.len() as u64;
             let key = CellKey::Exterior {
                 worldspace_id: demand.world,
                 grid_x: grid.x,
@@ -528,17 +588,12 @@ fn plan(
                 if package.0.placed_reference(*id).is_some_and(|reference| {
                     reference.model_path.is_some()
                         && reference_enabled(&package.0, *id, enable.state.as_deref()) == Some(true)
-                        && (inside
-                            || (config.cluster_own_statics
-                                && (full_stock_reach(reference)
-                                    || (reference.is_static_scenery
-                                        && permanent_refusals.contains(id)))))
                         && (needs_stock(reference)
                             || far.fallback_references.contains(id)
-                            || permanent_refusals.contains(id)
+                            || far.permanent_refusals.contains(id)
                             || (!changed_package && far.owners.contains_key(&(demand.world, *id))))
                 }) {
-                    desired.insert((demand.world, *id), key);
+                    bounded.insert((demand.world, *id), key);
                 }
             }
         }
@@ -557,9 +612,14 @@ fn plan(
             if let Some(key) =
                 complete_source_key(&package.0, demand, stream_radius, form.0, cell.0)
             {
-                desired.insert((demand.world, form.0), key);
+                bounded.insert((demand.world, form.0), key);
             }
         }
+    }
+    let target_changed = far.update_desired(unbounded, bounded);
+    drop(desired_span);
+    if let Some(profiler) = profiler.as_deref_mut() {
+        profiler.increment("cluster/stock_desired_candidates", examined);
     }
     // Inventory is a qualification/state snapshot, not work to repeat at every cell crossing.
     let counts = demand
@@ -578,7 +638,7 @@ fn plan(
                 demand,
                 stream_radius,
                 &far.fallback_references,
-                &desired,
+                &far.desired,
                 enable.state.as_deref(),
             );
             far.inventory
@@ -671,13 +731,21 @@ fn plan(
             }
         }
     }
-    // Another world's negative template arrival must not cancel current exact-ID work.
-    if !changed_package
-        && far.demand == demand
-        && far.reach == reach
-        && far.stream_radius == stream_radius
-        && far.desired == desired
-    {
+    let same_world = far.demand.map(|d| d.world) == demand.map(|d| d.world);
+    let center_changed = far.demand.map(|d| d.center) != demand.map(|d| d.center);
+    let role_changed = role(far.demand) != role(demand);
+    far.demand = demand;
+    far.reach = reach;
+    far.stream_radius = stream_radius;
+    // Demand priority/center/role changes do not invalidate exact source responses.
+    if !changed_package && same_world && !target_changed {
+        if center_changed {
+            far.reorder_queued(demand.map_or(IVec2::ZERO, |d| d.center));
+        }
+        if role_changed {
+            far.near_roles.clear();
+            commands.queue(|world: &mut World| with_far(world, refresh_holders));
+        }
         return;
     }
     far.generation = far.generation.wrapping_add(1);
@@ -694,22 +762,21 @@ fn plan(
         far.near_roles.clear();
         far.package = Some(package.0.clone());
     }
-    far.demand = demand;
-    far.reach = reach;
-    far.stream_radius = stream_radius;
     far.near_roles.clear();
+    // Retention only edits owner indexes; restore the union before any deferred world work.
+    let desired = std::mem::take(&mut far.desired);
     let retired: HashMap<_, _> = far
         .retain_owners(|id, _| desired.contains_key(id))
         .into_iter()
         .filter(|(_, owner)| owner.far)
         .collect();
+    far.desired = desired;
     if !retired.is_empty() {
         let old_package = far.package.clone();
         commands.queue(move |world: &mut World| {
             retire_sources(world, old_package, retired, HashMap::new());
         });
     }
-    far.desired = desired;
     // Certification can complete after the ordinary cells. Discover those exact direct roots
     // once per demand, retaining their source entity instead of creating a duplicate far scene.
     let mut conflicts = HashSet::new();
@@ -1363,6 +1430,50 @@ fn with_far(world: &mut World, action: impl FnOnce(&mut World, &mut FarStock)) {
 }
 
 impl FarStock {
+    /// Reconcile only touched identities against the final union, so moving between contributions
+    /// does not cancel exact requests. A crossing touches only the old and new bounded overlay.
+    fn update_desired(
+        &mut self,
+        unbounded: Option<HashMap<Identity, CellKey>>,
+        bounded: HashMap<Identity, CellKey>,
+    ) -> bool {
+        let mut touched: HashSet<_> = self
+            .bounded_desired
+            .keys()
+            .chain(bounded.keys())
+            .copied()
+            .collect();
+        if let Some(unbounded) = unbounded {
+            touched.extend(self.unbounded_desired.keys().copied());
+            touched.extend(unbounded.keys().copied());
+            self.unbounded_desired = unbounded;
+        }
+        self.bounded_desired = bounded;
+        let mut changed = false;
+        for id in touched {
+            let key = self
+                .unbounded_desired
+                .get(&id)
+                .or_else(|| self.bounded_desired.get(&id))
+                .copied();
+            if self.desired.get(&id).copied() == key {
+                continue;
+            }
+            changed = true;
+            if let Some(key) = key {
+                self.desired.insert(id, key);
+            } else {
+                self.desired.remove(&id);
+            }
+        }
+        changed
+    }
+
+    fn enroll_bounded(&mut self, id: Identity, key: CellKey) {
+        self.bounded_desired.insert(id, key);
+        self.desired.entry(id).or_insert(key);
+    }
+
     fn put_owner(&mut self, id: Identity, owner: Owner) {
         self.remove_owner(&id);
         for root in [Some(owner.parent), owner.near_root].into_iter().flatten() {
@@ -1432,6 +1543,12 @@ impl FarStock {
     fn clear_queued(&mut self) {
         self.queued.clear();
         self.queued_keys.clear();
+    }
+
+    fn reorder_queued(&mut self, center: IVec2) {
+        self.queued
+            .make_contiguous()
+            .sort_by_key(|(key, _)| sparse_cell_order(*key, center));
     }
 
     fn pop_queued(&mut self) -> Option<(CellKey, BTreeSet<u32>)> {
@@ -1744,14 +1861,18 @@ fn register_near(world: &mut World, far: &mut FarStock, root: Entity, key: CellK
         let id = (placing_world, form.0);
         // Ordinary admission can occur without camera/report movement. Enroll
         // Complete arrivals here rather than waiting for the planner's next scan.
-        if !far.desired.contains_key(&id)
-            && let (Some(package), Some(demand), Some(cell)) =
-                (&far.package, far.demand, world.get::<CellRef>(entity))
+        if let (Some(package), Some(demand), Some(cell)) =
+            (&far.package, far.demand, world.get::<CellRef>(entity))
             && placing_world == demand.world
+            && reference_enabled(
+                package,
+                form.0,
+                world.get_resource::<ReferenceEnableState>(),
+            ) == Some(true)
             && let Some(key) =
                 complete_source_key(package, demand, far.stream_radius, form.0, cell.0)
         {
-            far.desired.insert(id, key);
+            far.enroll_bounded(id, key);
         }
         if !far.desired.contains_key(&id) {
             continue;

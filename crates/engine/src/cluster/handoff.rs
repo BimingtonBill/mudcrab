@@ -750,6 +750,10 @@ struct QualificationCache {
 struct HotFacts {
     literal_pose: bool,
     pose: Option<Transform>,
+    // Cell and descendant/root roles can overlap on one entity. Keep their proof
+    // predicates independent so a cell tag cannot hide an authored pose edit.
+    cell_pose_valid: Option<bool>,
+    flat: Option<(Option<Mat4>, bool)>,
     visible: Option<Visibility>,
     inherited: Option<bool>,
     layers: Option<RenderLayers>,
@@ -767,10 +771,35 @@ type HotFactState<'a> = (
     Option<&'a RenderLayers>,
     Option<&'a MeshMaterial3d<StandardMaterial>>,
     Option<&'a MeshMaterial3d<SnowMaterial>>,
+    Option<&'a StreamedCellKey>,
+    Option<&'a FlatSourcePrimitive>,
+    Option<&'a GlobalTransform>,
 );
 
-fn hot_facts(state: HotFactState<'_>, literal_pose: bool) -> HotFacts {
-    let (pose, baseline, visible, inherited, layers, standard, snow) = state;
+fn hot_facts(state: HotFactState<'_>, literal_pose: bool, origin: IVec2) -> HotFacts {
+    let (pose, baseline, visible, inherited, layers, standard, snow, cell, flat, global) = state;
+    // Qualification uses the exact grid-relative cell pose, not its literal
+    // render-relative translation. Correct rebases preserve this predicate.
+    let cell_pose_valid = cell.map(|cell| match cell.0 {
+        CellKey::Exterior { grid_x, grid_y, .. } => pose.is_some_and(|pose| {
+            *pose
+                == Transform::from_translation(crate::streaming::grid_translation(
+                    IVec2::new(grid_x, grid_y),
+                    origin,
+                ))
+        }),
+        CellKey::Interior(_) => false,
+    });
+    // Flat draws rebase their expected and actual affine together. Retain the
+    // model-space proof and exact finite-affine agreement, canonicalizing refused
+    // nonfinite matrices so repeated invalid writes do not repeat qualification.
+    let flat = flat.map(|flat| {
+        (
+            flat.model_matrix.is_finite().then_some(flat.model_matrix),
+            flat.expected_global.affine().is_finite()
+                && global.is_some_and(|global| *global == flat.expected_global),
+        )
+    });
     // model_matrix rejects a node unless it equals its authored baseline.
     // All other poses have the same refused proof; returning to the baseline
     // still changes this snapshot and forces fresh qualification.
@@ -780,6 +809,8 @@ fn hot_facts(state: HotFactState<'_>, literal_pose: bool) -> HotFacts {
     HotFacts {
         literal_pose,
         pose,
+        cell_pose_valid,
+        flat,
         visible: visible.copied(),
         inherited: inherited.map(|visible| visible.get()),
         layers: layers.cloned(),
@@ -806,8 +837,6 @@ type SourceFactChanges = Or<(
     Changed<CellRef>,
     Changed<WorldAssetRoot>,
     Changed<OriginalStockScene>,
-    Changed<FlatSourcePrimitive>,
-    (With<FlatSourcePrimitive>, Changed<GlobalTransform>),
     Changed<MeshHandle>,
     Changed<Mesh3d>,
     Changed<SourcePrimitive>,
@@ -829,6 +858,8 @@ type SourceVisibilityChanges = Or<(Changed<Visibility>, Changed<InheritedVisibil
 #[cfg(test)]
 type HotFactChanges = Or<(
     Changed<Transform>,
+    Changed<FlatSourcePrimitive>,
+    (With<FlatSourcePrimitive>, Changed<GlobalTransform>),
     Changed<Visibility>,
     Changed<InheritedVisibility>,
     Changed<RenderLayers>,
@@ -915,8 +946,6 @@ source_change_queries!(SourceFactQueries, SourceObservationDomain, {
     cell: CellRef,
     scene: WorldAssetRoot,
     original_scene: OriginalStockScene,
-    flat_primitive: FlatSourcePrimitive,
-    flat_pose: GlobalTransform => With<FlatSourcePrimitive>,
     handle: MeshHandle,
     mesh: Mesh3d,
     primitive: SourcePrimitive,
@@ -935,6 +964,8 @@ source_change_queries!(SourceIdentityQueries, SourceObservationDomain, {
 });
 source_change_queries!(HotFactQueries, SourceObservationDomain, {
     pose: Transform,
+    flat_primitive: FlatSourcePrimitive,
+    flat_pose: GlobalTransform => With<FlatSourcePrimitive>,
     visibility: Visibility,
     inherited: InheritedVisibility,
     layers: RenderLayers,
@@ -992,6 +1023,7 @@ struct SourceQueries<'w, 's> {
         'w,
         's,
         (
+            Entity,
             &'static StreamedCellKey,
             &'static Transform,
             Option<&'static ChildOf>,
@@ -1497,7 +1529,7 @@ fn extract_sources(
                         .hot_facts
                         .get(entity)
                         .ok()
-                        .map(|state| hot_facts(state, previous.literal_pose))
+                        .map(|state| hot_facts(state, previous.literal_pose, current_origin))
                         .as_ref()
                         != Some(previous)
                 })
@@ -1549,7 +1581,25 @@ fn extract_sources(
         }
     }
     if queries.cache.origin != current_origin {
-        changed.extend(queries.cache.index.roots());
+        // A cell that missed the rebase has no Changed<Transform> notification.
+        // Check indexed cells at this boundary, rather than requalifying every
+        // reference merely because the render origin advanced.
+        for (entity, ..) in &queries.cells {
+            if queries.cache.index.contains_node(entity)
+                && queries.cache.hot.get(&entity).is_none_or(|previous| {
+                    queries
+                        .hot_facts
+                        .get(entity)
+                        .ok()
+                        .map(|state| hot_facts(state, previous.literal_pose, current_origin))
+                        .as_ref()
+                        != Some(previous)
+                })
+            {
+                changed.insert(entity);
+                hot_changed = true;
+            }
+        }
     }
     if !same {
         out.seen_roots.clear();
@@ -1759,7 +1809,7 @@ fn extract_sources(
                     if !flat_source::scene_path_matches(asset, original, expected_path) {
                         return None;
                     }
-                    let (cell_key, cell_pose, cell_parent) =
+                    let (_, cell_key, cell_pose, cell_parent) =
                         queries.cells.get(parent?.parent()).ok()?;
                     if cell_parent.is_some()
                         || cell?.0 != snapshot.source_cell_id
@@ -1999,9 +2049,12 @@ fn extract_sources(
                 })
                 .unwrap_or_default();
             queries.cache.identities.insert(*entity, identity);
-            let literal = queries.roots.contains(*entity) || queries.cells.contains(*entity);
+            let literal = queries.roots.contains(*entity);
             if let Ok(state) = queries.hot_facts.get(*entity) {
-                queries.cache.hot.insert(*entity, hot_facts(state, literal));
+                queries
+                    .cache
+                    .hot
+                    .insert(*entity, hot_facts(state, literal, current_origin));
             } else {
                 queries.cache.hot.remove(entity);
             }
@@ -2330,7 +2383,7 @@ fn extract_sources(
                 worlds.insert(entity.into(), world);
                 break;
             }
-            if let Ok((cell, _, _)) = queries.cells.get(ancestor) {
+            if let Ok((_, cell, _, _)) = queries.cells.get(ancestor) {
                 worlds.insert(entity.into(), cell_world(cell.0));
                 break;
             }
@@ -5152,6 +5205,46 @@ mod extract_source_tests {
             .entity_mut(primitive)
             .insert(Visibility::Inherited);
         input.app.update();
+
+        // Flat metadata and its draw affine belong to semantic hot observation.
+        // Exercise them separately: a matching total union would not detect a
+        // component accidentally left in the wrong change-query family.
+        input.app.world_mut().entity_mut(primitive).insert((
+            FlatSourcePrimitive {
+                model_matrix: Mat4::IDENTITY,
+                expected_global: GlobalTransform::IDENTITY,
+            },
+            GlobalTransform::IDENTITY,
+        ));
+        input.app.update();
+        input.app.update();
+        input
+            .app
+            .world_mut()
+            .get_mut::<FlatSourcePrimitive>(primitive)
+            .unwrap()
+            .model_matrix = Mat4::from_translation(Vec3::X);
+        input.app.update();
+        input.app.update();
+        *input
+            .app
+            .world_mut()
+            .get_mut::<GlobalTransform>(primitive)
+            .unwrap() = GlobalTransform::from_translation(Vec3::Y);
+        input.app.update();
+        input.app.update();
+        input
+            .app
+            .world_mut()
+            .entity_mut(primitive)
+            .remove::<FlatSourcePrimitive>();
+        input.app.update();
+        *input
+            .app
+            .world_mut()
+            .get_mut::<GlobalTransform>(primitive)
+            .unwrap() = GlobalTransform::IDENTITY;
+        input.app.update();
     }
 
     #[test]
@@ -5252,6 +5345,7 @@ mod extract_source_tests {
     }
 
     include!("flat_source_handoff_tests.rs");
+    include!("source_origin_tests.rs");
 
     fn assert_source_change_partition(work: SourceExtractionWork) {
         assert_eq!(
