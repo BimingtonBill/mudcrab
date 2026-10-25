@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 ## 2026-10-26, #2151.1 traversal source proof and distant demand reuse
 
 - Worktree `D:/Mudcrab/worktrees/cluster-traversal`, branch `phase2/cluster-traversal`, merged integration `8ae4e5733` before baseline and `551909a16` before retained checks and after captures. Gate owner `sol-2151`; isolated target/evidence `D:/Mudcrab/builds/cluster-traversal-target`. No push or PR. Detailed receipts and limitations: `docs/evidence/traversal-2151-1.md`.
@@ -38,7 +37,6 @@
 - Both final warm-up and retained capture guards were quiet; retained other CPU mean 4.4%, zero intruders. Capture followed #2151.1 and preceded #2153. Own bounded hold cleared immediately; no build ran inside the window. Final immutable executable SHA-256 `77dc9d7fde53e04af554a162c6a34c9ae5dc0c684179f0da34f6eda44d22d103`. Final frozen hashes match fmt, engine/workspace all-target/all-feature Clippy with warnings denied, engine nextest **3,330 passed/13 skipped**, workspace nextest **5,567 passed/63 skipped**, and doctests **18 passed/15 ignored**. Focused semantic proof passed 27 cases after observed reds. Independent frozen-source review found no concrete defects. An earlier shared-load LLVM OOM ran no tests; unchanged-source one-job retry passed.
 - No `bevy_ecs` vendor linked. Isolated uncompiled final native prototype would add a separate vendored crate/PR: 17 Rust files, +1,489/-41 versus pristine 0.19. Upstream check: **in 0.20.0-dev main, yes**, merged PRs **#25157 and #25946** provide opt-in column summary ticks/table skipping. Assess that backport before the novel atomic prototype. Metal/adapter-less runtime and net traversal scheduling cost remain unverified. #2151.1 owns HotFacts/rebase semantics and moving flat primitive/global inputs; preserve those changes in the generic declarations and independent test oracles, then rerun merged proof/attribution.
 - Evidence and exact SourceFactQueries field list: `docs/evidence/postready-cost-2145-2.md`; retained receipts and traces under `C:/MudcrabBuilds/cluster-postready-target`. No root notes, push, PR or Plus merge. Owned worktree/cache/prototype evidence remains within retention; no expired owned folder was removed.
-=======
 ## 2026-10-26, #2153 exact cluster selection and shadow-map reuse
 
 - Branch `phase2/cluster-gpu-reuse`, base `0ef2bde23`; Tracy loopback prerequisite
@@ -77,7 +75,6 @@
   `package.rs`, readiness bridge, streaming and `far_stock.rs` untouched. Portal-heavy
   integration, Metal, sustained unprofiled FPS and final presented/TAA byte pairing
   remain unproved.
->>>>>>> 2bf6c5ff8
 
 ## 2026-10-25, #2147 runtime-state-aware distant static drawing
 
@@ -2714,7 +2711,7 @@ chose to WAIT on it for base types (Whiterun's water); ours (renderable-base-typ
 `feedback-self-contained-asks`, `feedback-path-only-commits`):** **posts to realfakenerd's
 upstream are PAUSED** (comments, issues, PRs, bot replies; pushing to an open PR head counts).
 The user's own fork may be updated freely. Every ask to the user is self-contained and labelled
-�– AI / 👤 human / 🚫 no message. Commit named paths only in the shared checkout.
+🤖 AI / 👤 human / 🚫 no message. Commit named paths only in the shared checkout.
 
 **Prepared, held:** texts 11 prepass, 12 sky-dome, 13 sky-fog, 18 LOD issue (the user said yes to
 the issue before pausing); first sends when allowed: cell-name-nul, io-pool-stack, parser-never-panic,
