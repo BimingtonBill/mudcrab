@@ -2622,6 +2622,7 @@ mod world_startup_tests {
             .insert_resource(crate::cluster::package::PackageValidationStatus::Ready)
             .insert_resource(crate::cluster::render::ClusterScene {
                 certificate: None,
+                inventory: None,
                 terrain_blocks: Vec::new(),
                 meshes: Vec::new(),
                 instances: Vec::new(),

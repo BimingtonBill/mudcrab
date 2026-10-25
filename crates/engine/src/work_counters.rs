@@ -24,11 +24,17 @@ static COUNTS: Mutex<BTreeMap<&'static str, [u64; 2]>> = Mutex::new(BTreeMap::ne
 
 /// One full piece of work by the named system ("module/what", e.g. "terrain_handoff/surface_map").
 pub fn record(name: &'static str) {
+    record_count(name, 1);
+}
+
+/// Records an event's measured work in one lock acquisition, including zero work.
+/// Call only when the input changes; settled frames must not poll this counter.
+pub fn record_count(name: &'static str, amount: u64) {
     let after_ready = usize::from(READY.load(Ordering::Relaxed));
     let mut counts = COUNTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    counts.entry(name).or_default()[after_ready] += 1;
+    counts.entry(name).or_default()[after_ready] += amount;
 }
 
 /// The world was ready for the first time; later work counts as settled-frame work.

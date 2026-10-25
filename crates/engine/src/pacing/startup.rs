@@ -1,7 +1,7 @@
 //! The first load of a run, unpaced (impl-1124).
 //!
-//! From the first frame until the world is first ready (the pacing report's own latch,
-//! [`super::world_ready_at_frame_end`] held for [`super::READY_FRAMES_REQUIRED`] frames, and a
+//! From the first frame until dependency admission
+//! ([`super::world_ready_at_frame_end`] held for [`super::READY_FRAMES_REQUIRED`] frames, and a
 //! requested cluster package certified and loaded) the streaming pacing budgets are lifted: the
 //! render-asset upload budget, the model spawn cap and the unload budgets. The configured values
 //! come back on the ready frame (or once the load has made no progress for
@@ -117,8 +117,8 @@ impl StartupLoad {
 /// * the unload budgets to `0` and `0` (the one pair that is exactly the unbudgeted path, see
 ///   [`EngineConfig::max_unload_ms_per_frame`]).
 ///
-/// All three are restored to the configured values on the frame the world-ready latch fires (two
-/// consecutive ready frames, the pacing report's own predicate and rule, plus the cluster load) or
+/// All three are restored when dependency admission latches (two consecutive
+/// ready frames plus the cluster load, before the cover fade) or
 /// once the load has stalled for [`STARTUP_LIFT_TIMEOUT_SECONDS`], whichever comes first. Cluster
 /// mode fades and despawns its cover only after admission; other modes retain timeout recovery.
 /// The latch happens once: a later loss of ready never lifts again.
@@ -218,12 +218,23 @@ fn restore_startup_pacing(
     set_upload_budget(budget, configured.upload_bytes_per_frame);
 }
 
+/// Publish the visible-world boundary using the same run clock as scripted routes.
+fn record_visible_ready(load: &StartupLoad, real_time: &Time<Real>) {
+    crate::work_counters::mark_world_ready();
+    info!(
+        seconds = load.elapsed,
+        wall_seconds = load.wall_started.map(|start| start.elapsed().as_secs_f64()),
+        run_ms = real_time.elapsed_secs_f64() * 1000.0,
+        "startup load: the world is ready; the configured streaming pacing is back"
+    );
+}
+
 /// Holds the cover, watches the world-ready predicate, restores the configured pacing on the frame
 /// it latches (or at the timeout), then fades the cover out.
 ///
 /// The predicate is read at frame end, through [`world_ready_at_frame_end`] - the same function
-/// [`crate::pacing::track_world_ready`] reads it through a moment earlier in the frame's `Update`,
-/// so the two latch on the same frame.
+/// [`crate::pacing::track_world_ready`] reads for measurement. The cover's own
+/// admission remains independent; measurement additionally waits for its removal.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn drive_startup_load(
     time: Res<Time>,
@@ -277,7 +288,13 @@ fn drive_startup_load(
                 commands.entity(cover).despawn();
             }
             load.finished = true;
-            info!("startup load: cover fade finished");
+            info!(
+                run_ms = real_time.elapsed_secs_f64() * 1000.0,
+                "startup load: cover fade finished"
+            );
+            if load.ready_frames >= READY_FRAMES_REQUIRED {
+                record_visible_ready(&load, &real_time);
+            }
         } else {
             set_alpha(&mut overlay, 1.0 - fade / FADE_SECONDS);
             load.fade = Some(fade);
@@ -358,13 +375,16 @@ fn drive_startup_load(
         }
     }
     if latched {
-        crate::work_counters::mark_world_ready();
         info!(
             seconds = load.elapsed,
             // `seconds` stays for existing parsers; the virtual clock clamps long loading frames.
             wall_seconds = load.wall_started.map(|start| start.elapsed().as_secs_f64()),
-            "startup load: the world is ready; the configured streaming pacing is back"
+            run_ms = real_time.elapsed_secs_f64() * 1000.0,
+            "startup load: dependencies ready; the configured streaming pacing is back"
         );
+        if !load.cover_pending() {
+            record_visible_ready(&load, &real_time);
+        }
     } else if !load.stall_reported {
         load.stall_reported = true;
         // What held the world back, so a stall names its cause. Systems with more detail (the
@@ -525,6 +545,64 @@ mod tests {
         }
         assert_eq!(cover_alpha(&mut app), None, "the cover is gone");
         assert!(app.world().resource::<StartupLoad>().finished);
+    }
+
+    #[test]
+    fn pacing_measurement_waits_for_mandatory_cluster_cover_release() {
+        let mut config = configured_pacing();
+        config.clusters = Some("invented-selected-package".into());
+        config.cluster_own_statics = true;
+        config.startup_cover = false;
+        config.benchmark_duration_secs = Some(10.0);
+        let mut app = startup_app(config);
+        set_interior(&mut app, 77, true);
+        let (_directory, cache) = crate::pacing::tests::empty_cell_cache();
+        app.insert_resource(cache)
+            .insert_resource(crate::cluster::package::PackageValidationStatus::Ready)
+            .insert_resource(crate::cluster::render::ClusterScene {
+                certificate: None,
+                inventory: None,
+                terrain_blocks: Vec::new(),
+                meshes: Vec::new(),
+                instances: Vec::new(),
+                origin_offset: Vec3::ZERO,
+                blocks: Vec::new(),
+            })
+            .init_resource::<crate::pacing::PacingTracker>()
+            .init_resource::<crate::profiling::ProfilingState>()
+            .add_systems(Update, crate::pacing::track_world_ready);
+        let mut release_frame = None;
+        for _ in 0..frames_until_faded() + 6 {
+            app.update();
+            let tracker = app.world().resource::<crate::pacing::PacingTracker>();
+            if app.world().resource::<StartupLoad>().cover_pending() {
+                assert!(
+                    !tracker.world_ready_reached(),
+                    "benchmark admission must not latch while the mandatory cluster cover is visible"
+                );
+                assert!(
+                    tracker
+                        .report(app.world().resource::<EngineConfig>(), 0)
+                        .frames_after_ready
+                        .is_none()
+                );
+            } else {
+                release_frame = Some(tracker.frames);
+                break;
+            }
+        }
+        let release_frame =
+            release_frame.expect("ready dependencies must release the startup cover");
+        assert_eq!(cover_alpha(&mut app), None);
+        for _ in 0..3 {
+            app.update();
+        }
+        let report = app
+            .world()
+            .resource::<crate::pacing::PacingTracker>()
+            .report(app.world().resource::<EngineConfig>(), 0);
+        assert!(report.frames_to_world_ready.unwrap() > release_frame);
+        assert!(report.frames_after_ready.unwrap().frames > 0);
     }
 
     #[test]

@@ -177,6 +177,7 @@ impl Fixture {
         assert!(lazy.source_scene(1).is_none());
         app.insert_resource(lazy).insert_resource(ClusterScene {
             certificate: Some(certificate.clone()),
+            inventory: None,
             terrain_blocks: Vec::new(),
             meshes: vec![mesh.clone()],
             instances,

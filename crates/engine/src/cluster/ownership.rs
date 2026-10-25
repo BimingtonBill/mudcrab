@@ -876,6 +876,7 @@ mod batch_demand_tests {
     fn scene(package: &Arc<CertifiedPackage>, batch: Option<u32>) -> ClusterScene {
         ClusterScene {
             certificate: Some(package.clone()),
+            inventory: None,
             terrain_blocks: Vec::new(),
             meshes: Vec::new(),
             instances: batch

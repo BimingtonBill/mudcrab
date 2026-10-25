@@ -7102,6 +7102,7 @@ mod extract_source_tests {
         let certificate = input.app.world().resource::<ValidatedPackage>().0.clone();
         input.app.insert_resource(ClusterScene {
             certificate: None,
+            inventory: None,
             terrain_blocks: Vec::new(),
             meshes: Vec::new(),
             instances: Vec::new(),

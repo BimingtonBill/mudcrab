@@ -2617,3 +2617,6 @@ fn package_window_handles_sparse_unbounded_and_inclusive_bounded_queries() {
     assert!(cells(IVec2::ZERO, Some(-1)).is_empty());
     assert!(cells(IVec2::splat(i32::MAX), Some(0)).is_empty());
 }
+
+#[path = "far_stock_refresh_tests.rs"]
+mod refresh;

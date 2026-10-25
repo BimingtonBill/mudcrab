@@ -2743,6 +2743,7 @@ mod tests {
         use std::sync::{Arc, atomic::AtomicBool};
         ClusterScene {
             certificate: None,
+            inventory: None,
             terrain_blocks: Vec::new(),
             meshes: Vec::new(),
             instances: Vec::new(),

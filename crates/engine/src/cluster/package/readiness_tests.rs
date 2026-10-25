@@ -12,6 +12,7 @@ fn app() -> App {
         .init_resource::<crate::streaming::StreamingMetrics>()
         .insert_resource(ClusterScene {
             certificate: None,
+            inventory: None,
             terrain_blocks: Vec::new(),
             meshes: Vec::new(),
             instances: Vec::new(),
@@ -511,6 +512,7 @@ fn cached_scene_dependency_failure_retries_once_and_keeps_terminal_failure_expli
             .insert(path.into(), source.clone());
         app.insert_resource(ClusterScene {
             certificate: None,
+            inventory: None,
             terrain_blocks: Vec::new(),
             meshes: Vec::new(),
             instances: Vec::new(),
