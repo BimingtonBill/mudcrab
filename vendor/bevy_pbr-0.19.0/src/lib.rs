@@ -56,6 +56,7 @@ mod parallax;
 mod pbr_material;
 mod prepass;
 mod render;
+pub mod shadow_cache;
 mod ssao;
 mod ssr;
 mod transmission;

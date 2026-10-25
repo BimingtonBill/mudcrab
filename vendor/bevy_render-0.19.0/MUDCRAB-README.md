@@ -71,8 +71,25 @@ belong to the engine integration.
   differential enumeration, bin transitions/removals, stale caches, prepare lifetimes, hash generations,
   and absence of sorted phase-item value visits. Test execution and live cost checks belong to integration.
 
-To verify the remaining source is untouched, compare this directory with the registry copy, allowing the
-five source files listed above, this README, and the missing `.cargo-ok`.
+Task #2153 also adds exact shadow dependency facts and native parity support:
+
+- `render_asset.rs`, `erased_render_asset.rs` and `mesh/allocator.rs` publish
+  content/changed-ID/allocation revisions at producer mutations. Immutable
+  lookup does not certify arbitrary writes through escaped raw GPU handles.
+- `render_phase/draw.rs` tracks structural draw-registry mutations and preserves
+  command outcomes while reporting diagnostic Skip/missing-command failures.
+  `render_phase/mod.rs` routes missing lookups through the same audit admission.
+- `render_parity.rs`, `render_phase/draw_state.rs`, `view/mod.rs` and `lib.rs`
+  implement/export opt-in paired native attachment readbacks and actual-bind
+  validation. `NativeRenderAudit` exposes that safety scope to the PBR native
+  emitter; it grants no retained-map eligibility.
+- `texture/fallback_image.rs` omits unnecessary render-attachment capability
+  from initialized sampled fallback textures. Sampling/copy capabilities and
+  initial bytes remain; uninitialized depth/MSAA targets retain attachment use.
+
+For the complete invalidation and cooperative texture writer contract, see
+`../../docs/design/cluster-gpu-exact-reuse.md`. Compare with the registry copy
+allowing all files named in this README and the omitted registry bookkeeping.
 
 ## How to drop it
 

@@ -154,6 +154,26 @@ fn prepare_scene_shot(
     Ok((state, crate::capture_frame::CaptureTicket::new(baseline)))
 }
 
+/// Diagnostic plugins add singleton entities in Bevy 0.19. Account for only
+/// their exact resource entities; gameplay components must never be subtracted.
+/// A resource has its value and Bevy's mandatory, matching IsResource marker.
+fn capture_resource_entity<R: Resource>(world: &World, role: &str) -> Option<serde_json::Value> {
+    let component = world.component_id::<R>()?;
+    let entity = world.resource_entities().get(component)?;
+    let resource = world.get_entity(entity).ok()?;
+    let only_resource_component = resource.archetype().component_count() == 2
+        && resource.contains::<R>()
+        && resource
+            .get::<bevy::ecs::resource::IsResource>()
+            .is_some_and(|marker| marker.resource_component_id() == component);
+    Some(serde_json::json!({
+        "entity": entity.to_bits(),
+        "role": role,
+        "type_name": std::any::type_name::<R>(),
+        "only_resource_component": only_resource_component,
+    }))
+}
+
 fn scene_state(world: &World, baseline: crate::shots::Failures) -> serde_json::Value {
     let mode = *world.resource::<SceneGradeMode>();
     let preset = *world.resource::<SceneVisualPreset>();
@@ -171,6 +191,41 @@ fn scene_state(world: &World, baseline: crate::shots::Failures) -> serde_json::V
         .get_resource::<crate::capture_frame::TransferReadiness>()
         .and_then(|r| *r.0.lock().unwrap());
     let profiler = world.get_resource::<crate::profiling::ProfilingState>();
+    // This command is an explicit diagnostic request. Count the requested
+    // world's current meshes rather than reusing a periodic benchmark sample.
+    // The same query filter is used by the benchmark inventory producer.
+    let mesh_entities = world
+        .try_query_filtered::<(), With<Mesh3d>>()
+        .map_or(0, |mut meshes| meshes.iter(world).count());
+    let capture_resource_entities = [
+        capture_resource_entity::<IncomingCommands>(world, "stdin_commands"),
+        capture_resource_entity::<crate::capture_frame::RetryReadiness>(
+            world,
+            "capture_retry_readiness",
+        ),
+        capture_resource_entity::<crate::capture_frame::TransferReadiness>(
+            world,
+            "capture_transfer_readiness",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let entity_count_without_capture_resources = capture_resource_entities
+        .iter()
+        .all(|resource| resource["only_resource_component"] == true)
+        .then(|| {
+            world
+                .entity_count()
+                .checked_sub(capture_resource_entities.len() as u32)
+        })
+        .flatten();
+    let distant_gauge = |name: &str| {
+        profiler
+            .and_then(|profiler| profiler.gauge(name))
+            .filter(|value| value.is_finite() && *value >= 0.0 && value.fract() == 0.0)
+            .map(|value| value as u64)
+    };
     let pending_batches = [
         "lod/pending_terrain_batch_chunks",
         "lod/pending_initial_terrain_upload_chunks",
@@ -215,6 +270,19 @@ fn scene_state(world: &World, baseline: crate::shots::Failures) -> serde_json::V
     let grade = resolved.grade;
     serde_json::json!({
         "ready": ready, "grade": mode.name(), "preset": preset.name(),
+        "main_frame": profiler.map(crate::profiling::ProfilingState::main_frame),
+        "entity_count": world.entity_count(),
+        "entity_count_without_capture_resources": entity_count_without_capture_resources,
+        "capture_resource_entities": capture_resource_entities,
+        "mesh_entities": mesh_entities,
+        "distant_stock": {
+            "spawned_references": profiler.and_then(|profiler| profiler.counter("lod/exact_stock_spawned_references")),
+            "queued_cells": distant_gauge("lod/exact_stock_queued_cells"),
+            "pending_cells": distant_gauge("lod/exact_stock_pending_cells"),
+            "ready_cells": distant_gauge("lod/exact_stock_ready_cells"),
+            "awaiting_response_cells": distant_gauge("lod/exact_stock_awaiting_response_cells"),
+            "failed_cells": distant_gauge("lod/exact_stock_failed_cells"),
+        },
         "saturation": grade.saturation, "brightness": grade.brightness, "contrast": grade.contrast,
         "tint_amount": grade.tint_amount, "tint_rgb": grade.tint_rgb,
         "tone_map": tone.mode.name(),
@@ -270,6 +338,98 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Some(0))),
         ));
         world
+    }
+
+    #[test]
+    fn scene_state_inventory_is_sampled_from_the_requested_world() {
+        let mut world = ready_scene_world();
+        let mesh = world.spawn(Mesh3d::default()).id();
+        {
+            let mut profiler = world.resource_mut::<crate::profiling::ProfilingState>();
+            profiler.increment("lod/exact_stock_spawned_references", 17);
+            for field in [
+                "queued_cells",
+                "pending_cells",
+                "ready_cells",
+                "awaiting_response_cells",
+                "failed_cells",
+            ] {
+                profiler.set_gauge(format!("lod/exact_stock_{field}"), 0.0);
+            }
+        }
+        let first = scene_state(&world, crate::shots::Failures::default());
+        assert_eq!(first["entity_count"], world.entity_count());
+        assert_eq!(first["mesh_entities"], 1);
+        assert_eq!(first["distant_stock"]["spawned_references"], 17);
+        assert_eq!(first["distant_stock"]["pending_cells"], 0);
+        world.despawn(mesh);
+        world
+            .resource_mut::<crate::profiling::ProfilingState>()
+            .set_gauge("lod/exact_stock_pending_cells", 2.0);
+        let second = scene_state(&world, crate::shots::Failures::default());
+        assert_eq!(second["entity_count"], world.entity_count());
+        assert_eq!(second["mesh_entities"], 0);
+        assert_eq!(second["distant_stock"]["pending_cells"], 2);
+    }
+
+    #[test]
+    fn scene_state_accounts_only_exact_capture_resource_entities() {
+        let mut world = ready_scene_world();
+        let baseline = world.entity_count() - 2;
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        world.insert_resource(IncomingCommands(Mutex::new(receiver)));
+        let first = scene_state(&world, crate::shots::Failures::default());
+        assert_eq!(first["entity_count"], baseline + 3);
+        assert_eq!(first["entity_count_without_capture_resources"], baseline);
+        let resources = first["capture_resource_entities"].as_array().unwrap();
+        assert_eq!(resources.len(), 3);
+        assert!(
+            resources
+                .iter()
+                .all(|row| row["only_resource_component"] == true)
+        );
+        for (role, type_name) in [
+            ("stdin_commands", std::any::type_name::<IncomingCommands>()),
+            (
+                "capture_retry_readiness",
+                std::any::type_name::<crate::capture_frame::RetryReadiness>(),
+            ),
+            (
+                "capture_transfer_readiness",
+                std::any::type_name::<crate::capture_frame::TransferReadiness>(),
+            ),
+        ] {
+            let row = resources.iter().find(|row| row["role"] == role).unwrap();
+            assert_eq!(row["type_name"], type_name);
+        }
+        let ids = resources
+            .iter()
+            .map(|row| row["entity"].as_u64().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), resources.len());
+
+        let ordinary = world.spawn_empty().id();
+        let second = scene_state(&world, crate::shots::Failures::default());
+        assert_eq!(
+            second["entity_count_without_capture_resources"],
+            baseline + 1
+        );
+        world.entity_mut(ordinary).insert(Mesh3d::default());
+        let third = scene_state(&world, crate::shots::Failures::default());
+        assert_eq!(
+            third["entity_count_without_capture_resources"],
+            baseline + 1
+        );
+        assert_eq!(third["mesh_entities"], 1);
+
+        let incoming = world
+            .resource_entities()
+            .get(world.component_id::<IncomingCommands>().unwrap())
+            .unwrap();
+        world.entity_mut(incoming).insert(Mesh3d::default());
+        let contaminated = scene_state(&world, crate::shots::Failures::default());
+        assert!(contaminated["entity_count_without_capture_resources"].is_null());
+        assert_eq!(contaminated["entity_count"], world.entity_count());
     }
 
     fn captured_frame() -> CaptureFrame {

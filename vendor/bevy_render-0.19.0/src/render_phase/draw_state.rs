@@ -155,6 +155,7 @@ impl<'a> TrackedRenderPass<'a> {
     /// Function invalidates internal tracking state,
     /// some redundant pipeline operations may not be skipped.
     pub fn wgpu_pass(&mut self) -> &mut RenderPass<'a> {
+        crate::render_parity::validate_raster_pipeline(None);
         self.state.reset_tracking();
         &mut self.pass
     }
@@ -163,6 +164,7 @@ impl<'a> TrackedRenderPass<'a> {
     ///
     /// Subsequent draw calls will exhibit the behavior defined by the `pipeline`.
     pub fn set_render_pipeline(&mut self, pipeline: &'a RenderPipeline) {
+        crate::render_parity::validate_raster_pipeline(Some(pipeline.id()));
         #[cfg(feature = "detailed_trace")]
         trace!("set pipeline: {:?}", pipeline);
         if self.state.is_pipeline_set(pipeline.id()) {

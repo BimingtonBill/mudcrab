@@ -1,0 +1,7 @@
+# Preserve the exact Bevy 0.19.0 archive bytes in these unmodified upstream files.
+# Local render/audit patches retain the normal whitespace checks.
+src/deferred/copy_deferred_lighting_id.wgsl whitespace=-blank-at-eof
+src/mip_generation/downsample.wgsl whitespace=-blank-at-eol
+src/skybox/skybox.wgsl whitespace=-blank-at-eol
+src/tonemapping/lut_bindings.wgsl whitespace=-blank-at-eof
+src/tonemapping/luts/info.txt whitespace=-blank-at-eol

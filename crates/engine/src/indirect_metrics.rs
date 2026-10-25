@@ -14,7 +14,7 @@ use bevy::{
     },
     pbr::{
         DrawDepthOnlyPrepass, DrawMaterial, DrawMesh, DrawPrepass, RenderMaterialInstances, Shadow,
-        Transmissive3d,
+        Transmissive3d, shadow_cache::ShadowCacheTracking,
     },
     prelude::*,
     render::{
@@ -285,6 +285,9 @@ trait WithObservedMesh {
 impl<A, B, C, D, E> WithObservedMesh for (A, B, C, D, E, DrawMesh) {
     type Observed = (A, B, C, D, E, CountedDrawMesh);
 }
+impl<C: WithObservedMesh> WithObservedMesh for ShadowCacheTracking<C> {
+    type Observed = ShadowCacheTracking<C::Observed>;
+}
 
 fn replace_draw<P, C>(world: &mut World)
 where
@@ -300,8 +303,10 @@ where
         return;
     };
     let replacement = RenderCommandState::<P, C::Observed>::new(world);
-    world.resource::<DrawFunctions<P>>().write().draw_functions[id.0 as usize] =
-        Box::new(replacement);
+    world
+        .resource::<DrawFunctions<P>>()
+        .write()
+        .replace(id, replacement);
     world.resource::<DrawCountBridge>().0.wrapped_variants[P::INDEX]
         .fetch_add(1, Ordering::Relaxed);
 }
@@ -332,7 +337,13 @@ fn install_observed_draws(world: &mut World) {
     install!(AlphaMask3dPrepass, DrawPrepass);
     install!(Opaque3dDeferred, DrawPrepass);
     install!(AlphaMask3dDeferred, DrawPrepass);
-    install!(Shadow, DrawPrepass, DrawDepthOnlyPrepass);
+    // Preserve complete-map command tracking around the observed leaf. These
+    // diagnostic concrete producers conservatively refuse retained-map reuse.
+    install!(
+        Shadow,
+        ShadowCacheTracking<DrawPrepass>,
+        ShadowCacheTracking<DrawDepthOnlyPrepass>
+    );
 }
 
 struct CountedDrawMesh;

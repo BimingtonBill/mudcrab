@@ -10,7 +10,12 @@ use bevy_ecs::{
     world::World,
 };
 use bevy_utils::TypeIdMap;
-use core::{any::TypeId, fmt::Debug};
+use core::{
+    any::{Any, TypeId},
+    fmt::Debug,
+    ops::Deref,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use thiserror::Error;
 use variadics_please::all_tuples;
@@ -21,7 +26,7 @@ use variadics_please::all_tuples;
 ///
 /// This trait can either be implemented directly or implicitly composed out of multiple modular
 /// [`RenderCommand`]s. For more details and an example see the [`RenderCommand`] documentation.
-pub trait Draw<P: PhaseItem>: Send + Sync + 'static {
+pub trait Draw<P: PhaseItem>: Any + Send + Sync + 'static {
     /// Prepares the draw function to be used. This is called once and only once before the phase
     /// begins. There may be zero or more [`draw`](Draw::draw) calls following a call to this function.
     /// Implementing this is optional.
@@ -51,18 +56,62 @@ pub enum DrawError {
     ViewEntityNotFound,
 }
 
+// A process-wide stamp also distinguishes replacement DrawFunctions resources.
+// Recreating a registry must not alias an old retained-map key.
+fn next_draw_registry_revision() -> u64 {
+    static REVISION: AtomicU64 = AtomicU64::new(1);
+    REVISION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |revision| {
+            revision.checked_add(1)
+        })
+        .expect("Draw registry revision exhausted")
+}
+
+/// Read-only draw storage. Structural mutations go through
+/// [`DrawFunctionsInternal`] so retained render outputs can track its revision.
+/// Read access, including the existing `.draw_functions.len()`, is unchanged.
+pub struct DrawFunctionList<P: PhaseItem> {
+    functions: Vec<Box<dyn Draw<P>>>,
+    revision: u64,
+}
+
+impl<P: PhaseItem> Default for DrawFunctionList<P> {
+    fn default() -> Self {
+        Self {
+            functions: Vec::new(),
+            revision: next_draw_registry_revision(),
+        }
+    }
+}
+
+impl<P: PhaseItem> Deref for DrawFunctionList<P> {
+    type Target = [Box<dyn Draw<P>>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.functions
+    }
+}
+
+impl<P: PhaseItem> DrawFunctionList<P> {
+    /// Changes on registration, replacement, clearing, or registry recreation.
+    /// Preparing and fetching an existing draw do not change this stamp.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
 /// Stores all [`Draw`] functions for the [`PhaseItem`] type.
 ///
 /// For retrieval, the [`Draw`] functions are mapped to their respective [`TypeId`]s.
 pub struct DrawFunctionsInternal<P: PhaseItem> {
-    pub draw_functions: Vec<Box<dyn Draw<P>>>,
-    pub indices: TypeIdMap<DrawFunctionId>,
+    pub draw_functions: DrawFunctionList<P>,
+    indices: TypeIdMap<DrawFunctionId>,
 }
 
 impl<P: PhaseItem> DrawFunctionsInternal<P> {
     /// Prepares all draw function. This is called once and only once before the phase begins.
     pub fn prepare(&mut self, world: &World) {
-        for function in &mut self.draw_functions {
+        for function in &mut self.draw_functions.functions {
             function.prepare(world);
         }
     }
@@ -75,14 +124,39 @@ impl<P: PhaseItem> DrawFunctionsInternal<P> {
     /// Adds the [`Draw`] function and maps it to the type `T`
     pub fn add_with<T: 'static, D: Draw<P>>(&mut self, draw_function: D) -> DrawFunctionId {
         let id = DrawFunctionId(self.draw_functions.len().try_into().unwrap());
-        self.draw_functions.push(Box::new(draw_function));
+        self.draw_functions.functions.push(Box::new(draw_function));
+        self.draw_functions.revision = next_draw_registry_revision();
         self.indices.insert(TypeId::of::<T>(), id);
         id
     }
 
     /// Retrieves the [`Draw`] function corresponding to the `id` mutably.
     pub fn get_mut(&mut self, id: DrawFunctionId) -> Option<&mut dyn Draw<P>> {
-        self.draw_functions.get_mut(id.0 as usize).map(|f| &mut **f)
+        self.draw_functions
+            .functions
+            .get_mut(id.0 as usize)
+            .map(|f| &mut **f)
+    }
+
+    /// Replaces an existing draw while retaining its ID and lookup aliases.
+    /// The concrete replacement is revalidated by retained-output consumers.
+    pub fn replace<D: Draw<P>>(&mut self, id: DrawFunctionId, draw: D) -> bool {
+        let Some(slot) = self.draw_functions.functions.get_mut(id.0 as usize) else {
+            return false;
+        };
+        *slot = Box::new(draw);
+        self.draw_functions.revision = next_draw_registry_revision();
+        true
+    }
+
+    /// Removes all draws and their lookup aliases. Existing phase IDs must be
+    /// requeued before rendering with the repopulated registry.
+    pub fn clear(&mut self) {
+        if !self.draw_functions.is_empty() {
+            self.draw_functions.functions.clear();
+            self.draw_functions.revision = next_draw_registry_revision();
+        }
+        self.indices.clear();
     }
 
     /// Retrieves the id of the [`Draw`] function corresponding to their associated type `T`.
@@ -119,7 +193,7 @@ impl<P: PhaseItem> Default for DrawFunctions<P> {
     fn default() -> Self {
         Self {
             internal: RwLock::new(DrawFunctionsInternal {
-                draw_functions: Vec::new(),
+                draw_functions: DrawFunctionList::default(),
                 indices: Default::default(),
             }),
         }
@@ -227,6 +301,50 @@ pub enum RenderCommandResult {
     Failure(&'static str),
 }
 
+// Keep command admission testable without constructing a GPU render pass.
+pub(crate) fn admit_render_command_result(
+    world: &World,
+    view: Entity,
+    result: RenderCommandResult,
+) -> Result<(), DrawError> {
+    match result {
+        RenderCommandResult::Success => Ok(()),
+        RenderCommandResult::Skip => {
+            // Skip remains an ordinary successful no-op, but omitted draws
+            // cannot establish equality between the two diagnostic lanes.
+            crate::render_parity::raster_parity_draw_error(
+                world,
+                view,
+                "Native render command skipped",
+            );
+            Ok(())
+        }
+        RenderCommandResult::Failure(reason) => {
+            crate::render_parity::raster_parity_draw_error(world, view, reason);
+            Err(DrawError::RenderCommandFailure(reason))
+        }
+    }
+}
+
+// Used by every binned and sorted draw-function lookup before native emission.
+pub(crate) fn admit_draw_function<T>(
+    world: &World,
+    view: Entity,
+    draw_function: Option<T>,
+) -> Result<T, DrawError> {
+    draw_function.ok_or_else(|| {
+        const REASON: &str = "Native render draw function missing";
+        if crate::render_parity::raster_parity_lane(view).is_some()
+            || crate::render_parity::native_render_audit_active(view)
+        {
+            crate::render_parity::raster_parity_draw_error(world, view, REASON);
+        }
+        // Missing commands are incomplete ordinary rendering too. Returning
+        // an error prevents a retained shadow map from certifying partial work.
+        DrawError::RenderCommandFailure(REASON)
+    })
+}
+
 macro_rules! render_command_tuple_impl {
     ($(#[$meta:meta])* $(($name: ident, $view: ident, $entity: ident)),*) => {
         $(#[$meta])*
@@ -326,8 +444,9 @@ where
         view: Entity,
         item: &P,
     ) -> Result<(), DrawError> {
+        let view_entity = view;
         let param = self.state.get(world).unwrap();
-        let view = match self.view.get_manual(world, view) {
+        let view = match self.view.get_manual(world, view_entity) {
             Ok(view) => view,
             Err(err) => match err {
                 QueryEntityError::NotSpawned(_) => return Err(DrawError::ViewEntityNotFound),
@@ -339,10 +458,8 @@ where
         };
 
         let entity = self.entity.get_manual(world, item.entity()).ok();
-        match C::render(item, view, entity, param, pass) {
-            RenderCommandResult::Success | RenderCommandResult::Skip => Ok(()),
-            RenderCommandResult::Failure(reason) => Err(DrawError::RenderCommandFailure(reason)),
-        }
+        let result = C::render(item, view, entity, param, pass);
+        admit_render_command_result(world, view_entity, result)
     }
 }
 

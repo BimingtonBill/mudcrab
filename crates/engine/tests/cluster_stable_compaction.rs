@@ -4,6 +4,8 @@
 //! The stage table and the cull uniform come from the renderer's own contract module, so a
 //! change to a binding or a field cannot pass here with a stale copy. The old atomic-append
 //! shader is frozen in `fixtures/` and run on the GPU, never re-implemented on the CPU.
+#[path = "../src/cluster/cull_reuse.rs"]
+mod cull_reuse;
 #[path = "../src/cluster/gpu_contract.rs"]
 mod gpu_contract;
 #[path = "../src/cluster/stable_order.rs"]
@@ -14,6 +16,7 @@ use bevy::{
     tasks::block_on,
 };
 use bytemuck::Zeroable;
+use cull_reuse::{CullInputs, CullReuse};
 use gpu_contract::{CullParams, DRAW_INDEXED_INDIRECT_BYTES, SELECTED_CLUSTER_BYTES, STAGES};
 use std::{borrow::Cow, sync::mpsc, time::Duration};
 use wgpu::{util::DeviceExt, *};
@@ -635,6 +638,7 @@ struct Job {
 
 /// What the GPU left in the readback buffers. `list` is the instance list: four planes of
 /// `instance_count` words for the stable shader, one vec4 per survivor for the legacy one.
+#[derive(Debug, PartialEq, Eq)]
 struct Output {
     counts: Vec<u32>,
     args: Vec<u32>,
@@ -1697,5 +1701,463 @@ fn stable_views_share_instances_with_independent_scratch() {
             gpu.read_buffer(buffer, words.len()) == *words,
             "shared {name} buffer was modified by a view"
         );
+    }
+}
+
+/// The production gate belongs to exactly these output allocations. The forced reference
+/// owns different allocations but receives the same uploads and dirty-buffer history.
+struct ReusedView {
+    bound: Bound,
+    reuse: CullReuse,
+    uniform: Option<CullParams>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EncodedWork {
+    /// Host dispatch calls at the real production-shader encoding sites, not gate decisions.
+    stages: [u32; STAGES.len()],
+    clears: u32,
+}
+
+impl Gpu {
+    fn reuse_view(&self, shared: &Shared, scene: &Scene, groups: usize) -> ReusedView {
+        ReusedView {
+            bound: self.bind_stable(
+                shared,
+                self.view(
+                    scene.slots_before(scene.len()),
+                    groups,
+                    groups,
+                    scene.len(),
+                    INDEXED_ARG_WORDS,
+                ),
+            ),
+            reuse: CullReuse::default(),
+            uniform: None,
+        }
+    }
+
+    /// Interleave views exactly as the existing hardware harness does. A retained view
+    /// receives no upload, clear, or dispatch; only test-owned readback copies execute.
+    fn run_reused_views(
+        &self,
+        runs: &mut [(&mut ReusedView, &Job, CullInputs)],
+        force: bool,
+    ) -> (Vec<Output>, Vec<EncodedWork>) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor::default());
+        let mut work: Vec<EncodedWork> = runs.iter().map(|_| EncodedWork::default()).collect();
+        let recompute: Vec<bool> = runs
+            .iter_mut()
+            .enumerate()
+            .map(|(index, (view, job, inputs))| {
+                let uniform_changed = view.uniform.as_ref().is_none_or(|previous| {
+                    bytemuck::bytes_of(previous) != bytemuck::bytes_of(&job.params)
+                });
+                let needed = view.reuse.needs_recompute(*inputs, uniform_changed);
+                if needed || force {
+                    self.upload(&view.bound, job);
+                    view.uniform = Some(job.params);
+                    if !job.count_mode {
+                        encoder.clear_buffer(&view.bound.view.args, 0, None);
+                        work[index].clears += 1;
+                    }
+                    encoder.clear_buffer(&view.bound.view.counts, 0, None);
+                    work[index].clears += 1;
+                }
+                needed || force
+            })
+            .collect();
+        for stage in 0..STAGES.len() {
+            for (index, (view, job, _)) in runs.iter().enumerate() {
+                if recompute[index] {
+                    self.encode_stable(&mut encoder, &view.bound, job, stage);
+                    work[index].stages[stage] += 1;
+                }
+            }
+        }
+        for (index, (view, _, inputs)) in runs.iter_mut().enumerate() {
+            if recompute[index] {
+                view.reuse.encoded(*inputs);
+            }
+        }
+        let reads: Vec<_> = runs
+            .iter()
+            .map(|(view, job, _)| (&view.bound, *job))
+            .collect();
+        let mut outputs = self.collect(encoder, &reads);
+        // Include the allocation tail when instance_count is below reserved capacity.
+        for (output, (view, _, _)) in outputs.iter_mut().zip(runs.iter()) {
+            let words = (view.bound.view.list.size() / 4) as usize;
+            if output.list.len() != words {
+                output.list = self.read_buffer(&view.bound.view.list, words);
+            }
+        }
+        (outputs, work)
+    }
+}
+
+/// Check complete allocation bytes, including inactive count-mode arguments, unused visible
+/// records, instance-list tails, and the terrain sentinel. Comparing only live draws would
+/// miss a clear performed on the reuse path or stale indirect dispatch arguments.
+fn assert_reuse_output(label: &str, retained: &Output, forced: &Output) {
+    assert_eq!(retained.counts, forced.counts, "{label}: counts");
+    assert_eq!(retained.args_words, forced.args_words, "{label}: stride");
+    assert_eq!(retained.args, forced.args, "{label}: all arguments");
+    assert_eq!(
+        retained.visible, forced.visible,
+        "{label}: all visible records"
+    );
+    assert_eq!(retained.list, forced.list, "{label}: full instance list");
+    assert_eq!(
+        retained.dispatch, forced.dispatch,
+        "{label}: indirect dispatch"
+    );
+}
+
+fn assert_reuse_work(label: &str, work: &EncodedWork, job: &Job, recompute: bool) {
+    for (stage, &(name, _)) in STAGES.iter().enumerate() {
+        assert_eq!(work.stages[stage], u32::from(recompute), "{label}: {name}");
+    }
+    let clears = if recompute {
+        1 + u32::from(!job.count_mode)
+    } else {
+        0
+    };
+    assert_eq!(work.clears, clears, "{label}: output clears");
+}
+
+/// Each mutation is checked in its first frame, then followed by unchanged frames. Both
+/// allocation histories remain dirty after initialization; the reference always runs WGSL.
+/// Revision-only cases intentionally preserve shader inputs while requiring fresh dispatch.
+#[test]
+#[ignore = "hardware GPU proof: run through build_gate.py test, separately from CPU nextest"]
+fn stable_cull_reuse_matches_forced_recompute_after_mutations() {
+    let gpu = Gpu::new();
+    for count_mode in [false, true] {
+        let capacity = 66;
+        let groups = 4;
+        let mut scene = boundary_scene(capacity, false, 3);
+        // Exercise both object and terrain LOD thresholds in the same view.
+        for mesh in scene
+            .meshes
+            .as_chunks_mut::<16>()
+            .0
+            .iter_mut()
+            .skip(1)
+            .step_by(2)
+        {
+            mesh[6] = 1;
+        }
+        let shared = gpu.shared_zeroed(&scene);
+        gpu.upload_prefix(&shared, &scene, capacity - 1);
+        let mut retained = gpu.reuse_view(&shared, &scene, groups);
+        let mut forced = gpu.reuse_view(&shared, &scene, groups);
+        let mut plan = scene.plan(capacity - 1, groups, |id| scene.batch(id));
+        let mut mapping = [0u32, 1, 2, 3];
+        let mut entries = plan.group_entries();
+        let mut hidden_instance = None;
+        let mut job = Job {
+            params: view_params(capacity - 1, groups as u32, 1, true),
+            table: batch_table(&plan.group_entries(), capacity, |_| true),
+            order: plan.order(capacity),
+            count_mode,
+            poison: true,
+        };
+        job.params.terrain_error_pixels = 1.0;
+        let mut inputs = CullInputs::default();
+        let mut previous: Option<Output> = None;
+        for change in [
+            "initial",
+            "view",
+            "restore view",
+            "frustum",
+            "restore frustum",
+            "object LOD",
+            "terrain LOD",
+            "restore LOD",
+            "source order",
+            "instance transform",
+            "instance mask",
+            "append count before planning",
+            "plan appended instance",
+            "gpu revision",
+            "layout revision",
+            "materials revision",
+            "selection revision",
+            "plan revision",
+            "readiness revision",
+            "pipelines revision",
+            "origin x",
+            "origin y",
+            "origin z",
+            "allocation replacement",
+            "view recreation",
+        ] {
+            match change {
+                "initial" => {}
+                "view" => {
+                    job.params.orthographic = 0;
+                    job.params.camera = [10_000.0, 0.0, 0.0, 1.0];
+                    job.params.min_instance_pixels = 1.0;
+                }
+                "restore view" => {
+                    job.params.orthographic = 1;
+                    job.params.camera = [0.0, 0.0, 0.0, 1.0];
+                    job.params.min_instance_pixels = 0.0;
+                }
+                "frustum" => job.params.planes[0][3] = -20.0,
+                "restore frustum" => job.params.planes[0][3] = 0.0,
+                "object LOD" => job.params.error_pixels = 200.0,
+                "terrain LOD" => job.params.terrain_error_pixels = 200.0,
+                "restore LOD" => {
+                    job.params.error_pixels = 1.0;
+                    job.params.terrain_error_pixels = 1.0;
+                }
+                "source order" | "plan appended instance" => {
+                    if change == "source order" {
+                        // Production sorts IDs inside each group. Change actual group
+                        // membership so rebuilding the source order changes its words.
+                        mapping[..3].rotate_left(1);
+                    }
+                    plan = scene.plan(job.params.instance_count, groups, |id| {
+                        mapping[scene.batch(id) as usize]
+                    });
+                    entries = mapping
+                        .iter()
+                        .map(|&group| [1, group, plan.bases[group as usize], 0])
+                        .collect();
+                    job.order = plan.order(capacity);
+                    job.table = batch_table(&entries, capacity, |id| Some(id) != hidden_instance);
+                    inputs.plan += 1;
+                }
+                "instance transform" => {
+                    let id = 3usize; // Small-instance scatter path; later masks hit a large one.
+                    let transform = Mat4::from_translation(Vec3::new(-100.0, 0.0, 0.0));
+                    scene.instances[id * 20..id * 20 + 16]
+                        .copy_from_slice(&transform.to_cols_array().map(f32::to_bits));
+                    gpu.queue.write_buffer(
+                        &shared.instances,
+                        (id * 20 * 4) as u64,
+                        bytemuck::cast_slice(&scene.instances[id * 20..(id + 1) * 20]),
+                    );
+                    inputs.gpu += 1;
+                }
+                "instance mask" => {
+                    hidden_instance = Some(5);
+                    job.table = batch_table(&entries, capacity, |id| Some(id) != hidden_instance);
+                    inputs.selection += 1;
+                }
+                "append count before planning" => {
+                    gpu.upload_prefix(&shared, &scene, capacity);
+                    job.params.instance_count = capacity;
+                    inputs.gpu += 1;
+                }
+                "gpu revision" => inputs.gpu += 1,
+                "layout revision" => inputs.layout += 1,
+                "materials revision" => inputs.materials += 1,
+                "selection revision" => inputs.selection += 1,
+                "plan revision" => inputs.plan += 1,
+                "readiness revision" => inputs.readiness += 1,
+                "pipelines revision" => inputs.pipelines += 1,
+                "origin x" => inputs.origin[0] = 1.0f32.to_bits(),
+                "origin y" => inputs.origin[1] = 2.0f32.to_bits(),
+                "origin z" => inputs.origin[2] = 3.0f32.to_bits(),
+                "allocation replacement" | "view recreation" => {
+                    retained = gpu.reuse_view(&shared, &scene, groups);
+                    forced = gpu.reuse_view(&shared, &scene, groups);
+                    // The bytes can equal the previous view's uniform. Fresh allocation
+                    // validity must still force encoding independently of that equality.
+                    retained.uniform = Some(job.params);
+                    forced.uniform = Some(job.params);
+                }
+                _ => unreachable!(),
+            }
+            let label = format!("{change}, count_mode={count_mode}");
+            let (out, work) = gpu.run_reused_views(&mut [(&mut retained, &job, inputs)], false);
+            let (reference, reference_work) =
+                gpu.run_reused_views(&mut [(&mut forced, &job, inputs)], true);
+            assert_reuse_work(&label, &work[0], &job, true);
+            assert_reuse_work(&label, &reference_work[0], &job, true);
+            assert_reuse_output(&label, &out[0], &reference[0]);
+            if change == "initial" {
+                assert_exact(
+                    &label,
+                    &out[0],
+                    &plan.bases,
+                    &boundary_expected(&scene, &plan, |_| true),
+                    count_mode,
+                    true,
+                );
+                assert_survivors(
+                    &label,
+                    &out[0],
+                    capacity - 1,
+                    &(0..capacity - 1).collect::<Vec<_>>(),
+                );
+            }
+            if change == "append count before planning" {
+                assert_eq!(
+                    out[0].list[capacity as usize - 1],
+                    0,
+                    "{label}: unplanned append"
+                );
+            } else if change == "plan appended instance" {
+                assert!(
+                    out[0].list[capacity as usize - 1] > 0,
+                    "{label}: admitted append"
+                );
+            }
+            if matches!(
+                change,
+                "initial" | "allocation replacement" | "view recreation"
+            ) {
+                assert!(
+                    out[0].counts.iter().sum::<u32>() > 0,
+                    "{label}: vacuous fixture"
+                );
+                assert_eq!(out[0].visible.last(), Some(&SENTINEL), "{label}: tail");
+            } else if !change.contains("revision") && !change.starts_with("origin") {
+                assert_ne!(
+                    Some(&out[0]),
+                    previous.as_ref(),
+                    "{label}: mutation had no GPU effect"
+                );
+            }
+            previous = out.into_iter().next();
+            job.poison = false;
+            for frame in 0..3 {
+                let label = format!("{label}, unchanged frame {frame}");
+                let (out, work) = gpu.run_reused_views(&mut [(&mut retained, &job, inputs)], false);
+                let (reference, reference_work) =
+                    gpu.run_reused_views(&mut [(&mut forced, &job, inputs)], true);
+                assert_reuse_work(&label, &work[0], &job, false);
+                assert_reuse_work(&label, &reference_work[0], &job, true);
+                assert_reuse_output(&label, &out[0], &reference[0]);
+                assert_eq!(
+                    Some(&out[0]),
+                    previous.as_ref(),
+                    "{label}: retained bytes changed"
+                );
+            }
+        }
+    }
+}
+
+/// Mutating one view must neither invalidate nor clear another view's retained outputs.
+/// A shared instance edit, in contrast, must invalidate both in its first frame.
+#[test]
+#[ignore = "hardware GPU proof: run through build_gate.py test, separately from CPU nextest"]
+fn stable_cull_reuse_keeps_view_allocations_independent() {
+    let gpu = Gpu::new();
+    let scene = boundary_scene(66, false, 3);
+    let shared = gpu.shared(&scene);
+    let groups = 4;
+    let plan = scene.plan(scene.len(), groups, |id| scene.batch(id));
+    let mut retained = [
+        gpu.reuse_view(&shared, &scene, groups),
+        gpu.reuse_view(&shared, &scene, groups),
+    ];
+    let mut forced = [
+        gpu.reuse_view(&shared, &scene, groups),
+        gpu.reuse_view(&shared, &scene, groups),
+    ];
+    let mut jobs: [Job; 2] = std::array::from_fn(|view| Job {
+        params: view_params(scene.len(), groups as u32, 1, true),
+        table: batch_table(&plan.group_entries(), scene.len(), |id| {
+            id % 3 != view as u32
+        }),
+        order: plan.order(scene.len()),
+        count_mode: view == 1,
+        poison: true,
+    });
+    let mut inputs = [CullInputs::default(); 2];
+    let mut previous: Option<Vec<Output>> = None;
+    for (step, expected) in [
+        [true, true],
+        [false, false],
+        [true, false],
+        [false, true],
+        [true, true],
+        [true, false],
+        [false, false],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match step {
+            2 => jobs[0].params.error_pixels = 200.0,
+            3 => {
+                jobs[1].table = batch_table(&plan.group_entries(), scene.len(), |id| {
+                    !id.is_multiple_of(3)
+                });
+                inputs[1].selection += 1;
+            }
+            4 => {
+                // No per-view input changes: the shared revision alone must invalidate both.
+                let id = 5;
+                let transform = Mat4::from_translation(Vec3::new(-100.0, 0.0, 0.0));
+                gpu.queue.write_buffer(
+                    &shared.instances,
+                    id * 20 * 4,
+                    bytemuck::cast_slice(&transform.to_cols_array().map(f32::to_bits)),
+                );
+                for input in &mut inputs {
+                    input.gpu += 1;
+                }
+            }
+            5 => {
+                retained[0] = gpu.reuse_view(&shared, &scene, groups);
+                forced[0] = gpu.reuse_view(&shared, &scene, groups);
+                retained[0].uniform = Some(jobs[0].params);
+                forced[0].uniform = Some(jobs[0].params);
+            }
+            _ => {}
+        }
+        let mut runs: Vec<_> = retained
+            .iter_mut()
+            .zip(&jobs)
+            .zip(inputs)
+            .map(|((view, job), input)| (view, job, input))
+            .collect();
+        let (out, work) = gpu.run_reused_views(&mut runs, false);
+        let mut runs: Vec<_> = forced
+            .iter_mut()
+            .zip(&jobs)
+            .zip(inputs)
+            .map(|((view, job), input)| (view, job, input))
+            .collect();
+        let (reference, reference_work) = gpu.run_reused_views(&mut runs, true);
+        for view in 0..2 {
+            let label = format!("multi-view step {step}, view {view}");
+            assert_reuse_work(&label, &work[view], &jobs[view], expected[view]);
+            assert_reuse_work(&label, &reference_work[view], &jobs[view], true);
+            assert_reuse_output(&label, &out[view], &reference[view]);
+            if !expected[view] {
+                assert_eq!(
+                    out[view],
+                    previous.as_ref().unwrap()[view],
+                    "{label}: retained bytes"
+                );
+            } else if (2..=4).contains(&step) {
+                assert_ne!(
+                    out[view],
+                    previous.as_ref().unwrap()[view],
+                    "{label}: mutation had no GPU effect"
+                );
+            }
+        }
+        if step == 0 {
+            assert_ne!(
+                out[0].visible, out[1].visible,
+                "views must select different draws"
+            );
+            assert!(out.iter().all(|view| view.dispatch[3] > 0));
+        }
+        previous = Some(out);
+        for job in &mut jobs {
+            job.poison = false;
+        }
     }
 }

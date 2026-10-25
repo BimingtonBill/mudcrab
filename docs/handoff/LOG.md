@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 ## 2026-10-26, #2151.1 traversal source proof and distant demand reuse
 
 - Worktree `D:/Mudcrab/worktrees/cluster-traversal`, branch `phase2/cluster-traversal`, merged integration `8ae4e5733` before baseline and `551909a16` before retained checks and after captures. Gate owner `sol-2151`; isolated target/evidence `D:/Mudcrab/builds/cluster-traversal-target`. No push or PR. Detailed receipts and limitations: `docs/evidence/traversal-2151-1.md`.
@@ -37,6 +38,46 @@
 - Both final warm-up and retained capture guards were quiet; retained other CPU mean 4.4%, zero intruders. Capture followed #2151.1 and preceded #2153. Own bounded hold cleared immediately; no build ran inside the window. Final immutable executable SHA-256 `77dc9d7fde53e04af554a162c6a34c9ae5dc0c684179f0da34f6eda44d22d103`. Final frozen hashes match fmt, engine/workspace all-target/all-feature Clippy with warnings denied, engine nextest **3,330 passed/13 skipped**, workspace nextest **5,567 passed/63 skipped**, and doctests **18 passed/15 ignored**. Focused semantic proof passed 27 cases after observed reds. Independent frozen-source review found no concrete defects. An earlier shared-load LLVM OOM ran no tests; unchanged-source one-job retry passed.
 - No `bevy_ecs` vendor linked. Isolated uncompiled final native prototype would add a separate vendored crate/PR: 17 Rust files, +1,489/-41 versus pristine 0.19. Upstream check: **in 0.20.0-dev main, yes**, merged PRs **#25157 and #25946** provide opt-in column summary ticks/table skipping. Assess that backport before the novel atomic prototype. Metal/adapter-less runtime and net traversal scheduling cost remain unverified. #2151.1 owns HotFacts/rebase semantics and moving flat primitive/global inputs; preserve those changes in the generic declarations and independent test oracles, then rerun merged proof/attribution.
 - Evidence and exact SourceFactQueries field list: `docs/evidence/postready-cost-2145-2.md`; retained receipts and traces under `C:/MudcrabBuilds/cluster-postready-target`. No root notes, push, PR or Plus merge. Owned worktree/cache/prototype evidence remains within retention; no expired owned folder was removed.
+=======
+## 2026-10-26, #2153 exact cluster selection and shadow-map reuse
+
+- Branch `phase2/cluster-gpu-reuse`, base `0ef2bde23`; Tracy loopback prerequisite
+  cherry-picked as `1571b2fbe`. Allocation-local selection/indirect reuse gates all
+  eight stages together; producer revisions and exact view/uniform words invalidate
+  same-frame. Directional shadow arrays retain physical slice ownership, stock and
+  cluster caster/material dependencies, complete early/late certification and unknown
+  producer/texture refusals. No quality, content, cap or refresh-rate change.
+- Quiet same-binary main28 GPU attribution: **7.444194 -> 6.553069 -> 6.015837 ms**
+  (both forced; cull reuse/shadows forced; combined reuse). All guards quiet,
+  112,278 entities / 35,713 meshes, common 30-second frame denominator. Difference
+  **1.428357 ms**, one-sequence inference. Eight settled dispatches zero; cascades
+  0–2 zero renders. Standing WaterMaterial keeps cascade 3 fresh. This is not FPS
+  acceptance; legacy performance verdicts still fail.
+- Native standing equality: **39 raw pairs**, 1,571,992,744 bytes per lane across
+  five cull views, four maps and ten depth/normal/motion/HDR camera attachments.
+  Supplementary visible normal/forced native routes finish 40,500 units, five
+  nonblack moving PNGs each, official **CONTENT PASS**. Normal tail frame 5587
+  matches all four reused maps, including 12,733 populated depth texels. The first
+  route's black moving images were the existing startup cover; #2151 integration
+  fix `666d7ceca` owns that gap. Lead approved settle-20 with actual cover-release
+  before Moving proof; no renderer code or admission rule was changed for it.
+- Final identical-code checks: strict workspace all-target/all-feature Clippy;
+  workspace nextest **5,583 passed / 65 skipped**; PBR **68 passed**; doctests
+  **18 passed / 15 ignored**; fmt and whitespace; two native Vulkan cull fixtures;
+  R4 CPU tooling **123 passed**. All 892 Rust/WGSL/Cargo files match source digest
+  `8b641357...`; executable `732c9d7c...`. Native and capture failures are retained.
+- Design, invalidation matrix, texture writer contract/audit, full GPU table and
+  hash-linked evidence live under `docs/design/cluster-gpu-exact-reuse.md` and
+  `docs/evidence/cluster-gpu-reuse-2153*`. Raw artifacts remain in owned isolated
+  `D:/Mudcrab/builds/cluster-gpu-reuse-target`. Capture holds cleared; WINDOW
+  COMPLETE sent to lead. No cache deletion, push, PR or Plus merge.
+- Overlap: `handoff.rs` only three revision publications in two hunks; #2145.2
+  overlaps render/nearby source/terrain code. #2151.2's new ClusterScene inventory
+  is unread here; preserve existing layout-scope contract and add its fixture field.
+  `package.rs`, readiness bridge, streaming and `far_stock.rs` untouched. Portal-heavy
+  integration, Metal, sustained unprofiled FPS and final presented/TAA byte pairing
+  remain unproved.
+>>>>>>> 2bf6c5ff8
 
 ## 2026-10-25, #2147 runtime-state-aware distant static drawing
 

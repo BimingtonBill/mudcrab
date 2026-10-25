@@ -194,15 +194,37 @@ impl<A: ErasedRenderAsset> Default for ExtractedAssets<A> {
 /// Stores all GPU representations ([`ErasedRenderAsset`])
 /// of [`ErasedRenderAsset::SourceAsset`] as long as they exist.
 #[derive(Resource)]
-pub struct ErasedRenderAssets<ERA>(HashMap<UntypedAssetId, ERA>, u64);
+pub struct ErasedRenderAssets<ERA>(
+    HashMap<UntypedAssetId, ERA>,
+    u64,
+    HashMap<UntypedAssetId, u64>,
+    HashSet<UntypedAssetId>,
+);
 
 impl<ERA> Default for ErasedRenderAssets<ERA> {
     fn default() -> Self {
-        Self(Default::default(), 0)
+        Self(
+            Default::default(),
+            0,
+            Default::default(),
+            Default::default(),
+        )
     }
 }
 
 impl<ERA> ErasedRenderAssets<ERA> {
+    /// Drains producer mutation IDs for a single incremental dependency consumer.
+    /// Reads and missing removals do not produce deltas; retries publish on
+    /// successful preparation. Use `revision` for independent coarse consumers.
+    pub fn take_changed_assets(&mut self) -> Vec<UntypedAssetId> {
+        self.3.drain().collect()
+    }
+
+    /// Revision of one prepared asset, without invalidation from unrelated materials.
+    pub fn asset_revision(&self, id: impl Into<UntypedAssetId>) -> Option<u64> {
+        self.2.get(&id.into()).copied()
+    }
+
     /// Returns the monotonic change revision of this collection.
     ///
     /// Insertions, replacements, removals, and mutable access advance the revision.
@@ -227,23 +249,32 @@ impl<ERA> ErasedRenderAssets<ERA> {
     }
 
     pub fn get_mut(&mut self, id: impl Into<UntypedAssetId>) -> Option<&mut ERA> {
-        let asset = self.0.get_mut(&id.into())?;
+        let id = id.into();
+        let asset = self.0.get_mut(&id)?;
         self.1 = self
             .1
             .checked_add(1)
             .expect("Render asset revision exhausted");
+        self.2.insert(id, self.1);
+        self.3.insert(id);
         Some(asset)
     }
 
     pub fn insert(&mut self, id: impl Into<UntypedAssetId>, value: ERA) -> Option<ERA> {
+        let id = id.into();
         self.advance_revision();
-        self.0.insert(id.into(), value)
+        self.2.insert(id, self.1);
+        self.3.insert(id);
+        self.0.insert(id, value)
     }
 
     pub fn remove(&mut self, id: impl Into<UntypedAssetId>) -> Option<ERA> {
-        let removed = self.0.remove(&id.into());
+        let id = id.into();
+        let removed = self.0.remove(&id);
         if removed.is_some() {
             self.advance_revision();
+            self.2.remove(&id);
+            self.3.insert(id);
         }
         removed
     }
@@ -255,6 +286,10 @@ impl<ERA> ErasedRenderAssets<ERA> {
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (UntypedAssetId, &mut ERA)> {
         if !self.0.is_empty() {
             self.advance_revision();
+            for revision in self.2.values_mut() {
+                *revision = self.1;
+            }
+            self.3.extend(self.0.keys().copied());
         }
         self.0.iter_mut().map(|(k, v)| (*k, v))
     }
@@ -303,6 +338,10 @@ fn collect_erased_render_assets_to_reextract<A: ErasedRenderAsset>(
     });
     prepare_next_frame.assets.clear();
     if !ids.is_empty() {
+        for id in &ids {
+            render_assets.2.remove(&id.untyped());
+            render_assets.3.insert(id.untyped());
+        }
         render_assets.advance_revision();
         commands.insert_resource(ErasedRenderAssetsToReExtract::<A> { ids });
     }
@@ -505,6 +544,27 @@ mod revision_tests {
     use super::*;
     use bevy_ecs::{system::RunSystemOnce, world::World};
     use bevy_shader::Shader;
+
+    #[test]
+    fn prepared_asset_deltas_are_exact_and_drained_without_a_population_walk() {
+        let mut assets = ErasedRenderAssets::<u32>::default();
+        let used = AssetId::<Shader>::default();
+        let unrelated = AssetId::<Shader>::invalid();
+        assets.insert(used, 1);
+        let first_revision = assets.asset_revision(used);
+        assert_eq!(assets.take_changed_assets(), vec![used.untyped()]);
+        assets.insert(unrelated, 2);
+        assert_eq!(assets.asset_revision(used), first_revision);
+        assert_eq!(assets.take_changed_assets(), vec![unrelated.untyped()]);
+        assert!(assets.take_changed_assets().is_empty());
+        assets.get(used);
+        assert!(assets.take_changed_assets().is_empty());
+        assets.get_mut(used);
+        assert_eq!(assets.take_changed_assets(), vec![used.untyped()]);
+        assets.remove(used);
+        assert_eq!(assets.asset_revision(used), None);
+        assert_eq!(assets.take_changed_assets(), vec![used.untyped()]);
+    }
 
     #[test]
     fn erased_assets_revision_tracks_insert_replace_and_remove() {

@@ -126,6 +126,10 @@ pub struct EngineConfig {
     pub assets_dir: PathBuf,
     /// Explicit local report destination. `None` uses the per-user application-data directory.
     pub bug_report_dir: Option<PathBuf>,
+    /// Opt-in native retained-versus-forced shadow depth verification output.
+    pub verify_shadow_reuse: Option<PathBuf>,
+    /// Sentinel selecting one actual render FrameCount; requires verification.
+    pub verify_shadow_reuse_request: Option<PathBuf>,
     pub worldspace_id: u32,
     pub start_grid: (i32, i32),
     pub stream_radius: i32,
@@ -595,6 +599,8 @@ impl Default for EngineConfig {
             settings_overrides: Vec::new(),
             assets_dir: PathBuf::from("modern_assets"),
             bug_report_dir: None,
+            verify_shadow_reuse: None,
+            verify_shadow_reuse_request: None,
             worldspace_id: 0x3c,
             start_grid: (0, 0),
             // Skyrim's default `uGridsToLoad=5`.
@@ -872,6 +878,10 @@ Benchmark and profiling:
 
 Diagnostics:
   --bug-report-dir <dir>                local bug-report directory (default: per-user application data)
+  --verify-shadow-reuse <DIR>           exact native shadow depth audit (default: off; contaminates timings)
+  --verify-shadow-reuse-request <FILE>  requires audit mode; default DIR/REQUEST. Create after settlement;
+                                       first observed file selects one actual render FrameCount for all paired audits.
+                                       No reuse candidate is inconclusive. Existing audit environment controls remain supported.
   --diagnostic-asset-fallbacks          log every fallback asset substitution
   --diagnostic-pipelines                log pipeline cardinality and pending-specialization causes once a second
   --water-reflection <planar|ssr|on|off>  measurement switch and Water Plus: ssr (default) marches the screen in the
@@ -1320,6 +1330,16 @@ impl EngineConfig {
                         ));
                     }
                     config.bug_report_dir = Some(PathBuf::from(path));
+                }
+                "--verify-shadow-reuse" => {
+                    config.verify_shadow_reuse =
+                        Some(take_nonempty_path("--verify-shadow-reuse", args.next())?);
+                }
+                "--verify-shadow-reuse-request" => {
+                    config.verify_shadow_reuse_request = Some(take_nonempty_path(
+                        "--verify-shadow-reuse-request",
+                        args.next(),
+                    )?);
                 }
                 "--worldspace" => {
                     let value = take_raw(
@@ -2103,6 +2123,15 @@ impl EngineConfig {
             ));
         }
         config.check_seamless_only_flags()?;
+        if let Some(directory) = &config.verify_shadow_reuse {
+            config
+                .verify_shadow_reuse_request
+                .get_or_insert_with(|| directory.join("REQUEST"));
+        } else if config.verify_shadow_reuse_request.is_some() {
+            return Err(ConfigError::Message(
+                "--verify-shadow-reuse-request requires --verify-shadow-reuse <DIR>".to_owned(),
+            ));
+        }
         Ok(ConfigAction::Run(Box::new(config)))
     }
 
@@ -2931,6 +2960,15 @@ fn take_raw(
         // with a single dash.
         other => Err(ConfigError::invalid_value(option, other, expected)),
     }
+}
+
+fn take_nonempty_path(option: &'static str, value: Option<String>) -> Result<PathBuf, ConfigError> {
+    const EXPECTED: &str = "a nonempty local path";
+    let path = take_raw(option, EXPECTED, value)?;
+    if path.trim().is_empty() {
+        return Err(ConfigError::invalid_value(option, Some(path), EXPECTED));
+    }
+    Ok(path.into())
 }
 
 /// An `on` or `off` value, for the measurement switches.
@@ -5122,6 +5160,66 @@ mod tests {
             run_config(&["--bug-report-dir", "old", "--bug-report-dir", "new"]).bug_report_dir,
             Some(PathBuf::from("new"))
         );
+    }
+
+    #[test]
+    fn shadow_reuse_verification_is_opt_in_and_defaults_to_directory_request() {
+        let config = run_config(&[]);
+        assert!(config.verify_shadow_reuse.is_none());
+        assert!(config.verify_shadow_reuse_request.is_none());
+        for path in ["relative audit", "D:/audit output"] {
+            let config = run_config(&["--verify-shadow-reuse", path]);
+            assert_eq!(config.verify_shadow_reuse, Some(PathBuf::from(path)));
+            assert_eq!(
+                config.verify_shadow_reuse_request,
+                Some(PathBuf::from(path).join("REQUEST"))
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_reuse_request_preserves_path_in_either_option_order() {
+        for args in [
+            [
+                "--verify-shadow-reuse-request",
+                "shared request",
+                "--verify-shadow-reuse",
+                "audit",
+            ],
+            [
+                "--verify-shadow-reuse",
+                "audit",
+                "--verify-shadow-reuse-request",
+                "shared request",
+            ],
+        ] {
+            let config = run_config(&args);
+            assert_eq!(
+                config.verify_shadow_reuse_request,
+                Some("shared request".into())
+            );
+        }
+        assert!(
+            parse_error(&["--verify-shadow-reuse-request", "request"])
+                .to_string()
+                .contains("requires --verify-shadow-reuse")
+        );
+    }
+
+    #[test]
+    fn shadow_reuse_verification_refuses_missing_empty_and_option_shaped_paths() {
+        for option in ["--verify-shadow-reuse", "--verify-shadow-reuse-request"] {
+            for args in [
+                vec![option],
+                vec![option, ""],
+                vec![option, "  "],
+                vec![option, "--headless"],
+            ] {
+                assert!(EngineConfig::from_args(args.into_iter().map(str::to_owned)).is_err());
+            }
+        }
+        assert!(HELP_TEXT.contains("one actual render FrameCount"));
+        assert!(HELP_TEXT.contains("default: off"));
     }
 
     #[test]

@@ -54,6 +54,7 @@ pub mod occlusion_culling;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pipelined_rendering;
 pub mod render_asset;
+pub mod render_parity;
 pub mod render_phase;
 pub mod render_resource;
 pub mod renderer;

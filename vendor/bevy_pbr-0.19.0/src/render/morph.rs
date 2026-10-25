@@ -247,10 +247,12 @@ fn add_to_alignment<T: NoUninit + Default>(buffer: &mut RawBufferVec<T>) {
 // Notes on implementation: see comment on top of the extract_skins system in skin module.
 // This works similarly, but for `f32` instead of `Mat4`
 pub fn extract_morphs(
+    shadow_inputs: Res<crate::shadow_cache::ShadowStockInputs>,
+    mut removed_weights: Extract<RemovedComponents<MeshMorphWeights>>,
     morph_indices: ResMut<MorphIndices>,
     uniform: ResMut<MorphUniforms>,
-    query: Extract<Query<(Entity, &ViewVisibility, &MeshMorphWeights)>>,
-    weights_query: Extract<Query<&MorphWeights>>,
+    query: Extract<Query<(Entity, &ViewVisibility, Ref<MeshMorphWeights>)>>,
+    weights_query: Extract<Query<Ref<MorphWeights>>>,
     render_device: Res<RenderDevice>,
 ) {
     // Borrow check workaround.
@@ -280,16 +282,28 @@ pub fn extract_morphs(
     // Loop over each entity with morph targets.
     for (entity, view_visibility, mesh_weights) in &query {
         if !view_visibility.get() {
+            shadow_inputs.remove_morph(entity.into());
             continue;
         }
-        let Ok(weights) = (match mesh_weights {
-            MeshMorphWeights::Reference(entity) => {
-                weights_query.get(*entity).map(MorphWeights::weights)
+        let referenced_weights = match &*mesh_weights {
+            MeshMorphWeights::Reference(entity) => weights_query.get(*entity).ok(),
+            MeshMorphWeights::Value { .. } => None,
+        };
+        let Some((weights, source_changed)) = (match &*mesh_weights {
+            MeshMorphWeights::Reference(_) => referenced_weights.as_ref().map(|weights| {
+                (
+                    weights.weights(),
+                    mesh_weights.is_changed() || weights.is_changed(),
+                )
+            }),
+            MeshMorphWeights::Value { weights } => {
+                Some((weights.as_slice(), mesh_weights.is_changed()))
             }
-            MeshMorphWeights::Value { weights } => Ok(weights.as_slice()),
         }) else {
+            shadow_inputs.remove_morph(entity.into());
             continue;
         };
+        shadow_inputs.observe_morph(entity.into(), weights, source_changed);
 
         // Write the weights to the buffer. If we're using uniform buffers, then
         // we have to pad out the buffer to its fixed length.
@@ -337,6 +351,12 @@ pub fn extract_morphs(
                     },
                 );
             }
+        }
+    }
+    for entity in removed_weights.read() {
+        // A remove/reinsert in one frame was already observed above.
+        if !query.contains(entity) {
+            shadow_inputs.remove_morph(entity.into());
         }
     }
 }
