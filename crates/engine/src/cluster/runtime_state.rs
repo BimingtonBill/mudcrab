@@ -68,16 +68,37 @@ impl RuntimeReferenceState {
     }
 
     /// Enable overrides are reversible; pose and gameplay revocations remain permanent.
-    fn set_enabled(&mut self, reference: u32, enabled: bool) {
+    fn set_enabled(&mut self, reference: u32, enabled: bool, mapped: bool) {
         let changed = if enabled {
             Arc::make_mut(&mut self.disabled).remove(&reference);
             !self.permanent.contains(&reference)
                 && Arc::make_mut(&mut self.references).remove(&reference)
         } else {
             Arc::make_mut(&mut self.disabled).insert(reference);
-            Arc::make_mut(&mut self.references).insert(reference)
+            if mapped {
+                Arc::make_mut(&mut self.references).insert(reference)
+            } else {
+                !self.permanent.contains(&reference)
+                    && Arc::make_mut(&mut self.references).remove(&reference)
+            }
         };
         if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    /// A replacement certificate can change mapped membership without changing enable inputs.
+    /// Reproject only remembered state, once per certificate, never per frame or per instance.
+    pub(crate) fn reproject_enable_overrides(&mut self, package: &super::reader::CertifiedPackage) {
+        let mut references = self.permanent.as_ref().clone();
+        references.extend(
+            self.disabled
+                .iter()
+                .copied()
+                .filter(|id| package.reference(*id).is_some()),
+        );
+        if *self.references != references {
+            self.references = Arc::new(references);
             self.revision = self.revision.wrapping_add(1);
         }
     }
@@ -122,8 +143,13 @@ fn record_state_change(event: On<ReferenceStateChanged>, mut state: ResMut<Runti
 fn record_enable_change(
     event: On<crate::world::reference_state::ReferenceEnableChanged>,
     mut state: ResMut<RuntimeReferenceState>,
+    package: Option<Res<super::package::ValidatedPackage>>,
 ) {
-    state.set_enabled(event.reference, event.enabled);
+    // Membership includes partial and not-yet-resident instances. Without a certificate,
+    // preserve the existing conservative suppression policy. Disabled tracking remains
+    // global so a hidden stock root cannot become a permanent pose revocation.
+    let mapped = package.is_none_or(|package| package.0.reference(event.reference).is_some());
+    state.set_enabled(event.reference, event.enabled, mapped);
 }
 
 fn record_disabled_reference(
@@ -821,6 +847,59 @@ mod tests {
             enabled: true,
         });
         assert!(app.world().resource::<RuntimeReferenceState>().contains(7));
+    }
+
+    #[test]
+    fn wholly_refused_enable_changes_do_not_invalidate_cluster_masks_or_catalogs() {
+        use crate::world::reference_state::{self, ReferenceEnableState, SetReferenceEnabled};
+        let directory =
+            super::super::reader::producer_fixture_tests::published_for_runtime_draw_states();
+        let package = Arc::new(
+            crate::cluster::overlay_fixture::open_fixture(directory.path(), false).unwrap(),
+        );
+        assert!(package.reference(0x113).is_none());
+        assert!(package.reference(0x100).is_some());
+        assert!(!package.unclustered_primitives(0x100).unwrap().is_empty());
+        let mut app = app();
+        reference_state::install(&mut app);
+        app.world_mut()
+            .resource_mut::<ReferenceEnableState>()
+            .bind(package.enable_catalog().clone());
+        app.insert_resource(crate::cluster::package::ValidatedPackage(package));
+        for reference in [0x113, 0x100] {
+            let root = app
+                .world_mut()
+                .spawn((
+                    FormId(reference),
+                    RestingReferencePose(Transform::default()),
+                    Transform::default(),
+                    Visibility::Inherited,
+                ))
+                .id();
+            app.update();
+            let before = app.world().resource::<RuntimeReferenceState>().revision;
+            for (enabled, delta) in [(false, 1), (true, 2)] {
+                app.world_mut()
+                    .trigger(SetReferenceEnabled { reference, enabled });
+                app.update();
+                let state = app.world().resource::<RuntimeReferenceState>();
+                let expected = if reference == 0x100 { delta } else { 0 };
+                assert_eq!(
+                    state.revision - before,
+                    expected,
+                    "mapped-only invalidation for {reference:X}"
+                );
+                assert_eq!(
+                    state.references().count(),
+                    usize::from(reference == 0x100 && !enabled)
+                );
+                assert!(!state.permanent.contains(&reference));
+            }
+            assert_ne!(
+                app.world().get::<Visibility>(root),
+                Some(&Visibility::Hidden)
+            );
+        }
     }
 
     #[test]

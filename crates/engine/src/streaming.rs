@@ -243,6 +243,7 @@ pub struct StreamingPlugin;
 
 impl Plugin for StreamingPlugin {
     fn build(&self, app: &mut App) {
+        crate::world::reference_state::install(app);
         identity_changes::install_terrain(app.world_mut());
         app.add_systems(Last, terrain_identity::validate_relationships);
         terrain_audit::install(app);
@@ -22069,6 +22070,22 @@ mod upstream_tests {
                 .get::<FormId>(),
             Some(&FormId(0x100)),
             "and the reference is still spawned"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reference_enable_plugin_tests {
+    use super::*;
+
+    #[test]
+    fn non_cluster_streaming_installs_reference_enable_writer() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default());
+        app.add_plugins(StreamingPlugin);
+        assert!(
+            app.world()
+                .contains_resource::<crate::world::reference_state::ReferenceEnableState>()
         );
     }
 }

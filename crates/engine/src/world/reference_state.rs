@@ -1,4 +1,10 @@
 //! Session enable state shared by streamed roots and distant reference consumers.
+//!
+//! Events queued before the first catalog bind use the last value for each reference.
+//! Reversible visibility applies to indexed live roots in every mode. Re-admission of
+//! missing bodies is limited to cluster-owned exterior refused static scenery; enabling
+//! an absent interior, non-cluster or fully owned body does not spawn it through this API.
+//! The first writer invocation warns about this scope once per session, without frame scans.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -115,6 +121,22 @@ fn resolve_definition(
 #[component(storage = "SparseSet")]
 pub(crate) struct ReferenceVisibilityGate(pub(crate) Option<Visibility>);
 
+/// Source visibility writers must honor the reference gate even for explicit visibility.
+/// The event-driven gate owns hiding and remembers the writer's latest policy for restoration.
+pub(crate) fn effective_visibility(
+    requested: Visibility,
+    gate: Option<Mut<'_, ReferenceVisibilityGate>>,
+) -> Visibility {
+    if let Some(mut gate) = gate {
+        if gate.0 != Some(requested) {
+            gate.0 = Some(requested);
+        }
+        Visibility::Hidden
+    } else {
+        requested
+    }
+}
+
 struct RegisteredRoot {
     reference: u32,
     saved_visibility: Option<Visibility>,
@@ -126,6 +148,8 @@ pub struct ReferenceEnableState {
     catalog: Option<Arc<EnableCatalog>>,
     resolver: EnableStateResolver,
     overrides: HashMap<u32, bool>,
+    bind_changes: Vec<ReferenceEnableChanged>,
+    scope_warned: bool,
     revision: u64,
     roots: HashMap<u32, HashSet<Entity>>,
     entities: HashMap<Entity, RegisteredRoot>,
@@ -134,8 +158,9 @@ pub struct ReferenceEnableState {
 }
 
 impl ReferenceEnableState {
-    /// Changed winning inputs reset overrides and return true; recertifying the same inputs
-    /// preserves session state. The caller reconciles surviving roots after a true result.
+    /// The first bind applies queued overrides; later changed winning inputs reset them.
+    /// Recertifying the same inputs preserves session state. The caller reconciles surviving
+    /// roots after a true result.
     pub fn bind(&mut self, catalog: Arc<EnableCatalog>) -> bool {
         if self.catalog.as_ref().is_some_and(|current| {
             Arc::ptr_eq(current, &catalog) || current.definitions == catalog.definitions
@@ -143,9 +168,45 @@ impl ReferenceEnableState {
             self.catalog = Some(catalog);
             return false;
         }
+        self.bind_changes.clear();
         self.resolver = catalog.initial.clone();
+        if self.catalog.is_none() {
+            self.overrides.retain(|reference, _| {
+                let known =
+                    *reference == PLAYER_REFERENCE || catalog.definitions.contains_key(reference);
+                if !known {
+                    warn!(reference, "cannot set enable state of an unknown reference");
+                }
+                known
+            });
+            // Invalidate the affected cache before seeding every explicit override together.
+            // This preserves child insulation regardless of queued event or map iteration order.
+            let mut pending: Vec<_> = self.overrides.keys().copied().collect();
+            let mut affected = HashSet::new();
+            while let Some(reference) = pending.pop() {
+                if affected.insert(reference) {
+                    self.resolver.invalidate(reference);
+                    if let Some(children) = catalog.children.get(&reference) {
+                        pending.extend(children.iter().copied());
+                    }
+                }
+            }
+            for (&reference, &enabled) in &self.overrides {
+                self.resolver.seed(reference, Ok(enabled));
+            }
+            for reference in affected {
+                if let Ok(enabled) =
+                    resolve_definition(&mut self.resolver, &catalog.definitions, reference)
+                    && catalog.enabled(reference) != Some(enabled)
+                {
+                    self.bind_changes
+                        .push(ReferenceEnableChanged { reference, enabled });
+                }
+            }
+        } else {
+            self.overrides.clear();
+        }
         self.catalog = Some(catalog);
-        self.overrides.clear();
         self.revision = self.revision.wrapping_add(1);
         #[cfg(test)]
         self.recomputed.clear();
@@ -153,7 +214,7 @@ impl ReferenceEnableState {
     }
 
     /// Reconcile the existing identity index once when winning inputs change, never per frame.
-    pub(crate) fn reconcile_roots(&mut self, world: &mut World) {
+    fn reconcile_roots(&mut self, world: &mut World) {
         let entities: Vec<_> = self.entities.keys().copied().collect();
         for &entity in &entities {
             if world.get::<FormId>(entity).map(|form| form.0)
@@ -187,11 +248,14 @@ impl ReferenceEnableState {
     }
 
     fn set(&mut self, reference: u32, enabled: bool) -> Vec<ReferenceEnableChanged> {
-        let Some(catalog) = self.catalog.as_ref() else {
+        if !self.scope_warned {
+            self.scope_warned = true;
             warn!(
-                reference,
-                "cannot set reference enable state without a bound catalog"
+                "reference enable API scope requires a certified cluster catalog: reversible visibility applies to indexed live roots; missing-body re-admission is limited to cluster-owned exterior refused static scenery; pre-bind requests are queued"
             );
+        }
+        let Some(catalog) = self.catalog.as_ref() else {
+            self.overrides.insert(reference, enabled);
             return Vec::new();
         };
         if reference != PLAYER_REFERENCE && !catalog.definitions.contains_key(&reference) {
@@ -313,7 +377,8 @@ impl ReferenceEnableState {
             return;
         };
         let desired = if enabled {
-            root.saved_visibility.take().unwrap_or(*visibility)
+            let saved = root.saved_visibility.take();
+            authored.or(saved).unwrap_or(*visibility)
         } else {
             // A nested reference may already be hidden by an ancestor's gate.
             root.saved_visibility
@@ -326,7 +391,26 @@ impl ReferenceEnableState {
     }
 }
 
+/// Publish bind changes only after reconciliation restores the state resource. Component
+/// insertion may flush world commands while `resource_scope` has temporarily removed it.
+pub(crate) fn reconcile_bound_roots(world: &mut World) {
+    let changes = world.resource_scope(|world, mut state: Mut<ReferenceEnableState>| {
+        state.reconcile_roots(world);
+        std::mem::take(&mut state.bind_changes)
+    });
+    for change in changes {
+        world.trigger(change);
+    }
+}
+
 /// Explicitly enable or disable a placed reference for this session.
+///
+/// Before the first catalog bind, the last request per reference is queued. Equal-input
+/// recertification preserves overrides; changed winning inputs reset a bound session.
+/// Indexed live roots support reversible visibility. Missing-body re-admission is limited
+/// to cluster-owned exterior refused static scenery: this event does not provide a general
+/// spawn path for absent interiors, non-cluster references or fully owned geometry.
+/// The first invocation warns once per session about this scope.
 #[derive(Event, Clone, Copy, Debug)]
 pub struct SetReferenceEnabled {
     pub reference: u32,
@@ -546,11 +630,14 @@ fn reconcile_source_subtree(world: &mut World, state: &ReferenceEnableState, roo
         let gate = world.get::<ReferenceVisibilityGate>(entity).copied();
         let current = world.get::<Visibility>(entity).copied();
         let visibility = if disabled {
-            let authored = state
-                .entities
-                .get(&entity)
-                .and_then(|root| root.saved_visibility)
-                .or_else(|| gate.and_then(|gate| gate.0))
+            let authored = gate
+                .and_then(|gate| gate.0)
+                .or_else(|| {
+                    state
+                        .entities
+                        .get(&entity)
+                        .and_then(|root| root.saved_visibility)
+                })
                 .or(current);
             if gate.is_none_or(|gate| gate.0 != authored) {
                 world
@@ -655,6 +742,327 @@ mod tests {
 
     fn revision(app: &App) -> u64 {
         app.world().resource::<ReferenceEnableState>().revision()
+    }
+
+    fn unbound_app() -> App {
+        let mut app = App::new();
+        install(&mut app);
+        app.init_resource::<Changed>().add_observer(
+            |event: On<ReferenceEnableChanged>, mut changed: ResMut<Changed>| {
+                changed.0.push((event.reference, event.enabled));
+            },
+        );
+        app
+    }
+
+    fn bind_and_reconcile(app: &mut App, catalog: Arc<EnableCatalog>) {
+        if app
+            .world_mut()
+            .resource_mut::<ReferenceEnableState>()
+            .bind(catalog)
+        {
+            reconcile_bound_roots(app.world_mut());
+        }
+        app.world_mut().flush();
+    }
+
+    #[test]
+    fn pre_bind_event_applies_to_registered_root_at_initial_bind() {
+        let mut app = unbound_app();
+        let root = app.world_mut().spawn((FormId(1), Visibility::Visible)).id();
+        set(&mut app, 1, false);
+        assert_eq!(enabled(&app, 1), None);
+        assert_eq!(
+            app.world().get::<Visibility>(root),
+            Some(&Visibility::Visible)
+        );
+        assert!(app.world().resource::<Changed>().0.is_empty());
+
+        bind_and_reconcile(&mut app, catalog("(1,0,NULL,0)"));
+        assert_eq!(enabled(&app, 1), Some(false));
+        assert_eq!(
+            app.world().get::<Visibility>(root),
+            Some(&Visibility::Hidden)
+        );
+        set(&mut app, 1, true);
+        assert_eq!(
+            app.world().get::<Visibility>(root),
+            Some(&Visibility::Visible)
+        );
+    }
+
+    #[test]
+    fn pre_bind_replay_observers_can_read_restored_state_while_gating_live_roots() {
+        #[derive(Resource, Default)]
+        struct Readback(Vec<(u32, Option<bool>)>);
+        let mut app = unbound_app();
+        app.init_resource::<Readback>().add_observer(
+            |event: On<ReferenceEnableChanged>,
+             state: Res<ReferenceEnableState>,
+             mut seen: ResMut<Readback>| {
+                seen.0
+                    .push((event.reference, state.enabled(event.reference)));
+            },
+        );
+        let root = app.world_mut().spawn((FormId(1), Visibility::Visible)).id();
+        app.world_mut()
+            .spawn((Mesh3d::default(), Visibility::Visible, ChildOf(root)));
+        set(&mut app, 1, false);
+        bind_and_reconcile(&mut app, catalog("(1,0,NULL,0)"));
+        assert_eq!(app.world().resource::<Readback>().0, [(1, Some(false))]);
+        assert_eq!(
+            app.world().get::<Visibility>(root),
+            Some(&Visibility::Hidden)
+        );
+    }
+
+    #[test]
+    fn pre_bind_repeated_events_use_last_value_per_reference() {
+        let mut app = unbound_app();
+        let before = revision(&app);
+        for (reference, value) in [
+            (1, false),
+            (2, true),
+            (1, true),
+            (2, false),
+            (1, false),
+            (2, true),
+        ] {
+            set(&mut app, reference, value);
+        }
+        assert_eq!(revision(&app), before);
+        assert!(app.world().resource::<Changed>().0.is_empty());
+        bind_and_reconcile(&mut app, catalog("(1,0,NULL,0),(2,2048,NULL,0)"));
+        assert_eq!(
+            (enabled(&app, 1), enabled(&app, 2)),
+            (Some(false), Some(true))
+        );
+        let root = app
+            .world_mut()
+            .spawn((FormId(1), Visibility::Inherited))
+            .id();
+        assert_eq!(
+            app.world().get::<Visibility>(root),
+            Some(&Visibility::Hidden)
+        );
+        let root = app.world_mut().spawn((FormId(2), Visibility::Visible)).id();
+        assert_eq!(
+            app.world().get::<Visibility>(root),
+            Some(&Visibility::Visible)
+        );
+    }
+
+    #[test]
+    fn pre_bind_explicit_child_insulates_descendants_in_either_event_order() {
+        for events in [[(1, false), (2, true)], [(2, true), (1, false)]] {
+            let mut app = unbound_app();
+            for (reference, value) in events {
+                set(&mut app, reference, value);
+            }
+            bind_and_reconcile(&mut app, catalog("(1,0,NULL,0),(2,0,1,0),(3,0,2,1)"));
+            assert_eq!(
+                (enabled(&app, 1), enabled(&app, 2), enabled(&app, 3)),
+                (Some(false), Some(true), Some(false)),
+                "queued events: {events:?}",
+            );
+            set(&mut app, 1, true);
+            app.world_mut().resource_mut::<Changed>().0.clear();
+            set(&mut app, 1, false);
+            assert_eq!(
+                (enabled(&app, 2), enabled(&app, 3)),
+                (Some(true), Some(false))
+            );
+            assert_eq!(app.world().resource::<Changed>().0, [(1, false)]);
+        }
+    }
+
+    #[test]
+    fn pre_bind_override_survives_equal_recertification_but_not_changed_inputs() {
+        let mut app = unbound_app();
+        set(&mut app, 1, false);
+        bind_and_reconcile(&mut app, catalog("(1,0,NULL,0)"));
+        assert_eq!(enabled(&app, 1), Some(false));
+        let before = revision(&app);
+        bind_and_reconcile(&mut app, catalog("(1,0,NULL,0)"));
+        assert_eq!(enabled(&app, 1), Some(false));
+        assert_eq!(revision(&app), before);
+        bind_and_reconcile(&mut app, catalog("(1,0,NULL,0),(2,0,NULL,0)"));
+        assert_eq!(enabled(&app, 1), Some(true));
+        assert!(
+            app.world()
+                .resource::<ReferenceEnableState>()
+                .overrides
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pre_bind_unknown_reference_is_rejected_but_player_override_is_kept() {
+        let mut app = unbound_app();
+        set(&mut app, 99, false);
+        set(&mut app, PLAYER_REFERENCE, false);
+        bind_and_reconcile(&mut app, catalog("(1,0,20,0)"));
+        assert_eq!(enabled(&app, PLAYER_REFERENCE), Some(false));
+        assert_eq!(enabled(&app, 1), Some(false));
+        assert_eq!(enabled(&app, 99), None);
+        assert!(
+            !app.world()
+                .resource::<ReferenceEnableState>()
+                .overrides
+                .contains_key(&99)
+        );
+    }
+
+    fn assert_gate(app: &App, draw: Entity, hidden: bool) {
+        assert_eq!(
+            app.world().get::<Visibility>(draw),
+            Some(&if hidden {
+                Visibility::Hidden
+            } else {
+                Visibility::Visible
+            }),
+        );
+        assert_eq!(
+            app.world().get::<ReferenceVisibilityGate>(draw).is_some(),
+            hidden
+        );
+        assert_eq!(
+            app.world().get::<InheritedVisibility>(draw).unwrap().get(),
+            !hidden
+        );
+        assert!(app.world().resource::<Changed>().0.is_empty());
+    }
+
+    #[test]
+    fn tuple_observers_reconcile_flat_owner_insert_reparent_and_remove_without_enable_events() {
+        // Bevy 0.19 On<E, (A, B)> matches either component, not a query requiring both.
+        // Keep this harness free of scheduled visibility systems: graph observers must suffice.
+        let mut app = app(catalog("(1,2048,NULL,0),(2,0,NULL,0)"));
+        let disabled = app
+            .world_mut()
+            .spawn((FormId(1), Visibility::Inherited))
+            .id();
+        let enabled = app
+            .world_mut()
+            .spawn((FormId(2), Visibility::Inherited))
+            .id();
+        let draw = app
+            .world_mut()
+            .spawn((Mesh3d::default(), Visibility::Visible))
+            .id();
+        app.world_mut()
+            .entity_mut(draw)
+            .insert(FlatSourceOwner(disabled));
+        app.world_mut().flush();
+        assert!(app.world().get::<ChildOf>(draw).is_none());
+        assert_gate(&app, draw, true);
+
+        app.world_mut()
+            .entity_mut(draw)
+            .insert(FlatSourceOwner(enabled));
+        app.world_mut().flush();
+        assert_gate(&app, draw, false);
+        app.world_mut()
+            .entity_mut(draw)
+            .insert(FlatSourceOwner(disabled));
+        app.world_mut().flush();
+        assert_gate(&app, draw, true);
+        app.world_mut().entity_mut(draw).remove::<FlatSourceOwner>();
+        app.world_mut().flush();
+        assert_gate(&app, draw, false);
+    }
+
+    #[test]
+    fn tuple_observers_reconcile_child_of_edits_without_flat_owner_or_enable_events() {
+        let mut app = app(catalog("(1,2048,NULL,0),(2,0,NULL,0)"));
+        let disabled = app
+            .world_mut()
+            .spawn((FormId(1), Visibility::Inherited))
+            .id();
+        let enabled = app
+            .world_mut()
+            .spawn((FormId(2), Visibility::Inherited))
+            .id();
+        let draw = app
+            .world_mut()
+            .spawn((Mesh3d::default(), Visibility::Visible))
+            .id();
+        app.world_mut().entity_mut(draw).insert(ChildOf(disabled));
+        app.world_mut().flush();
+        assert!(app.world().get::<FlatSourceOwner>(draw).is_none());
+        assert_gate(&app, draw, true);
+
+        app.world_mut().entity_mut(draw).insert(ChildOf(enabled));
+        app.world_mut().flush();
+        assert_gate(&app, draw, false);
+        app.world_mut().entity_mut(draw).insert(ChildOf(disabled));
+        app.world_mut().flush();
+        assert_gate(&app, draw, true);
+        app.world_mut().entity_mut(draw).remove::<ChildOf>();
+        app.world_mut().flush();
+        assert_gate(&app, draw, false);
+    }
+
+    #[derive(Clone, Default)]
+    struct ScopeWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for ScopeWarnings {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            if message.0.contains("reference enable API scope") {
+                self.0.lock().unwrap().push(message.0);
+            }
+        }
+    }
+
+    #[test]
+    fn api_scope_warns_once_per_session_including_pre_bind_calls_and_recertification() {
+        let warnings = ScopeWarnings::default();
+        tracing::subscriber::with_default(warnings.clone(), || {
+            for session in 1..=2 {
+                let mut app = unbound_app();
+                set(&mut app, 1, false);
+                set(&mut app, 1, false);
+                bind_and_reconcile(&mut app, catalog("(1,0,NULL,0)"));
+                set(&mut app, 1, true);
+                bind_and_reconcile(&mut app, catalog("(1,0,NULL,0),(2,0,NULL,0)"));
+                set(&mut app, 2, false);
+                install(&mut app);
+                set(&mut app, 2, true);
+                assert_eq!(warnings.0.lock().unwrap().len(), session);
+            }
+        });
+        for warning in warnings.0.lock().unwrap().iter() {
+            assert!(warning.contains("indexed live roots"), "{warning}");
+            assert!(warning.contains("cluster-owned exterior"), "{warning}");
+            assert!(warning.contains("refused static scenery"), "{warning}");
+        }
     }
 
     #[test]
@@ -852,10 +1260,7 @@ mod tests {
                 .resource_mut::<ReferenceEnableState>()
                 .bind(catalog("(1,0,NULL,0),(2,0,NULL,0)"))
         );
-        app.world_mut()
-            .resource_scope(|world, mut state: Mut<ReferenceEnableState>| {
-                state.reconcile_roots(world);
-            });
+        reconcile_bound_roots(app.world_mut());
         assert_eq!(enabled(&app, 1), Some(true));
         assert_eq!(
             app.world().get::<Visibility>(root),

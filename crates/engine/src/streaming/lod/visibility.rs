@@ -143,6 +143,7 @@ type RingPatches = (
     Option<&'static MergedTerrainCoverage>,
     Has<TerrainSurfaceReady>,
     &'static mut Visibility,
+    Option<&'static mut crate::world::reference_state::ReferenceVisibilityGate>,
 );
 type RingPatchFilter = (With<RingTerrain>, With<TerrainPatch>);
 type ReplacementVisibilityChanged = (Changed<Visibility>, Without<RingTerrain>);
@@ -1556,10 +1557,12 @@ pub(in crate::streaming) fn update_terrain_lod_visibility(
     // and the current cluster generation/plan, never historical readiness.
     let ring_span = ::bevy::log::info_span!("lod::visibility::ring").entered();
     let mut ring_ready = 0usize;
-    for (world, _, _, ready, mut visibility) in &mut inputs.ring {
+    for (world, _, _, ready, mut visibility, gate) in &mut inputs.ring {
         if ready {
-            if *visibility != Visibility::Inherited {
-                *visibility = Visibility::Inherited;
+            let wanted =
+                crate::world::reference_state::effective_visibility(Visibility::Inherited, gate);
+            if *visibility != wanted {
+                *visibility = wanted;
             }
             ring_ready += usize::from(Some(world.0) == selection.world);
         }

@@ -3006,23 +3006,121 @@ fn setup_portal_quad(
 fn show_load_door_leaves(
     state: Res<PortalState>,
     held: Query<(), With<CrossingHeld>>,
-    mut doors: Query<(Entity, &LoadDoor, Option<&DoorState>, &mut Visibility)>,
+    mut doors: Query<LoadDoorVisibility>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = Instant::now();
-    for (door, load_door, door_state, mut visibility) in &mut doors {
-        let wanted = drawn_door_visibility(
-            load_door.auto_load,
-            door_state,
-            state.open_door == Some(door),
-            held.contains(door),
-            state.destination_door == Some(door),
+    for (door, load_door, door_state, mut visibility, gate) in &mut doors {
+        let wanted = crate::world::reference_state::effective_visibility(
+            drawn_door_visibility(
+                load_door.auto_load,
+                door_state,
+                state.open_door == Some(door),
+                held.contains(door),
+                state.destination_door == Some(door),
+            ),
+            gate,
         );
         if *visibility != wanted {
             *visibility = wanted;
         }
     }
     profiler.record_elapsed("portal/door_leaves", started);
+}
+
+type LoadDoorVisibility = (
+    Entity,
+    &'static LoadDoor,
+    Option<&'static DoorState>,
+    &'static mut Visibility,
+    Option<&'static mut crate::world::reference_state::ReferenceVisibilityGate>,
+);
+
+#[cfg(test)]
+mod reference_enable_regressions {
+    use super::*;
+    use crate::world::{
+        components::FormId,
+        reference_state::{self, EnableCatalog, ReferenceEnableState, SetReferenceEnabled},
+    };
+
+    #[test]
+    fn disabled_load_door_stays_hidden_across_portal_writes_and_late_scene_insertion() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE \"references\" (id INTEGER PRIMARY KEY); INSERT INTO \"references\" VALUES (1);").unwrap();
+        let mut app = App::new();
+        reference_state::install(&mut app);
+        app.init_resource::<PortalState>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, show_load_door_leaves);
+        app.world_mut()
+            .resource_mut::<ReferenceEnableState>()
+            .bind(Arc::new(EnableCatalog::read(&connection).unwrap()));
+        let door = app
+            .world_mut()
+            .spawn((
+                FormId(1),
+                LoadDoor {
+                    ref_id: 1,
+                    destination: DoorDestination {
+                        destination_ref_id: 2,
+                        interior_cell_id: Some(3),
+                        worldspace_id: None,
+                        arrival_position: [0.0; 3],
+                        arrival_rotation: [0.0; 3],
+                    },
+                    label: "Invented door".into(),
+                    auto_load: false,
+                    outward: None,
+                },
+                Visibility::Inherited,
+            ))
+            .id();
+        app.update();
+        app.world_mut().trigger(SetReferenceEnabled {
+            reference: 1,
+            enabled: false,
+        });
+        app.world_mut().flush();
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().get::<Visibility>(door),
+            Some(&Visibility::Hidden)
+        );
+        let mesh = app
+            .world_mut()
+            .spawn((
+                Mesh3d(Handle::default()),
+                Visibility::Visible,
+                ChildOf(door),
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(mesh),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<InheritedVisibility>(mesh),
+            Some(&InheritedVisibility::HIDDEN)
+        );
+        app.world_mut().trigger(SetReferenceEnabled {
+            reference: 1,
+            enabled: true,
+        });
+        app.world_mut().flush();
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(door),
+            Some(&Visibility::Inherited)
+        );
+        assert_ne!(
+            app.world().get::<Visibility>(mesh),
+            Some(&Visibility::Hidden)
+        );
+    }
 }
 
 /// Whether a load door's model is drawn, from the four facts that decide it: whether it is an

@@ -25,6 +25,18 @@ anchors that reference's state. Descendants follow it unless they have their own
 override. Repeating the same effective state does no resolution or visibility work. Changes
 and their nested observer commands are applied through Bevy's normal command flush points.
 
+The observer is installed for ordinary world streaming as well as cluster mode. The API requires
+a certified cluster enable catalog: before the first bind, it queues the last request per reference.
+Binding applies explicit parent and child overrides together, then reconciles live roots and
+publishes effective changes to cluster suppression. The first writer call warns once about scope.
+Indexed live roots can be hidden and restored after binding, including interiors. Creating a
+missing stock body is supported only for cluster-owned exterior refused static scenery. Other
+missing bodies require an ordinary cell commit; a non-cluster run without a catalog cannot apply
+queued state. This is an explicit boundary, not a general gameplay spawn or script implementation.
+
+Visibility writers use the enable gate as the authority and retain their latest requested policy
+while disabled, so restoring enable state does not resurrect an obsolete portal or light policy.
+
 Equal winning inputs preserve overrides across recertification, even when a new package owns
 the catalog allocation. Changed inputs reset the session cache and reconcile indexed surviving
 roots once. Entity unload and reload do not clear overrides.
@@ -48,6 +60,11 @@ cannot erase them. The existing partial-source selector remains authoritative: a
 reference instantiates only its refused source occurrences, while a wholly refused reference
 uses the ordinary complete model. Enabling does not recreate owned geometry as stock.
 
+Reversible cluster suppression is projected through the certificate's mapped-reference index,
+including partly mapped and not-yet-resident references. Toggling a wholly unclustered reference
+still gates its stock roots, but does not invalidate cluster selection masks or the readiness
+catalog. Replacing the certificate reprojects retained suppression even if enable inputs match.
+
 ## Diagnostics and limits
 
 The existing `cluster/undrawn_static_geometry` and `cluster/undrawn_runtime_refused` counters
@@ -56,8 +73,12 @@ runtime references no longer contribute to the missing-route count. Unresolved r
 is conservatively reported as a missing route rather than being called disabled.
 
 `cluster/runtime_refused_hidden_by_state` and `cluster/runtime_refused_unresolved_state` are
-current gauges for model-bearing, runtime-refused static scenery beyond the loaded grid.
-They update when demand or state changes. The inventory diagnoses route selection; it does
+sampled gauges for model-bearing, runtime-refused static scenery beyond the loaded grid
+at the snapshot's center.
+Inventory snapshots are taken at first world qualification and when effective enable state
+changes relative to that world's last sample. Returning to a world restores its own cached
+gauges, refreshing once if state changed while away. Demand-only cell crossings perform zero inventory walks; the cumulative
+`cluster/stock_inventory_walks` counter measures this work. The inventory diagnoses route selection; it does
 not certify completed asset IO or render readiness. A complete state-coverage claim also
 requires the unresolved-state gauge to be zero.
 
