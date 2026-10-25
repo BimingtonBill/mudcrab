@@ -2816,6 +2816,12 @@ fn advance_door_states(
     }
 }
 
+type DoorLeafVisibility = (
+    &'static DoorLeaf,
+    &'static mut Visibility,
+    Option<&'static mut crate::world::reference_state::ReferenceVisibilityGate>,
+);
+
 /// Draws or hides a door's leaves for the state the door is in.
 ///
 /// The swing is what the player asked to see, so the leaves are drawn the whole time the `Open`
@@ -2831,9 +2837,9 @@ fn advance_door_states(
 fn update_door_leaves(
     doors: Query<(&DoorState, Option<&DoorAnimation>)>,
     held: Query<(), With<CrossingHeld>>,
-    mut leaves: Query<(&DoorLeaf, &mut Visibility)>,
+    mut leaves: Query<DoorLeafVisibility>,
 ) {
-    for (leaf, mut visibility) in &mut leaves {
+    for (leaf, mut visibility, gate) in &mut leaves {
         let Ok((state, animation)) = doors.get(leaf.door) else {
             // The door is gone (its cell unloaded): its leaves are going with it.
             continue;
@@ -2843,6 +2849,7 @@ fn update_door_leaves(
         } else {
             Visibility::Hidden
         };
+        let wanted = crate::world::reference_state::effective_visibility(wanted, gate);
         if *visibility != wanted {
             *visibility = wanted;
         }

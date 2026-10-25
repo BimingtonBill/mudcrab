@@ -573,6 +573,7 @@ type CopyNodeQuery<'world, 'state> = Query<
         Option<&'static RenderLayers>,
         Option<&'static DoorLeaf>,
         Has<DoorCopyPart>,
+        Option<&'static mut crate::world::reference_state::ReferenceVisibilityGate>,
     ),
 >;
 
@@ -726,11 +727,13 @@ pub(crate) fn pose_door_copies(
         // The driver's own drawing state on the root: a door the portal hides whole (a door with
         // nothing to animate that was opened) is hidden in its copy too.
         let driver_visibility = nodes.get(driver).map(|(_, _, visibility, ..)| *visibility);
-        if let (Ok(wanted), Ok((_, _, mut visibility, ..))) =
+        if let (Ok(wanted), Ok((_, _, mut visibility, _, _, _, gate))) =
             (driver_visibility, nodes.get_mut(root))
-            && *visibility != wanted
         {
-            *visibility = wanted;
+            let wanted = crate::world::reference_state::effective_visibility(wanted, gate);
+            if *visibility != wanted {
+                *visibility = wanted;
+            }
         }
         // The nodes of the driver's model that its animation moves, by id: the leaf.
         let moved: HashSet<AnimationTargetId> = std::iter::once(driver)
@@ -846,7 +849,7 @@ impl CopyWalk<'_, '_, '_> {
         if target.is_some() {
             count.nodes += 1;
         }
-        let Ok((is_mesh, _, _, layers, leaf, part)) = nodes.get(entity) else {
+        let Ok((is_mesh, _, _, layers, leaf, part, _)) = nodes.get(entity) else {
             return;
         };
         let (has_layers, has_leaf, has_part) = (layers.is_some(), leaf.is_some(), part);
@@ -900,23 +903,26 @@ impl CopyWalk<'_, '_, '_> {
             } else {
                 Visibility::Hidden
             };
-            if let Ok((_, _, mut visibility, ..)) = nodes.get_mut(entity)
-                && *visibility != wanted
-            {
-                *visibility = wanted;
+            if let Ok((_, _, mut visibility, _, _, _, gate)) = nodes.get_mut(entity) {
+                let wanted = crate::world::reference_state::effective_visibility(wanted, gate);
+                if *visibility != wanted {
+                    *visibility = wanted;
+                }
             }
         } else if let Some(paired) = paired
             && paired != entity
             && let Ok([copy_node, source_node]) = nodes.get_many_mut([entity, paired])
         {
-            let (_, mut copy_transform, mut copy_visibility, ..) = copy_node;
+            let (_, mut copy_transform, mut copy_visibility, _, _, _, gate) = copy_node;
             let (_, source_transform, source_visibility, ..) = source_node;
             if *copy_transform != *source_transform {
                 *copy_transform = *source_transform;
             }
             // The leaf's drawing state is the driver's (`update_door_leaves` writes it there).
-            if leaf_node && *copy_visibility != *source_visibility {
-                *copy_visibility = *source_visibility;
+            let wanted =
+                crate::world::reference_state::effective_visibility(*source_visibility, gate);
+            if leaf_node && *copy_visibility != wanted {
+                *copy_visibility = wanted;
             }
         }
         let pose = match parent {

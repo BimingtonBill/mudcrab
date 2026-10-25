@@ -462,6 +462,7 @@ type BudgetLight = (
     &'static mut Visibility,
     Option<&'static RenderLayers>,
     &'static mut PointLight,
+    Option<&'static mut crate::world::reference_state::ReferenceVisibilityGate>,
 );
 
 /// Enables the [`ENABLED_LIGHT_BUDGET`] lights nearest the camera among those a view renders, and
@@ -500,8 +501,10 @@ fn budget_lights(
     settings: Option<Res<crate::settings::RenderingSettings>>,
 ) {
     if config.is_some_and(|config| !config.lights) {
-        for (_, _, mut visibility, _, _) in &mut lights {
-            visibility.set_if_neq(Visibility::Hidden);
+        for (_, _, mut visibility, _, _, gate) in &mut lights {
+            let wanted =
+                crate::world::reference_state::effective_visibility(Visibility::Hidden, gate);
+            visibility.set_if_neq(wanted);
         }
         budget.chosen_at = None;
         return;
@@ -513,7 +516,7 @@ fn budget_lights(
         budget.chosen_at = None;
     }
     if let Some(settings) = settings.as_deref() {
-        for (_, _, _, _, mut light) in &mut lights {
+        for (_, _, _, _, mut light, _) in &mut lights {
             if light.shadow_maps_enabled != settings.point_light_shadows {
                 light.shadow_maps_enabled = settings.point_light_shadows;
             }
@@ -543,9 +546,9 @@ fn budget_lights(
     let mut spawned = 0usize;
     let mut eligible = 0usize;
     let mut joined = false;
-    for (entity, _, _, layers, _) in lights.iter() {
+    for (entity, _, _, layers, _, gate) in lights.iter() {
         spawned += 1;
-        if counts_toward_budget(layers, doorway_drawn) {
+        if gate.is_none() && counts_toward_budget(layers, doorway_drawn) {
             eligible += 1;
             joined |= !budget.chosen.contains(&entity);
         }
@@ -573,8 +576,8 @@ fn budget_lights(
     // doorway drawn there is one list and the whole budget, exactly as before the split.
     let mut active: Vec<(Entity, f32)> = Vec::new();
     let mut destination: Vec<(Entity, f32)> = Vec::new();
-    for (entity, transform, _, layers, _) in lights.iter() {
-        if !counts_toward_budget(layers, doorway_drawn) {
+    for (entity, transform, _, layers, _, gate) in lights.iter() {
+        if gate.is_some() || !counts_toward_budget(layers, doorway_drawn) {
             continue;
         }
         let position = transform.translation();
@@ -602,12 +605,13 @@ fn budget_lights(
         .map(|(entity, _)| *entity)
         .collect();
 
-    for (entity, _, mut visibility, _, _) in &mut lights {
+    for (entity, _, mut visibility, _, _, gate) in &mut lights {
         let wanted = if enabled.contains(&entity) {
             Visibility::Inherited
         } else {
             Visibility::Hidden
         };
+        let wanted = crate::world::reference_state::effective_visibility(wanted, gate);
         if *visibility != wanted {
             *visibility = wanted;
         }
@@ -624,7 +628,7 @@ fn budget_lights(
     if let Some((nearest, distance_squared)) = active.first().or(destination.first()) {
         let (range, intensity) = lights
             .get(*nearest)
-            .map(|(_, _, _, _, light)| (light.range, light.intensity))
+            .map(|(_, _, _, _, light, _)| (light.range, light.intensity))
             .unwrap_or_default();
         debug!(
             spawned,
@@ -1594,6 +1598,122 @@ mod tests {
         move_camera(&mut app, Vec3::new(300.0, 0.0, 0.0));
         assert_eq!(visibility_at(&mut app, -10_000.0), Visibility::Hidden);
         assert_eq!(visibility_at(&mut app, 10_001.0), Visibility::Inherited);
+    }
+
+    #[test]
+    fn gated_budget_lights_release_slots_and_rejoin_without_camera_movement() {
+        use crate::world::reference_state::ReferenceVisibilityGate;
+        let mut app = budget_app(Vec3::ZERO, [Vec3::X, Vec3::X * 2.0]);
+        app.insert_resource(crate::settings::RenderingSettings {
+            point_light_budget: 1,
+            ..Default::default()
+        });
+        app.update();
+        let nearest = enabled_lights(&mut app)[0];
+        app.world_mut().entity_mut(nearest).insert((
+            ReferenceVisibilityGate(Some(Visibility::Inherited)),
+            Visibility::Hidden,
+        ));
+        app.update();
+        let selected = enabled_lights(&mut app);
+        assert_eq!(selected.len(), 1, "disabled lights must release their slot");
+        assert_ne!(selected[0], nearest);
+        app.world_mut()
+            .entity_mut(nearest)
+            .remove::<ReferenceVisibilityGate>();
+        app.update();
+        assert_eq!(enabled_lights(&mut app), [nearest]);
+    }
+
+    #[test]
+    fn gated_budget_global_lights_off_remembers_hidden_policy() {
+        use crate::world::reference_state::ReferenceVisibilityGate;
+        let mut app = budget_app(Vec3::ZERO, [Vec3::X]);
+        let light = enabled_lights(&mut app)[0];
+        app.world_mut().entity_mut(light).insert((
+            ReferenceVisibilityGate(Some(Visibility::Inherited)),
+            Visibility::Hidden,
+        ));
+        app.insert_resource(crate::config::EngineConfig {
+            lights: false,
+            ..Default::default()
+        });
+        app.update();
+        assert_eq!(
+            app.world().get::<ReferenceVisibilityGate>(light).unwrap().0,
+            Some(Visibility::Hidden),
+            "reenabling must restore the current global lights-off policy"
+        );
+    }
+
+    #[test]
+    fn gated_budget_changes_survive_reenable_with_stationary_camera() {
+        use crate::world::{
+            components::FormId,
+            reference_state::{self, EnableCatalog, ReferenceEnableState, SetReferenceEnabled},
+        };
+        let mut positions: Vec<_> = (0..63)
+            .map(|index| Vec3::new(1000.0 + index as f32, 0.0, 0.0))
+            .collect();
+        positions.extend([
+            Vec3::new(-10_000.0, 0.0, 0.0),
+            Vec3::new(10_001.0, 0.0, 0.0),
+        ]);
+        let mut app = budget_app(Vec3::ZERO, positions);
+        reference_state::install(&mut app);
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE \"references\" (id INTEGER PRIMARY KEY); INSERT INTO \"references\" VALUES (1),(2);").unwrap();
+        app.world_mut()
+            .resource_mut::<ReferenceEnableState>()
+            .bind(std::sync::Arc::new(
+                EnableCatalog::read(&connection).unwrap(),
+            ));
+        let mut query = app
+            .world_mut()
+            .query_filtered::<(Entity, &Transform), With<SkyrimLight>>();
+        let left = query
+            .iter(app.world())
+            .find(|(_, pose)| pose.translation.x == -10_000.0)
+            .unwrap()
+            .0;
+        let right = query
+            .iter(app.world())
+            .find(|(_, pose)| pose.translation.x == 10_001.0)
+            .unwrap()
+            .0;
+        for (entity, reference) in [(left, 1), (right, 2)] {
+            app.world_mut().entity_mut(entity).insert(FormId(reference));
+            app.world_mut().trigger(SetReferenceEnabled {
+                reference,
+                enabled: false,
+            });
+            app.world_mut().flush();
+        }
+        move_camera(&mut app, Vec3::new(300.0, 0.0, 0.0));
+        assert_eq!(
+            app.world().get::<Visibility>(left),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(right),
+            Some(&Visibility::Hidden)
+        );
+        for reference in [1, 2] {
+            app.world_mut().trigger(SetReferenceEnabled {
+                reference,
+                enabled: true,
+            });
+            app.world_mut().flush();
+        }
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(left),
+            Some(&Visibility::Hidden)
+        );
+        assert_eq!(
+            app.world().get::<Visibility>(right),
+            Some(&Visibility::Inherited)
+        );
     }
 
     /// A cell that streams in while the camera stands still has lights too, and the player walked

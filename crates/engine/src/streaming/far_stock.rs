@@ -107,6 +107,8 @@ pub(crate) struct FarStock {
     enable_revision: Option<u64>,
     fallback_references: BTreeSet<u32>,
     counted_worlds: HashSet<u32>,
+    /// Last qualified counts per world and enable revision; crossings reuse these snapshots.
+    inventory: HashMap<u32, (Option<u64>, StockReferenceCounts)>,
     qualification_pending: bool,
     measurements: FarStockMeasurements,
 }
@@ -201,7 +203,7 @@ fn reference_enabled(
     )
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RadiusCounts {
     inside: usize,
     beyond: usize,
@@ -217,7 +219,7 @@ impl RadiusCounts {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct StockReferenceCounts {
     refused: RadiusCounts,
     look_refused: RadiusCounts,
@@ -232,7 +234,7 @@ struct StockReferenceCounts {
     distant_runtime_stock: usize,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct UndrawnReferenceCounts {
     look: usize,
     runtime: usize,
@@ -439,6 +441,7 @@ fn plan(
             far.enable_revision = None;
             far.fallback_references.clear();
             far.counted_worlds.clear();
+            far.inventory.clear();
             far.qualification_pending = false;
         }
         return;
@@ -454,15 +457,15 @@ fn plan(
             if let Some(proxies) = enable.proxies.as_mut() {
                 proxies.clear_enable_overrides();
             }
-            commands.queue(|world: &mut World| {
-                world.resource_scope(|world, mut state: Mut<ReferenceEnableState>| {
-                    state.reconcile_roots(world);
-                });
-            });
+            commands.queue(crate::world::reference_state::reconcile_bound_roots);
+        }
+        if let Some(proxies) = enable.proxies.as_mut() {
+            proxies.reproject_enable_overrides(&package.0);
         }
         far.fallback_revision = None;
         far.fallback_references.clear();
         far.counted_worlds.clear();
+        far.inventory.clear();
     }
     let enable_revision = enable.state.as_deref().map(|state| state.revision());
     let enable_changed = far.enable_revision != enable_revision;
@@ -558,37 +561,41 @@ fn plan(
             }
         }
     }
-    // State gauges follow changed demand/state only; no settled-world inventory scan is added.
+    // Inventory is a qualification/state snapshot, not work to repeat at every cell crossing.
     let counts = demand
         .filter(|_| far.fallback_revision.is_some())
         .map(|demand| {
-            stock_reference_counts(
+            if let Some((revision, counts)) = far.inventory.get(&demand.world)
+                && *revision == enable_revision
+            {
+                return *counts;
+            }
+            if let Some(profiler) = profiler.as_deref_mut() {
+                profiler.increment("cluster/stock_inventory_walks", 1);
+            }
+            let counts = stock_reference_counts(
                 &package.0,
                 demand,
                 stream_radius,
                 &far.fallback_references,
                 &desired,
                 enable.state.as_deref(),
-            )
+            );
+            far.inventory
+                .insert(demand.world, (enable_revision, counts));
+            counts
         });
     if config.cluster_own_statics
         && let Some(counts) = &counts
+        && let Some(profiler) = profiler.as_deref_mut()
     {
-        if let Some(profiler) = profiler.as_deref_mut() {
-            profiler.set_gauge(
-                "cluster/runtime_refused_hidden_by_state",
-                counts.hidden_by_state as f64,
-            );
-            profiler.set_gauge(
-                "cluster/runtime_refused_unresolved_state",
-                counts.unresolved_state as f64,
-            );
-        }
-        info!(
-            undrawn_runtime_refused = counts.undrawn.runtime,
-            runtime_refused_hidden_by_state = counts.hidden_by_state,
-            runtime_refused_unresolved_state = counts.unresolved_state,
-            "runtime-refused static draw paths after demand or enable-state change"
+        profiler.set_gauge(
+            "cluster/runtime_refused_hidden_by_state",
+            counts.hidden_by_state as f64,
+        );
+        profiler.set_gauge(
+            "cluster/runtime_refused_unresolved_state",
+            counts.unresolved_state as f64,
         );
     }
     // Inventory follows the actual stock plan: refusal labels alone cannot prove a missing route.

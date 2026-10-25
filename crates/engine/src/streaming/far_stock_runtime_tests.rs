@@ -41,6 +41,165 @@ fn set(app: &mut App, reference: u32, enabled: bool) {
 }
 
 #[test]
+fn demand_only_changes_do_no_inventory_walks_after_first_qualification() {
+    let fixture = fixture();
+    let mut app = app(&fixture);
+    let walks = |app: &App| {
+        reported_undrawn_paths(app, fixture.directory.path());
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.directory.path().join("cpu-spans.json")).unwrap(),
+        )
+        .unwrap();
+        report["counters"]["cluster/stock_inventory_walks"]
+            .as_u64()
+            .unwrap_or(0)
+    };
+    app.update();
+    assert_eq!(walks(&app), 1);
+    let generation = app.world().resource::<FarStock>().generation;
+    for _ in 0..3 {
+        app.world_mut().resource_mut::<RenderOrigin>().0.x += 1;
+        app.update();
+    }
+    assert!(app.world().resource::<FarStock>().generation > generation);
+    assert_eq!(
+        walks(&app),
+        1,
+        "cell crossings must not inventory the world"
+    );
+    set(&mut app, 0x110, false);
+    assert_eq!(
+        walks(&app),
+        2,
+        "an effective enable change refreshes the inventory"
+    );
+    app.update();
+    assert_eq!(walks(&app), 2);
+}
+
+#[test]
+fn pre_bind_queued_disable_suppresses_owned_instances_at_first_qualification() {
+    let fixture = fixture();
+    assert!(fixture.package.reference(0x100).is_some());
+    let mut app = complete_plan_app(&fixture, exterior(0x70, IVec2::new(200, 0)));
+    reference_state::install(&mut app);
+    crate::cluster::runtime_state::install(&mut app);
+    app.world_mut()
+        .resource_mut::<EngineConfig>()
+        .cluster_own_statics = true;
+    app.world_mut()
+        .resource_mut::<SourceFallbackDemand>()
+        .update(Some(&fixture.package), BTreeSet::new());
+    app.world_mut().trigger(SetReferenceEnabled {
+        reference: 0x100,
+        enabled: false,
+    });
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<ReferenceEnableState>()
+            .enabled(0x100),
+        Some(false)
+    );
+    assert!(
+        app.world()
+            .resource::<crate::cluster::runtime_state::RuntimeReferenceState>()
+            .contains(0x100)
+    );
+    set(&mut app, 0x100, true);
+    assert!(
+        !app.world()
+            .resource::<crate::cluster::runtime_state::RuntimeReferenceState>()
+            .contains(0x100)
+    );
+}
+
+#[test]
+fn inventory_snapshots_restore_per_world_without_walking_and_refresh_after_away_state_change() {
+    let fixture = fixture();
+    let mut app = app(&fixture);
+    let snapshot = |app: &App| {
+        reported_undrawn_paths(app, fixture.directory.path());
+        let report: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.directory.path().join("cpu-spans.json")).unwrap(),
+        )
+        .unwrap();
+        (
+            report["counters"]["cluster/stock_inventory_walks"]
+                .as_u64()
+                .unwrap(),
+            report["gauges"]["cluster/runtime_refused_hidden_by_state"]
+                .as_f64()
+                .unwrap(),
+        )
+    };
+    app.update();
+    assert_eq!(snapshot(&app), (1, 2.0));
+    app.world_mut().resource_mut::<EngineConfig>().worldspace_id = 0x71;
+    app.update();
+    assert_eq!(snapshot(&app), (2, 0.0));
+    app.world_mut().resource_mut::<EngineConfig>().worldspace_id = 0x70;
+    app.update();
+    assert_eq!(
+        snapshot(&app),
+        (2, 2.0),
+        "return restores this world's cached snapshot"
+    );
+    app.world_mut().resource_mut::<EngineConfig>().worldspace_id = 0x71;
+    app.update();
+    set(&mut app, 0x109, true);
+    assert_eq!(snapshot(&app), (3, 0.0));
+    app.world_mut().resource_mut::<EngineConfig>().worldspace_id = 0x70;
+    app.update();
+    assert_eq!(
+        snapshot(&app),
+        (4, 1.0),
+        "state changed since this world's snapshot"
+    );
+}
+
+#[test]
+fn equal_enable_inputs_reproject_suppression_when_certificate_membership_changes() {
+    let mapped = Fixture::new();
+    let unmapped = Fixture::from_directory(published_for_legacy_threshold_inventory());
+    assert!(mapped.package.reference(0x100).is_some());
+    assert!(unmapped.package.reference(0x100).is_none());
+    let mut app = app(&mapped);
+    crate::cluster::runtime_state::install(&mut app);
+    app.update();
+    set(&mut app, 0x100, false);
+    assert!(
+        app.world()
+            .resource::<crate::cluster::runtime_state::RuntimeReferenceState>()
+            .contains(0x100)
+    );
+    let enable_revision = app.world().resource::<ReferenceEnableState>().revision();
+    for (fixture, suppressed) in [(&unmapped, false), (&mapped, true)] {
+        app.insert_resource(ValidatedPackage(fixture.package.clone()));
+        app.world_mut()
+            .resource_mut::<SourceFallbackDemand>()
+            .update(Some(&fixture.package), BTreeSet::new());
+        app.update();
+        assert_eq!(
+            app.world().resource::<ReferenceEnableState>().revision(),
+            enable_revision
+        );
+        assert_eq!(
+            app.world()
+                .resource::<ReferenceEnableState>()
+                .enabled(0x100),
+            Some(false)
+        );
+        assert_eq!(
+            app.world()
+                .resource::<crate::cluster::runtime_state::RuntimeReferenceState>()
+                .contains(0x100),
+            suppressed
+        );
+    }
+}
+
+#[test]
 fn distant_enable_parent_and_opposite_follow_runtime_state_without_settled_replanning() {
     let fixture = fixture();
     let mut app = app(&fixture);

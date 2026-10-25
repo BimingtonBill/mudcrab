@@ -703,6 +703,14 @@ fn measure_threshold_sun(
     };
 }
 
+type SpillVisibility = (
+    &'static SpillLight,
+    &'static mut Transform,
+    &'static mut SpotLight,
+    &'static mut Visibility,
+    Option<&'static mut crate::world::reference_state::ReferenceVisibilityGate>,
+);
+
 #[allow(clippy::too_many_arguments)]
 fn update_spill(
     time: Res<Time>,
@@ -721,7 +729,7 @@ fn update_spill(
     >,
     suns: Query<(&GlobalTransform, &DirectionalLight, Option<&RenderLayers>)>,
     shade: Option<Res<ThresholdSun>>,
-    mut spills: Query<(&SpillLight, &mut Transform, &mut SpotLight, &mut Visibility)>,
+    mut spills: Query<SpillVisibility>,
     mut memory: ResMut<SpillMemory>,
 ) {
     let doorway = portal.as_deref().and_then(PortalState::open_doorway);
@@ -788,19 +796,23 @@ fn update_spill(
     if lit.is_none() {
         *memory = SpillMemory::default();
     }
-    for (role, mut transform, mut light, mut visibility) in &mut spills {
+    for (role, mut transform, mut light, mut visibility, gate) in &mut spills {
         let wanted = lit.map(|(into_destination, into_source)| match role {
             SpillLight::IntoDestination => into_destination,
             SpillLight::IntoSource => into_source,
         });
         let Some(spill) = wanted.filter(|spill| spill.intensity > 0.0) else {
-            if *visibility != Visibility::Hidden {
-                *visibility = Visibility::Hidden;
+            let wanted =
+                crate::world::reference_state::effective_visibility(Visibility::Hidden, gate);
+            if *visibility != wanted {
+                *visibility = wanted;
             }
             continue;
         };
-        if *visibility != Visibility::Inherited {
-            *visibility = Visibility::Inherited;
+        let visible =
+            crate::world::reference_state::effective_visibility(Visibility::Inherited, gate);
+        if *visibility != visible {
+            *visibility = visible;
         }
         if *transform != spill.transform {
             *transform = spill.transform;
