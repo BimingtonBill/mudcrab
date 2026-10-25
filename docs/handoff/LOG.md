@@ -51,7 +51,7 @@
   (both forced; cull reuse/shadows forced; combined reuse). All guards quiet,
   112,278 entities / 35,713 meshes, common 30-second frame denominator. Difference
   **1.428357 ms**, one-sequence inference. Eight settled dispatches zero; cascades
-  0�2 zero renders. Standing WaterMaterial keeps cascade 3 fresh. This is not FPS
+  0–2 zero renders. Standing WaterMaterial keeps cascade 3 fresh. This is not FPS
   acceptance; legacy performance verdicts still fail.
 - Native standing equality: **39 raw pairs**, 1,571,992,744 bytes per lane across
   five cull views, four maps and ten depth/normal/motion/HDR camera attachments.
@@ -2714,7 +2714,7 @@ chose to WAIT on it for base types (Whiterun's water); ours (renderable-base-typ
 `feedback-self-contained-asks`, `feedback-path-only-commits`):** **posts to realfakenerd's
 upstream are PAUSED** (comments, issues, PRs, bot replies; pushing to an open PR head counts).
 The user's own fork may be updated freely. Every ask to the user is self-contained and labelled
-🤖 AI / 👤 human / 🚫 no message. Commit named paths only in the shared checkout.
+�– AI / 👤 human / 🚫 no message. Commit named paths only in the shared checkout.
 
 **Prepared, held:** texts 11 prepass, 12 sky-dome, 13 sky-fog, 18 LOD issue (the user said yes to
 the issue before pausing); first sends when allowed: cell-name-nul, io-pool-stack, parser-never-panic,
