@@ -152,6 +152,11 @@ fn run_with_space(
     let source = source_lock.asset_dir();
     let (raw_manifest, manifest, incomplete) = preflight(source)?;
     ensure!(
+        manifest.geometry.geometry_mode != shared::geometry::GeometryMode::Cluster
+            || options.triangle_threshold == 1,
+        "cluster geometry requires --triangle-threshold 1; small primitives have no baked draw path"
+    );
+    ensure!(
         options.terrain || options.terrain_sources.is_none(),
         "--terrain-sources requires --terrain"
     );

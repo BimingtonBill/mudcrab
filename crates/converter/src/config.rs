@@ -95,7 +95,8 @@ pub struct PipelineConfig {
     /// derives terrain. `auto` keeps a baked base and derives the historical optional overlay.
     #[serde(default)]
     pub lod_mode: crate::cluster::LodMode,
-    /// Smallest primitive, in triangles, that gets cluster LOD payloads.
+    /// Smallest primitive, in triangles, for the optional auto-mode overlay.
+    /// Forced cluster mode resolves this to one because it has no baked size-refusal path.
     #[serde(default = "default_cluster_triangle_threshold")]
     pub cluster_triangle_threshold: u32,
     /// Build the stand-in baked object chunks beside the cluster stage, for timing only.

@@ -180,6 +180,20 @@ fn output(options: &DeriveOptions) -> PathBuf {
 }
 
 #[test]
+fn cluster_only_base_rejects_size_refusal_before_creating_a_package() {
+    let fixture = fixture();
+    mutate_manifest(&fixture, |raw| {
+        raw["geometry_mode"] = serde_json::json!("cluster");
+        raw["cluster_package"] = serde_json::json!("derived/clusters-0123456789abcdef");
+    });
+    let error = run_with_space(&fixture.options, probe(), |_| Ok(u64::MAX))
+        .err()
+        .expect("cluster-only bases cannot lose small primitives");
+    assert!(format!("{error:#}").contains("cluster geometry requires --triangle-threshold 1"));
+    assert!(!fixture.options.source.join("derived").exists());
+}
+
+#[test]
 fn real_derive_hashes_every_base_file_and_preserves_foreign_and_unknown_metadata() {
     let fixture = fixture();
     let source = &fixture.options.source;

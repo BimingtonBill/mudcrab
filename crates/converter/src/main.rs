@@ -1606,7 +1606,8 @@ The adapter is probed once and recorded; offline derivation runs even
 when an auto probe reports missing runtime features. A derivation error leaves the base valid
 and prints the command to retry just the overlay.
 --cluster-terrain adds terrain clusters and their dependency metadata in auto mode; requires cluster/auto LOD.
---cluster-triangle-threshold sets the smallest primitive that gets clusters (default 1024).
+--cluster-triangle-threshold sets the auto overlay's minimum primitive size (default 1024).
+Forced cluster mode always uses 1 so every supported nonempty primitive has a draw path.
 --cluster-bench-baked is refused in full conversions. Use standalone cluster-stage --bench-baked
 against the published base for the measurement-only baked comparison.
 

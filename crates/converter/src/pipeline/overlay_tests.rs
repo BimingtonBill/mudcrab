@@ -219,6 +219,70 @@ async fn cluster_and_auto_conversions_publish_a_clusterless_base_and_one_accepte
     }
 }
 
+#[test]
+fn cluster_mode_clusters_small_primitives_and_records_the_resolved_threshold() {
+    // The shared producer/consumer fixture contains a supported 18-triangle STAT model.
+    let base = crate::test_support::SyntheticBase::complete();
+    let mut settings = PipelineConfig::new(base.path(), base.path());
+    settings.lod_mode = LodMode::Cluster;
+    assert_eq!(
+        settings.cluster_triangle_threshold,
+        DEFAULT_TRIANGLE_THRESHOLD
+    );
+    let manifest_path = base.path().join("conversion-manifest.json");
+    let mut manifest = ConversionManifest::load(&manifest_path).unwrap();
+    manifest.geometry = crate::cluster::geometry_manifest(&settings);
+    manifest.save(&manifest_path).unwrap();
+    crate::cluster::derive_after_publish(
+        &settings,
+        base.path(),
+        None,
+        crate::cluster::fixture_probe(&settings),
+        &PostPublish::FIXTURE,
+    )
+    .unwrap();
+    let overlay = sole_overlay(base.path());
+    let database = Connection::open(overlay.join("clusters.db")).unwrap();
+    let threshold: u32 = database
+        .query_row("SELECT triangle_threshold FROM cluster_build", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        threshold, 1,
+        "cluster mode must own every supported primitive"
+    );
+    let rejected: u64 = database
+        .query_row(
+            "SELECT count(*) FROM cluster_reference_coverage WHERE reason = 'below_triangle_threshold'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rejected, 0);
+    let instances: u64 = database
+        .query_row("SELECT count(*) FROM cluster_instance_map", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        instances > 0,
+        "small fixture primitives must actually be clustered"
+    );
+    let small_meshes: u64 = database
+        .query_row(
+            "SELECT count(*) FROM cluster_meshes WHERE source_triangles > 0 AND source_triangles < ?1",
+            [DEFAULT_TRIANGLE_THRESHOLD],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(small_meshes > 0);
+    let metadata = shared::cluster_overlay::read_metadata(&overlay).unwrap();
+    assert_eq!(metadata.build_settings.triangle_threshold, 1);
+    let geometry = shared::geometry::GeometryManifest::load(base.path()).unwrap();
+    assert_eq!(base.path().join(geometry.cluster_package.unwrap()), overlay);
+}
+
 #[tokio::test]
 async fn cluster_without_native_lod_origin_derives_cell_minima_and_admits_terrain() {
     let world = world(true);
@@ -616,7 +680,7 @@ async fn cluster_conversion_omits_baked_products_and_binds_the_exact_tree_and_te
 }
 
 #[tokio::test]
-async fn conversion_mode_and_cluster_settings_changes_rebuild_generated_products_on_resume() {
+async fn conversion_mode_changes_rebuild_products_and_cluster_threshold_keeps_full_coverage() {
     let world = world(true);
     let baked = convert(config(&world, LodMode::Baked), PostPublish::FIXTURE)
         .await
@@ -646,8 +710,8 @@ async fn conversion_mode_and_cluster_settings_changes_rebuild_generated_products
     changed.discard_derived = true;
     convert(changed, PostPublish::FIXTURE).await.unwrap();
     let second = shared::geometry::GeometryManifest::load(&world.output).unwrap();
-    assert_ne!(first.cluster_package, second.cluster_package);
-    assert!(!world.output.join(first.cluster_package.unwrap()).exists());
+    assert_eq!(first.cluster_package, second.cluster_package);
+    assert!(world.output.join(first.cluster_package.unwrap()).exists());
     assert_accepted_overlay(&world.output);
     let mut baked = config(&world, LodMode::Baked);
     baked.discard_derived = true;
@@ -1036,7 +1100,7 @@ async fn terrain_derive_failure_keeps_only_the_raw_vfs_in_a_folder_a_resume_cann
     let text = format!("{:#}", failure.error);
     assert!(text.contains("injected derive failure"), "{text}");
     assert!(
-        text.contains("--triangle-threshold 2048 --jobs 2 --terrain --terrain-sources '"),
+        text.contains("--triangle-threshold 1 --jobs 2 --terrain --terrain-sources '"),
         "{text}"
     );
     let raw = quoted_after(&text, "--terrain-sources '");

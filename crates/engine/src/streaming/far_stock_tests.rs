@@ -3,7 +3,9 @@ use crate::{
     cluster::reader::{
         ReferencePose, StockRefusalClass,
         producer_fixture_tests::{
-            published_for_inventory, published_for_loader, published_for_runtime_inventory,
+            published_for_inventory, published_for_legacy_threshold_inventory,
+            published_for_loader, published_for_runtime_inventory,
+            published_for_runtime_only_inventory,
         },
     },
     streaming::{PendingModel, despawn_subtree, grid_translation, reference_placement},
@@ -1908,6 +1910,7 @@ fn owned_statics_desire_complete_initial_material_refusal_beyond_grid_with_exact
         std::collections::BTreeMap::from([(*record, true)]),
     );
     let mut app = complete_plan_app(&fixture, *key);
+    app.init_resource::<ProfilingState>();
     {
         let mut config = app.world_mut().resource_mut::<EngineConfig>();
         config.cluster_own_statics = true;
@@ -1926,6 +1929,10 @@ fn owned_statics_desire_complete_initial_material_refusal_beyond_grid_with_exact
             .get(&(cell_world(*key).unwrap(), row.form_id)),
         Some(key),
         "certified initial material refusal must inherit owned scenery reach"
+    );
+    assert_eq!(
+        reported_undrawn_paths(&app, fixture.directory.path()),
+        (Some(0), Some(0))
     );
 
     // Exercise the actual pre-instancing subset selector. A same-bounds new
@@ -2085,6 +2092,7 @@ fn stock_candidate_counts_split_world_exact_demand_and_deduplicate_fallback() {
         demand,
         0,
         &BTreeSet::from([0x100, 0x101, 0x103, 0x108]),
+        &HashMap::new(),
     );
     assert_eq!(
         counts,
@@ -2110,7 +2118,287 @@ fn stock_candidate_counts_split_world_exact_demand_and_deduplicate_fallback() {
                 inside: 1,
                 beyond: 2
             },
+            undrawn: UndrawnReferenceCounts {
+                look: 1,
+                other: 1,
+                ..default()
+            },
         }
+    );
+}
+
+fn reported_undrawn_paths(app: &App, directory: &std::path::Path) -> (Option<u64>, Option<u64>) {
+    let config = EngineConfig {
+        profile_output_dir: Some(directory.to_path_buf()),
+        ..default()
+    };
+    app.world()
+        .resource::<ProfilingState>()
+        .write_bundle(
+            &config,
+            &serde_json::json!({}),
+            None,
+            &crate::render::RendererMetrics::default(),
+            None,
+            None,
+        )
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("cpu-spans.json")).unwrap()).unwrap();
+    (
+        report["counters"]["cluster/undrawn_static_geometry"].as_u64(),
+        report["counters"]["cluster/undrawn_runtime_refused"].as_u64(),
+    )
+}
+
+#[derive(Clone, Default)]
+struct UndrawnLogs(Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>);
+
+impl<S: tracing::Subscriber> bevy::log::tracing_subscriber::Layer<S> for UndrawnLogs {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _: bevy::log::tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "engine::streaming::far_stock"
+            || !matches!(
+                *event.metadata().level(),
+                tracing::Level::ERROR | tracing::Level::WARN
+            )
+        {
+            return;
+        }
+        #[derive(Default)]
+        struct Fields(std::collections::BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        fields
+            .0
+            .insert("level".into(), event.metadata().level().to_string());
+        self.0.lock().unwrap().push(fields.0);
+    }
+}
+
+#[test]
+fn undrawn_paths_report_actual_missing_distant_static_paths_once_at_qualification() {
+    use bevy::log::tracing_subscriber::{Registry, prelude::*};
+    let fixture = Fixture::from_directory(published_for_runtime_inventory());
+    let key = exterior(0x70, IVec2::ZERO);
+    let mut app = complete_plan_app(&fixture, key);
+    app.init_resource::<ProfilingState>();
+    app.edit_schedule(Update, |schedule| {
+        schedule.set_executor(bevy::ecs::schedule::SingleThreadedExecutor::new());
+    });
+    {
+        let mut config = app.world_mut().resource_mut::<EngineConfig>();
+        config.cluster_own_statics = true;
+        config.stream_radius = 0;
+    }
+    let logs = UndrawnLogs::default();
+    tracing::subscriber::with_default(Registry::default().with(logs.clone()), || {
+        app.update();
+        assert_eq!(
+            reported_undrawn_paths(&app, fixture.directory.path()),
+            (None, None)
+        );
+        app.world_mut()
+            .resource_mut::<SourceFallbackDemand>()
+            .update(Some(&fixture.package), BTreeSet::new());
+        app.update();
+        // The distant look refusal has stock. Runtime and unparsed static refusals have none.
+        let far = app.world().resource::<FarStock>();
+        assert!(far.desired.contains_key(&(0x70, 0x103)));
+        assert!(!far.desired.contains_key(&(0x70, 0x105)));
+        assert!(!far.desired.contains_key(&(0x70, 0x109)));
+        assert_eq!(
+            reported_undrawn_paths(&app, fixture.directory.path()),
+            (Some(1), Some(1))
+        );
+        app.world_mut()
+            .resource_mut::<SourceFallbackDemand>()
+            .update(Some(&fixture.package), BTreeSet::new());
+        app.update();
+        app.world_mut().resource_mut::<RenderOrigin>().0 += IVec2::X;
+        app.update();
+        assert_eq!(
+            reported_undrawn_paths(&app, fixture.directory.path()),
+            (Some(1), Some(1))
+        );
+    });
+    let events = logs.0.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    let fields = events
+        .iter()
+        .find(|fields| fields.contains_key("undrawn_static_geometry"))
+        .unwrap();
+    for (name, expected) in [
+        ("undrawn_static_geometry", "1"),
+        ("level", "ERROR"),
+        ("look_refused", "0"),
+        ("other_refused", "1"),
+        ("unclassified_refused", "0"),
+    ] {
+        assert_eq!(
+            fields.get(name).map(String::as_str),
+            Some(expected),
+            "{name}"
+        );
+    }
+    let runtime = events
+        .iter()
+        .find(|fields| fields.contains_key("undrawn_runtime_refused"))
+        .unwrap();
+    assert_eq!(
+        runtime.get("undrawn_runtime_refused").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        runtime.get("runtime_refused").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(runtime.get("level").map(String::as_str), Some("WARN"));
+}
+
+#[test]
+fn undrawn_paths_leave_baked_mode_unmeasured() {
+    let fixture = Fixture::new();
+    let mut app = complete_plan_app(&fixture, exterior(0x70, IVec2::ZERO));
+    app.init_resource::<ProfilingState>();
+    app.world_mut()
+        .resource_mut::<SourceFallbackDemand>()
+        .update(Some(&fixture.package), BTreeSet::new());
+    app.update();
+    assert_eq!(
+        reported_undrawn_paths(&app, fixture.directory.path()),
+        (None, None)
+    );
+}
+
+#[test]
+fn undrawn_paths_record_zero_for_complete_runtime_feedback_without_stock_permission() {
+    let fixture = Fixture::from_directory(published_for_loader());
+    let (key, row) = fixture.rows.first().unwrap();
+    let mut app = complete_plan_app(&fixture, *key);
+    app.init_resource::<ProfilingState>();
+    {
+        let mut config = app.world_mut().resource_mut::<EngineConfig>();
+        config.cluster_own_statics = true;
+        config.stream_radius = 0;
+    }
+    app.world_mut().resource_mut::<RenderOrigin>().0 = grid(*key) + IVec2::new(200, 0);
+    app.world_mut()
+        .resource_mut::<SourceFallbackDemand>()
+        .update(Some(&fixture.package), BTreeSet::from([row.form_id]));
+    app.update();
+    assert!(
+        !app.world()
+            .resource::<FarStock>()
+            .desired
+            .contains_key(&(cell_world(*key).unwrap(), row.form_id))
+    );
+    assert_eq!(
+        reported_undrawn_paths(&app, fixture.directory.path()),
+        (Some(0), Some(0))
+    );
+}
+
+#[test]
+fn undrawn_paths_record_zero_when_every_refusal_is_inside_grid() {
+    let fixture = Fixture::from_directory(published_for_runtime_inventory());
+    let mut app = complete_plan_app(&fixture, exterior(0x70, IVec2::ZERO));
+    app.init_resource::<ProfilingState>();
+    app.world_mut()
+        .resource_mut::<EngineConfig>()
+        .cluster_own_statics = true;
+    app.world_mut().resource_mut::<EngineConfig>().stream_radius = 2;
+    app.world_mut()
+        .resource_mut::<SourceFallbackDemand>()
+        .update(Some(&fixture.package), BTreeSet::new());
+    app.update();
+    assert!(
+        app.world()
+            .resource::<FarStock>()
+            .desired
+            .contains_key(&(0x70, 0x105))
+    );
+    assert!(
+        app.world()
+            .resource::<FarStock>()
+            .desired
+            .contains_key(&(0x70, 0x109))
+    );
+    assert_eq!(
+        reported_undrawn_paths(&app, fixture.directory.path()),
+        (Some(0), Some(0))
+    );
+}
+
+#[test]
+fn undrawn_paths_report_legacy_threshold_holes_without_adding_stock() {
+    let fixture = Fixture::from_directory(published_for_legacy_threshold_inventory());
+    let key = exterior(0x70, IVec2::new(200, 0));
+    let mut app = complete_plan_app(&fixture, key);
+    app.init_resource::<ProfilingState>();
+    {
+        let mut config = app.world_mut().resource_mut::<EngineConfig>();
+        config.cluster_own_statics = true;
+        config.stream_radius = 0;
+    }
+    app.world_mut()
+        .resource_mut::<SourceFallbackDemand>()
+        .update(Some(&fixture.package), BTreeSet::new());
+    app.update();
+    let reference = fixture.package.placed_reference(0x100).unwrap();
+    assert_eq!(reference.coverage, CoverageState::Partial);
+    assert_eq!(reference.refusal_class, StockRefusalClass::Other);
+    assert!(fixture.package.reference(0x100).is_none());
+    assert!(
+        !app.world()
+            .resource::<FarStock>()
+            .desired
+            .contains_key(&(0x70, 0x100))
+    );
+    // One threshold hole and one unparsed static; the look refusal has stock.
+    assert_eq!(
+        reported_undrawn_paths(&app, fixture.directory.path()),
+        (Some(2), Some(0))
+    );
+}
+
+#[test]
+fn undrawn_paths_warn_without_a_geometry_error_for_runtime_only_refusals() {
+    use bevy::log::tracing_subscriber::{Registry, prelude::*};
+    let fixture = Fixture::from_directory(published_for_runtime_only_inventory());
+    let mut app = complete_plan_app(&fixture, exterior(0x70, IVec2::ZERO));
+    app.init_resource::<ProfilingState>();
+    app.edit_schedule(Update, |schedule| {
+        schedule.set_executor(bevy::ecs::schedule::SingleThreadedExecutor::new());
+    });
+    {
+        let mut config = app.world_mut().resource_mut::<EngineConfig>();
+        config.cluster_own_statics = true;
+        config.stream_radius = 0;
+    }
+    app.world_mut()
+        .resource_mut::<SourceFallbackDemand>()
+        .update(Some(&fixture.package), BTreeSet::new());
+    let logs = UndrawnLogs::default();
+    tracing::subscriber::with_default(Registry::default().with(logs.clone()), || app.update());
+    assert_eq!(
+        reported_undrawn_paths(&app, fixture.directory.path()),
+        (Some(0), Some(1))
+    );
+    let events = logs.0.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].get("level").map(String::as_str), Some("WARN"));
+    assert_eq!(
+        events[0].get("undrawn_runtime_refused").map(String::as_str),
+        Some("1")
     );
 }
 
@@ -2129,6 +2417,7 @@ fn complete_runtime_fallback_counts_as_one_distant_candidate() {
         },
         0,
         &BTreeSet::from([row.form_id]),
+        &HashMap::new(),
     );
     assert_eq!(
         counts,
@@ -2182,6 +2471,55 @@ fn only_model_bearing_look_refused_static_scenery_has_full_stock_reach() {
 }
 
 #[test]
+fn undrawn_paths_preserve_every_missing_class_and_exclude_supported_or_nonstatic_routes() {
+    let fixture = Fixture::new();
+    let (_, row, _) = fixture.selected();
+    let base = fixture.package.placed_reference(row.form_id).unwrap();
+    let mut counts = UndrawnReferenceCounts::default();
+    for class in [
+        StockRefusalClass::Look,
+        StockRefusalClass::Runtime,
+        StockRefusalClass::Other,
+        StockRefusalClass::None,
+    ] {
+        let mut reference = base.clone();
+        reference.refusal_class = class;
+        counts.observe(&reference, false, false);
+    }
+    assert_eq!(
+        counts,
+        UndrawnReferenceCounts {
+            look: 1,
+            runtime: 1,
+            other: 1,
+            unclassified: 1
+        }
+    );
+    assert_eq!(counts.static_geometry(), 3);
+    for (inside, has_stock, is_static, coverage, has_model) in [
+        (true, false, true, CoverageState::Partial, true),
+        (false, true, true, CoverageState::Partial, true),
+        (false, false, false, CoverageState::Partial, true),
+        (false, false, true, CoverageState::Complete, true),
+        (false, false, true, CoverageState::Partial, false),
+    ] {
+        let mut reference = base.clone();
+        reference.is_static_scenery = is_static;
+        reference.coverage = coverage;
+        if !has_model {
+            reference.model_path = None;
+        }
+        let mut excluded = UndrawnReferenceCounts::default();
+        excluded.observe(&reference, inside, has_stock);
+        assert_eq!(
+            excluded,
+            UndrawnReferenceCounts::default(),
+            "inside={inside}, stock={has_stock}, static={is_static}, coverage={coverage:?}, model={has_model}"
+        );
+    }
+}
+
+#[test]
 fn stock_inventory_counts_look_runtime_and_other_refusals_separately() {
     let fixture = Fixture::from_directory(published_for_runtime_inventory());
     let counts = stock_reference_counts(
@@ -2195,6 +2533,7 @@ fn stock_inventory_counts_look_runtime_and_other_refusals_separately() {
         },
         0,
         &BTreeSet::new(),
+        &HashMap::new(),
     );
     assert_eq!(
         counts.look_refused,

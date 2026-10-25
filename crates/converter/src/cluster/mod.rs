@@ -109,7 +109,13 @@ fn conversion_options(config: &PipelineConfig, base: &Path) -> DeriveOptions {
         terrain: terrain_requested(config),
         terrain_sources: None,
         jobs: config.cpu_jobs,
-        triangle_threshold: config.cluster_triangle_threshold,
+        // Cluster-only bases have no baked draw path for size-refused primitives.
+        // Every nonempty supported primitive must therefore enter the package.
+        triangle_threshold: if cluster_only(config) {
+            1
+        } else {
+            config.cluster_triangle_threshold
+        },
         include_trees: cluster_only(config),
     }
 }
@@ -378,7 +384,7 @@ fn retry_command(config: &PipelineConfig, base: &Path, terrain_sources: Option<&
     let mut command = format!(
         "converter derive-clusters {} --triangle-threshold {} --jobs {}",
         shared::cluster_overlay::quote_argument(&base.display().to_string()),
-        config.cluster_triangle_threshold,
+        conversion_options(config, base).triangle_threshold,
         config.cpu_jobs
     );
     if terrain_requested(config) {
@@ -615,5 +621,38 @@ mod detach_tests {
         fs::create_dir_all(&staging).unwrap();
         let config = terrain_config(&data, &output);
         assert!(detach_terrain_sources(&config, &output, &staging).is_err());
+    }
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::*;
+
+    #[test]
+    fn cluster_mode_resolves_every_requested_threshold_to_one() {
+        let mut config = PipelineConfig::new("Data", "assets");
+        config.lod_mode = LodMode::Cluster;
+        for threshold in [1, DEFAULT_TRIANGLE_THRESHOLD, 2048] {
+            config.cluster_triangle_threshold = threshold;
+            let options = conversion_options(&config, Path::new("assets"));
+            assert_eq!(options.triangle_threshold, 1);
+            assert!(
+                retry_command(&config, Path::new("assets"), None)
+                    .contains("--triangle-threshold 1 --jobs")
+            );
+        }
+    }
+
+    #[test]
+    fn auto_and_baked_preserve_the_requested_threshold() {
+        let mut config = PipelineConfig::new("Data", "assets");
+        config.cluster_triangle_threshold = 2048;
+        for mode in [LodMode::Auto, LodMode::Baked] {
+            config.lod_mode = mode;
+            assert_eq!(
+                conversion_options(&config, Path::new("assets")).triangle_threshold,
+                2048
+            );
+        }
     }
 }

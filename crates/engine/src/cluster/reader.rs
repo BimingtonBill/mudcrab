@@ -1548,12 +1548,38 @@ pub(crate) mod producer_fixture_tests {
         published_inputs_with_inventory(true, true)
     }
 
+    /// Legacy package with below-threshold static primitives and no replacement records.
+    pub(crate) fn published_for_legacy_threshold_inventory() -> tempfile::TempDir {
+        published_options(FixtureOptions {
+            with_texture_and_rejected_primitive: false,
+            inventory: true,
+            triangle_threshold: 1024,
+            single_triangle: false,
+            billboard: false,
+            runtime_inventory: false,
+            base_record_type: "STAT",
+        })
+    }
+
     /// Inventory plus initially-disabled STAT reference 0x109, in WORLD at (-2, 1),
     /// with the same model path and pose as the other refused inventory references.
     pub(crate) fn published_for_runtime_inventory() -> tempfile::TempDir {
         published_options(FixtureOptions {
             with_texture_and_rejected_primitive: true,
             inventory: true,
+            triangle_threshold: 1,
+            single_triangle: false,
+            billboard: false,
+            runtime_inventory: true,
+            base_record_type: "STAT",
+        })
+    }
+
+    /// Complete static geometry plus one initially disabled, distant STAT reference.
+    pub(crate) fn published_for_runtime_only_inventory() -> tempfile::TempDir {
+        published_options(FixtureOptions {
+            with_texture_and_rejected_primitive: false,
+            inventory: false,
             triangle_threshold: 1,
             single_triangle: false,
             billboard: false,

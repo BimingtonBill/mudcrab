@@ -209,6 +209,40 @@ struct StockReferenceCounts {
     fallback: RadiusCounts,
     /// Union of refused and runtime fallback references; overlaps count only once.
     total: RadiusCounts,
+    undrawn: UndrawnReferenceCounts,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UndrawnReferenceCounts {
+    look: usize,
+    runtime: usize,
+    other: usize,
+    unclassified: usize,
+}
+
+impl UndrawnReferenceCounts {
+    fn observe(
+        &mut self,
+        reference: &crate::cluster::reader::PlacedReference,
+        inside: bool,
+        has_stock_demand: bool,
+    ) {
+        // This diagnoses absent routes, not pending IO or ordinary asset failures. Runtime-state
+        // refusals remain a separate, honest gap: the source loader may intentionally disable them.
+        if inside || has_stock_demand || !reference.is_static_scenery || !needs_stock(reference) {
+            return;
+        }
+        match reference.refusal_class {
+            StockRefusalClass::Look => self.look += 1,
+            StockRefusalClass::Runtime => self.runtime += 1,
+            StockRefusalClass::Other => self.other += 1,
+            StockRefusalClass::None => self.unclassified += 1,
+        }
+    }
+
+    fn static_geometry(&self) -> usize {
+        self.look + self.other + self.unclassified
+    }
 }
 
 /// Model-bearing demand candidates, before the ordinary loader checks enable state or assets.
@@ -217,6 +251,7 @@ fn stock_reference_counts(
     demand: LodDemand,
     stream_radius: i32,
     fallback_references: &BTreeSet<u32>,
+    desired: &HashMap<Identity, CellKey>,
 ) -> StockReferenceCounts {
     let mut counts = StockReferenceCounts::default();
     for (grid, ids) in package.placed_cells_in_window(demand.world, demand.center, None) {
@@ -231,6 +266,11 @@ fn stock_reference_counts(
             let refused = needs_stock(reference);
             let fallback = fallback_references.contains(id);
             if refused {
+                counts.undrawn.observe(
+                    reference,
+                    inside,
+                    desired.contains_key(&(demand.world, *id)),
+                );
                 counts.refused.add(inside);
                 match reference.refusal_class {
                     StockRefusalClass::Runtime => counts.runtime_refused.add(inside),
@@ -294,6 +334,7 @@ fn plan(
     package: Option<Res<ValidatedPackage>>,
     mut fallback: Option<ResMut<SourceFallbackDemand>>,
     ownership: Option<Res<crate::cluster::ownership::OwnershipFacts>>,
+    mut profiler: Option<ResMut<ProfilingState>>,
     mut far: ResMut<FarStock>,
     references: ExistingReferences,
     parents: Query<
@@ -401,39 +442,6 @@ fn plan(
     {
         return;
     }
-    if let Some(demand) = demand
-        && far.fallback_revision.is_some()
-        && far.counted_worlds.insert(demand.world)
-    {
-        let counts = stock_reference_counts(
-            &package.0,
-            demand,
-            config.stream_radius,
-            &far.fallback_references,
-        );
-        info!(
-            worldspace = demand.world,
-            center = ?demand.center,
-            stream_radius = config.stream_radius.max(0),
-            ?reach,
-            refused_inside = counts.refused.inside,
-            refused_beyond = counts.refused.beyond,
-            look_refused_inside = counts.look_refused.inside,
-            look_refused_beyond = counts.look_refused.beyond,
-            runtime_refused_inside = counts.runtime_refused.inside,
-            runtime_refused_beyond = counts.runtime_refused.beyond,
-            other_refused_inside = counts.other_refused.inside,
-            other_refused_beyond = counts.other_refused.beyond,
-            distant_look_stock = if config.cluster_own_statics { counts.look_refused.beyond } else { 0 },
-            distant_runtime_stock = 0usize,
-            distant_material_stock = if config.cluster_own_statics { counts.fallback.beyond } else { 0 },
-            fallback_inside = counts.fallback.inside,
-            fallback_beyond = counts.fallback.beyond,
-            total_inside = counts.total.inside,
-            total_beyond = counts.total.beyond,
-            "stock candidate inventory and classified distant demand at first qualification (once per package/worldspace)"
-        );
-    }
     // Only frozen material refusals inherit unbounded static-scenery reach.
     // Unclassified runtime source feedback has no authority to extend the grid.
     // This projection runs only after a changed demand/qualification, never settled frames.
@@ -484,6 +492,85 @@ fn plan(
                 complete_source_key(&package.0, demand, stream_radius, form.0, cell.0)
             {
                 desired.insert((demand.world, form.0), key);
+            }
+        }
+    }
+    // Inventory follows the actual stock plan: refusal labels alone cannot prove a missing route.
+    if let Some(demand) = demand
+        && far.fallback_revision.is_some()
+        && far.counted_worlds.insert(demand.world)
+    {
+        let counts = stock_reference_counts(
+            &package.0,
+            demand,
+            stream_radius,
+            &far.fallback_references,
+            &desired,
+        );
+        info!(
+            worldspace = demand.world,
+            center = ?demand.center,
+            stream_radius,
+            ?reach,
+            refused_inside = counts.refused.inside,
+            refused_beyond = counts.refused.beyond,
+            look_refused_inside = counts.look_refused.inside,
+            look_refused_beyond = counts.look_refused.beyond,
+            runtime_refused_inside = counts.runtime_refused.inside,
+            runtime_refused_beyond = counts.runtime_refused.beyond,
+            other_refused_inside = counts.other_refused.inside,
+            other_refused_beyond = counts.other_refused.beyond,
+            distant_look_stock = if config.cluster_own_statics { counts.look_refused.beyond } else { 0 },
+            distant_runtime_stock = 0usize,
+            distant_material_stock = if config.cluster_own_statics { counts.fallback.beyond } else { 0 },
+            fallback_inside = counts.fallback.inside,
+            fallback_beyond = counts.fallback.beyond,
+            total_inside = counts.total.inside,
+            total_beyond = counts.total.beyond,
+            "stock candidate inventory and classified distant demand at first qualification (once per package/worldspace)"
+        );
+        if config.cluster_own_statics {
+            let geometry = counts.undrawn.static_geometry();
+            let runtime = counts.undrawn.runtime;
+            // Run-lifetime counters count each package/worldspace's first qualified snapshot once.
+            // Recording zero distinguishes a passing snapshot from an unqualified run.
+            if let Some(profiler) = profiler.as_deref_mut() {
+                profiler.increment("cluster/undrawn_static_geometry", geometry as u64);
+                profiler.increment("cluster/undrawn_runtime_refused", runtime as u64);
+            }
+            info!(
+                worldspace = demand.world,
+                center = ?demand.center,
+                stream_radius,
+                undrawn_static_geometry = geometry,
+                undrawn_runtime_refused = runtime,
+                look_refused = counts.undrawn.look,
+                runtime_refused = runtime,
+                other_refused = counts.undrawn.other,
+                unclassified_refused = counts.undrawn.unclassified,
+                "cluster draw-path inventory at first qualification (once per package/worldspace)"
+            );
+            if geometry > 0 {
+                error!(
+                    worldspace = demand.world,
+                    center = ?demand.center,
+                    stream_radius,
+                    undrawn_static_geometry = geometry,
+                    look_refused = counts.undrawn.look,
+                    other_refused = counts.undrawn.other,
+                    unclassified_refused = counts.undrawn.unclassified,
+                    "immutable static geometry beyond the loaded grid has no draw path"
+                );
+            }
+            if runtime > 0 {
+                warn!(
+                    worldspace = demand.world,
+                    center = ?demand.center,
+                    stream_radius,
+                    undrawn_runtime_refused = runtime,
+                    runtime_refused = runtime,
+                    "runtime-refused static references beyond the loaded grid have no distant draw path; state-aware distant drawing is not implemented"
+                );
             }
         }
     }

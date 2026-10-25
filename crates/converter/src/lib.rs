@@ -35,7 +35,7 @@ pub mod terrain_arrays;
 pub mod terrain_chunks;
 pub mod terrain_pipeline;
 /// A synthetic complete base conversion for other crates' tests (feature `test-support`).
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod texture;
 pub mod texture_gpu;
