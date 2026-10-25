@@ -3388,7 +3388,11 @@ fn fly_camera(
             &mut auto_flight,
         );
     }
-    transform.translation += direction.normalize_or_zero() * speed * time.delta_secs();
+    let translation =
+        transform.translation + direction.normalize_or_zero() * speed * time.delta_secs();
+    if translation != transform.translation {
+        transform.translation = translation;
+    }
     profiler.record_elapsed("world/fly_camera", started);
 }
 
@@ -6422,6 +6426,77 @@ mod tests {
         let expected = bevy::image::ImageSampler::Descriptor(terrain_layer_sampler());
         assert_eq!(terrain_fixture_image([82, 116, 58, 255]).sampler, expected);
     }
+    #[test]
+    fn idle_fly_camera_preserves_the_transform_change_tick() {
+        use bevy::time::TimeUpdateStrategy;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ProfilingState>()
+            .insert_resource(EngineConfig {
+                headless: true,
+                ..default()
+            })
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_millis(100),
+            ))
+            .add_systems(Update, fly_camera);
+        let camera = app
+            .world_mut()
+            .spawn((StreamingCamera, Transform::from_xyz(10.0, 20.0, 30.0)))
+            .id();
+        app.update();
+        let changed = app
+            .world()
+            .entity(camera)
+            .get_ref::<Transform>()
+            .unwrap()
+            .last_changed();
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(
+            app.world()
+                .entity(camera)
+                .get_ref::<Transform>()
+                .unwrap()
+                .last_changed(),
+            changed,
+            "standing still must not invalidate transform consumers"
+        );
+        let mut keyboard = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keyboard.press(KeyCode::KeyW);
+        keyboard.press(KeyCode::KeyS);
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(camera)
+                .get_ref::<Transform>()
+                .unwrap()
+                .last_changed(),
+            changed,
+            "opposing inputs must not invalidate an unchanged pose"
+        );
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(KeyCode::KeyS);
+        app.update();
+        assert_ne!(
+            app.world().get::<Transform>(camera).unwrap().translation,
+            Vec3::new(10.0, 20.0, 30.0),
+            "movement still updates the camera"
+        );
+        assert_ne!(
+            app.world()
+                .entity(camera)
+                .get_ref::<Transform>()
+                .unwrap()
+                .last_changed(),
+            changed
+        );
+    }
+
     #[test]
     fn fly_camera_stands_still_while_the_console_is_open() {
         use crate::console::ConsoleState;

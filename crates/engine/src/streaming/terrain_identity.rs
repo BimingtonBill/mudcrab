@@ -11,6 +11,30 @@ pub(crate) struct TerrainPrimitiveIdentity {
     pub tier: Option<LodTier>,
 }
 
+#[cfg(test)]
+impl TerrainPrimitiveIdentity {
+    /// Creates a real near-terrain source for extraction tests outside streaming.
+    pub(crate) fn spawn_fixture(self, world: &mut World) -> Entity {
+        assert!(
+            self.tier.is_none(),
+            "this fixture creates full-detail terrain"
+        );
+        world
+            .spawn((
+                Mesh3d(Handle::default()),
+                TerrainCoverage {
+                    grid: self.grid,
+                    quadrant: self.quadrant,
+                    tier: self.tier,
+                },
+                TerrainWorldspace(self.worldspace_id),
+                Visibility::Inherited,
+                InheritedVisibility::VISIBLE,
+            ))
+            .id()
+    }
+}
+
 type TerrainNode = (
     Option<&'static TerrainCoverage>,
     Option<&'static TerrainWorldspace>,
