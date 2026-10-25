@@ -272,6 +272,7 @@ impl PhaseMembers {
         let Some(phase) = phase else {
             return members;
         };
+        crate::work_counters::record("phase_membership/binned_scan");
         for bin in phase.batchable_meshes.values() {
             members.extend(bin.entities().keys().copied());
         }
@@ -290,6 +291,7 @@ impl PhaseMembers {
     fn of_sorted<SPI: SortedPhaseItem>(phase: Option<&SortedRenderPhase<SPI>>) -> Self {
         let mut members = Self::default();
         if let Some(phase) = phase {
+            crate::work_counters::record("phase_membership/sorted_scan");
             members.extend(phase.items.keys().map(|(_, main)| *main));
         }
         members
@@ -341,6 +343,50 @@ pub(crate) struct QueuePhases<'w> {
 }
 
 impl QueuePhases<'_> {
+    /// Whether the current forward queue contains this main-world entity.
+    pub(crate) fn contains_forward(&self, view: &RetainedViewEntity, main: MainEntity) -> bool {
+        self.opaque
+            .as_ref()
+            .and_then(|phases| phases.get(view))
+            .is_some_and(|phase| phase.contains_main_entity(main))
+            || self
+                .alpha_mask
+                .as_ref()
+                .and_then(|phases| phases.get(view))
+                .is_some_and(|phase| phase.contains_main_entity(main))
+            || self
+                .transmissive
+                .as_ref()
+                .and_then(|phases| phases.get(view))
+                .is_some_and(|phase| phase.contains_main_entity(main))
+            || self
+                .transparent
+                .as_ref()
+                .and_then(|phases| phases.get(view))
+                .is_some_and(|phase| phase.contains_main_entity(main))
+    }
+
+    /// Whether the current prepass queue contains this main-world entity.
+    pub(crate) fn contains_prepass(&self, view: &RetainedViewEntity, main: MainEntity) -> bool {
+        self.opaque_prepass
+            .as_ref()
+            .and_then(|phases| phases.get(view))
+            .is_some_and(|phase| phase.contains_main_entity(main))
+            || self
+                .alpha_mask_prepass
+                .as_ref()
+                .and_then(|phases| phases.get(view))
+                .is_some_and(|phase| phase.contains_main_entity(main))
+    }
+
+    /// Whether the current shadow queue contains this main-world entity.
+    pub(crate) fn contains_shadow(&self, view: &RetainedViewEntity, main: MainEntity) -> bool {
+        self.shadow
+            .as_ref()
+            .and_then(|phases| phases.get(view))
+            .is_some_and(|phase| phase.contains_main_entity(main))
+    }
+
     /// What the view's main (forward) phases hold.
     pub(crate) fn forward(&self, view: &RetainedViewEntity) -> PhaseMembers {
         #[cfg(test)]
@@ -968,6 +1014,66 @@ mod tests {
         assert!(cache.queued_with(first, main_entity(1), || members(&[1])));
         assert!(!cache.queued_with(second, main_entity(1), || members(&[2])));
         assert!(cache.queued_with(second, main_entity(2), || panic!("view already indexed")));
+    }
+
+    #[test]
+    fn exact_membership_reads_live_views_without_copying_unrelated_phase_entities() {
+        use bevy::{
+            core_pipeline::core_3d::{Opaque3dBatchSetKey, Opaque3dBinKey},
+            render::{
+                batching::gpu_preprocessing::GpuPreprocessingMode,
+                mesh::allocator::MeshSlabs,
+                render_phase::{BinnedRenderPhaseType, DrawFunctionId, InputUniformIndex},
+            },
+        };
+        let view = RetainedViewEntity::new(main_entity(1000), None, 0);
+        let other_view = RetainedViewEntity::new(main_entity(1001), None, 0);
+        let mut phases = ViewBinnedRenderPhases::<Opaque3d>::default();
+        phases.prepare_for_new_frame(view, GpuPreprocessingMode::None);
+        let phase = phases.get_mut(&view).unwrap();
+        let batch_key = Opaque3dBatchSetKey {
+            pipeline: CachedRenderPipelineId::INVALID,
+            draw_function: DrawFunctionId(0),
+            material_bind_group_index: None,
+            slabs: MeshSlabs::default(),
+            lightmap_slab: None,
+        };
+        let bin_key = Opaque3dBinKey {
+            asset_id: Handle::<Mesh>::default().id().untyped(),
+        };
+        for entity in 1..=512 {
+            phase.add(
+                batch_key.clone(),
+                bin_key.clone(),
+                (Entity::PLACEHOLDER, main_entity(entity)),
+                InputUniformIndex::default(),
+                BinnedRenderPhaseType::NonMesh,
+            );
+        }
+        let mut world = World::new();
+        world.insert_resource(phases);
+        let mut state = bevy::ecs::system::SystemState::<QueuePhases>::new(&mut world);
+        FORWARD_PHASE_WORK.with(|work| work.set((0, 0)));
+        {
+            let queues = state.get(&world).unwrap();
+            assert!(queues.contains_forward(&view, main_entity(1)));
+            assert!(!queues.contains_forward(&other_view, main_entity(1)));
+            assert!(!queues.contains_forward(&view, main_entity(513)));
+            assert!(!queues.contains_prepass(&view, main_entity(1)));
+            assert!(!queues.contains_shadow(&view, main_entity(1)));
+        }
+        FORWARD_PHASE_WORK.with(|work| assert_eq!(work.get(), (0, 0)));
+        world
+            .resource_mut::<ViewBinnedRenderPhases<Opaque3d>>()
+            .get_mut(&view)
+            .unwrap()
+            .remove(main_entity(1));
+        {
+            let queues = state.get(&world).unwrap();
+            assert!(!queues.contains_forward(&view, main_entity(1)));
+            assert!(queues.contains_forward(&view, main_entity(2)));
+        }
+        FORWARD_PHASE_WORK.with(|work| assert_eq!(work.get(), (0, 0)));
     }
 
     #[test]

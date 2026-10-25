@@ -1,11 +1,16 @@
 //! Authored NIF depth state for surfaces drawn after opaque geometry.
 use bevy::{
+    ecs::system::SystemParamItem,
     mesh::MeshVertexBufferLayoutRef,
     pbr::{ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline},
     prelude::*,
-    render::render_resource::{
-        AsBindGroup, CompareFunction, DepthStencilState, RenderPipelineDescriptor,
-        SpecializedMeshPipelineError,
+    render::{
+        render_resource::{
+            AsBindGroup, AsBindGroupError, BindGroupLayout, BindGroupLayoutEntry, BindingResources,
+            BindlessDescriptor, BindlessSlabResourceLimit, CompareFunction, DepthStencilState,
+            RenderPipelineDescriptor, SpecializedMeshPipelineError, UnpreparedBindGroup,
+        },
+        renderer::RenderDevice,
     },
 };
 
@@ -75,10 +80,55 @@ impl NifDepthState {
     }
 }
 
-#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
-#[bind_group_data(NifDepthState)]
+#[derive(Asset, Reflect, Debug, Clone)]
 pub struct NifDepthExtension {
     pub state: NifDepthState,
+}
+
+// This extension owns only a pipeline key. Preserve the base material's bindless
+// resources without introducing an empty index table or additional GPU bindings.
+impl AsBindGroup for NifDepthExtension {
+    type Data = NifDepthState;
+    type Param = ();
+
+    fn label() -> &'static str {
+        "NifDepthExtension"
+    }
+
+    fn bind_group_data(&self) -> Self::Data {
+        self.state
+    }
+
+    fn bindless_slot_count() -> Option<BindlessSlabResourceLimit> {
+        Some(BindlessSlabResourceLimit::Auto)
+    }
+
+    fn bindless_descriptor() -> Option<BindlessDescriptor> {
+        Some(BindlessDescriptor {
+            resources: std::borrow::Cow::Borrowed(&[]),
+            buffers: std::borrow::Cow::Borrowed(&[]),
+            index_tables: std::borrow::Cow::Borrowed(&[]),
+        })
+    }
+
+    fn unprepared_bind_group(
+        &self,
+        _layout: &BindGroupLayout,
+        _render_device: &RenderDevice,
+        _param: &mut SystemParamItem<'_, '_, Self::Param>,
+        _force_no_bindless: bool,
+    ) -> Result<UnpreparedBindGroup, AsBindGroupError> {
+        Ok(UnpreparedBindGroup {
+            bindings: BindingResources(Vec::new()),
+        })
+    }
+
+    fn bind_group_layout_entries(
+        _render_device: &RenderDevice,
+        _force_no_bindless: bool,
+    ) -> Vec<BindGroupLayoutEntry> {
+        Vec::new()
+    }
 }
 
 impl From<&NifDepthExtension> for NifDepthState {
@@ -140,6 +190,61 @@ pub(crate) struct NifDepthMaterialSource(pub Handle<StandardMaterial>);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_only_extension_preserves_base_bindless_slot_limit() {
+        assert_eq!(
+            NifDepthMaterial::bindless_slot_count(),
+            StandardMaterial::bindless_slot_count()
+        );
+    }
+
+    #[test]
+    fn state_only_extension_adds_no_bindless_resources_or_index_tables() {
+        let extension = NifDepthExtension::bindless_descriptor().unwrap();
+        assert!(extension.resources.is_empty());
+        assert!(extension.buffers.is_empty());
+        assert!(extension.index_tables.is_empty());
+        let base = StandardMaterial::bindless_descriptor().unwrap();
+        let combined = NifDepthMaterial::bindless_descriptor().unwrap();
+        assert_eq!(combined.resources, base.resources);
+        let buffers = |descriptor: &bevy::render::render_resource::BindlessDescriptor| {
+            descriptor
+                .buffers
+                .iter()
+                .map(|buffer| (buffer.binding_number, buffer.bindless_index, buffer.size))
+                .collect::<Vec<_>>()
+        };
+        let tables = |descriptor: &bevy::render::render_resource::BindlessDescriptor| {
+            descriptor
+                .index_tables
+                .iter()
+                .map(|table| (table.indices.clone(), table.binding_number))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(buffers(&combined), buffers(&base));
+        assert_eq!(tables(&combined), tables(&base));
+    }
+
+    #[test]
+    fn all_authored_depth_states_remain_distinct_pipeline_keys() {
+        let mut keys = std::collections::HashSet::new();
+        for bits in 0..32 {
+            let state = NifDepthState {
+                depth_test: bits & 1 != 0,
+                depth_write: bits & 2 != 0,
+                decal: bits & 4 != 0,
+                alpha_mask: bits & 8 != 0,
+                cast_shadows: bits & 16 != 0,
+            };
+            let material = depth_material(StandardMaterial::default(), state);
+            let key = material.bind_group_data();
+            let extension_key = key.extension;
+            assert_eq!(extension_key, state);
+            assert!(keys.insert(key));
+        }
+        assert_eq!(keys.len(), 32);
+    }
 
     #[test]
     fn sorted_color_pass_keeps_authored_alpha_uniform_flags() {

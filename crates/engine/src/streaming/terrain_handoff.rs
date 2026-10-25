@@ -246,18 +246,15 @@ fn collect_counts(
             continue;
         }
         if is_shadow {
-            let shadow = queued.shadow(&key);
             counts.queued_shadow += inventory
                 .meshes
                 .keys()
-                .filter(|main| shadow.queued(**main))
+                .filter(|main| queued.contains_shadow(&key, **main))
                 .count();
         } else {
-            let forward = queued.forward(&key);
-            let prepass = queued.prepass(&key);
             for main in inventory.meshes.keys() {
-                counts.queued_forward += usize::from(forward.queued(*main));
-                counts.queued_prepass += usize::from(prepass.queued(*main));
+                counts.queued_forward += usize::from(queued.contains_forward(&key, *main));
+                counts.queued_prepass += usize::from(queued.contains_prepass(&key, *main));
             }
         }
     }
@@ -1112,9 +1109,6 @@ fn filter(
                     }
                 })
                 .unwrap_or_default();
-            let forward = queued.forward(&key);
-            let prepass = queued.prepass(&key);
-            let shadow = queued.shadow(&key);
             let drawable = visible
                 .iter()
                 .copied()
@@ -1124,14 +1118,14 @@ fn filter(
                         .get(main)
                         .is_some_and(|surface| stock.matches_mesh(*main, surface.mesh))
                         && if light.is_some() {
-                            shadow.queued(*main)
+                            queued.contains_shadow(&key, *main)
                                 && stock.drawable(*main, key, StockPassFamily::Shadow)
                         } else {
-                            forward.queued(*main)
+                            queued.contains_forward(&key, *main)
                                 && stock.drawable(*main, key, StockPassFamily::Forward)
                                 && (!(depth || normal || motion)
                                     || !stock.prepass_required(*main)
-                                    || (prepass.queued(*main)
+                                    || (queued.contains_prepass(&key, *main)
                                         && stock.drawable(*main, key, StockPassFamily::Prepass)))
                         }
                 })
@@ -2049,10 +2043,16 @@ mod tests {
             })
             .unwrap();
         let check = move |phases: crate::swap_bridge::systems::QueuePhases| {
-            (
+            let copied = (
                 phases.forward(&main_view).queued(main(1)),
                 phases.forward(&secondary_view).queued(main(1)),
-            )
+            );
+            let exact = (
+                phases.contains_forward(&main_view, main(1)),
+                phases.contains_forward(&secondary_view, main(1)),
+            );
+            assert_eq!(exact, copied);
+            exact
         };
         assert_eq!(world.run_system_once(check).unwrap(), (true, false));
         // The next stock queue can add the same still-extracted fallback to a

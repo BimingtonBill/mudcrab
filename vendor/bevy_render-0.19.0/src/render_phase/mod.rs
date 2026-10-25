@@ -38,7 +38,7 @@ pub use draw::*;
 pub use draw_state::*;
 use encase::ShaderType;
 use encase::{internal::WriteInto, ShaderSize};
-use indexmap::IndexMap;
+use indexmap::{map::RawEntryApiV1, IndexMap};
 use nonmax::NonMaxU32;
 pub use rangefinder::*;
 use wgpu::{BufferUsages, Features};
@@ -75,7 +75,7 @@ pub use bevy_material_macros::ShaderLabel;
 use bevy_render::renderer::RenderAdapterInfo;
 use core::{
     fmt::Debug,
-    hash::Hash,
+    hash::{BuildHasher, Hash},
     iter,
     marker::PhantomData,
     mem,
@@ -1064,6 +1064,60 @@ where
             .insert(main_entity, new_cached_binned_entity);
     }
 
+    /// Returns whether the entity is currently queued in its cached bin.
+    ///
+    /// This checks actual bin membership with a bounded number of hash lookups;
+    /// a missing cache entry, absent bin key, or removed member returns false.
+    /// Like [`Self::remove`], this relies on removing an entity before requeuing
+    /// it in another bin. Orphaned entries created by editing public bins without
+    /// updating the cache are not searched.
+    pub fn contains_main_entity(&self, main_entity: MainEntity) -> bool {
+        let Some(cached_bin_key) = self
+            .cached_entity_bin_keys
+            .get(&main_entity)
+            .and_then(|cached| cached.cached_bin_key.as_ref())
+        else {
+            return false;
+        };
+
+        match cached_bin_key.phase_type {
+            BinnedRenderPhaseType::MultidrawableMesh => self
+                .multidrawable_meshes
+                .get(&cached_bin_key.batch_set_key)
+                .and_then(|batch_set| {
+                    let bin_index = batch_set
+                        .bin_key_to_bin_index
+                        .get(&cached_bin_key.bin_key)?;
+                    batch_set.bin(*bin_index)
+                })
+                .is_some_and(|bin| {
+                    bin.entity_to_binned_mesh_instance_index
+                        .contains_key(&main_entity)
+                }),
+            BinnedRenderPhaseType::BatchableMesh => self
+                .batchable_meshes
+                .get(&(
+                    cached_bin_key.batch_set_key.clone(),
+                    cached_bin_key.bin_key.clone(),
+                ))
+                .is_some_and(|bin| bin.entities.contains_key(&main_entity)),
+            BinnedRenderPhaseType::UnbatchableMesh => self
+                .unbatchable_meshes
+                .get(&(
+                    cached_bin_key.batch_set_key.clone(),
+                    cached_bin_key.bin_key.clone(),
+                ))
+                .is_some_and(|bin| bin.entities.contains_key(&main_entity)),
+            BinnedRenderPhaseType::NonMesh => self
+                .non_mesh_items
+                .get(&(
+                    cached_bin_key.batch_set_key.clone(),
+                    cached_bin_key.bin_key.clone(),
+                ))
+                .is_some_and(|bin| bin.entities.contains_key(&main_entity)),
+        }
+    }
+
     /// Encodes the GPU commands needed to render all entities in this phase.
     pub fn render<'w>(
         &self,
@@ -1816,6 +1870,24 @@ impl<I> SortedRenderPhase<I>
 where
     I: SortedPhaseItem,
 {
+    /// Returns whether any queued item represents this main-world entity.
+    ///
+    /// Custom render entities, multiple render entities for one main entity,
+    /// and batch followers with empty instance ranges all count as members.
+    /// This probes the item map without scanning or changing phase order.
+    #[inline]
+    pub fn contains_main_entity(&self, main_entity: MainEntity) -> bool {
+        // EntityHash's write_u64 replaces its previous hash, so the tuple key's
+        // hash depends only on its final field, MainEntity. Hash with the actual
+        // map hasher and match that field to support every render entity carrier.
+        // The native hash-contract test guards this dependency on EntityHash.
+        let hash = self.items.hasher().hash_one(main_entity);
+        self.items
+            .raw_entry_v1()
+            .from_hash(hash, |&(_, candidate)| candidate == main_entity)
+            .is_some()
+    }
+
     /// Adds a [`PhaseItem`] to this render phase, which will persist between
     /// frames until removed.
     #[inline]
@@ -2236,6 +2308,556 @@ impl RenderBin {
     #[inline]
     pub fn entities(&self) -> &IndexMap<MainEntity, InputUniformIndex, EntityHash> {
         &self.entities
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use bevy_ecs::entity::{EntityGeneration, EntityIndex};
+    use core::{
+        hash::BuildHasher,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct MembershipBatchSetKey(u32);
+
+    impl PhaseItemBatchSetKey for MembershipBatchSetKey {
+        fn indexed(&self) -> bool {
+            true
+        }
+    }
+
+    struct MembershipPhaseItem {
+        render_entity: Entity,
+        main_entity: MainEntity,
+        batch_range: Range<u32>,
+        extra_index: PhaseItemExtraIndex,
+        main_entity_reads: Arc<AtomicUsize>,
+    }
+
+    impl PhaseItem for MembershipPhaseItem {
+        fn entity(&self) -> Entity {
+            self.render_entity
+        }
+
+        fn main_entity(&self) -> MainEntity {
+            self.main_entity_reads.fetch_add(1, Ordering::Relaxed);
+            self.main_entity
+        }
+
+        fn draw_function(&self) -> DrawFunctionId {
+            unimplemented!("Membership tests do not render")
+        }
+
+        fn batch_range(&self) -> &Range<u32> {
+            &self.batch_range
+        }
+
+        fn batch_range_mut(&mut self) -> &mut Range<u32> {
+            &mut self.batch_range
+        }
+
+        fn extra_index(&self) -> PhaseItemExtraIndex {
+            self.extra_index.clone()
+        }
+
+        fn batch_range_and_extra_index_mut(
+            &mut self,
+        ) -> (&mut Range<u32>, &mut PhaseItemExtraIndex) {
+            (&mut self.batch_range, &mut self.extra_index)
+        }
+    }
+
+    impl BinnedPhaseItem for MembershipPhaseItem {
+        type BinKey = u32;
+        type BatchSetKey = MembershipBatchSetKey;
+
+        fn new(
+            _: Self::BatchSetKey,
+            _: Self::BinKey,
+            (render_entity, main_entity): (Entity, MainEntity),
+            batch_range: Range<u32>,
+            extra_index: PhaseItemExtraIndex,
+        ) -> Self {
+            Self {
+                render_entity,
+                main_entity,
+                batch_range,
+                extra_index,
+                main_entity_reads: default(),
+            }
+        }
+    }
+
+    impl SortedPhaseItem for MembershipPhaseItem {
+        type SortKey = Entity;
+
+        fn sort_key(&self) -> Self::SortKey {
+            self.render_entity
+        }
+
+        fn recalculate_sort_keys(
+            _: &mut IndexMap<(Entity, MainEntity), Self, EntityHash>,
+            _: &ExtractedView,
+        ) {
+        }
+
+        fn indexed(&self) -> bool {
+            true
+        }
+    }
+
+    const MEMBERSHIP_PHASE_TYPES: [BinnedRenderPhaseType; 4] = [
+        BinnedRenderPhaseType::MultidrawableMesh,
+        BinnedRenderPhaseType::BatchableMesh,
+        BinnedRenderPhaseType::UnbatchableMesh,
+        BinnedRenderPhaseType::NonMesh,
+    ];
+
+    fn membership_entity(index: u32) -> Entity {
+        Entity::from_index(EntityIndex::from_raw_u32(index).unwrap())
+    }
+
+    fn membership_item(render_index: u32, main_index: u32) -> MembershipPhaseItem {
+        MembershipPhaseItem::new(
+            MembershipBatchSetKey(0),
+            0,
+            (
+                membership_entity(render_index),
+                membership_entity(main_index).into(),
+            ),
+            0..1,
+            PhaseItemExtraIndex::None,
+        )
+    }
+
+    fn enumerated_binned_members(
+        phase: &BinnedRenderPhase<MembershipPhaseItem>,
+    ) -> crate::sync_world::MainEntityHashSet {
+        phase
+            .multidrawable_meshes
+            .values()
+            .flat_map(RenderMultidrawableBatchSet::entities)
+            .chain(
+                phase
+                    .batchable_meshes
+                    .values()
+                    .flat_map(|bin| bin.entities().keys().copied()),
+            )
+            .chain(
+                phase
+                    .unbatchable_meshes
+                    .values()
+                    .flat_map(|bin| bin.entities.keys().copied()),
+            )
+            .chain(
+                phase
+                    .non_mesh_items
+                    .values()
+                    .flat_map(|bin| bin.entities.keys().copied()),
+            )
+            .collect()
+    }
+
+    fn assert_binned_membership_matches_enumeration(
+        phase: &BinnedRenderPhase<MembershipPhaseItem>,
+        probe_count: u32,
+    ) {
+        let expected = enumerated_binned_members(phase);
+        for index in 0..probe_count {
+            let main_entity = membership_entity(index).into();
+            assert_eq!(
+                phase.contains_main_entity(main_entity),
+                expected.contains(&main_entity),
+                "Membership differs for {main_entity:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn binned_membership_matches_enumeration_across_bins_removals_and_transitions() {
+        let mut phase =
+            BinnedRenderPhase::<MembershipPhaseItem>::new(GpuPreprocessingMode::Culling);
+        let mut index = 0;
+        for phase_type in MEMBERSHIP_PHASE_TYPES {
+            for batch_set in 0..2 {
+                for bin in 0..2 {
+                    for _ in 0..3 {
+                        phase.add(
+                            MembershipBatchSetKey(batch_set),
+                            bin,
+                            (
+                                membership_entity(index + 100),
+                                membership_entity(index).into(),
+                            ),
+                            InputUniformIndex(index),
+                            phase_type,
+                        );
+                        index += 1;
+                    }
+                }
+            }
+        }
+        assert_binned_membership_matches_enumeration(&phase, index + 1);
+
+        // All source/destination phase types, with changed batch and bin keys.
+        // Removing from populated bins also exercises displaced instance indices.
+        for (source, source_type) in MEMBERSHIP_PHASE_TYPES.into_iter().enumerate() {
+            let main_entity = membership_entity(source as u32 * 12).into();
+            for destination in MEMBERSHIP_PHASE_TYPES {
+                phase.remove(main_entity);
+                phase.add(
+                    MembershipBatchSetKey(0),
+                    0,
+                    (Entity::PLACEHOLDER, main_entity),
+                    InputUniformIndex(50),
+                    source_type,
+                );
+                assert_binned_membership_matches_enumeration(&phase, index + 1);
+                phase.remove(main_entity);
+                assert!(!phase.contains_main_entity(main_entity));
+                assert_binned_membership_matches_enumeration(&phase, index + 1);
+                phase.add(
+                    MembershipBatchSetKey(7),
+                    9,
+                    (Entity::PLACEHOLDER, main_entity),
+                    InputUniformIndex(50),
+                    destination,
+                );
+                assert_binned_membership_matches_enumeration(&phase, index + 1);
+            }
+        }
+        for main_index in 0..index {
+            phase.remove(membership_entity(main_index).into());
+            assert_binned_membership_matches_enumeration(&phase, index + 1);
+        }
+        assert!(phase.is_empty());
+    }
+
+    #[test]
+    fn binned_membership_requires_cache_and_its_exact_bin_without_orphan_recovery() {
+        for phase_type in MEMBERSHIP_PHASE_TYPES {
+            let mut phase =
+                BinnedRenderPhase::<MembershipPhaseItem>::new(GpuPreprocessingMode::Culling);
+            let main_entity = membership_entity(1).into();
+            phase.add(
+                MembershipBatchSetKey(0),
+                0,
+                (Entity::PLACEHOLDER, main_entity),
+                InputUniformIndex(0),
+                phase_type,
+            );
+            // The alternate bin exists, but contains a different entity.
+            phase.add(
+                MembershipBatchSetKey(0),
+                1,
+                (Entity::PLACEHOLDER, membership_entity(2).into()),
+                InputUniformIndex(1),
+                phase_type,
+            );
+            phase.cached_entity_bin_keys.remove(&main_entity);
+            assert!(!phase.contains_main_entity(main_entity));
+            assert!(enumerated_binned_members(&phase).contains(&main_entity));
+            phase.update_cache(main_entity, None);
+            assert!(!phase.contains_main_entity(main_entity));
+            for (batch_set, bin) in [(99, 0), (0, 99), (0, 1)] {
+                phase.update_cache(
+                    main_entity,
+                    Some(CachedBinKey {
+                        batch_set_key: MembershipBatchSetKey(batch_set),
+                        bin_key: bin,
+                        phase_type,
+                    }),
+                );
+                assert!(!phase.contains_main_entity(main_entity));
+            }
+            for wrong_type in MEMBERSHIP_PHASE_TYPES {
+                phase.update_cache(
+                    main_entity,
+                    Some(CachedBinKey {
+                        batch_set_key: MembershipBatchSetKey(0),
+                        bin_key: 0,
+                        phase_type: wrong_type,
+                    }),
+                );
+                assert_eq!(
+                    phase.contains_main_entity(main_entity),
+                    wrong_type == phase_type
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binned_membership_rejects_stale_cache_after_actual_membership_removal() {
+        for phase_type in MEMBERSHIP_PHASE_TYPES {
+            for keep_bin in [false, true] {
+                let mut phase =
+                    BinnedRenderPhase::<MembershipPhaseItem>::new(GpuPreprocessingMode::Culling);
+                let main_entity = membership_entity(1).into();
+                phase.add(
+                    MembershipBatchSetKey(0),
+                    0,
+                    (Entity::PLACEHOLDER, main_entity),
+                    InputUniformIndex(0),
+                    phase_type,
+                );
+                if keep_bin {
+                    phase.add(
+                        MembershipBatchSetKey(0),
+                        0,
+                        (Entity::PLACEHOLDER, membership_entity(2).into()),
+                        InputUniformIndex(1),
+                        phase_type,
+                    );
+                }
+                // Use the native removal helper but deliberately retain the stale cache.
+                remove_entity_from_bin(
+                    main_entity,
+                    &CachedBinKey {
+                        batch_set_key: MembershipBatchSetKey(0),
+                        bin_key: 0,
+                        phase_type,
+                    },
+                    &mut phase.multidrawable_meshes,
+                    &mut phase.batchable_meshes,
+                    &mut phase.unbatchable_meshes,
+                    &mut phase.non_mesh_items,
+                );
+                assert!(phase.cached_entity_bin_keys.contains_key(&main_entity));
+                assert!(!phase.contains_main_entity(main_entity));
+                assert_binned_membership_matches_enumeration(&phase, 4);
+            }
+        }
+    }
+
+    #[test]
+    fn multidrawable_membership_rejects_missing_and_invalid_bin_indices() {
+        let mut phase =
+            BinnedRenderPhase::<MembershipPhaseItem>::new(GpuPreprocessingMode::Culling);
+        let main_entity = membership_entity(1).into();
+        phase.add(
+            MembershipBatchSetKey(0),
+            0,
+            (Entity::PLACEHOLDER, main_entity),
+            InputUniformIndex(0),
+            BinnedRenderPhaseType::MultidrawableMesh,
+        );
+        let batch_set = phase
+            .multidrawable_meshes
+            .get_mut(&MembershipBatchSetKey(0))
+            .unwrap();
+        let bin_index = batch_set.bin_key_to_bin_index.remove(&0).unwrap();
+        assert!(!phase.contains_main_entity(main_entity));
+        let batch_set = phase
+            .multidrawable_meshes
+            .get_mut(&MembershipBatchSetKey(0))
+            .unwrap();
+        batch_set
+            .bin_key_to_bin_index
+            .insert(0, RenderBinIndex(u32::MAX));
+        assert!(!phase.contains_main_entity(main_entity));
+        let batch_set = phase
+            .multidrawable_meshes
+            .get_mut(&MembershipBatchSetKey(0))
+            .unwrap();
+        batch_set.bin_key_to_bin_index.insert(0, bin_index);
+        batch_set.bins[bin_index.0 as usize] = None;
+        assert!(!phase.contains_main_entity(main_entity));
+    }
+
+    #[test]
+    fn binned_membership_survives_prepare_and_preprocessing_downgrade() {
+        for mode in [
+            GpuPreprocessingMode::None,
+            GpuPreprocessingMode::PreprocessingOnly,
+            GpuPreprocessingMode::Culling,
+        ] {
+            let mut phase = BinnedRenderPhase::<MembershipPhaseItem>::new(mode);
+            for (index, phase_type) in MEMBERSHIP_PHASE_TYPES.into_iter().enumerate() {
+                phase.add(
+                    MembershipBatchSetKey(0),
+                    0,
+                    (Entity::PLACEHOLDER, membership_entity(index as u32).into()),
+                    InputUniformIndex(index as u32),
+                    phase_type,
+                );
+            }
+            let cached = &phase.cached_entity_bin_keys[&MainEntity::from(membership_entity(0))];
+            assert_eq!(
+                cached.cached_bin_key.as_ref().unwrap().phase_type,
+                if mode == GpuPreprocessingMode::PreprocessingOnly {
+                    BinnedRenderPhaseType::BatchableMesh
+                } else {
+                    BinnedRenderPhaseType::MultidrawableMesh
+                }
+            );
+            phase
+                .unbatchable_meshes
+                .get_mut(&(MembershipBatchSetKey(0), 0))
+                .unwrap()
+                .buffer_indices
+                .add(UnbatchableBinnedEntityIndices {
+                    instance_index: 0,
+                    extra_index: PhaseItemExtraIndex::None,
+                });
+            let before = enumerated_binned_members(&phase);
+            phase.prepare_for_new_frame();
+            assert_eq!(enumerated_binned_members(&phase), before);
+            assert_binned_membership_matches_enumeration(&phase, 5);
+            assert!(matches!(
+                phase.unbatchable_meshes[&(MembershipBatchSetKey(0), 0)].buffer_indices,
+                UnbatchableBinnedEntityIndexSet::NoEntities
+            ));
+        }
+    }
+
+    #[test]
+    fn sorted_membership_hash_contract_uses_actual_map_hasher() {
+        let phase = SortedRenderPhase::<MembershipPhaseItem>::default();
+        for main_index in [0, 1, 1024, u32::MAX - 1] {
+            for main_generation in [0, 1, 1 << 25, u32::MAX] {
+                let main_entity = MainEntity::from(Entity::from_index_and_generation(
+                    EntityIndex::from_raw_u32(main_index).unwrap(),
+                    EntityGeneration::from_bits(main_generation),
+                ));
+                for render_index in [0, 7, u32::MAX - 1] {
+                    for render_generation in [0, 1, u32::MAX] {
+                        let render_entity = Entity::from_index_and_generation(
+                            EntityIndex::from_raw_u32(render_index).unwrap(),
+                            EntityGeneration::from_bits(render_generation),
+                        );
+                        assert_eq!(
+                            phase.items.hasher().hash_one((render_entity, main_entity)),
+                            phase.items.hasher().hash_one(main_entity)
+                        );
+                    }
+                }
+                assert_eq!(
+                    phase
+                        .items
+                        .hasher()
+                        .hash_one((Entity::PLACEHOLDER, main_entity)),
+                    phase.items.hasher().hash_one(main_entity)
+                );
+            }
+        }
+    }
+
+    fn assert_sorted_membership_matches_enumeration(
+        phase: &SortedRenderPhase<MembershipPhaseItem>,
+    ) {
+        for main_index in 0..16 {
+            let main_entity = membership_entity(main_index).into();
+            assert_eq!(
+                phase.contains_main_entity(main_entity),
+                phase
+                    .items
+                    .values()
+                    .any(|item| item.main_entity() == main_entity)
+            );
+        }
+    }
+
+    #[test]
+    fn sorted_membership_preserves_custom_duplicate_carriers_and_batch_followers() {
+        let mut phase = SortedRenderPhase::<MembershipPhaseItem>::default();
+        for (render, main) in [(20, 1), (21, 1), (22, 2), (23, 3)] {
+            phase.add_retained(membership_item(render, main));
+        }
+        let mut placeholder_item = membership_item(0, 4);
+        placeholder_item.render_entity = Entity::PLACEHOLDER;
+        phase.add_retained(placeholder_item);
+        // Batching retains followers in the map, even when their ranges are empty.
+        phase
+            .items
+            .get_mut(&(membership_entity(20), membership_entity(1).into()))
+            .unwrap()
+            .batch_range = 0..4;
+        phase
+            .items
+            .get_mut(&(membership_entity(22), membership_entity(2).into()))
+            .unwrap()
+            .batch_range = 0..0;
+        phase.sort();
+        let before: Vec<_> = phase
+            .items
+            .iter()
+            .map(|(key, item)| (*key, item.batch_range.clone(), item.extra_index.clone()))
+            .collect();
+        assert_sorted_membership_matches_enumeration(&phase);
+        assert!(phase.contains_main_entity(membership_entity(2).into()));
+        let after: Vec<_> = phase
+            .items
+            .iter()
+            .map(|(key, item)| (*key, item.batch_range.clone(), item.extra_index.clone()))
+            .collect();
+        assert_eq!(before, after);
+        phase.remove(membership_entity(20), membership_entity(1).into());
+        assert!(phase.contains_main_entity(membership_entity(1).into()));
+        phase.remove(membership_entity(21), membership_entity(1).into());
+        assert!(!phase.contains_main_entity(membership_entity(1).into()));
+        assert_sorted_membership_matches_enumeration(&phase);
+        phase.add_retained(membership_item(24, 1));
+        assert_sorted_membership_matches_enumeration(&phase);
+        phase.clear();
+        assert_sorted_membership_matches_enumeration(&phase);
+    }
+
+    #[test]
+    fn sorted_membership_tracks_transient_and_retained_prepare() {
+        let view = RetainedViewEntity::new(membership_entity(100).into(), None, 0);
+        let mut phases = ViewSortedRenderPhases::<MembershipPhaseItem>::default();
+        phases.prepare_for_new_frame(view);
+        let phase = phases.get_mut(&view).unwrap();
+        phase.add_retained(membership_item(20, 1));
+        phase.add_transient(membership_item(21, 1));
+        phase.add_transient(membership_item(22, 2));
+        assert_sorted_membership_matches_enumeration(phase);
+        phases.prepare_for_new_frame(view);
+        let phase = phases.get_mut(&view).unwrap();
+        assert!(phase.contains_main_entity(membership_entity(1).into()));
+        assert!(!phase.contains_main_entity(membership_entity(2).into()));
+        assert!(phase.transient_items.is_empty());
+        assert_sorted_membership_matches_enumeration(phase);
+        // A transient key remains scheduled for removal even if replaced as retained.
+        phase.add_transient(membership_item(23, 3));
+        phase.add_retained(membership_item(23, 3));
+        phases.prepare_for_new_frame(view);
+        assert!(!phases[&view].contains_main_entity(membership_entity(3).into()));
+        assert_sorted_membership_matches_enumeration(&phases[&view]);
+    }
+
+    #[test]
+    fn sorted_membership_distinguishes_entity_generations() {
+        let mut phase = SortedRenderPhase::<MembershipPhaseItem>::default();
+        let mut item = membership_item(20, 1);
+        item.main_entity = Entity::from_index_and_generation(
+            EntityIndex::from_raw_u32(1).unwrap(),
+            EntityGeneration::from_bits(1),
+        )
+        .into();
+        let main_entity = item.main_entity;
+        phase.add_retained(item);
+        assert!(phase.contains_main_entity(main_entity));
+        assert!(!phase.contains_main_entity(membership_entity(1).into()));
+    }
+
+    #[test]
+    fn sorted_membership_does_not_visit_phase_item_values() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut phase = SortedRenderPhase::<MembershipPhaseItem>::default();
+        for main_index in 0..4096 {
+            let mut item = membership_item(main_index + 5000, main_index);
+            item.main_entity_reads = reads.clone();
+            phase.add_retained(item);
+        }
+        reads.store(0, Ordering::Relaxed);
+        assert!(phase.contains_main_entity(membership_entity(4095).into()));
+        assert!(!phase.contains_main_entity(membership_entity(4096).into()));
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
     }
 }
 
