@@ -39,7 +39,6 @@ impl Consumer {
 struct NeededBatch {
     batch: usize,
     terrain: bool,
-    casts_shadows: bool,
     invalid_owned_state: bool,
 }
 
@@ -47,13 +46,20 @@ struct NeededBatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NeededCatalogKey {
     gpu_identity: u64,
-    gpu_generation: u64,
-    gpu_layout: u64,
     scene_changed: Tick,
-    materials_revision: u64,
     refusal_revision: Option<u64>,
     layout_scope: u64,
     runtime_state_revision: Option<u64>,
+}
+
+/// Render readiness can change without changing any placed instance. In
+/// particular, global material uploads and GPU packing never own the catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReadinessKey {
+    catalog: NeededCatalogKey,
+    gpu_generation: u64,
+    gpu_layout: u64,
+    materials_revision: u64,
 }
 
 struct Snapshot {
@@ -69,6 +75,7 @@ struct Producer {
     generation: u64,
     revision: Option<[u64; 9]>,
     needed_key: Option<NeededCatalogKey>,
+    observation_key: Option<ReadinessKey>,
     needed_catalog: HashMap<u32, Vec<NeededBatch>>,
     consumers: Vec<Consumer>,
     frame: u64,
@@ -81,14 +88,15 @@ struct Producer {
 impl Producer {
     fn observe(
         &mut self,
-        needed_key: NeededCatalogKey,
+        inputs: ReadinessKey,
         revision: [u64; 9],
         consumers: Vec<Consumer>,
         needed: impl FnOnce() -> HashMap<u32, Vec<NeededBatch>>,
-        batch_ready: impl Fn(usize) -> (bool, bool, bool),
+        batch_ready: impl Fn(usize) -> (bool, bool, bool, bool),
     ) -> Option<std::collections::HashMap<u32, ClusterWorldReadiness>> {
-        let catalog_changed = self.needed_key != Some(needed_key);
+        let catalog_changed = self.needed_key != Some(inputs.catalog);
         if !catalog_changed
+            && self.observation_key == Some(inputs)
             && self.revision == Some(revision)
             && self.consumers.len() == consumers.len()
             && self
@@ -100,15 +108,30 @@ impl Producer {
             return None;
         }
         crate::work_counters::record("cluster_drawability/non_replay");
+        if let Some(previous) = self.observation_key {
+            if previous.materials_revision != inputs.materials_revision {
+                crate::work_counters::record("cluster_drawability/input_materials");
+            }
+            if previous.gpu_generation != inputs.gpu_generation {
+                crate::work_counters::record("cluster_drawability/input_gpu_generation");
+            }
+            if previous.gpu_layout != inputs.gpu_layout {
+                crate::work_counters::record("cluster_drawability/input_gpu_layout");
+            }
+        }
         #[cfg(test)]
         {
             self.walks += 1;
         }
         if catalog_changed {
-            self.needed_catalog = needed();
-            self.needed_key = Some(needed_key);
+            {
+                perf_span!("cluster::drawability::catalog");
+                self.needed_catalog = needed();
+            }
+            self.needed_key = Some(inputs.catalog);
             crate::work_counters::record("cluster_drawability/needed_catalog");
         }
+        perf_span!("cluster::drawability::aggregate");
         let mut worlds = std::collections::HashMap::new();
         for consumer in &consumers {
             let world = worlds
@@ -129,12 +152,14 @@ impl Producer {
                     domain.terrain
                 } else {
                     domain.objects
-                }) || (consumer.shadow && !need.casts_shadows)
-                {
+                }) {
+                    continue;
+                }
+                let (compute, template, failed, casts_shadows) = batch_ready(need.batch);
+                if consumer.shadow && !casts_shadows {
                     continue;
                 }
                 world.needed_batches += 1;
-                let (compute, template, failed) = batch_ready(need.batch);
                 world.pending_compute += usize::from(!compute);
                 world.pending_templates += usize::from(!need.terrain && !template);
                 world.failed_batches += usize::from(failed || need.invalid_owned_state);
@@ -147,6 +172,7 @@ impl Producer {
             }
         }
         self.revision = Some(revision);
+        self.observation_key = Some(inputs);
         self.consumers = consumers;
         Some(worlds)
     }
@@ -367,18 +393,20 @@ fn observe(
         layout,
         runtime_state.as_ref().map_or(0, |state| state.revision),
     ];
-    let needed_key = NeededCatalogKey {
-        gpu_identity: gpu.identity,
+    let inputs = ReadinessKey {
+        catalog: NeededCatalogKey {
+            gpu_identity: gpu.identity,
+            scene_changed: scene.last_changed(),
+            refusal_revision: sources.refusal_revision,
+            layout_scope: layout,
+            runtime_state_revision: runtime_state.as_ref().map(|state| state.revision),
+        },
         gpu_generation: gpu.generation,
         gpu_layout: gpu.layout_epoch,
-        scene_changed: scene.last_changed(),
         materials_revision: materials.revision(),
-        refusal_revision: sources.refusal_revision,
-        layout_scope: layout,
-        runtime_state_revision: runtime_state.as_ref().map(|state| state.revision),
     };
     let result = producer.observe(
-        needed_key,
+        inputs,
         revision,
         consumers,
         || {
@@ -394,12 +422,6 @@ fn observe(
                 };
                 let batch = instance.batch as usize;
                 let terrain = matches!(instance.identity, ClusterInstanceIdentity::Terrain { .. });
-                let casts_shadows = gpu
-                    .batches
-                    .get(batch)
-                    .and_then(|batch| batch.material)
-                    .and_then(|material| materials.get(material))
-                    .is_none_or(|material| material.properties.shadows_enabled);
                 let invalid_owned_state = match instance.identity {
                     ClusterInstanceIdentity::Object(record) => {
                         package.record(&record).is_some_and(|identity| {
@@ -417,7 +439,6 @@ fn observe(
                     .or_insert(NeededBatch {
                         batch,
                         terrain,
-                        casts_shadows,
                         invalid_owned_state: false,
                     });
                 need.invalid_owned_state |= invalid_owned_state;
@@ -432,6 +453,11 @@ fn observe(
                 compute,
                 sources.templates.get(batch) == Some(&true),
                 sources.source_fallback_batches.contains(&(batch as u32)),
+                gpu.batches
+                    .get(batch)
+                    .and_then(|batch| batch.material)
+                    .and_then(|material| materials.get(material))
+                    .is_none_or(|material| material.properties.shadows_enabled),
             )
         },
     );
@@ -520,6 +546,7 @@ fn publish(mut producer: ResMut<Producer>, mut main: ResMut<MainWorld>) {
                 .is_none()
                 .then_some(space.exterior_worldspace(config.worldspace_id))
         });
+    let evaluated = active_world.and_then(|world| worlds.get(&world)).copied();
     let missing = if let Some(mut gate) = main.get_resource_mut::<ClusterLoadingGate>() {
         if coherent {
             gate.publish(&package, layout, generation, frame, worlds);
@@ -536,6 +563,12 @@ fn publish(mut producer: ResMut<Producer>, mut main: ResMut<MainWorld>) {
     if missing > 0 && crate::work_counters::world_ready() {
         error!(
             owned_not_drawable = missing,
+            coherent,
+            snapshot_generation = generation,
+            snapshot_layout = layout,
+            active_world = ?active_world,
+            evaluated = ?evaluated,
+            gate = ?active_world.and_then(|world| main.get_resource::<ClusterLoadingGate>().map(|gate| gate.diagnostics(world))),
             "cluster-owned geometry lost drawability; stock replacement is forbidden"
         );
     }
@@ -559,16 +592,18 @@ pub(super) fn install(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn catalog_key() -> NeededCatalogKey {
-        NeededCatalogKey {
-            gpu_identity: 11,
+    fn catalog_key() -> ReadinessKey {
+        ReadinessKey {
+            catalog: NeededCatalogKey {
+                gpu_identity: 11,
+                scene_changed: Tick::new(5),
+                refusal_revision: Some(23),
+                layout_scope: 29,
+                runtime_state_revision: Some(31),
+            },
             gpu_generation: 13,
             gpu_layout: 17,
-            scene_changed: Tick::new(5),
             materials_revision: 19,
-            refusal_revision: Some(23),
-            layout_scope: 29,
-            runtime_state_revision: Some(31),
         }
     }
 
@@ -652,7 +687,6 @@ mod tests {
             vec![NeededBatch {
                 batch: 0,
                 terrain: false,
-                casts_shadows: true,
                 invalid_owned_state: false,
             }],
         )])
@@ -711,7 +745,7 @@ mod tests {
         let mut producer = Producer::default();
         let result = producer
             .observe(catalog_key(), [0; 9], consumers, needed, |_| {
-                (true, true, false)
+                (true, true, false, true)
             })
             .unwrap();
         assert_eq!(result[&42].missing_views, 1);
@@ -726,7 +760,7 @@ mod tests {
         let mut producer = Producer::default();
         let result = producer
             .observe(catalog_key(), [0; 9], consumers, needed, |_| {
-                (true, true, false)
+                (true, true, false, true)
             })
             .unwrap();
         assert_eq!(result[&42].applicable_cameras, 2);
@@ -760,7 +794,7 @@ mod tests {
         ];
         let waiting = producer
             .observe(catalog_key(), [0; 9], consumers.clone(), needed, |_| {
-                (true, true, false)
+                (true, true, false, true)
             })
             .unwrap();
         assert_eq!(waiting[&42].missing_views, 1);
@@ -785,7 +819,7 @@ mod tests {
                     consumer(2, true, Some(ready)),
                 ],
                 needed,
-                |_| (true, true, false),
+                |_| (true, true, false, true),
             )
             .unwrap();
         assert_eq!(ready_world[&42].pending_pipelines, 0);
@@ -803,7 +837,7 @@ mod tests {
         let mut revision = [1, 11, 13, 17, 19, 23, 1, 29, 31];
         let initial = producer
             .observe(catalog_key(), revision, consumers.clone(), catalog, |_| {
-                (true, true, false)
+                (true, true, false, true)
             })
             .unwrap();
         assert_eq!(initial[&42].pending_templates, 0);
@@ -812,7 +846,7 @@ mod tests {
         revision[5] += 1; // Source template layout qualification changed too.
         let changed = producer
             .observe(catalog_key(), revision, consumers.clone(), catalog, |_| {
-                (true, false, true)
+                (true, false, true, true)
             })
             .expect("changed source qualification must publish fresh readiness");
         assert_eq!(changed[&42].needed_batches, 1);
@@ -826,7 +860,7 @@ mod tests {
         revision[4] += 1;
         let recovered = producer
             .observe(catalog_key(), revision, consumers, catalog, |_| {
-                (true, true, false)
+                (true, true, false, true)
             })
             .unwrap();
         assert_eq!(recovered[&42].pending_templates, 0);
@@ -843,7 +877,7 @@ mod tests {
                 [0; 9],
                 vec![consumer(1, false, Some(Arc::new(vec![true])))],
                 needed,
-                |_| (true, true, false),
+                |_| (true, true, false, true),
             )
             .unwrap();
         let changed = producer
@@ -855,7 +889,7 @@ mod tests {
                     consumer(2, true, None),
                 ],
                 || panic!("consumer changes must reuse the needed catalog"),
-                |_| (true, true, false),
+                |_| (true, true, false, true),
             )
             .unwrap();
         assert_eq!(changed[&42].applicable_cameras, 1);
@@ -871,7 +905,7 @@ mod tests {
         let mut revision = [0; 9];
         producer
             .observe(catalog_key(), revision, consumers.clone(), needed, |_| {
-                (true, true, false)
+                (true, true, false, true)
             })
             .unwrap();
         revision[0] = 1;
@@ -881,10 +915,33 @@ mod tests {
                 revision,
                 consumers,
                 || panic!("admission generation does not change the inventory"),
-                |_| (true, true, false),
+                |_| (true, true, false, true),
             )
             .expect("a new admission generation must not replay old proof");
         assert_eq!(current[&42].pending_pipelines, 0);
+        assert_eq!(current[&42].needed_batches, 1);
+    }
+
+    #[test]
+    fn prepared_material_changes_refresh_proof_without_rewalking_instances() {
+        let mut producer = Producer::default();
+        let consumers = vec![consumer(1, false, Some(Arc::new(vec![true])))];
+        let mut key = catalog_key();
+        producer
+            .observe(key, [0; 9], consumers.clone(), needed, |_| {
+                (true, true, false, true)
+            })
+            .unwrap();
+        key.materials_revision += 1;
+        let current = producer
+            .observe(
+                key,
+                [0; 9],
+                consumers,
+                || panic!("prepared materials do not change the instance inventory"),
+                |_| (true, true, false, true),
+            )
+            .expect("material changes must still refresh the drawing proof");
         assert_eq!(current[&42].needed_batches, 1);
     }
 
@@ -894,7 +951,7 @@ mod tests {
         let consumers = vec![consumer(1, false, Some(Arc::new(vec![true])))];
         producer
             .observe(catalog_key(), [0; 9], consumers.clone(), needed, |_| {
-                (true, true, false)
+                (true, true, false, true)
             })
             .unwrap();
         assert!(
@@ -913,21 +970,18 @@ mod tests {
     #[test]
     fn changed_inventory_scope_replaces_the_needed_catalog() {
         let base = catalog_key();
-        let mut changes = [base; 8];
-        changes[0].gpu_identity += 1;
-        changes[1].gpu_generation += 1;
-        changes[2].gpu_layout += 1;
-        changes[3].scene_changed = Tick::new(6);
-        changes[4].materials_revision += 1;
-        changes[5].refusal_revision = Some(24);
-        changes[6].layout_scope += 1;
-        changes[7].runtime_state_revision = Some(32);
+        let mut changes = [base; 5];
+        changes[0].catalog.gpu_identity += 1;
+        changes[1].catalog.scene_changed = Tick::new(6);
+        changes[2].catalog.refusal_revision = Some(24);
+        changes[3].catalog.layout_scope += 1;
+        changes[4].catalog.runtime_state_revision = Some(32);
         for key in changes {
             let mut producer = Producer::default();
             let consumers = vec![consumer(1, false, Some(Arc::new(vec![true])))];
             producer
                 .observe(base, [0; 9], consumers.clone(), needed, |_| {
-                    (true, true, false)
+                    (true, true, false, true)
                 })
                 .unwrap();
             let calls = std::cell::Cell::new(0);
@@ -942,7 +996,7 @@ mod tests {
                         catalog.get_mut(&42).unwrap()[0].invalid_owned_state = true;
                         catalog
                     },
-                    |_| (true, true, false),
+                    |_| (true, true, false, true),
                 )
                 .expect("catalog changes must defeat an otherwise exact aggregate replay");
             assert_eq!(calls.get(), 1, "key={key:?}");
@@ -959,9 +1013,9 @@ mod tests {
             let calls = std::cell::Cell::new(0);
             for (expected, value) in [None, Some(0), Some(1)].into_iter().enumerate() {
                 if refusal {
-                    key.refusal_revision = value;
+                    key.catalog.refusal_revision = value;
                 } else {
-                    key.runtime_state_revision = value;
+                    key.catalog.runtime_state_revision = value;
                 }
                 let result = producer.observe(
                     key,
@@ -971,7 +1025,7 @@ mod tests {
                         calls.set(calls.get() + 1);
                         needed()
                     },
-                    |_| (true, true, false),
+                    |_| (true, true, false, true),
                 );
                 assert!(result.is_some(), "refusal={refusal}, revision={value:?}");
                 assert_eq!(calls.get(), expected + 1);
@@ -990,7 +1044,7 @@ mod tests {
         let mut key = catalog_key();
         let initial = producer
             .observe(key, [0; 9], consumers.clone(), needed, |_| {
-                (true, true, false)
+                (true, true, false, true)
             })
             .unwrap();
         assert_eq!(initial[&42].needed_batches, 2);
@@ -1000,12 +1054,8 @@ mod tests {
                 key,
                 [0; 9],
                 consumers,
-                || {
-                    let mut catalog = needed();
-                    catalog.get_mut(&42).unwrap()[0].casts_shadows = false;
-                    catalog
-                },
-                |_| (true, true, false),
+                || panic!("shadow policy changes readiness, not instance inventory"),
+                |_| (true, true, false, false),
             )
             .unwrap();
         assert_eq!(changed[&42].applicable_cameras, 1);
@@ -1020,12 +1070,12 @@ mod tests {
         let mut key = catalog_key();
         let initial = producer
             .observe(key, [0; 9], consumers.clone(), needed, |_| {
-                (true, false, true)
+                (true, false, true, true)
             })
             .unwrap();
         assert_eq!(initial[&42].needed_batches, 1);
         assert_eq!(initial[&42].failed_batches, 1);
-        key.refusal_revision = Some(24);
+        key.catalog.refusal_revision = Some(24);
         let changed = producer
             .observe(key, [0; 9], consumers, HashMap::new, |_| {
                 panic!("a permanently refused batch is no longer needed")
@@ -1063,7 +1113,7 @@ mod tests {
         let worlds = render
             .resource_mut::<Producer>()
             .observe(catalog_key(), [0; 9], consumers.clone(), needed, |_| {
-                (true, true, false)
+                (true, true, false, true)
             })
             .unwrap();
         render.resource_mut::<Producer>().pending = Some(Snapshot {
@@ -1101,7 +1151,7 @@ mod tests {
                 [0; 9],
                 consumers,
                 || panic!("same-scope return may reuse inventory, never readiness proof"),
-                |_| (true, true, false),
+                |_| (true, true, false, true),
             )
             .expect("withdrawal must force a fresh aggregate before readiness can return");
         assert_eq!(restored[&42].needed_batches, 1);
@@ -1138,7 +1188,7 @@ mod tests {
                 [0; 9],
                 vec![consumer(1, false, Some(Arc::new(vec![true])))],
                 needed,
-                |_| (true, true, false),
+                |_| (true, true, false, true),
             )
             .unwrap();
         assert_eq!(positive[&42].pending_pipelines, 0);
@@ -1148,7 +1198,7 @@ mod tests {
                 [0; 9],
                 vec![consumer(1, false, Some(Arc::new(vec![false])))],
                 needed,
-                |_| (true, true, false),
+                |_| (true, true, false, true),
             )
             .unwrap();
         assert_eq!(failed[&42].pending_pipelines, 1);

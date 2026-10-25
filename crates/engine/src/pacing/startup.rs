@@ -277,6 +277,7 @@ fn drive_startup_load(
                 commands.entity(cover).despawn();
             }
             load.finished = true;
+            info!("startup load: cover fade finished");
         } else {
             set_alpha(&mut overlay, 1.0 - fade / FADE_SECONDS);
             load.fade = Some(fade);
@@ -524,6 +525,63 @@ mod tests {
         }
         assert_eq!(cover_alpha(&mut app), None, "the cover is gone");
         assert!(app.world().resource::<StartupLoad>().finished);
+    }
+
+    #[test]
+    fn world_ready_route_waits_for_startup_cover_to_finish_before_moving() {
+        use crate::route::{RouteGround, RoutePlan, RouteRunner, drive_route};
+
+        let mut config = configured_pacing();
+        config.benchmark_duration_secs = Some(10.0);
+        let mut app = startup_app(config);
+        set_interior(&mut app, 77, true);
+        let plan = RoutePlan::parse(
+            r#"{"name":"fade","worldspace":60,"speed":400,"waypoints":[[0,0],[1000,0]]}"#,
+        )
+        .unwrap();
+        let mut tracker = crate::pacing::PacingTracker::default();
+        tracker.observe(0.0, true, false, 16.0);
+        tracker.observe(16.0, true, false, 16.0);
+        assert!(tracker.world_ready_reached());
+        app.insert_resource(tracker)
+            .insert_resource(RouteRunner::new(plan, RouteGround::from_cells([])))
+            .add_systems(PreUpdate, drive_route);
+        app.update();
+        for _ in 0..frames_until_faded() + 2 {
+            if !app.world().resource::<StartupLoad>().cover_pending() {
+                break;
+            }
+            assert!(
+                !app.world().resource::<RouteRunner>().report().started,
+                "a ready latch must not start traversal during the startup fade"
+            );
+            app.update();
+        }
+        assert!(!app.world().resource::<StartupLoad>().cover_pending());
+        app.update();
+        app.update();
+        let route = app.world().resource::<RouteRunner>().report();
+        assert!(route.started);
+        assert!(route.distance_travelled_units > 0.0);
+    }
+
+    #[test]
+    fn an_explicit_immediate_route_keeps_its_startup_stress_behavior() {
+        use crate::route::{RouteGround, RoutePlan, RouteRunner, drive_route};
+
+        let mut config = configured_pacing();
+        config.benchmark_duration_secs = Some(10.0);
+        let mut app = startup_app(config);
+        set_interior(&mut app, 77, true);
+        let plan = RoutePlan::parse(
+            r#"{"name":"immediate","worldspace":60,"speed":400,"start":"immediately","waypoints":[[0,0],[1000,0]]}"#,
+        )
+        .unwrap();
+        app.insert_resource(RouteRunner::new(plan, RouteGround::from_cells([])))
+            .add_systems(PreUpdate, drive_route);
+        app.update();
+        assert!(app.world().resource::<StartupLoad>().cover_pending());
+        assert!(app.world().resource::<RouteRunner>().report().started);
     }
 
     #[test]
