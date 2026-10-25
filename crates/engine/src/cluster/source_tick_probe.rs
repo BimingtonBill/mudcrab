@@ -12,10 +12,12 @@ pub(super) struct TickProbe {
 
 /// A conservative precheck for native `Changed<T>` queries.
 ///
-/// `false` proves no stored value changed in this tick window. `true` only
-/// requests the existing native query; its domain and invalidation policy still
-/// decide what to do. Disabled entities are included in this advisory superset.
-pub(super) fn component_changes<T: Component>(
+/// The admitted query must require `Changed<T>` conjunctively. `false` excludes
+/// changed `T` rows in its structurally eligible tables; `true` only requests the
+/// existing native query. Its row filters and default-query policy remain the
+/// authority. Omitted default filters deliberately keep an advisory superset.
+/// Non-dense or unavailable filter metadata retains the broad copied-tick scan.
+pub(super) fn filtered_component_changes<T: Component, F: bevy::ecs::query::QueryFilter>(
     world: &World,
     last_run: Tick,
     this_run: Tick,
@@ -36,7 +38,18 @@ pub(super) fn component_changes<T: Component>(
         return probe;
     }
 
+    // Reuse Bevy's structural predicate. Sparse membership can differ between
+    // archetypes sharing a table, so only dense filters may reject a table.
+    // State and table membership are read afresh; no table IDs survive moves.
+    let filter_state = F::IS_DENSE
+        .then(|| F::get_state(world.components()))
+        .flatten();
     for table in world.storages().tables.iter() {
+        if let Some(state) = filter_state.as_ref()
+            && !F::matches_component_set(state, &|id| table.has_column(id))
+        {
+            continue;
+        }
         let Some(column) = table.get_column(component_id) else {
             continue;
         };
@@ -60,6 +73,11 @@ pub(super) fn component_changes<T: Component>(
         }
     }
     probe
+}
+
+#[cfg(test)]
+fn component_changes<T: Component>(world: &World, last_run: Tick, this_run: Tick) -> TickProbe {
+    filtered_component_changes::<T, ()>(world, last_run, this_run)
 }
 
 #[cfg(test)]
@@ -361,5 +379,210 @@ mod tests {
         let probe = component_changes::<Sparse>(&world, now, now);
         assert!(probe.changed);
         assert_eq!(probe.rows_checked, 0);
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use bevy::ecs::{prelude::*, query::QueryFilter};
+
+    #[derive(Component)]
+    struct Value(u32);
+    #[derive(Component)]
+    struct Included;
+    #[derive(Component)]
+    struct Alternate;
+    #[derive(Component)]
+    struct Missing;
+    #[derive(Component)]
+    #[component(storage = "SparseSet")]
+    struct Sparse;
+
+    fn native<F: QueryFilter>(world: &mut World, last: Tick, now: Tick) -> bool {
+        let mut state = world.query_filtered::<Entity, (Changed<Value>, F)>();
+        // SAFETY: the query belongs to this world, reads only Entity/ticks and
+        // uses a shared world borrow. Explicit ticks match the probe's window.
+        unsafe {
+            state
+                .query_unchecked_with_ticks(world.as_unsafe_world_cell_readonly(), last, now)
+                .iter()
+                .next()
+                .is_some()
+        }
+    }
+
+    #[test]
+    fn dense_with_scope_does_not_read_unmatched_rows() {
+        let mut world = World::new();
+        world.spawn_batch((0..1024).map(Value));
+        world.spawn((Value(7), Included));
+        let now = world.read_change_tick();
+        let probe =
+            filtered_component_changes::<Value, (Changed<Value>, With<Included>)>(&world, now, now);
+        assert!(!probe.changed);
+        assert_eq!(
+            probe.rows_checked, 1,
+            "only the native structurally eligible table needs polling"
+        );
+    }
+
+    #[test]
+    fn excluded_mutation_does_not_admit_dense_with_query() {
+        let mut world = World::new();
+        let excluded = world.spawn(Value(1)).id();
+        let included = world.spawn((Value(2), Included)).id();
+        let last = world.read_change_tick();
+        world.increment_change_tick();
+        let now = world.read_change_tick();
+        world.get_mut::<Value>(excluded).unwrap().0 += 1;
+        assert!(!native::<With<Included>>(&mut world, last, now));
+        assert!(
+            !filtered_component_changes::<Value, (Changed<Value>, With<Included>)>(
+                &world, last, now
+            )
+            .changed
+        );
+        world.get_mut::<Value>(included).unwrap().0 += 1;
+        assert!(native::<With<Included>>(&mut world, last, now));
+        assert!(
+            filtered_component_changes::<Value, (Changed<Value>, With<Included>)>(
+                &world, last, now
+            )
+            .changed
+        );
+    }
+
+    #[test]
+    fn dense_without_and_or_scopes_preserve_native_candidates() {
+        let mut world = World::new();
+        world.spawn((Value(1), Included));
+        world.spawn((Value(2), Alternate));
+        world.spawn(Value(3));
+        let now = world.read_change_tick();
+        let without = filtered_component_changes::<Value, (Changed<Value>, Without<Included>)>(
+            &world, now, now,
+        );
+        assert_eq!(without.rows_checked, 2);
+        let either = filtered_component_changes::<
+            Value,
+            (Changed<Value>, Or<(With<Included>, With<Alternate>)>),
+        >(&world, now, now);
+        assert_eq!(either.rows_checked, 2);
+        assert!(!either.changed);
+        assert!(native::<Or<(With<Included>, With<Alternate>)>>(
+            &mut world,
+            Tick::new(0),
+            now
+        ));
+        assert!(
+            filtered_component_changes::<
+                Value,
+                (Changed<Value>, Or<(With<Included>, With<Alternate>)>),
+            >(&world, Tick::new(0), now)
+            .changed
+        );
+    }
+
+    #[test]
+    fn missing_filter_state_keeps_conservative_candidates() {
+        let mut world = World::new();
+        world.spawn((Value(1), Included));
+        let now = world.read_change_tick();
+        assert!(world.component_id::<Missing>().is_none());
+        assert!(
+            filtered_component_changes::<Value, (Changed<Value>, Without<Missing>)>(
+                &world,
+                Tick::new(0),
+                now
+            )
+            .changed
+        );
+        assert!(
+            filtered_component_changes::<
+                Value,
+                (Changed<Value>, Or<(With<Missing>, With<Included>)>),
+            >(&world, Tick::new(0), now)
+            .changed
+        );
+        assert!(
+            world.component_id::<Missing>().is_none(),
+            "admission must not register query inputs"
+        );
+    }
+
+    #[test]
+    fn sparse_scopes_never_reject_a_native_match_in_a_shared_table() {
+        let mut world = World::new();
+        let plain = world.spawn(Value(1)).id();
+        let sparse = world.spawn((Value(2), Sparse)).id();
+        assert_eq!(
+            world.entity(plain).location().table_id,
+            world.entity(sparse).location().table_id
+        );
+        let now = world.read_change_tick();
+        assert!(native::<With<Sparse>>(&mut world, Tick::new(0), now));
+        assert!(
+            filtered_component_changes::<Value, (Changed<Value>, With<Sparse>)>(
+                &world,
+                Tick::new(0),
+                now
+            )
+            .changed
+        );
+        assert!(native::<Without<Sparse>>(&mut world, Tick::new(0), now));
+        assert!(
+            filtered_component_changes::<Value, (Changed<Value>, Without<Sparse>)>(
+                &world,
+                Tick::new(0),
+                now
+            )
+            .changed
+        );
+        assert!(filtered_component_changes::<Value, (Changed<Value>, Or<(With<Sparse>, With<Included>)>)>(&world, Tick::new(0), now).changed);
+        assert_eq!(
+            filtered_component_changes::<Value, (Changed<Value>, Allow<Sparse>)>(&world, now, now)
+                .rows_checked,
+            2
+        );
+    }
+
+    #[test]
+    fn new_tables_and_migrations_preserve_prior_changed_ticks() {
+        let mut world = World::new();
+        let entity = world.spawn(Value(1)).id();
+        world.register_component::<Included>();
+        let last = world.read_change_tick();
+        world.increment_change_tick();
+        let now = world.read_change_tick();
+        world.get_mut::<Value>(entity).unwrap().0 = 2;
+        assert!(
+            !filtered_component_changes::<Value, (Changed<Value>, With<Included>)>(
+                &world, last, now
+            )
+            .changed
+        );
+        world.entity_mut(entity).insert(Included);
+        assert!(native::<With<Included>>(&mut world, last, now));
+        assert!(
+            filtered_component_changes::<Value, (Changed<Value>, With<Included>)>(
+                &world, last, now
+            )
+            .changed
+        );
+        world.entity_mut(entity).remove::<Included>();
+        assert!(
+            !filtered_component_changes::<Value, (Changed<Value>, With<Included>)>(
+                &world, last, now
+            )
+            .changed
+        );
+        world.spawn((Value(3), Included));
+        assert!(
+            filtered_component_changes::<Value, (Changed<Value>, With<Included>)>(
+                &world, last, now
+            )
+            .changed
+        );
     }
 }

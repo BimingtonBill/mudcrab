@@ -913,7 +913,7 @@ type SourceObservationDomain = (
 );
 
 // Keep native filters and their observation domain authoritative. A copied-tick
-// precheck skips their query machinery only when the entire component is quiet.
+// precheck skips their query machinery only when eligible tables are quiet.
 // This still polls table rows; it is not mutation tracking or a zero-work cache.
 macro_rules! source_change_queries {
     ($name:ident, $domain:ty, { $($field:ident: $component:ty $(=> $extra:ty)?),+ $(,)? }) => {
@@ -929,7 +929,7 @@ macro_rules! source_change_queries {
                 last_run: bevy::ecs::change_detection::Tick,
                 this_run: bevy::ecs::change_detection::Tick,
             ) -> (impl Iterator<Item = Entity> + 'a, u64, u64) {
-                $(let $field = source_tick_probe::component_changes::<$component>(world, last_run, this_run);)+
+                $(let $field = source_tick_probe::filtered_component_changes::<$component, ($domain, Changed<$component>, $($extra,)?)>(world, last_run, this_run);)+
                 let rows = 0 $(+ $field.rows_checked)+;
                 let admitted = 0 $(+ u64::from($field.changed))+;
                 (
@@ -5209,17 +5209,20 @@ mod extract_source_tests {
             .insert(Visibility::Inherited);
         input.app.update();
 
-        // Flat metadata and its draw affine belong to semantic hot observation.
-        // Exercise them separately: a matching total union would not detect a
-        // component accidentally left in the wrong change-query family.
-        input.app.world_mut().entity_mut(primitive).insert((
-            FlatSourcePrimitive {
-                model_matrix: Mat4::IDENTITY,
-                expected_global: GlobalTransform::IDENTITY,
-            },
-            GlobalTransform::IDENTITY,
-        ));
+        // Flat pose admission must use the native structural scope, while
+        // unrelated GlobalTransform writes stay outside this query branch.
+        // Flat metadata and its draw affine belong to semantic hot observation;
+        // exercise them separately, because a matching total union would not
+        // detect a component accidentally left in the wrong change-query family.
+        flatten_stock(&mut input, primitive);
+        let unrelated = input.app.world_mut().spawn(GlobalTransform::IDENTITY).id();
         input.app.update();
+        input.app.update();
+        *input
+            .app
+            .world_mut()
+            .get_mut::<GlobalTransform>(unrelated)
+            .unwrap() = GlobalTransform::from_translation(Vec3::X);
         input.app.update();
         input
             .app
@@ -5227,7 +5230,6 @@ mod extract_source_tests {
             .get_mut::<FlatSourcePrimitive>(primitive)
             .unwrap()
             .model_matrix = Mat4::from_translation(Vec3::X);
-        input.app.update();
         input.app.update();
         *input
             .app
