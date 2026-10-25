@@ -11,8 +11,29 @@ use engine::nif_depth::{NifDepthExtension, NifDepthMaterial, NifDepthState};
 
 #[test]
 fn authored_depth_extension_preserves_base_layout_in_both_binding_modes() {
+    // Probe compiled native backends before Bevy's infallible initializer. A
+    // machine without a physical adapter cannot run this device-backed test;
+    // device creation or validation failures on an available adapter must fail.
+    let backends = wgpu::Instance::enabled_backend_features()
+        & (Backends::VULKAN | Backends::DX12 | Backends::METAL | Backends::GL);
+    if backends.is_empty() {
+        eprintln!("SKIPPED: authored depth bindings: no compiled native GPU backend");
+        return;
+    }
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapters = bevy::tasks::block_on(instance.enumerate_adapters(backends));
+    if !adapters
+        .iter()
+        .any(|adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu)
+    {
+        eprintln!("SKIPPED: authored depth bindings: no physical GPU adapter for {backends:?}");
+        return;
+    }
     let RenderResources(device, _, adapter, ..) = bevy::tasks::block_on(
-        initialize_renderer_without_callbacks(Backends::VULKAN, None, &WgpuSettings::default()),
+        initialize_renderer_without_callbacks(backends, None, &WgpuSettings::default()),
     );
     assert_ne!(adapter.device_type, wgpu::DeviceType::Cpu, "GPU required");
     eprintln!(
