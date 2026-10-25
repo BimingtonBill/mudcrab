@@ -12,7 +12,9 @@ remote = ["bevy/bevy_remote"]
 # `--features tracy`; leave it off otherwise (it grows memory with no viewer attached).
 # `dep:profiling` with `profile-with-tracing` forwards wgpu-core's own scopes (command encoder finish,
 # barrier insertion, submit) to the same Tracy capture.
-tracy = ["bevy/trace_tracy", "dep:profiling", "profiling/profile-with-tracing"]
+# `tracy-client/only-localhost` keeps the profiler's listener on loopback: an all-interfaces listener
+# makes Windows Firewall prompt for every new engine binary path and exposes the capture stream.
+tracy = ["bevy/trace_tracy", "dep:profiling", "profiling/profile-with-tracing", "dep:tracy-client", "tracy-client/only-localhost"]
 # A RenderDoc capture of a chosen frame (`MUDCRAB_RENDERDOC_CAPTURE_FRAME=<n>`), for settled scenes:
 # `python tools/perf/perf_capture.py run renderdoc`. Development only; the engine must run under RenderDoc.
 renderdoc = ["dep:renderdoc"]
@@ -21,6 +23,8 @@ renderdoc = ["dep:renderdoc"]
 shared = { path = "../shared" }
 renderdoc = { version = "0.12.1", optional = true }
 profiling = { version = "1.0.18", optional = true, default-features = false }
+# Only to add `only-localhost` to the tracy-client Bevy's `trace_tracy` already locks; nothing new is compiled.
+tracy-client = { version = "=0.18.5", optional = true, default-features = false }
 bevy.workspace = true
 gltf = { version = "1.4", default-features = false }
 bevy_rapier3d = { version = "0.36.0", default-features = false, features = ["dim3", "debug-render-3d"] }
