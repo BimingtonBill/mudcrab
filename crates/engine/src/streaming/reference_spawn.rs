@@ -90,6 +90,8 @@ pub(crate) fn spawn_reference(
         world_position,
         WorldTransform(transform.to_matrix()),
         transform,
+        // Enable-state changes must also gate models that are still waiting for scene admission.
+        Visibility::default(),
     ));
     if let Some(bounds) = bounds.zip(model_bounds) {
         entity.insert(bounds);

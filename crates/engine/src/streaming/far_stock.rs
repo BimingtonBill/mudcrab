@@ -18,6 +18,7 @@ use crate::{
             CellRef, ExpectedModelBounds, ExteriorCellGrid, FormId, InstanceBounds, WorldTransform,
         },
         database::{CellKey, ReferenceResponse, ReferenceRow, WorldDatabase},
+        reference_state::ReferenceEnableState,
     },
 };
 use bevy::prelude::*;
@@ -82,7 +83,7 @@ struct FarStockMeasurements {
 pub(crate) struct FarStock {
     package: Option<Arc<CertifiedPackage>>,
     demand: Option<LodDemand>,
-    /// None scans the whole worldspace; only look-refused scenery may use that reach.
+    /// None scans the whole worldspace for enabled, refused static scenery.
     reach: Option<i32>,
     stream_radius: i32,
     generation: u64,
@@ -103,6 +104,7 @@ pub(crate) struct FarStock {
     near_roles: HashMap<Entity, CellRole>,
     fallback_revision: Option<u64>,
     refusal_revision: Option<u64>,
+    enable_revision: Option<u64>,
     fallback_references: BTreeSet<u32>,
     counted_worlds: HashSet<u32>,
     qualification_pending: bool,
@@ -112,6 +114,7 @@ pub(crate) struct FarStock {
 pub(crate) struct FarStockPlugin;
 impl Plugin for FarStockPlugin {
     fn build(&self, app: &mut App) {
+        crate::world::reference_state::install(app);
         super::partial_stock::install(app);
         app.init_resource::<FarStock>()
             .init_resource::<SourceFallbackDemand>()
@@ -181,7 +184,21 @@ fn needs_stock(reference: &crate::cluster::reader::PlacedReference) -> bool {
 fn full_stock_reach(reference: &crate::cluster::reader::PlacedReference) -> bool {
     needs_stock(reference)
         && reference.is_static_scenery
-        && reference.refusal_class == StockRefusalClass::Look
+        && matches!(
+            reference.refusal_class,
+            StockRefusalClass::Look | StockRefusalClass::Runtime
+        )
+}
+
+fn reference_enabled(
+    package: &CertifiedPackage,
+    reference: u32,
+    state: Option<&ReferenceEnableState>,
+) -> Option<bool> {
+    state.filter(|state| state.is_bound()).map_or_else(
+        || package.enable_catalog().enabled(reference),
+        |state| state.enabled(reference),
+    )
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -210,6 +227,9 @@ struct StockReferenceCounts {
     /// Union of refused and runtime fallback references; overlaps count only once.
     total: RadiusCounts,
     undrawn: UndrawnReferenceCounts,
+    hidden_by_state: usize,
+    unresolved_state: usize,
+    distant_runtime_stock: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -227,8 +247,7 @@ impl UndrawnReferenceCounts {
         inside: bool,
         has_stock_demand: bool,
     ) {
-        // This diagnoses absent routes, not pending IO or ordinary asset failures. Runtime-state
-        // refusals remain a separate, honest gap: the source loader may intentionally disable them.
+        // This diagnoses absent routes, not pending IO or ordinary asset failures.
         if inside || has_stock_demand || !reference.is_static_scenery || !needs_stock(reference) {
             return;
         }
@@ -252,6 +271,7 @@ fn stock_reference_counts(
     stream_radius: i32,
     fallback_references: &BTreeSet<u32>,
     desired: &HashMap<Identity, CellKey>,
+    state: Option<&ReferenceEnableState>,
 ) -> StockReferenceCounts {
     let mut counts = StockReferenceCounts::default();
     for (grid, ids) in package.placed_cells_in_window(demand.world, demand.center, None) {
@@ -266,11 +286,27 @@ fn stock_reference_counts(
             let refused = needs_stock(reference);
             let fallback = fallback_references.contains(id);
             if refused {
-                counts.undrawn.observe(
-                    reference,
-                    inside,
-                    desired.contains_key(&(demand.world, *id)),
-                );
+                let runtime = !inside
+                    && reference.is_static_scenery
+                    && reference.refusal_class == StockRefusalClass::Runtime;
+                let enabled = reference_enabled(package, *id, state);
+                if runtime && enabled == Some(true) && desired.contains_key(&(demand.world, *id)) {
+                    counts.distant_runtime_stock += 1;
+                }
+                if reference.is_static_scenery && enabled == Some(false) {
+                    if runtime {
+                        counts.hidden_by_state += 1;
+                    }
+                } else {
+                    if runtime && enabled.is_none() {
+                        counts.unresolved_state += 1;
+                    }
+                    counts.undrawn.observe(
+                        reference,
+                        inside,
+                        desired.contains_key(&(demand.world, *id)),
+                    );
+                }
                 counts.refused.add(inside);
                 match reference.refusal_class {
                     StockRefusalClass::Runtime => counts.runtime_refused.add(inside),
@@ -323,6 +359,12 @@ type ExistingReferences<'w, 's> = Query<
     Without<StreamedCellKey>,
 >;
 
+#[derive(bevy::ecs::system::SystemParam)]
+struct EnableStateContext<'w> {
+    state: Option<ResMut<'w, ReferenceEnableState>>,
+    proxies: Option<ResMut<'w, crate::cluster::runtime_state::RuntimeReferenceState>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan(
     mut commands: Commands,
@@ -336,6 +378,7 @@ fn plan(
     ownership: Option<Res<crate::cluster::ownership::OwnershipFacts>>,
     mut profiler: Option<ResMut<ProfilingState>>,
     mut far: ResMut<FarStock>,
+    mut enable: EnableStateContext,
     references: ExistingReferences,
     parents: Query<
         &StreamedCellKey,
@@ -393,6 +436,7 @@ fn plan(
             far.demand = None;
             far.fallback_revision = None;
             far.refusal_revision = None;
+            far.enable_revision = None;
             far.fallback_references.clear();
             far.counted_worlds.clear();
             far.qualification_pending = false;
@@ -404,10 +448,25 @@ fn plan(
         .as_ref()
         .is_none_or(|p| !Arc::ptr_eq(p, &package.0));
     if changed_package {
+        if let Some(state) = enable.state.as_mut()
+            && state.bind(package.0.enable_catalog().clone())
+        {
+            if let Some(proxies) = enable.proxies.as_mut() {
+                proxies.clear_enable_overrides();
+            }
+            commands.queue(|world: &mut World| {
+                world.resource_scope(|world, mut state: Mut<ReferenceEnableState>| {
+                    state.reconcile_roots(world);
+                });
+            });
+        }
         far.fallback_revision = None;
         far.fallback_references.clear();
         far.counted_worlds.clear();
     }
+    let enable_revision = enable.state.as_deref().map(|state| state.revision());
+    let enable_changed = far.enable_revision != enable_revision;
+    far.enable_revision = enable_revision;
     let refusal_revision = ownership
         .as_deref()
         .filter(|facts| facts.package_matches(&package.0))
@@ -428,21 +487,21 @@ fn plan(
     }
     let actual = views.current(&config, origin.0, portal.as_deref());
     let demand = views.residency_demand(&config, actual, portal.as_deref(), &mut lod);
-    // Owned clusters have no distance cutoff. Only recorded look-only STAT/TREE refusals
-    // and fixed material refusals inherit that reach. Runtime-state and unknown
-    // source feedback keep the grid.
+    // Owned clusters and enabled refused static scenery have no distance cutoff.
+    // Unknown source feedback keeps the grid; refusal classes do not replace enable state.
     // Native LOD stays disabled in owned mode, including for grid-bound references.
     let stream_radius = config.stream_radius.max(0);
     let reach = (!config.cluster_own_statics).then_some(stream_radius);
     if !changed_package
         && !fallback_changed
+        && !enable_changed
         && far.demand == demand
         && far.reach == reach
         && far.stream_radius == stream_radius
     {
         return;
     }
-    // Only frozen material refusals inherit unbounded static-scenery reach.
+    // Frozen material refusals supplement the unbounded look/runtime static-scenery routes.
     // Unclassified runtime source feedback has no authority to extend the grid.
     // This projection runs only after a changed demand/qualification, never settled frames.
     let permanent_refusals = ownership
@@ -465,6 +524,7 @@ fn plan(
             for id in ids {
                 if package.0.placed_reference(*id).is_some_and(|reference| {
                     reference.model_path.is_some()
+                        && reference_enabled(&package.0, *id, enable.state.as_deref()) == Some(true)
                         && (inside
                             || (config.cluster_own_statics
                                 && (full_stock_reach(reference)
@@ -482,6 +542,9 @@ fn plan(
         // An existing near source is not a redundant scene. Retain its exact
         // entity through retirement, including Complete references with runtime edits.
         for (_, form, cell, parent) in &references {
+            if reference_enabled(&package.0, form.0, enable.state.as_deref()) != Some(true) {
+                continue;
+            }
             let Ok(parent_key) = parents.get(parent.parent()) else {
                 continue;
             };
@@ -495,18 +558,45 @@ fn plan(
             }
         }
     }
+    // State gauges follow changed demand/state only; no settled-world inventory scan is added.
+    let counts = demand
+        .filter(|_| far.fallback_revision.is_some())
+        .map(|demand| {
+            stock_reference_counts(
+                &package.0,
+                demand,
+                stream_radius,
+                &far.fallback_references,
+                &desired,
+                enable.state.as_deref(),
+            )
+        });
+    if config.cluster_own_statics
+        && let Some(counts) = &counts
+    {
+        if let Some(profiler) = profiler.as_deref_mut() {
+            profiler.set_gauge(
+                "cluster/runtime_refused_hidden_by_state",
+                counts.hidden_by_state as f64,
+            );
+            profiler.set_gauge(
+                "cluster/runtime_refused_unresolved_state",
+                counts.unresolved_state as f64,
+            );
+        }
+        info!(
+            undrawn_runtime_refused = counts.undrawn.runtime,
+            runtime_refused_hidden_by_state = counts.hidden_by_state,
+            runtime_refused_unresolved_state = counts.unresolved_state,
+            "runtime-refused static draw paths after demand or enable-state change"
+        );
+    }
     // Inventory follows the actual stock plan: refusal labels alone cannot prove a missing route.
     if let Some(demand) = demand
         && far.fallback_revision.is_some()
         && far.counted_worlds.insert(demand.world)
     {
-        let counts = stock_reference_counts(
-            &package.0,
-            demand,
-            stream_radius,
-            &far.fallback_references,
-            &desired,
-        );
+        let counts = counts.as_ref().expect("qualified demand has an inventory");
         info!(
             worldspace = demand.world,
             center = ?demand.center,
@@ -521,7 +611,7 @@ fn plan(
             other_refused_inside = counts.other_refused.inside,
             other_refused_beyond = counts.other_refused.beyond,
             distant_look_stock = if config.cluster_own_statics { counts.look_refused.beyond } else { 0 },
-            distant_runtime_stock = 0usize,
+            distant_runtime_stock = counts.distant_runtime_stock,
             distant_material_stock = if config.cluster_own_statics { counts.fallback.beyond } else { 0 },
             fallback_inside = counts.fallback.inside,
             fallback_beyond = counts.fallback.beyond,
@@ -569,7 +659,7 @@ fn plan(
                     stream_radius,
                     undrawn_runtime_refused = runtime,
                     runtime_refused = runtime,
-                    "runtime-refused static references beyond the loaded grid have no distant draw path; state-aware distant drawing is not implemented"
+                    "enabled or unresolved runtime-refused static references beyond the loaded grid have no distant draw path"
                 );
             }
         }
@@ -691,6 +781,7 @@ pub(super) struct CollectParams<'w, 's> {
     commands: Commands<'w, 's>,
     config: Res<'w, EngineConfig>,
     ownership: Option<Res<'w, crate::cluster::ownership::OwnershipFacts>>,
+    enable_state: Option<Res<'w, ReferenceEnableState>>,
     database: Res<'w, WorldDatabase>,
     asset_server: Res<'w, AssetServer>,
     snow: Res<'w, DirectionalSnowCatalog>,
@@ -792,6 +883,7 @@ pub(super) fn collect(
                 mut commands,
                 config,
                 ownership,
+                enable_state,
                 asset_server,
                 snow,
                 origin,
@@ -903,10 +995,15 @@ pub(super) fn collect(
                     lights: config.lights,
                     schedule_scenes: super::requests::enabled(&config),
                 };
-                for row in rows {
+                for mut row in rows {
                     let id = (cell_world(key).unwrap(), row.form_id);
                     if far.owners.contains_key(&id) || !far.desired.contains_key(&id) {
                         continue;
+                    }
+                    // A response carries a new-game snapshot. Resolve session state at publication,
+                    // including state changes while this exact-ID request was in flight.
+                    if let Some(state) = enable_state.as_deref().filter(|state| state.is_bound()) {
+                        row.initially_enabled = state.enabled(row.form_id) == Some(true);
                     }
                     let Some((entity, requested)) =
                         spawn_reference(parent, row.clone(), &mut context)

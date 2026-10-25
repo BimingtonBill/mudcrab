@@ -2940,6 +2940,7 @@ struct CommitCatalogs<'w> {
     snow: Res<'w, DirectionalSnowCatalog>,
     budget: ResMut<'w, StreamingCommitBudget>,
     far: Option<ResMut<'w, far_stock::FarStock>>,
+    enable_state: Option<Res<'w, crate::world::reference_state::ReferenceEnableState>>,
 }
 
 /// What a commit reads to stamp a cell's nodes at birth (`crate::portal`'s spawn stamp,
@@ -3497,6 +3498,16 @@ fn collect_cells(
                     metrics.full_cells_without_terrain =
                         metrics.full_cells_without_terrain.saturating_add(1);
                     profiler.increment("streaming/full_cells_without_terrain", 1);
+                }
+                if let Some(state) = catalogs
+                    .enable_state
+                    .as_deref()
+                    .filter(|state| state.is_bound())
+                {
+                    for reference in &mut payload.references {
+                        reference.initially_enabled =
+                            state.enabled(reference.form_id) == Some(true);
+                    }
                 }
                 let adoptions = if detail == CellDetail::Full {
                     catalogs.far.as_deref_mut().map(|far| {
