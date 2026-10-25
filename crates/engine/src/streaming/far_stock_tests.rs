@@ -15,8 +15,22 @@ use bevy::{app::Propagate, camera::visibility::RenderLayers};
 use bevy_rapier3d::prelude::{Collider, ColliderDisabled};
 use std::time::Duration;
 
+#[test]
+fn runtime_refused_statics_have_unbounded_stock_reach() {
+    let fixture = Fixture::from_directory(published_for_runtime_inventory());
+    let reference = fixture.package.placed_reference(0x109).unwrap();
+    assert_eq!(reference.refusal_class, StockRefusalClass::Runtime);
+    assert!(
+        full_stock_reach(reference),
+        "runtime-refused static geometry needs the same distance-free source route"
+    );
+}
+
 #[path = "far_stock_pipeline_tests.rs"]
 mod sparse_pipeline;
+
+#[path = "far_stock_runtime_tests.rs"]
+mod runtime_enable;
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -2033,7 +2047,7 @@ fn owned_statics_desire_complete_initial_material_refusal_beyond_grid_with_exact
 }
 
 #[test]
-fn owned_statics_keep_runtime_state_refusals_within_stream_radius() {
+fn initially_disabled_runtime_refusals_stay_hidden_at_all_radii() {
     let fixture = Fixture::from_directory(published_for_runtime_inventory());
     let (key, row) = fixture
         .rows
@@ -2068,7 +2082,7 @@ fn owned_statics_keep_runtime_state_refusals_within_stream_radius() {
             .resource::<FarStock>()
             .desired
             .get(&(cell_world(*key).unwrap(), row.form_id)),
-        Some(key)
+        None
     );
     let generation = app.world().resource::<FarStock>().generation;
     app.update();
@@ -2093,6 +2107,7 @@ fn stock_candidate_counts_split_world_exact_demand_and_deduplicate_fallback() {
         0,
         &BTreeSet::from([0x100, 0x101, 0x103, 0x108]),
         &HashMap::new(),
+        None,
     );
     assert_eq!(
         counts,
@@ -2123,6 +2138,7 @@ fn stock_candidate_counts_split_world_exact_demand_and_deduplicate_fallback() {
                 other: 1,
                 ..default()
             },
+            ..default()
         }
     );
 }
@@ -2210,14 +2226,14 @@ fn undrawn_paths_report_actual_missing_distant_static_paths_once_at_qualificatio
             .resource_mut::<SourceFallbackDemand>()
             .update(Some(&fixture.package), BTreeSet::new());
         app.update();
-        // The distant look refusal has stock. Runtime and unparsed static refusals have none.
+        // The look refusal has stock; runtime state hides 0x109. Only the unparsed static lacks a route.
         let far = app.world().resource::<FarStock>();
         assert!(far.desired.contains_key(&(0x70, 0x103)));
         assert!(!far.desired.contains_key(&(0x70, 0x105)));
         assert!(!far.desired.contains_key(&(0x70, 0x109)));
         assert_eq!(
             reported_undrawn_paths(&app, fixture.directory.path()),
-            (Some(1), Some(1))
+            (Some(1), Some(0))
         );
         app.world_mut()
             .resource_mut::<SourceFallbackDemand>()
@@ -2227,11 +2243,11 @@ fn undrawn_paths_report_actual_missing_distant_static_paths_once_at_qualificatio
         app.update();
         assert_eq!(
             reported_undrawn_paths(&app, fixture.directory.path()),
-            (Some(1), Some(1))
+            (Some(1), Some(0))
         );
     });
     let events = logs.0.lock().unwrap();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 1);
     let fields = events
         .iter()
         .find(|fields| fields.contains_key("undrawn_static_geometry"))
@@ -2249,19 +2265,6 @@ fn undrawn_paths_report_actual_missing_distant_static_paths_once_at_qualificatio
             "{name}"
         );
     }
-    let runtime = events
-        .iter()
-        .find(|fields| fields.contains_key("undrawn_runtime_refused"))
-        .unwrap();
-    assert_eq!(
-        runtime.get("undrawn_runtime_refused").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(
-        runtime.get("runtime_refused").map(String::as_str),
-        Some("1")
-    );
-    assert_eq!(runtime.get("level").map(String::as_str), Some("WARN"));
 }
 
 #[test]
@@ -2327,7 +2330,7 @@ fn undrawn_paths_record_zero_when_every_refusal_is_inside_grid() {
             .contains_key(&(0x70, 0x105))
     );
     assert!(
-        app.world()
+        !app.world()
             .resource::<FarStock>()
             .desired
             .contains_key(&(0x70, 0x109))
@@ -2371,7 +2374,7 @@ fn undrawn_paths_report_legacy_threshold_holes_without_adding_stock() {
 }
 
 #[test]
-fn undrawn_paths_warn_without_a_geometry_error_for_runtime_only_refusals() {
+fn disabled_runtime_only_refusals_have_no_missing_path_warning() {
     use bevy::log::tracing_subscriber::{Registry, prelude::*};
     let fixture = Fixture::from_directory(published_for_runtime_only_inventory());
     let mut app = complete_plan_app(&fixture, exterior(0x70, IVec2::ZERO));
@@ -2391,15 +2394,9 @@ fn undrawn_paths_warn_without_a_geometry_error_for_runtime_only_refusals() {
     tracing::subscriber::with_default(Registry::default().with(logs.clone()), || app.update());
     assert_eq!(
         reported_undrawn_paths(&app, fixture.directory.path()),
-        (Some(0), Some(1))
+        (Some(0), Some(0))
     );
-    let events = logs.0.lock().unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].get("level").map(String::as_str), Some("WARN"));
-    assert_eq!(
-        events[0].get("undrawn_runtime_refused").map(String::as_str),
-        Some("1")
-    );
+    assert!(logs.0.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2418,6 +2415,7 @@ fn complete_runtime_fallback_counts_as_one_distant_candidate() {
         0,
         &BTreeSet::from([row.form_id]),
         &HashMap::new(),
+        None,
     );
     assert_eq!(
         counts,
@@ -2437,7 +2435,7 @@ fn complete_runtime_fallback_counts_as_one_distant_candidate() {
 }
 
 #[test]
-fn only_model_bearing_look_refused_static_scenery_has_full_stock_reach() {
+fn only_model_bearing_look_or_runtime_refused_static_scenery_has_full_stock_reach() {
     let fixture = Fixture::new();
     let (_, row, _) = fixture.selected();
     let mut reference = fixture
@@ -2449,7 +2447,7 @@ fn only_model_bearing_look_refused_static_scenery_has_full_stock_reach() {
         (StockRefusalClass::Look, true, true),
         (StockRefusalClass::Look, false, false),
         // The reader projects mixed runtime/look reasons to Runtime as well.
-        (StockRefusalClass::Runtime, true, false),
+        (StockRefusalClass::Runtime, true, true),
         (StockRefusalClass::Runtime, false, false),
         (StockRefusalClass::Other, true, false),
         (StockRefusalClass::None, true, false),
@@ -2534,6 +2532,7 @@ fn stock_inventory_counts_look_runtime_and_other_refusals_separately() {
         0,
         &BTreeSet::new(),
         &HashMap::new(),
+        None,
     );
     assert_eq!(
         counts.look_refused,

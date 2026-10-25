@@ -6,6 +6,7 @@ pub mod environment;
 pub mod imagespace;
 pub mod lighting;
 pub mod object_lod;
+pub mod reference_state;
 
 /// Rejects a database-supplied relative path that could escape the assets
 /// root once re-rooted under `textures/` or `meshes/` with `PathBuf::join`.

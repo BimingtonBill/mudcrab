@@ -1929,7 +1929,7 @@ fn finish_references(
     Ok(())
 }
 
-fn map_enable_inputs(
+pub(super) fn map_enable_inputs(
     row: &rusqlite::Row<'_>,
     start: usize,
 ) -> rusqlite::Result<InitialEnableInputs> {

@@ -185,6 +185,8 @@ pub struct CertifiedPackage {
     /// Separate from mapped-only replacement membership above; contains the full examined scope.
     placed_references: BTreeMap<u32, PlacedReference>,
     placed_reference_cells: BTreeMap<(u32, i32, i32), Vec<u32>>,
+    /// Winning-record enable definitions, retained under the same dataset lock as placement.
+    enable_catalog: std::sync::Arc<crate::world::reference_state::EnableCatalog>,
 }
 
 impl CertifiedPackage {
@@ -214,6 +216,9 @@ impl CertifiedPackage {
         bevy::log::debug!("cluster payload checks passed; opening the source authority");
         // The base with the overlay attached read-only: cluster tables and core tables, one view.
         let connection = envelope.connection()?;
+        let enable_catalog = std::sync::Arc::new(
+            crate::world::reference_state::EnableCatalog::read(&connection)?,
+        );
         bevy::log::info!(
             phase = "source_connection_open",
             wall_ms = phase_started.elapsed().as_secs_f64() * 1000.0,
@@ -582,6 +587,7 @@ impl CertifiedPackage {
             unclustered_primitives,
             placed_references,
             placed_reference_cells,
+            enable_catalog,
         })
     }
 
@@ -611,6 +617,11 @@ impl CertifiedPackage {
     /// None means absent from this declared scope, not known empty or eligible.
     pub fn placed_reference(&self, id: u32) -> Option<&PlacedReference> {
         self.placed_references.get(&id)
+    }
+    pub(crate) fn enable_catalog(
+        &self,
+    ) -> &std::sync::Arc<crate::world::reference_state::EnableCatalog> {
+        &self.enable_catalog
     }
     /// Nonempty position cells in exactly this placing world, in grid order.
     /// None selects the whole worldspace, matching owned clusters' unbounded object reach.
@@ -1588,6 +1599,40 @@ pub(crate) mod producer_fixture_tests {
         })
     }
 
+    /// Runtime-state refusals with a model-less parent outside the drawn reference scope.
+    pub(crate) fn published_for_runtime_draw_states() -> tempfile::TempDir {
+        published_options_with_inputs(
+            FixtureOptions {
+                with_texture_and_rejected_primitive: true,
+                inventory: true,
+                triangle_threshold: 1,
+                single_triangle: false,
+                billboard: false,
+                runtime_inventory: true,
+                base_record_type: "STAT",
+            },
+            |db| {
+                // All children share the distant placement. The parent has no render model.
+                for (reference, base, parent, opposite) in [
+                    (0x110, 0x15, None, 0),
+                    (0x111, 0x11, Some(0x110), 0),
+                    (0x112, 0x11, Some(0x110), 1),
+                    (0x113, 0x11, None, 0),
+                ] {
+                    db.execute(
+                        "INSERT INTO \"references\" (id,cell_id,worldspace_id,base_form_id,is_exterior,
+                         pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,scale,header_flags,data,
+                         enable_parent_id,enable_parent_flags)
+                         SELECT ?1,cell_id,worldspace_id,?2,is_exterior,pos_x,pos_y,pos_z,
+                         rot_x,rot_y,rot_z,scale,0,data,?3,?4 FROM \"references\" WHERE id=?5",
+                        params![reference, base, parent, opposite, RUNTIME_REF],
+                    ).unwrap();
+                }
+                db.execute("INSERT INTO scripts(form_id,script_name,vmad,properties_json) VALUES(0x113,'InventedStateScript',X'','{}')", []).unwrap();
+            },
+        )
+    }
+
     fn published_inputs(with_texture_and_rejected_primitive: bool) -> tempfile::TempDir {
         published_inputs_with_inventory(with_texture_and_rejected_primitive, false)
     }
@@ -1618,6 +1663,13 @@ pub(crate) mod producer_fixture_tests {
     }
 
     fn published_options(options: FixtureOptions) -> tempfile::TempDir {
+        published_options_with_inputs(options, |_| {})
+    }
+
+    fn published_options_with_inputs(
+        options: FixtureOptions,
+        edit: impl FnOnce(&Connection),
+    ) -> tempfile::TempDir {
         let FixtureOptions {
             with_texture_and_rejected_primitive,
             inventory,
@@ -1780,6 +1832,7 @@ pub(crate) mod producer_fixture_tests {
             )
             .unwrap();
         }
+        edit(&db);
         drop(db);
         let settings = StageSettings {
             mode: LodMode::Cluster,

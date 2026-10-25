@@ -5,10 +5,12 @@ use crate::cluster::{
     flat_source::{FlatSourceOwner, FlatSourcePrimitive, FlatSourcePrimitives},
     source_identity::{SourcePrimitive, SourcePrimitiveTransform},
 };
+use crate::world::reference_state::ReferenceVisibilityGate;
 use bevy::{
     animation::AnimationTargetId,
     app::{PropagateOver, PropagateSet},
     camera::visibility::{RenderLayers, VisibilitySystems},
+    ecs::{entity_disabling::Disabled, query::Allow},
     prelude::*,
     transform::TransformSystems,
 };
@@ -114,7 +116,12 @@ fn pose_chain(world: &World, entity: Entity, root: Entity) -> Option<(Vec<Transf
             return None;
         }
         if visibility == Visibility::Inherited {
-            visibility = node.get::<Visibility>().copied().unwrap_or_default();
+            // A reference gate is temporary, never part of the baked flat pose.
+            visibility = node
+                .get::<ReferenceVisibilityGate>()
+                .and_then(|gate| gate.0)
+                .or_else(|| node.get::<Visibility>().copied())
+                .unwrap_or_default();
         }
         chain.push(*node.get::<Transform>()?);
         current = node.get::<ChildOf>()?.parent();
@@ -203,12 +210,15 @@ type FlatRoots<'w, 's> = Query<
         &'static InheritedVisibility,
         Option<&'static RenderLayers>,
     ),
-    Or<(
-        Changed<GlobalTransform>,
-        Changed<InheritedVisibility>,
-        Changed<RenderLayers>,
-        Changed<FlatSourcePrimitives>,
-    )>,
+    (
+        Allow<Disabled>,
+        Or<(
+            Changed<GlobalTransform>,
+            Changed<InheritedVisibility>,
+            Changed<RenderLayers>,
+            Changed<FlatSourcePrimitives>,
+        )>,
+    ),
 >;
 type FlatDraws<'w, 's> = Query<
     'w,
@@ -219,6 +229,7 @@ type FlatDraws<'w, 's> = Query<
         &'static mut FlatSourcePrimitive,
         &'static mut Visibility,
         &'static mut InheritedVisibility,
+        Option<&'static ReferenceVisibilityGate>,
         Option<&'static mut RenderLayers>,
     ),
     Without<FlatSourcePrimitives>,
@@ -227,8 +238,15 @@ type FlatDraws<'w, 's> = Query<
 fn sync_flat(roots: FlatRoots, mut draws: FlatDraws, mut commands: Commands) {
     for (root, members, inherited, layers) in &roots {
         for entity in members.iter() {
-            let Ok((pose, mut global, mut proof, mut visibility, mut inherited_draw, draw_layers)) =
-                draws.get_mut(entity)
+            let Ok((
+                pose,
+                mut global,
+                mut proof,
+                mut visibility,
+                mut inherited_draw,
+                reference_gate,
+                draw_layers,
+            )) = draws.get_mut(entity)
             else {
                 continue;
             };
@@ -242,11 +260,12 @@ fn sync_flat(roots: FlatRoots, mut draws: FlatDraws, mut commands: Commands) {
             if proof.expected_global != next {
                 proof.expected_global = next;
             }
-            let visible = match pose.authored_visibility {
-                Visibility::Visible => true,
-                Visibility::Hidden => false,
-                Visibility::Inherited => inherited.get(),
-            };
+            let visible = reference_gate.is_none()
+                && match pose.authored_visibility {
+                    Visibility::Visible => true,
+                    Visibility::Hidden => false,
+                    Visibility::Inherited => inherited.get(),
+                };
             let explicit = if visible {
                 Visibility::Visible
             } else {
@@ -280,6 +299,80 @@ fn sync_flat(roots: FlatRoots, mut draws: FlatDraws, mut commands: Commands) {
 mod tests {
     use super::*;
     use bevy::{camera::visibility::VisibilityPlugin, transform::TransformPlugin};
+
+    #[test]
+    fn explicit_flat_visibility_cannot_override_reference_disable() {
+        use crate::world::{
+            components::FormId,
+            reference_state::{self, EnableCatalog, ReferenceEnableState, SetReferenceEnabled},
+        };
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE \"references\" (id INTEGER PRIMARY KEY); INSERT INTO \"references\" VALUES (7);").unwrap();
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::asset::AssetPlugin::default(),
+            TransformPlugin,
+            VisibilityPlugin,
+        ))
+        .init_asset::<Mesh>()
+        .init_asset::<bevy::mesh::skinning::SkinnedMeshInverseBindposes>()
+        .add_systems(
+            PostUpdate,
+            sync_flat
+                .after(VisibilitySystems::VisibilityPropagate)
+                .before(VisibilitySystems::CheckVisibility),
+        );
+        reference_state::install(&mut app);
+        app.world_mut()
+            .resource_mut::<ReferenceEnableState>()
+            .bind(Arc::new(EnableCatalog::read(&connection).unwrap()));
+        let root = app
+            .world_mut()
+            .spawn((FormId(7), Transform::default(), Visibility::Inherited))
+            .id();
+        let draw = app
+            .world_mut()
+            .spawn((
+                Mesh3d::default(),
+                FlatSourceOwner(root),
+                Visibility::Visible,
+                FlatSourcePrimitive {
+                    model_matrix: Mat4::IDENTITY,
+                    expected_global: GlobalTransform::default(),
+                },
+                FlatPose {
+                    chain: Arc::from([Transform::default()]),
+                    authored_visibility: Visibility::Visible,
+                },
+            ))
+            .remove::<Transform>()
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(draw),
+            Some(&Visibility::Visible)
+        );
+        for enabled in [false, true, false, true] {
+            app.world_mut().trigger(SetReferenceEnabled {
+                reference: 7,
+                enabled,
+            });
+            app.update();
+            assert_eq!(
+                app.world().get::<Visibility>(draw),
+                Some(if enabled {
+                    &Visibility::Visible
+                } else {
+                    &Visibility::Hidden
+                })
+            );
+            assert_eq!(
+                app.world().get::<InheritedVisibility>(draw).unwrap().get(),
+                enabled
+            );
+        }
+    }
 
     #[test]
     fn nested_meshes_flatten_together_but_keep_billboard_ancestry() {
