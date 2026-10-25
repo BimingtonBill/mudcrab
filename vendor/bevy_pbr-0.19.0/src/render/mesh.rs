@@ -1,4 +1,5 @@
 use crate::contact_shadows::ViewContactShadowsUniformOffset;
+use crate::shadow_cache::ShadowStockInputs;
 use crate::{
     material_bind_groups::MaterialBindGroupSlot, resources::write_atmosphere_buffer,
     skin::skin_uniforms_from_world,
@@ -1923,6 +1924,7 @@ pub fn extract_meshes_for_gpu_building(
                 )>,
                 Changed<VisibilityRange>,
                 Changed<SkinnedMesh>,
+                Changed<RenderLayers>,
             )>,
         >,
     >,
@@ -1939,6 +1941,7 @@ pub fn extract_meshes_for_gpu_building(
         mut removed_no_cpu_culling_query,
         mut removed_visibility_range_query,
         mut removed_skinned_mesh_query,
+        mut removed_render_layers_query,
     ): (
         Extract<RemovedComponents<PreviousGlobalTransform>>,
         Extract<RemovedComponents<Lightmap>>,
@@ -1952,6 +1955,7 @@ pub fn extract_meshes_for_gpu_building(
         Extract<RemovedComponents<NoCpuCulling>>,
         Extract<RemovedComponents<VisibilityRange>>,
         Extract<RemovedComponents<SkinnedMesh>>,
+        Extract<RemovedComponents<RenderLayers>>,
     ),
     all_meshes_query: Extract<Query<GpuMeshExtractionQuery>>,
     mut removed_meshes_query: Extract<RemovedComponents<Mesh3d>>,
@@ -1991,7 +1995,8 @@ pub fn extract_meshes_for_gpu_building(
             .chain(removed_no_automatic_batching_query.read())
             .chain(removed_no_cpu_culling_query.read())
             .chain(removed_visibility_range_query.read())
-            .chain(removed_skinned_mesh_query.read()),
+            .chain(removed_skinned_mesh_query.read())
+            .chain(removed_render_layers_query.read()),
     );
 
     // We have to skip the meshes in the potential reextraction set if we
@@ -2405,6 +2410,7 @@ pub fn set_mesh_motion_vector_flags(
 /// Creates the [`RenderMeshInstanceGpu`]s and [`MeshInputUniform`]s when GPU
 /// preprocessing is in use.
 pub fn collect_meshes_for_gpu_building(
+    shadow_inputs: Res<ShadowStockInputs>,
     render_mesh_instances: ResMut<RenderMeshInstances>,
     batched_instance_buffers: ResMut<
         gpu_preprocessing::BatchedInstanceBuffers<MeshUniform, MeshInputUniform>,
@@ -2467,6 +2473,7 @@ pub fn collect_meshes_for_gpu_building(
         let previous_input_buffer = &*previous_input_buffer;
         let mesh_culling_data_buffer = &*mesh_culling_data_buffer;
         let morph_indices = &*morph_indices;
+        let shadow_inputs = &*shadow_inputs;
 
         // Spawn workers on the taskpool to prepare and update meshes in parallel.
         ComputeTaskPool::get().scope(|scope| {
@@ -2491,6 +2498,7 @@ pub fn collect_meshes_for_gpu_building(
                             changed
                                 .drain(..)
                                 .for_each(|(entity, mesh_instance_builder)| {
+                                    shadow_inputs.caster_changed(entity);
                                     match mesh_instance_builder.prepare(
                                         entity,
                                         mesh_allocator,
@@ -2511,6 +2519,7 @@ pub fn collect_meshes_for_gpu_building(
                                 });
 
                             for entity in removed.drain(..) {
+                                shadow_inputs.caster_changed(entity);
                                 removed_tx.send(entity).unwrap();
                             }
                         });
@@ -2532,6 +2541,7 @@ pub fn collect_meshes_for_gpu_building(
                                     .drain(..)
                                     .chain(changed_gpu_culling.drain(..))
                             {
+                                shadow_inputs.caster_changed(entity);
                                 let Some(mut prepared) = mesh_instance_builder.prepare(
                                     entity,
                                     mesh_allocator,
@@ -2604,6 +2614,7 @@ pub fn collect_meshes_for_gpu_building(
                             }
 
                             for entity in removed.drain(..) {
+                                shadow_inputs.caster_changed(entity);
                                 removed_tx.send(entity).unwrap();
                             }
                         });

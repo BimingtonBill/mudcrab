@@ -125,6 +125,26 @@ struct AssetDirectoryReadLock {
     _guard: shared::asset_lock::AssetLock,
 }
 
+fn configure_shadow_reuse_verification(app: &mut App) -> Result<()> {
+    let config = app.world().resource::<EngineConfig>();
+    let Some(directory) = &config.verify_shadow_reuse else {
+        return Ok(());
+    };
+    let settings = bevy::pbr::shadow_cache::ShadowReuseVerification {
+        directory: directory.clone(),
+        request: config
+            .verify_shadow_reuse_request
+            .clone()
+            .unwrap_or_else(|| directory.join("REQUEST")),
+    };
+    // RenderStartup constructs ShadowMapCache before the first shadow allocation.
+    // Never mutate process environment after Bevy has started its task threads.
+    app.get_sub_app_mut(bevy::render::RenderApp)
+        .ok_or_else(|| color_eyre::eyre::eyre!("--verify-shadow-reuse requires the render app"))?
+        .insert_resource(settings);
+    Ok(())
+}
+
 pub fn run(mut config: EngineConfig) -> Result<()> {
     validate_fixture_selection(&config)?;
     let remote = RemoteSettings::from_config(&config)?;
@@ -449,6 +469,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .add_plugins(crate::render_backend::RenderBackendLogPlugin {
             problem: backend_choice.problem,
         });
+    configure_shadow_reuse_verification(&mut app)?;
     // Bevy's own `trace` features (`--features tracy`) add the render diagnostics themselves; a
     // second add panics, so add them only when the default plugins did not.
     if !app.world().resource::<EngineConfig>().no_render_diagnostics
@@ -3497,6 +3518,44 @@ struct ScreenshotCaptureState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shadow_verification_requires_render_app_only_when_enabled() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default());
+        configure_shadow_reuse_verification(&mut app).unwrap();
+        app.world_mut()
+            .resource_mut::<EngineConfig>()
+            .verify_shadow_reuse = Some("audit".into());
+        assert!(
+            configure_shadow_reuse_verification(&mut app)
+                .unwrap_err()
+                .to_string()
+                .contains("requires the render app")
+        );
+    }
+
+    #[test]
+    fn shadow_verification_settings_reach_render_world_before_gpu_construction() {
+        use bevy::pbr::shadow_cache::{ShadowMapCache, ShadowReuseVerification};
+        let mut app = App::new();
+        app.insert_sub_app(bevy::render::RenderApp, bevy::app::SubApp::new());
+        app.insert_resource(EngineConfig {
+            verify_shadow_reuse: Some("audit output".into()),
+            verify_shadow_reuse_request: Some("shared request".into()),
+            ..default()
+        });
+        configure_shadow_reuse_verification(&mut app).unwrap();
+        let render = app.sub_app(bevy::render::RenderApp).world();
+        assert_eq!(
+            render.resource::<ShadowReuseVerification>(),
+            &ShadowReuseVerification {
+                directory: "audit output".into(),
+                request: "shared request".into(),
+            }
+        );
+        assert!(!render.contains_resource::<ShadowMapCache>());
+    }
+
     /// A `--route` file shares the camera with neither `--shots` nor `--matched-route`. The refusal
     /// comes before the shots file is read, so the file names here need not exist.
     #[test]

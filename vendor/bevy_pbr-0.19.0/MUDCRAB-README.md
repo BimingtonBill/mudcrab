@@ -1,8 +1,7 @@
 # bevy_pbr 0.19.0: shadow render diagnostics and material readiness revisions
 
 This is the complete published bevy_pbr 0.19.0 crate, used by the root
-`[patch.crates-io]` entry. `src/render/light.rs` and `src/material_bind_groups.rs`
-differ from upstream source.
+`[patch.crates-io]` entry. The patches below describe the source differences.
 The full crate is 4.19 MB. Cargo cannot replace its private light module with a
 standalone file; preserving the module tree also preserves embedded shader and
 LUT asset paths. No dependency version or engine feature is changed.
@@ -51,6 +50,30 @@ tracking changes adds no slab scan. The public allocator enum remains unchanged.
 GPU-free tests cover the availability accounting and actual non-bindless
 unprepared allocation/free. They do not establish GPU correctness or timing.
 The cluster readiness consumer and live acceptance belong to engine integration.
+
+## Exact directional shadow retention (#2153)
+
+`src/shadow_cache.rs` owns retained directional texture slices, producer-driven
+caster/material revisions, current-frame external command certificates and
+physical slice ownership. `src/render/light.rs` skips attachment acquisition,
+clear and raster only after the complete exact key matches. Stock caster queue,
+mesh extraction, skin and morph producers publish their existing changes from
+`material.rs`, `render/mesh.rs`, `render/skin.rs` and `render/morph.rs`.
+`lib.rs` exports the integration module. Unknown materials, commands, incomplete
+draws and untracked writable texture bindings refuse reuse. Material type names
+are diagnostic metadata and do not grant eligibility.
+
+`src/shadow_cache_parity.rs` supplies opt-in same-frame native map byte checks,
+including maps that normal policy already renders. The fresh and retained paths
+both preserve real command/bind safety. Diagnostic refusal receipts are separate
+from map equality. Ordinary rendering performs no diagnostic copies, dependency
+walks or readbacks with verification disabled.
+
+The texture writer contract, invalidation list, engine integration, native audit
+boundaries and validation evidence are documented in
+`../../docs/design/cluster-gpu-exact-reuse.md`. Asset-backed texture updates must
+publish through `Assets<Image>` or a fresh `RenderAssets<GpuImage>::get_mut`.
+Raw writes through escaped handles are outside that cooperative contract.
 
 ## Workspace and removal
 

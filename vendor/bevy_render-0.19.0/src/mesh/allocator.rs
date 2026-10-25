@@ -43,6 +43,8 @@ pub struct MeshAllocatorPlugin;
 ///
 #[derive(Resource, Deref, DerefMut)]
 pub struct MeshAllocator {
+    /// Content writes are separate from the slab allocator's layout revision.
+    content_revision: u64,
     /// Holds all buffers and offset allocators.
     #[deref]
     slab_allocator: SlabAllocator<MeshSlabItem>,
@@ -232,6 +234,7 @@ impl FromWorld for MeshAllocator {
         slab_allocator.extra_buffer_usages |= mesh_allocator_settings.extra_buffer_usages;
 
         Self {
+            content_revision: 0,
             slab_allocator,
             general_vertex_slabs_supported,
         }
@@ -248,6 +251,12 @@ pub fn allocate_and_free_meshes(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
+    if !extracted_meshes.extracted.is_empty() || !extracted_meshes.removed.is_empty() {
+        mesh_allocator.content_revision = mesh_allocator
+            .content_revision
+            .checked_add(1)
+            .expect("Mesh content revision exhausted");
+    }
     // Process removed or modified meshes.
     mesh_allocator.free_meshes(&extracted_meshes);
 
@@ -262,6 +271,11 @@ pub fn allocate_and_free_meshes(
 }
 
 impl MeshAllocator {
+    /// Advances for geometry uploads/removals, including writes to an existing allocation.
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
+
     /// Returns the buffer and range within that buffer of the vertex data for
     /// the mesh with the given ID.
     ///

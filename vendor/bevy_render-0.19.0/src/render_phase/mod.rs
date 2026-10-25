@@ -1175,11 +1175,11 @@ where
                         );
 
                         // Fetch the draw function.
-                        let Some(draw_function) =
-                            draw_functions.get_mut(binned_phase_item.draw_function())
-                        else {
-                            continue;
-                        };
+                        let draw_function = admit_draw_function(
+                            world,
+                            view,
+                            draw_functions.get_mut(binned_phase_item.draw_function()),
+                        )?;
 
                         draw_function.draw(world, render_pass, view, &binned_phase_item)?;
                     }
@@ -1199,11 +1199,11 @@ where
                     );
 
                     // Fetch the draw function.
-                    let Some(draw_function) =
-                        draw_functions.get_mut(binned_phase_item.draw_function())
-                    else {
-                        continue;
-                    };
+                    let draw_function = admit_draw_function(
+                        world,
+                        view,
+                        draw_functions.get_mut(binned_phase_item.draw_function()),
+                    )?;
 
                     draw_function.draw(world, render_pass, view, &binned_phase_item)?;
                 }
@@ -1248,11 +1248,11 @@ where
                     );
 
                     // Fetch the draw function.
-                    let Some(draw_function) =
-                        draw_functions.get_mut(binned_phase_item.draw_function())
-                    else {
-                        continue;
-                    };
+                    let draw_function = admit_draw_function(
+                        world,
+                        view,
+                        draw_functions.get_mut(binned_phase_item.draw_function()),
+                    )?;
 
                     draw_function.draw(world, render_pass, view, &binned_phase_item)?;
                 }
@@ -1315,10 +1315,11 @@ where
                 );
 
                 // Fetch the draw function.
-                let Some(draw_function) = draw_functions.get_mut(binned_phase_item.draw_function())
-                else {
-                    continue;
-                };
+                let draw_function = admit_draw_function(
+                    world,
+                    view,
+                    draw_functions.get_mut(binned_phase_item.draw_function()),
+                )?;
 
                 draw_function.draw(world, render_pass, view, &binned_phase_item)?;
             }
@@ -1350,10 +1351,11 @@ where
                     PhaseItemExtraIndex::None,
                 );
 
-                let Some(draw_function) = draw_functions.get_mut(binned_phase_item.draw_function())
-                else {
-                    continue;
-                };
+                let draw_function = admit_draw_function(
+                    world,
+                    view,
+                    draw_functions.get_mut(binned_phase_item.draw_function()),
+                )?;
 
                 draw_function.draw(world, render_pass, view, &binned_phase_item)?;
             }
@@ -1971,7 +1973,8 @@ where
             if batch_range.is_empty() {
                 index += 1;
             } else {
-                let draw_function = draw_functions.get_mut(item.draw_function()).unwrap();
+                let draw_function =
+                    admit_draw_function(world, view, draw_functions.get_mut(item.draw_function()))?;
                 draw_function.draw(world, render_pass, view, item)?;
                 index += batch_range.len();
             }

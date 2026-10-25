@@ -73,6 +73,47 @@ fn fallback_image_new(
     samples: u32,
     value: u8,
 ) -> GpuImage {
+    let image = fallback_image_source(format, dimension, samples, value);
+    let extents = image.texture_descriptor.size;
+    let texture = if let Some(data) = image.data {
+        render_device.create_texture_with_data(
+            render_queue,
+            &image.texture_descriptor,
+            TextureDataOrder::default(),
+            &data,
+        )
+    } else {
+        render_device.create_texture(&image.texture_descriptor)
+    };
+
+    let texture_view = texture.create_view(&TextureViewDescriptor {
+        dimension: Some(dimension),
+        array_layer_count: Some(extents.depth_or_array_layers),
+        ..TextureViewDescriptor::default()
+    });
+    let sampler = match image.sampler {
+        ImageSampler::Default => (**default_sampler).clone(),
+        ImageSampler::Descriptor(ref descriptor) => {
+            render_device.create_sampler(&descriptor.as_wgpu())
+        }
+    };
+    GpuImage {
+        texture,
+        texture_view,
+        sampler,
+        texture_descriptor: image.texture_descriptor,
+        texture_view_descriptor: image.texture_view_descriptor,
+        had_data: true,
+    }
+}
+
+/// Owns initialization data and capabilities before the GPU allocation exists.
+fn fallback_image_source(
+    format: TextureFormat,
+    dimension: TextureViewDimension,
+    samples: u32,
+    value: u8,
+) -> Image {
     // TODO make this configurable per channel
 
     let extents = Extent3d {
@@ -105,39 +146,77 @@ fn fallback_image_new(
         image
     };
     image.texture_descriptor.sample_count = samples;
-    if image_dimension == TextureDimension::D2 {
+    // Initialized color fallbacks are sampling inputs, never attachment targets.
+    // Depth/MSAA fallbacks still require a render pass to initialize their texels.
+    if !create_texture_with_data && image_dimension == TextureDimension::D2 {
         image.texture_descriptor.usage |= TextureUsages::RENDER_ATTACHMENT;
     }
 
-    let texture = if create_texture_with_data {
-        render_device.create_texture_with_data(
-            render_queue,
-            &image.texture_descriptor,
-            TextureDataOrder::default(),
-            &image.data.expect("Image has no data"),
-        )
-    } else {
-        render_device.create_texture(&image.texture_descriptor)
-    };
+    image
+}
 
-    let texture_view = texture.create_view(&TextureViewDescriptor {
-        dimension: Some(dimension),
-        array_layer_count: Some(extents.depth_or_array_layers),
-        ..TextureViewDescriptor::default()
-    });
-    let sampler = match image.sampler {
-        ImageSampler::Default => (**default_sampler).clone(),
-        ImageSampler::Descriptor(ref descriptor) => {
-            render_device.create_sampler(&descriptor.as_wgpu())
+#[cfg(test)]
+mod fallback_image_tests {
+    use super::*;
+
+    #[test]
+    fn initialized_color_fallbacks_preserve_bytes_without_gpu_write_capabilities() {
+        for dimension in [
+            TextureViewDimension::D1,
+            TextureViewDimension::D2,
+            TextureViewDimension::D2Array,
+            TextureViewDimension::Cube,
+            TextureViewDimension::CubeArray,
+            TextureViewDimension::D3,
+        ] {
+            for value in [0, 255] {
+                let image =
+                    fallback_image_source(TextureFormat::Rgba8UnormSrgb, dimension, 1, value);
+                let layers = match dimension {
+                    TextureViewDimension::Cube | TextureViewDimension::CubeArray => 6,
+                    _ => 1,
+                };
+                assert_eq!(image.data, Some(vec![value; layers as usize * 4]));
+                assert_eq!(
+                    image.texture_descriptor.size,
+                    Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: layers,
+                    }
+                );
+                assert_eq!(image.texture_descriptor.sample_count, 1);
+                assert!(image.texture_descriptor.usage.contains(
+                    TextureUsages::TEXTURE_BINDING
+                        | TextureUsages::COPY_DST
+                        | TextureUsages::COPY_SRC
+                ));
+                assert!(
+                    !image.texture_descriptor.usage.intersects(
+                        TextureUsages::RENDER_ATTACHMENT | TextureUsages::STORAGE_BINDING
+                    ),
+                    "{dimension:?}"
+                );
+            }
         }
-    };
-    GpuImage {
-        texture,
-        texture_view,
-        sampler,
-        texture_descriptor: image.texture_descriptor,
-        texture_view_descriptor: image.texture_view_descriptor,
-        had_data: true,
+    }
+
+    #[test]
+    fn depth_and_multisample_fallbacks_keep_render_attachment_initialization() {
+        for (format, samples) in [
+            (TextureFormat::Depth32Float, 1),
+            (TextureFormat::Rgba8UnormSrgb, 4),
+            (TextureFormat::Depth32Float, 4),
+        ] {
+            let image = fallback_image_source(format, TextureViewDimension::D2, samples, 255);
+            assert!(image.data.is_none());
+            assert!(image
+                .texture_descriptor
+                .usage
+                .contains(TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING));
+            assert_eq!(image.texture_descriptor.sample_count, samples);
+            assert_eq!(image.texture_descriptor.format, format);
+        }
     }
 }
 

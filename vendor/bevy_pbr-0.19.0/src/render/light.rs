@@ -1,3 +1,7 @@
+use crate::shadow_cache::{
+    DirectionalShadowMapInputs, RetainedDirectionalShadowTexture, ShadowMapCache,
+    ShadowMapExternalInputs, ShadowStockInputs,
+};
 use crate::*;
 use alloc::sync::Arc;
 use bevy_asset::UntypedAssetId;
@@ -994,6 +998,7 @@ pub fn prepare_lights(
             Option<&RenderLayers>,
             Has<NoIndirectDrawing>,
             Option<&AmbientLight>,
+            Option<&bevy_render::camera::MipBias>,
         ),
         With<Camera3d>,
     >,
@@ -1043,10 +1048,24 @@ pub fn prepare_lights(
         Res<GpuPreprocessingSupport>,
         Option<Res<RenderClusteredDecals>>,
     ),
-    (existing_shadow_views, mut light_key_cache, mut specialized_shadow_material_pipeline_cache): (
+    (
+        existing_shadow_views,
+        mut light_key_cache,
+        mut specialized_shadow_material_pipeline_cache,
+        mut retained_texture,
+        shadow_cache,
+        external_inputs,
+        stock_inputs,
+        shadow_frame,
+    ): (
         Query<&ShadowView>,
         ResMut<LightKeyCache>,
         ResMut<SpecializedShadowMaterialPipelineCache>,
+        ResMut<RetainedDirectionalShadowTexture>,
+        Res<ShadowMapCache>,
+        Res<ShadowMapExternalInputs>,
+        Res<ShadowStockInputs>,
+        Res<bevy_diagnostic::FrameCount>,
     ),
 ) {
     let views_iter = views.iter();
@@ -1330,6 +1349,7 @@ pub fn prepare_lights(
         maybe_layers,
         _no_indirect_drawing,
         _maybe_ambient_override,
+        _mip_bias,
     ) in sorted_cameras
         .0
         .iter()
@@ -1411,27 +1431,54 @@ pub fn prepare_lights(
                 array_layer_count: None,
             });
 
-    let directional_light_depth_texture = texture_cache.get(
-        &render_device,
-        TextureDescriptor {
-            size: Extent3d {
-                width: (directional_light_shadow_map.size as u32)
-                    .min(render_device.limits().max_texture_dimension_2d),
-                height: (directional_light_shadow_map.size as u32)
-                    .min(render_device.limits().max_texture_dimension_2d),
-                depth_or_array_layers: (num_directional_cascades_enabled
-                    + spot_light_shadow_maps_count)
-                    .max(1) as u32,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: CORE_3D_DEPTH_FORMAT,
-            label: Some("directional_light_shadow_map_texture"),
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+    let directional_descriptor = TextureDescriptor {
+        size: Extent3d {
+            width: (directional_light_shadow_map.size as u32)
+                .min(render_device.limits().max_texture_dimension_2d),
+            height: (directional_light_shadow_map.size as u32)
+                .min(render_device.limits().max_texture_dimension_2d),
+            depth_or_array_layers: (num_directional_cascades_enabled + spot_light_shadow_maps_count)
+                .max(1) as u32,
         },
-    );
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: CORE_3D_DEPTH_FORMAT,
+        label: Some("directional_light_shadow_map_texture"),
+        usage: TextureUsages::RENDER_ATTACHMENT
+            | TextureUsages::TEXTURE_BINDING
+            | if shadow_cache.parity().enabled() {
+                TextureUsages::COPY_SRC
+            } else {
+                TextureUsages::empty()
+            },
+        view_formats: &[],
+    };
+    // This array is retained outside TextureCache: the transient pool can lend
+    // the same allocation to a different consumer on another frame.
+    if retained_texture
+        .texture
+        .as_ref()
+        .is_none_or(|(size, texture)| {
+            *size != directional_descriptor.size
+                || texture.texture.usage() != directional_descriptor.usage
+        })
+    {
+        shadow_cache.invalidate_physical_maps();
+        let texture = render_device.create_texture(&directional_descriptor);
+        let default_view = texture.create_view(&TextureViewDescriptor::default());
+        retained_texture.texture = Some((
+            directional_descriptor.size,
+            CachedTexture {
+                texture,
+                default_view,
+            },
+        ));
+    }
+    let Some((directional_extent, directional_light_depth_texture)) = &retained_texture.texture
+    else {
+        return;
+    };
 
     let directional_light_depth_texture_view =
         directional_light_depth_texture
@@ -1604,6 +1651,7 @@ pub fn prepare_lights(
         maybe_layers,
         no_indirect_drawing,
         maybe_ambient_override,
+        mip_bias,
     ) in sorted_cameras
         .0
         .iter()
@@ -1867,7 +1915,46 @@ pub fn prepare_lights(
                     cascade_index as u32,
                 );
 
+                let input_matrices = [
+                    cascade.world_from_cascade,
+                    cascade.clip_from_cascade,
+                    cascade.clip_from_world,
+                    extracted_view.world_from_view.to_matrix(),
+                    extracted_view.clip_from_view,
+                    light.transform.to_matrix(),
+                    extracted_view.clip_from_world.unwrap_or_else(|| {
+                        extracted_view.clip_from_view
+                            * extracted_view.world_from_view.to_matrix().inverse()
+                    }),
+                ]
+                .map(|matrix| matrix.to_cols_array().map(f32::to_bits));
+                let light_inputs = [
+                    light.shadow_depth_bias.to_bits(),
+                    light.shadow_normal_bias.to_bits(),
+                    cascade.texel_size.to_bits(),
+                    bound.to_bits(),
+                    mip_bias.map_or(0.0, |bias| bias.0).to_bits(),
+                    u32::from(light.occlusion_culling),
+                    directional_extent.width,
+                    directional_extent.height,
+                    directional_extent.depth_or_array_layers,
+                ];
+
+                shadow_cache.parity().observe(
+                    retained_view_entity,
+                    directional_light_depth_texture.texture.id(),
+                    directional_depth_texture_array_index - 1,
+                    shadow_frame.0,
+                );
                 commands.entity(view_light_entity).insert((
+                    DirectionalShadowMapInputs {
+                        texture: directional_light_depth_texture.texture.id(),
+                        slice: directional_depth_texture_array_index - 1,
+                        matrices: input_matrices,
+                        light: light_inputs,
+                        camera_layers: view_layers.clone(),
+                        light_layers: light.render_layers.clone(),
+                    },
                     ShadowView {
                         depth_attachment,
                         pass_name: format!(
@@ -1990,6 +2077,9 @@ pub fn prepare_lights(
     }
 
     shadow_render_phases.retain(|entity, _| live_shadow_mapping_lights.contains(entity));
+    shadow_cache.retain(&live_shadow_mapping_lights);
+    external_inputs.retain(&live_shadow_mapping_lights);
+    stock_inputs.retain(&live_shadow_mapping_lights);
     light_key_cache.retain(|entity, _| live_shadow_mapping_lights.contains(entity));
     specialized_shadow_material_pipeline_cache
         .retain(|entity, _| live_shadow_mapping_lights.contains(entity));
@@ -2250,12 +2340,27 @@ pub fn check_views_lights_need_specialization(
 }
 
 pub(crate) struct ShadowSpecializationWorkItem {
+    render_entity: Entity,
     visible_entity: MainEntity,
     retained_view_entity: RetainedViewEntity,
     mesh_key: MeshPipelineKey,
     layout: MeshVertexBufferLayoutRef,
     properties: Arc<MaterialProperties>,
     material_type_id: TypeId,
+}
+
+fn refuse_shadow_specialization(world: &mut World, item: &ShadowSpecializationWorkItem) {
+    world
+        .resource::<ShadowStockInputs>()
+        .refuse_view(item.retained_view_entity);
+    if let Some(pending) = world
+        .resource_mut::<PendingShadowQueues>()
+        .get_mut(&item.retained_view_entity)
+    {
+        pending
+            .current_frame
+            .insert((item.render_entity, item.visible_entity));
+    }
 }
 
 /// Holds all entities with mesh materials for which the shadow pass couldn't be
@@ -2267,6 +2372,7 @@ pub struct PendingShadowQueues(pub PendingQueues);
 
 #[derive(SystemParam)]
 pub(crate) struct SpecializeShadowsSystemParam<'w, 's> {
+    stock_inputs: Res<'w, ShadowStockInputs>,
     render_meshes: Res<'w, RenderAssets<RenderMesh>>,
     render_mesh_instances: Res<'w, RenderMeshInstances>,
     render_materials: Res<'w, ErasedRenderAssets<PreparedMaterial>>,
@@ -2292,6 +2398,7 @@ pub(crate) fn specialize_shadows(
 
     {
         let SpecializeShadowsSystemParam {
+            stock_inputs,
             render_meshes,
             render_mesh_instances,
             render_materials,
@@ -2307,6 +2414,7 @@ pub(crate) fn specialize_shadows(
         } = state.get_mut(world).unwrap();
 
         for (light_entity, extracted_view_light) in &view_light_entities {
+            stock_inputs.begin_view(extracted_view_light.retained_view_entity);
             all_shadow_views.insert(extracted_view_light.retained_view_entity);
 
             if !shadow_render_phases.contains_key(&extracted_view_light.retained_view_entity) {
@@ -2314,6 +2422,7 @@ pub(crate) fn specialize_shadows(
             }
             let Some(light_key) = light_key_cache.get(&extracted_view_light.retained_view_entity)
             else {
+                stock_inputs.refuse_view(extracted_view_light.retained_view_entity);
                 continue;
             };
 
@@ -2407,6 +2516,10 @@ pub(crate) fn specialize_shadows(
                     continue;
                 }
                 let Some(mesh) = render_meshes.get(mesh_instance.mesh_asset_id()) else {
+                    stock_inputs.refuse_view(extracted_view_light.retained_view_entity);
+                    view_pending_shadow_queues
+                        .current_frame
+                        .insert((*render_entity, *visible_entity));
                     continue;
                 };
 
@@ -2435,6 +2548,7 @@ pub(crate) fn specialize_shadows(
                 };
 
                 work_items.push(ShadowSpecializationWorkItem {
+                    render_entity: *render_entity,
                     visible_entity: *visible_entity,
                     retained_view_entity: extracted_view_light.retained_view_entity,
                     mesh_key,
@@ -2454,6 +2568,7 @@ pub(crate) fn specialize_shadows(
 
     for item in work_items.drain(..) {
         let Some(prepass_specialize) = item.properties.prepass_specialize else {
+            refuse_shadow_specialization(world, &item);
             continue;
         };
 
@@ -2479,6 +2594,7 @@ pub(crate) fn specialize_shadows(
         };
 
         let Some(draw_function) = draw_function else {
+            refuse_shadow_specialization(world, &item);
             continue;
         };
 
@@ -2490,7 +2606,10 @@ pub(crate) fn specialize_shadows(
                     .or_default()
                     .insert(item.visible_entity, (pipeline_id, draw_function));
             }
-            Err(err) => error!("{}", err),
+            Err(err) => {
+                refuse_shadow_specialization(world, &item);
+                error!("{}", err);
+            }
         }
     }
 
@@ -2504,6 +2623,10 @@ pub(crate) fn specialize_shadows(
 /// adds them to [`BinnedRenderPhase`]s or [`SortedRenderPhase`]s as
 /// appropriate.
 pub fn queue_shadows(
+    (stock_inputs, material_dependencies): (
+        Res<ShadowStockInputs>,
+        Res<shadow_cache::ShadowCacheMaterialDependencies>,
+    ),
     render_mesh_instances: Res<RenderMeshInstances>,
     render_materials: Res<ErasedRenderAssets<PreparedMaterial>>,
     render_material_instances: Res<RenderMaterialInstances>,
@@ -2549,6 +2672,7 @@ pub fn queue_shadows(
             .iter_to_dequeue(extracted_view_light.retained_view_entity, visible_entities)
         {
             shadow_phase.remove(main_entity);
+            stock_inputs.remove_caster(extracted_view_light.retained_view_entity, main_entity);
         }
 
         // Now iterate through all newly-visible entities and those needing respecialization.
@@ -2610,6 +2734,7 @@ pub fn queue_shadows(
             };
 
             let Some(mesh_slabs) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id()) else {
+                stock_inputs.refuse_view(extracted_view_light.retained_view_entity);
                 continue;
             };
 
@@ -2619,6 +2744,15 @@ pub fn queue_shadows(
                 material_bind_group_index,
                 slabs: mesh_slabs,
             };
+
+            stock_inputs.set_caster(
+                extracted_view_light.retained_view_entity,
+                *main_entity,
+                material_instance.asset_id,
+                render_materials.asset_revision(material_instance.asset_id),
+                material_dependencies.dependency(material_instance.asset_id),
+                material.shadow_cache_untracked_texture,
+            );
 
             shadow_phase.add(
                 batch_set_key,
@@ -2827,43 +2961,127 @@ fn view_shadow_pass<const IS_LATE: bool>(
         return;
     };
 
+    let cache = world
+        .get::<DirectionalShadowMapInputs>(view_light_entity)
+        .and_then(|_| world.get_resource::<ShadowMapCache>());
+    if let Some(cache) = cache {
+        let reuse = cache.begin(
+            world,
+            view_light_entity,
+            extracted_light_view.retained_view_entity,
+            IS_LATE,
+            &view_light.pass_name,
+        );
+        let paired = !IS_LATE
+            && cache.parity().begin(
+                cache,
+                world,
+                view_light_entity,
+                extracted_light_view.retained_view_entity,
+                occlusion_culling,
+                shadow_phase.is_empty(),
+                reuse,
+                ctx,
+            );
+        if reuse && (IS_LATE || !paired) {
+            // Must precede get_attachment: acquiring it consumes the clear.
+            return;
+        }
+    }
+
     #[cfg(feature = "trace")]
     let _shadow_pass_span = info_span!("", "{}", view_light.pass_name).entered();
 
     let depth_stencil_attachment = Some(view_light.depth_attachment.get_attachment(StoreOp::Store));
+    if let Some(cache) = cache {
+        cache.parity().attachment(
+            world,
+            extracted_light_view.retained_view_entity,
+            IS_LATE,
+            depth_stencil_attachment
+                .as_ref()
+                .and_then(|attachment| attachment.depth_ops.map(|ops| ops.load)),
+        );
+    }
 
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
-    let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
+    let descriptor = RenderPassDescriptor {
         label: Some(&view_light.pass_name),
         color_attachments: &[],
         depth_stencil_attachment,
         timestamp_writes: None,
         occlusion_query_set: None,
         multiview_mask: None,
-    });
+    };
 
-    // Bevy 0.19's PassSpanGuard::end forgets its owned label. Pair the recorder
-    // calls directly so dynamic shadow labels are released with the frame data.
-    if let Some(diagnostics) = diagnostics {
-        diagnostics.begin_pass_span(
-            &mut render_pass,
-            format!(
-                "{}_{}",
-                view_light.pass_name,
-                if IS_LATE { "late" } else { "early" }
-            )
-            .into(),
-        );
-    }
+    // Getter above runs exactly once. Replay uses the original attachment,
+    // clear/load/store operations and native command body on this encoder.
+    for lane in 0..2 {
+        let audit = cache
+            .filter(|cache| {
+                cache
+                    .parity()
+                    .active(world, extracted_light_view.retained_view_entity)
+            })
+            .map(|_| {
+                bevy_render::render_parity::NativeRenderAudit::begin(world, view_light_entity)
+            });
+        let mut render_pass = ctx.begin_tracked_render_pass(descriptor.clone());
 
-    if let Err(err) = shadow_phase.render(&mut render_pass, world, view_light_entity) {
-        error!("Error encountered while rendering the shadow phase {err:?}");
-    }
+        // Bevy 0.19's PassSpanGuard::end forgets its owned label. Pair the recorder
+        // calls directly so dynamic shadow labels are released with the frame data.
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.begin_pass_span(
+                &mut render_pass,
+                format!(
+                    "{}_{}",
+                    view_light.pass_name,
+                    if IS_LATE { "late" } else { "early" }
+                )
+                .into(),
+            );
+        }
 
-    if let Some(diagnostics) = diagnostics {
-        diagnostics.end_pass_span(&mut render_pass);
+        let rendered = shadow_phase.render(&mut render_pass, world, view_light_entity);
+        if let Err(err) = &rendered {
+            error!("Error encountered while rendering the shadow phase {err:?}");
+        }
+
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.end_pass_span(&mut render_pass);
+        }
+        // Both same-frame copies share this pass's encoder. End the native pass
+        // before encoding B; each camera's slice is saved before the next camera.
+        drop(render_pass);
+        if let Some(cache) = cache {
+            if let Some(reason) = audit.as_ref().and_then(|audit| audit.failure()) {
+                cache.parity().command_failure(
+                    world,
+                    extracted_light_view.retained_view_entity,
+                    &reason,
+                );
+            }
+            cache.finish_with_world(
+                world,
+                extracted_light_view.retained_view_entity,
+                IS_LATE,
+                occlusion_culling,
+                rendered.is_ok(),
+            );
+            let replay = cache.parity().finish(
+                cache,
+                world,
+                extracted_light_view.retained_view_entity,
+                IS_LATE,
+                ctx,
+            );
+            if replay && lane == 0 {
+                continue;
+            }
+        }
+        break;
     }
 }
 

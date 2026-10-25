@@ -2807,6 +2807,7 @@ fn finalize_terrain_clips(
                     .entered();
             queue.write_buffer(&view.visible, clip_offset, &bytes);
             view.terrain_clip_bytes = bytes;
+            view.shadow_content_revision = cull_reuse::next_revision();
         }
         view.terrain_clip_inputs = Some(inputs);
     }
@@ -3914,6 +3915,8 @@ fn select_instances(
             let view = gpu.views.get_mut(&key).unwrap();
             view.selection_base = Some(base);
             view.selection = Some(selected);
+            view.selection_revision = view.selection_revision.wrapping_add(1);
+            view.shadow_content_revision = cull_reuse::next_revision();
         } else {
             filters.reused += 1;
         }

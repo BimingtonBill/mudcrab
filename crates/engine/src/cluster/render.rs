@@ -16,6 +16,12 @@ mod gpu_contract;
 mod handoff;
 use gpu_contract::{CullParams, DRAW_INDEXED_INDIRECT_BYTES, SELECTED_CLUSTER_BYTES, STAGES};
 
+#[path = "cull_reuse.rs"]
+mod cull_reuse;
+
+#[path = "cull_parity.rs"]
+mod cull_parity;
+
 #[path = "stable_order.rs"]
 mod stable_order;
 
@@ -74,6 +80,10 @@ use bevy::{
         PrepassPipeline, PrepassPipelineSpecializer, SetMeshViewBindGroup,
         SetMeshViewBindingArrayBindGroup, SetPrepassViewBindGroup, SetPrepassViewEmptyBindGroup,
         Shadow, ShadowBatchSetKey, ShadowBinKey, ViewKeyCache, alpha_mode_pipeline_key,
+        shadow_cache::{
+            ShadowCacheMaterialDependencies, ShadowCacheTracking, ShadowMapCache,
+            ShadowMapExternalInputs,
+        },
     },
     prelude::*,
     render::{
@@ -145,6 +155,8 @@ pub(super) mod queue_stats {
     pub static CULL_PASS_NANOS: AtomicU64 = AtomicU64::new(0);
     /// Actual per-view cull uniform writes in the reporting window; unchanged views add none.
     pub static CULL_PARAMS_UPLOADS: AtomicU64 = AtomicU64::new(0);
+    pub static CULL_REUSED: AtomicU64 = AtomicU64::new(0);
+    pub static CULL_DISPATCHES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
     /// Draw groups in the camera's and in the latest rebuilt shadow view's plan: each is one
     /// indirect draw (and a pipeline and bind group switch) per view, encoded every frame.
     pub static GROUPS_CAMERA: AtomicU64 = AtomicU64::new(0);
@@ -187,6 +199,11 @@ pub(super) mod queue_stats {
         }
         let take = |counter: &AtomicU64| counter.swap(0, Relaxed);
         let per_frame = |nanos: u64| nanos as f64 / 1.0e6 / QUEUE_REPORT_EVERY as f64;
+        bevy::log::info!(
+            reused_views = take(&CULL_REUSED),
+            dispatches = ?CULL_DISPATCHES.each_ref().map(take),
+            "cluster exact cull work over {QUEUE_REPORT_EVERY} frames"
+        );
         bevy::log::info!(
             "cluster queue over {QUEUE_REPORT_EVERY} frames: batches {} full / {} skipped views ({} walked, {} batches taken up), {:.2} ms/frame; \
              shadows {} full / {} skipped views, {:.2} ms/frame; source orders built {}; batch loader {:.2}, extract {:.2}, prepare {:.2}, cull {:.2} ms/frame (writes {:.2}, passes {:.2}, params {} uploads); draw groups: camera {} ({} pipelines x {} material bind groups; {} of {} batches bindless), a shadow view {}",
@@ -831,12 +848,30 @@ impl Plugin for ClusterRenderPlugin {
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
+        render_app.init_resource::<ShadowCacheMaterialDependencies>();
+        {
+            let mut dependencies = render_app
+                .world_mut()
+                .resource_mut::<ShadowCacheMaterialDependencies>();
+            // These extensions' shadow stages have no time or external GPU
+            // producers beyond their ordinary mesh/material/image assets.
+            // UV animation mutates the underlying material asset and remains
+            // tracked; this declaration does not freeze animated alpha inputs.
+            dependencies.declare_static::<crate::nif_depth::NifDepthMaterial>();
+            dependencies.declare_static::<SnowMaterial>();
+            dependencies.declare_static::<crate::render::TerrainMaterial>();
+            dependencies.declare_static::<super::terrain::ClusterTerrainMaterial>();
+            dependencies.declare_static::<crate::effect_palette::EffectPaletteMaterial>();
+            dependencies.declare_static::<crate::terrain_merge::material::MergedTerrainMaterial>();
+        }
         pipeline_diagnostics::install(render_app, diagnostics);
         render_app
             .init_resource::<ClusterPipelines>()
             .init_resource::<ClusterSettings>()
             .init_resource::<ClusterBatchMaterials>()
             .init_resource::<ClusterFrame>()
+            .init_resource::<cull_parity::CullParity>()
+            .add_systems(Render, cull_parity::poll.in_set(RenderSystems::Cleanup))
             .add_systems(
                 ExtractSchedule,
                 (extract_batch_materials, extract_cluster_frame),
@@ -847,8 +882,8 @@ impl Plugin for ClusterRenderPlugin {
             .add_render_command::<AlphaMask3dPrepass, DrawClusterPrepass>()
             .add_render_command::<Opaque3dPrepass, DrawClusterDepthOnlyPrepass>()
             .add_render_command::<AlphaMask3dPrepass, DrawClusterDepthOnlyPrepass>()
-            .add_render_command::<Shadow, DrawClusterShadow>()
-            .add_render_command::<Shadow, DrawClusterShadowMask>()
+            .add_render_command::<Shadow, ShadowCacheTracking<DrawClusterShadow>>()
+            .add_render_command::<Shadow, ShadowCacheTracking<DrawClusterShadowMask>>()
             .add_systems(
                 Render,
                 (
@@ -888,6 +923,14 @@ impl Plugin for ClusterRenderPlugin {
 }
 
 impl ViewGpu {
+    fn prepass_ledger(&self, forced_audit_lane: bool) -> &std::sync::Mutex<HashMap<u32, u32>> {
+        if forced_audit_lane {
+            &self.audit_prepass_drawn
+        } else {
+            &self.prepass_drawn
+        }
+    }
+
     /// The plan's representative for batch `index`, if it has one.
     fn plan_rep(&self, index: u32) -> Option<&ReadyBatch> {
         self.plan_rep_positions
@@ -910,6 +953,18 @@ struct ViewGpu {
     last_seen: std::time::Instant,
     /// Draw commands require a cull encoded for the current frame/epoch.
     last_cull_epoch: u32,
+    /// Output identity belongs to these allocations; draw freshness still uses
+    /// last_cull_epoch so early/late prepass suppression resets every frame.
+    cull_reuse: cull_reuse::CullReuse,
+    pending_cull: Option<cull_reuse::CullInputs>,
+    /// Moves on dependency-proof changes, even when mask bytes compare equal.
+    selection_revision: u64,
+    /// Includes raster-only terrain clip writes without needlessly rerunning
+    /// selection compute, as well as every newly encoded cull result.
+    shadow_content_revision: u64,
+    /// Independent early/late ledger for the diagnostic forced raster lane.
+    audit_prepass_drawn: std::sync::Mutex<HashMap<u32, u32>>,
+    audit_cull_pending: bool,
     selection: Option<handoff::Selection>,
     /// The visible-set-independent part of `selection` ([`handoff::SelectionBase`]).
     selection_base: Option<Arc<handoff::SelectionBase>>,
@@ -3129,6 +3184,21 @@ fn cluster_cull_view_eligible(
     (opaque_phase_present || shadow_phase_present) && !view.draws.is_empty()
 }
 
+/// Both registered cluster shadow commands consume the same selected geometry
+/// and material closure. Publish each command explicitly so an unrelated custom
+/// shadow producer cannot inherit the aggregate cluster certificate.
+fn publish_cluster_shadow_inputs(
+    inputs: &ShadowMapExternalInputs,
+    view: RetainedViewEntity,
+    frame: u32,
+    revision: u64,
+    complete: bool,
+) {
+    inputs.publish(view, frame, revision, complete);
+    inputs.publish_draw::<DrawClusterShadow>(view, frame, revision, complete);
+    inputs.publish_draw::<DrawClusterShadowMask>(view, frame, revision, complete);
+}
+
 /// The cull passes of every view that draws clusters: the 3D camera and each shadow cascade or
 /// cube face. Each view owns its parameters, compact instance list, source selection scratch,
 /// prefixes, argument list and draw counts. Eight stages cover all batches, preserving source
@@ -3142,14 +3212,38 @@ fn run_cluster_cull(
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
-    views: Query<&ExtractedView>,
+    views: Query<(Entity, &ExtractedView)>,
     opaque_phases: Res<ViewBinnedRenderPhases<Opaque3d>>,
     shadow_phases: Res<ViewBinnedRenderPhases<Shadow>>,
     settings: Res<ClusterSettings>,
+    mut force_recompute: Local<Option<bool>>,
+    frame_count: Res<bevy::diagnostic::FrameCount>,
+    (shadow_inputs, parity, shadow_cache, raster_parity): (
+        Res<ShadowMapExternalInputs>,
+        Res<cull_parity::CullParity>,
+        Res<ShadowMapCache>,
+        Option<Res<bevy::render::render_parity::RasterParity>>,
+    ),
 ) {
     perf_span!("cluster::cull::total");
     let _timer = queue_stats::Timed::start(&queue_stats::CULL_NANOS);
+    parity.request_frame(
+        frame_count.0,
+        shadow_cache.parity_request_frame(frame_count.0),
+    );
     let Some(mut gpu) = gpu else {
+        for (_, view) in &views {
+            if shadow_phases.contains_key(&view.retained_view_entity) {
+                shadow_inputs.reset_materials(view.retained_view_entity, frame_count.0);
+                publish_cluster_shadow_inputs(
+                    &shadow_inputs,
+                    view.retained_view_entity,
+                    frame_count.0,
+                    0,
+                    true,
+                );
+            }
+        }
         return;
     };
     // Invalidate previous arguments even if a dependency vanished this frame.
@@ -3157,14 +3251,23 @@ fn run_cluster_cull(
     gpu.epoch = gpu.epoch.wrapping_add(1).max(1);
     let epoch = gpu.epoch;
     let Some(prepared) = prepared_cluster_cull(&gpu, &frame, &pipelines, &pipeline_cache) else {
+        for view in gpu.views.values_mut() {
+            view.cull_reuse.invalidate();
+            view.pending_cull = None;
+        }
         return;
     };
+    // Diagnostic control for same-binary forced-recompute parity captures.
+    // Read once, never poll the environment during settled rendering.
+    let force_recompute = *force_recompute.get_or_insert_with(|| {
+        std::env::var("MUDCRAB_FORCE_CLUSTER_RECOMPUTE").as_deref() == Ok("1")
+    });
     let instance_pipeline = prepared.instance;
     let pipeline = prepared.clusters;
     // Every view that exists is stamped; the ones that have not been seen for a while are freed
     // (their buffers are as big as the scene's slot count, so a leaked set is not small).
     let now = std::time::Instant::now();
-    for view in &views {
+    for (_, view) in &views {
         if let Some(view_gpu) = gpu.views.get_mut(&view.retained_view_entity) {
             view_gpu.last_seen = now;
         }
@@ -3219,8 +3322,12 @@ fn run_cluster_cull(
     let instance_count = gpu.total_instances;
     let instance_mask_base = gpu.batches.len().max(1) as u32;
     let use_count = gpu.use_count;
+    let gpu_identity = gpu.identity;
+    let layout = gpu.layout_epoch;
+    let materials = gpu.generation;
+    let pipelines_revision = pipeline_cache.readiness_revision();
     // The views that draw opaque 3D or cast shadows: the UI camera's view has neither phase.
-    for view in views.iter().filter(|view| {
+    for (_, view) in views.iter().filter(|(_, view)| {
         opaque_phases.contains_key(&view.retained_view_entity)
             || shadow_phases.contains_key(&view.retained_view_entity)
     }) {
@@ -3239,11 +3346,61 @@ fn run_cluster_cull(
             continue;
         };
         let params = cull_params(view, &settings, instance_count, instance_mask_base, epoch);
-        if let Some(bytes) = cull_params_to_upload(&mut view_gpu.params_uploaded, params) {
+        let upload = cull_params_to_upload(&mut view_gpu.params_uploaded, params);
+        let uniform_changed = upload.is_some();
+        if let Some(bytes) = upload {
             queue.write_buffer(&view_gpu.params, 0, bytes);
             queue_stats::bump(&queue_stats::CULL_PARAMS_UPLOADS);
         }
-        // The arguments and the counts start empty every frame.
+        let inputs = cull_reuse::CullInputs {
+            gpu: gpu_identity,
+            layout,
+            materials,
+            selection: view_gpu.selection_revision,
+            plan: view_gpu.plan_epoch,
+            readiness: view_gpu.readiness_revision,
+            pipelines: pipelines_revision,
+            origin: frame.origin_offset.to_array().map(f32::to_bits),
+            world_from_view: view
+                .world_from_view
+                .to_matrix()
+                .to_cols_array()
+                .map(f32::to_bits),
+            clip_from_view: view.clip_from_view.to_cols_array().map(f32::to_bits),
+            clip_from_world: view
+                .clip_from_world
+                .map(|matrix| matrix.to_cols_array().map(f32::to_bits)),
+            viewport: view.viewport.to_array(),
+            invert_culling: view.invert_culling,
+        };
+        if !view_gpu
+            .cull_reuse
+            .needs_recompute(inputs, uniform_changed || force_recompute)
+        {
+            if parity.begin(
+                view.retained_view_entity,
+                frame_count.0,
+                inputs,
+                view_gpu,
+                &device,
+                ctx.command_encoder(),
+            ) {
+                // Same-input diagnostic recomputation supplies a second native
+                // raster lane. Keep the shadow identity until its byte audit;
+                // this control is never enabled in timing captures.
+                view_gpu.cull_reuse.invalidate();
+                view_gpu.audit_cull_pending = true;
+            } else {
+                // Revalidate permission to draw this frame independently of when
+                // the retained buffers were produced. Do not clear retained counts.
+                view_gpu.last_cull_epoch = epoch;
+                view_gpu.pending_cull = None;
+                queue_stats::bump(&queue_stats::CULL_REUSED);
+                continue;
+            }
+        }
+        view_gpu.pending_cull = Some(inputs);
+        // Changed inputs start with empty arguments and counts.
         let encoder = ctx.command_encoder();
         // The draw reads only as many arguments as the count says where the adapter can read it
         // on the GPU, and every one of those is written by the cull; only the fixed-count
@@ -3255,14 +3412,15 @@ fn run_cluster_cull(
     }
     let active: Vec<&ViewGpu> = views
         .iter()
-        .filter_map(|view| {
+        .filter_map(|(_, view)| {
             let key = view.retained_view_entity;
             gpu.views.get(&key).filter(|view_gpu| {
-                cluster_cull_view_eligible(
-                    view_gpu,
-                    opaque_phases.contains_key(&key),
-                    shadow_phases.contains_key(&key),
-                )
+                view_gpu.pending_cull.is_some()
+                    && cluster_cull_view_eligible(
+                        view_gpu,
+                        opaque_phases.contains_key(&key),
+                        shadow_phases.contains_key(&key),
+                    )
             })
         })
         .collect();
@@ -3321,6 +3479,7 @@ fn run_cluster_cull(
                 _ => unreachable!(),
             });
             for view_gpu in &active {
+                queue_stats::bump(&queue_stats::CULL_DISPATCHES[stage]);
                 let bind_group = match stage {
                     0 => &view_gpu.instance_bind_group,
                     3 => &view_gpu.cull_bind_group,
@@ -3354,16 +3513,52 @@ fn run_cluster_cull(
     }
     drop(pass_timer);
     drop(active);
-    // Only views included in the just-encoded cull may consume its arguments.
-    for view in &views {
+    // Publish only results whose complete eight-stage encode finished. Reused
+    // results already acquired this frame's draw permission above.
+    for (view_entity, view) in &views {
         if let Some(view_gpu) = gpu.views.get_mut(&view.retained_view_entity)
             && cluster_cull_view_eligible(
                 view_gpu,
                 opaque_phases.contains_key(&view.retained_view_entity),
                 shadow_phases.contains_key(&view.retained_view_entity),
             )
+            && let Some(inputs) = view_gpu.pending_cull.take()
         {
+            view_gpu.cull_reuse.encoded(inputs);
+            if view_gpu.audit_cull_pending {
+                if let Some(pairs) = parity.finish(
+                    view.retained_view_entity,
+                    view_entity,
+                    ctx.command_encoder(),
+                ) && opaque_phases.contains_key(&view.retained_view_entity)
+                    && let Some(raster) = raster_parity
+                        .as_ref()
+                        .filter(|audit| audit.requested(frame_count.0))
+                    && let Err(error) = raster.register_view(frame_count.0, view_entity, pairs)
+                {
+                    error!(%error, "native raster buffer registration failed");
+                }
+                view_gpu.audit_cull_pending = false;
+            } else {
+                view_gpu.shadow_content_revision = view_gpu.cull_reuse.revision();
+            }
             view_gpu.last_cull_epoch = epoch;
+        }
+        if shadow_phases.contains_key(&view.retained_view_entity)
+            && let Some(view_gpu) = gpu.views.get(&view.retained_view_entity)
+        {
+            // Command tracking additionally observes any missing draw binding
+            // or pipeline. Empty content is explicit, never inferred from an
+            // absent publication left by a previous frame.
+            let complete = view_gpu.selection.is_some()
+                && (view_gpu.draws.is_empty() || view_gpu.last_cull_epoch == epoch);
+            publish_cluster_shadow_inputs(
+                &shadow_inputs,
+                view.retained_view_entity,
+                frame_count.0,
+                view_gpu.shadow_content_revision,
+                complete,
+            );
         }
     }
 }
@@ -3391,7 +3586,7 @@ fn new_view_gpu(
         device.create_buffer(&bevy::render::render_resource::BufferDescriptor {
             label: Some(label),
             size,
-            usage,
+            usage: usage | cull_parity::copy_usage(),
             mapped_at_creation: false,
         })
     };
@@ -3538,6 +3733,12 @@ fn new_view_gpu(
     ViewGpu {
         last_seen: std::time::Instant::now(),
         last_cull_epoch: 0,
+        cull_reuse: default(),
+        pending_cull: None,
+        selection_revision: 0,
+        shadow_content_revision: cull_reuse::next_revision(),
+        audit_prepass_drawn: default(),
+        audit_cull_pending: false,
         selection: None,
         selection_base: None,
         instance_mask_bytes: Vec::new(),
@@ -3782,12 +3983,12 @@ impl<P: PhaseItem, const FORWARD: bool, const ONCE: bool> RenderCommand<P>
     for DrawClusterIndirect<FORWARD, ONCE>
 {
     type Param = SRes<ClusterGpu>;
-    type ViewQuery = &'static ExtractedView;
+    type ViewQuery = (Entity, &'static ExtractedView);
     type ItemQuery = &'static ClusterBatch;
 
     fn render<'w>(
         _: &P,
-        view: ROQueryItem<'w, '_, Self::ViewQuery>,
+        (view_entity, view): ROQueryItem<'w, '_, Self::ViewQuery>,
         batch: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
         gpu: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
@@ -3809,7 +4010,9 @@ impl<P: PhaseItem, const FORWARD: bool, const ONCE: bool> RenderCommand<P>
         };
         if ONCE
             && view_gpu
-                .prepass_drawn
+                .prepass_ledger(bevy::render::render_parity::raster_parity_forced_lane(
+                    view_entity,
+                ))
                 .lock()
                 .expect("prepass draw record")
                 .insert(batch.index, gpu.epoch)
@@ -4345,6 +4548,10 @@ fn queue_cluster_shadows(
     batches: Query<(Entity, &MainEntity, &ClusterBatch)>,
     batch_materials: Res<ClusterBatchMaterials>,
     mut carrier_scratch: Local<Vec<Option<(Entity, MainEntity)>>>,
+    (frame_count, shadow_inputs): (
+        Res<bevy::diagnostic::FrameCount>,
+        Res<ShadowMapExternalInputs>,
+    ),
 ) {
     perf_span!("cluster::queue_shadows::total");
     let _timer = queue_stats::Timed::start(&queue_stats::SHADOW_NANOS);
@@ -4444,14 +4651,19 @@ fn queue_cluster_shadows(
             pipeline_cache.get_render_pipeline(id).is_some()
         });
     }
-    let opaque_draw = draw_functions.read().id::<DrawClusterShadow>();
-    let mask_draw = draw_functions.read().id::<DrawClusterShadowMask>();
+    let opaque_draw = draw_functions
+        .read()
+        .id::<ShadowCacheTracking<DrawClusterShadow>>();
+    let mask_draw = draw_functions
+        .read()
+        .id::<ShadowCacheTracking<DrawClusterShadowMask>>();
     for (light, view) in &lights {
         let Some(phase) = shadow_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
         let unclipped = matches!(light, LightEntity::Directional { .. });
         let key = view.retained_view_entity;
+        shadow_inputs.begin_materials(key, frame_count.0);
         if !gpu.views.contains_key(&key) {
             let view_gpu = new_view_gpu(&device, &pipeline_cache, &gpu);
             gpu.views.insert(key, view_gpu);
@@ -4475,6 +4687,9 @@ fn queue_cluster_shadows(
             continue;
         }
         perf_span!("cluster::queue_shadows::rebuild");
+        // Retain the closure on the fast path. Only a real plan rebuild removes
+        // old dependencies; prepared-material deltas update members separately.
+        shadow_inputs.reset_materials(key, frame_count.0);
         queue_stats::bump(&queue_stats::SHADOW_FULL);
         let opaque_pipeline = *pipelines.shadow.entry(unclipped).or_insert_with(|| {
             pipeline_cache.queue_render_pipeline(build_shadow_descriptor(
@@ -4505,6 +4720,9 @@ fn queue_cluster_shadows(
             let slots = batch.slots;
             let (pipeline, material_group) = match (&batch.cutout, render_mesh) {
                 (Some(cutout), Some(render_mesh)) => {
+                    if let Some(material) = materials.get(cutout.asset) {
+                        shadow_inputs.observe_material(key, frame_count.0, cutout.asset, material);
+                    }
                     let pipeline = cutout_shadow_pipeline(
                         &mut pipelines.shadow_mask,
                         cutout,

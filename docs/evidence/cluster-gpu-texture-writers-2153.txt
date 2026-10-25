@@ -1,0 +1,48 @@
+# #2153 texture writer grep receipt
+# 2026-10-26; source routing proof; native execution is separately recorded.
+# Command: rg -n "write_texture|copy_texture_to_texture|copy_buffer_to_texture|copy_external_image_to_texture|create_texture_with_data" crates/engine vendor
+crates/engine\examples\retail_curve_probe.rs:419:        self.queue.write_texture(
+vendor\bevy_render-0.19.0\src\render_parity.rs:454:            ctx.command_encoder().copy_texture_to_texture(
+vendor\bevy_render-0.19.0\src\renderer\render_device.rs:219:    pub fn create_texture_with_data(
+vendor\bevy_render-0.19.0\src\renderer\render_device.rs:228:                .create_texture_with_data(render_queue.as_ref(), desc, order, data);
+vendor\bevy_core_pipeline-0.19.0\src\prepass\node.rs:278:        ctx.command_encoder().copy_texture_to_texture(
+vendor\bevy_pbr-0.19.0\src\transmission\node.rs:79:                ctx.command_encoder().copy_texture_to_texture(
+vendor\bevy_pbr-0.19.0\src\ssao\mod.rs:296:            .create_texture_with_data(
+vendor\bevy_pbr-0.19.0\src\medium.rs:133:        let density_lut = render_device.create_texture_with_data(
+vendor\bevy_pbr-0.19.0\src\medium.rs:168:        let scattering_lut = render_device.create_texture_with_data(
+vendor\bevy_render-0.19.0\src\mesh\morph.rs:87:        let texture = render_device.create_texture_with_data(
+vendor\bevy_render-0.19.0\src\texture\gpu_image.rs:84:                render_queue.write_texture(
+vendor\bevy_render-0.19.0\src\texture\gpu_image.rs:104:            render_device.create_texture_with_data(
+vendor\bevy_render-0.19.0\src\texture\gpu_image.rs:136:                    command_encoder.copy_texture_to_texture(
+vendor\bevy_render-0.19.0\src\texture\fallback_image.rs:79:        render_device.create_texture_with_data(
+vendor\bevy_render-0.19.0\src\texture\fallback_image.rs:129:    let create_texture_with_data = !format.is_depth_stencil_format() && samples == 1;
+vendor\bevy_render-0.19.0\src\texture\fallback_image.rs:132:    let mut image = if create_texture_with_data {
+vendor\bevy_render-0.19.0\src\texture\fallback_image.rs:151:    if !create_texture_with_data && image_dimension == TextureDimension::D2 {
+vendor\bevy_pbr-0.19.0\src\render\mesh.rs:2764:        render_queue.write_texture(
+vendor\bevy_core_pipeline-0.19.0\src\deferred\node.rs:249:        ctx.command_encoder().copy_texture_to_texture(
+crates/engine\src\portal.rs:7143:        ctx.command_encoder().copy_texture_to_texture(
+vendor\bevy_core_pipeline-0.19.0\src\core_3d\mod.rs:10:/// - doesn't support `copy_texture_to_texture` for depth textures yet, thus it doesn't support `DepthPrepass`.
+vendor\bevy_core_pipeline-0.19.0\src\core_3d\mod.rs:23:/// - doesn't support `copy_texture_to_texture` for depth textures yet, thus it doesn't support `DepthPrepass`.
+crates/engine\src\water_ssr.rs:553:        render_queue.write_texture(
+crates/engine\src\water_ssr.rs:658:    ctx.command_encoder().copy_texture_to_texture(
+# Additional managed material, geometry and shader input proofs (rg -n -H):
+crates/engine/src/material_animation.rs:513:        if let Some(mut material) = standard.get_mut(*id) {
+crates/engine/src/material_animation.rs:515:            material.uv_transform = uv_transform(offset, scale);
+crates/engine/src/material_animation.rs:522:        if let Some(mut material) = palettes.get_mut(handle) {
+crates/engine/src/material_animation.rs:525:                material.extension.set_uv(offset, scale);
+crates/engine/src/material_animation.rs:526:                material.base.uv_transform = uv_transform(offset, scale);
+crates/engine/src/cluster/terrain.rs:287:                    let handle = images.add(load_atlas(&atlas_path)?);
+crates/engine/src/cluster/terrain.rs:292:            let material = materials.add(ClusterTerrainMaterial {
+crates/engine/src/cluster/terrain.rs:435:            if let Some(mut material) = materials.get_mut(&block.material) {
+crates/engine/src/cluster/terrain.rs:1355:        let handle = materials.add(ClusterTerrainMaterial {
+crates/engine/src/cluster/terrain.rs:1418:        let handle = materials.add(ClusterTerrainMaterial {
+crates/engine/src/cluster/handoff.rs:2810:            view.shadow_content_revision = cull_reuse::next_revision();
+crates/engine/src/cluster/handoff.rs:3919:            view.shadow_content_revision = cull_reuse::next_revision();
+vendor/bevy_render-0.19.0/src/mesh/mod.rs:120:impl RenderAsset for RenderMesh {
+vendor/bevy_render-0.19.0/src/mesh/mod.rs:204:            _render_morph_targets_allocator.allocate(
+vendor/bevy_pbr-0.19.0/src/render/pbr_prepass_functions.wgsl:22:fn prepass_alpha_discard(in: VertexOutput) {
+vendor/bevy_pbr-0.19.0/src/render/pbr_prepass_functions.wgsl:42:    let uv_transform = pbr_bindings::material_array[material_indices[slot].material].uv_transform;
+vendor/bevy_pbr-0.19.0/src/render/pbr_prepass_functions.wgsl:44:    let uv_transform = pbr_bindings::material.uv_transform;
+vendor/bevy_pbr-0.19.0/src/render/pbr_prepass_functions.wgsl:47:    uv = (uv_transform * vec3(uv, 1.0)).xy;
+vendor/bevy_pbr-0.19.0/src/render/pbr_prepass_functions.wgsl:51:            bindless_textures_2d[material_indices[slot].base_color_texture],
+vendor/bevy_pbr-0.19.0/src/render/pbr_prepass_functions.wgsl:54:            pbr_bindings::base_color_texture,

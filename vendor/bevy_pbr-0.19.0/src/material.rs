@@ -1,6 +1,10 @@
 use crate::material_bind_groups::{
     FallbackBindlessResources, MaterialBindGroupAllocator, MaterialBindingId,
 };
+use crate::shadow_cache::{
+    RetainedDirectionalShadowTexture, ShadowCacheMaterialDependencies, ShadowCacheTracking,
+    ShadowMapCache, ShadowMapExternalInputs, ShadowStockInputs,
+};
 use crate::*;
 use alloc::sync::Arc;
 use bevy_asset::prelude::AssetChanged;
@@ -296,6 +300,11 @@ impl Plugin for MaterialsPlugin {
                 .init_gpu_resource::<LightKeyCache>()
                 .init_gpu_resource::<SpecializedShadowMaterialPipelineCache>()
                 .init_resource::<DrawFunctions<Shadow>>()
+                .init_gpu_resource::<RetainedDirectionalShadowTexture>()
+                .init_gpu_resource::<ShadowMapCache>()
+                .init_gpu_resource::<ShadowMapExternalInputs>()
+                .init_gpu_resource::<ShadowStockInputs>()
+                .init_resource::<ShadowCacheMaterialDependencies>()
                 .init_resource::<RenderMaterialInstances>()
                 .allow_ambiguous_resource::<RenderMaterialInstances>()
                 .init_resource::<MaterialBindGroupAllocators>()
@@ -304,8 +313,8 @@ impl Plugin for MaterialsPlugin {
                 .allow_ambiguous_resource::<PendingMeshMaterialQueues>()
                 .init_gpu_resource::<PendingShadowQueues>()
                 .allow_ambiguous_resource::<PendingShadowQueues>()
-                .add_render_command::<Shadow, DrawPrepass>()
-                .add_render_command::<Shadow, DrawDepthOnlyPrepass>()
+                .add_render_command::<Shadow, ShadowCacheTracking<DrawPrepass>>()
+                .add_render_command::<Shadow, ShadowCacheTracking<DrawDepthOnlyPrepass>>()
                 .add_render_command::<Transparent3d, DrawMaterial>()
                 .add_render_command::<Opaque3d, DrawMaterial>()
                 .add_render_command::<AlphaMask3d, DrawMaterial>()
@@ -329,9 +338,19 @@ impl Plugin for MaterialsPlugin {
                     (
                         prepare_material_bind_groups,
                         write_material_bind_group_buffers,
+                        shadow_cache::apply_shadow_material_changes,
                     )
                         .chain()
                         .in_set(RenderSystems::PrepareBindGroups),
+                )
+                .add_systems(
+                    Render,
+                    (
+                        shadow_cache::parity::cleanup_shadow_parity,
+                        shadow_cache::report_shadow_cache_counters,
+                    )
+                        .chain()
+                        .in_set(RenderSystems::Cleanup),
                 )
                 .add_systems(
                     Render,
@@ -387,6 +406,12 @@ where
             );
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            // Names are diagnostic metadata, never a dependency declaration.
+            render_app.init_resource::<shadow_cache::ShadowMaterialTypeNames>();
+            render_app
+                .world_mut()
+                .resource_mut::<shadow_cache::ShadowMaterialTypeNames>()
+                .register::<M>();
             render_app
                 .add_systems(RenderStartup, add_material_bind_group_allocator::<M>)
                 .add_systems(
@@ -1442,6 +1467,15 @@ pub struct RenderMaterialBindings(HashMap<UntypedAssetId, MaterialBindingId>);
 pub struct PreparedMaterial {
     pub binding: MaterialBindingId,
     pub properties: Arc<MaterialProperties>,
+    /// Bindings cannot be inspected, so shadow reuse must be refused.
+    /// Inspectable textures use the cooperative writer contract: every
+    /// shadow-affecting upload or GPU write must mutate `Assets<Image>` or acquire
+    /// `RenderAssets<GpuImage>::get_mut` before encoding the write. Texture usage
+    /// flags alone do not prove a write; raw unannounced writes are unsupported.
+    pub shadow_cache_untracked_texture: bool,
+    /// Actual sampled bindings retained only for opt-in shadow diagnostics.
+    /// These references keep replaced GPU views alive until material replacement.
+    pub(crate) shadow_cache_texture_views: Option<Vec<(u32, TextureView)>>,
 }
 
 pub fn base_specialize(
@@ -1531,7 +1565,7 @@ where
         SRes<DrawFunctions<Opaque3dDeferred>>,
         SRes<DrawFunctions<AlphaMask3dDeferred>>,
         SRes<DrawFunctions<Shadow>>,
-        SRes<AssetServer>,
+        (SRes<AssetServer>, SRes<ShadowMapCache>),
         M::Param,
     );
 
@@ -1553,13 +1587,15 @@ where
             opaque_deferred_draw_functions,
             alpha_mask_deferred_draw_functions,
             shadow_draw_functions,
-            asset_server,
+            (asset_server, shadow_cache),
             material_param,
         ): &mut SystemParamItem<Self::Param>,
     ) -> Result<Self::ErasedAsset, PrepareAssetError<Self::SourceAsset>> {
         let material_layout = M::bind_group_layout_descriptor(render_device);
         let actual_material_layout = pipeline_cache.get_bind_group_layout(&material_layout);
 
+        let shadow_cache_untracked_texture;
+        let mut shadow_cache_texture_views = None;
         let binding = match material.unprepared_bind_group(
             &actual_material_layout,
             render_device,
@@ -1567,6 +1603,23 @@ where
             false,
         ) {
             Ok(unprepared) => {
+                shadow_cache_untracked_texture =
+                    shadow_cache::untracked_texture_bindings(&unprepared.bindings);
+                if shadow_cache.parity().enabled() {
+                    shadow_cache_texture_views = Some(
+                        unprepared
+                            .bindings
+                            .iter()
+                            .filter_map(|(binding, resource)| {
+                                if let OwnedBindingResource::TextureView(_, view) = resource {
+                                    Some((*binding, view.clone()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                    );
+                }
                 let bind_group_allocator =
                     bind_group_allocators.get_mut(&TypeId::of::<M>()).unwrap();
                 // Allocate or update the material.
@@ -1588,7 +1641,7 @@ where
                 }
             }
             Err(AsBindGroupError::RetryNextUpdate) => {
-                return Err(PrepareAssetError::RetryNextUpdate(material))
+                return Err(PrepareAssetError::RetryNextUpdate(material));
             }
             Err(AsBindGroupError::CreateBindGroupDirectly) => {
                 match material.as_bind_group(
@@ -1598,6 +1651,9 @@ where
                     material_param,
                 ) {
                     Ok(prepared_bind_group) => {
+                        // An opaque directly-created bind group need not expose
+                        // all of its resources through `bindings`.
+                        shadow_cache_untracked_texture = true;
                         let bind_group_allocator =
                             bind_group_allocators.get_mut(&TypeId::of::<M>()).unwrap();
                         // Store the resulting bind group directly in the slot.
@@ -1607,7 +1663,7 @@ where
                         material_binding_id
                     }
                     Err(AsBindGroupError::RetryNextUpdate) => {
-                        return Err(PrepareAssetError::RetryNextUpdate(material))
+                        return Err(PrepareAssetError::RetryNextUpdate(material));
                     }
                     Err(other) => return Err(PrepareAssetError::AsBindGroupError(other)),
                 }
@@ -1631,8 +1687,12 @@ where
         let draw_alpha_mask_deferred = alpha_mask_deferred_draw_functions
             .read()
             .id::<DrawPrepass>();
-        let draw_shadows = shadow_draw_functions.read().id::<DrawPrepass>();
-        let draw_shadows_depth_only = shadow_draw_functions.read().id::<DrawDepthOnlyPrepass>();
+        let draw_shadows = shadow_draw_functions
+            .read()
+            .id::<ShadowCacheTracking<DrawPrepass>>();
+        let draw_shadows_depth_only = shadow_draw_functions
+            .read()
+            .id::<ShadowCacheTracking<DrawDepthOnlyPrepass>>();
 
         let draw_functions = SmallVec::from_iter([
             (MainPassOpaqueDrawFunction.intern(), draw_opaque_pbr),
@@ -1734,6 +1794,8 @@ where
         let material_key = ErasedMaterialKey::new(bind_group_data);
 
         Ok(PreparedMaterial {
+            shadow_cache_untracked_texture,
+            shadow_cache_texture_views,
             binding,
             properties: Arc::new(MaterialProperties {
                 alpha_mode: material.alpha_mode(),

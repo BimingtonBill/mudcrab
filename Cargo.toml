@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-# Keep the patched PBR dependency on the engine's feature set; do not enable its optional processors.
-exclude = ["vendor/bevy_pbr-0.19.0"]
+# Keep patched pipeline dependencies on the engine's feature set; do not enable optional PBR processors.
+exclude = ["vendor/bevy_pbr-0.19.0", "vendor/bevy_core_pipeline-0.19.0"]
 members = [
     "crates/converter",
     "crates/dummy-content",
@@ -65,6 +65,8 @@ project-wormhole-esm = "0.1.0"
 bevy_render = { path = "vendor/bevy_render-0.19.0" }
 # Shadow pass diagnostics; see vendor/bevy_pbr-0.19.0/MUDCRAB-README.md.
 bevy_pbr = { path = "vendor/bevy_pbr-0.19.0" }
+# Native same-frame attachment parity uses the production pass emitters.
+bevy_core_pipeline = { path = "vendor/bevy_core_pipeline-0.19.0" }
 
 # Workspace profile optimization
 [profile.dev]

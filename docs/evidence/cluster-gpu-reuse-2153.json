@@ -1,0 +1,2080 @@
+{
+  "classification": "#2153 exact reuse source, hardware, native and quiet GPU attribution evidence; no FPS acceptance",
+  "code_identity": {
+    "files_checked": 892,
+    "changed": [],
+    "frozen_source_record_sha256": "ddb77dd5cf9fe845ce432e54485bef2779b6e65cbbfe1f69c0e9c75a485a8df8",
+    "code_subset_sha256": "9cd773972acf8bbebefca666da45b9cdc9c5e73fa7ab40a17db98a76cbd64eb6"
+  },
+  "source_validation": {
+    "source_sha256": "8b64135706fea19e712789a543ba7f5b9f3f518061dd1b58005447a52735db23",
+    "binary_sha256": "732c9d7c2861c71518c5766f5de6288bdf4a5563184be65a2938f7ea6339a16c",
+    "recorded": "2026-10-26T05:28:01.443345",
+    "workspace_nextest": {
+      "passed": 5583,
+      "skipped": 65
+    },
+    "pbr_nextest": {
+      "passed": 68
+    },
+    "docs": {
+      "passed": 18,
+      "ignored": 15
+    },
+    "capture_cpu": {
+      "passed": 111,
+      "log": "capture-2153-r3/cpu-r3-result-wrapper-green.log"
+    },
+    "fmt": "workspace and modified PBR style2021 checks passed",
+    "checks": {
+      "clippy2": {
+        "command": [
+          "C:\\Users\\Brannock\\miniconda3\\python.exe",
+          "C:/Users/Brannock/.mudcrab/build-gate/build_gate.py",
+          "run",
+          "--label",
+          "sol-2153-r3-clippy2",
+          "--",
+          "cargo",
+          "clippy",
+          "--workspace",
+          "--all-targets",
+          "--all-features",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "started": "2026-10-26T04:47:48.852085",
+        "finished": "2026-10-26T04:50:59.587997",
+        "exit_code": 0,
+        "log": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\r3-clippy2.log",
+        "log_sha256": "2f3ff584c076a9d9b29c4804e354317df5a76d1f516643afcd9a1cb84d73ca14"
+      },
+      "nextest": {
+        "command": [
+          "C:\\Users\\Brannock\\miniconda3\\python.exe",
+          "C:/Users/Brannock/.mudcrab/build-gate/build_gate.py",
+          "run",
+          "--label",
+          "sol-2153-r3-nextest",
+          "--",
+          "cargo",
+          "nextest",
+          "run",
+          "--workspace",
+          "--all-targets"
+        ],
+        "started": "2026-10-26T04:50:59.588541",
+        "finished": "2026-10-26T05:09:32.629902",
+        "exit_code": 0,
+        "log": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\r3-nextest.log",
+        "log_sha256": "b4f2ca5a9bd46028c5d4ae7375d1b336bf473e3b622fcfc87eccdd3b5e65aef7"
+      },
+      "vendor": {
+        "command": [
+          "C:\\Users\\Brannock\\miniconda3\\python.exe",
+          "C:/Users/Brannock/.mudcrab/build-gate/build_gate.py",
+          "run",
+          "--label",
+          "sol-2153-r3-vendor",
+          "--",
+          "cargo",
+          "nextest",
+          "run",
+          "-p",
+          "bevy_pbr",
+          "--all-targets"
+        ],
+        "started": "2026-10-26T05:09:32.630345",
+        "finished": "2026-10-26T05:24:49.674233",
+        "exit_code": 0,
+        "log": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\r3-vendor.log",
+        "log_sha256": "3095dabcc601bdae53b0e4cccd50b85f64a19faddbe98ef8e30b73eaaa17f26d"
+      },
+      "docs": {
+        "command": [
+          "C:\\Users\\Brannock\\miniconda3\\python.exe",
+          "C:/Users/Brannock/.mudcrab/build-gate/build_gate.py",
+          "run",
+          "--label",
+          "sol-2153-r3-docs",
+          "--",
+          "cargo",
+          "test",
+          "--workspace",
+          "--doc"
+        ],
+        "started": "2026-10-26T05:24:49.674696",
+        "finished": "2026-10-26T05:25:21.175487",
+        "exit_code": 0,
+        "log": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\r3-docs.log",
+        "log_sha256": "6ed9b072621a0a82cd6f76aa118ccb5f6d9bedd084f3e5b64336aa1804289850"
+      },
+      "release": {
+        "command": [
+          "C:\\Users\\Brannock\\miniconda3\\python.exe",
+          "C:/Users/Brannock/.mudcrab/build-gate/build_gate.py",
+          "run",
+          "--label",
+          "sol-2153-r3-release",
+          "--",
+          "cargo",
+          "build",
+          "--release",
+          "-p",
+          "engine",
+          "--features",
+          "tracy,renderdoc"
+        ],
+        "started": "2026-10-26T04:52:00.270821",
+        "finished": "2026-10-26T05:16:32.894603",
+        "exit_code": 0,
+        "log": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\r3-release.log",
+        "log_sha256": "55927109539df5b305b793b655af69a35b3aaf995360447bdc1d0bf56f7d4c72"
+      }
+    }
+  },
+  "performance": {
+    "classification": "Quiet GPU attribution TEST; not FPS acceptance",
+    "binary_sha256": "732c9d7c2861c71518c5766f5de6288bdf4a5563184be65a2938f7ea6339a16c",
+    "source_sha256": "8b64135706fea19e712789a543ba7f5b9f3f518061dd1b58005447a52735db23",
+    "source_record": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r3\\source-prebuild.json",
+    "capture_tools": {
+      "capture.py": "113660bc133ccd98120d048fecde59610c62b473ad531dc04737f6475ac082ba",
+      "summarize.py": "46f6680401dd4dbfcb40c6c1f2a6fbd107fe2f76f2210b1115671408bb3eb6ad",
+      "native_summary.py": "a74dc8c90064eb4ced08ff88c06a3c6151d673f7f276348509bad21043acd7bb"
+    },
+    "dataset": {
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\conversion-manifest.json": "faca91b473324a994b0bfa34396f90ace2ab72eb7ccbda1359a881948a86ac17",
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\skyrim_world.db": "46f9953ef10fad89e425d0d6de2fa4408ec5b6c2a027ad4760e6c22aeff1a189",
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\derived\\clusters-d4ca7334b3e2a58e\\cluster-manifest.json": "112de0c74defb977787b9ff6342ba596193192e1146a5474882ed5d149916b07",
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\derived\\clusters-d4ca7334b3e2a58e\\cluster-terrain-manifest.json": "5fc40ddeda86bd89d3e21f42b2fb6615dfd079d0ca414e0b93643c7e5edf3e31",
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\derived\\clusters-d4ca7334b3e2a58e\\clusters.db": "24738bdf257567061b796a5c40494cfbf58e4e150efd1347b440cd240ed28920",
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\derived\\clusters-d4ca7334b3e2a58e\\overlay.json": "348be87204ba8078b77e8992f77c721c3f745ca2b0a63c41570d82a169754c81"
+    },
+    "runs": [
+      {
+        "run": "before-both-01",
+        "controls": "both",
+        "gpu_tail_sha256": "68ae7595782fa01c4a95b04905dee0e4234b1768db0d6008624c6dff735e6f14",
+        "guard_sha256": "05640da68157a02c69fe59bb23059b5fe1d743329d297e5c1ec075f279f7e556",
+        "validation_sha256": "6c7270ed6b7955a2888ae88e706134c0746552debbd6a3865ba8520a4f30b145",
+        "render_frames": 2652,
+        "begin_ns": 126272306886,
+        "end_ns": 156272306886,
+        "recorded_pass_sum_ms": 7.444194268476622,
+        "passes": [
+          {
+            "name": "main_opaque_pass_3d",
+            "count": 2652,
+            "ms_per_render_frame": 2.440561520361991,
+            "mean_ms": 2.440561520361991,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "early prepass",
+            "count": 2652,
+            "ms_per_render_frame": 2.0629595897435897,
+            "mean_ms": 2.0629595897435897,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_3_early",
+            "count": 2652,
+            "ms_per_render_frame": 0.6158051040723982,
+            "mean_ms": 0.6158051040723982,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_2_early",
+            "count": 2652,
+            "ms_per_render_frame": 0.3490013634992458,
+            "mean_ms": 0.3490013634992458,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_cull",
+            "count": 2651,
+            "ms_per_render_frame": 0.3085873423831071,
+            "mean_ms": 0.30870374651075067,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_instance_cull",
+            "count": 2651,
+            "ms_per_render_frame": 0.3052311553544495,
+            "mean_ms": 0.3053462934741607,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "main_transparent_pass_3d",
+            "count": 2652,
+            "ms_per_render_frame": 0.2955294117647059,
+            "mean_ms": 0.2955294117647059,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "ssao",
+            "count": 2652,
+            "ms_per_render_frame": 0.2068028235294118,
+            "mean_ms": 0.2068028235294118,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_1_early",
+            "count": 2652,
+            "ms_per_render_frame": 0.14183751432880845,
+            "mean_ms": 0.14183751432880845,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "bin_unpacking",
+            "count": 2651,
+            "ms_per_render_frame": 0.10656473001508296,
+            "mean_ms": 0.10660492795171633,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "bloom",
+            "count": 2652,
+            "ms_per_render_frame": 0.09419911915535445,
+            "mean_ms": 0.09419911915535445,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "clustering",
+            "count": 2651,
+            "ms_per_render_frame": 0.05454846455505279,
+            "mean_ms": 0.054569041116559795,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_draw_scatter",
+            "count": 2651,
+            "ms_per_render_frame": 0.07352605731523379,
+            "mean_ms": 0.07355379253112033,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_draw_tile_prefix",
+            "count": 2651,
+            "ms_per_render_frame": 0.06640555052790346,
+            "mean_ms": 0.06643059977367032,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_0_early",
+            "count": 2652,
+            "ms_per_render_frame": 0.05528403016591252,
+            "mean_ms": 0.05528403016591252,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "taa",
+            "count": 2652,
+            "ms_per_render_frame": 0.05254757164404223,
+            "mean_ms": 0.05254757164404223,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_draw_large_scatter",
+            "count": 2651,
+            "ms_per_render_frame": 0.05275183107088989,
+            "mean_ms": 0.052771729913240285,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_instance_prefix",
+            "count": 2651,
+            "ms_per_render_frame": 0.03461251282051282,
+            "mean_ms": 0.03462556921916258,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_instance_scatter",
+            "count": 2651,
+            "ms_per_render_frame": 0.034436054298642535,
+            "mean_ms": 0.034449044134288946,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "early_mesh_preprocessing",
+            "count": 2651,
+            "ms_per_render_frame": 0.023857809954751133,
+            "mean_ms": 0.02386680950584685,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "late_mesh_preprocessing",
+            "count": 2652,
+            "ms_per_render_frame": 0.017131149321266966,
+            "mean_ms": 0.017131149321266966,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "tonemapping",
+            "count": 2652,
+            "ms_per_render_frame": 0.017129990950226246,
+            "mean_ms": 0.017129990950226246,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_draw_group_prefix",
+            "count": 2651,
+            "ms_per_render_frame": 0.01177908898944193,
+            "mean_ms": 0.011783532251980384,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "upscaling",
+            "count": 2652,
+            "ms_per_render_frame": 0.011433122171945701,
+            "mean_ms": 0.011433122171945701,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "late prepass",
+            "count": 2652,
+            "ms_per_render_frame": 0.008629092006033182,
+            "mean_ms": 0.008629092006033182,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "ui",
+            "count": 2652,
+            "ms_per_render_frame": 0.003042268476621418,
+            "mean_ms": 0.003042268476621418,
+            "evidence": "positive GPU events"
+          }
+        ],
+        "zero_proof": {
+          "cluster_instance_cull": false,
+          "cluster_instance_prefix": false,
+          "cluster_instance_scatter": false,
+          "cluster_cull": false,
+          "cluster_draw_tile_prefix": false,
+          "cluster_draw_group_prefix": false,
+          "cluster_draw_scatter": false,
+          "cluster_draw_large_scatter": false,
+          "shadow_directional_light_0_cascade_0_late": false,
+          "shadow_directional_light_0_cascade_2_early": false,
+          "shadow_directional_light_0_cascade_2_late": false,
+          "shadow_directional_light_0_cascade_3_early": false,
+          "shadow_directional_light_0_cascade_1_late": false,
+          "shadow_directional_light_0_cascade_0_early": false,
+          "shadow_directional_light_0_cascade_1_early": false,
+          "shadow_directional_light_0_cascade_3_late": false
+        }
+      },
+      {
+        "run": "before-shadow-01",
+        "controls": "shadow",
+        "gpu_tail_sha256": "84d948ffaea9cd8c56d3ecd5f323d683996f8292ff98444dfbb48fea5c622393",
+        "guard_sha256": "98a274b2db44a08925d26fa85b7926d35c535d83676bfc46e6ffaa8810330b26",
+        "validation_sha256": "6c7270ed6b7955a2888ae88e706134c0746552debbd6a3865ba8520a4f30b145",
+        "render_frames": 2617,
+        "begin_ns": 126989327088,
+        "end_ns": 156989327088,
+        "recorded_pass_sum_ms": 6.553068924722965,
+        "passes": [
+          {
+            "name": "main_opaque_pass_3d",
+            "count": 2617,
+            "ms_per_render_frame": 2.447436301108139,
+            "mean_ms": 2.447436301108139,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "early prepass",
+            "count": 2617,
+            "ms_per_render_frame": 2.0681489705769964,
+            "mean_ms": 2.0681489705769964,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_3_early",
+            "count": 2617,
+            "ms_per_render_frame": 0.6033676423385557,
+            "mean_ms": 0.6033676423385557,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_2_early",
+            "count": 2617,
+            "ms_per_render_frame": 0.34762589224302637,
+            "mean_ms": 0.34762589224302637,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_cull",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "cluster_instance_cull",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "main_transparent_pass_3d",
+            "count": 2618,
+            "ms_per_render_frame": 0.28866156973633933,
+            "mean_ms": 0.2885513093964859,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "ssao",
+            "count": 2617,
+            "ms_per_render_frame": 0.2078997814291173,
+            "mean_ms": 0.2078997814291173,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_1_early",
+            "count": 2617,
+            "ms_per_render_frame": 0.14172519984715323,
+            "mean_ms": 0.14172519984715323,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "bin_unpacking",
+            "count": 2617,
+            "ms_per_render_frame": 0.10025613450515856,
+            "mean_ms": 0.10025613450515856,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "bloom",
+            "count": 2618,
+            "ms_per_render_frame": 0.09374862820022926,
+            "mean_ms": 0.09371281894576013,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "clustering",
+            "count": 2617,
+            "ms_per_render_frame": 0.06876177607948032,
+            "mean_ms": 0.06876177607948032,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_draw_scatter",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "cluster_draw_tile_prefix",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_0_early",
+            "count": 2617,
+            "ms_per_render_frame": 0.055800369889186095,
+            "mean_ms": 0.055800369889186095,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "taa",
+            "count": 2618,
+            "ms_per_render_frame": 0.053280085594191826,
+            "mean_ms": 0.05325973414820474,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_draw_large_scatter",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "cluster_instance_prefix",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "cluster_instance_scatter",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "early_mesh_preprocessing",
+            "count": 2617,
+            "ms_per_render_frame": 0.017416999617883074,
+            "mean_ms": 0.017416999617883074,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "late_mesh_preprocessing",
+            "count": 2617,
+            "ms_per_render_frame": 0.01698423538402751,
+            "mean_ms": 0.01698423538402751,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "tonemapping",
+            "count": 2618,
+            "ms_per_render_frame": 0.01711649063813527,
+            "mean_ms": 0.017109952635599692,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_draw_group_prefix",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "upscaling",
+            "count": 2618,
+            "ms_per_render_frame": 0.011290216278181124,
+            "mean_ms": 0.011285903743315508,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "late prepass",
+            "count": 2617,
+            "ms_per_render_frame": 0.010465675200611388,
+            "mean_ms": 0.010465675200611388,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "ui",
+            "count": 2618,
+            "ms_per_render_frame": 0.0030829560565533054,
+            "mean_ms": 0.0030817784568372805,
+            "evidence": "positive GPU events"
+          }
+        ],
+        "zero_proof": {
+          "cluster_instance_cull": true,
+          "cluster_instance_prefix": true,
+          "cluster_instance_scatter": true,
+          "cluster_cull": true,
+          "cluster_draw_tile_prefix": true,
+          "cluster_draw_group_prefix": true,
+          "cluster_draw_scatter": true,
+          "cluster_draw_large_scatter": true,
+          "shadow_directional_light_0_cascade_2_late": false,
+          "shadow_directional_light_0_cascade_1_early": false,
+          "shadow_directional_light_0_cascade_1_late": false,
+          "shadow_directional_light_0_cascade_2_early": false,
+          "shadow_directional_light_0_cascade_0_late": false,
+          "shadow_directional_light_0_cascade_3_early": false,
+          "shadow_directional_light_0_cascade_3_late": false,
+          "shadow_directional_light_0_cascade_0_early": false
+        }
+      },
+      {
+        "run": "after-01",
+        "controls": "normal",
+        "gpu_tail_sha256": "3cf9201833112d8c7d1a8941e0131420669db150d00881fcf327e66edc09b9cd",
+        "guard_sha256": "1c6c822bfcd7d020039e54cd4fb9b43b3823fff319b5eaf30d2cb5edb08ad5e4",
+        "validation_sha256": "6c7270ed6b7955a2888ae88e706134c0746552debbd6a3865ba8520a4f30b145",
+        "render_frames": 2765,
+        "begin_ns": 125697412706,
+        "end_ns": 155697412706,
+        "recorded_pass_sum_ms": 6.015837419168173,
+        "passes": [
+          {
+            "name": "main_opaque_pass_3d",
+            "count": 2765,
+            "ms_per_render_frame": 2.4257097142857145,
+            "mean_ms": 2.4257097142857145,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "early prepass",
+            "count": 2765,
+            "ms_per_render_frame": 2.0726859920433998,
+            "mean_ms": 2.0726859920433998,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_3_early",
+            "count": 2765,
+            "ms_per_render_frame": 0.6051114126582278,
+            "mean_ms": 0.6051114126582278,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_2_early",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "cluster_cull",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "cluster_instance_cull",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "main_transparent_pass_3d",
+            "count": 2765,
+            "ms_per_render_frame": 0.2780187775768535,
+            "mean_ms": 0.2780187775768535,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "ssao",
+            "count": 2765,
+            "ms_per_render_frame": 0.21998186473779385,
+            "mean_ms": 0.21998186473779385,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_1_early",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "bin_unpacking",
+            "count": 2765,
+            "ms_per_render_frame": 0.10531497432188064,
+            "mean_ms": 0.10531497432188064,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "bloom",
+            "count": 2765,
+            "ms_per_render_frame": 0.11065792115732369,
+            "mean_ms": 0.11065792115732369,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "clustering",
+            "count": 2765,
+            "ms_per_render_frame": 0.06925610126582278,
+            "mean_ms": 0.06925610126582278,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_draw_scatter",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "cluster_draw_tile_prefix",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "shadow_directional_light_0_cascade_0_early",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "taa",
+            "count": 2765,
+            "ms_per_render_frame": 0.054313848824593135,
+            "mean_ms": 0.054313848824593135,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_draw_large_scatter",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "cluster_instance_prefix",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "cluster_instance_scatter",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "early_mesh_preprocessing",
+            "count": 2765,
+            "ms_per_render_frame": 0.017602800723327306,
+            "mean_ms": 0.017602800723327306,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "late_mesh_preprocessing",
+            "count": 2765,
+            "ms_per_render_frame": 0.01697247594936709,
+            "mean_ms": 0.01697247594936709,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "tonemapping",
+            "count": 2765,
+            "ms_per_render_frame": 0.017084319710669076,
+            "mean_ms": 0.017084319710669076,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "cluster_draw_group_prefix",
+            "count": 0,
+            "ms_per_render_frame": 0,
+            "mean_ms": null,
+            "evidence": "covering own reuse counter windows"
+          },
+          {
+            "name": "upscaling",
+            "count": 2765,
+            "ms_per_render_frame": 0.011413248462929477,
+            "mean_ms": 0.011413248462929477,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "late prepass",
+            "count": 2765,
+            "ms_per_render_frame": 0.008639745388788426,
+            "mean_ms": 0.008639745388788426,
+            "evidence": "positive GPU events"
+          },
+          {
+            "name": "ui",
+            "count": 2765,
+            "ms_per_render_frame": 0.0030742220614828207,
+            "mean_ms": 0.0030742220614828207,
+            "evidence": "positive GPU events"
+          }
+        ],
+        "zero_proof": {
+          "cluster_instance_cull": true,
+          "cluster_instance_prefix": true,
+          "cluster_instance_scatter": true,
+          "cluster_cull": true,
+          "cluster_draw_tile_prefix": true,
+          "cluster_draw_group_prefix": true,
+          "cluster_draw_scatter": true,
+          "cluster_draw_large_scatter": true,
+          "shadow_directional_light_0_cascade_1_early": true,
+          "shadow_directional_light_0_cascade_0_late": true,
+          "shadow_directional_light_0_cascade_1_late": true,
+          "shadow_directional_light_0_cascade_2_late": true,
+          "shadow_directional_light_0_cascade_3_late": false,
+          "shadow_directional_light_0_cascade_2_early": true,
+          "shadow_directional_light_0_cascade_0_early": true,
+          "shadow_directional_light_0_cascade_3_early": false
+        }
+      }
+    ],
+    "incremental_cull_ms": 0.8911253437536564,
+    "incremental_shadow_ms": 0.537231505554792,
+    "total_difference_ms": 1.4283568493084484
+  },
+  "native_standing": {
+    "classification": "Native same-frame raw logical-texel/buffer equality TEST; never timing/FPS acceptance",
+    "valid_test_evidence": true,
+    "frame": 1234,
+    "counts": {
+      "entities": 112281,
+      "meshes": 35713,
+      "entities_without_capture_resources": 112278,
+      "capture_resource_entities": [
+        {
+          "entity": 4294967288,
+          "only_resource_component": true,
+          "role": "stdin_commands",
+          "type_name": "engine::live_console::IncomingCommands"
+        },
+        {
+          "entity": 4294966846,
+          "only_resource_component": true,
+          "role": "capture_retry_readiness",
+          "type_name": "engine::capture_frame::RetryReadiness"
+        },
+        {
+          "entity": 4294966845,
+          "only_resource_component": true,
+          "role": "capture_transfer_readiness",
+          "type_name": "engine::capture_frame::TransferReadiness"
+        }
+      ]
+    },
+    "cull_views": 5,
+    "shadow_maps": 4,
+    "raster_views": 1,
+    "pairs": [
+      {
+        "a": "view-0-arguments-retained.bin",
+        "b": "view-0-arguments-forced.bin",
+        "bytes": 154926140,
+        "sha256": "bf956f74d57c44c72b856892b2a49e1cf8f3e52b7b55e8f0a1d27abc172be11b"
+      },
+      {
+        "a": "view-0-counts-retained.bin",
+        "b": "view-0-counts-forced.bin",
+        "bytes": 40444,
+        "sha256": "1c74ec0c1d4bd5f45671505954cfb3ddb7834826e55d94287d7d95364cb0be77"
+      },
+      {
+        "a": "view-0-visible-retained.bin",
+        "b": "view-0-visible-forced.bin",
+        "bytes": 124024112,
+        "sha256": "e6eb91674b8f68c058ed44c7d5a44da7b9f9262ed1ff1d1edf0adc77e2b6dea9"
+      },
+      {
+        "a": "view-0-instances-retained.bin",
+        "b": "view-0-instances-forced.bin",
+        "bytes": 8162064,
+        "sha256": "27bd587b0ef030244c98e70449147a2f5c525ad2645f2b5973495d37a998e45c"
+      },
+      {
+        "a": "view-0-dispatch-retained.bin",
+        "b": "view-0-dispatch-forced.bin",
+        "bytes": 16,
+        "sha256": "813841a41619b981aad53c75b9c3ee7428631517fe1494c4f004e48dac2eb336"
+      },
+      {
+        "a": "view-1-arguments-retained.bin",
+        "b": "view-1-arguments-forced.bin",
+        "bytes": 154926140,
+        "sha256": "9e9c808574206beb5ffce29165437d349723f1d2fb1120ff8103b4cb2715ad88"
+      },
+      {
+        "a": "view-1-counts-retained.bin",
+        "b": "view-1-counts-forced.bin",
+        "bytes": 40444,
+        "sha256": "811bd4078281be65721b5ed7cceb3ac5433b8c293981dd3fdc23d9f672452c15"
+      },
+      {
+        "a": "view-1-visible-retained.bin",
+        "b": "view-1-visible-forced.bin",
+        "bytes": 124024112,
+        "sha256": "2d272fd08f357a8688f1f5f99889770a5f5080028c7b29fa534534c03847c330"
+      },
+      {
+        "a": "view-1-instances-retained.bin",
+        "b": "view-1-instances-forced.bin",
+        "bytes": 8162064,
+        "sha256": "106e9a75a56bd09ece34a5b23add56b27f580d243616339215fe3893ec215d98"
+      },
+      {
+        "a": "view-1-dispatch-retained.bin",
+        "b": "view-1-dispatch-forced.bin",
+        "bytes": 16,
+        "sha256": "330d79c89e76a5eac23e5e5efae306b1cea685f40161e9183ff5d613171eb46c"
+      },
+      {
+        "a": "view-2-arguments-retained.bin",
+        "b": "view-2-arguments-forced.bin",
+        "bytes": 154926140,
+        "sha256": "9f0731074c703b224fc8342d0549e3b02ea345ceb6dc73ee8718893c3cb9fa55"
+      },
+      {
+        "a": "view-2-counts-retained.bin",
+        "b": "view-2-counts-forced.bin",
+        "bytes": 40444,
+        "sha256": "86e6affeb21afb4758960bd05cebb93e29d6ffea303e6f3c4885825d5bbf3002"
+      },
+      {
+        "a": "view-2-visible-retained.bin",
+        "b": "view-2-visible-forced.bin",
+        "bytes": 124024112,
+        "sha256": "345aeb9fc6b98dd1022d5cc5a6aa0d1b3a837c047ccf74400305aa9b24fe0bbe"
+      },
+      {
+        "a": "view-2-instances-retained.bin",
+        "b": "view-2-instances-forced.bin",
+        "bytes": 8162064,
+        "sha256": "3fc46dbf150ee03b985f46cb50ed09ec74388017dd7c0d14c9be22ab0f98475b"
+      },
+      {
+        "a": "view-2-dispatch-retained.bin",
+        "b": "view-2-dispatch-forced.bin",
+        "bytes": 16,
+        "sha256": "3d2dc2f6729e2d8f2b72a2556dbc14bff27a46ed77ee5f6fa14b875d450ad2d9"
+      },
+      {
+        "a": "view-3-arguments-retained.bin",
+        "b": "view-3-arguments-forced.bin",
+        "bytes": 154926140,
+        "sha256": "b3fe7944c1def42be9e03f6b30d53aafff57f452e17a39b5314a1d18b9e020d7"
+      },
+      {
+        "a": "view-3-counts-retained.bin",
+        "b": "view-3-counts-forced.bin",
+        "bytes": 40444,
+        "sha256": "1bb5f3ecf7ad85c92ada67a55179bc65e852d874c6acde45932a07884c7e6939"
+      },
+      {
+        "a": "view-3-visible-retained.bin",
+        "b": "view-3-visible-forced.bin",
+        "bytes": 124024112,
+        "sha256": "7b68bef903d4af27f9704ae51b4611606446113264e5b7fca88636677e712700"
+      },
+      {
+        "a": "view-3-instances-retained.bin",
+        "b": "view-3-instances-forced.bin",
+        "bytes": 8162064,
+        "sha256": "6a66328860716c4ff0e787860d7c9747e2c4504f5cbb467f3d05f7cc4317812e"
+      },
+      {
+        "a": "view-3-dispatch-retained.bin",
+        "b": "view-3-dispatch-forced.bin",
+        "bytes": 16,
+        "sha256": "f8d8ac82f7d13d64bae7a8972575b671f91fa0d0ffd69db87d1536c4d8c991ee"
+      },
+      {
+        "a": "view-4-arguments-retained.bin",
+        "b": "view-4-arguments-forced.bin",
+        "bytes": 154926140,
+        "sha256": "a8dbaca3d52c6fc67569facc45bf5cb1fc3413cb01bb3f8b1e9f093010e8fa5d"
+      },
+      {
+        "a": "view-4-counts-retained.bin",
+        "b": "view-4-counts-forced.bin",
+        "bytes": 40444,
+        "sha256": "085bf8cbf2959c384d21d39159f5ea21524d6eff10924db973567240011c21a3"
+      },
+      {
+        "a": "view-4-visible-retained.bin",
+        "b": "view-4-visible-forced.bin",
+        "bytes": 124024112,
+        "sha256": "b1727f1e225a03282982fa9afd8a58f3399dd68e633514e53b1c56657bbbbc0c"
+      },
+      {
+        "a": "view-4-instances-retained.bin",
+        "b": "view-4-instances-forced.bin",
+        "bytes": 8162064,
+        "sha256": "2213e8638e76a6582cb9507e03dfe1dcfd3c19204f8ef31df0560fb4e3c3f48e"
+      },
+      {
+        "a": "view-4-dispatch-retained.bin",
+        "b": "view-4-dispatch-forced.bin",
+        "bytes": 16,
+        "sha256": "0714d3c72edf8997ab73755413152c35f24e3b0f4d5413fdcd04a9d6490993cf"
+      },
+      {
+        "a": "1234-4294966720-4294966721-0-26-0-0.bin",
+        "b": "1234-4294966720-4294966721-0-26-0-1.bin",
+        "bytes": 16777216,
+        "sha256": "080acf35a507ac9849cfcba47dc2ad83e01b75663a516279c8b9d243b719643e"
+      },
+      {
+        "a": "1234-4294966720-4294966721-1-26-1-0.bin",
+        "b": "1234-4294966720-4294966721-1-26-1-1.bin",
+        "bytes": 16777216,
+        "sha256": "080acf35a507ac9849cfcba47dc2ad83e01b75663a516279c8b9d243b719643e"
+      },
+      {
+        "a": "1234-4294966720-4294966721-2-26-2-0.bin",
+        "b": "1234-4294966720-4294966721-2-26-2-1.bin",
+        "bytes": 16777216,
+        "sha256": "080acf35a507ac9849cfcba47dc2ad83e01b75663a516279c8b9d243b719643e"
+      },
+      {
+        "a": "1234-4294966720-4294966721-3-26-3-0.bin",
+        "b": "1234-4294966720-4294966721-3-26-3-1.bin",
+        "bytes": 16777216,
+        "sha256": "37db77f5c8afcd5a09d07070d6a3b3765aa55022c49b340a41cbc0a9f4fd2949"
+      },
+      {
+        "a": "frame-1234-view-4294966898-early-prepass-depth-retained.bin",
+        "b": "frame-1234-view-4294966898-early-prepass-depth-forced.bin",
+        "bytes": 5760000,
+        "sha256": "2cfd3f9d3527062db3c6d5ef5d5a1c3ff85bc511dcd27ca8774e31aa611251c9"
+      },
+      {
+        "a": "frame-1234-view-4294966898-early-prepass-motion-retained.bin",
+        "b": "frame-1234-view-4294966898-early-prepass-motion-forced.bin",
+        "bytes": 5760000,
+        "sha256": "d7015a3a2f2656dd9a7ff5249a065a28ed25011915a2e9f1dbc8dc5bf4f26ca8"
+      },
+      {
+        "a": "frame-1234-view-4294966898-early-prepass-normal-retained.bin",
+        "b": "frame-1234-view-4294966898-early-prepass-normal-forced.bin",
+        "bytes": 5760000,
+        "sha256": "c38d5967a8883968f01db7b29fe4f06a538a21da59a25a3bd9f9a194dfc6e5c6"
+      },
+      {
+        "a": "frame-1234-view-4294966898-late-prepass-depth-retained.bin",
+        "b": "frame-1234-view-4294966898-late-prepass-depth-forced.bin",
+        "bytes": 5760000,
+        "sha256": "2cfd3f9d3527062db3c6d5ef5d5a1c3ff85bc511dcd27ca8774e31aa611251c9"
+      },
+      {
+        "a": "frame-1234-view-4294966898-late-prepass-motion-retained.bin",
+        "b": "frame-1234-view-4294966898-late-prepass-motion-forced.bin",
+        "bytes": 5760000,
+        "sha256": "d7015a3a2f2656dd9a7ff5249a065a28ed25011915a2e9f1dbc8dc5bf4f26ca8"
+      },
+      {
+        "a": "frame-1234-view-4294966898-late-prepass-normal-retained.bin",
+        "b": "frame-1234-view-4294966898-late-prepass-normal-forced.bin",
+        "bytes": 5760000,
+        "sha256": "c38d5967a8883968f01db7b29fe4f06a538a21da59a25a3bd9f9a194dfc6e5c6"
+      },
+      {
+        "a": "frame-1234-view-4294966898-main_opaque_pass_3d-depth-retained.bin",
+        "b": "frame-1234-view-4294966898-main_opaque_pass_3d-depth-forced.bin",
+        "bytes": 5760000,
+        "sha256": "2cfd3f9d3527062db3c6d5ef5d5a1c3ff85bc511dcd27ca8774e31aa611251c9"
+      },
+      {
+        "a": "frame-1234-view-4294966898-main_opaque_pass_3d-linear-hdr-color-retained.bin",
+        "b": "frame-1234-view-4294966898-main_opaque_pass_3d-linear-hdr-color-forced.bin",
+        "bytes": 11520000,
+        "sha256": "9755bc48a407849dc63a27bf3f64527992a2b6e5c01f20fd69a8ae50dc4e6fa6"
+      },
+      {
+        "a": "frame-1234-view-4294966898-main_transparent_pass_3d-depth-retained.bin",
+        "b": "frame-1234-view-4294966898-main_transparent_pass_3d-depth-forced.bin",
+        "bytes": 5760000,
+        "sha256": "2cfd3f9d3527062db3c6d5ef5d5a1c3ff85bc511dcd27ca8774e31aa611251c9"
+      },
+      {
+        "a": "frame-1234-view-4294966898-main_transparent_pass_3d-linear-hdr-color-retained.bin",
+        "b": "frame-1234-view-4294966898-main_transparent_pass_3d-linear-hdr-color-forced.bin",
+        "bytes": 11520000,
+        "sha256": "593a36a6374db196165c70f6d82079c85507a33ca3e05c49e469b94bd1798691"
+      }
+    ],
+    "dependency_diagnostics": [
+      {
+        "receipt": "1234-4294966720-4294966721-0-26-0.txt",
+        "manifest": "1234-4294966720-4294966721-0-26-0-candidates.txt",
+        "manifest_sha256": "88ed3b3c9dd3e7ad07b9d2d6664e03349a8a62cbc2e3c434a2fd727aa02f53f5",
+        "candidate_rows": 12383,
+        "attribution": "candidate_set_not_isolated_culprit",
+        "normal_policy": "reuse",
+        "reuse_eligibility_granted": false,
+        "refusal_diagnostics_only": false
+      },
+      {
+        "receipt": "1234-4294966720-4294966721-1-26-1.txt",
+        "manifest": "1234-4294966720-4294966721-1-26-1-candidates.txt",
+        "manifest_sha256": "9fce9e3dd4765c313f5c7eb58b67e8d96c2cad2e542bef2c4853986975003658",
+        "candidate_rows": 12383,
+        "attribution": "candidate_set_not_isolated_culprit",
+        "normal_policy": "reuse",
+        "reuse_eligibility_granted": false,
+        "refusal_diagnostics_only": false
+      },
+      {
+        "receipt": "1234-4294966720-4294966721-2-26-2.txt",
+        "manifest": "1234-4294966720-4294966721-2-26-2-candidates.txt",
+        "manifest_sha256": "a976e66f58d07ad41fc9db2baebad4161e93ebbad2a1565e4f511d402553f4e2",
+        "candidate_rows": 12383,
+        "attribution": "candidate_set_not_isolated_culprit",
+        "normal_policy": "reuse",
+        "reuse_eligibility_granted": false,
+        "refusal_diagnostics_only": false
+      },
+      {
+        "receipt": "1234-4294966720-4294966721-3-26-3.txt",
+        "manifest": "1234-4294966720-4294966721-3-26-3-candidates.txt",
+        "manifest_sha256": "3004dd051cb0753899d1c9667b524cd8096034c1b4a73890f6c0b270505f1772",
+        "candidate_rows": 13574,
+        "attribution": "candidate_set_not_isolated_culprit",
+        "normal_policy": "fresh_raster",
+        "reuse_eligibility_granted": false,
+        "refusal_diagnostics_only": true
+      }
+    ],
+    "refusal_diagnostics": [
+      {
+        "path": "refusal-1234-4294966720-4294966721-0.txt",
+        "sha256": "001c8c0f085ba7332cc5cfc656837da8bc1bd560d290c8f059657b9138c6d45a",
+        "byte_coverage": false,
+        "reuse_eligibility_granted": false
+      },
+      {
+        "path": "refusal-1234-4294966720-4294966721-1.txt",
+        "sha256": "37e7cee2b3b3b6804a92a0e9e5a4be271834722423bae4d041b229229a4102e7",
+        "byte_coverage": false,
+        "reuse_eligibility_granted": false
+      },
+      {
+        "path": "refusal-1234-4294966720-4294966721-2.txt",
+        "sha256": "0e225fa29d6446a2747017c91b9e8045a3ad49c19a86c14588ea326ac1ea68ff",
+        "byte_coverage": false,
+        "reuse_eligibility_granted": false
+      },
+      {
+        "path": "refusal-1234-4294966720-4294966721-3.txt",
+        "sha256": "fed463f1a20944e4c20f90b876cb6528f9e6fb884f96c097b8a71a31b79ad964",
+        "byte_coverage": false,
+        "reuse_eligibility_granted": false
+      }
+    ],
+    "color_boundary": "Native linear HDR main-pass color before temporal postprocessing",
+    "final_postprocessed_color": "Not independently paired; consumes the unchanged native attachment values",
+    "binary_sha256": "732c9d7c2861c71518c5766f5de6288bdf4a5563184be65a2938f7ea6339a16c",
+    "source_sha256": "8b64135706fea19e712789a543ba7f5b9f3f518061dd1b58005447a52735db23",
+    "verdict_exit": 1,
+    "acceptance_fps": "NOT EVALUATED"
+  },
+  "movement": [
+    {
+      "run": "traversal-visible-normal-01",
+      "validation_sha256": "66815866539fbe28132fd050b17f7ca3a38c45df202b59f7df2e8564a252e686",
+      "verdict_sha256": "8c3b035724f252faa74e610e971cc2cdd2fb5c890f58a52241f9600bd386c3b8",
+      "route": {
+        "phase": "finished",
+        "elapsed_ms": 130693.7164,
+        "real_elapsed_ms": 130576.35160000001,
+        "cpu_settled_elapsed_ms": 25680.241699999995,
+        "movement_started_elapsed_ms": 45683.768299999996,
+        "movement_finished_elapsed_ms": 90683.7683,
+        "tail_finished_elapsed_ms": 130683.7683,
+        "route_distance_units": 40500.0
+      },
+      "content": "PASS",
+      "legacy_performance": "FAIL; profiler TEST, not acceptance",
+      "legacy_traversal": "N/A; supplemental native-route validation passed",
+      "visible_start": {
+        "cover_log_offset": 969674,
+        "moving_log_offset": 1017625,
+        "cover_released_before_moving": true,
+        "moving_images": [
+          {
+            "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-normal-01\\screenshots\\moving-001.png",
+            "extrema": [
+              [
+                76,
+                255
+              ],
+              [
+                89,
+                255
+              ],
+              [
+                89,
+                255
+              ]
+            ],
+            "nonblack": true,
+            "sha256": "5a9a42a84b2cfa5c01214e8e166b2c8d066d1b0d35e3b1b8050fb5484dd2720b"
+          },
+          {
+            "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-normal-01\\screenshots\\moving-002.png",
+            "extrema": [
+              [
+                93,
+                255
+              ],
+              [
+                116,
+                255
+              ],
+              [
+                120,
+                255
+              ]
+            ],
+            "nonblack": true,
+            "sha256": "ffa12ace11dd9ef9440a0d558800880533fdbdc270c0f5743954ecb821deda4d"
+          },
+          {
+            "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-normal-01\\screenshots\\moving-003.png",
+            "extrema": [
+              [
+                119,
+                255
+              ],
+              [
+                132,
+                255
+              ],
+              [
+                130,
+                255
+              ]
+            ],
+            "nonblack": true,
+            "sha256": "4f59111f91c4ec3303cf4fb499883e5e5af7c7a4893d7152110b5bc856646d5a"
+          },
+          {
+            "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-normal-01\\screenshots\\moving-004.png",
+            "extrema": [
+              [
+                114,
+                255
+              ],
+              [
+                128,
+                255
+              ],
+              [
+                126,
+                255
+              ]
+            ],
+            "nonblack": true,
+            "sha256": "c6b670a29b7c06c58ce846eb8c2d083ca4b9ba9383acd0fb8d232cbf24084e41"
+          },
+          {
+            "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-normal-01\\screenshots\\moving-006.png",
+            "extrema": [
+              [
+                125,
+                255
+              ],
+              [
+                139,
+                255
+              ],
+              [
+                139,
+                255
+              ]
+            ],
+            "nonblack": true,
+            "sha256": "0ea332a8ab950f3ff7e05e8e16ab5f1c002a9241dc2dffeae0ad82cfc6082d6e"
+          }
+        ],
+        "all_moving_images_nonblack": true
+      },
+      "fully_moving_dispatch_windows": [
+        [
+          1765,
+          1765,
+          1765,
+          1765,
+          1765,
+          1765,
+          1765,
+          1765
+        ],
+        [
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000
+        ],
+        [
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000
+        ]
+      ],
+      "screenshots": [
+        {
+          "receipt": "moving-001.json",
+          "camera_creation": [
+            20500.0,
+            -45305.52734375,
+            6120.0
+          ],
+          "main_frame": 2663,
+          "render_frame": 2663
+        },
+        {
+          "receipt": "moving-002.json",
+          "camera_creation": [
+            20500.0,
+            -38051.27734375,
+            6120.0
+          ],
+          "main_frame": 3202,
+          "render_frame": 3202
+        },
+        {
+          "receipt": "moving-003.json",
+          "camera_creation": [
+            20500.0,
+            -30651.73828125,
+            6120.0
+          ],
+          "main_frame": 3666,
+          "render_frame": 3666
+        },
+        {
+          "receipt": "moving-004.json",
+          "camera_creation": [
+            20500.0,
+            -23164.4375,
+            6120.0
+          ],
+          "main_frame": 4037,
+          "render_frame": 4037
+        },
+        {
+          "receipt": "moving-006.json",
+          "camera_creation": [
+            20500.0,
+            -8390.19921875,
+            6120.0
+          ],
+          "main_frame": 4643,
+          "render_frame": 4643
+        },
+        {
+          "receipt": "tail-007.json",
+          "camera_creation": [
+            20500.0,
+            -5000.0,
+            6120.0
+          ],
+          "main_frame": 4924,
+          "render_frame": 4924
+        },
+        {
+          "receipt": "tail-008.json",
+          "camera_creation": [
+            20500.0,
+            -5000.0,
+            6120.0
+          ],
+          "main_frame": 5252,
+          "render_frame": 5252
+        },
+        {
+          "receipt": "tail-009.json",
+          "camera_creation": [
+            20500.0,
+            -5000.0,
+            6120.0
+          ],
+          "main_frame": 5588,
+          "render_frame": 5588
+        },
+        {
+          "receipt": "tail-010.json",
+          "camera_creation": [
+            20500.0,
+            -5000.0,
+            6120.0
+          ],
+          "main_frame": 5946,
+          "render_frame": 5946
+        },
+        {
+          "receipt": "tail-011.json",
+          "camera_creation": [
+            20500.0,
+            -5000.0,
+            6120.0
+          ],
+          "main_frame": 6317,
+          "render_frame": 6317
+        }
+      ],
+      "shadow_verification": {
+        "classification": "Non-timing native shadow normal-policy candidate byte verification TEST",
+        "valid_candidate_evidence": true,
+        "frame": 5587,
+        "compared": 4,
+        "observed": 4,
+        "candidates": 4,
+        "matched_populated": 1,
+        "native_summary_status": "MATCH_ALL_OBSERVED_SHADOW_BYTES",
+        "whole_map_coverage": "MATCH_ALL_OBSERVED_SHADOW_BYTES",
+        "pairs": [
+          {
+            "a": "5587-4294966718-4294966720-0-26-0-0.bin",
+            "b": "5587-4294966718-4294966720-0-26-0-1.bin",
+            "bytes": 16777216,
+            "sha256": "080acf35a507ac9849cfcba47dc2ad83e01b75663a516279c8b9d243b719643e"
+          },
+          {
+            "a": "5587-4294966718-4294966720-1-26-1-0.bin",
+            "b": "5587-4294966718-4294966720-1-26-1-1.bin",
+            "bytes": 16777216,
+            "sha256": "080acf35a507ac9849cfcba47dc2ad83e01b75663a516279c8b9d243b719643e"
+          },
+          {
+            "a": "5587-4294966718-4294966720-2-26-2-0.bin",
+            "b": "5587-4294966718-4294966720-2-26-2-1.bin",
+            "bytes": 16777216,
+            "sha256": "080acf35a507ac9849cfcba47dc2ad83e01b75663a516279c8b9d243b719643e"
+          },
+          {
+            "a": "5587-4294966718-4294966720-3-26-3-0.bin",
+            "b": "5587-4294966718-4294966720-3-26-3-1.bin",
+            "bytes": 16777216,
+            "sha256": "c73b7ad9eeb9393ac11b9f312048fc5a4fa5dcb2c7c198d314f858a123278cb0"
+          }
+        ],
+        "dependency_diagnostics": [
+          {
+            "receipt": "5587-4294966718-4294966720-0-26-0.txt",
+            "manifest": "5587-4294966718-4294966720-0-26-0-candidates.txt",
+            "manifest_sha256": "9690a1a49b4c7857af5dc6fea4cd006ce210b9127febfc0e732c20328a0a9ee8",
+            "candidate_rows": 12383,
+            "attribution": "candidate_set_not_isolated_culprit",
+            "normal_policy": "reuse",
+            "reuse_eligibility_granted": false,
+            "refusal_diagnostics_only": false,
+            "runtime_diagnostics": [
+              {
+                "path": "runtime.log",
+                "log_offset": 1338036,
+                "log_end_offset": 1338319,
+                "raw_line": "2026-10-25T20:22:40.357598Z  WARN system{name=\"bevy_pbr::shadow_cache::parity::cleanup_shadow_parity\"}: bevy_pbr::shadow_cache::parity: SHADOW PARITY MATCH_BYTES: exact native depth only; timing and full raster acceptance excluded frame=5587 stem=\"5587-4294966718-4294966720-0-26-0\"\n"
+              }
+            ]
+          },
+          {
+            "receipt": "5587-4294966718-4294966720-1-26-1.txt",
+            "manifest": "5587-4294966718-4294966720-1-26-1-candidates.txt",
+            "manifest_sha256": "45b35eae09fdbbd93e888164c07696e6cbcc1e162fc08857ddbd0ef85ad41fe5",
+            "candidate_rows": 12383,
+            "attribution": "candidate_set_not_isolated_culprit",
+            "normal_policy": "reuse",
+            "reuse_eligibility_granted": false,
+            "refusal_diagnostics_only": false,
+            "runtime_diagnostics": [
+              {
+                "path": "runtime.log",
+                "log_offset": 1338885,
+                "log_end_offset": 1339168,
+                "raw_line": "2026-10-25T20:22:40.411289Z  WARN system{name=\"bevy_pbr::shadow_cache::parity::cleanup_shadow_parity\"}: bevy_pbr::shadow_cache::parity: SHADOW PARITY MATCH_BYTES: exact native depth only; timing and full raster acceptance excluded frame=5587 stem=\"5587-4294966718-4294966720-1-26-1\"\n"
+              }
+            ]
+          },
+          {
+            "receipt": "5587-4294966718-4294966720-2-26-2.txt",
+            "manifest": "5587-4294966718-4294966720-2-26-2-candidates.txt",
+            "manifest_sha256": "edb1c0ea93a5157fcf097d65b88a4119be8bc519a5c810260ddb88cff0b1e652",
+            "candidate_rows": 12383,
+            "attribution": "candidate_set_not_isolated_culprit",
+            "normal_policy": "reuse",
+            "reuse_eligibility_granted": false,
+            "refusal_diagnostics_only": false,
+            "runtime_diagnostics": [
+              {
+                "path": "runtime.log",
+                "log_offset": 1338602,
+                "log_end_offset": 1338885,
+                "raw_line": "2026-10-25T20:22:40.393295Z  WARN system{name=\"bevy_pbr::shadow_cache::parity::cleanup_shadow_parity\"}: bevy_pbr::shadow_cache::parity: SHADOW PARITY MATCH_BYTES: exact native depth only; timing and full raster acceptance excluded frame=5587 stem=\"5587-4294966718-4294966720-2-26-2\"\n"
+              }
+            ]
+          },
+          {
+            "receipt": "5587-4294966718-4294966720-3-26-3.txt",
+            "manifest": "5587-4294966718-4294966720-3-26-3-candidates.txt",
+            "manifest_sha256": "a5e6eceab8261c6cd508affbdf1e3a79b9752c43e1852f60518ad4de68a44d9c",
+            "candidate_rows": 12587,
+            "attribution": "candidate_set_not_isolated_culprit",
+            "normal_policy": "reuse",
+            "reuse_eligibility_granted": false,
+            "refusal_diagnostics_only": false,
+            "runtime_diagnostics": [
+              {
+                "path": "runtime.log",
+                "log_offset": 1338319,
+                "log_end_offset": 1338602,
+                "raw_line": "2026-10-25T20:22:40.375641Z  WARN system{name=\"bevy_pbr::shadow_cache::parity::cleanup_shadow_parity\"}: bevy_pbr::shadow_cache::parity: SHADOW PARITY MATCH_BYTES: exact native depth only; timing and full raster acceptance excluded frame=5587 stem=\"5587-4294966718-4294966720-3-26-3\"\n"
+              }
+            ]
+          }
+        ]
+      },
+      "shadow_depth_population": [
+        {
+          "receipt": "5587-4294966718-4294966720-0-26-0.txt",
+          "normal_policy": "reuse",
+          "nonclear_depth_texels": 0,
+          "logical_texels": 4194304
+        },
+        {
+          "receipt": "5587-4294966718-4294966720-1-26-1.txt",
+          "normal_policy": "reuse",
+          "nonclear_depth_texels": 0,
+          "logical_texels": 4194304
+        },
+        {
+          "receipt": "5587-4294966718-4294966720-2-26-2.txt",
+          "normal_policy": "reuse",
+          "nonclear_depth_texels": 0,
+          "logical_texels": 4194304
+        },
+        {
+          "receipt": "5587-4294966718-4294966720-3-26-3.txt",
+          "normal_policy": "reuse",
+          "nonclear_depth_texels": 12733,
+          "logical_texels": 4194304
+        }
+      ]
+    },
+    {
+      "run": "traversal-visible-forced-01",
+      "validation_sha256": "e18607539309defdf8dd05bf3c2d6a085eabbc0a8b4743f4f87827f665b4a993",
+      "verdict_sha256": "bc5d990fb410f55755f4847ea7b990998745f31eab106b59db4a558a293b5ba5",
+      "route": {
+        "phase": "finished",
+        "elapsed_ms": 131117.12420000002,
+        "real_elapsed_ms": 130980.25050000001,
+        "cpu_settled_elapsed_ms": 26099.952100000013,
+        "movement_started_elapsed_ms": 46102.457100000014,
+        "movement_finished_elapsed_ms": 91102.45710000001,
+        "tail_finished_elapsed_ms": 131102.45710000003,
+        "route_distance_units": 40500.0
+      },
+      "content": "PASS",
+      "legacy_performance": "FAIL; profiler TEST, not acceptance",
+      "legacy_traversal": "N/A; supplemental native-route validation passed",
+      "visible_start": {
+        "cover_log_offset": 988336,
+        "moving_log_offset": 1035970,
+        "cover_released_before_moving": true,
+        "moving_images": [
+          {
+            "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-forced-01\\screenshots\\moving-001.png",
+            "extrema": [
+              [
+                78,
+                255
+              ],
+              [
+                91,
+                255
+              ],
+              [
+                89,
+                255
+              ]
+            ],
+            "nonblack": true,
+            "sha256": "fcabfdf55023ba4d94d3fe71588e783762c38014f73f27b637ce7f241f29c6b8"
+          },
+          {
+            "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-forced-01\\screenshots\\moving-002.png",
+            "extrema": [
+              [
+                89,
+                255
+              ],
+              [
+                114,
+                255
+              ],
+              [
+                121,
+                255
+              ]
+            ],
+            "nonblack": true,
+            "sha256": "df1b28715400a215c8d30b990238d2841fe9156d6d08ed2469df0162d0321858"
+          },
+          {
+            "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-forced-01\\screenshots\\moving-003.png",
+            "extrema": [
+              [
+                119,
+                255
+              ],
+              [
+                132,
+                255
+              ],
+              [
+                130,
+                255
+              ]
+            ],
+            "nonblack": true,
+            "sha256": "6e3c0cfbdddd9eef381ada536a47da95d1887adc5571a52f44fd9306acc6197d"
+          },
+          {
+            "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-forced-01\\screenshots\\moving-004.png",
+            "extrema": [
+              [
+                112,
+                255
+              ],
+              [
+                126,
+                255
+              ],
+              [
+                126,
+                255
+              ]
+            ],
+            "nonblack": true,
+            "sha256": "6f278cdb3be595c6effdda88145f0484afc48b005498d17c1d0084014a304cb9"
+          },
+          {
+            "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-forced-01\\screenshots\\moving-006.png",
+            "extrema": [
+              [
+                92,
+                255
+              ],
+              [
+                103,
+                255
+              ],
+              [
+                100,
+                255
+              ]
+            ],
+            "nonblack": true,
+            "sha256": "ba4cfd6657d073cf3c8e320720204e8b9c4bde57ae10ad0174a30d60aca67cda"
+          }
+        ],
+        "all_moving_images_nonblack": true
+      },
+      "fully_moving_dispatch_windows": [
+        [
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000
+        ],
+        [
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000
+        ],
+        [
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000,
+          3000
+        ]
+      ],
+      "screenshots": [
+        {
+          "receipt": "moving-001.json",
+          "camera_creation": [
+            20500.0,
+            -45324.06640625,
+            6120.0
+          ],
+          "main_frame": 2446,
+          "render_frame": 2446
+        },
+        {
+          "receipt": "moving-002.json",
+          "camera_creation": [
+            20500.0,
+            -37999.62890625,
+            6120.0
+          ],
+          "main_frame": 3008,
+          "render_frame": 3008
+        },
+        {
+          "receipt": "moving-003.json",
+          "camera_creation": [
+            20500.0,
+            -30664.95703125,
+            6120.0
+          ],
+          "main_frame": 3457,
+          "render_frame": 3457
+        },
+        {
+          "receipt": "moving-004.json",
+          "camera_creation": [
+            20500.0,
+            -23267.236328125,
+            6120.0
+          ],
+          "main_frame": 3806,
+          "render_frame": 3806
+        },
+        {
+          "receipt": "moving-006.json",
+          "camera_creation": [
+            20500.0,
+            -8616.66796875,
+            6120.0
+          ],
+          "main_frame": 4377,
+          "render_frame": 4377
+        },
+        {
+          "receipt": "tail-007.json",
+          "camera_creation": [
+            20500.0,
+            -5000.0,
+            6120.0
+          ],
+          "main_frame": 4669,
+          "render_frame": 4669
+        },
+        {
+          "receipt": "tail-008.json",
+          "camera_creation": [
+            20500.0,
+            -5000.0,
+            6120.0
+          ],
+          "main_frame": 4972,
+          "render_frame": 4972
+        },
+        {
+          "receipt": "tail-009.json",
+          "camera_creation": [
+            20500.0,
+            -5000.0,
+            6120.0
+          ],
+          "main_frame": 5287,
+          "render_frame": 5287
+        },
+        {
+          "receipt": "tail-010.json",
+          "camera_creation": [
+            20500.0,
+            -5000.0,
+            6120.0
+          ],
+          "main_frame": 5643,
+          "render_frame": 5643
+        },
+        {
+          "receipt": "tail-011.json",
+          "camera_creation": [
+            20500.0,
+            -5000.0,
+            6120.0
+          ],
+          "main_frame": 6009,
+          "render_frame": 6009
+        }
+      ]
+    }
+  ],
+  "capture_protocol": {
+    "r4_cpu_tests": 123,
+    "discarded_warmup_link": {
+      "binary_sha256": "732c9d7c2861c71518c5766f5de6288bdf4a5563184be65a2938f7ea6339a16c",
+      "run": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r3\\warmup-01",
+      "discarded": true,
+      "completed": "2026-10-26T05:31:32.319854",
+      "inherited_from": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r3\\warmup.json",
+      "inherited_from_sha256": "f3d7faaa2f31db0e0862d939602971d7cf1a39bba17c0d74b38950c7b9e5bd74",
+      "warmup_launch_sha256": "0433b92b3efc3cb74718945473aaaf6630ffbc9e6e670910f0dfa360891dcc94",
+      "same_source_sha256": "8b64135706fea19e712789a543ba7f5b9f3f518061dd1b58005447a52735db23",
+      "note": "Existing discarded first-after-build R3 warm-up, same unchanged binary; no R4 warm-up run occurred."
+    },
+    "retained_window": {
+      "owner": "sol-2153",
+      "started": "2026-10-26T06:36:19.402743",
+      "authorization": "Lead one-hold order after intermediate-clear leak; moving TESTs use owner guard because gate test refuses any hold.",
+      "runs": [
+        {
+          "run": "after-01",
+          "status": 0,
+          "captured": "2026-10-26T06:41:17.861751"
+        },
+        {
+          "run": "traversal-normal-02",
+          "status": 0,
+          "captured": "2026-10-26T06:43:43.392580"
+        },
+        {
+          "run": "traversal-forced-01",
+          "status": 0,
+          "captured": "2026-10-26T06:46:02.197388"
+        }
+      ],
+      "hold_command": [
+        "C:\\Users\\Brannock\\miniconda3\\python.exe",
+        "C:\\Users\\Brannock\\.mudcrab\\build-gate\\build_gate.py",
+        "hold",
+        "set",
+        "timing-2153-gpu",
+        "--owner",
+        "sol-2153",
+        "--reason",
+        "#2153 remaining quiet controls and moving TEST window",
+        "--until",
+        "07:03",
+        "--drain",
+        "--drain-minutes",
+        "30"
+      ],
+      "exit_code": 0,
+      "finished": "2026-10-26T06:46:13.760314"
+    },
+    "visible_window": {
+      "authorization": "Lead approved settle-20 diagnostic; cover-release must precede Moving. Route-start fix belongs to2151 commit666d7ceca.",
+      "started": "2026-10-26T06:49:49.078366",
+      "runs": [
+        {
+          "run": "traversal-visible-normal-01",
+          "cover_log_offset": 969674,
+          "moving_log_offset": 1017625,
+          "cover_released_before_moving": true,
+          "moving_images": [
+            {
+              "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-normal-01\\screenshots\\moving-001.png",
+              "extrema": [
+                [
+                  76,
+                  255
+                ],
+                [
+                  89,
+                  255
+                ],
+                [
+                  89,
+                  255
+                ]
+              ],
+              "nonblack": true,
+              "sha256": "5a9a42a84b2cfa5c01214e8e166b2c8d066d1b0d35e3b1b8050fb5484dd2720b"
+            },
+            {
+              "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-normal-01\\screenshots\\moving-002.png",
+              "extrema": [
+                [
+                  93,
+                  255
+                ],
+                [
+                  116,
+                  255
+                ],
+                [
+                  120,
+                  255
+                ]
+              ],
+              "nonblack": true,
+              "sha256": "ffa12ace11dd9ef9440a0d558800880533fdbdc270c0f5743954ecb821deda4d"
+            },
+            {
+              "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-normal-01\\screenshots\\moving-003.png",
+              "extrema": [
+                [
+                  119,
+                  255
+                ],
+                [
+                  132,
+                  255
+                ],
+                [
+                  130,
+                  255
+                ]
+              ],
+              "nonblack": true,
+              "sha256": "4f59111f91c4ec3303cf4fb499883e5e5af7c7a4893d7152110b5bc856646d5a"
+            },
+            {
+              "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-normal-01\\screenshots\\moving-004.png",
+              "extrema": [
+                [
+                  114,
+                  255
+                ],
+                [
+                  128,
+                  255
+                ],
+                [
+                  126,
+                  255
+                ]
+              ],
+              "nonblack": true,
+              "sha256": "c6b670a29b7c06c58ce846eb8c2d083ca4b9ba9383acd0fb8d232cbf24084e41"
+            },
+            {
+              "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-normal-01\\screenshots\\moving-006.png",
+              "extrema": [
+                [
+                  125,
+                  255
+                ],
+                [
+                  139,
+                  255
+                ],
+                [
+                  139,
+                  255
+                ]
+              ],
+              "nonblack": true,
+              "sha256": "0ea332a8ab950f3ff7e05e8e16ab5f1c002a9241dc2dffeae0ad82cfc6082d6e"
+            }
+          ],
+          "all_moving_images_nonblack": true
+        },
+        {
+          "run": "traversal-visible-forced-01",
+          "cover_log_offset": 988336,
+          "moving_log_offset": 1035970,
+          "cover_released_before_moving": true,
+          "moving_images": [
+            {
+              "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-forced-01\\screenshots\\moving-001.png",
+              "extrema": [
+                [
+                  78,
+                  255
+                ],
+                [
+                  91,
+                  255
+                ],
+                [
+                  89,
+                  255
+                ]
+              ],
+              "nonblack": true,
+              "sha256": "fcabfdf55023ba4d94d3fe71588e783762c38014f73f27b637ce7f241f29c6b8"
+            },
+            {
+              "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-forced-01\\screenshots\\moving-002.png",
+              "extrema": [
+                [
+                  89,
+                  255
+                ],
+                [
+                  114,
+                  255
+                ],
+                [
+                  121,
+                  255
+                ]
+              ],
+              "nonblack": true,
+              "sha256": "df1b28715400a215c8d30b990238d2841fe9156d6d08ed2469df0162d0321858"
+            },
+            {
+              "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-forced-01\\screenshots\\moving-003.png",
+              "extrema": [
+                [
+                  119,
+                  255
+                ],
+                [
+                  132,
+                  255
+                ],
+                [
+                  130,
+                  255
+                ]
+              ],
+              "nonblack": true,
+              "sha256": "6e3c0cfbdddd9eef381ada536a47da95d1887adc5571a52f44fd9306acc6197d"
+            },
+            {
+              "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-forced-01\\screenshots\\moving-004.png",
+              "extrema": [
+                [
+                  112,
+                  255
+                ],
+                [
+                  126,
+                  255
+                ],
+                [
+                  126,
+                  255
+                ]
+              ],
+              "nonblack": true,
+              "sha256": "6f278cdb3be595c6effdda88145f0484afc48b005498d17c1d0084014a304cb9"
+            },
+            {
+              "path": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-r4\\traversal-visible-forced-01\\screenshots\\moving-006.png",
+              "extrema": [
+                [
+                  92,
+                  255
+                ],
+                [
+                  103,
+                  255
+                ],
+                [
+                  100,
+                  255
+                ]
+              ],
+              "nonblack": true,
+              "sha256": "ba4cfd6657d073cf3c8e320720204e8b9c4bde57ae10ad0174a30d60aca67cda"
+            }
+          ],
+          "all_moving_images_nonblack": true
+        }
+      ],
+      "exit_code": 0,
+      "finished": "2026-10-26T06:55:51.159033"
+    },
+    "route_cover_fix": "Traversal readiness #2151 commit666d7ceca, not GPU reuse; settle20 workaround explicitly approved."
+  },
+  "visual_review": {
+    "inspected": [
+      "traversal-visible-normal-01/screenshots/moving-001.png",
+      "traversal-visible-normal-01/screenshots/moving-004.png",
+      "traversal-visible-forced-01/screenshots/moving-002.png",
+      "traversal-visible-forced-01/screenshots/moving-004.png",
+      "traversal-normal-02/screenshots/tail-009.png"
+    ],
+    "observation": "Visible mountain/city/forest progression; no stale-view artifact observed in inspected frames. Sequential routes are not pixel-aligned parity captures."
+  },
+  "open_limits": [
+    "One quiet three-configuration sequence supports inference; unprofiled sustained120/140FPS acceptance remains unproved and legacy PERF says FAIL.",
+    "Portal-heavy integration and Metal hardware untested.",
+    "Full native raster equality covers one standing extracted frame before temporal postprocess; final presented/TAA output not independently paired.",
+    "Not every live asset/runtime producer was mutated in the native route; individual dependency and routing tests plus source tracing cover those paths.",
+    "Arbitrary escaped raw GPU writes outside the accepted cooperative producer contract are unsupported."
+  ]
+}
