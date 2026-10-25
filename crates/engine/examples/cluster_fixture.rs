@@ -370,6 +370,7 @@ fn setup(
             let copies = pool_copies.0.max(1);
             commands.insert_resource(ClusterScene {
                 certificate: None,
+                inventory: None,
                 terrain_blocks: Vec::new(),
                 origin_offset: Vec3::ZERO,
                 blocks: Vec::new(),

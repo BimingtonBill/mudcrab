@@ -1542,6 +1542,33 @@ pub(crate) mod producer_fixture_tests {
         published_inputs(false)
     }
 
+    /// Loader-valid geometry with two distinct references in the parent world
+    /// and one in the child world, for readiness group aggregation tests.
+    pub(crate) fn published_for_readiness() -> tempfile::TempDir {
+        published_options_with_inputs(
+            FixtureOptions {
+                with_texture_and_rejected_primitive: false,
+                inventory: false,
+                triangle_threshold: 1,
+                single_triangle: false,
+                billboard: false,
+                runtime_inventory: false,
+                base_record_type: "STAT",
+            },
+            |db| {
+                db.execute(
+                    "INSERT INTO \"references\" (id,cell_id,worldspace_id,base_form_id,is_exterior,
+                     pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,scale,header_flags,data)
+                     SELECT ?1,cell_id,worldspace_id,base_form_id,is_exterior,
+                     pos_x+1.0,pos_y,pos_z,rot_x,rot_y,rot_z,scale,header_flags,data
+                     FROM \"references\" WHERE id=?2",
+                    params![0x10A_u32, PARENT_REF],
+                )
+                .unwrap();
+            },
+        )
+    }
+
     /// Complete converter coverage whose actual loader template requires billboard motion.
     pub(crate) fn published_for_billboard_loader() -> tempfile::TempDir {
         published_options(FixtureOptions {

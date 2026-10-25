@@ -189,6 +189,7 @@ mod tests {
         let scene = ClusterScene {
             instances: vec![instance(ClusterInstanceIdentity::Object(*key), 0)],
             certificate: Some(certificate.clone()),
+            inventory: None,
             terrain_blocks: Vec::new(),
             meshes: Vec::new(),
             origin_offset: Vec3::ZERO,

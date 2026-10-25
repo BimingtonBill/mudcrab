@@ -21,7 +21,7 @@ use crate::{
         reference_state::ReferenceEnableState,
     },
 };
-use bevy::prelude::*;
+use bevy::{camera::visibility::RenderLayers, prelude::*};
 use crossbeam_channel::{Receiver, TryRecvError};
 use shared::cluster_mapping::CoverageState;
 use std::{
@@ -839,7 +839,16 @@ fn plan(
     let mut wanted: Vec<_> = wanted.into_iter().collect();
     wanted.sort_by_key(|(key, _)| sparse_cell_order(*key, center));
     far.set_queued(wanted.into());
-    commands.queue(|world: &mut World| with_far(world, refresh_holders));
+    commands.queue(move |world: &mut World| {
+        with_far(world, |world, far| {
+            if role_changed {
+                refresh_holders(world, far);
+            } else {
+                // Target membership does not change the role of unrelated holders.
+                prune_empty_holders(world, far);
+            }
+        });
+    });
     info!(
         generation = far.generation,
         desired = far.desired.len(),
@@ -1645,9 +1654,14 @@ fn holder_visibility(role: CellRole) -> Visibility {
 }
 
 fn sync_holder_role(world: &mut World, root: Entity, role: CellRole) -> Result<(), String> {
+    perf_span!("far_stock::sync_holder_role");
     // Retain role-owner validation, transfer/collider authority and the seamless source registry.
     crate::portal::sync_distant_role(world, root, role)?;
-    if !world.contains_resource::<crate::portal::StreamedCellLayerStamps>() {
+    if !world.contains_resource::<crate::portal::StreamedCellLayerStamps>()
+        && world
+            .get::<bevy::app::Propagate<RenderLayers>>(root)
+            .is_none_or(|layers| layers.0 != super::PLACED_OBJECT_RENDER_LAYERS)
+    {
         // Ordinary stock is a placed-object hierarchy, including scenes arriving after a refresh
         // or transfer. Visibility carries Hidden; portal roles must not replace this layer source.
         world
@@ -1839,7 +1853,7 @@ pub(super) fn queue_adopt(commands: &mut Commands, root: Entity, key: CellKey, i
             }
             register_near(world, far, root, key);
             reconcile_near(world, far);
-            refresh_holders(world, far);
+            prune_empty_holders(world, far);
         })
     });
 }
@@ -1930,7 +1944,9 @@ fn source_pose(far: &FarStock, id: u32) -> Option<crate::cluster::reader::Refere
         .map(|p| p.pose)
 }
 
-fn refresh_holders(world: &mut World, far: &mut FarStock) {
+fn prune_empty_holders(world: &mut World, far: &mut FarStock) {
+    perf_span!("far_stock::prune_empty_holders");
+    crate::work_counters::record_count("far_stock/pruned_holder_visits", far.holders.len() as u64);
     // Read the actual post-transfer children before selecting roots for role writes.
     far.holders.retain(|_, root| {
         let empty = world.get::<Children>(*root).is_none_or(|c| c.is_empty());
@@ -1939,9 +1955,17 @@ fn refresh_holders(world: &mut World, far: &mut FarStock) {
         }
         !empty
     });
+}
+
+fn refresh_holders(world: &mut World, far: &mut FarStock) {
+    perf_span!("far_stock::refresh_holders");
+    prune_empty_holders(world, far);
+    crate::work_counters::record_count("far_stock/role_holder_visits", far.holders.len() as u64);
     for &root in far.holders.values() {
         let visible = holder_visibility(role(far.demand));
-        world.entity_mut(root).insert(visible);
+        if world.get::<Visibility>(root) != Some(&visible) {
+            world.entity_mut(root).insert(visible);
+        }
         if let Err(reason) = sync_holder_role(world, root, role(far.demand)) {
             fatal(world, reason);
         }
@@ -2015,7 +2039,9 @@ fn reconcile_near(world: &mut World, far: &mut FarStock) {
         }
     }
     if moved {
-        refresh_holders(world, far);
+        // move_owner validates and rebinds the transferred sources. Other
+        // holders retain their role; only now-empty holders need cleanup.
+        prune_empty_holders(world, far);
     }
 }
 

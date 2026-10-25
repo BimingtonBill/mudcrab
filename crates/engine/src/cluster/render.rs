@@ -652,6 +652,10 @@ pub struct ClusterScene {
     /// Retained source authority for every package-local object key, including render extraction.
     /// None is reserved for explicitly invented fixture scenes.
     pub certificate: Option<Arc<super::reader::CertifiedPackage>>,
+    /// Complete membership published after final instance ordering. Rebuild this index
+    /// whenever instance identity, batch assignment, or ordering changes.
+    /// None is reserved for explicitly invented fixture scenes.
+    pub inventory: Option<Arc<super::instance_inventory::InstanceInventory>>,
     /// Per-instance terrain clip metadata; indexed by the terrain identity, never by shared mesh hash.
     pub terrain_blocks: Vec<super::terrain::TerrainViewBlock>,
     pub meshes: Vec<ClusterMeshAsset>,
@@ -685,6 +689,7 @@ impl ClusterScene {
     pub fn new(mesh: ClusterMeshAsset, records: &[InstanceRecord]) -> Self {
         Self {
             certificate: None,
+            inventory: None,
             terrain_blocks: Vec::new(),
             origin_offset: Vec3::ZERO,
             blocks: Vec::new(),
@@ -5550,6 +5555,7 @@ mod tangent_layout_regressions {
         let authored = super::super::assets::authored_tangent_fixture();
         let mut scene = ClusterScene {
             certificate: None,
+            inventory: None,
             terrain_blocks: Vec::new(),
             meshes: vec![plain, authored],
             instances: vec![

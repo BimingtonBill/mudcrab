@@ -919,8 +919,9 @@ fn load_cluster_package(
     // A batch entity is cheap and exists from the start; its material is requested only once an
     // instance of the batch comes into view (`load_batches_in_view`), so loading follows what the
     // camera sees and not the size of the package.
+    let layout_scope = next_layout_scope();
     commands.insert_resource(LazyBatches {
-        layout_scope: next_layout_scope(),
+        layout_scope,
         batches: batch_keys
             .iter()
             .zip(batch_spheres)
@@ -1033,6 +1034,19 @@ fn load_cluster_package(
         });
     }
     let instances = ordered;
+    let inventory = match super::instance_inventory::InstanceInventory::build(
+        validated.0.clone(),
+        layout_scope,
+        &instances,
+        batch_keys.len(),
+    ) {
+        Ok(inventory) => Arc::new(inventory),
+        Err(reason) => {
+            error!(%reason, "cluster instance inventory could not be certified");
+            exit.write(AppExit::error());
+            return;
+        }
+    };
     if let Some(point) = source.priority_point {
         // The first blocks, and how far from the start they are: the order is the point.
         let nearest: Vec<String> = scene_blocks
@@ -1138,6 +1152,7 @@ fn load_cluster_package(
     }
     commands.insert_resource(ClusterScene {
         certificate: Some(validated.0.clone()),
+        inventory: Some(inventory),
         terrain_blocks: terrain_view_blocks,
         meshes: scene_meshes,
         instances,

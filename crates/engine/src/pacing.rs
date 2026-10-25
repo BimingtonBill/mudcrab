@@ -140,8 +140,9 @@ struct Mark {
 /// committed is resident while its references are still in the command buffer, so the first frame
 /// it holds can be one frame early; the second cannot.
 ///
-/// The startup load lift ([`startup::StartupLoadPlugin`]) waits for the same two
-/// frames, so the pacing budgets come back on the frame this report latches the world ready.
+/// The startup load uses the same stability count before beginning its fade.
+/// Measurement applies this count after that cover has finished, so covered
+/// frames cannot enter the post-ready window.
 pub(crate) const READY_FRAMES_REQUIRED: u32 = 2;
 
 /// Latches "ready" once the predicate has held on [`READY_FRAMES_REQUIRED`] consecutive frames,
@@ -552,6 +553,7 @@ pub(crate) fn track_world_ready(
     // choice is made, so it is also the one place a test has to pin.
     real_time: Res<Time<Real>>,
     mut gate: Option<ResMut<crate::cluster::loading::ClusterLoadingGate>>,
+    startup: Option<Res<startup::StartupLoad>>,
     (mode, hold): (
         Option<Res<crate::physics::MoveMode>>,
         Option<Res<crate::physics::WalkSpawnHold>>,
@@ -582,17 +584,31 @@ pub(crate) fn track_world_ready(
     );
     ready &= config.clusters.is_none()
         || crate::cluster::loading::physics_settled(mode.as_deref(), hold.as_deref());
+    // Dependency admission starts the existing fade independently. Measurement
+    // starts only once that cover is gone; it must never score black frames.
+    ready &= startup.as_deref().is_none_or(|load| !load.cover_pending());
     let elapsed_millis = started.elapsed().as_secs_f64() * 1000.0;
     // Frame-time windows are for benchmark runs; an ordinary session runs unbounded.
     tracker.record_frame_windows = config.is_benchmark_run();
     tracker.window_failed_cells = failed;
     let was_latched = tracker.first_ready.latched.is_some();
+    let window_start =
+        tracker.record_frame_windows && was_latched && tracker.frames_after_ready.is_empty();
+    let frame_delta_ms = window_delta_ms(&real_time);
     let jump_now = tracker.observe(
         elapsed_millis,
         ready,
         config.benchmark_jump.is_some(),
-        window_delta_ms(&real_time),
+        frame_delta_ms,
     );
+    if window_start && !tracker.frames_after_ready.is_empty() {
+        info!(
+            run_ms = real_time.elapsed_secs_f64() * 1000.0,
+            window_start_run_ms = real_time.elapsed_secs_f64() * 1000.0 - frame_delta_ms,
+            main_frame = profiler.main_frame(),
+            "pacing measurement: post-ready window started"
+        );
+    }
     if let Some(grid) = config.benchmark_jump.filter(|_| jump_now) {
         let position = benchmark_jump_position(&config, &cache, origin.0, grid);
         camera.translation = position;
@@ -608,6 +624,12 @@ pub(crate) fn track_world_ready(
         && !was_latched
     {
         profiler.event("pacing", "world_ready", Some(mark.millis));
+        info!(
+            run_ms = real_time.elapsed_secs_f64() * 1000.0,
+            first_ready_frame = mark.frames,
+            main_frame = profiler.main_frame(),
+            "pacing measurement: world-ready latch"
+        );
     }
 }
 
@@ -973,7 +995,7 @@ mod tests {
 
     /// An empty `CellCache`: `track_world_ready` requires the resource, and a run with no jump
     /// configured never reads it. The directory is returned because the map must outlive the app.
-    fn empty_cell_cache() -> (tempfile::TempDir, CellCache) {
+    pub(super) fn empty_cell_cache() -> (tempfile::TempDir, CellCache) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("cell_cache.rkyv");
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&shared::CellCache {

@@ -109,6 +109,7 @@ pub mod assets;
 pub mod envelope;
 pub(crate) mod flat_source;
 mod instance_identity;
+pub mod instance_inventory;
 mod instance_mask;
 pub(crate) mod loading;
 mod mesh_payload;

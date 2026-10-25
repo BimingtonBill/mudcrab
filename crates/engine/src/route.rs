@@ -571,22 +571,29 @@ pub(crate) fn drive_route(
     };
     // Only a measuring run keeps the readiness the start waits for.
     let waits_for_world = runner.plan.start == RouteStart::WorldReady && config.measures_pacing();
-    // The pacing latch precedes the startup cover's fade. Starting movement
-    // during that fade changes the loading pose, invalidates render admission,
-    // and resets the fade every frame. This is an initial-start dependency only:
-    // a running route must never wait for streaming or re-enter loading.
+    // Keep the cover guard for routes without a pacing tracker as well. Moving
+    // during the fade would invalidate admission and restart that fade. This is
+    // an initial-start dependency only: a running route never waits for streaming.
     let ready = runner.started
         || runner.plan.start == RouteStart::Immediately
-        || (startup.is_none_or(|load| !load.cover_pending())
+        || (startup.as_deref().is_none_or(|load| !load.cover_pending())
             && (!waits_for_world
                 || tracker
                     .as_deref()
                     .is_some_and(PacingTracker::world_ready_reached)));
+    let was_started = runner.started;
     let frame = runner.step(
         real_time.delta_secs(),
         ready,
         real_time.elapsed_secs_f64() * 1000.0,
     );
+    if !was_started && runner.started {
+        info!(
+            run_ms = real_time.elapsed_secs_f64() * 1000.0,
+            cover_pending = startup.as_deref().is_some_and(|load| load.cover_pending()),
+            "scripted route started"
+        );
+    }
     let eye = frame.eye_height.unwrap_or(camera.translation.y);
     camera.translation = Vec3::new(
         frame.position.x - origin.0.x as f32 * CELL_SIZE,

@@ -45,7 +45,6 @@ struct NeededBatch {
 /// Inventory inputs only. Loading generations and source qualification belong to the aggregate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NeededCatalogKey {
-    gpu_identity: u64,
     scene_changed: Tick,
     refusal_revision: Option<u64>,
     layout_scope: u64,
@@ -57,13 +56,15 @@ struct NeededCatalogKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReadinessKey {
     catalog: NeededCatalogKey,
+    gpu_identity: u64,
     gpu_generation: u64,
     gpu_layout: u64,
     materials_revision: u64,
 }
 
 struct Snapshot {
-    package: Arc<super::super::super::reader::CertifiedPackage>,
+    package: Arc<Certificate>,
+    inventory: Arc<Inventory>,
     layout: u64,
     generation: u64,
     frame: u64,
@@ -76,7 +77,15 @@ struct Producer {
     revision: Option<[u64; 9]>,
     needed_key: Option<NeededCatalogKey>,
     observation_key: Option<ReadinessKey>,
-    needed_catalog: HashMap<u32, Vec<NeededBatch>>,
+    needed_catalog: NeededCatalog,
+    inventory: Option<Arc<Inventory>>,
+    inventory_scene_changed: Option<Tick>,
+    inventory_valid: bool,
+    contributions: Option<InventoryContributions>,
+    #[cfg(test)]
+    inventory_work: InventoryWork,
+    #[cfg(test)]
+    validation_walks: usize,
     consumers: Vec<Consumer>,
     frame: u64,
     pending: Option<Snapshot>,
@@ -85,13 +94,220 @@ struct Producer {
     walks: usize,
 }
 
+type NeededCatalog = HashMap<u32, HashMap<(usize, bool), NeededBatch>>;
+type Inventory = crate::cluster::instance_inventory::InstanceInventory;
+type Certificate = super::super::super::reader::CertifiedPackage;
+type RecordKey = crate::cluster::reader::RecordKey;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InventoryWork {
+    rebuilt_batches: u64,
+    visited_instances: u64,
+}
+
+impl InventoryWork {
+    fn record(self) {
+        crate::work_counters::record_count(
+            "cluster_drawability/rebuilt_batches",
+            self.rebuilt_batches,
+        );
+        crate::work_counters::record_count(
+            "cluster_drawability/visited_instances",
+            self.visited_instances,
+        );
+    }
+}
+
+/// Keys removed before each changed batch's new contributions are installed.
+struct InventoryContributions {
+    inventory: Arc<Inventory>,
+    refusal_revision: Option<u64>,
+    runtime_revision: Option<u64>,
+    refused: std::collections::BTreeSet<RecordKey>,
+    runtime: std::collections::BTreeSet<u32>,
+    groups: Vec<Vec<(u32, bool)>>,
+}
+
 impl Producer {
+    /// Resource ticks are local to the render world; only this ordered validation
+    /// uses them. Publication compares retained allocation provenance instead.
+    fn validate_inventory(
+        &mut self,
+        inventory: &Arc<Inventory>,
+        package: &Arc<Certificate>,
+        layout: u64,
+        scene_changed: Tick,
+        instances: &[ClusterInstance],
+    ) -> bool {
+        let replaced = self
+            .inventory
+            .as_ref()
+            .is_none_or(|old| !Arc::ptr_eq(old, inventory));
+        if replaced || self.inventory_scene_changed != Some(scene_changed) {
+            self.inventory = Some(inventory.clone());
+            self.inventory_scene_changed = Some(scene_changed);
+            self.inventory_valid = inventory.matches_instances(instances);
+            #[cfg(test)]
+            {
+                self.validation_walks += 1;
+            }
+            if replaced {
+                self.needed_key = None;
+            }
+        }
+        inventory.matches(package, layout) && self.inventory_valid
+    }
+
+    fn withdraw(&mut self) {
+        self.withdrawal_pending |= self.revision.take().is_some();
+        self.pending = None;
+    }
+
+    fn update_inventory(
+        &mut self,
+        inventory: &Arc<Inventory>,
+        package: &Arc<Certificate>,
+        refusal_revision: Option<u64>,
+        refused: &std::collections::BTreeSet<RecordKey>,
+        runtime_revision: Option<u64>,
+        runtime_references: impl FnOnce() -> std::collections::BTreeSet<u32>,
+    ) -> bool {
+        let reset = self
+            .contributions
+            .as_ref()
+            .is_none_or(|old| !Arc::ptr_eq(&old.inventory, inventory));
+        let mut touched = std::collections::BTreeSet::new();
+        if reset {
+            self.needed_catalog.clear();
+            touched.extend((0..inventory.batch_count()).map(|batch| batch as u32));
+            self.contributions = Some(InventoryContributions {
+                inventory: inventory.clone(),
+                refusal_revision,
+                runtime_revision,
+                refused: refused.clone(),
+                runtime: runtime_references(),
+                groups: vec![Vec::new(); inventory.batch_count()],
+            });
+        } else if let Some(state) = self.contributions.as_mut() {
+            if state.refusal_revision != refusal_revision {
+                for record in state.refused.symmetric_difference(refused) {
+                    touched.extend(inventory.batches_for_record(record));
+                }
+                state.refused = refused.clone();
+                state.refusal_revision = refusal_revision;
+            }
+            if state.runtime_revision != runtime_revision {
+                let runtime = runtime_references();
+                for reference in state.runtime.symmetric_difference(&runtime) {
+                    touched.extend(inventory.batches_for_reference(*reference));
+                }
+                state.runtime = runtime;
+                state.runtime_revision = runtime_revision;
+            }
+        }
+        let mut work = InventoryWork::default();
+        if let Some(state) = self.contributions.as_mut() {
+            for batch in touched {
+                work.rebuilt_batches += 1;
+                for (world, terrain) in state.groups[batch as usize].drain(..) {
+                    if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                        self.needed_catalog.entry(world)
+                    {
+                        entry.get_mut().remove(&(batch as usize, terrain));
+                        if entry.get().is_empty() {
+                            entry.remove();
+                        }
+                    }
+                }
+                let mut groups: HashMap<(u32, bool), NeededBatch> = HashMap::new();
+                for &index in inventory.indices_for_batch(batch) {
+                    work.visited_instances += 1;
+                    let (identity, _) = inventory.instances()[index];
+                    let (world, terrain, invalid) = match identity {
+                        ClusterInstanceIdentity::Object(record) => {
+                            if state.refused.contains(&record) {
+                                continue;
+                            }
+                            // Inventory::build proved every object key against this retained,
+                            // immutable certificate before admission.
+                            let Some(record) = package.record(&record) else {
+                                error!(
+                                    ?record,
+                                    "validated cluster inventory lost its object certificate"
+                                );
+                                work.record();
+                                self.inventory_valid = false;
+                                self.contributions = None;
+                                self.needed_catalog.clear();
+                                return false;
+                            };
+                            (
+                                record.worldspace,
+                                false,
+                                state.runtime.contains(&record.reference),
+                            )
+                        }
+                        ClusterInstanceIdentity::Terrain { worldspace, .. } => {
+                            (worldspace, true, false)
+                        }
+                        ClusterInstanceIdentity::Fixture => continue,
+                    };
+                    groups
+                        .entry((world, terrain))
+                        .or_insert(NeededBatch {
+                            batch: batch as usize,
+                            terrain,
+                            invalid_owned_state: false,
+                        })
+                        .invalid_owned_state |= invalid;
+                }
+                for ((world, terrain), need) in groups {
+                    self.needed_catalog
+                        .entry(world)
+                        .or_default()
+                        .insert((batch as usize, terrain), need);
+                    state.groups[batch as usize].push((world, terrain));
+                }
+            }
+        }
+        work.record();
+        #[cfg(test)]
+        {
+            self.inventory_work.rebuilt_batches += work.rebuilt_batches;
+            self.inventory_work.visited_instances += work.visited_instances;
+        }
+        true
+    }
+}
+
+impl Producer {
+    #[cfg(test)]
     fn observe(
         &mut self,
         inputs: ReadinessKey,
         revision: [u64; 9],
         consumers: Vec<Consumer>,
-        needed: impl FnOnce() -> HashMap<u32, Vec<NeededBatch>>,
+        needed: impl FnOnce() -> NeededCatalog,
+        batch_ready: impl Fn(usize) -> (bool, bool, bool, bool),
+    ) -> Option<HashMap<u32, ClusterWorldReadiness>> {
+        self.observe_with(
+            inputs,
+            revision,
+            consumers,
+            |producer| {
+                producer.needed_catalog = needed();
+                true
+            },
+            batch_ready,
+        )
+    }
+
+    fn observe_with(
+        &mut self,
+        inputs: ReadinessKey,
+        revision: [u64; 9],
+        consumers: Vec<Consumer>,
+        needed: impl FnOnce(&mut Self) -> bool,
         batch_ready: impl Fn(usize) -> (bool, bool, bool, bool),
     ) -> Option<std::collections::HashMap<u32, ClusterWorldReadiness>> {
         let catalog_changed = self.needed_key != Some(inputs.catalog);
@@ -109,6 +325,9 @@ impl Producer {
         }
         crate::work_counters::record("cluster_drawability/non_replay");
         if let Some(previous) = self.observation_key {
+            if previous.gpu_identity != inputs.gpu_identity {
+                crate::work_counters::record("cluster_drawability/input_gpu_identity");
+            }
             if previous.materials_revision != inputs.materials_revision {
                 crate::work_counters::record("cluster_drawability/input_materials");
             }
@@ -124,9 +343,40 @@ impl Producer {
             self.walks += 1;
         }
         if catalog_changed {
+            let previous = self.needed_key;
+            for (name, changed) in [
+                ("cluster_drawability/catalog_initial", previous.is_none()),
+                (
+                    "cluster_drawability/catalog_scene",
+                    previous.is_some_and(|old| old.scene_changed != inputs.catalog.scene_changed),
+                ),
+                (
+                    "cluster_drawability/catalog_refusal",
+                    previous
+                        .is_some_and(|old| old.refusal_revision != inputs.catalog.refusal_revision),
+                ),
+                (
+                    "cluster_drawability/catalog_layout",
+                    previous.is_some_and(|old| old.layout_scope != inputs.catalog.layout_scope),
+                ),
+                (
+                    "cluster_drawability/catalog_runtime_state",
+                    previous.is_some_and(|old| {
+                        old.runtime_state_revision != inputs.catalog.runtime_state_revision
+                    }),
+                ),
+            ] {
+                if changed {
+                    crate::work_counters::record(name);
+                }
+            }
+            info!(?previous, current = ?inputs.catalog, "cluster drawability catalog input changed");
             {
                 perf_span!("cluster::drawability::catalog");
-                self.needed_catalog = needed();
+                if !needed(self) {
+                    self.withdraw();
+                    return None;
+                }
             }
             self.needed_key = Some(inputs.catalog);
             crate::work_counters::record("cluster_drawability/needed_catalog");
@@ -145,7 +395,7 @@ impl Producer {
                 .needed_catalog
                 .get(&consumer.world)
                 .into_iter()
-                .flatten()
+                .flat_map(|batches| batches.values())
             {
                 let domain = ViewDomain::new(&consumer.layers, consumer.shadow);
                 if !(if need.terrain {
@@ -244,21 +494,41 @@ fn observe(
     mut producer: ResMut<Producer>,
 ) {
     let (Some(gpu), Some(scene)) = (gpu, scene) else {
-        producer.withdrawal_pending |= producer.revision.take().is_some();
-        producer.pending = None;
+        producer.withdraw();
         return;
     };
     let (Some(package), Some(layout)) = (gpu.certificate.as_ref(), sources.lazy_layout_scope)
     else {
-        producer.withdrawal_pending |= producer.revision.take().is_some();
-        producer.pending = None;
+        producer.withdraw();
         return;
     };
-    let same = sources
+    let Some(inventory) = scene.inventory.as_ref() else {
+        producer.withdraw();
+        return;
+    };
+    // An inventory describes identities only within the exact retained certificate
+    // and final batch layout. GPU identity itself is aggregate drawing proof.
+    let coherent = sources
         .certificate
         .as_ref()
-        .is_some_and(|source| Arc::ptr_eq(source, package));
-    let compute = same && prepared_cluster_cull(&gpu, &frame, &pipelines, &cache).is_some();
+        .is_some_and(|source| Arc::ptr_eq(source, package))
+        && scene
+            .certificate
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, package));
+    if !coherent
+        || !producer.validate_inventory(
+            inventory,
+            package,
+            layout,
+            scene.last_changed(),
+            &scene.instances,
+        )
+    {
+        producer.withdraw();
+        return;
+    }
+    let compute = prepared_cluster_cull(&gpu, &frame, &pipelines, &cache).is_some();
     let mut consumers: Vec<_> = views
         .iter()
         .filter_map(|(_, view, light, layers)| {
@@ -395,58 +665,35 @@ fn observe(
     ];
     let inputs = ReadinessKey {
         catalog: NeededCatalogKey {
-            gpu_identity: gpu.identity,
             scene_changed: scene.last_changed(),
             refusal_revision: sources.refusal_revision,
             layout_scope: layout,
             runtime_state_revision: runtime_state.as_ref().map(|state| state.revision),
         },
+        gpu_identity: gpu.identity,
         gpu_generation: gpu.generation,
         gpu_layout: gpu.layout_epoch,
         materials_revision: materials.revision(),
     };
-    let result = producer.observe(
+    let result = producer.observe_with(
         inputs,
         revision,
         consumers,
-        || {
-            let mut needed: HashMap<u32, HashMap<(usize, bool), NeededBatch>> = HashMap::new();
-            for instance in &scene.instances {
-                if matches!(instance.identity, ClusterInstanceIdentity::Object(record)
-                if sources.permanently_refused_records.contains(&record))
-                {
-                    continue;
-                }
-                let Some(world) = instance.identity.placed_worldspace(Some(package)) else {
-                    continue;
-                };
-                let batch = instance.batch as usize;
-                let terrain = matches!(instance.identity, ClusterInstanceIdentity::Terrain { .. });
-                let invalid_owned_state = match instance.identity {
-                    ClusterInstanceIdentity::Object(record) => {
-                        package.record(&record).is_some_and(|identity| {
-                            runtime_state
-                                .as_ref()
-                                .is_some_and(|state| state.contains(identity.reference))
-                        })
-                    }
-                    _ => false,
-                };
-                let need = needed
-                    .entry(world)
-                    .or_default()
-                    .entry((batch, terrain))
-                    .or_insert(NeededBatch {
-                        batch,
-                        terrain,
-                        invalid_owned_state: false,
-                    });
-                need.invalid_owned_state |= invalid_owned_state;
-            }
-            needed
-                .into_iter()
-                .map(|(world, batches)| (world, batches.into_values().collect()))
-                .collect()
+        |producer| {
+            producer.update_inventory(
+                inventory,
+                package,
+                sources.refusal_revision,
+                &sources.permanently_refused_records,
+                runtime_state.as_ref().map(|state| state.revision),
+                || {
+                    runtime_state
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|state| state.references())
+                        .collect()
+                },
+            )
         },
         |batch| {
             (
@@ -493,6 +740,7 @@ fn observe(
         producer.frame = producer.frame.wrapping_add(1);
         producer.pending = Some(Snapshot {
             package: package.clone(),
+            inventory: inventory.clone(),
             layout,
             generation: producer.generation,
             frame: producer.frame,
@@ -504,6 +752,7 @@ fn observe(
 fn publish(mut producer: ResMut<Producer>, mut main: ResMut<MainWorld>) {
     let Some(Snapshot {
         package,
+        inventory,
         layout,
         generation,
         frame,
@@ -536,7 +785,18 @@ fn publish(mut producer: ResMut<Producer>, mut main: ResMut<MainWorld>) {
         .is_some_and(|current| Arc::ptr_eq(&current.0, &package))
         && main
             .get_resource::<crate::cluster::package::LazyBatches>()
-            .is_some_and(|lazy| lazy.layout_scope == layout);
+            .is_some_and(|lazy| lazy.layout_scope == layout)
+        && inventory.matches(&package, layout)
+        && main.get_resource::<ClusterScene>().is_some_and(|scene| {
+            scene
+                .certificate
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &package))
+                && scene
+                    .inventory
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &inventory))
+        });
     let active_world = main
         .get_resource::<crate::streaming::ActiveSpace>()
         .zip(main.get_resource::<crate::config::EngineConfig>())
@@ -548,13 +808,17 @@ fn publish(mut producer: ResMut<Producer>, mut main: ResMut<MainWorld>) {
         });
     let evaluated = active_world.and_then(|world| worlds.get(&world)).copied();
     let missing = if let Some(mut gate) = main.get_resource_mut::<ClusterLoadingGate>() {
-        if coherent {
-            gate.publish(&package, layout, generation, frame, worlds);
-        } else {
+        let accepted = coherent && gate.publish(&package, layout, generation, frame, worlds);
+        if !coherent {
             gate.withdraw();
+        }
+        if !accepted {
+            // Rejection must not suppress recomputation when this exact Arc returns.
+            producer.revision = None;
         }
         active_world.map_or(0, |world| gate.owned_not_drawable(world))
     } else {
+        producer.revision = None;
         return;
     };
     if let Some(mut profiler) = main.get_resource_mut::<crate::profiling::ProfilingState>() {
@@ -592,15 +856,17 @@ pub(super) fn install(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("readiness_inventory_tests.rs");
+    include!("readiness_batch_tests.rs");
     fn catalog_key() -> ReadinessKey {
         ReadinessKey {
             catalog: NeededCatalogKey {
-                gpu_identity: 11,
                 scene_changed: Tick::new(5),
                 refusal_revision: Some(23),
                 layout_scope: 29,
                 runtime_state_revision: Some(31),
             },
+            gpu_identity: 11,
             gpu_generation: 13,
             gpu_layout: 17,
             materials_revision: 19,
@@ -681,14 +947,17 @@ mod tests {
         );
     }
 
-    fn needed() -> HashMap<u32, Vec<NeededBatch>> {
+    fn needed() -> NeededCatalog {
         HashMap::from([(
             42,
-            vec![NeededBatch {
-                batch: 0,
-                terrain: false,
-                invalid_owned_state: false,
-            }],
+            HashMap::from([(
+                (0, false),
+                NeededBatch {
+                    batch: 0,
+                    terrain: false,
+                    invalid_owned_state: false,
+                },
+            )]),
         )])
     }
     #[test]
@@ -970,12 +1239,11 @@ mod tests {
     #[test]
     fn changed_inventory_scope_replaces_the_needed_catalog() {
         let base = catalog_key();
-        let mut changes = [base; 5];
-        changes[0].catalog.gpu_identity += 1;
-        changes[1].catalog.scene_changed = Tick::new(6);
-        changes[2].catalog.refusal_revision = Some(24);
-        changes[3].catalog.layout_scope += 1;
-        changes[4].catalog.runtime_state_revision = Some(32);
+        let mut changes = [base; 4];
+        changes[0].catalog.scene_changed = Tick::new(6);
+        changes[1].catalog.refusal_revision = Some(24);
+        changes[2].catalog.layout_scope += 1;
+        changes[3].catalog.runtime_state_revision = Some(32);
         for key in changes {
             let mut producer = Producer::default();
             let consumers = vec![consumer(1, false, Some(Arc::new(vec![true])))];
@@ -993,7 +1261,12 @@ mod tests {
                     || {
                         calls.set(calls.get() + 1);
                         let mut catalog = needed();
-                        catalog.get_mut(&42).unwrap()[0].invalid_owned_state = true;
+                        catalog
+                            .get_mut(&42)
+                            .unwrap()
+                            .get_mut(&(0, false))
+                            .unwrap()
+                            .invalid_owned_state = true;
                         catalog
                     },
                     |_| (true, true, false, true),
@@ -1099,6 +1372,7 @@ mod tests {
         let mut main = MainWorld::default();
         main.insert_resource(crate::cluster::package::ValidatedPackage(package.clone()));
         main.insert_resource(lazy);
+        let inventory = install_empty_inventory_scene(&mut main, &package, layout);
         main.insert_resource(crate::config::EngineConfig {
             worldspace_id: 42,
             ..default()
@@ -1118,6 +1392,7 @@ mod tests {
             .unwrap();
         render.resource_mut::<Producer>().pending = Some(Snapshot {
             package: package.clone(),
+            inventory: inventory.clone(),
             layout,
             generation,
             frame: 1,
@@ -1165,6 +1440,7 @@ mod tests {
         );
         render.resource_mut::<Producer>().pending = Some(Snapshot {
             package,
+            inventory: inventory.clone(),
             layout,
             generation,
             frame: 2,
@@ -1216,6 +1492,7 @@ mod tests {
         let mut main = MainWorld::default();
         main.insert_resource(crate::cluster::package::ValidatedPackage(package.clone()));
         main.insert_resource(lazy);
+        let inventory = install_empty_inventory_scene(&mut main, &package, layout);
         main.insert_resource(crate::config::EngineConfig {
             worldspace_id: 42,
             ..default()
@@ -1230,6 +1507,7 @@ mod tests {
         for (frame, pipelines) in [(1, 0), (2, 1), (3, 0)] {
             render.resource_mut::<Producer>().pending = Some(Snapshot {
                 package: package.clone(),
+                inventory: inventory.clone(),
                 layout,
                 generation,
                 frame,
