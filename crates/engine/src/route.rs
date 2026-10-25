@@ -17,7 +17,9 @@
 //! * The route starts when the world is first ready (the pacing predicate, see `pacing`), so the
 //!   measured walk is not the cold load of the start cell; until then the camera waits at the first
 //!   waypoint. That wait is the only one: once the route has started the runner never waits for
-//!   loading, never slows down and hides nothing. A route with `"start": "immediately"` does not
+//!   loading, never slows down and hides nothing. Initial admission includes the startup cover's
+//!   fade: moving before it finishes would invalidate the loading pose and keep the cover up.
+//!   A route with `"start": "immediately"` does not
 //!   wait at all. Frame times are scored from the first full frame on the route.
 //! * The route ends when the last waypoint is reached, and the benchmark window with it, so the
 //!   report covers the route and nothing after it. A looped route never ends; the benchmark's own
@@ -560,6 +562,7 @@ pub(crate) fn drive_route(
     origin: Res<RenderOrigin>,
     real_time: Res<Time<Real>>,
     tracker: Option<Res<PacingTracker>>,
+    startup: Option<Res<crate::pacing::startup::StartupLoad>>,
     mut runner: ResMut<RouteRunner>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
 ) {
@@ -568,10 +571,17 @@ pub(crate) fn drive_route(
     };
     // Only a measuring run keeps the readiness the start waits for.
     let waits_for_world = runner.plan.start == RouteStart::WorldReady && config.measures_pacing();
-    let ready = !waits_for_world
-        || tracker
-            .as_deref()
-            .is_some_and(PacingTracker::world_ready_reached);
+    // The pacing latch precedes the startup cover's fade. Starting movement
+    // during that fade changes the loading pose, invalidates render admission,
+    // and resets the fade every frame. This is an initial-start dependency only:
+    // a running route must never wait for streaming or re-enter loading.
+    let ready = runner.started
+        || runner.plan.start == RouteStart::Immediately
+        || (startup.is_none_or(|load| !load.cover_pending())
+            && (!waits_for_world
+                || tracker
+                    .as_deref()
+                    .is_some_and(PacingTracker::world_ready_reached)));
     let frame = runner.step(
         real_time.delta_secs(),
         ready,
