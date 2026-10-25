@@ -1,7 +1,7 @@
 //! Optional observation of API draw calls issued by Bevy's original mesh command.
 //!
 //! Atomic counters add submission overhead. Enable only for a separately labelled count capture.
-use crate::profiling::ProfilingState;
+use crate::{nif_depth::NifDepthMaterial, profiling::ProfilingState};
 use bevy::{
     core_pipeline::{
         core_3d::{AlphaMask3d, Opaque3d, Transparent3d},
@@ -12,7 +12,10 @@ use bevy::{
         query::ROQueryItem,
         system::{ReadOnlySystemParam, SystemParamItem, lifetimeless::SRes},
     },
-    pbr::{DrawDepthOnlyPrepass, DrawMaterial, DrawMesh, DrawPrepass, Shadow, Transmissive3d},
+    pbr::{
+        DrawDepthOnlyPrepass, DrawMaterial, DrawMesh, DrawPrepass, RenderMaterialInstances, Shadow,
+        Transmissive3d,
+    },
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
@@ -25,6 +28,7 @@ use bevy::{
 };
 use serde::Serialize;
 use std::{
+    any::TypeId,
     collections::BTreeMap,
     sync::{
         Arc, Mutex,
@@ -100,6 +104,10 @@ draw_counters!(
     leaf_mesh_commands_skipped,
     leaf_mesh_command_failures,
     issued_api_calls,
+    nif_depth_issued_api_calls,
+    standard_issued_api_calls,
+    other_material_issued_api_calls,
+    missing_material_issued_api_calls,
     direct_indexed_api_calls,
     direct_non_indexed_api_calls,
     fixed_indirect_api_calls,
@@ -329,7 +337,11 @@ fn install_observed_draws(world: &mut World) {
 
 struct CountedDrawMesh;
 impl<P: ObservedPhase> RenderCommand<P> for CountedDrawMesh {
-    type Param = (<DrawMesh as RenderCommand<P>>::Param, SRes<DrawCountBridge>);
+    type Param = (
+        <DrawMesh as RenderCommand<P>>::Param,
+        SRes<DrawCountBridge>,
+        Option<SRes<RenderMaterialInstances>>,
+    );
     type ViewQuery = <DrawMesh as RenderCommand<P>>::ViewQuery;
     type ItemQuery = <DrawMesh as RenderCommand<P>>::ItemQuery;
 
@@ -337,7 +349,7 @@ impl<P: ObservedPhase> RenderCommand<P> for CountedDrawMesh {
         item: &P,
         view: ROQueryItem<'w, '_, Self::ViewQuery>,
         entity: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
-        (original, bridge): SystemParamItem<'w, '_, Self::Param>,
+        (original, bridge, materials): SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
         let indexed = original
@@ -351,7 +363,18 @@ impl<P: ObservedPhase> RenderCommand<P> for CountedDrawMesh {
             .leaf_mesh_commands_reached
             .fetch_add(1, Ordering::Relaxed);
         match &result {
-            RenderCommandResult::Success => record_issued_draw(counts, indexed, item.extra_index()),
+            RenderCommandResult::Success => {
+                record_issued_draw(counts, indexed, item.extra_index());
+                record_material_draw(
+                    counts,
+                    materials.as_ref().and_then(|materials| {
+                        materials
+                            .instances
+                            .get(&item.main_entity())
+                            .map(|material| material.asset_id.type_id())
+                    }),
+                );
+            }
             RenderCommandResult::Skip => {
                 counts
                     .leaf_mesh_commands_skipped
@@ -365,6 +388,16 @@ impl<P: ObservedPhase> RenderCommand<P> for CountedDrawMesh {
         }
         result
     }
+}
+
+fn record_material_draw(counts: &AtomicDrawCounts, material_type: Option<TypeId>) {
+    let counter = match material_type {
+        Some(id) if id == TypeId::of::<NifDepthMaterial>() => &counts.nif_depth_issued_api_calls,
+        Some(id) if id == TypeId::of::<StandardMaterial>() => &counts.standard_issued_api_calls,
+        Some(_) => &counts.other_material_issued_api_calls,
+        None => &counts.missing_material_issued_api_calls,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 fn record_issued_draw(
@@ -444,6 +477,24 @@ mod tests {
         ) -> Result<(), DrawError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn material_partition_counts_each_success_once_including_missing_identity() {
+        let counts = AtomicDrawCounts::default();
+        for material in [
+            Some(TypeId::of::<NifDepthMaterial>()),
+            Some(TypeId::of::<StandardMaterial>()),
+            Some(TypeId::of::<crate::snow::SnowMaterial>()),
+            None,
+        ] {
+            record_material_draw(&counts, material);
+        }
+        let snapshot = counts.snapshot();
+        assert_eq!(snapshot.nif_depth_issued_api_calls, 1);
+        assert_eq!(snapshot.standard_issued_api_calls, 1);
+        assert_eq!(snapshot.other_material_issued_api_calls, 1);
+        assert_eq!(snapshot.missing_material_issued_api_calls, 1);
     }
 
     #[test]

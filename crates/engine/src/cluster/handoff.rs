@@ -2671,17 +2671,6 @@ fn finalize_terrain_clips(
                 .and_then(|shadow| shadow.subviews.get(&key)),
         };
         let shadow = light.is_some();
-        #[cfg(feature = "tracy")]
-        let membership_span =
-            bevy::log::info_span!("cluster::terrain_clips::phase_membership").entered();
-        let forward_members = phases.forward(&key);
-        let depth_members = if shadow {
-            phases.shadow(&key)
-        } else {
-            phases.prepass(&key)
-        };
-        #[cfg(feature = "tracy")]
-        drop(membership_span);
         // Separate records are essential: stock can be ready in forward while
         // its depth pipeline is still compiling, or vice versa. Actual queued
         // shadow membership also proves the stock queue's render-layer check.
@@ -2708,22 +2697,24 @@ fn finalize_terrain_clips(
                     .map(|identity| (identity.grid, identity.quadrant))
             };
             if !shadow
-                && forward_members.queued(*main)
+                && phases.contains_forward(&key, *main)
                 && stock.drawable(*main, key, StockPassFamily::Forward)
             {
                 forward_covered.extend(quadrants());
             }
-            if depth_members.queued(*main)
-                && stock.drawable(
-                    *main,
-                    key,
-                    if shadow {
-                        StockPassFamily::Shadow
-                    } else {
-                        StockPassFamily::Prepass
-                    },
-                )
-            {
+            if (if shadow {
+                phases.contains_shadow(&key, *main)
+            } else {
+                phases.contains_prepass(&key, *main)
+            }) && stock.drawable(
+                *main,
+                key,
+                if shadow {
+                    StockPassFamily::Shadow
+                } else {
+                    StockPassFamily::Prepass
+                },
+            ) {
                 depth_covered.extend(quadrants());
             }
         }

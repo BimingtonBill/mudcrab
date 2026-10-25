@@ -59,6 +59,18 @@ its material/pipeline proof between owner events. GPU-free tests cover the avail
 actual asset mutation APIs, and the device-recovery removal system. Live rendering and performance checks
 belong to the engine integration.
 
+- The post-ready cost work adds two read-only membership queries in `src/render_phase/mod.rs`:
+  `BinnedRenderPhase::contains_main_entity(MainEntity)` uses the native cached bin key and checks actual
+  membership in that exact bin, across all four phase types. Missing/empty cache entries and stale removed
+  members return false. It follows the native dequeue-before-requeue contract and does not recover orphaned
+  public-bin edits. `SortedRenderPhase::contains_main_entity(MainEntity)` probes the existing item map with
+  IndexMap's `raw_entry_v1` API, preserving custom/duplicate render carriers and batch followers. Its hash
+  lookup relies on Bevy 0.19's `EntityHash` replacing the hash on each `write_u64`, so a tuple key hashes like
+  its final `MainEntity`; an explicit test checks this contract with the actual map hasher. Neither query adds
+  an index, enumerates the phase, nor changes order, ranges, or membership. GPU-free native tests cover
+  differential enumeration, bin transitions/removals, stale caches, prepare lifetimes, hash generations,
+  and absence of sorted phase-item value visits. Test execution and live cost checks belong to integration.
+
 To verify the remaining source is untouched, compare this directory with the registry copy, allowing the
 five source files listed above, this README, and the missing `.cargo-ok`.
 
@@ -67,7 +79,7 @@ five source files listed above, this README, and the missing `.cargo-ok`.
 Remove the `[patch.crates-io]` `bevy_render` line from the workspace `Cargo.toml`, delete this folder, and
 `cargo update -p bevy_render` (or any build) restores the registry source and checksum in `Cargo.lock`. The
 engine's `--render-parallel-finish` flag, its call to `set_parallel_finish`, and consumers of the additional
-phase iterator and revision APIs must then be removed or migrated too.
+phase iterator, membership queries and revision APIs must then be removed or migrated too.
 
 ## Plan
 
