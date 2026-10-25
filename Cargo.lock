@@ -2930,6 +2930,7 @@ dependencies = [
  "tempfile",
  "time",
  "tracing",
+ "tracy-client",
  "url",
  "uuid",
  "wgpu",
