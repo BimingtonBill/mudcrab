@@ -882,7 +882,7 @@ type SourceObservationDomain = (
 );
 
 // Keep native filters and their observation domain authoritative. A copied-tick
-// precheck skips their query machinery only when the entire component is quiet.
+// precheck skips their query machinery only when eligible tables are quiet.
 // This still polls table rows; it is not mutation tracking or a zero-work cache.
 macro_rules! source_change_queries {
     ($name:ident, $domain:ty, { $($field:ident: $component:ty $(=> $extra:ty)?),+ $(,)? }) => {
@@ -898,7 +898,7 @@ macro_rules! source_change_queries {
                 last_run: bevy::ecs::change_detection::Tick,
                 this_run: bevy::ecs::change_detection::Tick,
             ) -> (impl Iterator<Item = Entity> + 'a, u64, u64) {
-                $(let $field = source_tick_probe::component_changes::<$component>(world, last_run, this_run);)+
+                $(let $field = source_tick_probe::filtered_component_changes::<$component, ($domain, Changed<$component>, $($extra,)?)>(world, last_run, this_run);)+
                 let rows = 0 $(+ $field.rows_checked)+;
                 let admitted = 0 $(+ u64::from($field.changed))+;
                 (
@@ -5151,6 +5151,25 @@ mod extract_source_tests {
             .world_mut()
             .entity_mut(primitive)
             .insert(Visibility::Inherited);
+        input.app.update();
+
+        // Flat pose admission must use the native structural scope, while
+        // unrelated GlobalTransform writes stay outside this query branch.
+        flatten_stock(&mut input, primitive);
+        let unrelated = input.app.world_mut().spawn(GlobalTransform::IDENTITY).id();
+        input.app.update();
+        input.app.update();
+        *input
+            .app
+            .world_mut()
+            .get_mut::<GlobalTransform>(unrelated)
+            .unwrap() = GlobalTransform::from_translation(Vec3::X);
+        input.app.update();
+        *input
+            .app
+            .world_mut()
+            .get_mut::<GlobalTransform>(primitive)
+            .unwrap() = GlobalTransform::from_translation(Vec3::Y);
         input.app.update();
     }
 
