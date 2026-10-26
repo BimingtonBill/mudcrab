@@ -185,6 +185,7 @@ impl TemplateMeshDependencies {
 #[derive(Clone, Copy, Debug, Default)]
 struct SourceExtractionWork {
     tick_rows_checked: u64,
+    visibility_probe_reuses: u64,
     identity_query_scans: u64,
     fact_query_scans: u64,
     hot_query_scans: u64,
@@ -916,33 +917,37 @@ type SourceObservationDomain = (
 // precheck skips their query machinery only when eligible tables are quiet.
 // This still polls table rows; it is not mutation tracking or a zero-work cache.
 macro_rules! source_change_queries {
-    ($name:ident, $domain:ty, { $($field:ident: $component:ty $(=> $extra:ty)?),+ $(,)? }) => {
+    ($name:ident, $probes:ident, $domain:ty, { $($field:ident: $component:ty $(=> $extra:ty)?),+ $(,)? }) => {
         #[derive(SystemParam)]
         struct $name<'w, 's> {
-            $($field: Query<'w, 's, Entity, ($domain, Changed<$component>, $($extra,)?)>),+
+            $($field: source_tick_probe::ComponentChangeQuery<'w, 's, $component, ($domain, $($extra,)?)>),+
+        }
+
+        #[derive(Clone, Copy)]
+        struct $probes {
+            $($field: source_tick_probe::TickProbe),+
         }
 
         impl $name<'_, '_> {
-            fn iter<'a>(
-                &'a self,
-                world: &'a World,
-                last_run: bevy::ecs::change_detection::Tick,
-                this_run: bevy::ecs::change_detection::Tick,
-            ) -> (impl Iterator<Item = Entity> + 'a, u64, u64) {
-                $(let $field = source_tick_probe::filtered_component_changes::<$component, ($domain, Changed<$component>, $($extra,)?)>(world, last_run, this_run);)+
+            fn iter(&self, prechecked: Option<$probes>) -> (impl Iterator<Item = Entity> + '_, u64, u64, $probes) {
+                let probes = prechecked.unwrap_or_else(|| $probes {
+                    $($field: self.$field.probe()),+
+                });
+                let $probes { $($field),+ } = probes;
                 let rows = 0 $(+ $field.rows_checked)+;
                 let admitted = 0 $(+ u64::from($field.changed))+;
                 (
-                    std::iter::empty()$(.chain(self.$field.iter().take(if $field.changed { usize::MAX } else { 0 })))+,
+                    std::iter::empty()$(.chain($field.changed.then(|| self.$field.iter_changed()).into_iter().flatten()))+,
                     rows,
                     admitted,
+                    probes,
                 )
             }
         }
     };
 }
 
-source_change_queries!(SourceFactQueries, SourceObservationDomain, {
+source_change_queries!(SourceFactQueries, SourceFactProbes, SourceObservationDomain, {
     cell: CellRef,
     scene: WorldAssetRoot,
     original_scene: OriginalStockScene,
@@ -957,12 +962,12 @@ source_change_queries!(SourceFactQueries, SourceObservationDomain, {
     extras: bevy::gltf::GltfExtras,
     retired: crate::streaming::RetireHidden,
 });
-source_change_queries!(SourceIdentityQueries, SourceObservationDomain, {
+source_change_queries!(SourceIdentityQueries, SourceIdentityProbes, SourceObservationDomain, {
     form: FormId,
     parent: ChildOf,
     flat_owner: FlatSourceOwner,
 });
-source_change_queries!(HotFactQueries, SourceObservationDomain, {
+source_change_queries!(HotFactQueries, HotFactProbes, SourceObservationDomain, {
     pose: Transform,
     flat_primitive: FlatSourcePrimitive,
     flat_pose: GlobalTransform => With<FlatSourcePrimitive>,
@@ -972,15 +977,13 @@ source_change_queries!(HotFactQueries, SourceObservationDomain, {
     standard: MeshMaterial3d<StandardMaterial>,
     snow: MeshMaterial3d<SnowMaterial>,
 });
-source_change_queries!(TerrainVisibilityQueries, (bevy::ecs::query::Allow<Visibility>, bevy::ecs::query::Allow<InheritedVisibility>), {
+source_change_queries!(TerrainVisibilityQueries, TerrainVisibilityProbes, (bevy::ecs::query::Allow<Visibility>, bevy::ecs::query::Allow<InheritedVisibility>), {
     visibility: Visibility,
     inherited: InheritedVisibility,
 });
 
 #[derive(SystemParam)]
 struct SourceQueries<'w, 's> {
-    // Read-all access makes copied row ticks quiescent throughout extraction.
-    world: &'w World,
     structure: Option<Res<'w, crate::streaming::identity_changes::StructureEpoch>>,
     query_filters: Res<'w, bevy::ecs::entity_disabling::DefaultQueryFilters>,
     journal: Option<Res<'w, Messages<crate::streaming::identity_changes::SourceNodeChanged>>>,
@@ -1461,11 +1464,7 @@ fn extract_sources(
     let journal_entities = changed.len();
     let mut identity_changed = false;
     {
-        let (entities, rows, admitted) = queries.identity_changes.iter(
-            queries.world,
-            queries.ticks.last_run(),
-            queries.ticks.this_run(),
-        );
+        let (entities, rows, admitted, _) = queries.identity_changes.iter(None);
         work.tick_rows_checked += rows;
         work.identity_query_scans += admitted;
         if admitted != 0 {
@@ -1495,11 +1494,7 @@ fn extract_sources(
     // Dirty identities are still deduplicated by the existing consumer.
     let mut other_changed = false;
     {
-        let (entities, rows, admitted) = queries.fact_changes.iter(
-            queries.world,
-            queries.ticks.last_run(),
-            queries.ticks.this_run(),
-        );
+        let (entities, rows, admitted, _) = queries.fact_changes.iter(None);
         work.tick_rows_checked += rows;
         work.fact_query_scans += admitted;
         if admitted != 0 {
@@ -1511,12 +1506,10 @@ fn extract_sources(
         }
     }
     let mut hot_changed = false;
+    let hot_visibility_probes;
     {
-        let (entities, rows, admitted) = queries.hot_changes.iter(
-            queries.world,
-            queries.ticks.last_run(),
-            queries.ticks.this_run(),
-        );
+        let (entities, rows, admitted, probes) = queries.hot_changes.iter(None);
+        hot_visibility_probes = (probes.visibility, probes.inherited);
         work.tick_rows_checked += rows;
         work.hot_query_scans += admitted;
         if admitted != 0 {
@@ -2287,12 +2280,20 @@ fn extract_sources(
         .any(|entity| terrain.contains_key(&MainEntity::from(*entity)));
     let fresh_terrain_visible =
         (refresh || fresh_terrain.is_some() || terrain_subject_changed || {
-            let (mut entities, rows, admitted) = queries.terrain_visibility_changes.iter(
-                queries.world,
-                queries.ticks.last_run(),
-                queries.ticks.this_run(),
-            );
+            let (mut entities, rows, admitted, _) =
+                queries
+                    .terrain_visibility_changes
+                    .iter(Some(TerrainVisibilityProbes {
+                        // Hot allows a superset of Terrain's disablers and adds no
+                        // visibility scope. A negative raw probe therefore excludes
+                        // Terrain changes; a positive conservatively admits its native
+                        // query. Share only this extraction's probe, never hot entities
+                        // or semantic hot_changed. Native policies remain separate.
+                        visibility: hot_visibility_probes.0.reused(),
+                        inherited: hot_visibility_probes.1.reused(),
+                    }));
             work.tick_rows_checked += rows;
+            work.visibility_probe_reuses += 2;
             work.terrain_visibility_query_scans += admitted;
             if admitted != 0 {
                 crate::work_counters::record("cluster_sources/terrain_visibility_query_scan");
@@ -2652,6 +2653,7 @@ fn extract_sources(
             other_refreshes = timing.other_refreshes,
             structural_refreshes = timing.structural_refreshes,
             tick_rows_checked = work.tick_rows_checked,
+            visibility_probe_reuses = work.visibility_probe_reuses,
             identity_query_scans = work.identity_query_scans,
             fact_query_scans = work.fact_query_scans,
             hot_query_scans = work.hot_query_scans,
@@ -5067,6 +5069,11 @@ mod extract_source_tests {
         input.render.resource_mut::<Sources>().force_full = true;
         input.extract();
         assert!(input.sources().last_work.qualification_full);
+        assert_eq!(
+            input.sources().last_work.visibility_probe_reuses,
+            0,
+            "full recovery bypasses terrain-query admission"
+        );
         assert_eq!(snapshot(input.sources()), expected);
         assert_eq!(input.sources().terrain, expected_terrain);
         assert_eq!(input.sources().terrain_visible, expected_terrain_visible);
@@ -5081,6 +5088,121 @@ mod extract_source_tests {
         let work = input.sources().last_work;
         assert!(!work.qualification_full);
         assert_eq!((work.discovery_roots, work.discovery_meshes), (0, 0));
+    }
+
+    #[test]
+    fn warmed_visibility_consumers_share_copied_ticks_without_skipping_population_work() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        input.extract();
+        input.extract();
+        let before = input.sources().last_work;
+        input
+            .app
+            .world_mut()
+            .spawn_batch((0..1024).map(|_| (Visibility::Inherited, InheritedVisibility::VISIBLE)));
+        input.extract();
+        input.extract();
+        input.extract();
+        let after = input.sources().last_work;
+        assert_eq!(
+            after.tick_rows_checked - before.tick_rows_checked,
+            2048,
+            "two visibility columns are polled once, despite separate hot/terrain consumers"
+        );
+        assert_eq!(after.visibility_probe_reuses, 2);
+        assert_eq!(after.terrain_visibility_query_scans, 0);
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
+    }
+
+    #[test]
+    fn shared_visibility_admission_preserves_terrain_disablers_and_journal_restoration() {
+        let mut input = Fixture::pending_with_disablers(|world| {
+            world.register_disabling_component::<FormId>();
+        });
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        let terrain = crate::streaming::TerrainPrimitiveIdentity {
+            worldspace_id: input.key.worldspace,
+            grid: IVec2::ZERO,
+            quadrant: 0,
+            tier: None,
+        }
+        .spawn_fixture(input.app.world_mut());
+        let main = MainEntity::from(terrain);
+        input.extract();
+        assert_eq!(
+            input.sources().last_work.visibility_probe_reuses,
+            0,
+            "the fresh terrain snapshot bypasses terrain-query admission"
+        );
+        input.extract();
+        assert!(input.sources().terrain_visible.contains(&main));
+        input
+            .app
+            .world_mut()
+            .entity_mut(terrain)
+            .insert(FormId(u32::MAX));
+        input.extract();
+        assert!(!input.sources().terrain_visible.contains(&main));
+        assert_eq!(
+            input.sources().last_work.visibility_probe_reuses,
+            0,
+            "changed terrain subjects bypass terrain-query admission"
+        );
+        assert_full_oracle(&mut input);
+        input.app.world_mut().entity_mut(terrain).remove::<FormId>();
+        input.extract();
+        assert!(
+            input.sources().terrain_visible.contains(&main),
+            "journal restoration must not require a new visibility write"
+        );
+        assert_full_oracle(&mut input);
+        *input
+            .app
+            .world_mut()
+            .get_mut::<InheritedVisibility>(terrain)
+            .unwrap() = InheritedVisibility::HIDDEN;
+        input.extract();
+        assert!(!input.sources().terrain_visible.contains(&main));
+        assert_full_oracle(&mut input);
+        *input
+            .app
+            .world_mut()
+            .get_mut::<InheritedVisibility>(terrain)
+            .unwrap() = InheritedVisibility::VISIBLE;
+        input.extract();
+        assert!(input.sources().terrain_visible.contains(&main));
+        assert_full_oracle(&mut input);
+    }
+
+    #[test]
+    fn default_disabled_visibility_population_does_not_add_source_tick_reads() {
+        let mut input = Fixture::pending();
+        let primitive = input.spawn_stock();
+        input.assert_bound(primitive);
+        input.extract();
+        input.extract();
+        let before = input.sources().last_work.tick_rows_checked;
+        input.app.world_mut().spawn_batch((0..1024).map(|_| {
+            (
+                Visibility::Inherited,
+                InheritedVisibility::VISIBLE,
+                bevy::ecs::entity_disabling::Disabled,
+            )
+        }));
+        input.extract();
+        input.extract();
+        input.extract();
+        assert_eq!(
+            input.sources().last_work.tick_rows_checked,
+            before,
+            "captured native default filters exclude disabled tables before polling"
+        );
+        assert_delta_only(&input);
+        assert_full_oracle(&mut input);
     }
 
     #[test]
@@ -5120,8 +5242,6 @@ mod extract_source_tests {
         }
 
         fn compare(
-            world: &World,
-            ticks: bevy::ecs::system::SystemChangeTick,
             queries: (
                 SourceFactQueries,
                 SourceIdentityQueries,
@@ -5138,30 +5258,19 @@ mod extract_source_tests {
                 terrain: old_terrain,
             } = originals;
             assert_eq!(
-                facts
-                    .iter(world, ticks.last_run(), ticks.this_run())
-                    .0
-                    .collect::<EntityHashSet>(),
+                facts.iter(None).0.collect::<EntityHashSet>(),
                 old_facts.iter().collect()
             );
             assert_eq!(
-                identity
-                    .iter(world, ticks.last_run(), ticks.this_run())
-                    .0
-                    .collect::<EntityHashSet>(),
+                identity.iter(None).0.collect::<EntityHashSet>(),
                 old_identity.iter().collect()
             );
             assert_eq!(
-                hot.iter(world, ticks.last_run(), ticks.this_run())
-                    .0
-                    .collect::<EntityHashSet>(),
+                hot.iter(None).0.collect::<EntityHashSet>(),
                 old_hot.iter().collect()
             );
             assert_eq!(
-                terrain
-                    .iter(world, ticks.last_run(), ticks.this_run())
-                    .0
-                    .collect::<EntityHashSet>(),
+                terrain.iter(None).0.collect::<EntityHashSet>(),
                 old_terrain.iter().collect()
             );
         }
