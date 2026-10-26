@@ -63,17 +63,61 @@ mesh extraction, skin and morph producers publish their existing changes from
 draws and untracked writable texture bindings refuse reuse. Material type names
 are diagnostic metadata and do not grant eligibility.
 
-`src/shadow_cache_parity.rs` supplies opt-in same-frame native map byte checks,
+The default-off `gpu-reuse-verify` feature forwards to
+`bevy_render/gpu-reuse-verify`. It compiles `src/shadow_cache_parity.rs` and its
+same-frame native map byte checks,
 including maps that normal policy already renders. The fresh and retained paths
 both preserve real command/bind safety. Diagnostic refusal receipts are separate
 from map equality. Ordinary rendering performs no diagnostic copies, dependency
-walks or readbacks with verification disabled.
+walks or readbacks with verification disabled. The default shadow path emits
+one native pass body; the replay loop, `ShadowReuseVerification`, texture-view
+diagnostics and audit counters do not compile into that path. Production
+cumulative and per-view reuse windows remain available, including an
+`audit_forced=0` telemetry field without stored audit state.
 
 The texture writer contract, invalidation list, engine integration, native audit
 boundaries and validation evidence are documented in
 `../../docs/design/cluster-gpu-exact-reuse.md`. Asset-backed texture updates must
 publish through `Assets<Image>` or a fresh `RenderAssets<GpuImage>::get_mut`.
 Raw writes through escaped handles are outside that cooperative contract.
+
+### Review corrections (#2153.1)
+
+Directional cameras reserve distinct physical slices. A fitting array sums
+camera cascades, with spots following the complete directional allocation. If
+that sum exceeds the device limit, retained per-camera atlases preserve the
+original per-camera/spot budget. Shared spots raster once; whole depth layers copy
+to the extra atlases at identical shader indices before camera sampling. The
+production overflow path alone adds COPY_SRC/COPY_DST and copy encoding; diagnostic
+COPY usages remain feature-gated independently. Camera topology changes invalidate
+owners, refresh unchanged spot attachments and prune removed atlas keys. Memory
+grows with active camera maps; no shadow content/settings are reduced.
+
+Only views with `DirectionalShadowMapInputs` enter stock begin/remove/set/pending
+bookkeeping. Point/spot faces keep their native pending queues but do not create
+stock-cache caster/material indices. Their draw wrappers also skip cache locks.
+The bounded `many_point_views_do_zero_stock_bookkeeping_cpu_diagnostic` test runs
+30 point lights x 6 faces x 10,000 casters plus four directional views through the
+actual helpers, comparing ungated calls with the production admission gate. It
+prints mutation-lock/index counts, retained memberships and elapsed CPU time;
+the elapsed values are diagnostics, not renderer timings or acceptance bars.
+
+Geometry, mesh allocation, image and pipeline revisions remain global conservative
+counters: any relevant mutation anywhere invalidates every map. Narrowing these
+requires complete per-caster producer dependency indices. `invalidated` therefore
+does not imply that a cascade's own casters changed. Static shader declarations
+remain supported; the unused unbounded per-asset `set_revision` API was removed.
+Animated material inputs still publish prepared-material changes.
+
+Poisoned dependency locks refuse certificates. Dependency mutation access discards
+poisoned state without clearing poison. The map owner lock instead recovers its
+per-frame early-skip flags, withdraws all owner/key certificates and permanently
+disables retention until resource recreation. Fresh early passes still receive
+late occlusion work; an already reused early pass skips late appending for that
+frame only. Recovery never re-enables retention. A late producer change after early reuse also skips the late draw,
+revokes ownership, and requires a cleared render next frame. That rare frame
+retains the previous complete map rather than combining old and new casters.
+Private unit tests now live in separate sibling modules.
 
 ## Workspace and removal
 

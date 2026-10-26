@@ -36,6 +36,8 @@ all-features = true
 features = ["bevy_image/zstd_rust"]
 
 [features]
+# Native GPU byte verification is intentionally absent from production builds.
+gpu-reuse-verify = ["bevy_render/gpu-reuse-verify"]
 area_light_luts = [
     "bevy_image/ktx2",
     "bevy_image/zstd",

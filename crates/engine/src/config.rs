@@ -127,8 +127,10 @@ pub struct EngineConfig {
     /// Explicit local report destination. `None` uses the per-user application-data directory.
     pub bug_report_dir: Option<PathBuf>,
     /// Opt-in native retained-versus-forced shadow depth verification output.
+    #[cfg(feature = "gpu-reuse-verify")]
     pub verify_shadow_reuse: Option<PathBuf>,
     /// Sentinel selecting one actual render FrameCount; requires verification.
+    #[cfg(feature = "gpu-reuse-verify")]
     pub verify_shadow_reuse_request: Option<PathBuf>,
     pub worldspace_id: u32,
     pub start_grid: (i32, i32),
@@ -599,7 +601,9 @@ impl Default for EngineConfig {
             settings_overrides: Vec::new(),
             assets_dir: PathBuf::from("modern_assets"),
             bug_report_dir: None,
+            #[cfg(feature = "gpu-reuse-verify")]
             verify_shadow_reuse: None,
+            #[cfg(feature = "gpu-reuse-verify")]
             verify_shadow_reuse_request: None,
             worldspace_id: 0x3c,
             start_grid: (0, 0),
@@ -748,12 +752,28 @@ impl Default for EngineConfig {
     }
 }
 
+#[cfg(feature = "gpu-reuse-verify")]
+macro_rules! gpu_reuse_verification_help {
+    () => { "  --verify-shadow-reuse <DIR>           exact native shadow depth audit (default: off; contaminates timings)
+  --verify-shadow-reuse-request <FILE>  requires audit mode; default DIR/REQUEST. Create after settlement;
+                                       first observed file selects one actual render FrameCount for all paired audits.
+                                       No reuse candidate is inconclusive. Existing audit environment controls remain supported.
+" };
+}
+
+#[cfg(not(feature = "gpu-reuse-verify"))]
+macro_rules! gpu_reuse_verification_help {
+    () => {
+        ""
+    };
+}
+
 /// The text `--help` prints, and the list of options the engine accepts.
 ///
 /// This and the `match` in [`EngineConfig::from_args`] are the two places an
 /// option is named; the tests read the match arms back out of this file and
 /// check the two agree, so neither can drift from the other.
-pub const HELP_TEXT: &str = "\
+pub const HELP_TEXT: &str = concat!("\
 Mudcrab engine
 
 Usage: engine [options]
@@ -878,11 +898,9 @@ Benchmark and profiling:
 
 Diagnostics:
   --bug-report-dir <dir>                local bug-report directory (default: per-user application data)
-  --verify-shadow-reuse <DIR>           exact native shadow depth audit (default: off; contaminates timings)
-  --verify-shadow-reuse-request <FILE>  requires audit mode; default DIR/REQUEST. Create after settlement;
-                                       first observed file selects one actual render FrameCount for all paired audits.
-                                       No reuse candidate is inconclusive. Existing audit environment controls remain supported.
-  --diagnostic-asset-fallbacks          log every fallback asset substitution
+",
+    gpu_reuse_verification_help!(),
+    "  --diagnostic-asset-fallbacks          log every fallback asset substitution
   --diagnostic-pipelines                log pipeline cardinality and pending-specialization causes once a second
   --water-reflection <planar|ssr|on|off>  measurement switch and Water Plus: ssr (default) marches the screen in the
                                         water shader, never renders the reflection view and copies the opaque colour
@@ -944,7 +962,7 @@ Help:
 
 Example (the dummy-content fixture's worldspace is 1):
   engine --assets modern_assets --worldspace 1
-";
+");
 
 /// What a parsed command line asks the process to do.
 #[derive(Debug, Clone)]
@@ -1331,10 +1349,12 @@ impl EngineConfig {
                     }
                     config.bug_report_dir = Some(PathBuf::from(path));
                 }
+                #[cfg(feature = "gpu-reuse-verify")]
                 "--verify-shadow-reuse" => {
                     config.verify_shadow_reuse =
                         Some(take_nonempty_path("--verify-shadow-reuse", args.next())?);
                 }
+                #[cfg(feature = "gpu-reuse-verify")]
                 "--verify-shadow-reuse-request" => {
                     config.verify_shadow_reuse_request = Some(take_nonempty_path(
                         "--verify-shadow-reuse-request",
@@ -2123,6 +2143,7 @@ impl EngineConfig {
             ));
         }
         config.check_seamless_only_flags()?;
+        #[cfg(feature = "gpu-reuse-verify")]
         if let Some(directory) = &config.verify_shadow_reuse {
             config
                 .verify_shadow_reuse_request
@@ -2962,6 +2983,7 @@ fn take_raw(
     }
 }
 
+#[cfg(feature = "gpu-reuse-verify")]
 fn take_nonempty_path(option: &'static str, value: Option<String>) -> Result<PathBuf, ConfigError> {
     const EXPECTED: &str = "a nonempty local path";
     let path = take_raw(option, EXPECTED, value)?;
@@ -3422,7 +3444,16 @@ mod tests {
     fn parser_options() -> Vec<&'static str> {
         CONFIG_SOURCE
             .lines()
-            .filter_map(|line| {
+            .scan("", |previous, line| {
+                let enabled = cfg!(feature = "gpu-reuse-verify")
+                    || *previous != r#"#[cfg(feature = "gpu-reuse-verify")]"#;
+                *previous = line.trim();
+                Some((enabled, line))
+            })
+            .filter_map(|(enabled, line)| {
+                if !enabled {
+                    return None;
+                }
                 let (option, rest) = leading_quoted(line)?;
                 // The bare `--` arm is a no-op marker, not an option to document.
                 // Only option literals: the portal's demo-name arms (`"alftand" =>`) are values.
@@ -5162,6 +5193,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gpu-reuse-verify")]
     #[test]
     fn shadow_reuse_verification_is_opt_in_and_defaults_to_directory_request() {
         let config = run_config(&[]);
@@ -5177,6 +5209,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gpu-reuse-verify")]
     #[test]
     fn shadow_reuse_request_preserves_path_in_either_option_order() {
         for args in [
@@ -5206,6 +5239,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gpu-reuse-verify")]
     #[test]
     fn shadow_reuse_verification_refuses_missing_empty_and_option_shaped_paths() {
         for option in ["--verify-shadow-reuse", "--verify-shadow-reuse-request"] {

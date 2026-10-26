@@ -1,3 +1,5 @@
+// Development-only crate: production resolves pristine crates.io Bevy 0.19.
+#![cfg(feature = "gpu-reuse-verify")]
 #![expect(missing_docs, reason = "Not all docs are written yet, see #3492.")]
 #![forbid(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -26,9 +28,7 @@ pub use schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems};
 
 mod fullscreen_vertex_shader;
 
-use crate::schedule::{
-    camera_driver, handle_uncovered_swap_chains, submit_pending_command_buffers,
-};
+use crate::schedule::{camera_driver, handle_uncovered_swap_chains, submit_pending_command_buffers};
 use crate::{
     blit::BlitPlugin, core_2d::Core2dPlugin, core_3d::Core3dPlugin,
     deferred::copy_lighting_id::CopyDeferredLightingIdPlugin, mip_generation::MipGenerationPlugin,
@@ -37,8 +37,8 @@ use crate::{
 };
 use bevy_app::{App, Plugin};
 use bevy_asset::embedded_asset;
-use bevy_render::RenderApp;
 use bevy_render::renderer::{RenderGraph, RenderGraphSystems};
+use bevy_render::RenderApp;
 use oit::OrderIndependentTransparencyPlugin;
 
 #[derive(Default)]

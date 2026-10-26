@@ -935,6 +935,17 @@ pub struct ShadowView {
     pub pass_name: String,
 }
 
+/// Physical source and prepared destinations for this shared spot map. The
+/// source identity is retained even without copies so reordering/atlas rebuilds
+/// refresh unchanged lights' attachments during prepare, before any sampling.
+#[derive(Component)]
+#[doc(hidden)]
+pub struct SpotShadowAtlas {
+    source: Texture,
+    destinations: Vec<Texture>,
+    layer: u32,
+}
+
 #[derive(Component)]
 pub struct ViewShadowBindings {
     pub point_light_depth_texture: Texture,
@@ -1056,17 +1067,16 @@ pub fn prepare_lights(
         shadow_cache,
         external_inputs,
         stock_inputs,
-        shadow_frame,
     ): (
-        Query<&ShadowView>,
+        Query<(&ShadowView, Option<&SpotShadowAtlas>)>,
         ResMut<LightKeyCache>,
         ResMut<SpecializedShadowMaterialPipelineCache>,
         ResMut<RetainedDirectionalShadowTexture>,
         Res<ShadowMapCache>,
         Res<ShadowMapExternalInputs>,
         Res<ShadowStockInputs>,
-        Res<bevy_diagnostic::FrameCount>,
     ),
+    #[cfg(feature = "gpu-reuse-verify")] shadow_frame: Res<bevy_diagnostic::FrameCount>,
 ) {
     let views_iter = views.iter();
     let views_count = views_iter.len();
@@ -1339,10 +1349,10 @@ pub fn prepare_lights(
         );
     }
 
-    // iterate the views once to find the maximum number of cascade shadowmaps we will need
-    let mut num_directional_cascades_enabled = 0usize;
+    // Count the same layer-filtered, admitted cascades used by the uniforms below.
+    let mut camera_cascade_counts = Vec::with_capacity(views_count);
     for (
-        _entity,
+        entity,
         _camera_main_entity,
         _extracted_view,
         _clusters,
@@ -1358,21 +1368,40 @@ pub fn prepare_lights(
         let mut num_directional_cascades_for_this_view = 0usize;
         let render_layers = maybe_layers.unwrap_or_default();
 
-        for light_entity in directional_light_entities.iter() {
+        for light_entity in directional_light_entities
+            .iter()
+            .filter(|light_entity| {
+                directional_lights
+                    .get(**light_entity)
+                    .unwrap()
+                    .2
+                    .render_layers
+                    .intersects(render_layers)
+            })
+            .take(MAX_DIRECTIONAL_LIGHTS)
+        {
             let light = directional_lights.get(*light_entity).unwrap().2;
-            if light.shadow_maps_enabled && light.render_layers.intersects(render_layers) {
-                num_directional_cascades_for_this_view += light
-                    .cascade_shadow_config
-                    .bounds
-                    .len()
-                    .min(MAX_CASCADES_PER_LIGHT);
+            if light.shadow_maps_enabled {
+                admit_directional_shadow_cascades(
+                    &mut num_directional_cascades_for_this_view,
+                    light
+                        .cascade_shadow_config
+                        .bounds
+                        .len()
+                        .min(MAX_CASCADES_PER_LIGHT),
+                    max_texture_array_layers,
+                );
             }
         }
 
-        num_directional_cascades_enabled = num_directional_cascades_enabled
-            .max(num_directional_cascades_for_this_view)
-            .min(max_texture_array_layers);
+        camera_cascade_counts.push((entity, num_directional_cascades_for_this_view));
     }
+    let atlas_layout = directional_shadow_atlas_layout(
+        camera_cascade_counts,
+        spot_light_shadow_maps_count,
+        max_texture_array_layers,
+    );
+    let num_directional_cascades_enabled = atlas_layout.spot_start;
 
     global_clusterable_object_meta
         .gpu_clustered_lights
@@ -1431,31 +1460,37 @@ pub fn prepare_lights(
                 array_layer_count: None,
             });
 
+    // Keep one disjoint array when it fits. Otherwise each camera has a retained
+    // atlas with local cascade indices and the original per-camera layer budget.
+    // These COPY usages transport production spot maps; audit usages stay gated
+    // independently below. No additional copy capability is needed in the fast path.
+    let directional_usage = directional_shadow_atlas_usage(atlas_layout.overflow);
+    #[cfg(feature = "gpu-reuse-verify")]
+    let directional_usage = directional_usage
+        | if shadow_cache.parity().enabled() {
+            TextureUsages::COPY_SRC
+        } else {
+            TextureUsages::empty()
+        };
     let directional_descriptor = TextureDescriptor {
         size: Extent3d {
             width: (directional_light_shadow_map.size as u32)
                 .min(render_device.limits().max_texture_dimension_2d),
             height: (directional_light_shadow_map.size as u32)
                 .min(render_device.limits().max_texture_dimension_2d),
-            depth_or_array_layers: (num_directional_cascades_enabled + spot_light_shadow_maps_count)
-                .max(1) as u32,
+            depth_or_array_layers: atlas_layout.layers as u32,
         },
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
         format: CORE_3D_DEPTH_FORMAT,
         label: Some("directional_light_shadow_map_texture"),
-        usage: TextureUsages::RENDER_ATTACHMENT
-            | TextureUsages::TEXTURE_BINDING
-            | if shadow_cache.parity().enabled() {
-                TextureUsages::COPY_SRC
-            } else {
-                TextureUsages::empty()
-            },
+        usage: directional_usage,
         view_formats: &[],
     };
-    // This array is retained outside TextureCache: the transient pool can lend
-    // the same allocation to a different consumer on another frame.
+    // These arrays are retained outside TextureCache: the transient pool can
+    // lend the same allocation to a different consumer on another frame.
+    let mut atlas_changed = atlas_layout.topology_changed(&retained_texture);
     if retained_texture
         .texture
         .as_ref()
@@ -1464,7 +1499,8 @@ pub fn prepare_lights(
                 || texture.texture.usage() != directional_descriptor.usage
         })
     {
-        shadow_cache.invalidate_physical_maps();
+        atlas_changed = true;
+        retained_texture.camera_textures.clear();
         let texture = render_device.create_texture(&directional_descriptor);
         let default_view = texture.create_view(&TextureViewDescriptor::default());
         retained_texture.texture = Some((
@@ -1475,32 +1511,44 @@ pub fn prepare_lights(
             },
         ));
     }
+    let extra_cameras: EntityHashSet = atlas_layout.extra_cameras().collect();
+    retained_texture
+        .camera_textures
+        .retain(|camera, _| extra_cameras.contains(camera));
+    for camera in atlas_layout.extra_cameras() {
+        retained_texture
+            .camera_textures
+            .entry(camera)
+            .or_insert_with(|| {
+                atlas_changed = true;
+                let texture = render_device.create_texture(&directional_descriptor);
+                let default_view = texture.create_view(&TextureViewDescriptor::default());
+                CachedTexture {
+                    texture,
+                    default_view,
+                }
+            });
+    }
+    if atlas_changed {
+        shadow_cache.invalidate_physical_maps();
+    }
+    retained_texture
+        .camera_slices
+        .clone_from(&atlas_layout.camera_slices);
+    retained_texture.spot_start = atlas_layout.spot_start;
+    retained_texture.overflow = atlas_layout.overflow;
+
     let Some((directional_extent, directional_light_depth_texture)) = &retained_texture.texture
     else {
         return;
     };
+    let spot_copy_destinations: Vec<_> = atlas_layout
+        .extra_cameras()
+        .map(|camera| retained_texture.camera_textures[&camera].texture.clone())
+        .collect();
 
     let directional_light_depth_texture_view =
-        directional_light_depth_texture
-            .texture
-            .create_view(&TextureViewDescriptor {
-                label: Some("directional_light_shadow_map_array_texture_view"),
-                format: None,
-                #[cfg(any(
-                    not(feature = "webgl"),
-                    not(target_arch = "wasm32"),
-                    feature = "webgpu"
-                ))]
-                dimension: Some(TextureViewDimension::D2Array),
-                #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
-                dimension: Some(TextureViewDimension::D2),
-                usage: None,
-                aspect: TextureAspect::DepthOnly,
-                base_mip_level: 0,
-                mip_level_count: None,
-                base_array_layer: 0,
-                array_layer_count: None,
-            });
+        directional_shadow_array_view(&directional_light_depth_texture.texture);
 
     let mut live_views = EntityHashSet::with_capacity(views_count);
 
@@ -1581,7 +1629,6 @@ pub fn prepare_lights(
     for (light_index, light_entity) in point_light_entities
         .iter()
         .skip(point_light_count)
-        .take(spot_light_count)
         .enumerate()
     {
         let (
@@ -1592,11 +1639,11 @@ pub fn prepare_lights(
             (_, spot_light_frustum),
         ) = point_lights.get_mut(*light_entity).unwrap();
 
-        if !light.shadow_maps_enabled {
-            despawn_entities(
-                &mut commands,
-                mem::take(&mut point_and_spot_light_view_entities.0),
-            );
+        if discard_unadmitted_spot_views(
+            &mut commands,
+            &mut point_and_spot_light_view_entities,
+            light_index < spot_light_count && light.shadow_maps_enabled,
+        ) {
             continue;
         }
 
@@ -1604,6 +1651,18 @@ pub fn prepare_lights(
         // so the retained view entity must not include the camera.
         let retained_view_entity = RetainedViewEntity::new(*light_main_entity, None, 0);
 
+        let spot_layer = (num_directional_cascades_enabled + light_index) as u32;
+        let current_spot_atlas = point_and_spot_light_view_entities
+            .0
+            .first()
+            .and_then(|entity| existing_shadow_views.get(*entity).ok())
+            .and_then(|(_, atlas)| atlas)
+            .map(|atlas| (atlas.source.id(), atlas.layer));
+        let spot_atlas_changed = spot_shadow_atlas_needs_update(
+            atlas_changed,
+            current_spot_atlas,
+            (directional_light_depth_texture.texture.id(), spot_layer),
+        );
         if point_and_spot_light_view_entities.0.is_empty() {
             let view_light_entity = commands.spawn_empty().id();
 
@@ -1612,6 +1671,7 @@ pub fn prepare_lights(
                 &mut directional_light_depth_attachments,
                 (num_directional_cascades_enabled, light_index),
                 &directional_light_depth_texture,
+                &spot_copy_destinations,
                 view_light_entity,
                 (light_entity, light_main_entity, light),
                 spot_light_frustum,
@@ -1620,12 +1680,13 @@ pub fn prepare_lights(
             );
 
             point_and_spot_light_view_entities.0 = vec![view_light_entity];
-        } else if changed_point_lights.get(*light_entity).is_ok() {
+        } else if spot_atlas_changed || changed_point_lights.get(*light_entity).is_ok() {
             create_spot_shadow_map(
                 &mut commands,
                 &mut directional_light_depth_attachments,
                 (num_directional_cascades_enabled, light_index),
                 &directional_light_depth_texture,
+                &spot_copy_destinations,
                 // There should only be one view light entity for spotlights
                 point_and_spot_light_view_entities.0[0],
                 (light_entity, light_main_entity, light),
@@ -1642,22 +1703,38 @@ pub fn prepare_lights(
         live_shadow_mapping_lights.insert(retained_view_entity);
     }
 
-    // set up light data for each view
+    // Use the prepared camera order directly: allocation and sampling consume
+    // the same ranges, including cameras with no matching directional lights.
     for (
-        entity,
-        camera_main_entity,
-        extracted_view,
-        clusters,
-        maybe_layers,
-        no_indirect_drawing,
-        maybe_ambient_override,
-        mip_bias,
+        (
+            entity,
+            camera_main_entity,
+            extracted_view,
+            clusters,
+            maybe_layers,
+            no_indirect_drawing,
+            maybe_ambient_override,
+            mip_bias,
+        ),
+        (layout_camera, view_slices),
     ) in sorted_cameras
         .0
         .iter()
         .filter_map(|sorted_camera| views.get(sorted_camera.entity).ok())
+        .zip(&atlas_layout.camera_slices)
     {
+        debug_assert_eq!(entity, *layout_camera);
         live_views.insert(entity);
+        let camera_texture = atlas_layout
+            .camera_atlas(entity)
+            .map(|camera| &retained_texture.camera_textures[&camera]);
+        let directional_light_depth_texture =
+            camera_texture.unwrap_or(directional_light_depth_texture);
+        let camera_texture_view =
+            camera_texture.map(|texture| directional_shadow_array_view(&texture.texture));
+        let directional_light_depth_texture_view = camera_texture_view
+            .as_ref()
+            .unwrap_or(&directional_light_depth_texture_view);
 
         let view_layers = maybe_layers.unwrap_or_default();
         let mut view_lights = Vec::new();
@@ -1686,6 +1763,7 @@ pub fn prepare_lights(
         let ambient_light = maybe_ambient_override.unwrap_or(&ambient_light);
 
         let mut gpu_directional_lights = [GpuDirectionalLight::default(); MAX_DIRECTIONAL_LIGHTS];
+        let directional_view_base = view_slices.start as u32;
         let mut num_directional_cascades_enabled_for_this_view = 0usize;
         let mut num_directional_lights_for_this_view = 0usize;
         for (index, light_entity) in directional_light_entities
@@ -1724,11 +1802,13 @@ pub fn prepare_lights(
                     .len()
                     .min(MAX_CASCADES_PER_LIGHT);
 
-                if num_directional_cascades_enabled_for_this_view + cascades
-                    <= max_texture_array_layers
-                {
+                num_cascades = admit_directional_shadow_cascades(
+                    &mut num_directional_cascades_enabled_for_this_view,
+                    cascades,
+                    max_texture_array_layers,
+                );
+                if num_cascades == cascades {
                     flags |= DirectionalLightFlags::SHADOW_MAPS_ENABLED;
-                    num_cascades += cascades;
                 }
             }
 
@@ -1754,7 +1834,8 @@ pub fn prepare_lights(
                 shadow_normal_bias: light.shadow_normal_bias,
                 num_cascades: num_cascades as u32,
                 cascades_overlap_proportion: light.cascade_shadow_config.overlap_proportion,
-                depth_texture_base_index: num_directional_cascades_enabled_for_this_view as u32,
+                depth_texture_base_index: directional_view_base
+                    + (num_directional_cascades_enabled_for_this_view - num_cascades) as u32,
                 sun_disk_angular_size: light.sun_disk_angular_size,
                 sun_disk_intensity: light.sun_disk_intensity,
                 decal_index: decals
@@ -1763,8 +1844,12 @@ pub fn prepare_lights(
                     .and_then(|index| index.try_into().ok())
                     .unwrap_or(u32::MAX),
             };
-            num_directional_cascades_enabled_for_this_view += num_cascades;
         }
+        debug_assert_eq!(
+            view_slices.len(),
+            num_directional_cascades_enabled_for_this_view
+        );
+        let mut directional_depth_texture_array_index = view_slices.start as u32;
 
         let mut gpu_lights = GpuLights {
             directional_lights: gpu_directional_lights,
@@ -1809,7 +1894,6 @@ pub fn prepare_lights(
             }
         }
 
-        let mut directional_depth_texture_array_index = 0u32;
         for (light_index, light_entity) in directional_light_entities
             .iter()
             .filter(|light_entity| {
@@ -1940,6 +2024,7 @@ pub fn prepare_lights(
                     directional_extent.depth_or_array_layers,
                 ];
 
+                #[cfg(feature = "gpu-reuse-verify")]
                 shadow_cache.parity().observe(
                     retained_view_entity,
                     directional_light_depth_texture.texture.id(),
@@ -2061,7 +2146,7 @@ pub fn prepare_lights(
 
     // Mark the existing shadow maps as unused this frame so that the first
     // drawcall to them will clear them.
-    for existing_shadow_view in &existing_shadow_views {
+    for (existing_shadow_view, _) in &existing_shadow_views {
         existing_shadow_view
             .depth_attachment
             .prepare_for_new_frame();
@@ -2200,6 +2285,7 @@ fn create_spot_shadow_map(
     directional_light_depth_attachments: &mut HashMap<u32, DepthAttachment>,
     (num_directional_cascades_enabled, light_index): (usize, usize),
     directional_light_depth_texture: &CachedTexture,
+    spot_copy_destinations: &[Texture],
     view_light_entity: Entity,
     (light_entity, light_main_entity, light): (&Entity, &MainEntity, &ExtractedPointLight),
     spot_light_frustum: Option<&Frustum>,
@@ -2239,6 +2325,11 @@ fn create_spot_shadow_map(
 
     let retained_view_entity = RetainedViewEntity::new(*light_main_entity, None, 0);
     commands.entity(view_light_entity).insert((
+        SpotShadowAtlas {
+            source: directional_light_depth_texture.texture.clone(),
+            destinations: spot_copy_destinations.to_vec(),
+            layer: base_array_layer,
+        },
         ShadowView {
             depth_attachment,
             pass_name: format!("shadow_spot_light_{light_index}"),
@@ -2271,6 +2362,21 @@ fn create_spot_shadow_map(
     ) {
         commands.entity(view_light_entity).insert(NoIndirectDrawing);
     }
+}
+
+// The budget can shrink without changing the excluded light itself. Retired
+// views own attachment/source/destination handles, so they must be despawned
+// even though the ordinary admitted-light preparation no longer visits them.
+fn discard_unadmitted_spot_views(
+    commands: &mut Commands,
+    views: &mut PointAndSpotLightViewEntities,
+    admitted: bool,
+) -> bool {
+    if admitted {
+        return false;
+    }
+    despawn_entities(commands, mem::take(&mut views.0));
+    true
 }
 
 fn despawn_entities(commands: &mut Commands, entities: Vec<Entity>) {
@@ -2343,6 +2449,7 @@ pub(crate) struct ShadowSpecializationWorkItem {
     render_entity: Entity,
     visible_entity: MainEntity,
     retained_view_entity: RetainedViewEntity,
+    cacheable: bool,
     mesh_key: MeshPipelineKey,
     layout: MeshVertexBufferLayoutRef,
     properties: Arc<MaterialProperties>,
@@ -2350,9 +2457,11 @@ pub(crate) struct ShadowSpecializationWorkItem {
 }
 
 fn refuse_shadow_specialization(world: &mut World, item: &ShadowSpecializationWorkItem) {
-    world
-        .resource::<ShadowStockInputs>()
-        .refuse_view(item.retained_view_entity);
+    if item.cacheable {
+        world
+            .resource::<ShadowStockInputs>()
+            .refuse_view(item.retained_view_entity);
+    }
     if let Some(pending) = world
         .resource_mut::<PendingShadowQueues>()
         .get_mut(&item.retained_view_entity)
@@ -2379,7 +2488,15 @@ pub(crate) struct SpecializeShadowsSystemParam<'w, 's> {
     render_material_instances: Res<'w, RenderMaterialInstances>,
     shadow_render_phases: Res<'w, ViewBinnedRenderPhases<Shadow>>,
     render_lightmaps: Res<'w, RenderLightmaps>,
-    view_light_entities: Query<'w, 's, (&'static LightEntity, &'static ExtractedView)>,
+    view_light_entities: Query<
+        'w,
+        's,
+        (
+            &'static LightEntity,
+            &'static ExtractedView,
+            Option<&'static DirectionalShadowMapInputs>,
+        ),
+    >,
     shadow_map_visible_entities_query: Query<'w, 's, &'static RenderShadowMapVisibleEntities>,
     light_key_cache: Res<'w, LightKeyCache>,
     specialized_shadow_material_pipeline_cache: ResMut<'w, SpecializedShadowMaterialPipelineCache>,
@@ -2413,8 +2530,11 @@ pub(crate) fn specialize_shadows(
             dirty_specializations,
         } = state.get_mut(world).unwrap();
 
-        for (light_entity, extracted_view_light) in &view_light_entities {
-            stock_inputs.begin_view(extracted_view_light.retained_view_entity);
+        for (light_entity, extracted_view_light, directional_inputs) in &view_light_entities {
+            let stock_inputs = stock_inputs.for_directional_view(directional_inputs);
+            if let Some(stock_inputs) = stock_inputs {
+                stock_inputs.begin_view(extracted_view_light.retained_view_entity);
+            }
             all_shadow_views.insert(extracted_view_light.retained_view_entity);
 
             if !shadow_render_phases.contains_key(&extracted_view_light.retained_view_entity) {
@@ -2422,7 +2542,9 @@ pub(crate) fn specialize_shadows(
             }
             let Some(light_key) = light_key_cache.get(&extracted_view_light.retained_view_entity)
             else {
-                stock_inputs.refuse_view(extracted_view_light.retained_view_entity);
+                if let Some(stock_inputs) = stock_inputs {
+                    stock_inputs.refuse_view(extracted_view_light.retained_view_entity);
+                }
                 continue;
             };
 
@@ -2516,7 +2638,9 @@ pub(crate) fn specialize_shadows(
                     continue;
                 }
                 let Some(mesh) = render_meshes.get(mesh_instance.mesh_asset_id()) else {
-                    stock_inputs.refuse_view(extracted_view_light.retained_view_entity);
+                    if let Some(stock_inputs) = stock_inputs {
+                        stock_inputs.refuse_view(extracted_view_light.retained_view_entity);
+                    }
                     view_pending_shadow_queues
                         .current_frame
                         .insert((*render_entity, *visible_entity));
@@ -2551,6 +2675,7 @@ pub(crate) fn specialize_shadows(
                     render_entity: *render_entity,
                     visible_entity: *visible_entity,
                     retained_view_entity: extracted_view_light.retained_view_entity,
+                    cacheable: stock_inputs.is_some(),
                     mesh_key,
                     layout: mesh.layout.clone(),
                     properties: material.properties.clone(),
@@ -2633,13 +2758,21 @@ pub fn queue_shadows(
     mut shadow_render_phases: ResMut<ViewBinnedRenderPhases<Shadow>>,
     gpu_preprocessing_support: Res<GpuPreprocessingSupport>,
     mesh_allocator: Res<MeshAllocator>,
-    view_light_entities: Query<(&LightEntity, &ExtractedView, Option<&RenderLayers>)>,
+    view_light_entities: Query<(
+        &LightEntity,
+        &ExtractedView,
+        Option<&RenderLayers>,
+        Option<&DirectionalShadowMapInputs>,
+    )>,
     shadow_map_visible_entities_query: Query<&RenderShadowMapVisibleEntities>,
     specialized_material_pipeline_cache: Res<SpecializedShadowMaterialPipelineCache>,
     mut pending_shadow_queues: ResMut<PendingShadowQueues>,
     dirty_specializations: Res<DirtySpecializations>,
 ) {
-    for (light_entity, extracted_view_light, maybe_view_render_layers) in &view_light_entities {
+    for (light_entity, extracted_view_light, maybe_view_render_layers, directional_inputs) in
+        &view_light_entities
+    {
+        let stock_inputs = stock_inputs.for_directional_view(directional_inputs);
         let Some(shadow_phase) =
             shadow_render_phases.get_mut(&extracted_view_light.retained_view_entity)
         else {
@@ -2672,7 +2805,9 @@ pub fn queue_shadows(
             .iter_to_dequeue(extracted_view_light.retained_view_entity, visible_entities)
         {
             shadow_phase.remove(main_entity);
-            stock_inputs.remove_caster(extracted_view_light.retained_view_entity, main_entity);
+            if let Some(stock_inputs) = stock_inputs {
+                stock_inputs.remove_caster(extracted_view_light.retained_view_entity, main_entity);
+            }
         }
 
         // Now iterate through all newly-visible entities and those needing respecialization.
@@ -2734,7 +2869,9 @@ pub fn queue_shadows(
             };
 
             let Some(mesh_slabs) = mesh_allocator.mesh_slabs(&mesh_instance.mesh_asset_id()) else {
-                stock_inputs.refuse_view(extracted_view_light.retained_view_entity);
+                if let Some(stock_inputs) = stock_inputs {
+                    stock_inputs.refuse_view(extracted_view_light.retained_view_entity);
+                }
                 continue;
             };
 
@@ -2745,14 +2882,16 @@ pub fn queue_shadows(
                 slabs: mesh_slabs,
             };
 
-            stock_inputs.set_caster(
-                extracted_view_light.retained_view_entity,
-                *main_entity,
-                material_instance.asset_id,
-                render_materials.asset_revision(material_instance.asset_id),
-                material_dependencies.dependency(material_instance.asset_id),
-                material.shadow_cache_untracked_texture,
-            );
+            if let Some(stock_inputs) = stock_inputs {
+                stock_inputs.set_caster(
+                    extracted_view_light.retained_view_entity,
+                    *main_entity,
+                    material_instance.asset_id,
+                    render_materials.asset_revision(material_instance.asset_id),
+                    material_dependencies.dependency(material_instance.asset_id),
+                    material.shadow_cache_untracked_texture,
+                );
+            }
 
             shadow_phase.add(
                 batch_set_key,
@@ -2891,18 +3030,166 @@ impl CachedRenderPipelinePhaseItem for Shadow {
 pub const EARLY_SHADOW_PASS: bool = false;
 pub const LATE_SHADOW_PASS: bool = true;
 
+#[derive(Debug, PartialEq, Eq)]
+struct DirectionalShadowAtlasLayout {
+    camera_slices: Vec<(Entity, Range<usize>)>,
+    spot_start: usize,
+    layers: usize,
+    overflow: bool,
+}
+
+impl DirectionalShadowAtlasLayout {
+    /// None selects the master; extra atlases are keyed by their owning camera.
+    fn camera_atlas(&self, camera: Entity) -> Option<Entity> {
+        (self.overflow
+            && self
+                .camera_slices
+                .first()
+                .is_some_and(|(master, _)| *master != camera))
+        .then_some(camera)
+    }
+
+    fn topology_changed(&self, retained: &RetainedDirectionalShadowTexture) -> bool {
+        retained.camera_slices != self.camera_slices
+            || retained.spot_start != self.spot_start
+            || retained.overflow != self.overflow
+    }
+
+    fn extra_cameras(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.camera_slices
+            .iter()
+            .skip(1)
+            .filter(|_| self.overflow)
+            .map(|(camera, _)| *camera)
+    }
+}
+
+fn directional_shadow_atlas_layout(
+    camera_cascades: Vec<(Entity, usize)>,
+    spots: usize,
+    max_layers: usize,
+) -> DirectionalShadowAtlasLayout {
+    let total: usize = camera_cascades.iter().map(|(_, cascades)| cascades).sum();
+    let overflow = total + spots > max_layers;
+    let mut next = 0;
+    let mut largest = 0;
+    let camera_slices = camera_cascades
+        .into_iter()
+        .map(|(camera, cascades)| {
+            largest = largest.max(cascades);
+            let slices = if overflow {
+                0..cascades
+            } else {
+                reserve_directional_shadow_slices(&mut next, cascades)
+            };
+            (camera, slices)
+        })
+        .collect();
+    let spot_start = if overflow { largest } else { total };
+    DirectionalShadowAtlasLayout {
+        camera_slices,
+        spot_start,
+        layers: (spot_start + spots).max(1),
+        overflow,
+    }
+}
+
+/// Both preallocation and GPU uniforms must apply the original per-camera
+/// admission limit, independent of the sum of all active cameras' cascades.
+fn admit_directional_shadow_cascades(
+    total: &mut usize,
+    cascades: usize,
+    max_layers: usize,
+) -> usize {
+    if *total + cascades <= max_layers {
+        *total += cascades;
+        cascades
+    } else {
+        0
+    }
+}
+
+fn directional_shadow_atlas_usage(overflow: bool) -> TextureUsages {
+    let usage = TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
+    if overflow {
+        usage | TextureUsages::COPY_SRC | TextureUsages::COPY_DST
+    } else {
+        usage
+    }
+}
+
+fn spot_shadow_atlas_needs_update(
+    atlas_changed: bool,
+    current: Option<(TextureId, u32)>,
+    desired: (TextureId, u32),
+) -> bool {
+    atlas_changed || current != Some(desired)
+}
+
+fn spot_shadow_copy_region(source_size: Extent3d, layer: u32) -> (Origin3d, Extent3d) {
+    (
+        Origin3d {
+            x: 0,
+            y: 0,
+            z: layer,
+        },
+        Extent3d {
+            depth_or_array_layers: 1,
+            ..source_size
+        },
+    )
+}
+
+fn directional_shadow_array_view(texture: &Texture) -> TextureView {
+    texture.create_view(&TextureViewDescriptor {
+        label: Some("directional_light_shadow_map_array_texture_view"),
+        format: None,
+        #[cfg(any(
+            not(feature = "webgl"),
+            not(target_arch = "wasm32"),
+            feature = "webgpu"
+        ))]
+        dimension: Some(TextureViewDimension::D2Array),
+        #[cfg(all(feature = "webgl", target_arch = "wasm32", not(feature = "webgpu")))]
+        dimension: Some(TextureViewDimension::D2),
+        usage: None,
+        aspect: TextureAspect::DepthOnly,
+        base_mip_level: 0,
+        mip_level_count: None,
+        base_array_layer: 0,
+        array_layer_count: None,
+    })
+}
+
+/// Reserves disjoint physical slices for one camera's directional cascades.
+fn reserve_directional_shadow_slices(next: &mut usize, cascades: usize) -> Range<usize> {
+    let start = *next;
+    *next += cascades;
+    start..*next
+}
+
+#[cfg(test)]
+#[path = "light_shadow_cache_tests.rs"]
+mod shadow_cache_tests;
+
 /// Renders the shadow maps that aren't associated with a specific view.
 ///
 /// At present, these consist of the point and spot light shadow maps.
 pub fn shared_shadow_pass<const IS_LATE: bool>(
     world: &World,
-    view_light_query: ViewQuery<(Entity, &ShadowView, &ExtractedView, Has<OcclusionCulling>)>,
+    view_light_query: ViewQuery<(
+        Entity,
+        &ShadowView,
+        &ExtractedView,
+        Has<OcclusionCulling>,
+        Option<&SpotShadowAtlas>,
+    )>,
     shadow_render_phases: Res<ViewBinnedRenderPhases<Shadow>>,
     mut ctx: RenderContext,
 ) {
-    let (view_light_entity, view_light, extracted_light_view, occlusion_culling) =
+    let (view_light_entity, view_light, extracted_light_view, occlusion_culling, spot_atlas) =
         view_light_query.into_inner();
-    view_shadow_pass::<IS_LATE>(
+    let rendered = view_shadow_pass::<IS_LATE>(
         view_light_entity,
         view_light,
         extracted_light_view,
@@ -2911,6 +3198,29 @@ pub fn shared_shadow_pass<const IS_LATE: bool>(
         &shadow_render_phases,
         &mut ctx,
     );
+    if let (true, Some(atlas)) = (rendered, spot_atlas) {
+        // Shared root views complete before camera views run. Keep each
+        // early/late copy on the native pass encoder, after its attachment
+        // is stored, before any camera samples these same shader indices.
+        let (origin, size) = spot_shadow_copy_region(atlas.source.size(), atlas.layer);
+        for destination in &atlas.destinations {
+            ctx.command_encoder().copy_texture_to_texture(
+                TexelCopyTextureInfo {
+                    texture: &atlas.source,
+                    mip_level: 0,
+                    origin,
+                    aspect: TextureAspect::DepthOnly,
+                },
+                TexelCopyTextureInfo {
+                    texture: destination,
+                    mip_level: 0,
+                    origin,
+                    aspect: TextureAspect::DepthOnly,
+                },
+                size,
+            );
+        }
+    }
 }
 
 /// Renders the shadow maps that are associated with a specific view.
@@ -2943,6 +3253,8 @@ pub fn per_view_shadow_pass<const IS_LATE: bool>(
 }
 
 /// A common helper function to render a shadow map.
+/// Returns whether a native pass (including its clear/store) was encoded, so
+/// shared spots copy only after actual writes and never on a skipped late pass.
 fn view_shadow_pass<const IS_LATE: bool>(
     view_light_entity: Entity,
     view_light: &ShadowView,
@@ -2951,14 +3263,14 @@ fn view_shadow_pass<const IS_LATE: bool>(
     world: &World,
     shadow_render_phases: &ViewBinnedRenderPhases<Shadow>,
     ctx: &mut RenderContext,
-) {
+) -> bool {
     if IS_LATE && !occlusion_culling {
-        return;
+        return false;
     }
 
     let Some(shadow_phase) = shadow_render_phases.get(&extracted_light_view.retained_view_entity)
     else {
-        return;
+        return false;
     };
 
     let cache = world
@@ -2972,6 +3284,7 @@ fn view_shadow_pass<const IS_LATE: bool>(
             IS_LATE,
             &view_light.pass_name,
         );
+        #[cfg(feature = "gpu-reuse-verify")]
         let paired = !IS_LATE
             && cache.parity().begin(
                 cache,
@@ -2983,9 +3296,11 @@ fn view_shadow_pass<const IS_LATE: bool>(
                 reuse,
                 ctx,
             );
-        if reuse && (IS_LATE || !paired) {
+        #[cfg(feature = "gpu-reuse-verify")]
+        let reuse = reuse && (IS_LATE || !paired);
+        if reuse {
             // Must precede get_attachment: acquiring it consumes the clear.
-            return;
+            return false;
         }
     }
 
@@ -2993,6 +3308,7 @@ fn view_shadow_pass<const IS_LATE: bool>(
     let _shadow_pass_span = info_span!("", "{}", view_light.pass_name).entered();
 
     let depth_stencil_attachment = Some(view_light.depth_attachment.get_attachment(StoreOp::Store));
+    #[cfg(feature = "gpu-reuse-verify")]
     if let Some(cache) = cache {
         cache.parity().attachment(
             world,
@@ -3016,19 +3332,9 @@ fn view_shadow_pass<const IS_LATE: bool>(
         multiview_mask: None,
     };
 
-    // Getter above runs exactly once. Replay uses the original attachment,
-    // clear/load/store operations and native command body on this encoder.
-    for lane in 0..2 {
-        let audit = cache
-            .filter(|cache| {
-                cache
-                    .parity()
-                    .active(world, extracted_light_view.retained_view_entity)
-            })
-            .map(|_| {
-                bevy_render::render_parity::NativeRenderAudit::begin(world, view_light_entity)
-            });
-        let mut render_pass = ctx.begin_tracked_render_pass(descriptor.clone());
+    #[cfg(not(feature = "gpu-reuse-verify"))]
+    {
+        let mut render_pass = ctx.begin_tracked_render_pass(descriptor);
 
         // Bevy 0.19's PassSpanGuard::end forgets its owned label. Pair the recorder
         // calls directly so dynamic shadow labels are released with the frame data.
@@ -3052,17 +3358,8 @@ fn view_shadow_pass<const IS_LATE: bool>(
         if let Some(diagnostics) = diagnostics {
             diagnostics.end_pass_span(&mut render_pass);
         }
-        // Both same-frame copies share this pass's encoder. End the native pass
-        // before encoding B; each camera's slice is saved before the next camera.
         drop(render_pass);
         if let Some(cache) = cache {
-            if let Some(reason) = audit.as_ref().and_then(|audit| audit.failure()) {
-                cache.parity().command_failure(
-                    world,
-                    extracted_light_view.retained_view_entity,
-                    &reason,
-                );
-            }
             cache.finish_with_world(
                 world,
                 extracted_light_view.retained_view_entity,
@@ -3070,19 +3367,80 @@ fn view_shadow_pass<const IS_LATE: bool>(
                 occlusion_culling,
                 rendered.is_ok(),
             );
-            let replay = cache.parity().finish(
-                cache,
-                world,
-                extracted_light_view.retained_view_entity,
-                IS_LATE,
-                ctx,
-            );
-            if replay && lane == 0 {
-                continue;
-            }
         }
-        break;
     }
+
+    #[cfg(feature = "gpu-reuse-verify")]
+    {
+        // Getter above runs exactly once. Replay uses the original attachment,
+        // clear/load/store operations and native command body on this encoder.
+        for lane in 0..2 {
+            let audit = cache
+                .filter(|cache| {
+                    cache
+                        .parity()
+                        .active(world, extracted_light_view.retained_view_entity)
+                })
+                .map(|_| {
+                    bevy_render::render_parity::NativeRenderAudit::begin(world, view_light_entity)
+                });
+            let mut render_pass = ctx.begin_tracked_render_pass(descriptor.clone());
+
+            // Bevy 0.19's PassSpanGuard::end forgets its owned label. Pair the recorder
+            // calls directly so dynamic shadow labels are released with the frame data.
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.begin_pass_span(
+                    &mut render_pass,
+                    format!(
+                        "{}_{}",
+                        view_light.pass_name,
+                        if IS_LATE { "late" } else { "early" }
+                    )
+                    .into(),
+                );
+            }
+
+            let rendered = shadow_phase.render(&mut render_pass, world, view_light_entity);
+            if let Err(err) = &rendered {
+                error!("Error encountered while rendering the shadow phase {err:?}");
+            }
+
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.end_pass_span(&mut render_pass);
+            }
+            // Both same-frame copies share this pass's encoder. End the native pass
+            // before encoding B; each camera's slice is saved before the next camera.
+            drop(render_pass);
+            if let Some(cache) = cache {
+                if let Some(reason) = audit.as_ref().and_then(|audit| audit.failure()) {
+                    cache.parity().command_failure(
+                        world,
+                        extracted_light_view.retained_view_entity,
+                        &reason,
+                    );
+                }
+                cache.finish_with_world(
+                    world,
+                    extracted_light_view.retained_view_entity,
+                    IS_LATE,
+                    occlusion_culling,
+                    rendered.is_ok(),
+                );
+                let replay = cache.parity().finish(
+                    cache,
+                    world,
+                    extracted_light_view.retained_view_entity,
+                    IS_LATE,
+                    ctx,
+                );
+                if replay && lane == 0 {
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+    true
 }
 
 /// Creates the [`ClusterableObjectType`] data for a point or spot light.

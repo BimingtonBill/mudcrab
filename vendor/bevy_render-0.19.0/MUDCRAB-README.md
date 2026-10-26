@@ -76,16 +76,24 @@ Task #2153 also adds exact shadow dependency facts and native parity support:
 - `render_asset.rs`, `erased_render_asset.rs` and `mesh/allocator.rs` publish
   content/changed-ID/allocation revisions at producer mutations. Immutable
   lookup does not certify arbitrary writes through escaped raw GPU handles.
-- `render_phase/draw.rs` tracks structural draw-registry mutations and preserves
-  command outcomes while reporting diagnostic Skip/missing-command failures.
-  `render_phase/mod.rs` routes missing lookups through the same audit admission.
+- `render_phase/draw.rs` tracks structural draw-registry mutations in production.
+  Binned and sorted phases skip missing draw functions and continue with the
+  remaining phase items. Command Skip/success/failure outcomes are preserved.
 - `render_parity.rs`, `render_phase/draw_state.rs`, `view/mod.rs` and `lib.rs`
-  implement/export opt-in paired native attachment readbacks and actual-bind
-  validation. `NativeRenderAudit` exposes that safety scope to the PBR native
-  emitter; it grants no retained-map eligibility.
+  implement/export paired native attachment readbacks and actual-bind validation
+  only with the default-off `gpu-reuse-verify` Cargo feature. The module, native
+  pipeline/raw-pass checks, command/missing-draw audit hooks and extra attachment
+  copy flags compile out without the feature. `NativeRenderAudit` exposes that
+  safety scope to the PBR native emitter; it grants no retained-map eligibility.
+  The raster audit reads other settings only with a nonempty
+  `MUDCRAB_RASTER_PARITY_DIR`; malformed frame thresholds log a diagnostic failure
+  and disable the audit without panicking or enabling copy flags.
 - `texture/fallback_image.rs` omits unnecessary render-attachment capability
   from initialized sampled fallback textures. Sampling/copy capabilities and
   initial bytes remain; uninitialized depth/MSAA targets retain attachment use.
+
+Reuse-specific raster, render-asset, erased-asset and fallback-image tests live
+in adjacent `*_tests.rs` modules. Raster tests require `gpu-reuse-verify`.
 
 For the complete invalidation and cooperative texture writer contract, see
 `../../docs/design/cluster-gpu-exact-reuse.md`. Compare with the registry copy

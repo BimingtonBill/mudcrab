@@ -43,6 +43,7 @@ debug = [
 decoupled_naga = ["bevy_shader/decoupled_naga"]
 detailed_trace = []
 gles = ["wgpu/gles"]
+gpu-reuse-verify = []
 morph = ["bevy_mesh/morph"]
 multi_threaded = [
     "bevy_tasks/multi_threaded",

@@ -9,6 +9,9 @@ license = "MIT OR Apache-2.0"
 keywords = ["bevy"]
 
 [features]
+# Diagnostic GPU reuse audits. Disabled in production builds.
+gpu-reuse-verify = []
+
 # Bevy users should _never_ turn this feature on.
 #
 # Bevy/wgpu developers can turn this feature on to test a newer version of wgpu without needing to also update naga_oil.

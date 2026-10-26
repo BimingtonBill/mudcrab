@@ -1,6 +1,6 @@
 use crate::{
     core_3d::Transparent3d,
-    oit::{OrderIndependentTransparencySettings, resolve::OitResolvePipelineId},
+    oit::{resolve::OitResolvePipelineId, OrderIndependentTransparencySettings},
 };
 use bevy_camera::{MainPassResolutionOverride, Viewport};
 use bevy_ecs::prelude::*;

@@ -10,7 +10,8 @@ No dependency version or upstream shader was changed. Upstream's
 Registry `.cargo-ok` and the package-local cache `Cargo.lock` are omitted.
 The normalized `Cargo.toml` and original upstream manifest are preserved.
 
-The parent owns the root Cargo patch and lockfile integration. The renderer-side
+This copy is development-only, selected by the explicit overlay described in
+`../README.md`; production uses the registry package without these hooks. The renderer-side
 implementation is `bevy_render::render_parity`; this crate owns the real native
 emission hooks. The hooks do not replace shaders or reconstruct draws.
 

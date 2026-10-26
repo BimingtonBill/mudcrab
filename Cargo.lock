@@ -693,6 +693,8 @@ dependencies = [
 [[package]]
 name = "bevy_core_pipeline"
 version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "885d640bbff6c4fa3beadbb043d0d1ae53b2fda864da18a2bf2670fb90428865"
 dependencies = [
  "bevy_app",
  "bevy_asset",
@@ -2902,7 +2904,9 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bevy_pbr",
  "bevy_rapier3d",
+ "bevy_render",
  "bytemuck",
  "color-eyre",
  "converter",

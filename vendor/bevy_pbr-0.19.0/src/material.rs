@@ -294,7 +294,18 @@ impl Plugin for MaterialsPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((PrepassPipelinePlugin, PrepassPlugin::new(self.debug_flags)));
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            #[cfg(feature = "gpu-reuse-verify")]
+            render_app.add_systems(
+                Render,
+                shadow_cache::parity::cleanup_shadow_parity
+                    .before(shadow_cache::report_shadow_cache_counters)
+                    .in_set(RenderSystems::Cleanup),
+            );
             render_app
+                .add_systems(
+                    Render,
+                    shadow_cache::report_shadow_cache_counters.in_set(RenderSystems::Cleanup),
+                )
                 .init_gpu_resource::<SpecializedMaterialPipelineCache>()
                 .init_gpu_resource::<SpecializedMeshPipelines<MaterialPipelineSpecializer>>()
                 .init_gpu_resource::<LightKeyCache>()
@@ -342,15 +353,6 @@ impl Plugin for MaterialsPlugin {
                     )
                         .chain()
                         .in_set(RenderSystems::PrepareBindGroups),
-                )
-                .add_systems(
-                    Render,
-                    (
-                        shadow_cache::parity::cleanup_shadow_parity,
-                        shadow_cache::report_shadow_cache_counters,
-                    )
-                        .chain()
-                        .in_set(RenderSystems::Cleanup),
                 )
                 .add_systems(
                     Render,
@@ -407,11 +409,14 @@ where
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             // Names are diagnostic metadata, never a dependency declaration.
-            render_app.init_resource::<shadow_cache::ShadowMaterialTypeNames>();
-            render_app
-                .world_mut()
-                .resource_mut::<shadow_cache::ShadowMaterialTypeNames>()
-                .register::<M>();
+            #[cfg(feature = "gpu-reuse-verify")]
+            {
+                render_app.init_resource::<shadow_cache::ShadowMaterialTypeNames>();
+                render_app
+                    .world_mut()
+                    .resource_mut::<shadow_cache::ShadowMaterialTypeNames>()
+                    .register::<M>();
+            }
             render_app
                 .add_systems(RenderStartup, add_material_bind_group_allocator::<M>)
                 .add_systems(
@@ -1475,6 +1480,7 @@ pub struct PreparedMaterial {
     pub shadow_cache_untracked_texture: bool,
     /// Actual sampled bindings retained only for opt-in shadow diagnostics.
     /// These references keep replaced GPU views alive until material replacement.
+    #[cfg(feature = "gpu-reuse-verify")]
     pub(crate) shadow_cache_texture_views: Option<Vec<(u32, TextureView)>>,
 }
 
@@ -1542,6 +1548,11 @@ where
     )
 }
 
+#[cfg(feature = "gpu-reuse-verify")]
+type ShadowMaterialDiagnostics = SRes<ShadowMapCache>;
+#[cfg(not(feature = "gpu-reuse-verify"))]
+type ShadowMaterialDiagnostics = ();
+
 // orphan rules T_T
 impl<M: Material> ErasedRenderAsset for MeshMaterial3d<M>
 where
@@ -1565,7 +1576,7 @@ where
         SRes<DrawFunctions<Opaque3dDeferred>>,
         SRes<DrawFunctions<AlphaMask3dDeferred>>,
         SRes<DrawFunctions<Shadow>>,
-        (SRes<AssetServer>, SRes<ShadowMapCache>),
+        (SRes<AssetServer>, ShadowMaterialDiagnostics),
         M::Param,
     );
 
@@ -1587,14 +1598,17 @@ where
             opaque_deferred_draw_functions,
             alpha_mask_deferred_draw_functions,
             shadow_draw_functions,
-            (asset_server, shadow_cache),
+            (asset_server, shadow_diagnostics),
             material_param,
         ): &mut SystemParamItem<Self::Param>,
     ) -> Result<Self::ErasedAsset, PrepareAssetError<Self::SourceAsset>> {
+        #[cfg(not(feature = "gpu-reuse-verify"))]
+        let () = shadow_diagnostics;
         let material_layout = M::bind_group_layout_descriptor(render_device);
         let actual_material_layout = pipeline_cache.get_bind_group_layout(&material_layout);
 
         let shadow_cache_untracked_texture;
+        #[cfg(feature = "gpu-reuse-verify")]
         let mut shadow_cache_texture_views = None;
         let binding = match material.unprepared_bind_group(
             &actual_material_layout,
@@ -1605,7 +1619,8 @@ where
             Ok(unprepared) => {
                 shadow_cache_untracked_texture =
                     shadow_cache::untracked_texture_bindings(&unprepared.bindings);
-                if shadow_cache.parity().enabled() {
+                #[cfg(feature = "gpu-reuse-verify")]
+                if shadow_diagnostics.parity().enabled() {
                     shadow_cache_texture_views = Some(
                         unprepared
                             .bindings
@@ -1795,6 +1810,7 @@ where
 
         Ok(PreparedMaterial {
             shadow_cache_untracked_texture,
+            #[cfg(feature = "gpu-reuse-verify")]
             shadow_cache_texture_views,
             binding,
             properties: Arc::new(MaterialProperties {

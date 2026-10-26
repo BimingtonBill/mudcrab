@@ -38,24 +38,45 @@ use wgpu::{
     TextureFormat, TextureUsages, TextureViewDescriptor,
 };
 
+#[derive(Debug, Default)]
 struct Config {
     directory: Option<PathBuf>,
     request: Option<PathBuf>,
     min_frame: u32,
 }
 
+impl Config {
+    fn from_env(mut read: impl FnMut(&str) -> Option<std::ffi::OsString>) -> Result<Self, String> {
+        let Some(directory) = read("MUDCRAB_RASTER_PARITY_DIR") else {
+            // Ignore all other diagnostic settings unless this audit is enabled.
+            return Ok(Self::default());
+        };
+        if directory.is_empty() {
+            return Err("MUDCRAB_RASTER_PARITY_DIR must not be empty".to_owned());
+        }
+        let min_frame = match read("MUDCRAB_RASTER_PARITY_MIN_FRAME") {
+            Some(value) => value
+                .into_string()
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .ok_or("MUDCRAB_RASTER_PARITY_MIN_FRAME must be an unsigned 32-bit integer")?,
+            None => 0,
+        };
+        Ok(Self {
+            directory: Some(PathBuf::from(directory)),
+            request: read("MUDCRAB_GPU_PARITY_REQUEST").map(PathBuf::from),
+            min_frame,
+        })
+    }
+}
+
 fn config() -> &'static Config {
     static CONFIG: OnceLock<Config> = OnceLock::new();
-    CONFIG.get_or_init(|| Config {
-        directory: std::env::var_os("MUDCRAB_RASTER_PARITY_DIR").map(PathBuf::from),
-        request: std::env::var_os("MUDCRAB_GPU_PARITY_REQUEST").map(PathBuf::from),
-        min_frame: std::env::var("MUDCRAB_RASTER_PARITY_MIN_FRAME")
-            .map(|value| {
-                value
-                    .parse()
-                    .expect("Invalid MUDCRAB_RASTER_PARITY_MIN_FRAME")
-            })
-            .unwrap_or(0),
+    CONFIG.get_or_init(|| {
+        Config::from_env(|name| std::env::var_os(name)).unwrap_or_else(|error| {
+            bevy_log::error!("NATIVE RASTER PARITY FAILED: {error}; audit disabled");
+            Config::default()
+        })
     })
 }
 
@@ -1032,258 +1053,5 @@ fn write_summary(state: &mut State) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::render_phase::{
-        admit_draw_function, admit_render_command_result, DrawError, RenderCommandResult,
-    };
-
-    #[test]
-    fn native_shadow_layout_admits_reads_and_refuses_render_storage_writes() {
-        use crate::render_resource::{BindGroupLayoutDescriptor, BindGroupLayoutEntry};
-        assert!(!read_only_render_layout(&[]));
-        for stage in [ShaderStages::VERTEX, ShaderStages::FRAGMENT] {
-            for read_only in [false, true] {
-                let layout = BindGroupLayoutDescriptor::new(
-                    "shadow audit",
-                    &[BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: stage,
-                        ty: BindingType::Buffer {
-                            ty: BufferBindingType::Storage { read_only },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    }],
-                );
-                assert_eq!(read_only_render_layout(&[layout]), read_only);
-            }
-            for access in [
-                StorageTextureAccess::WriteOnly,
-                StorageTextureAccess::ReadWrite,
-                StorageTextureAccess::Atomic,
-                StorageTextureAccess::ReadOnly,
-            ] {
-                let layout = BindGroupLayoutDescriptor::new(
-                    "shadow audit",
-                    &[BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: stage,
-                        ty: BindingType::StorageTexture {
-                            access,
-                            format: TextureFormat::R32Uint,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    }],
-                );
-                assert_eq!(
-                    read_only_render_layout(&[layout]),
-                    access == StorageTextureAccess::ReadOnly
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn native_shadow_scope_preserves_failure_and_rejects_unknown_pipeline() {
-        let (world, view, _) = draw_admission_world();
-        let allowed = RenderPipelineId::new();
-        let audit = NativeRenderAudit::enter(view, vec![allowed]);
-        validate_raster_pipeline(Some(allowed));
-        assert!(audit.failure().is_none());
-        validate_raster_pipeline(Some(RenderPipelineId::new()));
-        assert!(audit
-            .failure()
-            .unwrap()
-            .contains("Unverified native render pipeline"));
-        drop(audit);
-        let audit = NativeRenderAudit::enter(view, Vec::new());
-        assert_eq!(
-            admit_render_command_result(
-                &world,
-                view,
-                RenderCommandResult::Failure("failed shadow command")
-            ),
-            Err(DrawError::RenderCommandFailure("failed shadow command"))
-        );
-        assert_eq!(audit.failure().as_deref(), Some("failed shadow command"));
-    }
-
-    #[test]
-    fn native_shadow_scope_tracks_skip_missing_and_raw_pipeline_without_raster_lanes() {
-        let (world, view, other) = draw_admission_world();
-        let audit = NativeRenderAudit::enter(view, Vec::new());
-        assert!(native_render_audit_active(view));
-        assert!(!native_render_audit_active(other));
-        assert_eq!(raster_parity_lane(view), None);
-        assert_eq!(
-            admit_render_command_result(&world, other, RenderCommandResult::Skip),
-            Ok(())
-        );
-        assert!(audit.failure().is_none());
-        assert_eq!(
-            admit_render_command_result(&world, view, RenderCommandResult::Skip),
-            Ok(())
-        );
-        assert!(audit.failure().unwrap().contains("skipped"));
-        drop(audit);
-        let audit = NativeRenderAudit::enter(view, Vec::new());
-        assert!(admit_draw_function::<()>(&world, view, None).is_err());
-        assert!(audit.failure().unwrap().contains("missing"));
-        drop(audit);
-        let audit = NativeRenderAudit::enter(view, Vec::new());
-        validate_raster_pipeline(None);
-        assert!(audit.failure().unwrap().contains("raw pass"));
-        drop(audit);
-        assert!(!native_render_audit_active(view));
-        assert!(world.resource::<RasterParity>().lock().error.is_none());
-    }
-
-    #[test]
-    fn padding_is_excluded_but_every_native_byte_is_retained() {
-        assert_eq!(
-            unpack_rows(&[1, 2, 99, 99, 3, 4, 98, 98], 2, 4),
-            [1, 2, 3, 4]
-        );
-    }
-
-    #[test]
-    fn lane_is_scoped_to_view_and_restored() {
-        let mut world = World::new();
-        let view = world.spawn_empty().id();
-        let other = world.spawn_empty().id();
-        assert!(!raster_parity_forced_lane(view));
-        {
-            let _guard = LaneGuard::enter(view, RasterParityLane::Forced);
-            assert!(raster_parity_forced_lane(view));
-            assert!(!raster_parity_forced_lane(other));
-        }
-        assert!(!raster_parity_forced_lane(view));
-    }
-
-    #[test]
-    fn receipt_strings_escape_control_characters() {
-        assert_eq!(json_string("a\"\\\n\u{1}"), "\"a\\\"\\\\\\n\\u0001\"");
-    }
-
-    fn draw_admission_world() -> (World, Entity, Entity) {
-        let mut world = World::new();
-        world.init_resource::<RasterParity>();
-        let view = world.spawn_empty().id();
-        let other = world.spawn_empty().id();
-        (world, view, other)
-    }
-
-    #[test]
-    fn draw_admission_skip_fails_both_active_lanes_without_changing_draw_result() {
-        for lane in [RasterParityLane::Retained, RasterParityLane::Forced] {
-            let (world, view, _) = draw_admission_world();
-            let _guard = LaneGuard::enter(view, lane);
-            assert_eq!(
-                admit_render_command_result(&world, view, RenderCommandResult::Skip),
-                Ok(())
-            );
-            assert!(world.resource::<RasterParity>().lock().error.is_some());
-        }
-    }
-
-    #[test]
-    fn draw_admission_skip_preserves_inactive_and_other_view_behavior() {
-        let (world, view, other) = draw_admission_world();
-        assert_eq!(
-            admit_render_command_result(&world, view, RenderCommandResult::Skip),
-            Ok(())
-        );
-        let _guard = LaneGuard::enter(other, RasterParityLane::Retained);
-        assert_eq!(
-            admit_render_command_result(&world, view, RenderCommandResult::Skip),
-            Ok(())
-        );
-        assert!(world.resource::<RasterParity>().lock().error.is_none());
-    }
-
-    #[test]
-    fn draw_admission_success_including_intentional_once_suppression_is_accepted() {
-        for lane in [RasterParityLane::Retained, RasterParityLane::Forced] {
-            let (world, view, _) = draw_admission_world();
-            let _guard = LaneGuard::enter(view, lane);
-            assert_eq!(
-                admit_render_command_result(&world, view, RenderCommandResult::Success),
-                Ok(())
-            );
-            assert!(world.resource::<RasterParity>().lock().error.is_none());
-        }
-    }
-
-    #[test]
-    fn draw_admission_command_failure_preserves_original_error() {
-        let (world, view, _) = draw_admission_world();
-        assert_eq!(
-            admit_render_command_result(&world, view, RenderCommandResult::Failure("failure")),
-            Err(DrawError::RenderCommandFailure("failure"))
-        );
-    }
-
-    #[test]
-    fn draw_admission_missing_lookup_fails_both_active_lanes_before_sorted_unwrap() {
-        for lane in [RasterParityLane::Retained, RasterParityLane::Forced] {
-            let (world, view, _) = draw_admission_world();
-            let _guard = LaneGuard::enter(view, lane);
-            assert!(admit_draw_function::<()>(&world, view, None).is_err());
-            assert!(world.resource::<RasterParity>().lock().error.is_some());
-        }
-    }
-
-    #[test]
-    fn missing_draw_without_audit_cannot_certify_success() {
-        let (world, view, _) = draw_admission_world();
-        assert!(admit_draw_function::<()>(&world, view, None).is_err());
-        assert!(world.resource::<RasterParity>().lock().error.is_none());
-    }
-
-    #[test]
-    fn draw_admission_missing_lookup_errors_without_polluting_other_view_audits() {
-        let (world, view, other) = draw_admission_world();
-        assert!(admit_draw_function::<()>(&world, view, None).is_err());
-        let _guard = LaneGuard::enter(other, RasterParityLane::Retained);
-        assert!(admit_draw_function::<()>(&world, view, None).is_err());
-        assert!(world.resource::<RasterParity>().lock().error.is_none());
-    }
-
-    #[test]
-    fn draw_admission_present_lookup_preserves_draw_and_accepts_active_lanes() {
-        for lane in [RasterParityLane::Retained, RasterParityLane::Forced] {
-            let (world, view, _) = draw_admission_world();
-            let _guard = LaneGuard::enter(view, lane);
-            assert_eq!(admit_draw_function(&world, view, Some(7)), Ok(7));
-            assert!(world.resource::<RasterParity>().lock().error.is_none());
-        }
-    }
-
-    #[test]
-    fn raw_and_unknown_pipeline_access_fail_only_the_active_audit() {
-        let parity = RasterParity::default();
-        let known = RenderPipelineId::new();
-        let unknown = RenderPipelineId::new();
-        {
-            let _guard = PipelineGuard(PIPELINES.with(|slot| {
-                slot.replace(Some(PipelineScope {
-                    allowed: vec![known],
-                    state: Arc::clone(&parity.state),
-                }))
-            }));
-            validate_raster_pipeline(Some(known));
-            assert!(parity.lock().error.is_none());
-            validate_raster_pipeline(Some(unknown));
-            assert!(parity.lock().error.is_some());
-            parity.lock().error = None;
-            validate_raster_pipeline(None);
-            assert!(parity.lock().error.is_some());
-        }
-        parity.lock().error = None;
-        validate_raster_pipeline(None);
-        assert!(parity.lock().error.is_none());
-    }
-}
+#[path = "render_parity_tests.rs"]
+mod tests;

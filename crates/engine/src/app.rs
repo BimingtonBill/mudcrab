@@ -125,6 +125,7 @@ struct AssetDirectoryReadLock {
     _guard: shared::asset_lock::AssetLock,
 }
 
+#[cfg(feature = "gpu-reuse-verify")]
 fn configure_shadow_reuse_verification(app: &mut App) -> Result<()> {
     let config = app.world().resource::<EngineConfig>();
     let Some(directory) = &config.verify_shadow_reuse else {
@@ -469,6 +470,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .add_plugins(crate::render_backend::RenderBackendLogPlugin {
             problem: backend_choice.problem,
         });
+    #[cfg(feature = "gpu-reuse-verify")]
     configure_shadow_reuse_verification(&mut app)?;
     // Bevy's own `trace` features (`--features tracy`) add the render diagnostics themselves; a
     // second add panics, so add them only when the default plugins did not.
@@ -3522,6 +3524,7 @@ struct ScreenshotCaptureState {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "gpu-reuse-verify")]
     #[test]
     fn shadow_verification_requires_render_app_only_when_enabled() {
         let mut app = App::new();
@@ -3538,6 +3541,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gpu-reuse-verify")]
     #[test]
     fn shadow_verification_settings_reach_render_world_before_gpu_construction() {
         use bevy::pbr::shadow_cache::{ShadowMapCache, ShadowReuseVerification};

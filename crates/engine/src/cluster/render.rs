@@ -19,6 +19,7 @@ use gpu_contract::{CullParams, DRAW_INDEXED_INDIRECT_BYTES, SELECTED_CLUSTER_BYT
 #[path = "cull_reuse.rs"]
 mod cull_reuse;
 
+#[cfg(feature = "gpu-reuse-verify")]
 #[path = "cull_parity.rs"]
 mod cull_parity;
 
@@ -81,8 +82,7 @@ use bevy::{
         SetMeshViewBindingArrayBindGroup, SetPrepassViewBindGroup, SetPrepassViewEmptyBindGroup,
         Shadow, ShadowBatchSetKey, ShadowBinKey, ViewKeyCache, alpha_mode_pipeline_key,
         shadow_cache::{
-            ShadowCacheMaterialDependencies, ShadowCacheTracking, ShadowMapCache,
-            ShadowMapExternalInputs,
+            ShadowCacheMaterialDependencies, ShadowCacheTracking, ShadowMapExternalInputs,
         },
     },
     prelude::*,
@@ -870,13 +870,15 @@ impl Plugin for ClusterRenderPlugin {
             dependencies.declare_static::<crate::terrain_merge::material::MergedTerrainMaterial>();
         }
         pipeline_diagnostics::install(render_app, diagnostics);
+        #[cfg(feature = "gpu-reuse-verify")]
+        render_app
+            .init_resource::<cull_parity::CullParity>()
+            .add_systems(Render, cull_parity::poll.in_set(RenderSystems::Cleanup));
         render_app
             .init_resource::<ClusterPipelines>()
             .init_resource::<ClusterSettings>()
             .init_resource::<ClusterBatchMaterials>()
             .init_resource::<ClusterFrame>()
-            .init_resource::<cull_parity::CullParity>()
-            .add_systems(Render, cull_parity::poll.in_set(RenderSystems::Cleanup))
             .add_systems(
                 ExtractSchedule,
                 (extract_batch_materials, extract_cluster_frame),
@@ -928,6 +930,7 @@ impl Plugin for ClusterRenderPlugin {
 }
 
 impl ViewGpu {
+    #[cfg(feature = "gpu-reuse-verify")]
     fn prepass_ledger(&self, forced_audit_lane: bool) -> &std::sync::Mutex<HashMap<u32, u32>> {
         if forced_audit_lane {
             &self.audit_prepass_drawn
@@ -968,7 +971,9 @@ struct ViewGpu {
     /// selection compute, as well as every newly encoded cull result.
     shadow_content_revision: u64,
     /// Independent early/late ledger for the diagnostic forced raster lane.
+    #[cfg(feature = "gpu-reuse-verify")]
     audit_prepass_drawn: std::sync::Mutex<HashMap<u32, u32>>,
+    #[cfg(feature = "gpu-reuse-verify")]
     audit_cull_pending: bool,
     selection: Option<handoff::Selection>,
     /// The visible-set-independent part of `selection` ([`handoff::SelectionBase`]).
@@ -3204,6 +3209,26 @@ fn publish_cluster_shadow_inputs(
     inputs.publish_draw::<DrawClusterShadowMask>(view, frame, revision, complete);
 }
 
+#[derive(bevy::ecs::query::QueryData)]
+struct ClusterCullView {
+    view: &'static ExtractedView,
+    #[cfg(feature = "gpu-reuse-verify")]
+    entity: Entity,
+}
+
+/// Shadow publication stays in production; diagnostic resources disappear entirely
+/// without the verification feature, including their schedule access.
+#[derive(bevy::ecs::system::SystemParam)]
+struct ClusterCullOutputs<'w> {
+    shadow_inputs: Res<'w, ShadowMapExternalInputs>,
+    #[cfg(feature = "gpu-reuse-verify")]
+    parity: Res<'w, cull_parity::CullParity>,
+    #[cfg(feature = "gpu-reuse-verify")]
+    shadow_cache: Res<'w, bevy::pbr::shadow_cache::ShadowMapCache>,
+    #[cfg(feature = "gpu-reuse-verify")]
+    raster_parity: Option<Res<'w, bevy::render::render_parity::RasterParity>>,
+}
+
 /// The cull passes of every view that draws clusters: the 3D camera and each shadow cascade or
 /// cube face. Each view owns its parameters, compact instance list, source selection scratch,
 /// prefixes, argument list and draw counts. Eight stages cover all batches, preserving source
@@ -3217,27 +3242,33 @@ fn run_cluster_cull(
     pipeline_cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
-    views: Query<(Entity, &ExtractedView)>,
+    views: Query<ClusterCullView>,
     opaque_phases: Res<ViewBinnedRenderPhases<Opaque3d>>,
     shadow_phases: Res<ViewBinnedRenderPhases<Shadow>>,
     settings: Res<ClusterSettings>,
     mut force_recompute: Local<Option<bool>>,
     frame_count: Res<bevy::diagnostic::FrameCount>,
-    (shadow_inputs, parity, shadow_cache, raster_parity): (
-        Res<ShadowMapExternalInputs>,
-        Res<cull_parity::CullParity>,
-        Res<ShadowMapCache>,
-        Option<Res<bevy::render::render_parity::RasterParity>>,
-    ),
+    outputs: ClusterCullOutputs,
 ) {
     perf_span!("cluster::cull::total");
     let _timer = queue_stats::Timed::start(&queue_stats::CULL_NANOS);
+    let ClusterCullOutputs {
+        shadow_inputs,
+        #[cfg(feature = "gpu-reuse-verify")]
+        parity,
+        #[cfg(feature = "gpu-reuse-verify")]
+        shadow_cache,
+        #[cfg(feature = "gpu-reuse-verify")]
+        raster_parity,
+    } = outputs;
+    #[cfg(feature = "gpu-reuse-verify")]
     parity.request_frame(
         frame_count.0,
         shadow_cache.parity_request_frame(frame_count.0),
     );
     let Some(mut gpu) = gpu else {
-        for (_, view) in &views {
+        for query_view in &views {
+            let view = query_view.view;
             if shadow_phases.contains_key(&view.retained_view_entity) {
                 shadow_inputs.reset_materials(view.retained_view_entity, frame_count.0);
                 publish_cluster_shadow_inputs(
@@ -3272,7 +3303,8 @@ fn run_cluster_cull(
     // Every view that exists is stamped; the ones that have not been seen for a while are freed
     // (their buffers are as big as the scene's slot count, so a leaked set is not small).
     let now = std::time::Instant::now();
-    for (_, view) in &views {
+    for query_view in &views {
+        let view = query_view.view;
         if let Some(view_gpu) = gpu.views.get_mut(&view.retained_view_entity) {
             view_gpu.last_seen = now;
         }
@@ -3332,10 +3364,12 @@ fn run_cluster_cull(
     let materials = gpu.generation;
     let pipelines_revision = pipeline_cache.readiness_revision();
     // The views that draw opaque 3D or cast shadows: the UI camera's view has neither phase.
-    for (_, view) in views.iter().filter(|(_, view)| {
+    for query_view in views.iter().filter(|query_view| {
+        let view = query_view.view;
         opaque_phases.contains_key(&view.retained_view_entity)
             || shadow_phases.contains_key(&view.retained_view_entity)
     }) {
+        let view = query_view.view;
         // A view with nothing to draw (no batch has a material yet) has no groups.
         let Some(view_gpu) = gpu
             .views
@@ -3378,11 +3412,12 @@ fn run_cluster_cull(
             viewport: view.viewport.to_array(),
             invert_culling: view.invert_culling,
         };
-        if !view_gpu
+        let recompute = view_gpu
             .cull_reuse
-            .needs_recompute(inputs, uniform_changed || force_recompute)
-        {
-            if parity.begin(
+            .needs_recompute(inputs, uniform_changed || force_recompute);
+        #[cfg(feature = "gpu-reuse-verify")]
+        let recompute = if !recompute
+            && parity.begin(
                 view.retained_view_entity,
                 frame_count.0,
                 inputs,
@@ -3390,19 +3425,22 @@ fn run_cluster_cull(
                 &device,
                 ctx.command_encoder(),
             ) {
-                // Same-input diagnostic recomputation supplies a second native
-                // raster lane. Keep the shadow identity until its byte audit;
-                // this control is never enabled in timing captures.
-                view_gpu.cull_reuse.invalidate();
-                view_gpu.audit_cull_pending = true;
-            } else {
-                // Revalidate permission to draw this frame independently of when
-                // the retained buffers were produced. Do not clear retained counts.
-                view_gpu.last_cull_epoch = epoch;
-                view_gpu.pending_cull = None;
-                queue_stats::bump(&queue_stats::CULL_REUSED);
-                continue;
-            }
+            // Same-input diagnostic recomputation supplies a second native
+            // raster lane. Keep the shadow identity until its byte audit;
+            // this control is never enabled in timing captures.
+            view_gpu.cull_reuse.invalidate();
+            view_gpu.audit_cull_pending = true;
+            true
+        } else {
+            recompute
+        };
+        if !recompute {
+            // Revalidate permission to draw this frame independently of when
+            // the retained buffers were produced. Do not clear retained counts.
+            view_gpu.last_cull_epoch = epoch;
+            view_gpu.pending_cull = None;
+            queue_stats::bump(&queue_stats::CULL_REUSED);
+            continue;
         }
         view_gpu.pending_cull = Some(inputs);
         // Changed inputs start with empty arguments and counts.
@@ -3417,7 +3455,8 @@ fn run_cluster_cull(
     }
     let active: Vec<&ViewGpu> = views
         .iter()
-        .filter_map(|(_, view)| {
+        .filter_map(|query_view| {
+            let view = query_view.view;
             let key = view.retained_view_entity;
             gpu.views.get(&key).filter(|view_gpu| {
                 view_gpu.pending_cull.is_some()
@@ -3520,7 +3559,8 @@ fn run_cluster_cull(
     drop(active);
     // Publish only results whose complete eight-stage encode finished. Reused
     // results already acquired this frame's draw permission above.
-    for (view_entity, view) in &views {
+    for query_view in &views {
+        let view = query_view.view;
         if let Some(view_gpu) = gpu.views.get_mut(&view.retained_view_entity)
             && cluster_cull_view_eligible(
                 view_gpu,
@@ -3530,16 +3570,22 @@ fn run_cluster_cull(
             && let Some(inputs) = view_gpu.pending_cull.take()
         {
             view_gpu.cull_reuse.encoded(inputs);
+            #[cfg(not(feature = "gpu-reuse-verify"))]
+            {
+                view_gpu.shadow_content_revision = view_gpu.cull_reuse.revision();
+            }
+            #[cfg(feature = "gpu-reuse-verify")]
             if view_gpu.audit_cull_pending {
                 if let Some(pairs) = parity.finish(
                     view.retained_view_entity,
-                    view_entity,
+                    query_view.entity,
                     ctx.command_encoder(),
                 ) && opaque_phases.contains_key(&view.retained_view_entity)
                     && let Some(raster) = raster_parity
                         .as_ref()
                         .filter(|audit| audit.requested(frame_count.0))
-                    && let Err(error) = raster.register_view(frame_count.0, view_entity, pairs)
+                    && let Err(error) =
+                        raster.register_view(frame_count.0, query_view.entity, pairs)
                 {
                     error!(%error, "native raster buffer registration failed");
                 }
@@ -3588,10 +3634,12 @@ fn new_view_gpu(
 ) -> ViewGpu {
     perf_span!("cluster::view::allocate");
     let make = |label: &str, size: u64, usage: BufferUsages| {
+        #[cfg(feature = "gpu-reuse-verify")]
+        let usage = usage | cull_parity::copy_usage();
         device.create_buffer(&bevy::render::render_resource::BufferDescriptor {
             label: Some(label),
             size,
-            usage: usage | cull_parity::copy_usage(),
+            usage,
             mapped_at_creation: false,
         })
     };
@@ -3742,7 +3790,9 @@ fn new_view_gpu(
         pending_cull: None,
         selection_revision: 0,
         shadow_content_revision: cull_reuse::next_revision(),
+        #[cfg(feature = "gpu-reuse-verify")]
         audit_prepass_drawn: default(),
+        #[cfg(feature = "gpu-reuse-verify")]
         audit_cull_pending: false,
         selection: None,
         selection_base: None,
@@ -3988,16 +4038,21 @@ impl<P: PhaseItem, const FORWARD: bool, const ONCE: bool> RenderCommand<P>
     for DrawClusterIndirect<FORWARD, ONCE>
 {
     type Param = SRes<ClusterGpu>;
+    #[cfg(feature = "gpu-reuse-verify")]
     type ViewQuery = (Entity, &'static ExtractedView);
+    #[cfg(not(feature = "gpu-reuse-verify"))]
+    type ViewQuery = &'static ExtractedView;
     type ItemQuery = &'static ClusterBatch;
 
     fn render<'w>(
         _: &P,
-        (view_entity, view): ROQueryItem<'w, '_, Self::ViewQuery>,
+        view: ROQueryItem<'w, '_, Self::ViewQuery>,
         batch: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
         gpu: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
+        #[cfg(feature = "gpu-reuse-verify")]
+        let (view_entity, view) = view;
         let gpu = gpu.into_inner();
         let Some(batch) = batch else {
             return RenderCommandResult::Skip;
@@ -4013,17 +4068,21 @@ impl<P: PhaseItem, const FORWARD: bool, const ONCE: bool> RenderCommand<P>
         let Some(draw) = view_gpu.draws.get(&batch.index) else {
             return RenderCommandResult::Skip;
         };
-        if ONCE
-            && view_gpu
-                .prepass_ledger(bevy::render::render_parity::raster_parity_forced_lane(
-                    view_entity,
-                ))
+        if ONCE {
+            #[cfg(feature = "gpu-reuse-verify")]
+            let ledger = view_gpu.prepass_ledger(
+                bevy::render::render_parity::raster_parity_forced_lane(view_entity),
+            );
+            #[cfg(not(feature = "gpu-reuse-verify"))]
+            let ledger = &view_gpu.prepass_drawn;
+            if ledger
                 .lock()
                 .expect("prepass draw record")
                 .insert(batch.index, gpu.epoch)
                 == Some(gpu.epoch)
-        {
-            return RenderCommandResult::Success;
+            {
+                return RenderCommandResult::Success;
+            }
         }
         pass.set_index_buffer(gpu.cluster_indices.slice(..), IndexFormat::Uint16);
         if gpu.use_count {
@@ -5086,54 +5145,6 @@ fn publish_terrain_readiness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytemuck::Zeroable;
-
-    #[test]
-    fn cull_uniform_uploads_once_until_shader_inputs_change() {
-        let mut uploaded = None;
-        let mut params = CullParams::zeroed();
-        let first = cull_params_to_upload(&mut uploaded, params).expect("first upload");
-        assert_eq!(first, &[0; CULL_PARAMS_BYTES]);
-        assert!(cull_params_to_upload(&mut uploaded, params).is_none());
-        params.epoch = 42;
-        assert!(cull_params_to_upload(&mut uploaded, params).is_none());
-        params.instance_count = 17;
-        let bytes = cull_params_to_upload(&mut uploaded, params).expect("new instances");
-        assert_eq!(&bytes[108..112], &17_u32.to_ne_bytes());
-        assert_eq!(&bytes[124..128], &[0; 4]);
-        assert!(cull_params_to_upload(&mut uploaded, params).is_none());
-        uploaded = None;
-        assert!(cull_params_to_upload(&mut uploaded, params).is_some());
-    }
-
-    #[test]
-    fn cull_uniform_upload_observes_every_shader_input_byte() {
-        let params = CullParams::zeroed();
-        for byte in 0..std::mem::offset_of!(CullParams, epoch) {
-            let mut uploaded = Some(params);
-            let mut changed = params;
-            bytemuck::bytes_of_mut(&mut changed)[byte] = 1;
-            let bytes = cull_params_to_upload(&mut uploaded, changed)
-                .unwrap_or_else(|| panic!("shader input byte {byte} changed"));
-            assert_eq!(bytes[byte], 1);
-        }
-    }
-
-    #[test]
-    fn cull_uniform_upload_compares_float_bits_including_nan_and_signed_zero() {
-        let mut uploaded = None;
-        let mut params = CullParams::zeroed();
-        params.near = f32::from_bits(0x7fc0_0001);
-        assert!(cull_params_to_upload(&mut uploaded, params).is_some());
-        assert!(cull_params_to_upload(&mut uploaded, params).is_none());
-        params.near = f32::from_bits(0x7fc0_0002);
-        assert!(cull_params_to_upload(&mut uploaded, params).is_some());
-        params.near = 0.0;
-        assert!(cull_params_to_upload(&mut uploaded, params).is_some());
-        params.near = -0.0;
-        assert!(cull_params_to_upload(&mut uploaded, params).is_some());
-    }
-
     #[test]
     fn optional_layout_refusal_queues_ordinary_once_and_does_not_retry_the_refused_variant() {
         let draw = BindGroupLayoutDescriptor::new(
@@ -6100,3 +6111,7 @@ mod tangent_layout_regressions {
         assert!(!pipelines.prepass.contains_key(&key));
     }
 }
+
+#[cfg(test)]
+#[path = "cull_uniform_tests.rs"]
+mod cull_uniform_tests;
