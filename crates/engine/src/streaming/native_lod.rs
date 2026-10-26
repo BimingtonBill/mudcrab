@@ -38,6 +38,17 @@ pub(crate) struct FarNativePolicy {
     owned: bool,
 }
 impl FarNativePolicy {
+    fn update(&mut self, window: Option<(u32, IVec2, i32)>, owned: bool) {
+        // Owned clusters are never withheld for native LOD. Keep the latest
+        // window for an ownership toggle, without invalidating identical policy.
+        let changed = self.owned != owned || (!owned && self.window != window);
+        self.window = window;
+        self.owned = owned;
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
     pub(crate) fn cluster_inside_grid(&self, world: u32, cell: IVec2) -> bool {
         self.owned
             || self.window.is_some_and(|(w, center, radius)| {
@@ -97,6 +108,27 @@ struct MeshRoles {
     near: Option<NativeLodCell>,
     block: Option<BlockKey>,
     native: Option<NativeLodCell>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawRole {
+    Block(BlockKey),
+    Native(NativeLodCell),
+    Near,
+}
+
+fn draw_role(inputs: &Inputs, main: MainEntity, reads: &mut u64) -> Option<DrawRole> {
+    // Extraction publishes the same merged inventory that the native filter
+    // consumes. Preserve object-before-native priority without re-reading maps.
+    *reads += 1;
+    let roles = inputs.roles.get(&main)?;
+    if let Some(key) = roles.block {
+        return Some(DrawRole::Block(key));
+    }
+    if let Some(cell) = roles.native {
+        return Some(DrawRole::Native(cell));
+    }
+    roles.near.map(|_| DrawRole::Near)
 }
 
 #[derive(Resource, Default)]
@@ -187,6 +219,7 @@ fn evaluate(
     stats.tree_cells = 0;
     stats.object_blocks = 0;
     stats.frames = stats.frames.wrapping_add(1);
+    let mut role_reads = 0;
     for (view, visible, depth, normal, motion) in &views {
         let mut failure_counts = [0usize; 4];
         let mut stuck = Vec::new();
@@ -199,17 +232,18 @@ fn evaluate(
             .into_iter()
             .flat_map(|class| class.iter_visible())
         {
-            if !inputs.native.contains_key(main)
-                && !inputs.object_meshes.contains_key(main)
-                && !inputs.near.contains_key(main)
-            {
+            let Some(role) = draw_role(&inputs, *main, &mut role_reads) else {
                 continue;
-            }
+            };
             stats.visible += 1;
-            if let Some(key) = inputs.object_meshes.get(main) {
-                blocks.insert(*key);
-            } else if let Some(cell) = inputs.native.get(main) {
-                trees.insert(*cell);
+            match role {
+                DrawRole::Block(key) => {
+                    blocks.insert(key);
+                }
+                DrawRole::Native(cell) => {
+                    trees.insert(cell);
+                }
+                DrawRole::Near => {}
             }
             let queued_forward = forward.queued(*main);
             let proof_forward =
@@ -227,12 +261,10 @@ fn evaluate(
                 *count += usize::from(missing);
             }
             if !proof_forward && stuck.len() < STUCK_SAMPLES && stats.frames.is_multiple_of(120) {
-                let source = if let Some(block) = inputs.object_meshes.get(main) {
-                    format!("object block {block:?}")
-                } else if let Some(cell) = inputs.native.get(main) {
-                    format!("native {cell:?}")
-                } else {
-                    format!("near {:?}", inputs.near.get(main))
+                let source = match role {
+                    DrawRole::Block(block) => format!("object block {block:?}"),
+                    DrawRole::Native(cell) => format!("native {cell:?}"),
+                    DrawRole::Near => format!("near {:?}", inputs.near.get(main)),
                 };
                 stuck.push((
                     *main,
@@ -256,6 +288,7 @@ fn evaluate(
             }
         }
     }
+    crate::work_counters::record_count("native_lod/draw_role_reads", role_reads);
     if stats.frames.is_multiple_of(120) {
         info!(
             pending = stats.pending,
@@ -376,9 +409,7 @@ fn extract(
         .current(&config, origin.0, portal.as_deref())
         .map(|d| (d.world, d.center, config.stream_radius));
     if policy.window != window || policy.owned != config.cluster_own_statics {
-        policy.window = window;
-        policy.owned = config.cluster_own_statics;
-        policy.revision = policy.revision.wrapping_add(1);
+        policy.update(window, config.cluster_own_statics);
     }
     // An object LOD state with no ready block (object LOD switched off, or nothing loaded yet)
     // gives the filter nothing to select or hide, and makes it walk every near cell for nothing.
@@ -826,6 +857,8 @@ pub(super) fn demand_role(demand: Option<super::lod::LodDemand>) -> CellRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("native_lod_policy_tests.rs");
+    include!("native_lod_role_tests.rs");
     #[test]
     fn residency_or_one_missing_pass_never_certifies_a_cell() {
         assert!(!qualified_cell(false, [true, true]));
