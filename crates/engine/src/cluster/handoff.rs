@@ -105,6 +105,8 @@ pub(super) struct Sources {
     fixture_layout_scope: bool,
     /// Definitive global template/material refusal, separate from loading false values.
     source_fallback_batches: BTreeSet<u32>,
+    /// Exact loading-aggregate inputs, independent of broad source qualification.
+    readiness_changes: SourceReadinessChanges,
     /// Unsupported material features, excluding failed or invalid source resources.
     material_refused_batches: BTreeSet<u32>,
     template_revision: u64,
@@ -125,6 +127,20 @@ pub(super) struct Sources {
         Option<bevy::asset::UntypedAssetId>,
         Option<AssetId<WorldAsset>>,
     )>,
+}
+
+#[derive(Default)]
+struct SourceReadinessChanges {
+    scope: Arc<()>,
+    batches: BTreeSet<usize>,
+}
+
+impl SourceReadinessChanges {
+    fn record(&mut self, batch: usize, old: (bool, bool), new: (bool, bool)) {
+        if old != new {
+            self.batches.insert(batch);
+        }
+    }
 }
 
 /// Dependencies belong to the loaded template, including every mesh of a refused template.
@@ -2231,6 +2247,15 @@ fn extract_sources(
                 out.template_inputs.resize(index as usize + 1, (None, None));
             }
             out.template_inputs[index as usize] = input;
+            let old_readiness = (
+                out.templates.get(index as usize).copied().unwrap_or(false),
+                out.source_fallback_batches.contains(&index),
+            );
+            out.readiness_changes.record(
+                index as usize,
+                old_readiness,
+                (row.template, row.fallback),
+            );
             templates[index as usize] = row.template;
             normal_maps[index as usize] = row.normal_map;
             stock_tangents[index as usize] = row.stock_tangents;
@@ -2256,6 +2281,8 @@ fn extract_sources(
         // Pending=false -> loaded-invalid=false does not change templates. Keep its
         // negative demand independently so that transition cannot be lost.
         out.source_fallback_batches = source_fallback_batches;
+        let old_batches = out.templates.len();
+        out.readiness_changes.batches.extend(batches..old_batches);
         (templates, normal_maps)
     });
     drop(templates_span);
@@ -2567,6 +2594,12 @@ fn extract_sources(
             queries.cache.evaluated = None;
             out.bound.clear();
             out.stock_primitives.clear();
+            for index in 0..out.templates.len() {
+                let fallback = out.source_fallback_batches.contains(&(index as u32));
+                let previous = out.templates[index];
+                out.readiness_changes
+                    .record(index, (previous, fallback), (false, fallback));
+            }
             out.templates.fill(false);
             if out.stock_tangents.iter().any(Option::is_some) {
                 out.stock_tangents.fill(None);
@@ -2701,11 +2734,18 @@ impl ViewDomain {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct PreparedMaterialInputs {
+    scope: u64,
+    revision: u64,
+    allocators: Vec<(std::any::TypeId, u64)>,
+}
+
 #[derive(Resource, Default)]
 struct Filters {
     frames: u64,
     /// Exact mutation revisions for prepared assets and the small material-type allocator set.
-    material_inputs: Option<(u64, Vec<(std::any::TypeId, u64)>)>,
+    material_inputs: Option<PreparedMaterialInputs>,
     materials_revision: u64,
     /// One [`SelectionIndex`] per worldspace a view has selected in.
     indexes: HashMap<Option<u32>, SelectionIndex>,
@@ -3070,6 +3110,44 @@ pub(super) struct ReadinessKey {
     far_current: bool,
     shadow: bool,
     prepass: bool,
+}
+
+/// Exact bit transition published after fresh drawing proof. Weak references
+/// identify both endpoints without retaining obsolete readiness allocations.
+pub(super) struct ReadinessChanges {
+    previous: std::sync::Weak<Vec<bool>>,
+    current: std::sync::Weak<Vec<bool>>,
+    batches: Vec<usize>,
+}
+
+impl ReadinessChanges {
+    fn between(previous: Option<&Arc<Vec<bool>>>, current: &Arc<Vec<bool>>) -> Self {
+        let old = previous.map_or(&[][..], |bits| bits.as_slice());
+        crate::work_counters::record_count(
+            "cluster_select/readiness_delta_bits",
+            old.len().max(current.len()) as u64,
+        );
+        let batches = (0..old.len().max(current.len()))
+            .filter(|&batch| {
+                old.get(batch).copied().unwrap_or(false)
+                    != current.get(batch).copied().unwrap_or(false)
+            })
+            .collect();
+        Self {
+            previous: previous.map(Arc::downgrade).unwrap_or_default(),
+            current: Arc::downgrade(current),
+            batches,
+        }
+    }
+
+    fn matches(&self, previous: &Option<Arc<Vec<bool>>>, current: &Option<Arc<Vec<bool>>>) -> bool {
+        previous
+            .as_ref()
+            .is_some_and(|bits| self.previous.ptr_eq(&Arc::downgrade(bits)))
+            && current
+                .as_ref()
+                .is_some_and(|bits| self.current.ptr_eq(&Arc::downgrade(bits)))
+    }
 }
 
 fn retain_equal_readiness(
@@ -3940,7 +4018,11 @@ fn select_instances(
         .map(|(kind, allocator)| (*kind, allocator.readiness_revision()))
         .collect();
     allocator_revisions.sort_unstable_by_key(|(kind, _)| *kind);
-    let material_inputs = (materials.revision(), allocator_revisions);
+    let material_inputs = PreparedMaterialInputs {
+        scope: materials.change_scope(),
+        revision: materials.revision(),
+        allocators: allocator_revisions,
+    };
     if filters.material_inputs.as_ref() != Some(&material_inputs) {
         filters.material_inputs = Some(material_inputs);
         filters.materials_revision = filters.materials_revision.wrapping_add(1);
@@ -4017,6 +4099,13 @@ fn select_instances(
                     readiness_key,
                     current,
                 );
+                let previous = view_gpu.readiness_cache.as_ref().map(|(_, ready)| ready);
+                let changes = previous
+                    .is_none_or(|old| !Arc::ptr_eq(old, &readiness))
+                    .then(|| Arc::new(ReadinessChanges::between(previous, &readiness)));
+                if let Some(changes) = changes {
+                    gpu.views.get_mut(&key).unwrap().readiness_changes = Some(changes);
+                }
                 gpu.views.get_mut(&key).unwrap().readiness_cache =
                     Some((readiness_key, readiness.clone()));
                 readiness
@@ -5518,6 +5607,7 @@ mod extract_source_tests {
 
     include!("flat_source_handoff_tests.rs");
     include!("source_origin_tests.rs");
+    include!("readiness_source_tests.rs");
 
     fn assert_source_change_partition(work: SourceExtractionWork) {
         assert_eq!(
