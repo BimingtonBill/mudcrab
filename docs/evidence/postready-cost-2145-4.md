@@ -1,6 +1,6 @@
 # Standing CPU round #2145.4
 
-Status: Step 1 quiet measurements and required gates complete. Step 2 instrumentation remains staged only; its later campaign does not block the measured implementation commit.
+Status: Step 1 committed with accepted paired measurements and green gates. Step 2 binaries frozen; first window and authorized retry refused quiet admission before engine launch. No accepted Step 2 timing split.
 
 ## Identity and constraints
 
@@ -138,3 +138,32 @@ The optional upload-system ownership export refused its 8-million streamed-row/l
 Gated fmt, strict engine/workspace all-target/all-feature Clippy, workspace all-target nextest and workspace doctests passed. Nextest: Summary [ 493.844s] 5662 tests run: 5662 passed (9 slow), 65 skipped. Doctests: 18 passed, 15 ignored, zero failures. All three new production extraction regressions passed; 894 frozen source/manifest hashes match. Focused native proof passed 21/21 after exact work-count reds. Independent final source review found no actionable defect. Existing proc-macro-error2 future-incompatibility notice remains.
 
 Exact receipts: `r4-step1-final-verification.json`, `r4-gates-green.json`, and the corresponding immutable logs under the isolated target. No full runtime test or performance result is inferred from source review alone.
+
+
+## Step 2 frozen builds and refused timing windows
+
+Step 1 is committed as `e7c9c71ec4f62618f8dc3397e256d5e6b564aca1`. Its measurements and green gates above remain the accepted result. Step 2 has **no accepted measurements**: both authorized windows were refused before the first discarded warm-up could launch an engine. No split attribution or new FPS result is inferred.
+
+The fresh counterfactual baseline reconstructs the two source files at `94d8722a0` and adds four Tracy-only spans. The fresh candidate reconstructs committed Step 1 and adds the identical spans. Both receipts declare Step 1 HEAD; their complete 894-file source inventories, immutable patches and retained source files identify the actual compiled variants. Stripping the exact insertions reconstructs each underlying handoff source. The stages are journal read/deduplication/coverage; semantic admission/native enumeration/fact comparison; origin/missed-rebase checks; and only `SourceIndex::update`. Semantic would still not mean pure native-query time, and parent minus these disjoint parts would remain structural/recovery/bookkeeping/instrumentation residual.
+
+| Frozen variant | Strict engine Clippy | Tracy release | Executable SHA-256 |
+|---|---:|---:|---|
+| Baseline plus four spans | PASS, 5m16s | PASS, 28m28s | `587b28197b54f98dc94a0ea5d89cb8296248cb1316c8abff57b045345c2d7708` |
+| Step 1 plus four spans | PASS, 2m40s | PASS, 30m43s | `08463cb40da1f895c62cf4f140b7771f598d892051702247d3ec18ff89786f66` |
+
+The existing build controller completed without restart and restored byte-exact committed Step 1 source. Production Rust remains unchanged by Step 2. Both binaries and reviewed diagnostic source artifacts remain in the owned target. The subsequent documentation update changes no build input.
+
+After the lead's `2151.3 FINAL COMPLETE` permission, each window was announced before arming. Each acquired an empty, drained, disk-quiet hold, and retained the unchanged guard: other CPU below 6%, idle GPU below 15%, no intruders. The user authorized exactly one fresh retry after reading the first refusal. The retry's separate 15.898-second native precheck found CPU 1.8% and GPU 22%; it was recorded as not quiet. Its full guard remained authoritative and refused engine admission. A slot race with #2151.4 Clippy also refused retry preflight before any hold; capture waited for that job to finish. No receipt or first-attempt directory was overwritten.
+
+| Attempt | Guard result | Other CPU | GPU | Hold duration | Owned survivors |
+|---|---|---:|---:|---:|---:|
+| First | `not_quiet_before_start`, exit 6 | 7.9% | 53% | 71.722926 s | 0 |
+| Authorized retry | `not_quiet_before_start`, exit 6 | 2.4% | 25% | 71.473542 s | 0 |
+
+The first receipt names busy UI, proxy, agent and audio processes. The retry names `audiodg.exe`, `voicemeeter8x64.exe` and `t3 code (nightly).exe` in its CPU list; those values describe fractions of one CPU core, not GPU ownership. GPU producer attribution remains unknown. These foreign processes were not stopped or modified. The second refusal is explained by GPU load exceeding the unchanged idle threshold; CPU was below its limit. No guard threshold, content setting or benchmark requirement was relaxed.
+
+Each Windows owned job accounted for 65 processes and verified zero survivors before finally clearing its hold. Holds cleared at **17:27:11.722926** and **18:33:28.473542 Adelaide, 2026-10-26**. Both `WINDOW COMPLETE` relays were sent. There is no own hold, running capture, accepted benchmark, recorder result or crossing split from Step 2. The authorized retry is exhausted; no further timing run was started.
+
+Exact target-local receipts: `r4-split-window-results.json`, both `r4-split[-retry1]-capture-journal.jsonl` files, per-attempt `benchmark.json.guard.json` and process-cleanup records, `r4-split-retry1-short-quiet.json`, both build snapshots, and `r4-split-restore-receipt.json`. The original campaign controller and isolated retry controller retain separate artifacts. The announced-permission branch passed independent review; 29 capture/attribution tests passed for each controller variant. These tests prove helper behavior, not measurement acceptance.
+
+The remaining roughly 10 ms inclusive crossing zone is still **unclassified among journal, semantic, origin and index update**. No evidence here establishes that it is per-new-entity work, pure change-query time, or safely pre-stageable. Existing `SourceIndex::update` already handles dirty dependencies incrementally; arbitrary in-place component mutation still requires observation. A later quiet, newly authorized campaign must supply the missing split. The 140 FPS and 7.0 ms render goals remain unmet.
