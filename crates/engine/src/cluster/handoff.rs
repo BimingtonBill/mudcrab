@@ -3072,11 +3072,42 @@ pub(super) struct ReadinessKey {
     prepass: bool,
 }
 
+fn retain_equal_readiness(
+    previous: Option<&(ReadinessKey, Arc<Vec<bool>>)>,
+    key: ReadinessKey,
+    current: Vec<bool>,
+) -> Arc<Vec<bool>> {
+    // The cache belongs to this GPU's ViewGpu; GPU replacement creates fresh
+    // views. Evaluate current proof before this comparison, even for equal bits.
+    // Role changes must invalidate selection too: its stamp omits these roles.
+    if let Some((old, readiness)) = previous
+        && (
+            old.generation,
+            old.layout,
+            old.batches,
+            old.shadow,
+            old.prepass,
+        ) == (
+            key.generation,
+            key.layout,
+            key.batches,
+            key.shadow,
+            key.prepass,
+        )
+        && readiness.as_ref() == &current
+    {
+        crate::work_counters::record("cluster_select/readiness_equal_reuse");
+        return readiness.clone();
+    }
+    Arc::new(current)
+}
+
 fn batch_materials_now<'a>(
     gpu: &ClusterGpu,
     materials: &'a ErasedRenderAssets<PreparedMaterial>,
     allocators: &MaterialBindGroupAllocators,
 ) -> Vec<Option<BatchMaterialNow<'a>>> {
+    perf_span!("cluster::select::material_table");
     // Sequential: the pool's tasks cannot hold borrows of the render world's assets.
     (0..gpu.batches.len())
         .map(|batch| batch_material(gpu, batch, materials, allocators))
@@ -3096,6 +3127,11 @@ fn views_batch_readiness(
     far_current: bool,
     queued: &queued_proof::QueuedBatchProof,
 ) -> Vec<bool> {
+    perf_span!("cluster::select::batch_readiness");
+    crate::work_counters::record_count(
+        "cluster_select/readiness_batches",
+        gpu.batches.len() as u64,
+    );
     par_batches(gpu.batches.len(), |batch| {
         queued.main.get(batch) == Some(&true)
             && (!prepass
@@ -3347,6 +3383,7 @@ impl SelectionIndex {
 
     /// Indexes the instances that arrived since the last call.
     fn append(&mut self, data: SelectionData<'_>, world: Option<u32>) {
+        perf_span!("cluster::select::index_append");
         if self.batches.len() < data.batch_count {
             self.batches
                 .resize_with(data.batch_count, BatchInstances::default);
@@ -3467,6 +3504,7 @@ struct BatchState {
 
 impl SelectionBase {
     fn states(sources: &Sources, readiness: &[bool], batches: usize) -> Vec<BatchState> {
+        perf_span!("cluster::select::base_states");
         (0..batches)
             .map(|batch| BatchState {
                 ready: readiness.get(batch).copied().unwrap_or(false),
@@ -3488,6 +3526,7 @@ impl SelectionBase {
         inputs: BaseInputs,
         states: Vec<BatchState>,
     ) -> Self {
+        perf_span!("cluster::select::base_build");
         let mut base = Self {
             inputs,
             states: vec![BatchState::default(); states.len()],
@@ -3513,6 +3552,7 @@ impl SelectionBase {
         inputs: BaseInputs,
         states: Vec<BatchState>,
     ) -> Self {
+        perf_span!("cluster::select::base_update");
         if self.inputs != inputs
             || self.states.len() > states.len()
             || self.mask.capacity() != data.capacity
@@ -3953,8 +3993,9 @@ fn select_instances(
         let readiness = match &view_gpu.readiness_cache {
             Some((cached, readiness)) if *cached == readiness_key => readiness.clone(),
             _ => {
+                perf_span!("cluster::select::readiness_miss");
                 crate::work_counters::record("cluster_select/readiness");
-                let readiness = Arc::new(if readiness_key.shadow_warmup {
+                let current = if readiness_key.shadow_warmup {
                     views_batch_readiness(
                         &gpu,
                         view_gpu,
@@ -3970,7 +4011,12 @@ fn select_instances(
                     )
                 } else {
                     vec![false; gpu.batches.len()]
-                });
+                };
+                let readiness = retain_equal_readiness(
+                    view_gpu.readiness_cache.as_ref(),
+                    readiness_key,
+                    current,
+                );
                 gpu.views.get_mut(&key).unwrap().readiness_cache =
                     Some((readiness_key, readiness.clone()));
                 readiness
@@ -3993,6 +4039,7 @@ fn select_instances(
                 || !Arc::ptr_eq(&selection.readiness, &readiness)
         });
         if stale {
+            perf_span!("cluster::select::rebuild");
             filters.rebuilt += 1;
             let data = SelectionData {
                 identity: gpu.identity,
@@ -4043,8 +4090,12 @@ fn select_instances(
                     base
                 }
             };
-            let mut mask = base.mask.clone();
+            let mut mask = {
+                perf_span!("cluster::select::mask_clone");
+                base.mask.clone()
+            };
             if !sources.permanently_refused_records.is_empty() {
+                perf_span!("cluster::select::refusal_filter");
                 for batch in &filters.indexes[&world].batches {
                     for object in &batch.objects {
                         if object.object.is_some_and(|(record, _)| {
@@ -4060,6 +4111,7 @@ fn select_instances(
             let terrain_visible = domain.terrain;
             let objects_visible = domain.objects;
             if !terrain_visible || !objects_visible {
+                perf_span!("cluster::select::layer_filter");
                 for batch in &filters.indexes[&world].batches {
                     if !terrain_visible {
                         for &(index, _) in &batch.terrain {
@@ -4141,11 +4193,16 @@ fn select_instances(
         }
         covered_views.insert(key);
         if stale || view.instance_mask_bytes.is_empty() {
+            perf_span!("cluster::select::publish_mask");
             let mut bytes = Vec::new();
             selected.mask.append_le_bytes(&mut bytes);
             let offset = gpu.batches.len().max(1) as u64 * 16;
             let view = gpu.views.get_mut(&key).unwrap();
             if bytes != view.instance_mask_bytes {
+                crate::work_counters::record_count(
+                    "cluster_select/mask_upload_bytes",
+                    bytes.len() as u64,
+                );
                 queue.write_buffer(&view.batch_table, offset, &bytes);
                 view.instance_mask_bytes = bytes;
             }
@@ -4398,6 +4455,7 @@ mod reference_root_memo_tests {
 #[cfg(test)]
 mod selection_regressions {
     use super::*;
+    include!("selection_readiness_tests.rs");
 
     #[test]
     fn shader_invalidation_changes_readiness_key_when_ready_pipeline_count_is_unchanged() {

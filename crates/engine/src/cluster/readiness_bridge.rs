@@ -324,6 +324,22 @@ impl Producer {
             return None;
         }
         crate::work_counters::record("cluster_drawability/non_replay");
+        if let Some(previous) = self.revision {
+            for (name, changed) in [
+                (
+                    "cluster_drawability/input_sources",
+                    previous[4] != revision[4],
+                ),
+                (
+                    "cluster_drawability/input_source_layout",
+                    previous[5] != revision[5],
+                ),
+            ] {
+                if changed {
+                    crate::work_counters::record(name);
+                }
+            }
+        }
         if let Some(previous) = self.observation_key {
             if previous.gpu_identity != inputs.gpu_identity {
                 crate::work_counters::record("cluster_drawability/input_gpu_identity");
@@ -383,6 +399,10 @@ impl Producer {
         }
         perf_span!("cluster::drawability::aggregate");
         let mut worlds = std::collections::HashMap::new();
+        let mut visited_batches = 0;
+        // These immutable batch facts belong to this observation, independently
+        // of consumer world, role and readiness. Keep view/group failures below.
+        let mut batch_facts = std::collections::HashMap::new();
         for consumer in &consumers {
             let world = worlds
                 .entry(consumer.world)
@@ -397,6 +417,7 @@ impl Producer {
                 .into_iter()
                 .flat_map(|batches| batches.values())
             {
+                visited_batches += 1;
                 let domain = ViewDomain::new(&consumer.layers, consumer.shadow);
                 if !(if need.terrain {
                     domain.terrain
@@ -405,7 +426,9 @@ impl Producer {
                 }) {
                     continue;
                 }
-                let (compute, template, failed, casts_shadows) = batch_ready(need.batch);
+                let (compute, template, failed, casts_shadows) = *batch_facts
+                    .entry(need.batch)
+                    .or_insert_with(|| batch_ready(need.batch));
                 if consumer.shadow && !casts_shadows {
                     continue;
                 }
@@ -421,6 +444,14 @@ impl Producer {
                 );
             }
         }
+        crate::work_counters::record_count(
+            "cluster_drawability/aggregate_batch_visits",
+            visited_batches,
+        );
+        crate::work_counters::record_count(
+            "cluster_drawability/batch_fact_preparations",
+            batch_facts.len() as u64,
+        );
         self.revision = Some(revision);
         self.observation_key = Some(inputs);
         self.consumers = consumers;

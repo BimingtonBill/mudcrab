@@ -822,7 +822,7 @@ fn collect_and_finish(
         return;
     }
     if let Some(path) = &config.benchmark_frame_times
-        && let Err(error) = write_frame_times(path, &samples.frame_ms)
+        && let Err(error) = write_frame_times(path, &samples.frame_ms, &samples.ledger.scored)
     {
         error!(%error, path = %path.display(), "failed to write benchmark frame times");
         exit.write(AppExit::error());
@@ -974,14 +974,35 @@ pub(crate) fn percentile(sorted: &[f64], percentile: f64) -> f64 {
 
 /// Writes the measured frame times as CSV (`frame,ms`), one row per frame after the warm-up, in
 /// the order they were measured: the series behind the report's mean and percentiles.
-fn write_frame_times(path: &std::path::Path, frame_ms: &[f64]) -> std::io::Result<()> {
+/// The already retained native budget ledger is a separate sidecar: its clock,
+/// count and ownership rule must not be silently zipped with the virtual series.
+fn write_frame_times(
+    path: &std::path::Path,
+    frame_ms: &[f64],
+    scored: &[ScoredFrame],
+) -> std::io::Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, frame_times_csv(frame_ms))
+    fs::write(path, frame_times_csv(frame_ms))?;
+    fs::write(path.with_extension("budget.csv"), frame_budget_csv(scored))
+}
+
+fn frame_budget_csv(scored: &[ScoredFrame]) -> String {
+    let mut csv = String::from("scored_frame,real_ms,owner,main_thread_wait_ms\n");
+    for (frame, sample) in scored.iter().enumerate() {
+        let wait = sample
+            .wait_ms
+            .map_or_else(String::new, |ms| format!("{ms:.6}"));
+        csv.push_str(&format!(
+            "{frame},{:.6},{:?},{wait}\n",
+            sample.ms, sample.owner
+        ));
+    }
+    csv
 }
 
 fn frame_times_csv(frame_ms: &[f64]) -> String {
@@ -1002,6 +1023,7 @@ fn frame_times_csv(frame_ms: &[f64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("metrics_frame_ledger_tests.rs");
 
     /// The signal-timing app used by the gate test: minimal plugins, an asset store to add to,
     /// and a `ProfilingState` for the plugin (or the test) to record into.

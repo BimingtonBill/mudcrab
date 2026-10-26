@@ -205,10 +205,10 @@ type FlatRoots<'w, 's> = Query<
     'w,
     's,
     (
-        &'static GlobalTransform,
-        &'static FlatSourcePrimitives,
-        &'static InheritedVisibility,
-        Option<&'static RenderLayers>,
+        Ref<'static, GlobalTransform>,
+        Ref<'static, FlatSourcePrimitives>,
+        Ref<'static, InheritedVisibility>,
+        Option<Ref<'static, RenderLayers>>,
     ),
     (
         Allow<Disabled>,
@@ -235,9 +235,53 @@ type FlatDraws<'w, 's> = Query<
     Without<FlatSourcePrimitives>,
 >;
 
+#[derive(Default)]
+struct FlatSyncObservation {
+    roots: u64,
+    pose_roots: u64,
+    visibility_roots: u64,
+    layer_roots: u64,
+    membership_roots: u64,
+    members: u64,
+    pose_computations: u64,
+    global_writes: u64,
+    proof_writes: u64,
+}
+
+impl FlatSyncObservation {
+    fn record(self) {
+        if self.roots == 0 {
+            return;
+        }
+        for (name, amount) in [
+            ("flat_stock/sync_roots", self.roots),
+            ("flat_stock/sync_pose_roots", self.pose_roots),
+            ("flat_stock/sync_visibility_roots", self.visibility_roots),
+            ("flat_stock/sync_layer_roots", self.layer_roots),
+            ("flat_stock/sync_membership_roots", self.membership_roots),
+            ("flat_stock/sync_members", self.members),
+            ("flat_stock/sync_pose_computations", self.pose_computations),
+            ("flat_stock/sync_global_writes", self.global_writes),
+            ("flat_stock/sync_proof_writes", self.proof_writes),
+        ] {
+            crate::work_counters::record_count(name, amount);
+        }
+    }
+}
+
 fn sync_flat(roots: FlatRoots, mut draws: FlatDraws, mut commands: Commands) {
+    perf_span!("flat_stock::sync::total");
+    let mut observation = FlatSyncObservation::default();
     for (root, members, inherited, layers) in &roots {
+        observation.roots += 1;
+        observation.pose_roots += u64::from(root.is_changed());
+        observation.visibility_roots += u64::from(inherited.is_changed());
+        observation.layer_roots +=
+            u64::from(layers.as_ref().is_some_and(|value| value.is_changed()));
+        observation.membership_roots += u64::from(members.is_changed());
+        let layers = layers.as_deref();
         for entity in members.iter() {
+            observation.members += 1;
             let Ok((
                 pose,
                 mut global,
@@ -250,14 +294,17 @@ fn sync_flat(roots: FlatRoots, mut draws: FlatDraws, mut commands: Commands) {
             else {
                 continue;
             };
+            observation.pose_computations += 1;
             let next = pose
                 .chain
                 .iter()
                 .fold(*root, |parent, local| parent.mul_transform(*local));
             if *global != next {
+                observation.global_writes += 1;
                 *global = next;
             }
             if proof.expected_global != next {
+                observation.proof_writes += 1;
                 proof.expected_global = next;
             }
             let visible = reference_gate.is_none()
@@ -293,6 +340,7 @@ fn sync_flat(roots: FlatRoots, mut draws: FlatDraws, mut commands: Commands) {
             }
         }
     }
+    observation.record();
 }
 
 #[cfg(test)]

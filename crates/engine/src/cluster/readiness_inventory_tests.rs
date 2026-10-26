@@ -1,6 +1,39 @@
 // Included inside readiness_bridge.rs's existing test module after the baseline is frozen.
 
 #[test]
+fn batch_facts_are_shared_across_consumers_without_sharing_view_readiness() {
+    let mut producer = Producer::default();
+    let facts = std::cell::Cell::new(0);
+    let worlds = producer
+        .observe(
+            catalog_key(),
+            [0; 9],
+            vec![
+                consumer(1, false, Some(Arc::new(vec![true]))),
+                consumer(2, true, Some(Arc::new(vec![false]))),
+            ],
+            needed,
+            |batch| {
+                assert_eq!(batch, 0);
+                facts.set(facts.get() + 1);
+                (true, false, false, true)
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        worlds[&42],
+        ClusterWorldReadiness {
+            applicable_cameras: 1,
+            needed_batches: 2,
+            pending_templates: 2,
+            pending_pipelines: 1,
+            ..default()
+        }
+    );
+    assert_eq!(facts.get(), 1, "batch facts do not depend on the consumer");
+}
+
+#[test]
 fn gpu_identity_changes_refresh_batch_failure_and_recovery_without_rebuilding_inventory() {
     let mut producer = Producer::default();
     let consumers = vec![consumer(1, false, Some(Arc::new(vec![true])))];
