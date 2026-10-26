@@ -1257,6 +1257,9 @@ pub fn prepare_view_targets(
             *msaa,
         );
         let (a, b, sampled, main_texture) = textures.entry(key.clone()).or_insert_with(|| {
+            let usage = texture_usage.0;
+            #[cfg(feature = "gpu-reuse-verify")]
+            let usage = usage | crate::render_parity::raster_parity_copy_usage(1);
             let descriptor = TextureDescriptor {
                 label: None,
                 size: target_size.to_extents(),
@@ -1264,7 +1267,7 @@ pub fn prepare_view_targets(
                 sample_count: 1,
                 dimension: TextureDimension::D2,
                 format: main_texture_format,
-                usage: texture_usage.0 | crate::render_parity::raster_parity_copy_usage(1),
+                usage,
                 view_formats: match main_texture_format {
                     TextureFormat::Bgra8Unorm => &[TextureFormat::Bgra8UnormSrgb],
                     TextureFormat::Rgba8Unorm => &[TextureFormat::Rgba8UnormSrgb],

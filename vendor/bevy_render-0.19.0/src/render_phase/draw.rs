@@ -302,6 +302,7 @@ pub enum RenderCommandResult {
 }
 
 // Keep command admission testable without constructing a GPU render pass.
+#[cfg(feature = "gpu-reuse-verify")]
 pub(crate) fn admit_render_command_result(
     world: &World,
     view: Entity,
@@ -327,22 +328,23 @@ pub(crate) fn admit_render_command_result(
 }
 
 // Used by every binned and sorted draw-function lookup before native emission.
+#[cfg(feature = "gpu-reuse-verify")]
 pub(crate) fn admit_draw_function<T>(
     world: &World,
     view: Entity,
     draw_function: Option<T>,
-) -> Result<T, DrawError> {
-    draw_function.ok_or_else(|| {
+) -> Option<T> {
+    if draw_function.is_none() {
         const REASON: &str = "Native render draw function missing";
         if crate::render_parity::raster_parity_lane(view).is_some()
             || crate::render_parity::native_render_audit_active(view)
         {
             crate::render_parity::raster_parity_draw_error(world, view, REASON);
         }
-        // Missing commands are incomplete ordinary rendering too. Returning
-        // an error prevents a retained shadow map from certifying partial work.
-        DrawError::RenderCommandFailure(REASON)
-    })
+        // A missing command fails diagnostic certification without aborting
+        // the rest of the production phase.
+    }
+    draw_function
 }
 
 macro_rules! render_command_tuple_impl {
@@ -459,7 +461,15 @@ where
 
         let entity = self.entity.get_manual(world, item.entity()).ok();
         let result = C::render(item, view, entity, param, pass);
-        admit_render_command_result(world, view_entity, result)
+        #[cfg(feature = "gpu-reuse-verify")]
+        {
+            admit_render_command_result(world, view_entity, result)
+        }
+        #[cfg(not(feature = "gpu-reuse-verify"))]
+        match result {
+            RenderCommandResult::Success | RenderCommandResult::Skip => Ok(()),
+            RenderCommandResult::Failure(reason) => Err(DrawError::RenderCommandFailure(reason)),
+        }
     }
 }
 

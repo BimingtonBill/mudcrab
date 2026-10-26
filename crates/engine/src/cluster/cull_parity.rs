@@ -1,6 +1,8 @@
 //! Opt-in same-frame readback of the native retained and forced cull outputs.
 //! Diagnostic snapshots also supply the native raster audit's two input lanes.
 
+#![cfg(feature = "gpu-reuse-verify")]
+
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},

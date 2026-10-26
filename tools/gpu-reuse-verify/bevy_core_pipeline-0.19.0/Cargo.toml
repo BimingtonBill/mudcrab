@@ -36,6 +36,9 @@ all-features = true
 features = ["bevy_image/zstd_rust"]
 
 [features]
+# This copy is selected only by the explicit development Cargo overlay.
+default = ["gpu-reuse-verify"]
+gpu-reuse-verify = ["bevy_render/gpu-reuse-verify"]
 tonemapping_luts = [
     "bevy_image/ktx2",
     "bevy_image/zstd",
@@ -151,3 +154,6 @@ unused_qualifications = "warn"
 level = "warn"
 priority = 0
 check-cfg = ["cfg(docsrs_dep)"]
+
+# Kept outside the production workspace.
+[workspace]

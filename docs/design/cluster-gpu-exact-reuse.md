@@ -58,7 +58,19 @@ Sources:
 - https://github.com/bevyengine/bevy/issues/12590
 
 The 0.19 trace identified two additional ownership requirements. Directional
-cascade slices are reused between cameras, and TextureCache is a transient pool.
+cascade slices were reused between cameras, and TextureCache is a transient pool.
+The review correction allocates disjoint ranges for each active camera: array
+size is the sum of their enabled cascades when that plus the original admitted
+spot demand fits the device layer limit. Shader offsets and attachments share the
+same camera range base; spot slices follow all directional ranges. If the sum
+would exceed that limit, each camera receives a retained physical atlas with local
+cascade indices and a common spot offset after the largest per-camera range.
+Shared spots still raster once; whole depth slices copy to the extra camera
+atlases on the same native encoder before camera sampling. This preserves the
+original admitted shadow content and per-camera layer budget. Physical slice-owner
+validation remains a second residency check; cameras do not evict each other.
+Topology/extent/usage changes invalidate ownership and refresh unchanged spot
+attachments. Removed camera atlas keys are pruned.
 Matching descriptors or unchanged view entities therefore do not prove map
 residency. Retention must own the allocation or track every slice overwrite.
 Stock caster invalidation also needs mesh/deformation and material/image content
@@ -173,10 +185,16 @@ including early/late draw completion. A can be a retained map or a map that
 normal policy already renders. Fresh nonoccluded maps use the captured original
 clear descriptor twice; A is copied only after normal native completion. Fresh
 occluded maps and unsupported attachment load operations remain inconclusive.
-It retains diagnostic texture bindings
-only when enabled. Disabled mode creates no audit state, candidate scans,
-staging buffers, filesystem polling or readbacks. A single optional-state branch
-remains at the existing pass hooks; this is not a claim of zero instructions.
+It is compiled only with the default-off `gpu-reuse-verify` Cargo feature.
+Without the feature there is no audit module, resource, texture-binding snapshot,
+audit copy usage flag, replay loop, CLI switch, or actual-bind thread-local check.
+The production atlas overflow path independently uses texture copy capabilities
+to distribute shared spot results; those copies are required rendering work,
+not verification readback or replay.
+Native camera raster parity additionally requires the explicit development-only
+Cargo overlay in `tools/gpu-reuse-verify/README.md`; production core_pipeline
+resolves the pristine registry package. Cargo cannot make `[patch]` conditional
+on a feature, so that overlay is intentionally separate and never auto-loaded.
 
 Each compared map links a full caster/material/sampled-texture candidate manifest
 and a bounded runtime diagnostic. Stock candidates identify main entities and
@@ -268,3 +286,46 @@ existing #2147 runtime-state revision remains in the selection dependency stamp.
 
 The Tracy loopback prerequisite is local commit `1571b2fbe`, cherry-picked from
 `8189a981e`. No push, PR or Plus merge is performed by this task.
+
+
+## Review correction boundaries (#2153.1)
+
+Stock caster dependency indexes exist only for views carrying
+`DirectionalShadowMapInputs`. Point/spot faces keep their ordinary rendering,
+visibility and pipeline specialization but never call the retained-map caster
+begin/set/remove/refusal bookkeeping. The existing mutation loops still update
+actual directional dependents, without scanning caster populations at reuse time.
+
+Prepared geometry, mesh, image and pipeline readiness counters in each map key
+remain global and conservative. Any such producer mutation can redraw unrelated
+cascades. This is a performance limitation, not a claim of per-caster precision;
+narrowing would require resource-specific producer indexes with the same complete
+writer contract. No new settled dependency walk was introduced to narrow them.
+Material changes already use the targeted material-to-cascade index. The unused
+per-asset declaration revision map/API was removed: custom shadow types either
+make the existing static declaration or remain fail-closed.
+
+Poisoned dependency locks discard partial state and refuse certificates. Map
+owner recovery withdraws keys/owners, permanently disables retention until
+resource recreation, and preserves only the frame-local early-skip decision.
+Fresh early passes still execute real late occlusion work. Poisoning does not
+propagate an expected startup/runtime panic through every later cascade. Late revocation of early reuse skips late
+append too, withdraws ownership, and requires a cleared full render next frame.
+Production missing draw lookup skips that item and continues the phase; only a
+verification build records the native audit failure. Ordinary command Skip/Failure
+still reaches the shadow tracking wrapper and cannot certify completed work.
+
+
+The final #2153.1 correction also retires unadmitted/shadow-disabled spot views
+through the existing per-light deferred-despawn loop. Their destination handles
+must not retain a pruned camera atlas. The 256-layer/two-camera/252-spot boundary
+and budget reduction/readmission are covered by CPU/ECS regressions; live GPU
+overflow transitions remain unproved. Production overflow depth copies preserve
+shared spot content and are separate from feature-only audit copies.
+
+The feature-off production recapture retains the saving: GPU pass sum
+7.225837 ms forced versus 5.802041 ms reused (1.423796 ms), with all eight settled
+compute stages and cascades 0-2 at zero work. Cascade 3 stays fresh. This is one
+quiet profiler TEST sequence, not FPS acceptance. Final gates, exact settings,
+source footprints, file hashes and limitations are in
+[the review-round evidence](../evidence/cluster-gpu-reuse-review-2153-1.md).

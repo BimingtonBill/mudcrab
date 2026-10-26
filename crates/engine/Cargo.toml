@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+# Development-only byte readback and native replay. No audit hooks in default builds.
+gpu-reuse-verify = ["bevy_render/gpu-reuse-verify", "bevy_pbr/gpu-reuse-verify"]
 # Serve the Bevy Remote Protocol on 127.0.0.1 when the engine runs with
 # `--remote`. Local development only: the endpoint has no authentication.
 remote = ["bevy/bevy_remote"]
@@ -26,6 +28,9 @@ profiling = { version = "1.0.18", optional = true, default-features = false }
 # Only to add `only-localhost` to the tracy-client Bevy's `trace_tracy` already locks; nothing new is compiled.
 tracy-client = { version = "=0.18.5", optional = true, default-features = false }
 bevy.workspace = true
+# Forward development audit features to the already patched renderer and PBR crates.
+bevy_render = { version = "0.19.0", default-features = false }
+bevy_pbr = { version = "0.19.0", default-features = false }
 gltf = { version = "1.4", default-features = false }
 bevy_rapier3d = { version = "0.36.0", default-features = false, features = ["dim3", "debug-render-3d"] }
 mlua.workspace = true
