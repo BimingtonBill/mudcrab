@@ -1,0 +1,110 @@
+{
+  "rows": [
+    {
+      "run": "before-both",
+      "compute_ms": 0.8922595868131867,
+      "shadow_ms": 1.1305278291993721,
+      "total_ms": 7.225837191836734,
+      "frames": 3185,
+      "guard_other_cpu_mean": 4.3
+    },
+    {
+      "run": "before-shadow",
+      "compute_ms": 0,
+      "shadow_ms": 1.136332132795532,
+      "total_ms": 6.341409916227118,
+      "frames": 3223,
+      "guard_other_cpu_mean": 4.2
+    },
+    {
+      "run": "after",
+      "compute_ms": 0,
+      "shadow_ms": 0.6211717294004488,
+      "total_ms": 5.802041126001924,
+      "frames": 3119,
+      "guard_other_cpu_mean": 5.4
+    }
+  ],
+  "saving_ms": 1.4237960658348108,
+  "prior_saving_ms": 1.428357,
+  "prior_normal_ms": 6.015837,
+  "interpretation": "One quiet sequence, profiler TEST GPU pass sums; no acceptance FPS or exclusive patch attribution.",
+  "source_pin": {
+    "binary": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\release\\engine.exe",
+    "binary_sha256": "b03c92dd1b3dbf2c7fd5ffd9062919ca1b06477eee1a838a67a5191229f26e1b",
+    "commit": "94d8722a0b116260e6359f1f31d25c192541a60a",
+    "source_sha256": "324f2b2ae42b90348a2c4fdbb1daa110db4f97266d46e4144dc96c3d18b264b0",
+    "source_record": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\source-prebuild.json",
+    "source_record_sha256": "5b790058eaa6d559e09b43950ff7088ddb0fd9334cd8b0ec582b0fb91273f286",
+    "build_log": "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\review1-release.log",
+    "build_log_sha256": "4b040461471f19dbdb28d9f73e52122379684ad8a5a08a349d9ab1aaa4ef4a85",
+    "declared_parent_build": [
+      "cargo",
+      "build",
+      "--release",
+      "-p",
+      "engine",
+      "--features",
+      "tracy,renderdoc"
+    ],
+    "dataset": {
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\conversion-manifest.json": "faca91b473324a994b0bfa34396f90ace2ab72eb7ccbda1359a881948a86ac17",
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\skyrim_world.db": "46f9953ef10fad89e425d0d6de2fa4408ec5b6c2a027ad4760e6c22aeff1a189",
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\derived\\clusters-d4ca7334b3e2a58e\\cluster-manifest.json": "112de0c74defb977787b9ff6342ba596193192e1146a5474882ed5d149916b07",
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\derived\\clusters-d4ca7334b3e2a58e\\cluster-terrain-manifest.json": "5fc40ddeda86bd89d3e21f42b2fb6615dfd079d0ca414e0b93643c7e5edf3e31",
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\derived\\clusters-d4ca7334b3e2a58e\\clusters.db": "24738bdf257567061b796a5c40494cfbf58e4e150efd1347b440cd240ed28920",
+      "C:\\Modding\\Mudcrab\\SkyrimConverted-main28\\derived\\clusters-d4ca7334b3e2a58e\\overlay.json": "348be87204ba8078b77e8992f77c721c3f745ca2b0a63c41570d82a169754c81"
+    },
+    "baseline_launch_sha256": "03a5b2b08d506908e75b0e6ca16df2301e69b63819b4e430c7312b17d0565511",
+    "capture_tools": {
+      "capture.py": "5e4f7dc4176785ff50ecf8173c4f5d3995be6902f0dc441b46623ae5a81ef23c",
+      "summarize.py": "46f6680401dd4dbfcb40c6c1f2a6fbd107fe2f76f2210b1115671408bb3eb6ad",
+      "native_summary.py": "a74dc8c90064eb4ced08ff88c06a3c6151d673f7f276348509bad21043acd7bb"
+    },
+    "verdict_sha256": "b6bcc3bc5f220af8a200fa0a8f1669655302138a81b0314963e59546f60cfae7",
+    "created": "2026-10-26T10:16:17.350302"
+  },
+  "files": {
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-both\\guard.json": "7a5fd56513f4d21a08b4917e6f8a1be7580407ea9a54b6bc9b331bbc66d53128",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-both\\validation.json": "6c7270ed6b7955a2888ae88e706134c0746552debbd6a3865ba8520a4f30b145",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-both\\gpu-tail.json": "822742e4827865d08f5ee6d5efb253ccf310392b215cabb427cb3eba4fb5c0b8",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-both\\benchmark.json": "f412476838c0ff7fe63fe4be424ccbd452696f3a3a69e8d2347cf4c46d729dc9",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-both\\verdict.txt": "714538d9a06febb6baab4da629be056b591f7b941d4a2a44356ed37917bf10b8",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-both\\counter-log.txt": "d607ce5d96d13a581b3d60fb72c1a890990518ed5b96cb9fa015c321a73e0870",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-both\\launch.json": "1f31e89708d7a42708ebcb33fcca45c32354126bb9a17d4ac057a21ae934aac5",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-both\\exit.json": "65ce7b97919ce42b9be97978121d2063845393fff3f559a358f462263617adb9",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-shadow\\guard.json": "ce7211b479edf2bbd9b612f2f41d2513bb8d591fe90164d9f19d66015d0653f9",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-shadow\\validation.json": "6c7270ed6b7955a2888ae88e706134c0746552debbd6a3865ba8520a4f30b145",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-shadow\\gpu-tail.json": "44d672d3b623d4f0fdc3f7025345de28575dd8354318b30ef47b03eb7dfb9325",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-shadow\\benchmark.json": "62e3171c46b6979743252f1716db34a30bf9997bbd9b9a9343e3dac8f06ed5dc",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-shadow\\verdict.txt": "398b3ae46b8aaac5e801accdc189c2f0001a954064cbddf2e8b8f7411c863ef9",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-shadow\\counter-log.txt": "a55555893eb2e6c0578b160a01b246da5f0c15ba81ac25f0e10e18c6ad255801",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-shadow\\launch.json": "0450a578369fd87c81e9521fa2d59ffd9afc97fb0e7d400ae81dbc808a838894",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-before-shadow\\exit.json": "65ce7b97919ce42b9be97978121d2063845393fff3f559a358f462263617adb9",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-after\\guard.json": "f44add51980d5b88a6be433677e95e7d75edcd5bc9b81d17cc17de932797d449",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-after\\validation.json": "6c7270ed6b7955a2888ae88e706134c0746552debbd6a3865ba8520a4f30b145",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-after\\gpu-tail.json": "ba14452a3f67f71bf9aeb3c238a7d6af909da163876b51363b5e26f8d1110206",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-after\\benchmark.json": "cd0b13d8a08bedd5c9404fbfb431b424ea7ecad2fdc663d0cb5a336c8ed86804",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-after\\verdict.txt": "e73175c1555aef224f3af7a4fc44607460d3c085b6a4adff16d0d7ca4fea3834",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-after\\counter-log.txt": "7cbab824ca754588b3a12acd010a8d353f73cf366ad51ea4a626ab0d478dc4eb",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-after\\launch.json": "a4341fe8b6631e03056cc60ca641b7650adb193e536b649f48352fe3b59d1940",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\capture-2153-review1\\standing-01-after\\exit.json": "65ce7b97919ce42b9be97978121d2063845393fff3f559a358f462263617adb9"
+  },
+  "runtime_source_sha256": "b46b8d1c3340c4759388487154d5ae2ae40ebf99aa25cb8a9854d448496517a5",
+  "gate_receipts": [
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\review1-default-clippy-final-r4.json",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\review1-default-pbr-clippy-r4.json",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\review1-default-pbr-tests-r4.json",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\review1-default-tests-r4.json",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\review1-default-docs-r4.json",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\review1-verify-clippy-r4.json",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\review1-verify-pbr-clippy-r6.json",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\review1-verify-tests-r7.json",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\review1-verify-pbr-tests-r7.json",
+    "D:\\Mudcrab\\builds\\cluster-gpu-reuse-target\\review1-release.json"
+  ],
+  "local_commits": {
+    "renderer": "1b21a3b9e546d75c9996916ee31cf7fcd67e7739",
+    "inventory": "1bab551555109856e9d4a9eb3c6ff1638f5b6ec2"
+  }
+}
