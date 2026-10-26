@@ -1048,6 +1048,7 @@ struct ViewGpu {
     pub(super) readiness_revision: u64,
     /// The view's readiness from the last frame it was computed, with the key it was computed for.
     pub(super) readiness_cache: Option<(handoff::ReadinessKey, Arc<Vec<bool>>)>,
+    pub(super) readiness_changes: Option<Arc<handoff::ReadinessChanges>>,
     queued_proof_cache: handoff::queued_proof::QueuedProofCache,
     /// The `plan_epoch` the prepass phases were last filled for, the items it queued, and which
     /// of the two phases they went to.
@@ -1248,11 +1249,15 @@ struct BatchGpu {
 
 fn invalidate_batch_material(gpu: &mut ClusterGpu, index: usize) {
     let batch = &mut gpu.batches[index];
-    if batch.material.take().is_some() || batch.tangents.is_some() {
+    let binding_changed = batch.material.take().is_some();
+    if binding_changed || batch.tangents.is_some() {
         gpu.generation = gpu.generation.wrapping_add(1);
     }
     batch.tangents = None;
     batch.cutout = None;
+    if binding_changed {
+        gpu.readiness_material_batches.insert(index);
+    }
 }
 
 /// One load-time walk, not a scene scan per frame. The package loader partitions
@@ -1514,6 +1519,10 @@ struct ClusterGpu {
     /// shadow view whose plan was made under the same generation has nothing to redo.
     generation: u64,
     batches: Vec<BatchGpu>,
+    /// Actual binding changes, accumulated for the loading-only projection.
+    readiness_material_batches: std::collections::BTreeSet<usize>,
+    /// Numeric prepared-material revisions restart with collection replacement.
+    prepared_material_scope: Option<u64>,
     /// The blocks of the scene, in arrival order, and whether each has been appended.
     blocks: Vec<GpuBlock>,
     /// Whether each mesh has been written into the pools yet.
@@ -2211,6 +2220,8 @@ fn prepare_cluster_gpu(
         layout_epoch: 0,
         logged_quarters: 0,
         batches,
+        readiness_material_batches: Default::default(),
+        prepared_material_scope: None,
         blocks,
         pooled: vec![false; scene.meshes.len()],
         terrain_meshes: {
@@ -2371,6 +2382,22 @@ fn queue_cluster_batches(
     let Some(gpu) = gpu.as_deref_mut() else {
         return;
     };
+    let material_scope = materials.change_scope();
+    if gpu.prepared_material_scope != Some(material_scope) {
+        let replaced = gpu
+            .prepared_material_scope
+            .replace(material_scope)
+            .is_some();
+        if replaced {
+            gpu.generation = gpu.generation.wrapping_add(1);
+            for view in gpu.views.values_mut() {
+                view.walk_stamp = None;
+                view.walk_base = None;
+                view.readiness_cache = None;
+                view.readiness_changes = None;
+            }
+        }
+    }
     let Some(dummy_mesh) = dummy_mesh else {
         return;
     };
@@ -2656,6 +2683,9 @@ fn queue_cluster_batches(
                         continue;
                     };
                     far_variant = selected_far;
+                    if gpu.batches[index].material != Some(asset_id) {
+                        gpu.readiness_material_batches.insert(index);
+                    }
                     gpu.batches[index].material = Some(asset_id);
                     gpu.batches[index].tangents = Some(tangents);
                     gpu.generation = gpu.generation.wrapping_add(1);
@@ -3833,6 +3863,7 @@ fn new_view_gpu(
         plan_epoch: 0,
         readiness_revision: 0,
         readiness_cache: None,
+        readiness_changes: None,
         queued_proof_cache: default(),
         prepass_epoch: None,
         prepass_items: Vec::new(),

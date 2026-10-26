@@ -6,6 +6,12 @@ use bevy::ecs::change_detection::Tick;
 use bevy::pbr::{ExtractedPointLight, PointAndSpotLightViewEntities, ViewLightEntities};
 use bevy::render::MainWorld;
 
+#[path = "readiness_aggregate.rs"]
+mod aggregate;
+
+#[path = "readiness_inputs.rs"]
+mod inputs;
+
 // UI creates an ExtractedView sharing its camera's MainEntity, but no world
 // geometry role. Identify roles independently of their phases/GPU proof: missing
 // required Camera3d/light proof must remain a blocking consumer.
@@ -19,6 +25,7 @@ struct Consumer {
     shadow: bool,
     layers: RenderLayers,
     readiness: Option<Arc<Vec<bool>>>,
+    readiness_changes: Option<Arc<ReadinessChanges>>,
 }
 
 impl Consumer {
@@ -35,7 +42,7 @@ impl Consumer {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NeededBatch {
     batch: usize,
     terrain: bool,
@@ -82,6 +89,11 @@ struct Producer {
     inventory_scene_changed: Option<Tick>,
     inventory_valid: bool,
     contributions: Option<InventoryContributions>,
+    aggregate: aggregate::Aggregate,
+    batch_inputs: inputs::BatchInputs,
+    material_reader: bevy::render::erased_render_asset::ErasedRenderAssetChangeReader,
+    catalog_dirty: std::collections::BTreeSet<usize>,
+    force_publication: bool,
     #[cfg(test)]
     inventory_work: InventoryWork,
     #[cfg(test)]
@@ -153,6 +165,7 @@ impl Producer {
             }
             if replaced {
                 self.needed_key = None;
+                self.force_publication = true;
             }
         }
         inventory.matches(package, layout) && self.inventory_valid
@@ -161,6 +174,9 @@ impl Producer {
     fn withdraw(&mut self) {
         self.withdrawal_pending |= self.revision.take().is_some();
         self.pending = None;
+        self.aggregate = default();
+        self.batch_inputs = default();
+        self.material_reader = default();
     }
 
     fn update_inventory(
@@ -178,6 +194,9 @@ impl Producer {
             .is_none_or(|old| !Arc::ptr_eq(&old.inventory, inventory));
         let mut touched = std::collections::BTreeSet::new();
         if reset {
+            if let Some(old) = &self.contributions {
+                self.catalog_dirty.extend(0..old.inventory.batch_count());
+            }
             self.needed_catalog.clear();
             touched.extend((0..inventory.batch_count()).map(|batch| batch as u32));
             self.contributions = Some(InventoryContributions {
@@ -209,11 +228,14 @@ impl Producer {
         if let Some(state) = self.contributions.as_mut() {
             for batch in touched {
                 work.rebuilt_batches += 1;
+                let mut previous = HashMap::new();
                 for (world, terrain) in state.groups[batch as usize].drain(..) {
                     if let std::collections::hash_map::Entry::Occupied(mut entry) =
                         self.needed_catalog.entry(world)
                     {
-                        entry.get_mut().remove(&(batch as usize, terrain));
+                        if let Some(need) = entry.get_mut().remove(&(batch as usize, terrain)) {
+                            previous.insert((world, terrain), need);
+                        }
                         if entry.get().is_empty() {
                             entry.remove();
                         }
@@ -261,6 +283,9 @@ impl Producer {
                         })
                         .invalid_owned_state |= invalid;
                 }
+                if groups != previous {
+                    self.catalog_dirty.insert(batch as usize);
+                }
                 for ((world, terrain), need) in groups {
                     self.needed_catalog
                         .entry(world)
@@ -302,6 +327,9 @@ impl Producer {
         )
     }
 
+    // Fixture compatibility: old callers expose only broad notifications. They
+    // conservatively name all catalog batches; production supplies exact deltas.
+    #[cfg(test)]
     fn observe_with(
         &mut self,
         inputs: ReadinessKey,
@@ -309,56 +337,64 @@ impl Producer {
         consumers: Vec<Consumer>,
         needed: impl FnOnce(&mut Self) -> bool,
         batch_ready: impl Fn(usize) -> (bool, bool, bool, bool),
-    ) -> Option<std::collections::HashMap<u32, ClusterWorldReadiness>> {
-        let catalog_changed = self.needed_key != Some(inputs.catalog);
-        if !catalog_changed
-            && self.observation_key == Some(inputs)
-            && self.revision == Some(revision)
-            && self.consumers.len() == consumers.len()
-            && self
+    ) -> Option<HashMap<u32, ClusterWorldReadiness>> {
+        let changed = self.needed_key != Some(inputs.catalog)
+            || self.observation_key != Some(inputs)
+            || self.revision != Some(revision)
+            || self.consumers.len() != consumers.len()
+            || !self
                 .consumers
                 .iter()
                 .zip(&consumers)
-                .all(|(old, new)| old.same(new))
-        {
+                .all(|(a, b)| a.same(b));
+        if !changed {
             return None;
         }
-        crate::work_counters::record("cluster_drawability/non_replay");
-        if let Some(previous) = self.revision {
-            for (name, changed) in [
-                (
-                    "cluster_drawability/input_sources",
-                    previous[4] != revision[4],
-                ),
-                (
-                    "cluster_drawability/input_source_layout",
-                    previous[5] != revision[5],
-                ),
-            ] {
-                if changed {
-                    crate::work_counters::record(name);
+        let touched = self
+            .needed_catalog
+            .values()
+            .flat_map(|world| world.values().map(|need| need.batch))
+            .collect();
+        self.observe_incremental(
+            inputs,
+            revision,
+            consumers,
+            |producer| {
+                let old: Vec<_> = producer
+                    .needed_catalog
+                    .values()
+                    .flat_map(|world| world.values().map(|need| need.batch))
+                    .collect();
+                if !needed(producer) {
+                    return false;
                 }
-            }
-        }
-        if let Some(previous) = self.observation_key {
-            if previous.gpu_identity != inputs.gpu_identity {
-                crate::work_counters::record("cluster_drawability/input_gpu_identity");
-            }
-            if previous.materials_revision != inputs.materials_revision {
-                crate::work_counters::record("cluster_drawability/input_materials");
-            }
-            if previous.gpu_generation != inputs.gpu_generation {
-                crate::work_counters::record("cluster_drawability/input_gpu_generation");
-            }
-            if previous.gpu_layout != inputs.gpu_layout {
-                crate::work_counters::record("cluster_drawability/input_gpu_layout");
-            }
-        }
-        #[cfg(test)]
-        {
-            self.walks += 1;
-        }
-        if catalog_changed {
+                producer.catalog_dirty.extend(old);
+                producer.catalog_dirty.extend(
+                    producer
+                        .needed_catalog
+                        .values()
+                        .flat_map(|world| world.values().map(|need| need.batch)),
+                );
+                true
+            },
+            touched,
+            true,
+            |_, batch| batch_ready(batch),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe_incremental(
+        &mut self,
+        inputs: ReadinessKey,
+        revision: [u64; 9],
+        consumers: Vec<Consumer>,
+        needed: impl FnOnce(&mut Self) -> bool,
+        mut changed: std::collections::BTreeSet<usize>,
+        force: bool,
+        batch_ready: impl Fn(&inputs::BatchInputs, usize) -> (bool, bool, bool, bool),
+    ) -> Option<HashMap<u32, ClusterWorldReadiness>> {
+        if self.needed_key != Some(inputs.catalog) {
             let previous = self.needed_key;
             for (name, changed) in [
                 ("cluster_drawability/catalog_initial", previous.is_none()),
@@ -386,7 +422,6 @@ impl Producer {
                     crate::work_counters::record(name);
                 }
             }
-            info!(?previous, current = ?inputs.catalog, "cluster drawability catalog input changed");
             {
                 perf_span!("cluster::drawability::catalog");
                 if !needed(self) {
@@ -397,65 +432,42 @@ impl Producer {
             self.needed_key = Some(inputs.catalog);
             crate::work_counters::record("cluster_drawability/needed_catalog");
         }
-        perf_span!("cluster::drawability::aggregate");
-        let mut worlds = std::collections::HashMap::new();
-        let mut visited_batches = 0;
-        // These immutable batch facts belong to this observation, independently
-        // of consumer world, role and readiness. Keep view/group failures below.
-        let mut batch_facts = std::collections::HashMap::new();
-        for consumer in &consumers {
-            let world = worlds
-                .entry(consumer.world)
-                .or_insert_with(ClusterWorldReadiness::default);
-            world.applicable_cameras += usize::from(!consumer.shadow);
-            if consumer.readiness.is_none() {
-                world.missing_views += 1;
-            }
-            for need in self
-                .needed_catalog
-                .get(&consumer.world)
-                .into_iter()
-                .flat_map(|batches| batches.values())
-            {
-                visited_batches += 1;
-                let domain = ViewDomain::new(&consumer.layers, consumer.shadow);
-                if !(if need.terrain {
-                    domain.terrain
-                } else {
-                    domain.objects
-                }) {
-                    continue;
-                }
-                let (compute, template, failed, casts_shadows) = *batch_facts
-                    .entry(need.batch)
-                    .or_insert_with(|| batch_ready(need.batch));
-                if consumer.shadow && !casts_shadows {
-                    continue;
-                }
-                world.needed_batches += 1;
-                world.pending_compute += usize::from(!compute);
-                world.pending_templates += usize::from(!need.terrain && !template);
-                world.failed_batches += usize::from(failed || need.invalid_owned_state);
-                world.pending_pipelines += usize::from(
-                    !consumer
-                        .readiness
-                        .as_ref()
-                        .is_some_and(|ready| ready.get(need.batch) == Some(&true)),
-                );
-            }
+        changed.append(&mut self.catalog_dirty);
+        let new_gpu = self
+            .observation_key
+            .is_some_and(|old| old.gpu_identity != inputs.gpu_identity);
+        if new_gpu {
+            self.aggregate = default();
         }
-        crate::work_counters::record_count(
-            "cluster_drawability/aggregate_batch_visits",
-            visited_batches,
+        if self.revision.is_some_and(|old| old[6] != revision[6]) {
+            changed.extend(
+                self.needed_catalog
+                    .values()
+                    .flat_map(|world| world.values().map(|need| need.batch)),
+            );
+        }
+        // Broad source/material epochs are observation metadata, never batch
+        // dependencies. Scope and admission boundaries require fresh publication.
+        let provenance_changed = std::mem::take(&mut self.force_publication);
+        let force = force
+            || provenance_changed
+            || self.revision.is_none_or(|old| old[..4] != revision[..4])
+            || new_gpu;
+        let result = self.aggregate.observe(
+            consumers.clone(),
+            &self.needed_catalog,
+            &changed,
+            |batch| batch_ready(&self.batch_inputs, batch),
+            force,
         );
-        crate::work_counters::record_count(
-            "cluster_drawability/batch_fact_preparations",
-            batch_facts.len() as u64,
-        );
+        #[cfg(test)]
+        if result.is_some() {
+            self.walks += 1;
+        }
         self.revision = Some(revision);
         self.observation_key = Some(inputs);
         self.consumers = consumers;
-        Some(worlds)
+        result
     }
 }
 
@@ -471,6 +483,7 @@ fn complete_camera_consumers(consumers: &mut Vec<Consumer>, expected: &HashMap<M
                 shadow: false,
                 layers: crate::render::reflectable_world_layers(),
                 readiness: None,
+                readiness_changes: None,
             });
         }
     }
@@ -494,6 +507,7 @@ fn require_shadow_consumer(
             shadow: true,
             layers: layers.clone(),
             readiness: None,
+            readiness_changes: None,
         });
     }
 }
@@ -507,13 +521,13 @@ fn extract_generation(
 
 #[allow(clippy::too_many_arguments)]
 fn observe(
-    gpu: Option<Res<ClusterGpu>>,
+    gpu: Option<ResMut<ClusterGpu>>,
     scene: Option<Res<ClusterScene>>,
-    sources: Res<Sources>,
-    frame: Res<ClusterFrame>,
-    pipelines: Res<ClusterPipelines>,
-    cache: Res<PipelineCache>,
-    materials: Res<ErasedRenderAssets<PreparedMaterial>>,
+    sources: Option<ResMut<Sources>>,
+    frame: Option<Res<ClusterFrame>>,
+    pipelines: Option<Res<ClusterPipelines>>,
+    cache: Option<Res<PipelineCache>>,
+    materials: Option<Res<ErasedRenderAssets<PreparedMaterial>>>,
     runtime_state: Option<Res<crate::cluster::runtime_state::RuntimeReferenceState>>,
     views: LoadingViews,
     camera_lights: Query<&ViewLightEntities>,
@@ -524,12 +538,20 @@ fn observe(
     )>,
     mut producer: ResMut<Producer>,
 ) {
-    let (Some(gpu), Some(scene)) = (gpu, scene) else {
+    let (
+        Some(mut gpu),
+        Some(scene),
+        Some(mut sources),
+        Some(frame),
+        Some(pipelines),
+        Some(cache),
+        Some(materials),
+    ) = (gpu, scene, sources, frame, pipelines, cache, materials)
+    else {
         producer.withdraw();
         return;
     };
-    let (Some(package), Some(layout)) = (gpu.certificate.as_ref(), sources.lazy_layout_scope)
-    else {
+    let (Some(package), Some(layout)) = (gpu.certificate.clone(), sources.lazy_layout_scope) else {
         producer.withdraw();
         return;
     };
@@ -542,15 +564,15 @@ fn observe(
     let coherent = sources
         .certificate
         .as_ref()
-        .is_some_and(|source| Arc::ptr_eq(source, package))
+        .is_some_and(|source| Arc::ptr_eq(source, &package))
         && scene
             .certificate
             .as_ref()
-            .is_some_and(|source| Arc::ptr_eq(source, package));
+            .is_some_and(|source| Arc::ptr_eq(source, &package));
     if !coherent
         || !producer.validate_inventory(
             inventory,
-            package,
+            &package,
             layout,
             scene.last_changed(),
             &scene.instances,
@@ -580,6 +602,10 @@ fn observe(
                     .get(&key)
                     .and_then(|view| view.readiness_cache.as_ref())
                     .map(|(_, ready)| ready.clone()),
+                readiness_changes: gpu
+                    .views
+                    .get(&key)
+                    .and_then(|view| view.readiness_changes.clone()),
             })
         })
         .collect();
@@ -614,6 +640,7 @@ fn observe(
                             shadow: true,
                             layers: layers.clone(),
                             readiness: None,
+                            readiness_changes: None,
                         });
                     }
                 }
@@ -624,6 +651,7 @@ fn observe(
                 shadow: true,
                 layers: layers.clone(),
                 readiness: None,
+                readiness_changes: None,
             }),
         }
         match sources
@@ -641,6 +669,7 @@ fn observe(
                             shadow: true,
                             layers: layers.clone(),
                             readiness: None,
+                            readiness_changes: None,
                         });
                         continue;
                     };
@@ -670,6 +699,7 @@ fn observe(
                 shadow: true,
                 layers,
                 readiness: None,
+                readiness_changes: None,
             }),
         }
     }
@@ -706,14 +736,37 @@ fn observe(
         gpu_layout: gpu.layout_epoch,
         materials_revision: materials.revision(),
     };
-    let result = producer.observe_with(
+    let source_changes = std::mem::take(&mut sources.readiness_changes.batches);
+    let binding_changes = std::mem::take(&mut gpu.readiness_material_batches);
+    let material_changes = materials.read_changes(&mut producer.material_reader);
+    let changed = producer.batch_inputs.refresh(
+        gpu.identity,
+        &sources.readiness_changes.scope,
+        gpu.batches.len(),
+        &binding_changes,
+        &source_changes,
+        material_changes.as_deref(),
+        |batch| gpu.batches[batch].material,
+        |batch| {
+            (
+                sources.templates.get(batch) == Some(&true),
+                sources.source_fallback_batches.contains(&(batch as u32)),
+            )
+        },
+        |asset| {
+            materials
+                .get(asset)
+                .is_none_or(|material| material.properties.shadows_enabled)
+        },
+    );
+    let result = producer.observe_incremental(
         inputs,
         revision,
         consumers,
         |producer| {
             producer.update_inventory(
                 inventory,
-                package,
+                &package,
                 sources.refusal_revision,
                 &sources.permanently_refused_records,
                 runtime_state.as_ref().map(|state| state.revision),
@@ -726,17 +779,15 @@ fn observe(
                 },
             )
         },
-        |batch| {
-            (
-                compute,
-                sources.templates.get(batch) == Some(&true),
-                sources.source_fallback_batches.contains(&(batch as u32)),
-                gpu.batches
-                    .get(batch)
-                    .and_then(|batch| batch.material)
-                    .and_then(|material| materials.get(material))
-                    .is_none_or(|material| material.properties.shadows_enabled),
-            )
+        changed,
+        false,
+        |facts, batch| {
+            let (template, failed, casts_shadows) = facts
+                .facts
+                .get(batch)
+                .copied()
+                .unwrap_or((false, false, true));
+            (compute, template, failed, casts_shadows)
         },
     );
     if let Some(worlds) = result {
@@ -889,6 +940,7 @@ mod tests {
     use super::*;
     include!("readiness_inventory_tests.rs");
     include!("readiness_batch_tests.rs");
+    include!("readiness_delta_tests.rs");
     fn catalog_key() -> ReadinessKey {
         ReadinessKey {
             catalog: NeededCatalogKey {
@@ -904,7 +956,7 @@ mod tests {
         }
     }
 
-    fn consumer(id: u32, shadow: bool, ready: Option<Arc<Vec<bool>>>) -> Consumer {
+    pub(super) fn consumer(id: u32, shadow: bool, ready: Option<Arc<Vec<bool>>>) -> Consumer {
         Consumer {
             key: RetainedViewEntity {
                 main_entity: Entity::from_raw_u32(id).unwrap().into(),
@@ -915,6 +967,7 @@ mod tests {
             shadow,
             layers: crate::render::PLACED_OBJECT_RENDER_LAYERS,
             readiness: ready,
+            readiness_changes: None,
         }
     }
     fn extracted_view(main: MainEntity, subview: u32) -> ExtractedView {

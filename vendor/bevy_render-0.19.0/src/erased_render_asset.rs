@@ -6,6 +6,8 @@ use bevy_app::{App, Plugin, SubApp};
 use bevy_asset::RenderAssetUsages;
 use bevy_asset::{Asset, AssetEvent, AssetId, Assets, UntypedAssetId};
 use bevy_ecs::{
+    change_detection::DetectChangesMut,
+    message::{Message, MessageCursor, Messages},
     prelude::{Commands, IntoScheduleConfigs, Local, MessageReader, ResMut, Resource},
     schedule::{ScheduleConfigs, SystemSet},
     system::{ScheduleSystem, StaticSystemParam, SystemParam, SystemParamItem, SystemState},
@@ -122,6 +124,9 @@ impl<A: ErasedRenderAsset, AFTER: ErasedRenderAssetDependency + 'static> Plugin
 
     fn finish(&self, app: &mut App) {
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            let first_collection = !render_app
+                .world()
+                .contains_resource::<ErasedAssetChangeLogInstalled<A::ErasedAsset>>();
             render_app
                 .init_resource::<ExtractedAssets<A>>()
                 .init_resource::<ErasedRenderAssets<A::ErasedAsset>>()
@@ -135,6 +140,16 @@ impl<A: ErasedRenderAsset, AFTER: ErasedRenderAssetDependency + 'static> Plugin
                     ExtractSchedule,
                     extract_erased_render_asset::<A>.in_set(AssetExtractionSystems),
                 );
+            if first_collection {
+                render_app
+                    .world_mut()
+                    .insert_resource(ErasedAssetChangeLogInstalled::<A::ErasedAsset>(PhantomData));
+                render_app.add_systems(
+                    Render,
+                    advance_erased_asset_changes::<A::ErasedAsset>
+                        .in_set(RenderSystems::ExtractCommands),
+                );
+            }
             AFTER::register_system(
                 render_app,
                 prepare_erased_assets::<A>.in_set(RenderSystems::PrepareAssets),
@@ -199,20 +214,84 @@ pub struct ErasedRenderAssets<ERA>(
     u64,
     HashMap<UntypedAssetId, u64>,
     HashSet<UntypedAssetId>,
+    Messages<ErasedAssetMutation>,
+    u64,
 );
+
+#[derive(Message)]
+struct ErasedAssetMutation(UntypedAssetId);
+
+#[derive(Resource)]
+struct ErasedAssetChangeLogInstalled<ERA: Send + Sync + 'static>(PhantomData<fn() -> ERA>);
+
+/// Mudcrab vendor extension: an independent prepared-asset mutation cursor.
+/// A cursor belongs to one collection lifetime, even when revisions restart.
+#[derive(Default)]
+pub struct ErasedRenderAssetChangeReader {
+    scope: u64,
+    revision: u64,
+    cursor: MessageCursor<ErasedAssetMutation>,
+}
 
 impl<ERA> Default for ErasedRenderAssets<ERA> {
     fn default() -> Self {
+        static NEXT_SCOPE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+        let scope = NEXT_SCOPE
+            .fetch_update(
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+                |value| value.checked_add(1),
+            )
+            .expect("Prepared asset collection scope exhausted");
         Self(
             Default::default(),
             0,
             Default::default(),
             Default::default(),
+            Messages::default(),
+            scope,
         )
     }
 }
 
 impl<ERA> ErasedRenderAssets<ERA> {
+    /// Mudcrab vendor extension: identifies this collection's lifetime.
+    /// Pair with `revision` when retaining proof across resource replacement.
+    pub fn change_scope(&self) -> u64 {
+        self.5
+    }
+
+    /// Mudcrab vendor extension: non-destructive, independent mutation observation.
+    /// Returns `None` for a new/replaced collection or expired cursor: rebuild the
+    /// complete baseline. Otherwise returns deduplicated IDs changed since this
+    /// reader last observed, including removals and conservative mutable access.
+    /// Messages survive two render update cycles. An unchanged revision visits no
+    /// events or assets. This never drains the shadow cache's `take_changed_assets`.
+    pub fn read_changes(
+        &self,
+        reader: &mut ErasedRenderAssetChangeReader,
+    ) -> Option<Vec<UntypedAssetId>> {
+        if reader.scope != self.5 || reader.cursor.missed_messages(&self.4) != 0 {
+            reader.scope = self.5;
+            reader.revision = self.1;
+            reader.cursor = self.4.get_cursor_current();
+            return None;
+        }
+        if reader.revision == self.1 {
+            return Some(Vec::new());
+        }
+        reader.revision = self.1;
+        Some(
+            reader
+                .cursor
+                .read(&self.4)
+                .map(|change| change.0)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect(),
+        )
+    }
+
     /// Drains producer mutation IDs for a single incremental dependency consumer.
     /// Reads and missing removals do not produce deltas; retries publish on
     /// successful preparation. Use `revision` for independent coarse consumers.
@@ -257,6 +336,7 @@ impl<ERA> ErasedRenderAssets<ERA> {
             .expect("Render asset revision exhausted");
         self.2.insert(id, self.1);
         self.3.insert(id);
+        self.4.write(ErasedAssetMutation(id));
         Some(asset)
     }
 
@@ -265,6 +345,7 @@ impl<ERA> ErasedRenderAssets<ERA> {
         self.advance_revision();
         self.2.insert(id, self.1);
         self.3.insert(id);
+        self.4.write(ErasedAssetMutation(id));
         self.0.insert(id, value)
     }
 
@@ -275,6 +356,7 @@ impl<ERA> ErasedRenderAssets<ERA> {
             self.advance_revision();
             self.2.remove(&id);
             self.3.insert(id);
+            self.4.write(ErasedAssetMutation(id));
         }
         removed
     }
@@ -290,8 +372,20 @@ impl<ERA> ErasedRenderAssets<ERA> {
                 *revision = self.1;
             }
             self.3.extend(self.0.keys().copied());
+            self.4
+                .write_batch(self.0.keys().copied().map(ErasedAssetMutation));
         }
         self.0.iter_mut().map(|(k, v)| (*k, v))
+    }
+}
+
+/// Rotate once per erased collection, before all material-type preparations.
+/// Empty logs need no rotation; no asset population is inspected here.
+fn advance_erased_asset_changes<ERA: Send + Sync + 'static>(
+    mut assets: ResMut<ErasedRenderAssets<ERA>>,
+) {
+    if !assets.4.is_empty() {
+        assets.bypass_change_detection().4.update();
     }
 }
 
@@ -341,6 +435,7 @@ fn collect_erased_render_assets_to_reextract<A: ErasedRenderAsset>(
         for id in &ids {
             render_assets.2.remove(&id.untyped());
             render_assets.3.insert(id.untyped());
+            render_assets.4.write(ErasedAssetMutation(id.untyped()));
         }
         render_assets.advance_revision();
         commands.insert_resource(ErasedRenderAssetsToReExtract::<A> { ids });
