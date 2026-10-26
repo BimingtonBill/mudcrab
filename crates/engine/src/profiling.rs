@@ -798,6 +798,7 @@ impl ProfilingState {
         *counter = counter.saturating_add(amount);
     }
 
+    #[cfg(feature = "gpu-reuse-verify")]
     /// Reads the current producer counter for an on-demand diagnostic response.
     pub(crate) fn counter(&self, name: &str) -> Option<u64> {
         self.counters.get(name).copied()
