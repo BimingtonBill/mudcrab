@@ -1,3 +1,11 @@
+## 2026-10-26, #2145.4 Step 2 build freeze and foreign-load refusal
+
+- Step 1 remains `e7c9c71ec4f62618f8dc3397e256d5e6b564aca1`, with paired standing/crossing proof, 127.1432 FPS plain TEST and green workspace gates. No Rust, manifest, settings or threshold changes in this follow-up.
+- Existing split-pair controller completed without restart. Fresh baseline/candidate each add the identical four Tracy-only source stages; strict engine all-target/all-feature Clippy and release builds passed. Frozen SHA-256: baseline `587b28197b54f98dc94a0ea5d89cb8296248cb1316c8abff57b045345c2d7708`; candidate `08463cb40da1f895c62cf4f140b7771f598d892051702247d3ec18ff89786f66`. Complete 894-source inventories and immutable source patches retained. Controller restored byte-exact committed Step 1; all 894 hashes rechecked before this documentation-only update.
+- First Step 2 window and one explicitly authorized fresh retry both refused before engine launch: guard other CPU/GPU **7.9%/53%**, then **2.4%/25%**. Retry short check was also not quiet (**1.8%/22%**). GPU producer remains unattributed; busy UI/proxy/audio/agent CPU processes were foreign and untouched. No guard threshold relaxed, no accepted split, no claim about pure-query or per-new-entity crossing cost.
+- Each hold drained empty slots and quiet disks, then finally-cleared after native owned-job accounting verified **65 processes, zero survivors**. Hold durations **71.722926 / 71.473542 seconds**; clears at **17:27:11.722926 / 18:33:28.473542 Adelaide**. Both WINDOW COMPLETE relays sent. Authorized retry exhausted; no further hold, engine, export or capture started. No push or expired-folder removal.
+- Full evidence appended to `docs/evidence/postready-cost-2145-4.md`; exact target-local `r4-split-window-results.json`, guard/journal/cleanup/restore/build receipts retained. Step 2 split remains blocked on a newly authorized quiet campaign. 140 FPS and 7.0 ms render goals remain unmet.
+
 ## 2026-10-26, #2145.4 native source-query admission and paired crossing proof
 
 - Branch `phase2/cluster-postready-cost`, worktree `D:/Mudcrab/worktrees/cluster-postready`, integration base `94d8722a0`, isolated target `C:/MudcrabBuilds/cluster-postready-target`, gate owner `sol-2145`. No push, ECS vendoring, quality change, content cap or HotFacts/origin semantic edit.

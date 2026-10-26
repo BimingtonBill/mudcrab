@@ -29,7 +29,8 @@ Research read: `analysis-1009-baseline-cpu-breakdown.md` establishes the pipelin
 - [x] Complete required workspace nextest and doctest gates; fmt and strict workspace Clippy passed.
 - [x] Capture paired quiet diagnostics plus non-Tracy FPS; inspect logs, grader and content identity.
 - [x] Record Step 1 measured deltas, remaining work and risks; update handoff and commit with required trailer.
-- [ ] After the Step 1 commit, build fresh Tracy baseline/candidate with identical journal/semantic/origin/index-update spans and measure a later crossing split; preserve a separate evidence directory.
+- [x] After the Step 1 commit, freeze fresh Tracy baseline/candidate with identical journal/semantic/origin/index-update spans; restore production source byte-exact.
+- [ ] Measure the later crossing split. BLOCKED: first window and one authorized retry refused pre-start quiet admission; GPU 53% / 25%. Both holds finally-cleared; no accepted Step 2 timings. A new quiet authorization is required.
 
 ## Selected bounded slice
 
@@ -48,3 +49,8 @@ Current ownership review rejects whole-frame submission skipping and unchanged-c
 The complete source index is a defensible candidate domain only with all lifecycle dirties and full recovery. It intentionally includes uncertified roots, every role-visible mesh, ancestry and retained history. The retained earlier scene already indexed 98,038 nodes among 112,278 entities; per-entity lookup is not evidence of fewer or cheaper reads. No index-scoped rewrite is selected without a measured advantage over contiguous column reads.
 
 Separate command/count captures enable `RUST_LOG=info,wgpu_core=info,wgpu_hal=info`. Bevy's more specific default `wgpu=error` directive explained the earlier empty native queue-scope export despite global `info`. Keep the primary pair's original logging and report native API counts separately; these scopes do not expose upload payload bytes.
+
+
+## Step 2 authorization and final state
+
+The later `2151.3 FINAL COMPLETE` relay authorized an announced Step 2 window, with one hold no longer than 25 minutes and finally-clear. A subsequent explicit instruction authorized one fresh retry with the same binaries and a short quiet check first. Both windows refused engine admission under unchanged guards. The first and retry hold durations were 71.722926 and 71.473542 seconds. Source is restored to committed Step 1; diagnostic spans remain only in retained build artifacts. See the evidence document for exact guard and cleanup receipts. No further retry is authorized.
