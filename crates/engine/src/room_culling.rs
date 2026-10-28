@@ -846,6 +846,17 @@ impl RoomCullingState {
         self.enabled && self.probe != TableProbe::Absent
     }
 
+    /// Room graphs of loaded interior cells still being read. A shot waits for them: until a
+    /// cell's graph arrives, its rooms are drawn whole and the view is not the culled one.
+    pub fn pending_reads(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Loaded interior cells whose room graph could not be read; they are drawn whole.
+    pub fn failed_reads(&self) -> usize {
+        self.failed.len()
+    }
+
     /// Registers a graph for a loaded cell root. Tests only: the loader goes through
     /// `collect_loaded_graphs`, which also records what the probe found.
     #[cfg(test)]
@@ -1994,6 +2005,28 @@ mod tests {
                 drawn: visible.len(),
             }),
             "the receipt counts are the main view's list before and after the cull"
+        );
+    }
+
+    /// A shot does not settle on a view whose room graph is unread: it would photograph and
+    /// measure the cell drawn whole. A run without room culling adds nothing to the gate.
+    #[test]
+    fn unread_room_graphs_hold_the_shot_settle_gate() {
+        let quiet = crate::shots::SettleCounts {
+            renderer_ready: true,
+            pending_specializations: Some(0),
+            pending_render_transfers: Some(0),
+            ..default()
+        };
+        assert!(quiet.with_room_graphs(None).is_quiet());
+        let mut state = RoomCullingState::new(true, PathBuf::new());
+        assert!(quiet.with_room_graphs(Some(&state)).is_quiet());
+        state.failed.insert(7);
+        let failed = quiet.with_room_graphs(Some(&state));
+        assert_eq!(failed.failed_room_graphs, 1);
+        assert!(
+            !failed.is_quiet(),
+            "a cell drawn whole after a failed read is not the culled view"
         );
     }
 

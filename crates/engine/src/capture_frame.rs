@@ -293,7 +293,8 @@ fn extract_capture_frames(
             profiler,
             uploads,
             renderer.final_path_active(),
-        );
+        )
+        .with_room_graphs(room_culling.as_deref());
         let record = CaptureFrame {
             main_frame: frame.0,
             render_frame: extracted.render_frame,
