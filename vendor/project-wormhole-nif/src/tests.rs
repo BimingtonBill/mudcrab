@@ -1319,6 +1319,71 @@ mod legacy_skin {
     }
 
     #[test]
+    fn rejects_an_undrawn_zero_weight_vertex_that_a_partition_triangle_draws() {
+        // The shape's own triangles skip vertex 3, but a partition triangle uses it.
+        let padding = vertex(Vec3::Z, [0, 0, 0, 0], [0.0, 0.0, 0.0, 0.0]);
+        let mut nif = padded_buffer_fixture(padding, false);
+        if let NifBlock::NiSkinPartition(partition) = &mut nif.blocks[4] {
+            partition.triangles = vec![U16Vec3::new(1, 2, 3)];
+        } else {
+            panic!("fixture block 4 is not NiSkinPartition");
+        }
+
+        let error = nif_to_model(&nif, Some(&nif)).unwrap_err();
+
+        assert!(
+            error.contains("vertex 3 has a skin weight sum of 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_undrawn_zero_weight_partition_row() {
+        // Weights from partition rows, not the vertex buffer, are never padding.
+        let position = |position| BSVertexData {
+            position: Some(position),
+            ..Default::default()
+        };
+        let mut tri_shape = shape(
+            1,
+            2,
+            vec![
+                position(Vec3::ZERO),
+                position(Vec3::X),
+                position(Vec3::Y),
+                position(Vec3::Z),
+            ],
+        );
+        tri_shape.triangles.push(U16Vec3::new(0, 1, 2));
+        tri_shape.num_triangles = 1;
+        let mut rows = partition(vec![0]);
+        rows.weights = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 0.0],
+        ];
+        rows.bone_indices = vec![vec![0, 0, 0, 0]; 4];
+        let nif = nif_file(
+            vec![
+                NifBlock::NiNode(node(0)),
+                NifBlock::BSTriShape(tri_shape),
+                NifBlock::NiSkinInstance(instance(vec![0], 3, 4)),
+                NifBlock::NiSkinData(skin_data(vec![bone(Vec3::ZERO)])),
+                NifBlock::NiSkinPartition(rows),
+            ],
+            &["BoneA", "Shape"],
+        );
+
+        let error = nif_to_model(&nif, Some(&nif)).unwrap_err();
+
+        assert!(
+            error.contains("vertex 3 has a skin weight sum of 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn rejects_an_undrawn_vertex_with_a_negative_weight_sum() {
         // Only an exactly-zero padding vertex is bound; other bad weights still fail.
         let broken = vertex(Vec3::Z, [0, 0, 0, 0], [-1.0, 0.0, 0.0, 0.0]);
