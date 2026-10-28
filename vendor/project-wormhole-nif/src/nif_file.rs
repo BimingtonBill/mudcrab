@@ -979,7 +979,8 @@ fn legacy_skinned_mesh(
     // and take the binding their stored first index already names, at full
     // weight. Only that exact pattern is bound: a zero-weight vertex that a
     // triangle draws, that a partition's vertex map lists, or that names other
-    // bones is still refused.
+    // bones is still refused. When partitions disagreed on carrying a map, the
+    // merged map is gone and nothing is treated as padding.
     let mut in_use = vec![false; position_count];
     let drawn = mesh
         .triangles
@@ -994,12 +995,15 @@ fn legacy_skinned_mesh(
     let mut joints = Vec::with_capacity(position_count);
     let mut weights = Vec::with_capacity(position_count);
     for (vertex_index, (raw_joints, raw_weights)) in influences.into_iter().enumerate() {
-        let raw_weights =
-            if !in_use[vertex_index] && raw_joints == [0; 4] && raw_weights == [0.0; 4] {
-                [1.0, 0.0, 0.0, 0.0]
-            } else {
-                raw_weights
-            };
+        let raw_weights = if !partition.vertex_map_discarded
+            && !in_use[vertex_index]
+            && raw_joints == [0; 4]
+            && raw_weights == [0.0; 4]
+        {
+            [1.0, 0.0, 0.0, 0.0]
+        } else {
+            raw_weights
+        };
         let (vertex_joints, vertex_weights) = normalize_vertex_influences(
             raw_joints,
             raw_weights,

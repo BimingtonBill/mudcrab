@@ -861,6 +861,7 @@ mod legacy_skin {
             weights: Vec::new(),
             bone_indices: Vec::new(),
             vertex_map: None,
+            vertex_map_discarded: false,
             partition_flags: 0,
             palette_overflow: false,
         }
@@ -1286,6 +1287,25 @@ mod legacy_skin {
         let mut nif = padded_buffer_fixture(mapped, false);
         if let NifBlock::NiSkinPartition(partition) = &mut nif.blocks[4] {
             partition.vertex_map = Some(vec![0, 1, 2, 3]);
+        } else {
+            panic!("fixture block 4 is not NiSkinPartition");
+        }
+
+        let error = nif_to_model(&nif, Some(&nif)).unwrap_err();
+
+        assert!(
+            error.contains("vertex 3 has a skin weight sum of 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn binds_no_padding_when_partitions_disagreed_on_a_vertex_map() {
+        // Mixed map presence drops the merged map, so a mapped vertex cannot be ruled out.
+        let padding = vertex(Vec3::Z, [0, 0, 0, 0], [0.0, 0.0, 0.0, 0.0]);
+        let mut nif = padded_buffer_fixture(padding, false);
+        if let NifBlock::NiSkinPartition(partition) = &mut nif.blocks[4] {
+            partition.vertex_map_discarded = true;
         } else {
             panic!("fixture block 4 is not NiSkinPartition");
         }
