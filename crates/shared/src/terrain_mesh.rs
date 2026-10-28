@@ -228,6 +228,8 @@ pub enum LandTextureFormat {
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub struct LandTextureArray {
     /// Path relative to the converted output root, e.g. `terrain/land-diffuse-bc1-1024.ktx2`.
+    /// [`LandTextureTable::validate`] refuses any other shape, so a reader may open it under
+    /// the pack root without checking it again.
     pub path: String,
     pub usage: LandTextureUsage,
     pub format: LandTextureFormat,
@@ -373,6 +375,18 @@ pub enum TerrainMeshError {
     ArrayClass {
         array: usize,
     },
+    /// An array file's `path` is not a canonical relative path: absolute, above the root, URI
+    /// syntax, a control character or empty.
+    ArrayPath {
+        array: usize,
+        path: String,
+    },
+    /// An array file's `path` is relative, but not a `terrain/*.ktx2` file: the only shape the
+    /// converter writes, and so the only one the engine will open.
+    ArrayPathOutsideTerrain {
+        array: usize,
+        path: String,
+    },
 }
 
 impl std::fmt::Display for TerrainMeshError {
@@ -444,15 +458,50 @@ impl std::fmt::Display for TerrainMeshError {
                 f,
                 "texture array {array}: its usage and format are not a class, or the class repeats"
             ),
+            Self::ArrayPath { array, path } => write!(
+                f,
+                "texture array {array}: path {path:?} is not a relative path inside the converted pack"
+            ),
+            Self::ArrayPathOutsideTerrain { array, path } => write!(
+                f,
+                "texture array {array}: path {path:?} is not a terrain/*.ktx2 file"
+            ),
         }
     }
 }
 
 impl std::error::Error for TerrainMeshError {}
 
+/// Checks one array file's `path` is confined to the pack: a canonical relative path under
+/// `terrain/` with a `.ktx2` suffix, the only shape the converter writes. Without this the
+/// engine's `root.join(&path)` would follow `..` or an absolute path out of the asset root
+/// (`join` discards the root for a drive path), and the asset server would be handed the same
+/// escaping path. [`crate::streaming_costs::canonical_resource_key`] is the workspace's one
+/// rule for what a runtime asset path may look like; the `terrain/*.ktx2` shape is this
+/// table's own.
+fn validate_array_path(array: usize, path: &str) -> Result<(), TerrainMeshError> {
+    let key = crate::streaming_costs::canonical_resource_key(path).map_err(|_| {
+        TerrainMeshError::ArrayPath {
+            array,
+            path: path.to_owned(),
+        }
+    })?;
+    let terrain_ktx2 = key
+        .strip_prefix("terrain/")
+        .is_some_and(|file| file.ends_with(".ktx2"));
+    if !terrain_ktx2 {
+        return Err(TerrainMeshError::ArrayPathOutsideTerrain {
+            array,
+            path: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 impl LandTextureTable {
-    /// Checks the version, the array shapes, that entries are dense by id with no repeated
-    /// LTEX, and that every entry names an existing array layer.
+    /// Checks the version, the array shapes, that every array path stays inside the pack (see
+    /// [`LandTextureArray::path`]), that entries are dense by id with no repeated LTEX, and that
+    /// every entry names an existing array layer.
     pub fn validate(&self) -> Result<(), TerrainMeshError> {
         if self.format_version != TERRAIN_MESH_FORMAT_VERSION {
             return Err(TerrainMeshError::FormatVersion {
@@ -461,6 +510,7 @@ impl LandTextureTable {
         }
         let mut classes = std::collections::HashSet::new();
         for (array, file) in self.arrays.iter().enumerate() {
+            validate_array_path(array, &file.path)?;
             let formats = match file.usage {
                 LandTextureUsage::DiffuseSrgb => DIFFUSE_FORMATS,
                 LandTextureUsage::NormalLinear => NORMAL_FORMATS,
@@ -831,6 +881,49 @@ mod tests {
         assert!(json.contains("\"diffuse_srgb\""), "{json}");
         let typo = json.replace("diffuse_srgb", "diffuse_srbg");
         assert!(serde_json::from_str::<LandTextureTable>(&typo).is_err());
+    }
+
+    #[test]
+    fn validate_refuses_array_paths_that_leave_the_pack() {
+        table(3).validate().unwrap();
+        // Forms that would resolve outside the converted output root: `..` escapes on every
+        // platform, and Windows `join` discards the root for a drive-absolute path.
+        for escaped in [
+            "",
+            "../x.ktx2",
+            "terrain/../../x.ktx2",
+            "terrain\\..\\x.ktx2",
+            "/terrain/x.ktx2",
+            "C:/x.ktx2",
+            "C:\\x.ktx2",
+            "\\\\host\\share\\x.ktx2",
+            "terrain/x.ktx2\0",
+        ] {
+            let mut bad = table(3);
+            bad.arrays[0].path = escaped.into();
+            assert_eq!(
+                bad.validate(),
+                Err(TerrainMeshError::ArrayPath {
+                    array: 0,
+                    path: escaped.into()
+                }),
+                "{escaped:?} must be refused"
+            );
+        }
+        // Relative, but not the shape the converter writes: the engine would open a path the
+        // pack does not have.
+        for elsewhere in ["textures/x.ktx2", "terrain/x.dds", "terrain/x", "x.ktx2"] {
+            let mut bad = table(3);
+            bad.arrays[0].path = elsewhere.into();
+            assert_eq!(
+                bad.validate(),
+                Err(TerrainMeshError::ArrayPathOutsideTerrain {
+                    array: 0,
+                    path: elsewhere.into()
+                }),
+                "{elsewhere:?} must be refused"
+            );
+        }
     }
 
     #[test]
