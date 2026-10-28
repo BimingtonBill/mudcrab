@@ -433,7 +433,7 @@ impl AssetPipeline {
         }
         let publication_started = Instant::now();
         report.publication_phase_elapsed_ms =
-            publish_runtime_pack(&staging, &config.output_dir, &report, &output_lock)
+            publish_runtime_pack(&staging, &config.output_dir, &mut report, &output_lock)
                 .map_err(|error| failure(error, &staging, &cancellation))?;
         report.artifacts.push(PathBuf::from(
             shared::streaming_costs::STREAMING_COST_FILE_NAME,
@@ -442,27 +442,53 @@ impl AssetPipeline {
         report
             .phase_elapsed_ms
             .insert("runtime_publication".into(), report.publication_elapsed_ms);
+        // The runtime pack is published and sealed; everything below only maintains the
+        // ingestion cache. A failure here is a notice, never a failed conversion: the pack on
+        // disk is good and complete, so the run must not hand back a resume command for it.
         let cache_persistence_started = Instant::now();
         let cache_root = config.ingestion_cache_dir().join(".ingestion-cache");
-        if staging.join(".ingestion-cache").is_dir() {
-            persist_ingestion_cache(&staging.join(".ingestion-cache"), &cache_root)
-                .map_err(|error| failure(error, &staging, &cancellation))?;
+        if staging.join(".ingestion-cache").is_dir()
+            && let Err(error) =
+                persist_ingestion_cache(&staging.join(".ingestion-cache"), &cache_root)
+        {
+            push_post_publication_notice(
+                &mut report.notices,
+                format!(
+                    "published the asset pack, but could not save the ingestion cache to {}: {error:#}",
+                    cache_root.display()
+                ),
+            );
         }
         report.phase_elapsed_ms.insert(
             "ingestion_cache_persistence".into(),
             cache_persistence_started.elapsed().as_millis(),
         );
         let manifest_reload_started = Instant::now();
-        let manifest =
-            ConversionManifest::load(&config.output_dir.join("conversion-manifest.json"))
-                .map_err(|error| failure(error, &staging, &cancellation))?;
+        let published_manifest =
+            ConversionManifest::load(&config.output_dir.join("conversion-manifest.json"));
         report.phase_elapsed_ms.insert(
             "published_manifest_reload".into(),
             manifest_reload_started.elapsed().as_millis(),
         );
         let cache_pruning_started = Instant::now();
-        prune_stale_ingestion_blobs(&cache_root, &manifest)
-            .map_err(|error| failure(error, &staging, &cancellation))?;
+        match published_manifest {
+            Ok(manifest) => {
+                if let Err(error) = prune_stale_ingestion_blobs(&cache_root, &manifest) {
+                    push_post_publication_notice(
+                        &mut report.notices,
+                        format!(
+                            "published the asset pack, but stale ingestion-cache pruning failed: {error:#}"
+                        ),
+                    );
+                }
+            }
+            Err(error) => push_post_publication_notice(
+                &mut report.notices,
+                format!(
+                    "published the asset pack, but its conversion manifest could not be reloaded, so stale ingestion-cache pruning was skipped: {error:#}"
+                ),
+            ),
+        }
         report.phase_elapsed_ms.insert(
             "ingestion_cache_pruning".into(),
             cache_pruning_started.elapsed().as_millis(),
@@ -4102,12 +4128,31 @@ impl PublicationTimings {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Makes the previous pack's removal fail after the swap, as a held or read-only backup
+    /// does on Windows, so tests can prove a failed cleanup never fails a published pack.
+    static FAIL_PREVIOUS_PACK_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the post-publication ingestion-cache persistence fail, as a full disk does.
+    static FAIL_INGESTION_CACHE_PERSISTENCE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Names a failure that happened after the runtime pack was published. The pack on disk is
+/// complete, so the message is a notice: it is printed with the run's summary, kept in the JSON
+/// report, and logged, but it never makes a good pack look like a failed conversion or asks the
+/// user to resume a run that is already published.
+fn push_post_publication_notice(notices: &mut Vec<String>, message: String) {
+    warn!("{message}");
+    notices.push(message);
+}
+
 /// Publishes only runtime artifacts. Staging keeps `vfs/` and
 /// `.ingestion-cache/` as build workspace; those never land in `output`.
 fn publish_runtime_pack(
     staging: &Path,
     output: &Path,
-    report: &PipelineReport,
+    report: &mut PipelineReport,
     lock: &AssetLock,
 ) -> Result<BTreeMap<String, u128>> {
     let mut timings = PublicationTimings {
@@ -4167,7 +4212,14 @@ fn publish_runtime_pack(
         timings.measure("runtime_pack_costs", || {
             write_streaming_cost_catalog(&pack_staging)
         })?;
-        publish_directory_locked_with_timings(&pack_staging, output, true, lock, &mut timings)
+        publish_directory_locked_with_timings(
+            &pack_staging,
+            output,
+            true,
+            lock,
+            &mut timings,
+            &mut report.notices,
+        )
     })();
     if published.is_err() {
         let _ = fs::remove_dir_all(&pack_staging);
@@ -4193,6 +4245,10 @@ pub(crate) fn write_streaming_cost_catalog(pack: &Path) -> Result<()> {
 
 /// Publishes ingestion blobs into the persistent cache, repairing corrupt copies.
 fn persist_ingestion_cache(staging_cache: &Path, cache_root: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_INGESTION_CACHE_PERSISTENCE.with(std::cell::Cell::get) {
+        bail!("injected ingestion cache persistence failure");
+    }
     let absolute = if cache_root.is_absolute() {
         cache_root.to_owned()
     } else {
@@ -5079,12 +5135,16 @@ fn publish_directory_locked(
     replace: bool,
     lock: &AssetLock,
 ) -> Result<()> {
+    // A metadata rebuild publishes into a new directory and never replaces an output, so it has
+    // no previous pack to clean up; a post-publish notice from here has no report to reach and
+    // only goes to the log.
     publish_directory_locked_with_timings(
         staging,
         output,
         replace,
         lock,
         &mut PublicationTimings::default(),
+        &mut Vec::new(),
     )
 }
 
@@ -5094,6 +5154,7 @@ fn publish_directory_locked_with_timings(
     replace: bool,
     lock: &AssetLock,
     timings: &mut PublicationTimings,
+    notices: &mut Vec<String>,
 ) -> Result<()> {
     timings.measure("destination_lock_validation", || {
         reject_symlink_output(output)?;
@@ -5177,15 +5238,42 @@ fn publish_directory_locked_with_timings(
         }
         return Err(error).wrap_err("failed to publish converted assets");
     }
+    // The new pack is in place, so the only work left is deleting the previous pack. A failure
+    // here must not fail a conversion that published successfully: it is reported as a notice,
+    // and the ownership record is kept so the next run's recovery deletes the leftover backup
+    // without re-verifying it.
     if backup.exists() {
-        timings.measure("previous_pack_cleanup", || {
-            fs::remove_dir_all(backup).map_err(Into::into)
-        })?;
+        let cleanup: Result<()> = timings.measure("previous_pack_cleanup", || {
+            #[cfg(test)]
+            if FAIL_PREVIOUS_PACK_CLEANUP.with(std::cell::Cell::get) {
+                bail!("injected previous pack cleanup failure");
+            }
+            fs::remove_dir_all(&backup).map_err(Into::into)
+        });
+        if let Err(error) = cleanup {
+            push_post_publication_notice(
+                notices,
+                format!(
+                    "published the new pack, but could not remove the previous pack {}: {error:#}; the next run deletes it, or delete it yourself to free the space",
+                    backup.display()
+                ),
+            );
+            return Ok(());
+        }
     }
     if record_path.is_file() {
-        timings.measure("ownership_record_cleanup", || {
-            fs::remove_file(record_path).map_err(Into::into)
-        })?;
+        let cleanup: Result<()> = timings.measure("ownership_record_cleanup", || {
+            fs::remove_file(&record_path).map_err(Into::into)
+        });
+        if let Err(error) = cleanup {
+            push_post_publication_notice(
+                notices,
+                format!(
+                    "published the new pack, but could not remove its ownership record {}: {error:#}; the next run retries removing it",
+                    record_path.display()
+                ),
+            );
+        }
     }
     Ok(())
 }
@@ -5389,16 +5477,20 @@ fn recover_interrupted_publication(output: &Path) -> Result<()> {
     if output.exists() {
         let current = manifest_hash(output)?;
         if current == record.next_manifest_hash {
-            if backup.exists() {
-                verify_package_seal(
-                    output,
-                    &record.next_manifest_hash,
-                    &record.next_generated_artifacts,
-                )?;
-                validate_publication_package(output)?;
-                verify_publication_seal(&backup, &record)?;
-                crate::config::check_output_dir(&backup)?;
-                fs::remove_dir_all(&backup)?;
+            // The output is the sealed new pack, so the record's backup is the previous pack
+            // and holds nothing worth keeping. It is not re-verified: a delete that stopped
+            // halfway leaves a backup that can never satisfy its seal, and demanding it would
+            // fail every later run on a good pack. The strict seal stays only in the branch
+            // below, where the backup becomes the output again.
+            verify_package_seal(
+                output,
+                &record.next_manifest_hash,
+                &record.next_generated_artifacts,
+            )?;
+            validate_publication_package(output)?;
+            if !remove_publication_backup(&backup) {
+                // The record stays, so the next run retries the delete.
+                return Ok(());
             }
         } else {
             ensure!(
@@ -5413,6 +5505,33 @@ fn recover_interrupted_publication(output: &Path) -> Result<()> {
     }
     fs::remove_file(record_path)?;
     Ok(())
+}
+
+/// Deletes a backup left by an interrupted cleanup and returns whether it is gone. The output is
+/// already the sealed new pack, so nothing in the backup is worth keeping: a delete that still
+/// fails names the leftover and never fails a run that has a good pack.
+fn remove_publication_backup(backup: &Path) -> bool {
+    #[cfg(test)]
+    let removed = if FAIL_PREVIOUS_PACK_CLEANUP.with(std::cell::Cell::get) {
+        Err(std::io::Error::other(
+            "injected previous pack cleanup failure",
+        ))
+    } else {
+        fs::remove_dir_all(backup)
+    };
+    #[cfg(not(test))]
+    let removed = fs::remove_dir_all(backup);
+    match removed {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            warn!(
+                "could not remove the previous pack {}: {error}; the next run retries, or delete it yourself to free the space",
+                backup.display()
+            );
+            false
+        }
+    }
 }
 
 fn verify_publication_seal(backup: &Path, record: &PublicationRecord) -> Result<()> {
@@ -6400,7 +6519,7 @@ mod tests {
         fs::write(staging.join("published.glb"), b"invalid GLB").unwrap();
         fs::write(staging.join("stale.glb"), b"stale GLB").unwrap();
         fs::write(staging.join(STREAMING_COST_FILE_NAME), b"old sidecar").unwrap();
-        let report = PipelineReport {
+        let mut report = PipelineReport {
             artifacts: vec![
                 "conversion-manifest.json".into(),
                 "scripts/papyrus_runtime.luau".into(),
@@ -6410,7 +6529,7 @@ mod tests {
             ..Default::default()
         };
         let lock = AssetLock::acquire_exclusive(&output).unwrap();
-        publish_runtime_pack(&staging, &output, &report, &lock).unwrap();
+        publish_runtime_pack(&staging, &output, &mut report, &lock).unwrap();
         let fingerprint = hash_file(&output.join("conversion-manifest.json")).unwrap();
         let catalog =
             StreamingCostCatalog::load(&output.join(STREAMING_COST_FILE_NAME), &fingerprint)
@@ -6441,12 +6560,12 @@ mod tests {
         write_test_runtime_pack(&output, "previous");
         write_test_runtime_pack(&staging, "next");
         fs::write(staging.join("conversion-manifest.json"), b"invalid JSON").unwrap();
-        let report = PipelineReport {
+        let mut report = PipelineReport {
             artifacts: vec!["conversion-manifest.json".into()],
             ..Default::default()
         };
         let lock = AssetLock::acquire_exclusive(&output).unwrap();
-        assert!(publish_runtime_pack(&staging, &output, &report, &lock).is_err());
+        assert!(publish_runtime_pack(&staging, &output, &mut report, &lock).is_err());
         assert_eq!(published_manifest(&output).configuration_hash, "previous");
         assert_eq!(
             fs::read(output.join("scripts/papyrus_runtime.luau")).unwrap(),
@@ -6481,6 +6600,83 @@ mod tests {
                 if boundary < 2 { "previous" } else { "next" }
             );
         }
+    }
+
+    /// A cleanup that died halfway leaves a backup that can never match its seal: files are
+    /// already gone. The output is the sealed new pack, so recovery must delete the remains
+    /// instead of refusing it, which would fail every later run on a good pack.
+    #[test]
+    fn recovery_discards_a_partially_deleted_backup_of_a_published_pack() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("assets");
+        let backup = directory.path().join("assets.backup-123");
+        let staging = directory.path().join("staging");
+        write_test_runtime_pack(&output, "previous");
+        write_test_runtime_pack(&staging, "next");
+        write_publication_record(&output, &backup, &staging).unwrap();
+        fs::rename(&output, &backup).unwrap();
+        fs::rename(&staging, &output).unwrap();
+        // The delete stopped after removing the previous pack's manifest and sealed script.
+        fs::remove_file(backup.join("conversion-manifest.json")).unwrap();
+        fs::remove_file(backup.join("scripts/papyrus_runtime.luau")).unwrap();
+
+        recover_interrupted_publication(&output).unwrap();
+
+        assert_eq!(published_manifest(&output).configuration_hash, "next");
+        assert!(!backup.exists());
+        assert!(!publication_record_path(&output).unwrap().exists());
+    }
+
+    /// A previous pack that cannot be deleted after the swap must not fail the run or wedge the
+    /// next one: the new pack stays published, the run reports a notice, and recovery completes.
+    #[test]
+    fn failed_previous_pack_cleanup_keeps_the_published_pack_and_a_retryable_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        let output = directory.path().join("assets");
+        write_test_runtime_pack(&output, "previous");
+        write_test_runtime_pack(&staging, "next");
+        let backup = output.with_extension(format!("backup-{}", std::process::id()));
+        let mut report = PipelineReport {
+            artifacts: vec![
+                "conversion-manifest.json".into(),
+                "scripts/papyrus_runtime.luau".into(),
+            ],
+            ..Default::default()
+        };
+        let lock = AssetLock::acquire_exclusive(&output).unwrap();
+
+        FAIL_PREVIOUS_PACK_CLEANUP.with(|fail| fail.set(true));
+        let published = publish_runtime_pack(&staging, &output, &mut report, &lock);
+        FAIL_PREVIOUS_PACK_CLEANUP.with(|fail| fail.set(false));
+
+        published.unwrap();
+        assert_eq!(published_manifest(&output).configuration_hash, "next");
+        assert!(backup.is_dir(), "the leftover backup is kept, not lost");
+        assert!(
+            publication_record_path(&output).unwrap().is_file(),
+            "the record is kept so recovery deletes the backup"
+        );
+        assert!(
+            report.notices.iter().any(|notice| notice
+                .contains("could not remove the previous pack")
+                && notice.contains(&backup.display().to_string())),
+            "notices: {:?}",
+            report.notices
+        );
+
+        // A recovery whose delete fails again keeps the record, so a later run retries.
+        FAIL_PREVIOUS_PACK_CLEANUP.with(|fail| fail.set(true));
+        let retried = recover_interrupted_publication(&output);
+        FAIL_PREVIOUS_PACK_CLEANUP.with(|fail| fail.set(false));
+        retried.unwrap();
+        assert!(backup.is_dir());
+        assert!(publication_record_path(&output).unwrap().is_file());
+
+        recover_interrupted_publication(&output).unwrap();
+        assert!(!backup.exists());
+        assert!(!publication_record_path(&output).unwrap().exists());
+        assert_eq!(published_manifest(&output).configuration_hash, "next");
     }
 
     #[tokio::test]
@@ -10527,6 +10723,54 @@ mod tests {
         assert!(output.join("conversion-manifest.json").is_file());
         assert!(!StagingJournal::path_in(&output).exists());
         assert_eq!(staging_entries(temp.path()), Vec::<PathBuf>::new());
+    }
+
+    /// The pack is already published when the ingestion cache is written, so a cache write that
+    /// fails must leave a complete run, not a failure that sends the user back to resume it.
+    #[tokio::test]
+    async fn a_post_publication_cache_failure_keeps_the_published_pack_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(
+            data.join("assets.ba2"),
+            dummy_content::ba2::general(
+                &[dummy_content::Entry::new(
+                    "strings/readme.strings",
+                    b"cached asset",
+                )],
+                dummy_content::ba2::Compression::None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = cpu_lod_config(&data, &output);
+        config.extract_all_archive_files = true;
+
+        FAIL_INGESTION_CACHE_PERSISTENCE.with(|fail| fail.set(true));
+        let report = run_without_progress(config.clone()).await;
+        FAIL_INGESTION_CACHE_PERSISTENCE.with(|fail| fail.set(false));
+
+        assert!(report.complete, "warnings: {:?}", report.warnings);
+        assert_eq!(published_manifest(&output).complete, report.complete);
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|notice| notice.contains("could not save the ingestion cache")),
+            "notices: {:?}",
+            report.notices
+        );
+        let cache = config.ingestion_cache_dir().join(".ingestion-cache/sha256");
+        assert!(
+            !cache.exists(),
+            "the injected failure skipped cache persistence"
+        );
+
+        // The next run publishes normally from the same inputs.
+        let rerun = run_without_progress(config).await;
+        assert!(rerun.complete);
     }
 
     #[tokio::test]
