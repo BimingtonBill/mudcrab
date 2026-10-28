@@ -3024,12 +3024,6 @@ fn table_group(view: &ViewGpu, batch: usize) -> Option<u32> {
         .then(|| u32::from_le_bytes(row[4..8].try_into().unwrap()))
 }
 
-type ReadinessDependencies<'a> = (
-    &'a PipelineCache,
-    &'a ErasedRenderAssets<PreparedMaterial>,
-    &'a MaterialBindGroupAllocators,
-);
-
 /// What readiness reads of one batch that no view changes: its prepared material when that is
 /// current for the batch (its slab bound, its slot the one the batch was built with), and whether
 /// a shadow view may draw it with that material.
@@ -3238,26 +3232,6 @@ fn batch_material<'a>(
         material,
         shadow_ok,
     })
-}
-
-fn batch_ready(
-    gpu: &ClusterGpu,
-    view: &ViewGpu,
-    batch: usize,
-    shadow: bool,
-    prepass: bool,
-    dependencies: ReadinessDependencies,
-) -> bool {
-    let (cache, materials, allocators) = dependencies;
-    batch_ready_with(
-        gpu,
-        view,
-        batch,
-        batch_material(gpu, batch, materials, allocators),
-        shadow,
-        prepass,
-        cache,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
