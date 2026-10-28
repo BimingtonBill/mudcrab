@@ -1268,6 +1268,25 @@ mod legacy_skin {
     }
 
     #[test]
+    fn rejects_an_undrawn_zero_weight_vertex_that_a_partition_maps() {
+        // A vertex a partition lists is skinned data, not padding, even when no triangle draws it.
+        let mapped = vertex(Vec3::Z, [0, 0, 0, 0], [0.0, 0.0, 0.0, 0.0]);
+        let mut nif = padded_buffer_fixture(mapped, false);
+        if let NifBlock::NiSkinPartition(partition) = &mut nif.blocks[4] {
+            partition.vertex_map = Some(vec![0, 1, 2, 3]);
+        } else {
+            panic!("fixture block 4 is not NiSkinPartition");
+        }
+
+        let error = nif_to_model(&nif, Some(&nif)).unwrap_err();
+
+        assert!(
+            error.contains("vertex 3 has a skin weight sum of 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn rejects_an_undrawn_vertex_with_a_negative_weight_sum() {
         // Only an exactly-zero padding vertex is bound; other bad weights still fail.
         let broken = vertex(Vec3::Z, [0, 0, 0, 0], [-1.0, 0.0, 0.0, 0.0]);

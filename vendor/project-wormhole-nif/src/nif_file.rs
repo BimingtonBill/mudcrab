@@ -978,26 +978,28 @@ fn legacy_skinned_mesh(
     // in the buffer (morphs and FaceGen .tri files address vertices by index)
     // and take the binding their stored first index already names, at full
     // weight. Only that exact pattern is bound: a zero-weight vertex that a
-    // triangle draws, or one that names other bones, is still refused.
-    let mut drawn = vec![false; position_count];
-    for corner in mesh
+    // triangle draws, that a partition's vertex map lists, or that names other
+    // bones is still refused.
+    let mut in_use = vec![false; position_count];
+    let drawn = mesh
         .triangles
         .iter()
-        .flat_map(|triangle| triangle.to_array())
-    {
-        if let Some(slot) = drawn.get_mut(usize::from(corner)) {
+        .flat_map(|triangle| triangle.to_array());
+    let mapped = partition.vertex_map.iter().flatten().copied();
+    for vertex in drawn.chain(mapped) {
+        if let Some(slot) = in_use.get_mut(usize::from(vertex)) {
             *slot = true;
         }
     }
     let mut joints = Vec::with_capacity(position_count);
     let mut weights = Vec::with_capacity(position_count);
     for (vertex_index, (raw_joints, raw_weights)) in influences.into_iter().enumerate() {
-        let raw_weights = if !drawn[vertex_index] && raw_joints == [0; 4] && raw_weights == [0.0; 4]
-        {
-            [1.0, 0.0, 0.0, 0.0]
-        } else {
-            raw_weights
-        };
+        let raw_weights =
+            if !in_use[vertex_index] && raw_joints == [0; 4] && raw_weights == [0.0; 4] {
+                [1.0, 0.0, 0.0, 0.0]
+            } else {
+                raw_weights
+            };
         let (vertex_joints, vertex_weights) = normalize_vertex_influences(
             raw_joints,
             raw_weights,
