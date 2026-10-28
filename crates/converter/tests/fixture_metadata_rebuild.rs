@@ -1,6 +1,8 @@
+mod common;
+
 use converter::{
     AssetPipeline, PipelineConfig,
-    cache::{ConversionManifest, hash_file},
+    cache::{ConversionManifest, hash_bytes, hash_file},
 };
 use dummy_content::{Entry, bsa, esm, layout, nif};
 use rusqlite::Connection;
@@ -11,6 +13,453 @@ const VOLCANIC_MODEL: &str = "meshes/landscape/grass/dlc02volcanicashgrass01.nif
 const VOLCANIC_GLB: &str = "meshes/landscape/grass/dlc02volcanicashgrass01.glb";
 const VOLCANIC_ORIGINAL: &str = "textures/landscape/grass/volcanicashgrass02_n.dds";
 const VOLCANIC_TARGET: &str = "textures/dlc02/landscape/grass/volcanicashgrass02_n.dds";
+
+/// Old complete packs can contain optional derived files and strays without output proofs.
+/// Omit only those files while publishing every verified neighboring asset unchanged.
+#[tokio::test]
+async fn metadata_rebuild_skips_unproven_derived_outputs_and_strays_locally() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    let source = directory.path().join("source");
+    let output = directory.path().join("rebuilt");
+    generate(&data);
+    convert(&data, &source).await;
+    let manifest = ConversionManifest::load(&source.join("conversion-manifest.json")).unwrap();
+    let manifest_hash = hash_file(&source.join("conversion-manifest.json")).unwrap();
+    let before: Vec<_> = manifest
+        .entries
+        .values()
+        .map(|entry| {
+            (
+                entry.output.clone(),
+                hash_file(&source.join(&entry.output)).unwrap(),
+            )
+        })
+        .collect();
+    let unproven = [
+        "meshes/actors/character/composed/default/male/body.glb",
+        "meshes/actors/character/composed/default/female/body.glb",
+        "meshes/actors/character/animations/male/mt_idle.glb",
+        "meshes/actors/character/animations/female/mt_idle.glb",
+        "scripts/mod-stray.luau",
+        "textures/mod-stray.bin",
+    ];
+    for relative in unproven {
+        let path = source.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"unproven bytes must never be retained").unwrap();
+    }
+    let result = rebuild(&data, &source, &output).await;
+    assert!(
+        result.is_ok(),
+        "local unproven files aborted publication: {result:?}"
+    );
+    let report = result.unwrap();
+    assert!(report.complete, "{:?}", report.warnings);
+    assert!(report.warnings.is_empty());
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("6 unproven retained assets")),
+        "{:?}",
+        report.notices
+    );
+    for relative in unproven {
+        assert!(
+            !output.join(relative).exists(),
+            "unproven output published: {relative}"
+        );
+        assert_eq!(
+            fs::read(source.join(relative)).unwrap(),
+            b"unproven bytes must never be retained"
+        );
+    }
+    for (relative, hash) in before {
+        assert_eq!(
+            hash_file(&output.join(&relative)).unwrap(),
+            hash,
+            "verified neighbor changed: {relative}"
+        );
+        assert_eq!(hash_file(&source.join(&relative)).unwrap(), hash);
+    }
+    assert_eq!(
+        hash_file(&source.join("conversion-manifest.json")).unwrap(),
+        manifest_hash
+    );
+    let connection = Connection::open(output.join("skyrim_world.db")).unwrap();
+    let count: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM \"references\" WHERE id=4660",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "valid neighboring plugin record must publish");
+}
+
+/// Supply independent synthetic producer facts for the consumer's body-recipe fixture.
+fn derived_body_proof(bytes: &[u8]) -> converter::cache::DerivedOutput {
+    converter::cache::DerivedOutput {
+        recipe: "body-compose-v1".into(),
+        inputs: [
+            (
+                "meshes/actors/character/character assets/malebody_1.nif",
+                "body",
+            ),
+            (
+                "meshes/actors/character/character assets/malehands_1.nif",
+                "hands",
+            ),
+            (
+                "meshes/actors/character/character assets/malefeet_1.nif",
+                "feet",
+            ),
+            (
+                "meshes/actors/character/character assets/skeleton.nif",
+                "skeleton",
+            ),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| (path.into(), converter::cache::hash_bytes(bytes.as_bytes())))
+        .collect(),
+        output_size: bytes.len() as u64,
+        output_hash: converter::cache::hash_bytes(bytes),
+    }
+}
+
+/// Hold a Windows source file open without sharing reads until the guard is dropped.
+#[cfg(windows)]
+fn block_file_reads(path: &Path) -> Option<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    Some(
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap(),
+    )
+}
+
+/// Restore a Unix fixture's permissions even if the rebuild or an assertion panics.
+#[cfg(unix)]
+struct RestoreFilePermissions<'a> {
+    path: &'a Path,
+    permissions: fs::Permissions,
+}
+
+#[cfg(unix)]
+impl Drop for RestoreFilePermissions<'_> {
+    /// Best-effort restoration must not hide the original assertion failure.
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(self.path, self.permissions.clone());
+    }
+}
+
+/// Deny Unix reads, skipping root or another process that bypasses file permissions.
+#[cfg(unix)]
+fn block_file_reads(path: &Path) -> Option<RestoreFilePermissions<'_>> {
+    use std::os::unix::fs::PermissionsExt;
+    let restore = RestoreFilePermissions {
+        path,
+        permissions: fs::metadata(path).unwrap().permissions(),
+    };
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(path).is_ok() {
+        eprintln!("skipping unreadable-file fixture: file permissions are bypassed (root)");
+        return None;
+    }
+    Some(restore)
+}
+
+/// An unreadable optional body with a valid proof cannot block verified neighboring publication.
+#[cfg(any(windows, unix))]
+#[tokio::test]
+async fn metadata_rebuild_omits_unreadable_proven_derived_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    let source = directory.path().join("source");
+    let output = directory.path().join("rebuilt");
+    generate(&data);
+    convert(&data, &source).await;
+    let manifest_path = source.join("conversion-manifest.json");
+    let mut manifest = ConversionManifest::load(&manifest_path).unwrap();
+    let neighbor = manifest.entries[layout::GENERATED_MODEL_PATH].clone();
+    let neighbor_hash = hash_file(&source.join(&neighbor.output)).unwrap();
+    let bytes = fs::read(source.join(&neighbor.output)).unwrap();
+    let relative = "meshes/actors/character/composed/default/male/body.glb";
+    let body = source.join(relative);
+    fs::create_dir_all(body.parent().unwrap()).unwrap();
+    fs::write(&body, &bytes).unwrap();
+    manifest
+        .derived_outputs
+        .insert(relative.into(), derived_body_proof(&bytes));
+    manifest.save(&manifest_path).unwrap();
+    let source_manifest_hash = hash_file(&manifest_path).unwrap();
+    let Some(unreadable) = block_file_reads(&body) else {
+        return;
+    };
+    assert!(fs::read(&body).is_err(), "fixture must actually deny reads");
+    let result = rebuild(&data, &source, &output).await;
+    drop(unreadable);
+    assert!(
+        result.is_ok(),
+        "unreadable optional derived output aborted publication: {result:?}"
+    );
+    let report = result.unwrap();
+    assert!(report.complete, "{:?}", report.warnings);
+    assert!(report.warnings.is_empty());
+    let omissions: Vec<_> = report
+        .notices
+        .iter()
+        .filter(|notice| notice.contains("unproven retained assets"))
+        .collect();
+    assert_eq!(omissions.len(), 1, "{:?}", report.notices);
+    assert!(omissions[0].contains("1 unproven retained assets"));
+    assert!(omissions[0].contains(relative));
+    assert!(
+        !output.join(relative).exists(),
+        "partial body must not publish"
+    );
+    assert_eq!(
+        hash_file(&output.join(&neighbor.output)).unwrap(),
+        neighbor_hash
+    );
+    let published = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+    assert!(published.complete);
+    assert!(published.derived_outputs.is_empty());
+    assert_eq!(
+        published.entries[layout::GENERATED_MODEL_PATH].output_hash,
+        neighbor_hash
+    );
+    assert_eq!(fs::read(&body).unwrap(), bytes);
+    assert_eq!(
+        hash_file(&source.join(&neighbor.output)).unwrap(),
+        neighbor_hash
+    );
+    assert_eq!(hash_file(&manifest_path).unwrap(), source_manifest_hash);
+}
+
+/// The optional-output recovery must never hide an unreadable ordinary recorded asset.
+#[cfg(any(windows, unix))]
+#[tokio::test]
+async fn metadata_rebuild_rejects_unreadable_ordinary_asset() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    let source = directory.path().join("source");
+    let output = directory.path().join("rebuilt");
+    generate(&data);
+    convert(&data, &source).await;
+    let manifest = ConversionManifest::load(&source.join("conversion-manifest.json")).unwrap();
+    let relative = &manifest.entries[layout::GENERATED_MODEL_PATH].output;
+    let path = source.join(relative);
+    let original_hash = hash_file(&path).unwrap();
+    let Some(unreadable) = block_file_reads(&path) else {
+        return;
+    };
+    assert!(fs::read(&path).is_err(), "fixture must actually deny reads");
+    let result = rebuild(&data, &source, &output).await;
+    drop(unreadable);
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains(&format!("failed to copy retained asset {relative}")),
+        "{error}"
+    );
+    assert!(
+        !output.exists(),
+        "unverified ordinary bytes must not publish"
+    );
+    assert_eq!(hash_file(&path).unwrap(), original_hash);
+}
+
+/// Unproven symlinks are omitted without following or modifying their external target.
+#[cfg(unix)]
+#[tokio::test]
+async fn metadata_rebuild_skips_stray_symlinks_without_following_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    let source = directory.path().join("source");
+    let output = directory.path().join("rebuilt");
+    generate(&data);
+    convert(&data, &source).await;
+    let external = directory.path().join("protected.luau");
+    fs::write(&external, b"protected external bytes").unwrap();
+    std::os::unix::fs::symlink(&external, source.join("scripts/stray.luau")).unwrap();
+    let report = rebuild(&data, &source, &output).await.unwrap();
+    assert!(report.complete, "{:?}", report.warnings);
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("1 unproven retained assets"))
+    );
+    assert!(!output.join("scripts/stray.luau").exists());
+    assert_eq!(fs::read(&external).unwrap(), b"protected external bytes");
+    assert!(
+        source
+            .join("scripts/stray.luau")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+/// Runtime-only packs preserve authenticated derived bytes and their original proof repeatedly.
+#[tokio::test]
+async fn metadata_rebuild_retains_proven_derived_bytes_without_raw_inputs() {
+    for recipe in ["body-compose-v1", "body-compose-v2"] {
+        assert_runtime_only_derived_reuse(recipe).await;
+    }
+}
+
+/// Publishes each supported body recipe twice without consulting its original inputs.
+async fn assert_runtime_only_derived_reuse(recipe: &str) {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    let source = directory.path().join("source");
+    generate(&data);
+    convert(&data, &source).await;
+    assert!(!source.join("vfs").exists());
+    let manifest_path = source.join("conversion-manifest.json");
+    let mut manifest = ConversionManifest::load(&manifest_path).unwrap();
+    let mesh = manifest
+        .entries
+        .values()
+        .find(|entry| entry.output.ends_with(".glb"))
+        .unwrap();
+    let bytes = fs::read(source.join(&mesh.output)).unwrap();
+    let relative = "meshes/actors/character/composed/default/male/body.glb";
+    fs::create_dir_all(source.join(relative).parent().unwrap()).unwrap();
+    fs::write(source.join(relative), &bytes).unwrap();
+    // Moving the synthetic scene changes its relative texture base; finalize its
+    // absent references before recording producer facts for the retained bytes.
+    let pruned = converter::mesh::MeshConverter::prune_dangling_texture_uris(&source).unwrap();
+    assert_eq!(pruned.len(), 1);
+    assert_eq!(pruned[0].glb, relative);
+    let bytes = fs::read(source.join(relative)).unwrap();
+    let mut proof = derived_body_proof(&bytes);
+    proof.recipe = recipe.into();
+    if recipe == "body-compose-v2" {
+        proof.inputs.insert(
+            "recipes/body-compose-v2/context.json".into(),
+            hash_bytes(b"[[[\"body\",null],[\"hands\",null],[\"feet\",null]],[]]"),
+        );
+    }
+    manifest
+        .derived_outputs
+        .insert(relative.into(), proof.clone());
+    manifest.save(&manifest_path).unwrap();
+    let source_hash = hash_file(&manifest_path).unwrap();
+    let mut previous = source.clone();
+    for name in ["rebuilt", "repeated"] {
+        let output = directory.path().join(name);
+        let report = rebuild(&data, &previous, &output).await.unwrap();
+        assert!(report.complete, "{:?}", report.warnings);
+        assert!(
+            !report
+                .notices
+                .iter()
+                .any(|notice| notice.contains("unproven retained"))
+        );
+        assert_eq!(fs::read(output.join(relative)).unwrap(), bytes);
+        let current = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+        assert_eq!(current.derived_outputs.get(relative), Some(&proof));
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("streaming-costs.json")).unwrap())
+                .unwrap();
+        assert!(catalog.to_string().contains(relative));
+        previous = output;
+    }
+    assert_eq!(hash_file(&manifest_path).unwrap(), source_hash);
+}
+
+/// Malformed, unsupported, missing and corrupted optional outputs cannot block valid neighbors.
+#[tokio::test]
+async fn metadata_rebuild_omits_invalid_individual_derived_proofs() {
+    for case in [
+        "recipe",
+        "size",
+        "hash",
+        "inputs",
+        "missing",
+        "malformed",
+        "malformed-missing",
+        "escaping",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        let source = directory.path().join("source");
+        let output = directory.path().join("rebuilt");
+        generate(&data);
+        convert(&data, &source).await;
+        let manifest_path = source.join("conversion-manifest.json");
+        let manifest = ConversionManifest::load(&manifest_path).unwrap();
+        let neighbor = manifest
+            .entries
+            .values()
+            .find(|entry| entry.output.ends_with(".glb"))
+            .unwrap();
+        let neighbor_hash = hash_file(&source.join(&neighbor.output)).unwrap();
+        let bytes = fs::read(source.join(&neighbor.output)).unwrap();
+        let relative = "meshes/actors/character/composed/default/male/body.glb";
+        let mut proof = serde_json::to_value(derived_body_proof(&bytes)).unwrap();
+        match case {
+            "recipe" => proof["recipe"] = "future-body-v99".into(),
+            "size" => proof["output_size"] = 1.into(),
+            "hash" => proof["output_hash"] = "0".repeat(64).into(),
+            "inputs" => proof["inputs"] = serde_json::json!({"wrong.nif": "0".repeat(64)}),
+            "malformed" | "malformed-missing" => proof["output_size"] = "not an integer".into(),
+            _ => {}
+        }
+        let mut document = serde_json::to_value(&manifest).unwrap();
+        let proof_path = if case == "escaping" {
+            "../escaped.glb"
+        } else {
+            relative
+        };
+        document["derived_outputs"] = serde_json::json!({proof_path: proof});
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&document).unwrap(),
+        )
+        .unwrap();
+        if !["missing", "malformed-missing", "escaping"].contains(&case) {
+            fs::create_dir_all(source.join(relative).parent().unwrap()).unwrap();
+            fs::write(source.join(relative), &bytes).unwrap();
+        }
+        let source_hash = hash_file(&manifest_path).unwrap();
+        let result = rebuild(&data, &source, &output).await;
+        assert!(result.is_ok(), "{case}: {result:?}");
+        let report = result.unwrap();
+        assert!(report.complete, "{case}: {:?}", report.warnings);
+        assert_eq!(
+            report
+                .notices
+                .iter()
+                .filter(|notice| notice.contains("1 unproven retained assets"))
+                .count(),
+            1,
+            "{case}: {:?}",
+            report.notices
+        );
+        assert!(!output.join(relative).exists(), "{case}");
+        assert!(!directory.path().join("escaped.glb").exists());
+        assert_eq!(
+            hash_file(&output.join(&neighbor.output)).unwrap(),
+            neighbor_hash,
+            "{case}"
+        );
+        assert!(
+            ConversionManifest::load(&output.join("conversion-manifest.json"))
+                .unwrap()
+                .derived_outputs
+                .is_empty(),
+            "{case}"
+        );
+        assert_eq!(hash_file(&manifest_path).unwrap(), source_hash, "{case}");
+    }
+}
 
 /// Adds a scoped volcanic model whose authored normal is absent but DLC02 source exists.
 fn add_volcanic_source(data: &Path) {
@@ -137,7 +586,7 @@ fn generate(data: &Path) {
 async fn convert(data: &Path, output: &Path) -> converter::PipelineReport {
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let report = AssetPipeline::run_async(PipelineConfig::new(data, output), tx)
+    let report = AssetPipeline::run_async(common::cpu_lod_config(data, output), tx)
         .await
         .unwrap();
     drain.await.unwrap();
@@ -153,7 +602,8 @@ async fn rebuild(
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result =
-        AssetPipeline::rebuild_metadata_async(PipelineConfig::new(data, output), source, tx).await;
+        AssetPipeline::rebuild_metadata_async(common::cpu_lod_config(data, output), source, tx)
+            .await;
     drain.await.unwrap();
     result
 }
@@ -199,16 +649,17 @@ fn native_configuration_hash(config: &PipelineConfig, zstd_level: u32) -> String
     )
 }
 
+/// A schema-16 native producer cannot be relabeled as current by metadata rebuild: its KTX2
+/// textures predate the current layout, so the source must be regenerated by normal conversion.
 #[tokio::test]
-async fn native_retained_configuration_survives_rebuilds_without_becoming_cache_hits() {
+async fn native_pre_producer_28_configuration_is_rejected_not_relabeled() {
     let directory = tempfile::tempdir().unwrap();
     let data = directory.path().join("Data");
     let source = directory.path().join("source");
     let output = directory.path().join("derived");
-    let repeated = directory.path().join("derived-again");
     generate(&data);
     convert(&data, &source).await;
-    let config = PipelineConfig::new(&data, &output);
+    let config = common::cpu_lod_config(&data, &output);
     let producer_hash = native_configuration_hash(&config, 6);
     assert_eq!(
         producer_hash,
@@ -219,51 +670,15 @@ async fn native_retained_configuration_survives_rebuilds_without_becoming_cache_
         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     manifest.schema_version = 16;
     manifest.asset_configuration_hashes.clear();
-    manifest.configuration_hash = producer_hash.clone();
+    manifest.configuration_hash = producer_hash;
     manifest.save(&path).unwrap();
     fs::write(source.join("record-reader.json"), br#"{"mode":"legacy"}"#).unwrap();
-    let original = hash_file(&path).unwrap();
-    rebuild(&data, &source, &output).await.unwrap();
-    rebuild(&data, &output, &repeated).await.unwrap();
-    assert_eq!(hash_file(&path).unwrap(), original);
-    let retained: ConversionManifest =
-        serde_json::from_slice(&fs::read(repeated.join("conversion-manifest.json")).unwrap())
-            .unwrap();
-    assert_eq!(
-        retained.retained_asset_configuration_hash,
-        Some(producer_hash.clone())
+    let error = rebuild(&data, &source, &output).await.unwrap_err();
+    assert!(
+        format!("{error:?}").contains("predate the current texture layout"),
+        "{error:?}"
     );
-    assert_eq!(retained.retained_mesh_schema_version, Some(16));
-    for entry in manifest.entries.values() {
-        assert_eq!(
-            hash_file(&repeated.join(&entry.output)).unwrap(),
-            entry.output_hash
-        );
-    }
-    let provenance: serde_json::Value =
-        serde_json::from_slice(&fs::read(repeated.join("metadata-rebuild.json")).unwrap()).unwrap();
-    assert_eq!(
-        provenance["retained_asset_configuration_hash"],
-        producer_hash
-    );
-    let mut missing_producer = retained;
-    missing_producer.retained_asset_configuration_hash = None;
-    missing_producer
-        .save(&repeated.join("conversion-manifest.json"))
-        .unwrap();
-    let error = rebuild(&data, &repeated, &directory.path().join("missing-producer"))
-        .await
-        .unwrap_err();
-    assert!(format!("{error:?}").contains("missing retained producer configuration"));
-    let report = convert(&data, &repeated).await;
-    assert_eq!(
-        report.cache_hits, 0,
-        "native producer bytes must not become normal converter cache hits"
-    );
-    let current: ConversionManifest =
-        serde_json::from_slice(&fs::read(repeated.join("conversion-manifest.json")).unwrap())
-            .unwrap();
-    assert_eq!(current.retained_asset_configuration_hash, None);
+    assert!(!output.exists());
 }
 
 /// Changed native settings fail against the exact recorded legacy producer identity.
@@ -279,14 +694,15 @@ async fn metadata_rebuild_rejects_changed_native_producer_settings() {
         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     for (index, retained) in [false, true].into_iter().enumerate() {
         let output = directory.path().join(format!("rejected-{index}"));
-        let changed = native_configuration_hash(&PipelineConfig::new(&data, &output), 7);
+        let changed = native_configuration_hash(&common::cpu_lod_config(&data, &output), 7);
         if retained {
             manifest.schema_version = converter::cache::CONVERTER_SCHEMA_VERSION;
             let mut legacy_config = PipelineConfig::new(&data, &output);
             legacy_config.record_reader = converter::config::RecordReader::Legacy;
             manifest.configuration_hash =
                 converter::cache::configuration_hash(&legacy_config).unwrap();
-            manifest.retained_mesh_schema_version = Some(16);
+            manifest.retained_mesh_schema_version =
+                Some(converter::cache::CONVERTER_SCHEMA_VERSION);
             manifest.asset_configuration_hashes.clear();
             manifest.retained_asset_configuration_hash = Some(changed);
             fs::write(
@@ -310,7 +726,12 @@ async fn metadata_rebuild_rejects_changed_native_producer_settings() {
         }
         manifest.save(&path).unwrap();
         let error = rebuild(&data, &source, &output).await.unwrap_err();
-        assert!(format!("{error:?}").contains("configuration does not match"));
+        let expected = if retained {
+            "retained producer configuration does not match rebuild settings"
+        } else {
+            "predate the current texture layout"
+        };
+        assert!(format!("{error:?}").contains(expected), "{error:?}");
         assert!(!output.exists());
     }
 }
@@ -323,7 +744,6 @@ async fn metadata_rebuild_reuses_bytes_and_recovers_authoritative_flags() {
     let output = directory.path().join("derived");
     generate(&data);
     convert(&data, &source).await;
-    schema_four_source(&source);
     let old_manifest = hash_file(&source.join("conversion-manifest.json")).unwrap();
     let old_db = hash_file(&source.join("skyrim_world.db")).unwrap();
     let source_manifest: ConversionManifest =
@@ -364,8 +784,14 @@ async fn metadata_rebuild_reuses_bytes_and_recovers_authoritative_flags() {
     assert_eq!(version, shared::WORLD_DATABASE_SCHEMA_VERSION);
     let provenance: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("metadata-rebuild.json")).unwrap()).unwrap();
-    assert_eq!(provenance["source_converter_schema"], 15);
-    assert_eq!(provenance["source_retained_mesh_schema"], 15);
+    assert_eq!(
+        provenance["source_converter_schema"],
+        converter::cache::CONVERTER_SCHEMA_VERSION
+    );
+    assert_eq!(
+        provenance["source_retained_mesh_schema"],
+        converter::cache::CONVERTER_SCHEMA_VERSION
+    );
     assert_eq!(provenance["source_manifest_hash"], old_manifest);
     assert_eq!(
         hash_file(&output.join("metadata-source-conversion-manifest.json")).unwrap(),
@@ -374,117 +800,66 @@ async fn metadata_rebuild_reuses_bytes_and_recovers_authoritative_flags() {
     assert!(output.join("lod-manifest.json").is_file());
 }
 
-/// Retained asset provenance allows proven producer-24 GLBs but rebuilds its textures.
+/// Metadata output from a current-producer source keeps its GLBs as normal cache hits, and a
+/// repeated rebuild regenerates nothing that the normal route would not regenerate.
 #[tokio::test]
-async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
-    for source_schema in [
-        15,
-        16,
-        19,
-        20,
-        21,
-        22,
-        23,
-        24,
-        converter::cache::CONVERTER_SCHEMA_VERSION,
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let data = directory.path().join("Data");
-        let source = directory.path().join("source");
-        let output = directory.path().join("derived");
-        let repeated = directory.path().join("derived-again");
-        generate(&data);
-        convert(&data, &source).await;
-        if source_schema == 15 {
-            schema_four_source(&source);
-        } else {
-            let path = source.join("conversion-manifest.json");
-            let mut manifest: ConversionManifest =
-                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            manifest.schema_version = source_schema;
-            if source_schema != converter::cache::CONVERTER_SCHEMA_VERSION {
-                manifest.asset_configuration_hashes.clear();
-            }
-            if source_schema != converter::cache::CONVERTER_SCHEMA_VERSION {
-                let mut legacy_config = PipelineConfig::new(&data, &output);
-                legacy_config.record_reader = converter::config::RecordReader::Legacy;
-                manifest.configuration_hash =
-                    converter::cache::configuration_hash_for_schema(&legacy_config, source_schema)
-                        .unwrap();
-                fs::write(source.join("record-reader.json"), br#"{"mode":"legacy"}"#).unwrap();
-            }
-            manifest.save(&path).unwrap();
-        }
-        rebuild(&data, &source, &output).await.unwrap();
-        rebuild(&data, &output, &repeated).await.unwrap();
-        let retained: ConversionManifest =
-            serde_json::from_slice(&fs::read(repeated.join("conversion-manifest.json")).unwrap())
-                .unwrap();
-        assert_eq!(retained.retained_mesh_schema_version, Some(source_schema));
-        let meshes = retained
+async fn metadata_rebuild_of_current_source_keeps_meshes_as_cache_hits() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    let source = directory.path().join("source");
+    let output = directory.path().join("derived");
+    let repeated = directory.path().join("derived-again");
+    generate(&data);
+    convert(&data, &source).await;
+    rebuild(&data, &source, &output).await.unwrap();
+    rebuild(&data, &output, &repeated).await.unwrap();
+    let retained: ConversionManifest =
+        serde_json::from_slice(&fs::read(repeated.join("conversion-manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        retained.retained_mesh_schema_version,
+        Some(converter::cache::CONVERTER_SCHEMA_VERSION)
+    );
+    let meshes = retained
+        .entries
+        .values()
+        .filter(|entry| entry.output.ends_with(".glb"))
+        .count();
+    assert!(meshes > 0);
+    let eligible = ConversionManifest::load(&repeated.join("conversion-manifest.json")).unwrap();
+    assert_eq!(
+        eligible
             .entries
             .values()
             .filter(|entry| entry.output.ends_with(".glb"))
-            .count();
-        assert!(meshes > 0);
-        let eligible =
-            ConversionManifest::load(&repeated.join("conversion-manifest.json")).unwrap();
-        assert_eq!(
-            eligible
-                .entries
-                .values()
-                .filter(|entry| entry.output.ends_with(".glb"))
-                .count(),
-            if source_schema == 24 || source_schema == converter::cache::CONVERTER_SCHEMA_VERSION {
-                meshes
-            } else {
-                0
-            },
-            "metadata-only upgrades preserve original provenance; only known compatible producer meshes are normal cache hits"
-        );
-        let report = convert(&data, &repeated).await;
-        let regenerated = if source_schema == converter::cache::CONVERTER_SCHEMA_VERSION {
-            0
-        } else {
-            retained
-                .entries
-                .values()
-                .filter(|entry| {
-                    let output = entry.output.to_ascii_lowercase();
-                    !output.ends_with(".luau") && !(source_schema == 24 && output.ends_with(".glb"))
-                })
-                .count()
-        };
-        let current: ConversionManifest =
-            serde_json::from_slice(&fs::read(repeated.join("conversion-manifest.json")).unwrap())
-                .unwrap();
-        assert!(retained.archives.is_empty());
-        let extracted = current
-            .archives
-            .values()
-            .map(|archive| archive.files.len())
-            .sum::<usize>();
-        assert_eq!(report.converted, (regenerated + extracted) as u64);
-        assert_eq!(
-            report.cache_hits,
-            (retained.entries.len() - regenerated) as u64
-        );
-        assert_eq!(current.retained_mesh_schema_version, None);
-    }
+            .count(),
+        meshes,
+        "current-producer GLBs remain reusable"
+    );
+    let report = convert(&data, &repeated).await;
+    let current: ConversionManifest =
+        serde_json::from_slice(&fs::read(repeated.join("conversion-manifest.json")).unwrap())
+            .unwrap();
+    let extracted = current
+        .archives
+        .values()
+        .map(|archive| archive.files.len())
+        .sum::<usize>();
+    assert_eq!(report.converted, extracted as u64);
+    assert_eq!(report.cache_hits, retained.entries.len() as u64);
+    assert_eq!(current.retained_mesh_schema_version, None);
 }
 
 /// Invalid source/retained producer pairs are stamped faithfully and rejected.
 #[tokio::test]
 async fn metadata_rebuild_rejects_unsupported_mesh_provenance() {
+    // Only producer-27 meshes may survive into the current schema; producers 24 and 26 never do.
+    let current = converter::cache::CONVERTER_SCHEMA_VERSION;
     for (schema, mesh_schema) in [
-        (15, 16),
-        (21, 17),
-        (21, 18),
-        (24, 25),
-        (
-            converter::cache::CONVERTER_SCHEMA_VERSION,
-            converter::cache::CONVERTER_SCHEMA_VERSION + 1,
-        ),
+        (current, 24),
+        (current, 26),
+        (current, 25),
+        (current, current + 1),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("Data");
@@ -525,7 +900,6 @@ async fn markerless_legacy_metadata_never_promotes_retained_meshes() {
     let output = directory.path().join("derived-again");
     generate(&data);
     convert(&data, &source).await;
-    schema_four_source(&source);
     rebuild(&data, &source, &legacy).await.unwrap();
     let manifest_path = legacy.join("conversion-manifest.json");
     let mut manifest: ConversionManifest =
@@ -1150,10 +1524,7 @@ async fn v91_metadata_rebuild_rejects_ambiguous_lod_and_lighting_producers() {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains(&format!(
-                "complete converter schema 15, 16, 19 through 24 or {}",
-                converter::cache::CONVERTER_SCHEMA_VERSION
-            )),
+            error.contains("predate the current texture layout"),
             "{error}"
         );
         assert!(!output.exists());

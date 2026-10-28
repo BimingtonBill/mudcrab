@@ -44,7 +44,7 @@ preserves WRLD RNAM payloads and TNAM strings and restores record-aware VMAD
 ownership compatibility. Version 2 added corrected faction links, strict native
 link ownership and local recovery to version 1's corrected TX06/TX07 and ARMO
 world-model projections. These metadata contracts are independent of asset
-producer 26. In-house adapter version 11 adds projection-aware winner admission
+producer 27. In-house adapter version 11 adds projection-aware winner admission
 to version 10's corrected schema layouts, GMST winner admission, union localization
 and filename namespaces. Required runtime projection checks resolve localized
 fields before admission, so an unusable later candidate preserves its usable
@@ -52,7 +52,7 @@ predecessor without crossing an admitted deletion.
 Version 12 keeps zero-FormID GMST settings distinct and prevents a rejected
 identity collision from blocking a later usable definition.
 In-house identity includes the
-authored schema SHA-256, adapter version and English localization choice, and
+authored schema SHA-256, adapter version, string-table language and encodings, and
 `inhouse-reader-diagnostics.json` records bounded decoder and adapter issues.
 The manifest's `configuration_hash` keeps the full reader identity for metadata
 provenance. Database, terrain cache and LOD artifacts are rebuilt on every
@@ -61,18 +61,25 @@ Converted assets use separate producer, settings and source proofs, described
 below; a full reader identity change alone does not discard those candidates or
 the archive extraction manifest.
 
-Localized fields in in-house mode use their declared English STRINGS, DLSTRINGS
-or ILSTRINGS bank from the effective archive VFS, with loose files taking
-precedence. Every validated occurrence remains in canonical records. Null or
+Localized fields in in-house mode use their declared STRINGS, DLSTRINGS or
+ILSTRINGS bank, `Strings/<plugin>_<language>.<bank>`, from the effective archive VFS,
+with loose files taking precedence. `--language` (`PipelineConfig.language`, default
+`english`) selects the language as Skyrim's `sLanguage` does; it must be letters,
+digits and underscores, since it is part of a file name. Resume commands keep it. Every validated occurrence remains in canonical records. Null or
 missing IDs yield empty canonical text and retain their original ID, bank,
 winning plugin and status in `inhouse_localized_fields`; nullable runtime name
-columns remain NULL. Missing nonzero keys produce counted warnings. Explicitly
-resolved empty text remains distinguishable from unresolved text. Other language
-selection is not implemented. A selected union or definition leaf's explicit
+columns remain NULL. Missing nonzero keys in readable tables produce counted
+notices; missing or unreadable tables and referenced malformed entries produce
+warnings. A null ID does not require its declared bank. Explicitly resolved
+empty text remains distinguishable from unresolved text. A selected union or definition leaf's explicit
 bank overrides its parent's bank; an unspecified leaf inherits the parent bank,
 then defaults to STRINGS.
 Ordinary plugin text and English string banks use Windows-1252, including bytes
-that happen to form valid UTF-8. VMAD strings use their independent UTF-8 format.
+that happen to form valid UTF-8. Banks in another language are read as UTF-8, as
+Skyrim SE's non-English banks are (Cyrillic, Polish), falling back to Windows-1252
+for text that is not valid UTF-8; the reader identity of a non-English pack records
+this as `string_table_encoding`, while an English pack's identity is unchanged.
+VMAD strings use their independent UTF-8 format.
 Text requiring normalization is encoded as UTF-8 after decoding; already exact
 ASCII codes retain their original width and termination. Original source bytes
 remain available in provenance. The reader identity records both encoding contracts.
@@ -85,7 +92,9 @@ contracts and are not upgraded to the current projection.
 Adapter-12 metadata recognizes the exact adapter-10 and adapter-11 retained-asset contracts
 with matching original schema/add-on bytes, reader fields and combined settings
 hash. The original reader and asset producer remain recorded across repeated
-metadata rebuilds. These explicit compatibility pairs do not authorize arbitrary
+metadata rebuilds. The string-table language changes database text only, so a pack
+read in one language is a valid source for a rebuild in another; its proof is
+checked in the language it recorded. These explicit compatibility pairs do not authorize arbitrary
 older in-house identities or automatically extend to future adapters.
 New full configuration hashes
 include the versioned legacy identity, while `configuration_hash_for_schema`
@@ -98,6 +107,18 @@ proofs. Retained models/textures keep their verified bytes and may carry older
 TXST role encodings. Explicit retention does not upgrade their producer or grant
 normal cache eligibility: a later normal conversion checks the original producer
 and current settings, source dependencies and resolved texture encoding.
+Composed default bodies and generated default gait clips carry separate
+`derived_outputs` proofs. Metadata reuse copies only derived files whose supported
+recipe, logical input hashes, output size and final SHA-256 are recorded. It
+preserves those original proofs across repeated rebuilds, including runtime packs
+without raw VFS inputs. It does not regenerate them from unauthenticated current
+Data. Historical derived files without proof, unavailable individual derived
+outputs (including read, copy or hash failures) and unknown stray runtime files
+are omitted with one counted, bounded notice; verified neighboring assets remain
+unchanged. Partial derived copies are removed when possible; cleanup failures
+are counted in that same notice without aborting the rebuild. These optional omissions
+do not make the metadata rebuild incomplete. Use normal conversion to regenerate
+derived outputs. Recorded ordinary assets retain their checksum requirements.
 Unknown source producer identities are rejected by the retained-asset route.
 Plugin filename keys use Unicode lowercase after native Windows-1252 decoding,
 including accented case pairs. The same shared function supplies player and MO2 selection, the merged MO2 Data index, master and identity lookup, and archive attachment keys. Record signatures and GMST EditorIDs retain their
@@ -124,7 +145,8 @@ compatibility proof does not alter normal conversion or staging cache identities
 For record-only diagnostics, `inhouse-records <Data> <plugins.txt> <new directory>`
 writes the database, cell caches, reader identity and diagnostic report without
 running asset stages or publishing a runtime pack. The new directory also keeps
-selected English archive STRINGS inputs under `.strings-input` for comparison.
+selected English archive STRINGS inputs under `.strings-input` for comparison; it does
+not take `--language`.
 
 `--typed-signatures TAG1,TAG2` selects the authored typed envelopes to retain;
 `--database-work-dir <new directory>` builds SQLite on a separate local disk and
@@ -325,6 +347,33 @@ that affect that kind's bytes:
 | DDS -> KTX2 | Texture producer, fallback quality, UASTC level, Zstd level and CPU/GPU encoder quality | DDS bytes, resolved `TextureEncoding` from the freshly rebuilt database and accepted GLBs, plus the applicable GPU encoding label |
 | PEX -> Luau | Script ABI | PEX bytes; known producer eligibility is checked separately |
 
+`derived_outputs` is an optional map keyed by canonical output path, separate
+from single-source `entries`. Each proof records a versioned recipe, a map of
+canonical logical input paths to winning raw SHA-256 hashes, any recipe-owned
+context digest, and the final output's size and SHA-256. `body-compose-v1`
+records that sex's heavy body, hands and feet NIFs plus the shared skeleton NIF.
+Current producers emit `body-compose-v2`, adding
+`recipes/body-compose-v2/context.json`: the SHA-256 of compact JSON containing
+the ordered heavy skin choices and thin preparation inputs. Each heavy entry
+is `[slot, skin]`; each thin entry is `[slot, winning_raw_sha256, skin]`, in
+body/hands/feet order. A skin is null or `[TXST_FormID, eight_NIF_texture_slots]`.
+The outer JSON is `[heavy_entries, thin_entries]`. Thin entries are empty when
+any thin part is missing, matching the existing preparation gate. These choices
+describe main's existing catalog skin selection and thin morph generation;
+physical source paths and unrelated database rows are excluded. Historical v1
+proofs remain eligible for package-snapshot retention.
+`default-gait-v1` consumes the body NIF,
+skeleton NIF, skeleton HKX and the sex-specific gait HKX; it builds its bone tree
+from the NIF inputs. Original asset producer/settings provenance remains on the
+manifest. Material repair and texture pruning refresh the derived output hash
+to describe the published bytes.
+
+Normal conversion continues to regenerate these optional derived outputs and
+records a proof only on success; these records do not introduce derived warm
+cache hits. Absent or malformed individual proofs establish no eligibility.
+Adding this provenance does not change asset bytes or the existing global cache
+identities; future recipe byte changes require their own identity change.
+
 Worker counts, GPU batch size and `--no-lod` do not affect these settings proofs.
 A reader/schema edit that leaves the actual asset dependencies and encoding
 unchanged therefore permits reuse. A role edit that changes one DDS's resolved
@@ -336,7 +385,8 @@ entries carrying a full configuration hash do not acquire a new proof implicitly
 
 Normal producer eligibility remains independent of explicit metadata retention.
 The only cross-producer mesh allowance is producer 24 -> 26; a future producer
-does not inherit that allowance. Older textures regenerate, and scripts require
+does not inherit that allowance, so producer 27 (which changes the GLB collision
+data) reuses only its own meshes. Older textures regenerate, and scripts require
 both a supported producer and matching ABI settings. A retained producer remains
 the producer of its original bytes after any number of metadata rebuilds.
 
