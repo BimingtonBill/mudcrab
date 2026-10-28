@@ -715,14 +715,28 @@ impl Decoded {
         (block, (frame - block * self.frames_per_block) as f32)
     }
 
-    pub fn sample(&self, track: usize, frame: usize) -> TransformSample {
+    /// Samples `track` at a global frame, refusing a non-finite result.
+    ///
+    /// Finite control points do not guarantee a finite sample: a frame past the knot domain
+    /// extrapolates, with basis weights above one, and can overflow `f32`.
+    pub fn sample(&self, track_index: usize, frame: usize) -> Result<TransformSample> {
         let (block, u) = self.locate(frame);
-        let track = &self.blocks[block][track];
-        TransformSample {
+        let track = &self.blocks[block][track_index];
+        let sample = TransformSample {
             translation: eval_vec3(&track.translation, u),
             rotation: eval_quat(&track.rotation, u),
             scale: eval_vec3(&track.scale, u),
-        }
+        };
+        ensure!(
+            sample
+                .translation
+                .iter()
+                .chain(&sample.rotation)
+                .chain(&sample.scale)
+                .all(|value| value.is_finite()),
+            "track {track_index} samples to a non-finite transform at frame {frame}: {sample:?}"
+        );
+        Ok(sample)
     }
 }
 
@@ -1256,6 +1270,36 @@ mod tests {
             ..finite
         };
         assert!(!track_values_are_finite(&non_finite));
+    }
+
+    /// Finite control points can still extrapolate past `f32::MAX` at a frame beyond the knot
+    /// domain; that sample is refused rather than written into the clip.
+    #[test]
+    fn sample_past_the_knot_domain_that_overflows_is_refused() {
+        let track = Track {
+            translation: Vec3Track::Spline {
+                knots: Knots {
+                    degree: 1,
+                    knots: vec![0, 0, 1, 1],
+                },
+                components: [vec![0.0, 3.0e38], vec![0.0], vec![0.0]],
+            },
+            rotation: QuatTrack::Static([0.0, 0.0, 0.0, 1.0]),
+            scale: Vec3Track::Static([1.0; 3]),
+        };
+        let decoded = Decoded {
+            blocks: vec![vec![track]],
+            frames_per_block: 2,
+        };
+        assert_eq!(
+            decoded.sample(0, 1).unwrap().translation,
+            [3.0e38, 0.0, 0.0]
+        );
+        let error = decoded.sample(0, 2).unwrap_err().to_string();
+        assert!(
+            error.contains("track 0") && error.contains("frame 2"),
+            "{error}"
+        );
     }
 
     #[test]
