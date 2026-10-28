@@ -971,9 +971,33 @@ fn legacy_skinned_mesh(
         InfluenceIndices::InstanceBones => None,
         InfluenceIndices::PartitionPalette => Some(partition.bone_palette.as_slice()),
     };
+    // Retail SSE shared vertex buffers carry padding vertices that no partition
+    // maps and no triangle draws: all four weights 0.0 and bone indices
+    // (0, 0, 0, 0) (118 vanilla NIFs, 2,724 vertices, e.g. the 1st-person
+    // daedric cuirass). They never reach the screen, so they keep their place
+    // in the buffer (morphs and FaceGen .tri files address vertices by index)
+    // and take the binding their stored first index already names, at full
+    // weight. Only that exact pattern is bound: a zero-weight vertex that a
+    // triangle draws, or one that names other bones, is still refused.
+    let mut drawn = vec![false; position_count];
+    for corner in mesh
+        .triangles
+        .iter()
+        .flat_map(|triangle| triangle.to_array())
+    {
+        if let Some(slot) = drawn.get_mut(usize::from(corner)) {
+            *slot = true;
+        }
+    }
     let mut joints = Vec::with_capacity(position_count);
     let mut weights = Vec::with_capacity(position_count);
     for (vertex_index, (raw_joints, raw_weights)) in influences.into_iter().enumerate() {
+        let raw_weights = if !drawn[vertex_index] && raw_joints == [0; 4] && raw_weights == [0.0; 4]
+        {
+            [1.0, 0.0, 0.0, 0.0]
+        } else {
+            raw_weights
+        };
         let (vertex_joints, vertex_weights) = normalize_vertex_influences(
             raw_joints,
             raw_weights,

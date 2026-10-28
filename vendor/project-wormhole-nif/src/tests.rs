@@ -774,7 +774,7 @@ fn retail_male_body_retains_legacy_skin() {
 
 mod legacy_skin {
     use project_wormhole_ba2::dev::Bounds;
-    use project_wormhole_shared::glam::{Mat3, Mat4, Quat, U8Vec4, Vec3, Vec4};
+    use project_wormhole_shared::glam::{Mat3, Mat4, Quat, U16Vec3, U8Vec4, Vec3, Vec4};
 
     use crate::dev::*;
 
@@ -1160,9 +1160,118 @@ mod legacy_skin {
         assert!(error.contains("shape block 2"), "{error}");
     }
 
+    /// One bone, three vertices drawn by triangle (0, 1, 2), and `extra` appended
+    /// after them. `extra_drawn` adds a second triangle that uses the extra vertex.
+    fn padded_buffer_fixture(extra: BSVertexData, extra_drawn: bool) -> NifFile {
+        let weighted = |position| vertex(position, [0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]);
+        let mut tri_shape = shape(
+            1,
+            2,
+            vec![
+                weighted(Vec3::ZERO),
+                weighted(Vec3::X),
+                weighted(Vec3::Y),
+                extra,
+            ],
+        );
+        tri_shape.triangles.push(U16Vec3::new(0, 1, 2));
+        if extra_drawn {
+            tri_shape.triangles.push(U16Vec3::new(1, 2, 3));
+        }
+        tri_shape.num_triangles = tri_shape.triangles.len() as u32;
+        nif_file(
+            vec![
+                NifBlock::NiNode(node(0)),
+                NifBlock::BSTriShape(tri_shape),
+                NifBlock::NiSkinInstance(instance(vec![0], 3, 4)),
+                NifBlock::NiSkinData(skin_data(vec![bone(Vec3::ZERO)])),
+                NifBlock::NiSkinPartition(partition(vec![0])),
+            ],
+            &["BoneA", "Shape"],
+        )
+    }
+
     #[test]
-    fn rejects_a_vertex_whose_weights_sum_to_zero() {
-        let nif = one_bone_fixture([0, 0, 0, 0], [0.0, 0.0, 0.0, 0.0], Vec3::ZERO);
+    fn rejects_a_drawn_vertex_whose_weights_sum_to_zero() {
+        let unweighted = vertex(Vec3::Z, [0, 0, 0, 0], [0.0, 0.0, 0.0, 0.0]);
+        let nif = padded_buffer_fixture(unweighted, true);
+
+        let error = nif_to_model(&nif, Some(&nif)).unwrap_err();
+
+        assert!(
+            error.contains("vertex 3 has a skin weight sum of 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn keeps_an_undrawn_zero_weight_padding_vertex_skinned_in_place() {
+        // The retail pattern: all weights 0.0, indices (0, 0, 0, 0), no triangle.
+        let padding = vertex(Vec3::Z, [0, 0, 0, 0], [0.0, 0.0, 0.0, 0.0]);
+        let nif = padded_buffer_fixture(padding, false);
+
+        let model = nif_to_model(&nif, Some(&nif)).unwrap();
+
+        let skinned = &model.skeletal_meshes[0];
+        let mesh = skinned.mesh.as_ref().unwrap();
+        assert_eq!(
+            mesh.positions.len(),
+            4,
+            "the padding vertex keeps its index"
+        );
+        assert_eq!(mesh.positions[3], Vec3::Z);
+        assert_eq!(skinned.weights[3], Vec4::new(1.0, 0.0, 0.0, 0.0));
+        assert_eq!(skinned.joints[3], U8Vec4::ZERO);
+        model.to_gltf("padded".to_owned()).unwrap();
+    }
+
+    #[test]
+    fn keeps_a_padding_vertex_in_the_partition_shared_buffer_skinned() {
+        // The retail layout: the shape carries no vertices, and positions, weights and
+        // triangles all come from the NiSkinPartition's shared buffer.
+        let weighted = |position| vertex(position, [0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]);
+        let mut shared = partition(vec![0]);
+        shared.vertex_data = vec![
+            weighted(Vec3::ZERO),
+            weighted(Vec3::X),
+            weighted(Vec3::Y),
+            vertex(Vec3::Z, [0, 0, 0, 0], [0.0, 0.0, 0.0, 0.0]),
+        ];
+        shared.triangles = vec![U16Vec3::new(0, 1, 2)];
+        let nif = nif_file(
+            vec![
+                NifBlock::NiNode(node(0)),
+                NifBlock::BSTriShape(shape(1, 2, Vec::new())),
+                NifBlock::NiSkinInstance(instance(vec![0], 3, 4)),
+                NifBlock::NiSkinData(skin_data(vec![bone(Vec3::ZERO)])),
+                NifBlock::NiSkinPartition(shared),
+            ],
+            &["BoneA", "Shape"],
+        );
+
+        let model = nif_to_model(&nif, Some(&nif)).unwrap();
+
+        let skinned = &model.skeletal_meshes[0];
+        assert_eq!(skinned.mesh.as_ref().unwrap().positions[3], Vec3::Z);
+        assert_eq!(skinned.weights[3], Vec4::new(1.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn rejects_an_undrawn_zero_weight_vertex_that_names_other_bones() {
+        // Retail padding always names bone indices (0, 0, 0, 0); anything else is not padding.
+        let other = vertex(Vec3::Z, [1, 0, 0, 0], [0.0, 0.0, 0.0, 0.0]);
+        let nif = padded_buffer_fixture(other, false);
+
+        let error = nif_to_model(&nif, Some(&nif)).unwrap_err();
+
+        assert!(error.contains("skin weight sum"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_undrawn_vertex_with_a_negative_weight_sum() {
+        // Only an exactly-zero padding vertex is bound; other bad weights still fail.
+        let broken = vertex(Vec3::Z, [0, 0, 0, 0], [-1.0, 0.0, 0.0, 0.0]);
+        let nif = padded_buffer_fixture(broken, false);
 
         let error = nif_to_model(&nif, Some(&nif)).unwrap_err();
 
