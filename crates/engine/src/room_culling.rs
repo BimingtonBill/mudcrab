@@ -798,6 +798,14 @@ struct LoadedGraph {
     graph: RoomGraph,
 }
 
+/// The streaming camera's `Mesh3d` list in one frame: what Bevy's frustum check listed and what
+/// room culling left drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MainViewMeshes {
+    pub listed: usize,
+    pub drawn: usize,
+}
+
 /// The settings, the probe result and the graphs of the interior cells that are loaded.
 #[derive(Resource)]
 pub struct RoomCullingState {
@@ -808,8 +816,12 @@ pub struct RoomCullingState {
     pending: HashMap<u32, Task<LoadResult>>,
     /// Cells whose read failed; they are not retried.
     failed: HashSet<u32>,
-    /// Entities removed from the main view in the last frame, for diagnostics.
+    /// Entities removed from the room-culling views in the last frame, for diagnostics.
     pub culled_last_frame: usize,
+    /// The streaming camera's `Mesh3d` list in the last frame, before and after room culling.
+    /// `None` while room culling is off. Capture receipts record it, so a shots run measures the
+    /// reduction at every pose.
+    pub main_view_meshes: Option<MainViewMeshes>,
     /// Whether the first frame that hid anything has been logged.
     reported_first_cull: bool,
 }
@@ -824,6 +836,7 @@ impl RoomCullingState {
             pending: HashMap::new(),
             failed: HashSet::new(),
             culled_last_frame: 0,
+            main_view_meshes: None,
             reported_first_cull: false,
         }
     }
@@ -1002,6 +1015,7 @@ pub fn cull_room_views(
             &GlobalTransform,
             &Projection,
             Option<&Camera>,
+            Has<StreamingCamera>,
             &mut VisibleEntities,
         ),
         Or<(With<StreamingCamera>, With<RoomCullingView>)>,
@@ -1012,16 +1026,19 @@ pub fn cull_room_views(
     mut owners: Local<HashMap<Entity, (u32, Entity)>>,
 ) {
     state.culled_last_frame = 0;
-    if !state.enabled || state.graphs.is_empty() {
+    state.main_view_meshes = None;
+    if !state.enabled {
         return;
     }
     let mut cells: Vec<u32> = state.graphs.keys().copied().collect();
     cells.sort_unstable();
     let mut culled = 0;
-    for (camera_transform, projection, camera, mut visible) in &mut views {
+    let mut main_view = None;
+    for (camera_transform, projection, camera, is_main, mut visible) in &mut views {
         if camera.is_some_and(|camera| !camera.is_active) {
             continue;
         }
+        let listed = visible.get(TypeId::of::<Mesh3d>()).len();
         let clip_from_world =
             projection.get_clip_from_view() * camera_transform.to_matrix().inverse();
         for cell in &cells {
@@ -1078,8 +1095,13 @@ pub fn cull_room_views(
             // cell whose rooms also hold the camera is walked too. A cell only removes its own
             // objects ([`RoomGraph::is_drawn`] keeps what is outside its graph).
         }
+        if is_main {
+            let drawn = visible.get(TypeId::of::<Mesh3d>()).len();
+            main_view = Some(MainViewMeshes { listed, drawn });
+        }
     }
     state.culled_last_frame = culled;
+    state.main_view_meshes = main_view;
     if culled > 0 && !state.reported_first_cull {
         state.reported_first_cull = true;
         info!("room culling: the first frame that hid anything removed {culled} meshes");
@@ -1755,10 +1777,10 @@ mod tests {
             .execute_batch(&format!(
                 "CREATE TABLE schema_info(version INTEGER NOT NULL);
                  INSERT INTO schema_info VALUES({});
-                 CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
+                 CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL,flags INTEGER NOT NULL DEFAULT 0);
                  CREATE TABLE \"references\"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
-                 INSERT INTO statics VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1);
-                 INSERT INTO statics VALUES(500,'architecture/floor.nif',-1,-2,-3,1,2,3,1);
+                 INSERT INTO statics VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1,0);
+                 INSERT INTO statics VALUES(500,'architecture/floor.nif',-1,-2,-3,1,2,3,1,0);
                  INSERT INTO \"references\" VALUES(500,7,20,0,0,0,0,0,0,1);
                  INSERT INTO \"references\" VALUES(501,7,500,1000,0,0,0,0,0,1);",
                 shared::WORLD_DATABASE_SCHEMA_VERSION
@@ -1963,9 +1985,32 @@ mod tests {
             app.world().get::<ViewVisibility>(c).unwrap().get(),
             "Bevy's own check still marks it visible, which is what shadow passes use"
         );
+        let state = app.world().resource::<RoomCullingState>();
+        assert_eq!(state.culled_last_frame, 1);
         assert_eq!(
-            app.world().resource::<RoomCullingState>().culled_last_frame,
-            1
+            state.main_view_meshes,
+            Some(MainViewMeshes {
+                listed: visible.len() + 1,
+                drawn: visible.len(),
+            }),
+            "the receipt counts are the main view's list before and after the cull"
+        );
+    }
+
+    /// The committed measurement poses stay a valid shots file of interior poses, so the counts
+    /// in `scripts/room_culling_counts.py` can be reproduced with `--shots` on any conversion.
+    #[test]
+    fn measurement_poses_are_a_valid_interior_shots_file() {
+        let file = crate::shots::ShotsFile::parse(include_str!(
+            "../tests/fixtures/room-culling-shots.json"
+        ))
+        .expect("the room-culling poses parse");
+        assert!(!file.shots.is_empty());
+        assert!(
+            file.shots
+                .iter()
+                .all(|shot| shot.interior_cell_id.is_some()),
+            "room culling only acts inside interiors"
         );
     }
 
