@@ -1637,7 +1637,7 @@ fn array(
         }
         _ => return Err(format!("unsupported array count rule {kind}")),
     };
-    if count > 1_000_000 {
+    if count > super::schema_format::MAX_ARRAY_ELEMENTS {
         return Err("array exceeds one million elements".into());
     }
     if count

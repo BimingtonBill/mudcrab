@@ -5,6 +5,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
+/// Most elements one schema array may hold. The decoder refuses a larger count, and
+/// schema loading refuses a fixed count above it, so the rule fails where it is written.
+pub const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
+
 /// A complete schema, with reusable authored definitions and source citations.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -455,6 +459,13 @@ impl Schema {
                 .ok_or_else(|| {
                     format!("fixed array {} lacks an integer count value", field.name)
                 })?;
+            let limit = MAX_ARRAY_ELEMENTS;
+            if u128::from(count) > limit as u128 {
+                return Err(format!(
+                    "fixed array {} declares {count} elements, above the {limit}-element limit",
+                    field.name
+                ));
+            }
             // A declared stride makes `size` unambiguously the array's extent;
             // without one the decoder uses `size` as the stride itself.
             if let (Some(stride), Some(size)) = (declared_stride, field.size)
@@ -685,6 +696,10 @@ mod tests {
                 r#""size":12,"count":{"kind":"fixed","value":2,"stride":4},"members":[{"name":"value","kind":"u32"}]"#,
                 "declares 2 x 4 bytes but size 12",
             ),
+            (
+                r#""count":{"kind":"fixed","value":1000001,"stride":4},"members":[{"name":"value","kind":"u32"}]"#,
+                "declares 1000001 elements, above the 1000000-element limit",
+            ),
         ] {
             let error = schema_with_array(field).expect_err(field);
             assert!(error.contains(expected), "{field}: {error}");
@@ -701,6 +716,7 @@ mod tests {
             r#""count":{"kind":"prefix_u32","stride":4},"members":[{"name":"value","kind":"u32"}]"#,
             r#""count":{"kind":"fixed","value":2,"stride":4},"size":8,"members":[{"name":"value","kind":"u32"}]"#,
             r#""count":{"kind":"fixed","value":2},"members":[{"name":"value","kind":"u32"}]"#,
+            r#""count":{"kind":"fixed","value":1000000,"stride":4},"members":[{"name":"value","kind":"u32"}]"#,
             // The alternate-texture decider owns its own counted layout.
             r#""count":{"kind":"unsupported"},"decider":"alternate_textures""#,
         ] {
