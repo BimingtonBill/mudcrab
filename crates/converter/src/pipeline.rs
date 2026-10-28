@@ -5187,14 +5187,32 @@ fn publish_directory_locked_with_timings(
         recover_interrupted_publication(output)
     })?;
     let (backup, _backup_lock, record_path) = timings.measure("backup_setup", || {
-        let backup = output.with_file_name(format!(
-            "{}{}",
-            publication_backup_prefix(output)?,
-            std::process::id()
-        ));
-        if backup.exists() {
-            bail!("refusing to overwrite stale backup {}", backup.display());
+        // A previous pack this process could not delete may still hold the first name: an
+        // owned leftover is stepped past, anything else is still refused.
+        let prefix = publication_backup_prefix(output)?;
+        let pid = std::process::id();
+        let leftovers = read_publication_leftovers(output)?;
+        let mut chosen = None;
+        for attempt in 0..MAX_PUBLICATION_LEFTOVERS {
+            let name = match attempt {
+                0 => format!("{prefix}{pid}"),
+                _ => format!("{prefix}{pid}-{attempt}"),
+            };
+            let candidate = output.with_file_name(&name);
+            if !candidate.exists() {
+                chosen = Some(candidate);
+                break;
+            }
+            if !leftovers.contains(&name) {
+                bail!("refusing to overwrite stale backup {}", candidate.display());
+            }
         }
+        let backup = chosen.ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "{MAX_PUBLICATION_LEFTOVERS} undeletable previous packs of {} remain; delete them to publish",
+                output.display()
+            )
+        })?;
         let backup_lock = AssetLock::acquire_exclusive(&backup)?;
         let record_path = publication_record_path(output)?;
         Ok((backup, backup_lock, record_path))
@@ -5433,6 +5451,7 @@ fn recover_interrupted_publication(output: &Path) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    let leftovers = retry_publication_leftovers(output, parent)?;
     let record_path = publication_record_path(output)?;
     let record = match record_path.symlink_metadata() {
         Ok(metadata) => {
@@ -5448,9 +5467,11 @@ fn recover_interrupted_publication(output: &Path) -> Result<()> {
                 for entry in fs::read_dir(parent)? {
                     let entry = entry?;
                     let kind = entry.file_type()?;
+                    let name = entry.file_name().to_string_lossy().into_owned();
                     ensure!(
                         !(kind.is_dir() || kind.is_symlink())
-                            || !entry.file_name().to_string_lossy().starts_with(&prefix),
+                            || !name.starts_with(&prefix)
+                            || (kind.is_dir() && leftovers.contains(&name)),
                         "unowned publication backup {}; manual recovery required",
                         entry.path().display()
                     );
@@ -5465,11 +5486,7 @@ fn recover_interrupted_publication(output: &Path) -> Result<()> {
         "publication record belongs to another destination"
     );
     ensure!(
-        Path::new(&record.backup_name).components().count() == 1
-            && !record.backup_name.contains(['/', '\\', ':'])
-            && record
-                .backup_name
-                .starts_with(&publication_backup_prefix(output)?),
+        is_owned_backup_name(output, &record.backup_name)?,
         "invalid owned backup name"
     );
     let backup = parent.join(&record.backup_name);
@@ -5489,8 +5506,10 @@ fn recover_interrupted_publication(output: &Path) -> Result<()> {
             )?;
             validate_publication_package(output)?;
             if !remove_publication_backup(&backup) {
-                // The record stays, so the next run retries the delete.
-                return Ok(());
+                // The record's job is done: the output is the new pack. The backup moves to
+                // the leftover list, which every run retries, so the next publication can
+                // write its own record.
+                add_publication_leftover(output, &record.backup_name)?;
             }
         } else {
             ensure!(
@@ -5565,6 +5584,95 @@ fn verify_package_seal(
         );
     }
     Ok(())
+}
+
+/// Most stale backups one destination keeps a name for; past this, publication stops and asks
+/// for them to be deleted instead of growing the list without bound.
+const MAX_PUBLICATION_LEFTOVERS: usize = 64;
+
+/// Previous packs a run published over and then could not delete. They are owned (this
+/// destination made them and sealed their replacement), so every recovery retries deleting
+/// them, but they no longer block a new publication the way an in-flight record does.
+fn publication_leftovers_path(output: &Path) -> Result<PathBuf> {
+    let name = output
+        .file_name()
+        .ok_or_else(|| color_eyre::eyre::eyre!("output has no name"))?;
+    Ok(output.with_file_name(format!(
+        ".{}.publication-leftovers.json",
+        name.to_string_lossy()
+    )))
+}
+
+/// A single path component under this destination's backup prefix.
+fn is_owned_backup_name(output: &Path, name: &str) -> Result<bool> {
+    Ok(Path::new(name).components().count() == 1
+        && !name.contains(['/', '\\', ':'])
+        && name.starts_with(&publication_backup_prefix(output)?))
+}
+
+fn read_publication_leftovers(output: &Path) -> Result<Vec<String>> {
+    let path = publication_leftovers_path(output)?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let names: Vec<String> = serde_json::from_slice(&bytes)
+        .wrap_err_with(|| format!("invalid publication leftover list {}", path.display()))?;
+    for name in &names {
+        ensure!(
+            is_owned_backup_name(output, name)?,
+            "invalid leftover backup name {name:?} in {}",
+            path.display()
+        );
+    }
+    Ok(names)
+}
+
+fn write_publication_leftovers(output: &Path, names: &[String]) -> Result<()> {
+    use std::io::Write;
+    let path = publication_leftovers_path(output)?;
+    if names.is_empty() {
+        return match fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        };
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| color_eyre::eyre::eyre!("leftover list has no parent"))?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(&serde_json::to_vec_pretty(names)?)?;
+    file.as_file().sync_all()?;
+    file.persist(&path)?;
+    Ok(())
+}
+
+fn add_publication_leftover(output: &Path, name: &str) -> Result<()> {
+    let mut names = read_publication_leftovers(output)?;
+    if !names.iter().any(|existing| existing == name) {
+        names.push(name.to_owned());
+    }
+    write_publication_leftovers(output, &names)
+}
+
+/// Retries deleting every leftover backup and returns the ones still present. The caller holds
+/// the destination's exclusive lock.
+fn retry_publication_leftovers(output: &Path, parent: &Path) -> Result<Vec<String>> {
+    let names = read_publication_leftovers(output)?;
+    if names.is_empty() {
+        return Ok(names);
+    }
+    let mut remaining = Vec::new();
+    for name in names {
+        let backup = parent.join(&name);
+        let _backup_lock = AssetLock::acquire_exclusive(&backup)?;
+        if !remove_publication_backup(&backup) {
+            remaining.push(name);
+        }
+    }
+    write_publication_leftovers(output, &remaining)?;
+    Ok(remaining)
 }
 
 fn publication_backup_prefix(output: &Path) -> Result<String> {
@@ -6630,7 +6738,7 @@ mod tests {
     /// A previous pack that cannot be deleted after the swap must not fail the run or wedge the
     /// next one: the new pack stays published, the run reports a notice, and recovery completes.
     #[test]
-    fn failed_previous_pack_cleanup_keeps_the_published_pack_and_a_retryable_record() {
+    fn failed_previous_pack_cleanup_never_blocks_this_or_the_next_publication() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path().join("staging");
         let output = directory.path().join("assets");
@@ -6665,18 +6773,29 @@ mod tests {
             report.notices
         );
 
-        // A recovery whose delete fails again keeps the record, so a later run retries.
+        // The next publication in the same process, with deletes still failing, publishes
+        // anyway: the first leftover moves to the leftover list and its name stays taken.
+        let staging = directory.path().join("staging-2");
+        write_test_runtime_pack(&staging, "third");
         FAIL_PREVIOUS_PACK_CLEANUP.with(|fail| fail.set(true));
-        let retried = recover_interrupted_publication(&output);
+        let republished = publish_runtime_pack(&staging, &output, &mut report, &lock);
         FAIL_PREVIOUS_PACK_CLEANUP.with(|fail| fail.set(false));
-        retried.unwrap();
-        assert!(backup.is_dir());
+        republished.unwrap();
+        assert_eq!(published_manifest(&output).configuration_hash, "third");
+        let second_backup = output.with_extension(format!("backup-{}-1", std::process::id()));
+        assert!(backup.is_dir() && second_backup.is_dir());
+        assert_eq!(
+            read_publication_leftovers(&output).unwrap(),
+            [backup.file_name().unwrap().to_string_lossy().into_owned()]
+        );
         assert!(publication_record_path(&output).unwrap().is_file());
 
+        // Once deletes work again, one recovery clears both the record's backup and the list.
         recover_interrupted_publication(&output).unwrap();
-        assert!(!backup.exists());
+        assert!(!backup.exists() && !second_backup.exists());
         assert!(!publication_record_path(&output).unwrap().exists());
-        assert_eq!(published_manifest(&output).configuration_hash, "next");
+        assert!(!publication_leftovers_path(&output).unwrap().exists());
+        assert_eq!(published_manifest(&output).configuration_hash, "third");
     }
 
     #[tokio::test]
