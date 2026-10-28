@@ -1160,6 +1160,17 @@ mod legacy_skin {
         assert!(error.contains("shape block 2"), "{error}");
     }
 
+    /// The exported glTF still skins the mesh: one skin, and the primitive carries
+    /// `JOINTS_0` and `WEIGHTS_0`. An unskinned export would pass the model checks alone.
+    fn assert_exports_one_skin(model: &crate::model::all::Model) {
+        use gltf::json::validation::Checked;
+        let (root, _) = model.to_gltf("padded".to_owned()).unwrap();
+        assert_eq!(root.skins.len(), 1);
+        let attributes = &root.meshes[0].primitives[0].attributes;
+        assert!(attributes.contains_key(&Checked::Valid(gltf::Semantic::Joints(0))));
+        assert!(attributes.contains_key(&Checked::Valid(gltf::Semantic::Weights(0))));
+    }
+
     /// One bone, three vertices drawn by triangle (0, 1, 2), and `extra` appended
     /// after them. `extra_drawn` adds a second triangle that uses the extra vertex.
     fn padded_buffer_fixture(extra: BSVertexData, extra_drawn: bool) -> NifFile {
@@ -1222,7 +1233,7 @@ mod legacy_skin {
         assert_eq!(mesh.positions[3], Vec3::Z);
         assert_eq!(skinned.weights[3], Vec4::new(1.0, 0.0, 0.0, 0.0));
         assert_eq!(skinned.joints[3], U8Vec4::ZERO);
-        model.to_gltf("padded".to_owned()).unwrap();
+        assert_exports_one_skin(&model);
     }
 
     #[test]
@@ -1254,6 +1265,7 @@ mod legacy_skin {
         let skinned = &model.skeletal_meshes[0];
         assert_eq!(skinned.mesh.as_ref().unwrap().positions[3], Vec3::Z);
         assert_eq!(skinned.weights[3], Vec4::new(1.0, 0.0, 0.0, 0.0));
+        assert_exports_one_skin(&model);
     }
 
     #[test]
