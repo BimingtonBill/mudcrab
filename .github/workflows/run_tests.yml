@@ -327,10 +327,19 @@ jobs:
         uses: taiki-e/install-action@cargo-audit
 
       - name: Audit dependencies
+        # Temporary ignores for the zstd 0.13 line that Bevy pins. Remove RUSTSEC-2026-0391, -0398 and
+        # -0403 when bevy_image moves to zstd 0.14 (still ^0.13.3 in Bevy 0.19.1 and 0.20.0). Bevy's
+        # ktx2 loader only calls zstd::decode_all under the zstd_c feature, so:
+        #   -0391 needs a reused context (zstd::stream::raw::{Encoder,Decoder}::with_context), never used.
+        #   -0398 needs zstd-safe's seekable feature, which is not enabled in our tree.
+        #   -0403 lists zstd::decode_all and the read decoder as unaffected.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
+          --ignore RUSTSEC-2026-0391
+          --ignore RUSTSEC-2026-0398
+          --ignore RUSTSEC-2026-0403
 
   performance:
     needs: [orchestrate]
