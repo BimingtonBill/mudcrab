@@ -4099,6 +4099,20 @@ mod tests {
     /// as its child. Written as raw bytes because no fixture generator produces
     /// a scene graph this deep.
     fn node_chain_nif(len: usize) -> Vec<u8> {
+        let children: Vec<Vec<u32>> = (0..len)
+            .map(|index| {
+                if index + 1 < len {
+                    vec![(index + 1) as u32]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        node_graph_nif(&children)
+    }
+
+    /// A NIF of `NiNode` blocks where block `i` lists `children[i]`.
+    fn node_graph_nif(children: &[Vec<u32>]) -> Vec<u8> {
         const NIF_VERSION: u32 = 0x1402_0007;
         const USER_VERSION: u32 = 12;
         const BETHESDA_VERSION: u32 = 100;
@@ -4124,16 +4138,7 @@ mod tests {
             bytes.extend_from_slice(&0u32.to_le_bytes()); // effects
             bytes
         }
-        let blocks: Vec<Vec<u8>> = (0..len)
-            .map(|index| {
-                let children = if index + 1 < len {
-                    vec![(index + 1) as u32]
-                } else {
-                    Vec::new()
-                };
-                node(&children)
-            })
-            .collect();
+        let blocks: Vec<Vec<u8>> = children.iter().map(|children| node(children)).collect();
         let mut bytes = b"Gamebryo File Format, Version 20.2.0.7\n".to_vec();
         bytes.extend_from_slice(&NIF_VERSION.to_le_bytes());
         bytes.push(1); // little-endian
@@ -4181,6 +4186,30 @@ mod tests {
         fs::write(&input, node_chain_nif(MAX_SCENE_DEPTH)).unwrap();
         let diagnostics = MeshConverter::inspect_nif(&input).unwrap();
         assert_eq!(diagnostics.max_scene_depth, MAX_SCENE_DEPTH);
+    }
+
+    #[test]
+    fn scene_graph_loop_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("loop.nif");
+        fs::write(&input, node_graph_nif(&[vec![1], vec![2], vec![1]])).unwrap();
+        let error = MeshConverter::inspect_nif(&input).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("loops through block 1"), "{message}");
+    }
+
+    #[test]
+    fn shared_scene_children_count_their_depth_once_from_every_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("shared.nif");
+        // Block 0 is a leaf that the outer walk finishes first, before block 3
+        // reaches it as a child; blocks 1 and 2 then share block 3, whose depth
+        // the second parent reads from the cache.
+        let graph = [vec![], vec![3], vec![1, 3], vec![0]];
+        fs::write(&input, node_graph_nif(&graph)).unwrap();
+        let diagnostics = MeshConverter::inspect_nif(&input).unwrap();
+        // 2 -> 1 -> 3 -> 0 is the deepest chain.
+        assert_eq!(diagnostics.max_scene_depth, 4);
     }
 
     #[test]
