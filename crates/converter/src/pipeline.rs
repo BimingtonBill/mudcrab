@@ -5258,8 +5258,10 @@ fn publish_directory_locked_with_timings(
     }
     // The new pack is in place, so the only work left is deleting the previous pack. A failure
     // here must not fail a conversion that published successfully: it is reported as a notice,
-    // and the ownership record is kept so the next run's recovery deletes the leftover backup
-    // without re-verifying it.
+    // and the backup moves to the leftover list, which every run retries. The record's job is
+    // done, so it is removed: kept, a later change to the pack (a repair) would make recovery
+    // refuse the remaining backup as an ambiguous publication. Only a failed list write keeps
+    // the record, so recovery still deletes the backup.
     if backup.exists() {
         let cleanup: Result<()> = timings.measure("previous_pack_cleanup", || {
             #[cfg(test)]
@@ -5276,7 +5278,20 @@ fn publish_directory_locked_with_timings(
                     backup.display()
                 ),
             );
-            return Ok(());
+            let name = backup
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .ok_or_else(|| color_eyre::eyre::eyre!("previous pack backup has no name"));
+            if let Err(list_error) = name.and_then(|name| add_publication_leftover(output, &name)) {
+                push_post_publication_notice(
+                    notices,
+                    format!(
+                        "could not list the previous pack {} for later removal: {list_error:#}; its ownership record is kept so the next run deletes it",
+                        backup.display()
+                    ),
+                );
+                return Ok(());
+            }
         }
     }
     if record_path.is_file() {
@@ -5451,7 +5466,8 @@ fn recover_interrupted_publication(output: &Path) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let leftovers = retry_publication_leftovers(output, parent)?;
+    // The record is settled before the leftover list is retried: an interrupted recovery can
+    // list the record's own backup, which must stay until the record says it is garbage.
     let record_path = publication_record_path(output)?;
     let record = match record_path.symlink_metadata() {
         Ok(metadata) => {
@@ -5462,6 +5478,7 @@ fn recover_interrupted_publication(output: &Path) -> Result<()> {
             serde_json::from_slice::<PublicationRecord>(&fs::read(&record_path)?)?
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let leftovers = retry_publication_leftovers(output, parent)?;
             if !output.exists() {
                 let prefix = publication_backup_prefix(output)?;
                 for entry in fs::read_dir(parent)? {
@@ -5490,7 +5507,7 @@ fn recover_interrupted_publication(output: &Path) -> Result<()> {
         "invalid owned backup name"
     );
     let backup = parent.join(&record.backup_name);
-    let _backup_lock = AssetLock::acquire_exclusive(&backup)?;
+    let backup_lock = AssetLock::acquire_exclusive(&backup)?;
     if output.exists() {
         let current = manifest_hash(output)?;
         if current == record.next_manifest_hash {
@@ -5523,6 +5540,9 @@ fn recover_interrupted_publication(output: &Path) -> Result<()> {
         fs::rename(&backup, output).wrap_err("failed to restore owned last-good assets")?;
     }
     fs::remove_file(record_path)?;
+    // A listed backup may be the record's own, so its lock is released before the retry.
+    drop(backup_lock);
+    retry_publication_leftovers(output, parent)?;
     Ok(())
 }
 
@@ -5666,7 +5686,19 @@ fn retry_publication_leftovers(output: &Path, parent: &Path) -> Result<Vec<Strin
     let mut remaining = Vec::new();
     for name in names {
         let backup = parent.join(&name);
-        let _backup_lock = AssetLock::acquire_exclusive(&backup)?;
+        // A reader still holding a leftover only delays its deletion; it never stops a run.
+        let _backup_lock = match AssetLock::acquire_exclusive(&backup) {
+            Ok(lock) => lock,
+            Err(error) if error.is_held() => {
+                warn!(
+                    "could not remove the previous pack {}: {error}; the next run retries",
+                    backup.display()
+                );
+                remaining.push(name);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         if !remove_publication_backup(&backup) {
             remaining.push(name);
         }
@@ -6761,9 +6793,15 @@ mod tests {
         published.unwrap();
         assert_eq!(published_manifest(&output).configuration_hash, "next");
         assert!(backup.is_dir(), "the leftover backup is kept, not lost");
+        let backup_name = backup.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            read_publication_leftovers(&output).unwrap(),
+            std::slice::from_ref(&backup_name),
+            "the backup moves to the leftover list"
+        );
         assert!(
-            publication_record_path(&output).unwrap().is_file(),
-            "the record is kept so recovery deletes the backup"
+            !publication_record_path(&output).unwrap().exists(),
+            "a done record never meets a later change to the pack"
         );
         assert!(
             report.notices.iter().any(|notice| notice
@@ -6774,7 +6812,7 @@ mod tests {
         );
 
         // The next publication in the same process, with deletes still failing, publishes
-        // anyway: the first leftover moves to the leftover list and its name stays taken.
+        // anyway: the first leftover's name stays taken and the second joins the list.
         let staging = directory.path().join("staging-2");
         write_test_runtime_pack(&staging, "third");
         FAIL_PREVIOUS_PACK_CLEANUP.with(|fail| fail.set(true));
@@ -6786,11 +6824,18 @@ mod tests {
         assert!(backup.is_dir() && second_backup.is_dir());
         assert_eq!(
             read_publication_leftovers(&output).unwrap(),
-            [backup.file_name().unwrap().to_string_lossy().into_owned()]
+            [
+                backup_name,
+                second_backup
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            ]
         );
-        assert!(publication_record_path(&output).unwrap().is_file());
+        assert!(!publication_record_path(&output).unwrap().exists());
 
-        // Once deletes work again, one recovery clears both the record's backup and the list.
+        // Once deletes work again, one recovery clears both leftovers and the list.
         recover_interrupted_publication(&output).unwrap();
         assert!(!backup.exists() && !second_backup.exists());
         assert!(!publication_record_path(&output).unwrap().exists());
@@ -7006,6 +7051,53 @@ mod tests {
         drop(reader);
         recover_interrupted_publication(&output).unwrap();
         assert!(output.is_dir());
+    }
+
+    /// A recovery interrupted after listing its record's backup leaves both behind; the next
+    /// recovery settles the record first, so the listed backup is restored, not deleted.
+    #[test]
+    fn recovery_settles_the_record_before_retrying_a_listed_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("assets");
+        let backup = directory.path().join("assets.backup-123");
+        fs::create_dir_all(backup.join("scripts")).unwrap();
+        fs::write(backup.join("scripts/papyrus_runtime.luau"), b"return {}").unwrap();
+        ConversionManifest {
+            schema_version: CONVERTER_SCHEMA_VERSION,
+            complete: true,
+            ..Default::default()
+        }
+        .save(&backup.join("conversion-manifest.json"))
+        .unwrap();
+        seal_test_backup(&output, &backup);
+        add_publication_leftover(&output, "assets.backup-123").unwrap();
+        recover_interrupted_publication(&output).unwrap();
+        assert!(output.join("scripts/papyrus_runtime.luau").is_file());
+        assert!(!backup.exists());
+        assert!(!publication_record_path(&output).unwrap().exists());
+        assert!(!publication_leftovers_path(&output).unwrap().exists());
+    }
+
+    /// A reader holding a leftover delays its deletion without failing recovery.
+    #[test]
+    fn recovery_keeps_a_leftover_held_by_a_reader_and_continues() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("assets");
+        let leftover = directory.path().join("assets.backup-9");
+        write_test_runtime_pack(&output, "current");
+        fs::create_dir_all(&leftover).unwrap();
+        add_publication_leftover(&output, "assets.backup-9").unwrap();
+        let reader = AssetLock::acquire_shared(&leftover).unwrap();
+        recover_interrupted_publication(&output).unwrap();
+        assert!(leftover.is_dir());
+        assert_eq!(
+            read_publication_leftovers(&output).unwrap(),
+            ["assets.backup-9"]
+        );
+        drop(reader);
+        recover_interrupted_publication(&output).unwrap();
+        assert!(!leftover.exists());
+        assert!(!publication_leftovers_path(&output).unwrap().exists());
     }
 
     #[tokio::test]
