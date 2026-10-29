@@ -5266,4 +5266,135 @@ mod tests {
             );
         }
     }
+
+    /// A winner rejected without a successor leaves the winning-kind catalogue
+    /// before the next replay, so a dependent naming it no longer selects the
+    /// alternative its former kind implied.
+    #[test]
+    fn deferred_recovery_drops_a_removed_winner_before_its_dependents_replay() {
+        let ownership = r#"{"signature":"COED","name":"probe_ownership","kind":"struct","size":16,"reject_record_on_error":true,"members":[
+                        {"name":"probe_owner","kind":"form_id","targets":["NPC_","FACT"]},
+                        {"name":"probe_deferred","kind":"union","offset":4,"size":4,"decider":"inventory_owner_condition","fields":[
+                            {"name":"unused","kind":"bytes","size":4},
+                            {"name":"global","kind":"form_id","size":8,"targets":["GLOB"]},
+                            {"name":"rank","kind":"i32"}]},
+                        {"name":"probe_later","kind":"form_id","offset":8,"targets":["NPC_"]},
+                        {"name":"probe_weight","kind":"f32","offset":12}]}"#;
+        let schema = Schema::parse(
+            format!(
+                r#"{{"version":1,"records":[
+                {{"signature":"NPC_","fields":[{{"signature":"EDID","name":"owner_editor","kind":"zstring"}},{ownership}]}},
+                {{"signature":"TEST","fields":[{{"signature":"EDID","name":"probe_editor","kind":"zstring"}},{ownership}]}}
+            ]}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Owner.esm");
+        let coed = |owner: u32| {
+            replay_probe_subrecord(
+                b"COED",
+                &[
+                    owner.to_le_bytes(),
+                    0u32.to_le_bytes(),
+                    0u32.to_le_bytes(),
+                    0.375f32.to_le_bytes(),
+                ]
+                .concat(),
+            )
+        };
+        let mut source = replay_probe_record(
+            b"TES4",
+            0,
+            1,
+            &replay_probe_subrecord(
+                b"HEDR",
+                &[
+                    1.7f32.to_le_bytes(),
+                    3u32.to_le_bytes(),
+                    0x800u32.to_le_bytes(),
+                ]
+                .concat(),
+            ),
+        );
+        let anchor = 0x1900;
+        let removed = 0x1820;
+        let dependent = 0x1830;
+        source.extend(replay_probe_record(
+            b"NPC_",
+            anchor,
+            0,
+            &replay_probe_subrecord(b"EDID", b"Anchor\0"),
+        ));
+        // An NPC_ owner selects the oversized global alternative, so this winner
+        // fails its replay; it has no predecessor and its prefix is refused below.
+        source.extend(replay_probe_record(
+            b"NPC_",
+            removed,
+            0,
+            &[replay_probe_subrecord(b"EDID", b"Removed\0"), coed(anchor)].concat(),
+        ));
+        // Replayed after the removal, the dependent must see its owner as absent.
+        source.extend(replay_probe_record(
+            b"TEST",
+            dependent,
+            0,
+            &[
+                replay_probe_subrecord(b"EDID", b"Dependent\0"),
+                coed(removed),
+            ]
+            .concat(),
+        ));
+        std::fs::write(&path, &source).unwrap();
+        let paths = vec![path];
+        let order = LoadOrder::read(&paths).unwrap();
+        let result = super::super::read_plugins_with_validation_and_observer_with_schema(
+            &paths,
+            &order,
+            &schema,
+            |record| {
+                let owned = record
+                    .fields
+                    .iter()
+                    .any(|field| field.signature == *b"COED");
+                if record.form_id == removed && !owned {
+                    Err("probe owner needs its ownership".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(
+            !result.records.contains_key(&removed),
+            "the refused prefix leaves no winner"
+        );
+        let history = result
+            .history
+            .iter()
+            .find(|entry| entry.form_id == Some(removed))
+            .expect("removed occurrence history");
+        assert!(!history.accepted);
+        assert!(
+            history
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("recovered prefix unusable")),
+            "the removal records why its prefix was refused"
+        );
+        let record = &result.records[&dependent];
+        assert_eq!(
+            record
+                .fields
+                .iter()
+                .map(|field| field.signature)
+                .collect::<Vec<_>>(),
+            vec![*b"EDID", *b"COED"],
+            "the dependent replays against the catalogue without its removed owner"
+        );
+        assert!(record.rejected_fields.is_empty());
+        assert!(!record_contains_deferred(record));
+    }
 }
