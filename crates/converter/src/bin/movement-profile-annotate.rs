@@ -198,6 +198,9 @@ mod tests {
         // The player race and a modded race the old hand-picked selection did not name.
         let (_directory, path) =
             package_with_races(&[(0x0000_1234, 0x0003_580D), (0x0001_3746, 0x0003_580D)]);
+        // A repeated run replaces the projection: the exact rows and counts below would
+        // grow if a run kept stale or duplicate rows.
+        annotate(&path).unwrap();
         annotate(&path).unwrap();
         let connection = Connection::open(&path).unwrap();
         let links: Vec<(u32, Option<u32>)> = connection
