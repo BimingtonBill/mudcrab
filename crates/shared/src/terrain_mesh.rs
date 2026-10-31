@@ -476,9 +476,10 @@ impl std::error::Error for TerrainMeshError {}
 /// `terrain/` with a `.ktx2` suffix, the only shape the converter writes. Without this the
 /// engine's `root.join(&path)` would follow `..` or an absolute path out of the asset root
 /// (`join` discards the root for a drive path), and the asset server would be handed the same
-/// escaping path. [`crate::streaming_costs::canonical_resource_key`] is the workspace's one
-/// rule for what a runtime asset path may look like; the `terrain/*.ktx2` shape is this
-/// table's own.
+/// escaping path. [`crate::streaming_costs::canonical_resource_key`] normalizes resource
+/// identities; require that it leaves the path unchanged because readers use the original
+/// string. The `terrain/*.ktx2` shape is this table's own: one nonempty filename directly
+/// under `terrain/`, with no intermediate directories for the OS to interpret.
 fn validate_array_path(array: usize, path: &str) -> Result<(), TerrainMeshError> {
     let key = crate::streaming_costs::canonical_resource_key(path).map_err(|_| {
         TerrainMeshError::ArrayPath {
@@ -486,9 +487,16 @@ fn validate_array_path(array: usize, path: &str) -> Result<(), TerrainMeshError>
             path: path.to_owned(),
         }
     })?;
+    if key != path {
+        return Err(TerrainMeshError::ArrayPath {
+            array,
+            path: path.to_owned(),
+        });
+    }
     let terrain_ktx2 = key
         .strip_prefix("terrain/")
-        .is_some_and(|file| file.ends_with(".ktx2"));
+        .and_then(|file| file.strip_suffix(".ktx2"))
+        .is_some_and(|stem| !stem.is_empty() && !stem.contains('/'));
     if !terrain_ktx2 {
         return Err(TerrainMeshError::ArrayPathOutsideTerrain {
             array,
@@ -896,7 +904,15 @@ mod tests {
             "/terrain/x.ktx2",
             "C:/x.ktx2",
             "C:\\x.ktx2",
+            "C:terrain/x.ktx2",
+            "\\terrain\\x.ktx2",
             "\\\\host\\share\\x.ktx2",
+            "\\\\?\\C:\\terrain\\x.ktx2",
+            "//host/share/terrain/x.ktx2",
+            "terrain/x.ktx2:stream",
+            "terrain/%2e%2e/x.ktx2",
+            "terrain/x.ktx2?query",
+            "terrain/x.ktx2#label",
             "terrain/x.ktx2\0",
         ] {
             let mut bad = table(3);
@@ -922,6 +938,57 @@ mod tests {
                     path: elsewhere.into()
                 }),
                 "{elsewhere:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_refuses_normalized_array_paths_before_readers_use_the_original() {
+        for path in [
+            "terrain\\x.ktx2",
+            "TERRAIN/x.ktx2",
+            "terrain/X.KTX2",
+            "./terrain/x.ktx2",
+            "terrain/./x.ktx2",
+            "terrain//x.ktx2",
+            "terrain/x.ktx2/.",
+            "terrain/x.ktx2/",
+        ] {
+            let mut bad = table(3);
+            // Validate unused normal arrays too, not only entry-referenced diffuse arrays.
+            let mut normal = bad.arrays[0].clone();
+            normal.path = path.into();
+            normal.usage = LandTextureUsage::NormalLinear;
+            normal.format = LandTextureFormat::Bc5;
+            bad.arrays.push(normal);
+            assert_eq!(
+                bad.validate(),
+                Err(TerrainMeshError::ArrayPath {
+                    array: 1,
+                    path: path.into(),
+                }),
+                "{path:?} must be refused without rewriting it"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_requires_one_array_filename_under_terrain() {
+        for path in [
+            "terrain/.ktx2",
+            "terrain/subdir/x.ktx2",
+            "terrain/.. /x.ktx2",
+            "terrain/.../x.ktx2",
+        ] {
+            let mut bad = table(3);
+            bad.arrays[0].path = path.into();
+            assert_eq!(
+                bad.validate(),
+                Err(TerrainMeshError::ArrayPathOutsideTerrain {
+                    array: 0,
+                    path: path.into(),
+                }),
+                "{path:?} is not one array filename under terrain"
             );
         }
     }
