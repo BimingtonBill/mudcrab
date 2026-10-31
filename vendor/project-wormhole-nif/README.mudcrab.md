@@ -6,8 +6,8 @@ commit `cfd1c409d9a6e27d649ab276471c98c344b436cd` (path `nif`). The crate and th
 `GPL-3.0-or-later`, the same licence as Mudcrab.
 
 Unlike `vendor/bevy_image`, this is a maintained fork, not a pristine copy. The copy vendored on
-2026-08-18 was already reformatted, so every source file differs from the published one, and 33 later
-commits changed it further (12 files, +6,092/-468 lines): legacy (pre-Skyrim) `NiTriShape` geometry
+2026-08-18 was already reformatted, so every source file differs from the published one, and 34 later
+commits changed it further (12 files, +6,191/-468 lines): legacy (pre-Skyrim) `NiTriShape` geometry
 in the new `src/legacy.rs`, legacy skin instances, skin partitions, skeleton binding, merged-palette
 checks and header fixes. The sibling crates `project-wormhole-esm`, `project-wormhole-shared` and
 `project-wormhole-ba2` still come unchanged from crates.io. `crates/converter` and
