@@ -973,6 +973,9 @@ fn declares_skin_type(diagnostics: &NifParseDiagnostics) -> bool {
         .any(|block_type| is_declared_skin_block(block_type))
 }
 
+/// Offsets named in a skin-parse refusal before the rest are only counted.
+const MAX_REPORTED_SKIN_OFFSETS: usize = 8;
+
 /// Refuses a NIF whose declared skin instance block did not parse.
 ///
 /// Rescuing an unparsable block keeps the rest of the file readable, but for a
@@ -984,12 +987,16 @@ fn ensure_declared_skins_parsed(diagnostics: &NifParseDiagnostics, path: &Path) 
         if !is_declared_skin_block(block_type) {
             continue;
         }
-        let offsets = diagnostics
+        let all_offsets = diagnostics
             .fallback_offsets
             .get(block_type)
             .map(Vec::as_slice)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // A crafted file can declare up to the header's block limit, so the
+        // message names the first few and counts the rest.
+        let mut offsets = all_offsets
             .iter()
+            .take(MAX_REPORTED_SKIN_OFFSETS)
             .map(|offset| {
                 if *offset == usize::MAX {
                     "parser panicked".to_owned()
@@ -999,6 +1006,10 @@ fn ensure_declared_skins_parsed(diagnostics: &NifParseDiagnostics, path: &Path) 
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let more = all_offsets.len().saturating_sub(MAX_REPORTED_SKIN_OFFSETS);
+        if more > 0 {
+            offsets.push_str(&format!(", and {more} more"));
+        }
         bail!(
             "NIF {} has {count} {block_type} block(s) that could not be parsed ({offsets}); \
              refusing to convert a skinned mesh as static",
@@ -4189,6 +4200,26 @@ mod tests {
     }
 
     #[test]
+    fn skin_parse_refusal_names_only_the_first_offsets() {
+        let mut diagnostics = NifParseDiagnostics::default();
+        let block_type = "NiSkinInstance".to_owned();
+        diagnostics.fallback_blocks.insert(block_type.clone(), 20);
+        let mut offsets: Vec<usize> = (0..19).map(|index| 100 + index).collect();
+        offsets.insert(0, usize::MAX);
+        diagnostics.fallback_offsets.insert(block_type, offsets);
+        let message = ensure_declared_skins_parsed(&diagnostics, Path::new("many.nif"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("20 NiSkinInstance block(s)"), "{message}");
+        assert!(
+            message.contains("(parser panicked, offset 100,"),
+            "{message}"
+        );
+        assert!(message.contains("offset 106, and 12 more)"), "{message}");
+        assert!(!message.contains("offset 107"), "{message}");
+    }
+
+    #[test]
     fn scene_graph_loop_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("loop.nif");
@@ -4306,11 +4337,27 @@ mod tests {
 
         #[test]
         fn nif_never_panics_on_larger_arbitrary_bytes(tail in arbitrary_bytes(4096)) {
-            // Longer than the 512-byte budget: enough for a whole header and a
-            // short block table, so the walk sees arbitrary scene graphs.
+            // Longer than the 512-byte budget, so whole headers and block tables
+            // are reached; most random tails still stop at header validation.
+            // Scene graphs get their own property below.
             let mut bytes = b"Gamebryo File Format, Version 20.2.0.7\n".to_vec();
             bytes.extend_from_slice(&tail);
             inspect_and_convert(&bytes);
+        }
+
+        #[test]
+        fn nif_scene_graphs_never_panic_and_stay_within_the_depth_limit(
+            // Child indices run past the last block too: the walk skips those.
+            children in prop::collection::vec(prop::collection::vec(0u32..96, 0..4), 1..80)
+        ) {
+            let directory = tempfile::tempdir().unwrap();
+            let input = directory.path().join("graph.nif");
+            fs::write(&input, node_graph_nif(&children)).unwrap();
+            // Loops and over-deep graphs are refused; an accepted graph is in bounds.
+            if let Ok(diagnostics) = MeshConverter::inspect_nif(&input) {
+                prop_assert!(diagnostics.max_scene_depth <= MAX_SCENE_DEPTH);
+            }
+            let _ = MeshConverter::convert_nif_to_glb(&input, &directory.path().join("graph.glb"));
         }
 
         #[test]
